@@ -6150,6 +6150,56 @@ impl BcodeClient {
         }
     }
 
+    /// Read one bounded page in a retained, non-resumable workflow inventory snapshot.
+    ///
+    /// Recursively expand child runs using the same scan ID. Expiry/eviction is an
+    /// observation failure, not idle evidence. Close the scan on completion or error.
+    /// # Errors
+    /// Returns transport, invalid cursor, unavailable snapshot or mismatched response errors.
+    pub async fn workflow_activity_page(
+        &self,
+        request: bcode_workflow_view_models::WorkflowActivityPageRequest,
+    ) -> Result<bcode_workflow_view_models::WorkflowActivityPage, ClientError> {
+        let expected = request.clone();
+        match self
+            .send_request(Request::WorkflowActivityPage { request })
+            .await?
+        {
+            ResponsePayload::WorkflowActivityPage { page }
+                if page.version == bcode_workflow_view_models::WORKFLOW_ACTIVITY_VERSION
+                    && page.run_id == expected.run_id
+                    && page.root_run_id == expected.root_run_id
+                    && page.section == expected.section
+                    && expected
+                        .scan_id
+                        .as_ref()
+                        .is_none_or(|id| id == &page.scan_id)
+                    && expected
+                        .expected_revision
+                        .is_none_or(|revision| revision == page.revision) =>
+            {
+                Ok(page)
+            }
+            ResponsePayload::WorkflowActivityPage { .. } => Err(ClientError::Protocol(
+                "unsupported or mismatched workflow activity page".into(),
+            )),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Release a retained read snapshot without cancelling or mutating workflow execution.
+    /// # Errors
+    /// Returns transport, daemon cleanup or unexpected response errors.
+    pub async fn workflow_activity_close(&self, scan_id: String) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::WorkflowActivityClose { scan_id })
+            .await?
+        {
+            ResponsePayload::WorkflowActivityClosed => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Read one bounded scheduling page using an opaque application cursor.
     ///
     /// # Errors
@@ -8497,6 +8547,7 @@ mod session_progress_tests {
             observation: SessionProgressObservation::Available {
                 epoch: "public-epoch".into(),
                 counter: 7,
+                last_progress_at_ms: Some(123),
             },
         }
     }
@@ -8522,7 +8573,8 @@ mod session_progress_tests {
                 "version": SESSION_PROGRESS_VERSION,
                 "session_id": id.to_string(),
                 "observation": {
-                    "status": "available", "epoch": "public-epoch", "counter": 7
+                    "status": "available", "epoch": "public-epoch", "counter": 7,
+                    "last_progress_at_ms": 123
                 }
             })
         );
@@ -8550,10 +8602,104 @@ mod session_progress_tests {
     }
 
     #[test]
+    fn workflow_activity_request_roundtrips_retained_scan_coordinates() {
+        let request = Request::WorkflowActivityPage {
+            request: bcode_workflow_view_models::WorkflowActivityPageRequest {
+                version: bcode_workflow_view_models::WORKFLOW_ACTIVITY_VERSION,
+                scan_id: Some("opaque-scan".into()),
+                root_run_id: "root".into(),
+                run_id: "child".into(),
+                expected_revision: Some(3),
+                section: bcode_workflow_view_models::WorkflowActivitySection::Children,
+                cursor: Some("opaque-cursor".into()),
+                limit: 100,
+            },
+        };
+        let encoded = bcode_ipc::request_envelope(1, &request).unwrap();
+        let decoded = bcode_ipc::decode_request(&encoded.payload).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
+        let response = Response::Ok(ResponsePayload::WorkflowActivityClosed);
+        let encoded = bcode_ipc::response_envelope(1, &response).unwrap();
+        assert!(matches!(
+            decode_response(&encoded.payload).unwrap(),
+            Response::Ok(ResponsePayload::WorkflowActivityClosed)
+        ));
+    }
+
+    #[test]
+    fn workflow_activity_response_preserves_asof_coverage_and_unavailable_progress() {
+        let page = bcode_workflow_view_models::WorkflowActivityPage {
+            version: bcode_workflow_view_models::WORKFLOW_ACTIVITY_VERSION,
+            scan_id: "scan".into(),
+            root_run_id: "root".into(),
+            snapshot_started_at_ms: 123,
+            snapshot_age_ms: 5,
+            scan_lifetime_ms: 120_000,
+            current_idle_eligible: false,
+            run_id: "root".into(),
+            revision: 2,
+            section: bcode_workflow_view_models::WorkflowActivitySection::Attempts,
+            attempts: vec![bcode_workflow_view_models::WorkflowActivityAttempt {
+                dispatch_identity: "dispatch".into(),
+                node_id: "node".into(),
+                activation_id: "activation".into(),
+                attempt: 1,
+                terminal: false,
+                session_id: Some("session".into()),
+                observation: bcode_workflow_view_models::AttemptObservation::Unavailable {
+                    reason: bcode_workflow_view_models::WorkflowAttemptUnavailableReason::UnknownDispatchSource,
+                },
+                progress: Some(SessionProgressSnapshot {
+                    version: SESSION_PROGRESS_VERSION,
+                    session_id: "session".into(),
+                    observation: SessionProgressObservation::Unavailable {
+                        reason: SessionProgressUnavailableReason::CoverageUnavailable,
+                    },
+                }),
+            }],
+            children: vec![],
+            next_cursor: None,
+            inventory_exhausted: true,
+            subtree_coverage_complete: true,
+            issues: vec!["live coverage unavailable".into()],
+        };
+        let encoded = bcode_ipc::response_envelope(
+            1,
+            &Response::Ok(ResponsePayload::WorkflowActivityPage { page: page.clone() }),
+        )
+        .unwrap();
+        match decode_response(&encoded.payload).unwrap() {
+            Response::Ok(ResponsePayload::WorkflowActivityPage { page: decoded }) => {
+                assert_eq!(decoded, page);
+                assert!(decoded.subtree_coverage_complete);
+                assert!(!decoded.current_idle_eligible);
+                assert_eq!(
+                    decoded.attempts[0]
+                        .progress
+                        .as_ref()
+                        .unwrap()
+                        .advanced_since(decoded.attempts[0].progress.as_ref().unwrap()),
+                    None
+                );
+            }
+            _ => panic!("expected typed workflow activity page"),
+        }
+    }
+
+    #[test]
     fn rejects_wrong_identity_future_versions_and_unexpected_payloads() {
         let id = SessionId::new();
         assert!(matches!(
             decode_session_progress_response(wire_decode(snapshot(SessionId::new())), id),
+            Err(ClientError::Protocol(_))
+        ));
+        let mut legacy = snapshot(id);
+        legacy.version = 1;
+        assert!(matches!(
+            decode_session_progress_response(wire_decode(legacy), id),
             Err(ClientError::Protocol(_))
         ));
         let mut future = snapshot(id);

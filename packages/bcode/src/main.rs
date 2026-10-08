@@ -74,7 +74,15 @@ fn main() {
         let result = bcode_cli::run(build_info).await;
 
         if let Err(error) = result {
-            eprintln!("error: {error}");
+            if std::env::args_os().any(|argument| argument == "--json-errors") {
+                let diagnostic = bcode_cli::clierror::CliDiagnosticError::from_error(&error);
+                match serde_json::to_string(&diagnostic) {
+                    Ok(json) => eprintln!("{json}"),
+                    Err(_) => eprintln!("{{\"schema_version\":1,\"code\":\"cli_failure\",\"phase\":\"operation\",\"message\":\"CLI operation failed.\"}}"),
+                }
+            } else {
+                eprintln!("error: {error}");
+            }
             std::process::exit(i32::from(error.exit_code()));
         }
     });

@@ -17,7 +17,10 @@ use bcode_session_models::{
     SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
-pub use bcode_workflow_view_models::SessionProgressSnapshot;
+pub use bcode_workflow_view_models::{
+    AttemptObservation, SessionProgressSnapshot, WORKFLOW_ACTIVITY_VERSION, WorkflowActivityPage,
+    WorkflowActivityPageRequest, WorkflowActivitySection, WorkflowStageProgress,
+};
 pub use bcode_worktree_models::{
     WorktreeCreateOperationStatus, WorktreeCreateRequest, WorktreeCreateResponse,
     WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse,
@@ -123,7 +126,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Older peers are rejected rather than interpreting the combined payload layout.
 /// Version 48 adds scoped session discovery and bounded catalog pages.
 /// Version 49 adds content-free session progress snapshots; version 48 peers are rejected.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 49;
+/// Version 50 adds retained workflow activity snapshots and host progress timestamps.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 50;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1398,6 +1402,14 @@ pub enum Request {
     SessionProgressSnapshot {
         session_id: SessionId,
     },
+    /// Bounded inventory through one ephemeral retained workflow snapshot.
+    WorkflowActivityPage {
+        request: bcode_workflow_view_models::WorkflowActivityPageRequest,
+    },
+    /// Release a retained read snapshot; does not affect workflow execution.
+    WorkflowActivityClose {
+        scan_id: String,
+    },
 }
 
 /// Server stop request policy.
@@ -2665,6 +2677,12 @@ pub enum ResponsePayload {
     SessionProgressSnapshot {
         snapshot: SessionProgressSnapshot,
     },
+    /// Inventory is as-of a retained snapshot, not current-idle authority.
+    WorkflowActivityPage {
+        page: bcode_workflow_view_models::WorkflowActivityPage,
+    },
+    /// Ephemeral read resources released; no execution effects.
+    WorkflowActivityClosed,
 }
 
 /// Stable reasons runtime ownership cannot currently be released.

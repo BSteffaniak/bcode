@@ -114,22 +114,41 @@ async fn supported(db: &dyn Database) -> Result<bool, Error> {
 pub async fn lookup(db: &dyn Database, run_id: &str) -> Result<RunLookup, Error> {
     crate::validate_id("run_id", run_id).map_err(|_| Error::InvalidAdmission)?;
     let tx = db.begin_transaction().await?;
-    let legacy = !tx
+    match lookup_in(&*tx, run_id).await {
+        Ok(result) => {
+            tx.commit().await?;
+            Ok(result)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+/// Classify one exact identity within the caller's snapshot without starting a transaction.
+///
+/// Does not commit, roll back, repair, migrate or acquire execution authority.
+/// # Errors
+/// Rejects invalid identities and storage failures; compatibility/degradation remain explicit.
+pub async fn lookup_in(db: &dyn Database, run_id: &str) -> Result<RunLookup, Error> {
+    crate::validate_id("run_id", run_id).map_err(|_| Error::InvalidAdmission)?;
+    let legacy = !db
         .select("workflow_runs")
         .columns(&["run_id"])
         .where_eq("run_id", run_id)
         .limit(1)
-        .execute(&*tx)
+        .execute(db)
         .await?
         .is_empty();
-    let extension = tx.table_exists(RUNS).await?;
+    let extension = db.table_exists(RUNS).await?;
     let newer = extension
-        && !tx
+        && !db
             .select(RUNS)
             .columns(&["run_id"])
             .where_eq("run_id", run_id)
             .limit(1)
-            .execute(&*tx)
+            .execute(db)
             .await?
             .is_empty();
     if legacy {
@@ -142,20 +161,20 @@ pub async fn lookup(db: &dyn Database, run_id: &str) -> Result<RunLookup, Error>
     if !newer {
         return Ok(RunLookup::Missing);
     }
-    if !supported(&*tx).await? {
+    if !supported(db).await? {
         return Ok(RunLookup::UnsupportedRepresentation);
     }
-    super::verified(&*tx).await?;
-    let result = match super::identity_in(&*tx, run_id).await {
+    super::verified(db).await?;
+    let result = match super::identity_in(db, run_id).await {
         Ok(None) => RunLookup::Missing,
         Ok(Some(RunRepresentation::Legacy)) => RunLookup::Legacy,
         Ok(Some(RunRepresentation::Version2)) => {
-            let rows = tx
+            let rows = db
                 .select(RUNS)
                 .columns(&["run_id", "association_session_id", "status"])
                 .where_eq("run_id", run_id)
                 .limit(1)
-                .execute(&*tx)
+                .execute(db)
                 .await?;
             rows.first()
                 .and_then(|row| observation(row).ok())
@@ -164,7 +183,6 @@ pub async fn lookup(db: &dyn Database, run_id: &str) -> Result<RunLookup, Error>
         Err(Error::MaintenanceRequired) => RunLookup::Degraded,
         Err(error) => return Err(error),
     };
-    tx.commit().await?;
     Ok(result)
 }
 

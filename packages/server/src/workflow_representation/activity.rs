@@ -17,6 +17,7 @@ use std::num::NonZeroUsize;
 struct Progress {
     epoch: String,
     counter: u64,
+    last_progress_at_ms: Option<u64>,
     event_sequence: Option<u64>,
     tools: BTreeMap<String, u64>,
     tool_order: VecDeque<String>,
@@ -67,7 +68,12 @@ impl SessionProgressRegistry {
     /// first signal establishes a baseline, not proof of progress since an unknown
     /// observation. Overflow starts a new epoch rather than wrapping the counter.
     pub fn observe(&mut self, session_id: SessionId) {
+        let last_progress_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
         if let Some(progress) = self.sessions.get_mut(&session_id) {
+            progress.last_progress_at_ms = last_progress_at_ms;
             if let Some(counter) = progress.counter.checked_add(1) {
                 progress.counter = counter;
             } else {
@@ -86,6 +92,7 @@ impl SessionProgressRegistry {
             Progress {
                 epoch: uuid::Uuid::new_v4().to_string(),
                 counter: 1,
+                last_progress_at_ms,
                 event_sequence: None,
                 tools: BTreeMap::new(),
                 tool_order: VecDeque::new(),
@@ -185,6 +192,7 @@ impl SessionProgressRegistry {
                         SessionProgressObservation::Available {
                             epoch: progress.epoch.clone(),
                             counter: progress.counter,
+                            last_progress_at_ms: progress.last_progress_at_ms,
                         }
                     } else {
                         SessionProgressObservation::Unavailable {

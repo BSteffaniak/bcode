@@ -327,10 +327,42 @@ pub fn shared_execution_session(
 #[derive(Debug)]
 pub struct SharedExecutionSessionPermit {
     session_id: SessionId,
+    observation: Arc<SharedExecutionSessionObservation>,
     _permit: tokio::sync::OwnedMutexGuard<()>,
 }
 
+/// Read-only shared admission identity, invalidated when the sequential permit is released.
+#[derive(Debug)]
+pub struct SharedExecutionSessionObservation {
+    provenance: ExecutionSessionProvenance,
+    held: std::sync::atomic::AtomicBool,
+}
+
+impl SharedExecutionSessionObservation {
+    /// Return provenance only while the admission permit is still held.
+    #[must_use]
+    pub fn provenance(&self) -> Option<&ExecutionSessionProvenance> {
+        self.held
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(&self.provenance)
+    }
+}
+
+impl Drop for SharedExecutionSessionPermit {
+    fn drop(&mut self) {
+        self.observation
+            .held
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl SharedExecutionSessionPermit {
+    /// Observe this admission's provenance only while its sequential permit is retained.
+    #[must_use]
+    pub fn observation(&self) -> std::sync::Weak<SharedExecutionSessionObservation> {
+        Arc::downgrade(&self.observation)
+    }
+
     /// Return the serialized parent session target.
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
@@ -540,6 +572,59 @@ pub enum SessionError {
     /// Session is owned by another daemon or cannot be leased.
     #[error(transparent)]
     Lease(#[from] lease::SessionLeaseError),
+}
+
+impl SessionError {
+    /// Return a secret-safe static category for public observation diagnostics.
+    ///
+    /// Categories describe failure provenance, not permission to retry or repair.
+    /// No error payload, path, identifier, or backend message is returned.
+    #[must_use]
+    pub fn observation_category(&self) -> &'static str {
+        match self {
+            Self::Db(error) if error.is_lock_error() => "database_locked",
+            Self::Db(error) => match error {
+                db::SessionDbError::Connection(_) => "database_connection",
+                db::SessionDbError::Database(_) => "database_operation",
+                db::SessionDbError::Migration(_) => "database_migration",
+                db::SessionDbError::Io(_) => "database_io",
+                db::SessionDbError::Lease(_) => "lease_unavailable",
+                db::SessionDbError::Serialize(_) => "event_serialization",
+                db::SessionDbError::PersistedEvent(_) => "persisted_event_invalid",
+                db::SessionDbError::ProjectionStale { .. } => "database_projection_stale",
+                db::SessionDbError::ModelContextProjectionStale { .. } => {
+                    "model_context_projection_stale"
+                }
+                db::SessionDbError::ProjectionIncompatible { .. }
+                | db::SessionDbError::ModelContextProjectionVersion { .. } => {
+                    "projection_incompatible"
+                }
+                db::SessionDbError::WriterIncompatible { .. } => "writer_incompatible",
+                db::SessionDbError::MigrationHistoryIncompatible { .. } => {
+                    "migration_history_incompatible"
+                }
+                db::SessionDbError::InvalidData(_) => "database_invalid_data",
+                db::SessionDbError::InvalidCanonicalAppendSequence { .. } => {
+                    "canonical_append_sequence_invalid"
+                }
+                db::SessionDbError::InvalidCanonicalSequence { .. } => "canonical_sequence_invalid",
+                db::SessionDbError::InvalidCompactionMarker { .. } => "compaction_marker_invalid",
+                db::SessionDbError::InvalidRow { .. } => "database_invalid_row",
+                db::SessionDbError::TransientContribution { .. }
+                | db::SessionDbError::HistoryReadLimitExceeded { .. } => {
+                    "observation_request_rejected"
+                }
+            },
+            Self::ProjectionStale { .. } => "projection_stale",
+            Self::StorageMigrationRequired { .. } => "storage_migration_required",
+            Self::Lease(_) => "lease_unavailable",
+            Self::NotFound(_) => "session_not_found",
+            Self::Store(_) => "store_error",
+            Self::DbUnavailable(_) => "database_unavailable",
+            Self::EventSerialization(_) => "event_serialization",
+            _ => "other_session_error",
+        }
+    }
 }
 
 fn session_derivation_prompt_candidate(
@@ -1612,6 +1697,10 @@ impl SessionManager {
         };
         Ok(SharedExecutionSessionPermit {
             session_id,
+            observation: Arc::new(SharedExecutionSessionObservation {
+                provenance: provenance.clone(),
+                held: std::sync::atomic::AtomicBool::new(true),
+            }),
             _permit: lock.lock_owned().await,
         })
     }
@@ -3059,6 +3148,104 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
     use switchy::database::query::FilterableQuery;
+
+    #[test]
+    fn observation_categories_do_not_expose_nested_payloads() {
+        let errors = [
+            (
+                db::SessionDbError::InvalidData("secret/path".into()),
+                "database_invalid_data",
+            ),
+            (
+                db::SessionDbError::InvalidRow {
+                    column: "secret/path".into(),
+                },
+                "database_invalid_row",
+            ),
+            (
+                db::SessionDbError::InvalidCanonicalAppendSequence {
+                    expected: 1,
+                    actual: 2,
+                },
+                "canonical_append_sequence_invalid",
+            ),
+            (
+                db::SessionDbError::InvalidCanonicalSequence {
+                    expected: 1,
+                    actual: 2,
+                },
+                "canonical_sequence_invalid",
+            ),
+            (
+                db::SessionDbError::InvalidCompactionMarker {
+                    sequence: 1,
+                    message: "secret/path".into(),
+                },
+                "compaction_marker_invalid",
+            ),
+            (
+                db::SessionDbError::ProjectionStale {
+                    projection: "secret",
+                    checkpoint: None,
+                    expected: 7,
+                },
+                "database_projection_stale",
+            ),
+            (
+                db::SessionDbError::WriterIncompatible {
+                    actual: Some(999),
+                    expected: 4,
+                },
+                "writer_incompatible",
+            ),
+            (
+                db::SessionDbError::Io(std::io::Error::other("secret/path")),
+                "database_io",
+            ),
+        ];
+        for (error, expected) in errors {
+            assert_eq!(SessionError::Db(error).observation_category(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_canonical_append_and_non_owning_child_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let session = manager
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let writer = async {
+            for _ in 0..16 {
+                manager
+                    .append_context_compacted(session.id, "context".into(), 0)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("append category: {}", error.observation_category())
+                    });
+                tokio::task::yield_now().await;
+            }
+        };
+        let reader = async {
+            for _ in 0..16 {
+                let page = manager
+                    .query_child_sessions(bcode_session_models::SessionChildQuery {
+                        parent_id: session.id,
+                        after: None,
+                        limit: 1,
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("observation category: {}", error.observation_category())
+                    });
+                assert!(page.complete);
+                assert!(page.children.is_empty());
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::join!(writer, reader);
+    }
 
     #[tokio::test]
     async fn usage_catalog_identity_pages_are_exclusive_and_complete() {

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 struct ActivityEvidence {
     sequence: Option<u64>,
     complete: bool,
+    poisoned: bool,
     permissions: BTreeSet<String>,
     exchanges: BTreeSet<String>,
     submissions: BTreeSet<String>,
@@ -26,7 +27,8 @@ impl ActivityEvidence {
                 self.complete = false;
             }
         } else {
-            self.complete = event.sequence == 0
+            self.complete = !self.poisoned
+                && event.sequence == 0
                 && matches!(event.kind, SessionEventKind::SessionCreated { .. });
         }
         self.sequence = Some(event.sequence);
@@ -111,17 +113,132 @@ impl ActivityEvidence {
 #[derive(Debug, Default)]
 pub struct ActivityObservations {
     sessions: BTreeMap<SessionId, ActivityEvidence>,
+    receiver: Option<tokio::sync::broadcast::Receiver<bcode_session::SessionMutationCommitted>>,
+    buffered: BTreeMap<SessionId, BTreeMap<u64, SessionEvent>>,
+    pending: bool,
 }
 
 impl ActivityObservations {
-    pub fn observe(&mut self, event: &SessionEvent) {
-        if !self.sessions.contains_key(&event.session_id) && self.sessions.len() >= 128 {
-            self.sessions.pop_first();
+    /// Subscribe before the server exposes any session creation operation.
+    #[must_use]
+    pub fn new(
+        receiver: tokio::sync::broadcast::Receiver<bcode_session::SessionMutationCommitted>,
+    ) -> Self {
+        Self {
+            receiver: Some(receiver),
+            pending: true,
+            ..Self::default()
         }
-        self.sessions
-            .entry(event.session_id)
-            .or_default()
-            .observe(event);
+    }
+
+    fn degrade_all(&mut self) {
+        for facts in self.sessions.values_mut() {
+            facts.complete = false;
+            facts.poisoned = true;
+        }
+    }
+
+    /// Drain bounded newly committed mutations; gaps await contiguous publication.
+    /// Lag or closure permanently degrades all existing baselines. No replay occurs.
+    #[cfg(test)]
+    pub fn drain(&mut self, budget: usize) {
+        self.drain_with(budget, |_| {});
+    }
+
+    /// Forward identity-verified canonical mutations to another bounded observation registry.
+    /// Delivery may be reordered or duplicated; the callback must deduplicate by sequence.
+    /// Events are borrowed only for this call and are not retained in another payload queue.
+    pub fn drain_with(&mut self, budget: usize, mut observe: impl FnMut(&SessionEvent)) {
+        if self.receiver.is_none() {
+            return;
+        }
+        self.pending = true;
+        for _ in 0..budget {
+            let result = self.receiver.as_mut().expect("receiver exists").try_recv();
+            match result {
+                Ok(mutation) => {
+                    if mutation.session_id == mutation.event.session_id {
+                        self.observe_canonical(&mutation.event);
+                        observe(&mutation.event);
+                    } else {
+                        self.degrade_all();
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    self.degrade_all();
+                    self.buffered.clear();
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    self.degrade_all();
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    self.pending = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Release disposable evidence when runtime observation ownership ends.
+    pub fn release(&mut self, id: SessionId) {
+        self.sessions.remove(&id);
+        self.buffered.remove(&id);
+    }
+
+    /// Legacy synthetic observer; manual frontend publication is ignored when subscribed.
+    pub fn observe(&mut self, event: &SessionEvent) {
+        if self.receiver.is_none() {
+            self.observe_canonical(event);
+        }
+    }
+
+    fn observe_canonical(&mut self, event: &SessionEvent) {
+        if !self.sessions.contains_key(&event.session_id)
+            && self.sessions.len() >= 128
+            && let Some((id, _)) = self.sessions.pop_first()
+        {
+            self.buffered.remove(&id);
+        }
+        let facts = self.sessions.entry(event.session_id).or_default();
+        if facts
+            .sequence
+            .is_some_and(|sequence| event.sequence <= sequence)
+        {
+            return;
+        }
+        let buffer = self.buffered.entry(event.session_id).or_default();
+        if let Some(previous) = buffer.get(&event.sequence) {
+            if previous != event {
+                facts.complete = false;
+                facts.poisoned = true;
+            }
+            return;
+        }
+        if buffer.len() >= 64 {
+            facts.complete = false;
+            facts.poisoned = true;
+            return;
+        }
+        buffer.insert(event.sequence, event.clone());
+        loop {
+            let next = facts
+                .sequence
+                .map_or(Some(0), |sequence| sequence.checked_add(1));
+            let Some(next) = next else {
+                facts.complete = false;
+                facts.poisoned = true;
+                break;
+            };
+            let Some(event) = buffer.remove(&next) else {
+                break;
+            };
+            facts.observe(&event);
+        }
+    }
+
+    fn covered(&self, id: SessionId) -> bool {
+        !self.pending && self.buffered.get(&id).is_none_or(BTreeMap::is_empty)
     }
 
     pub fn evidence(&self, id: SessionId) -> bcode_session_models::SessionActivityEvidence {
@@ -137,7 +254,7 @@ impl ActivityObservations {
             input_waits: observed.map_or(0, |facts| {
                 u32::try_from(facts.exchanges.len()).unwrap_or(u32::MAX)
             }),
-            counts_complete: observed.is_some_and(|facts| facts.complete),
+            counts_complete: observed.is_some_and(|facts| facts.complete) && self.covered(id),
             observed_event_sequence: observed.and_then(|facts| facts.sequence),
             // Raw tool names/arguments and arbitrary labels are not normalized public operation labels.
             current_operation: None,
@@ -145,9 +262,11 @@ impl ActivityObservations {
     }
 
     pub fn states(&self, id: SessionId) -> (Vec<SessionActivityState>, bool) {
-        self.sessions
+        let (states, complete) = self
+            .sessions
             .get(&id)
-            .map_or_else(|| (Vec::new(), false), ActivityEvidence::states)
+            .map_or_else(|| (Vec::new(), false), ActivityEvidence::states);
+        (states, complete && self.covered(id))
     }
 }
 
@@ -184,6 +303,108 @@ mod tests {
                 execution_descriptor: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn manager_committed_non_lifecycle_events_preserve_ordered_complete_evidence() {
+        let manager = bcode_session::SessionManager::default();
+        let mut observations = ActivityObservations::new(manager.subscribe_mutations());
+        let summary = manager
+            .create_session(None, std::path::PathBuf::from("/"))
+            .await
+            .unwrap();
+
+        for sequence in 1..=11 {
+            let committed = manager
+                .append_context_compacted(summary.id, "context".into(), 0)
+                .await
+                .unwrap();
+            assert_eq!(committed.sequence, sequence);
+            // A reordered independent publisher must not move this canonical observer.
+            observations.observe(&event(summary.id, sequence + 100, accepted()));
+        }
+        observations.drain(3);
+        assert!(!observations.evidence(summary.id).counts_complete);
+        let mut delivered = Vec::new();
+        observations.drain_with(32, |event| delivered.push(event.sequence));
+        assert_eq!(delivered, (3..=11).collect::<Vec<_>>());
+        assert!(observations.evidence(summary.id).counts_complete);
+        assert_eq!(
+            observations.evidence(summary.id).observed_event_sequence,
+            Some(11)
+        );
+        assert_eq!(observations.states(summary.id), (Vec::new(), true));
+    }
+
+    #[tokio::test]
+    async fn receiver_lag_never_recovers_completeness() {
+        let id = SessionId::new();
+        let seed = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: std::path::PathBuf::from("/"),
+            },
+        );
+        let manager = bcode_session::SessionManager::default();
+        let summary = manager
+            .create_session(None, std::path::PathBuf::from("/"))
+            .await
+            .unwrap();
+        let mutation = |event: SessionEvent| bcode_session::SessionMutationCommitted {
+            session_id: id,
+            event,
+            summary: summary.clone(),
+        };
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        let mut observations = ActivityObservations::new(receiver);
+        sender.send(mutation(seed)).unwrap();
+        observations.drain(32);
+        sender.send(mutation(event(id, 1, accepted()))).unwrap();
+        sender.send(mutation(event(id, 2, accepted()))).unwrap();
+        observations.drain(32);
+        observations.drain(32);
+        assert!(!observations.evidence(id).counts_complete);
+        assert!(!observations.states(id).1);
+    }
+
+    #[tokio::test]
+    async fn reordered_mutations_remain_unknown_until_contiguous() {
+        let manager = bcode_session::SessionManager::default();
+        let summary = manager
+            .create_session(None, std::path::PathBuf::from("/"))
+            .await
+            .unwrap();
+        let id = summary.id;
+        let mutation = |event: SessionEvent| bcode_session::SessionMutationCommitted {
+            session_id: id,
+            event,
+            summary: summary.clone(),
+        };
+        let (sender, receiver) = tokio::sync::broadcast::channel(16);
+        let mut observations = ActivityObservations::new(receiver);
+        let creation = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: std::path::PathBuf::from("/"),
+            },
+        );
+        sender.send(mutation(creation)).unwrap();
+        observations.drain(100);
+        assert!(observations.evidence(id).counts_complete);
+        sender.send(mutation(event(id, 2, accepted()))).unwrap();
+        observations.drain(100);
+        assert!(!observations.evidence(id).counts_complete);
+        assert_eq!(observations.evidence(id).observed_event_sequence, Some(0));
+        sender.send(mutation(event(id, 1, accepted()))).unwrap();
+        observations.drain(100);
+        assert!(observations.evidence(id).counts_complete);
+        assert_eq!(observations.evidence(id).observed_event_sequence, Some(2));
+        observations.release(id);
+        assert!(!observations.evidence(id).counts_complete);
     }
 
     #[test]

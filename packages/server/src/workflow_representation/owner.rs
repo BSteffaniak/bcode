@@ -96,6 +96,28 @@ pub async fn link_execution_session(
     }
 }
 
+/// Record shared-parent linkage only in the current representation, which permits
+/// multiple exact dispatch links to the same canonical session. Legacy dispatch retains
+/// its pre-existing no-link behavior; unknown or degraded representations fail closed.
+pub async fn link_shared_execution_session(
+    state: &ServerState,
+    authority: &WorkflowExecutionAuthority,
+    link: &WorkflowExecutionSessionLink,
+) -> Result<(), WorkflowStoreError> {
+    let retained = retained_store(state).await.map_err(store_error)?;
+    match lookup_at(retained.path(), &link.run_id)
+        .await
+        .map_err(store_error)?
+    {
+        RunLookup::Legacy => {
+            retained.verify_execution_authority(&link.run_id, authority)?;
+            Ok(())
+        }
+        RunLookup::Available(_) => link_execution_session(state, authority, link).await,
+        _ => Err(store_error("unsupported shared execution storage")),
+    }
+}
+
 /// Commit the owner receipt without switching canonical representations on failure.
 pub async fn persist_receipt(
     state: &ServerState,

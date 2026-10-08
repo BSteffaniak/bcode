@@ -88,6 +88,10 @@ async fn legacy_only_database_routes_without_installing_extension() {
 }
 
 async fn admit_extension(state: &ServerState) {
+    admit_extension_with_observations(state, false).await;
+}
+
+async fn admit_extension_with_observations(state: &ServerState, observed: bool) {
     let db = open(&crate::workflow_store_path(state), true).expect("typed store");
     representation::install(&db)
         .await
@@ -116,9 +120,16 @@ async fn admit_extension(state: &ServerState) {
     run.definition_id = identity.definition_id;
     run.definition_version = identity.definition_version;
     run.limits.concurrency_cap = None;
-    representation::admit(&db, &run, &definition)
-        .await
-        .expect("extension admission");
+    if observed {
+        representation::journal::install(&db).await.unwrap();
+        representation::admit_registered_observed(&db, &run, &definition, true)
+            .await
+            .expect("observed registered admission");
+    } else {
+        representation::admit(&db, &run, &definition)
+            .await
+            .expect("extension admission");
+    }
 }
 
 #[tokio::test]
@@ -512,6 +523,22 @@ async fn typed_provider_fixture_with_delegation(
     std::sync::Arc<ServerState>,
     bcode_workflow::WorkflowDefinition,
 ) {
+    typed_provider_fixture_with_target(
+        delegation,
+        bcode_workflow::PromptContextTarget::FreshIsolated,
+    )
+    .await
+}
+
+async fn typed_provider_fixture_with_target(
+    delegation: bool,
+    target: bcode_workflow::PromptContextTarget,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::sync::Arc<ServerState>,
+    bcode_workflow::WorkflowDefinition,
+) {
     let root = tempfile::tempdir().expect("workflow root");
     let sessions_root = tempfile::tempdir().expect("sessions root");
     let sessions = crate::SessionManager::persistent_lazy(sessions_root.path());
@@ -534,12 +561,10 @@ async fn typed_provider_fixture_with_delegation(
         configured
     });
     let schema = bcode_workflow::ValueSchema::of::<u32>();
-    let config: bcode_workflow::WorkflowPromptConfiguration =
-        serde_json::from_value(crate::tests::test_workflow_prompt_configuration(
-            schema,
-            bcode_workflow::PromptContextTarget::FreshIsolated,
-        ))
-        .expect("configuration");
+    let config: bcode_workflow::WorkflowPromptConfiguration = serde_json::from_value(
+        crate::tests::test_workflow_prompt_configuration(schema, target),
+    )
+    .expect("configuration");
     let mut definition = bcode_workflow::WorkflowBuilder::new(
         "typed-agent",
         bcode_workflow::Step::<u32, u32>::agent("agent", &config).expect("agent"),
@@ -582,6 +607,69 @@ async fn typed_provider_fixture_with_delegation(
         .await
         .expect("test-only admission");
     (root, sessions_root, state, definition)
+}
+
+#[tokio::test]
+async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link() {
+    let (_root, _sessions_root, state, _) = typed_provider_fixture_with_target(
+        false,
+        bcode_workflow::PromptContextTarget::SharedParentSequential,
+    )
+    .await;
+    let parent = status(&state, "new")
+        .await
+        .unwrap()
+        .unwrap()
+        .parent_session_id
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        loop {
+            crate::drive_workflow_run(&state, "new").await.unwrap();
+            if status(&state, "new").await.unwrap().unwrap().status
+                == bcode_workflow::RunStatus::Completed
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shared parent completes within existing regression bound");
+    let db = open(&crate::workflow_store_path(&state), false).unwrap();
+    let links = representation::inspection_sessions::links(&db, "new", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].session_id, parent);
+    assert!(
+        inspection::shared_parent_link(&db, "new", &links[0])
+            .await
+            .unwrap()
+    );
+    let id = parent.parse().unwrap();
+    assert!(
+        state
+            .sessions
+            .session_summary_non_owning(id)
+            .await
+            .unwrap()
+            .execution
+            .is_none()
+    );
+    let mut spoofed = links[0].clone();
+    spoofed.session_id = bcode_session_models::SessionId::new().to_string();
+    assert!(
+        !inspection::shared_parent_link(&db, "new", &spoofed)
+            .await
+            .unwrap()
+    );
+    spoofed = links[0].clone();
+    spoofed.workspace_snapshot = "wrong-workspace".into();
+    assert!(
+        !inspection::shared_parent_link(&db, "new", &spoofed)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

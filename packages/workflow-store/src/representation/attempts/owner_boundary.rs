@@ -387,9 +387,58 @@ pub async fn terminal_outcome(
     crate::validate_id("dispatch_identity", dispatch_identity)
         .map_err(|_| Error::InvalidAdmission)?;
     let tx = db.begin_transaction().await?;
-    super::super::verified(&*tx).await?;
-    run(&*tx, run_id).await?;
-    let row = attempt(&*tx, dispatch_identity)
+    match terminal_outcome_in(&*tx, run_id, dispatch_identity).await {
+        Ok(outcome) => {
+            tx.commit().await?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+/// Read the exact terminal outcome inside the caller's snapshot, without a nested transaction.
+///
+/// Preserves receipt, identity, timestamp and compatibility validation; never commits,
+/// rolls back, repairs or acquires execution authority.
+/// # Errors
+/// Rejects invalid/missing attempts, inconsistent receipts, unsupported storage and database failures.
+pub async fn terminal_outcome_in(
+    db: &dyn Database,
+    run_id: &str,
+    dispatch_identity: &str,
+) -> Result<Option<super::TerminalOutcome>, Error> {
+    Ok(attempt_observation_in(db, run_id, dispatch_identity)
+        .await?
+        .outcome)
+}
+
+/// Verified canonical attempt ledger transitions without exposing them publicly as payloads.
+pub struct AttemptLedgerObservation {
+    /// Verified terminal outcome.
+    pub outcome: Option<super::TerminalOutcome>,
+    /// Verified admission receipt.
+    pub receipt: Option<DispatchReceipt>,
+    /// Canonical terminal timestamp.
+    pub terminal_at_ms: Option<u64>,
+}
+
+/// Read canonical stage facts inside the caller's snapshot.
+/// # Errors
+/// Rejects inconsistent identities, receipts, timestamps and unsupported storage.
+pub async fn attempt_observation_in(
+    db: &dyn Database,
+    run_id: &str,
+    dispatch_identity: &str,
+) -> Result<AttemptLedgerObservation, Error> {
+    crate::validate_id("run_id", run_id).map_err(|_| Error::InvalidAdmission)?;
+    crate::validate_id("dispatch_identity", dispatch_identity)
+        .map_err(|_| Error::InvalidAdmission)?;
+    super::super::verified(db).await?;
+    run(db, run_id).await?;
+    let row = attempt(db, dispatch_identity)
         .await?
         .ok_or(Error::InvalidAdmission)?;
     let prepared = checked_prepared(&row, run_id, dispatch_identity)?;
@@ -414,7 +463,7 @@ pub async fn terminal_outcome(
     let outcome = match row.get("outcome_json") {
         Some(DatabaseValue::Null) if row.get("terminal_at_ms") == Some(DatabaseValue::Null) => None,
         Some(DatabaseValue::String(json)) if json.len() <= super::super::MAX_ADMISSION_BYTES => {
-            let receipt = receipt.ok_or(Error::MaintenanceRequired)?;
+            let receipt = receipt.as_ref().ok_or(Error::MaintenanceRequired)?;
             if super::integer(&row, "terminal_at_ms")?.cast_unsigned() < receipt.admitted_at_ms {
                 return Err(Error::MaintenanceRequired);
             }
@@ -422,8 +471,16 @@ pub async fn terminal_outcome(
         }
         _ => return Err(Error::MaintenanceRequired),
     };
-    tx.commit().await?;
-    Ok(outcome)
+    let terminal_at_ms = if outcome.is_some() {
+        Some(super::integer(&row, "terminal_at_ms")?.cast_unsigned())
+    } else {
+        None
+    };
+    Ok(AttemptLedgerObservation {
+        outcome,
+        receipt,
+        terminal_at_ms,
+    })
 }
 
 /// Read an exact committed intent, including settled attempts, without authorizing replay.

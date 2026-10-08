@@ -416,6 +416,7 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     // Disposable bounded observations of successfully committed terminal work.
+    workflow_activity_scans: workflow_representation::workflow_activity::WorkflowActivityScans,
     progress_observations: StdMutex<workflow_representation::activity::SessionProgressRegistry>,
     activity_observations: Mutex<session_activity::ActivityObservations>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
@@ -649,6 +650,7 @@ async fn remove_session_runtime_if_current(
         .is_some_and(|handle| Arc::ptr_eq(&handle.current_turn, current_turn))
     {
         runtimes.remove(&session_id);
+        drop(runtimes);
         true
     } else {
         false
@@ -2391,6 +2393,8 @@ impl ServerState {
         state_root: PathBuf,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
+        let activity_observations =
+            session_activity::ActivityObservations::new(sessions.subscribe_mutations());
         let session_migrations = bcode_session_migration::SessionMigrationService::default();
         let (workflow_store, workflow_store_unavailable) = init.workflow_store.map_or_else(
             || {
@@ -2482,12 +2486,18 @@ impl ServerState {
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
+            workflow_activity_scans:
+                workflow_representation::workflow_activity::WorkflowActivityScans::new(
+                    std::num::NonZeroUsize::new(16).expect("positive scan budget"),
+                    std::time::Duration::from_mins(2),
+                )
+                .expect("positive scan lifetime"),
             progress_observations: StdMutex::new(
                 workflow_representation::activity::SessionProgressRegistry::new(
                     std::num::NonZeroUsize::new(4096).expect("positive retention budget"),
                 ),
             ),
-            activity_observations: Mutex::default(),
+            activity_observations: Mutex::new(activity_observations),
             turn_admission_locks: Mutex::default(),
             workflow_prompt_admissions: StdMutex::default(),
             workflow_store: StdMutex::new(workflow_store).into(),
@@ -3122,6 +3132,12 @@ impl ServerState {
         }
     }
 
+    async fn expire_workflow_activity_scans(&self) {
+        if let Err(error) = self.workflow_activity_scans.expire().await {
+            tracing::warn!(%error, "workflow activity snapshot expiry unavailable");
+        }
+    }
+
     async fn start_workflow_driver(self: &Arc<Self>) {
         let mut task = self.workflow_driver_task.lock().await;
         if task.is_some() || self.shutdown_requested.load(Ordering::SeqCst) {
@@ -3148,7 +3164,10 @@ impl ServerState {
             loop {
                 tokio::select! {
                     biased;
-                    _ = shutdown.recv() => break,
+                    _ = shutdown.recv() => {
+                        let _ = state.workflow_activity_scans.close_all().await;
+                        break;
+                    },
                     result = workers.join_next(), if !workers.is_empty() => {
                         match result {
                             Some(Ok(run_id)) => { active.remove(&run_id); }
@@ -3161,7 +3180,9 @@ impl ServerState {
                             None => {}
                         }
                     }
-                    _ = recovery_tick.tick(), if workers.len() < capacity => {
+                    _ = recovery_tick.tick() => {
+                        state.expire_workflow_activity_scans().await;
+                        if workers.len() >= capacity { continue; }
                         if state.poll_workflow_initialization(false).is_err() {
                             recovery_tick.reset();
                             continue;
@@ -6253,6 +6274,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CreateSession { .. } => "create_session",
         Request::CreateChildSession { .. } => "create_child_session",
         Request::SessionSummary { .. } => "session_summary",
+        Request::WorkflowActivityPage { .. } => "workflow_activity_page",
+        Request::WorkflowActivityClose { .. } => "workflow_activity_close",
         Request::SessionProgressSnapshot { .. } => "session_progress_snapshot",
         Request::SessionActivity { .. } => "session_activity",
         Request::ReconcileSessionChildren { .. } => "reconcile_session_children",
@@ -6625,24 +6648,33 @@ async fn handle_request_inner(
             .await
         }
         SessionLifecycleRequest::UpdateClientRuntimeContext { runtime_context } => {
-            handle_update_client_runtime_context(
+            Box::pin(handle_update_client_runtime_context(
                 request_id,
                 client_id,
                 state,
                 writer,
                 runtime_context,
-            )
+            ))
             .await
         }
-        SessionLifecycleRequest::Ping => handle_ping(request_id, writer).await,
+        SessionLifecycleRequest::Ping => Box::pin(handle_ping(request_id, writer)).await,
         SessionLifecycleRequest::IngestClientMetrics { batch } => {
-            handle_ingest_client_metrics(request_id, state, writer, batch).await
+            Box::pin(handle_ingest_client_metrics(
+                request_id, state, writer, batch,
+            ))
+            .await
         }
         SessionLifecycleRequest::ServerStatus { working_directory } => {
-            handle_server_status(request_id, state, writer, working_directory.as_deref()).await
+            Box::pin(handle_server_status(
+                request_id,
+                state,
+                writer,
+                working_directory.as_deref(),
+            ))
+            .await
         }
         SessionLifecycleRequest::ModelCatalogDiagnostics => {
-            handle_model_catalog_diagnostics(request_id, state, writer).await
+            Box::pin(handle_model_catalog_diagnostics(request_id, state, writer)).await
         }
         SessionLifecycleRequest::ServerStop { mode } => {
             handle_server_stop(request_id, state, writer, mode).await
@@ -6681,22 +6713,38 @@ async fn handle_request_inner(
             ))
             .await
         }
+        SessionLifecycleRequest::WorkflowActivityPage { request } => {
+            let response = Box::pin(workflow_representation::workflow_activity::page(
+                state,
+                &state.workflow_activity_scans,
+                request,
+            ))
+            .await
+            .map_or_else(
+                |_| {
+                    Response::Err(ErrorResponse::new(
+                        "workflow_activity_unavailable",
+                        "workflow activity snapshot unavailable, expired, or unsupported",
+                    ))
+                },
+                |page| Response::Ok(ResponsePayload::WorkflowActivityPage { page }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::WorkflowActivityClose { scan_id } => {
+            let response = match Box::pin(state.workflow_activity_scans.close(&scan_id)).await {
+                Ok(()) => Response::Ok(ResponsePayload::WorkflowActivityClosed),
+                Err(_) => Response::Err(ErrorResponse::new(
+                    "workflow_activity_unavailable",
+                    "workflow activity snapshot release unavailable",
+                )),
+            };
+            send_response(writer, request_id, response).await
+        }
         SessionLifecycleRequest::SessionProgressSnapshot { session_id } => {
-            let mut snapshot = state
-                .progress_observations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .snapshot(session_id);
-            if !state.sessions.session_is_owned(session_id).await {
-                snapshot.observation = bcode_workflow_view_models::SessionProgressObservation::Unavailable {
-                    reason: bcode_workflow_view_models::SessionProgressUnavailableReason::CoverageUnavailable,
-                };
-            }
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionProgressSnapshot { snapshot }),
-            )
+            Box::pin(handle_session_progress(
+                request_id, state, writer, session_id,
+            ))
             .await
         }
         SessionLifecycleRequest::SessionActivity { session_id, query } => {
@@ -9768,9 +9816,11 @@ async fn explicit_session_ownership_release_outcome_inner(
     let outcome = if blockers.is_empty() {
         match state.sessions.release_session_ownership(session_id).await? {
             bcode_session::SessionOwnershipRelease::Released => {
+                state.activity_observations.lock().await.release(session_id);
                 SessionOwnershipReleaseOutcome::Released
             }
             bcode_session::SessionOwnershipRelease::AlreadyUnowned => {
+                state.activity_observations.lock().await.release(session_id);
                 SessionOwnershipReleaseOutcome::AlreadyUnowned
             }
             bcode_session::SessionOwnershipRelease::Blocked(snapshot) => {
@@ -9972,6 +10022,10 @@ async fn handle_create_child_session(
     send_response(writer, request_id, response).await
 }
 
+fn session_observation_error_tag(error: &bcode_session::SessionError) -> &'static str {
+    error.observation_category()
+}
+
 async fn handle_session_children(
     request_id: u64,
     state: &ServerState,
@@ -9984,12 +10038,54 @@ async fn handle_session_children(
             "session_not_found",
             "parent session not found",
         )),
-        Err(_) => Response::Err(ErrorResponse::new(
+        Err(
+            bcode_session::SessionError::ProjectionStale { .. }
+            | bcode_session::SessionError::Db(bcode_session::db::SessionDbError::ProjectionStale {
+                ..
+            }),
+        ) => Response::Err(ErrorResponse::new(
+            "session_children_temporarily_unavailable",
+            "child discovery crossed a concurrent canonical append; retry the bounded observation",
+        )),
+        Err(error) if matches!(&error, bcode_session::SessionError::Db(db) if db.is_lock_error()) => {
+            Response::Err(ErrorResponse::new(
+                "session_children_temporarily_unavailable",
+                "child discovery unavailable: database_locked; retry bounded observation",
+            ))
+        }
+        Err(error) => Response::Err(ErrorResponse::new(
             "session_children_unavailable",
-            "child discovery unavailable; verify the query budget and session health",
+            format!(
+                "child discovery unavailable: {}",
+                session_observation_error_tag(&error)
+            ),
         )),
     };
     send_response(writer, request_id, response).await
+}
+
+async fn handle_session_progress(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let mut snapshot = state
+        .progress_observations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot(session_id);
+    if !state.sessions.session_is_owned(session_id).await {
+        snapshot.observation = bcode_workflow_view_models::SessionProgressObservation::Unavailable {
+            reason: bcode_workflow_view_models::SessionProgressUnavailableReason::CoverageUnavailable,
+        };
+    }
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::SessionProgressSnapshot { snapshot }),
+    )
+    .await
 }
 
 async fn handle_session_activity(
@@ -10004,9 +10100,27 @@ async fn handle_session_activity(
         Err(bcode_session::SessionError::NotFound(_)) => {
             Response::Err(ErrorResponse::new("session_not_found", "session not found"))
         }
-        Err(_) => Response::Err(ErrorResponse::new(
+        Err(
+            bcode_session::SessionError::ProjectionStale { .. }
+            | bcode_session::SessionError::Db(bcode_session::db::SessionDbError::ProjectionStale {
+                ..
+            }),
+        ) => Response::Err(ErrorResponse::new(
+            "session_activity_temporarily_unavailable",
+            "activity observation crossed a concurrent canonical append; retry the bounded observation",
+        )),
+        Err(error) if matches!(&error, bcode_session::SessionError::Db(db) if db.is_lock_error()) => {
+            Response::Err(ErrorResponse::new(
+                "session_activity_temporarily_unavailable",
+                "activity unavailable: database_locked; retry bounded observation",
+            ))
+        }
+        Err(error) => Response::Err(ErrorResponse::new(
             "session_activity_unavailable",
-            "activity unavailable; verify the query budget and session health",
+            format!(
+                "activity unavailable: {}",
+                session_observation_error_tag(&error)
+            ),
         )),
     };
     send_response(writer, request_id, response).await
@@ -22598,7 +22712,15 @@ async fn ingest_provider_stream_event_payload(
     outcome.stream.events_decoded = outcome.stream.events_decoded.saturating_add(1);
     outcome.stream.last_decoded_event = Some(provider_turn_event_kind(&event).to_string());
     let is_progress = model_event_is_progress(&event);
-    if is_progress {
+    let substantive_progress = match &event {
+        ProviderTurnEvent::ReasoningActivity { .. }
+        | ProviderTurnEvent::Output {
+            event: bcode_model::ProviderOutputEvent::ReasoningActivity { .. },
+            ..
+        } => false,
+        _ => is_progress,
+    };
+    if substantive_progress {
         state
             .progress_observations
             .lock()
@@ -37962,6 +38084,20 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                 .admit_shared_execution_session(parent_session_id, &provenance)
                 .await
                 .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            workflow_representation::owner::link_shared_execution_session(
+                state,
+                &dispatch_authority,
+                &bcode_workflow_store::WorkflowExecutionSessionLink::new(
+                    request.activation.run_id.clone(),
+                    request.activation.node_id.clone(),
+                    request.activation.activation_id.clone(),
+                    request.attempt,
+                    permit.session_id().to_string(),
+                    run.workspace_snapshot.clone(),
+                    current_unix_millis(),
+                ),
+            )
+            .await?;
             (permit.session_id(), Some(permit))
         }
     };
@@ -37976,6 +38112,20 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         CancellationHandle::WorkflowNode(Arc::clone(&cancellation)),
     )
     .await;
+    if let Some(permit) = shared_permit.as_ref()
+        && !state
+            .runtime_work
+            .bind_shared_execution(
+                target_session_id,
+                &WorkId::new(request.dispatch_identity.clone()),
+                permit,
+            )
+            .await
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "shared execution dispatch association is unavailable".into(),
+        ));
+    }
     let metadata = bcode_session_models::TurnAdmissionMetadata {
         activity: if let Some(producer) = &configuration.activity_producer {
             project_workflow_activity(
@@ -39903,20 +40053,26 @@ fn plugin_service_response(
     }
 }
 
-async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
-    state.activity_observations.lock().await.observe(event);
-    if matches!(
+fn observe_substantive_stage(state: &ServerState, event: &bcode_session_models::SessionEvent) {
+    let substantive_stage = matches!(
         event.kind,
         SessionEventKind::ModelTurnStarted { .. }
             | SessionEventKind::ModelTurnFinished { .. }
             | SessionEventKind::ToolInvocationResultRecorded { .. }
-    ) {
+    ) || matches!(&event.kind, SessionEventKind::ToolInvocationLifecycle { event }
+            if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Started);
+    if substantive_stage {
         state
             .progress_observations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .observe_event(event.session_id, event.sequence);
     }
+}
+
+async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
+    state.activity_observations.lock().await.observe(event);
+    observe_substantive_stage(state, event);
     state
         .metrics
         .record_event("session.event", 1, session_event_metric_labels(event));

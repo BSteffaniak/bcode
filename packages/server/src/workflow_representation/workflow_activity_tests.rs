@@ -1,0 +1,358 @@
+//! Behavioral contract/cursor tests; no source-text assertions.
+use super::*;
+
+async fn seeded_activity_state(
+    intent: serde_json::Value,
+) -> (tempfile::TempDir, ServerState, String, String) {
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        bcode_workflow_store::WorkflowStore::create_coexistence_baseline(root.path()).unwrap();
+    let db = super::super::open(store.path(), true).unwrap();
+    bcode_workflow_store::representation::install(&db)
+        .await
+        .unwrap();
+    let definition = bcode_workflow::WorkflowBuilder::new(
+        "activity-endpoint",
+        bcode_workflow::Step::task("worker", |value: u32, _| async move { Ok(value) }),
+    )
+    .build()
+    .unwrap()
+    .definition()
+    .clone();
+    let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+        "activity-endpoint",
+        &definition,
+    )
+    .unwrap();
+    let run = bcode_workflow_store::NewWorkflowRun {
+        run_id: "endpoint-run".into(),
+        definition_id: identity.definition_id,
+        definition_version: identity.definition_version,
+        workspace_snapshot: "fixture".into(),
+        parent_session_id: None,
+        parent_session_generation: None,
+        binding: None,
+        authored_provenance: None,
+        input: Some(serde_json::json!(1)),
+        execution_authority: None,
+        created_at_ms: 1,
+        authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+            version: 1,
+            provider_id: "fixture".into(),
+            profile_id: "build".into(),
+            policy_digest_sha256: "a".repeat(64),
+        },
+        authorization_ceiling: bcode_workflow::WorkflowToolCapability::ReadOnly,
+        limits: bcode_workflow::WorkflowRunLimits::default(),
+    };
+    bcode_workflow_store::representation::admit(&db, &run, &definition)
+        .await
+        .unwrap();
+    let authority = bcode_workflow_store::WorkflowExecutionAuthority {
+        target_artifact_id: "fixture-artifact".into(),
+        daemon_instance_id: "fixture-daemon".into(),
+        generation: 1,
+        fencing_token: "fixture-fence".into(),
+    };
+    bcode_workflow_store::representation::attempts::claim_authority(&db, &run.run_id, &authority)
+        .await
+        .unwrap();
+    let activation =
+        bcode_workflow_store::representation::graph::activation_id(&db, &run.run_id, "worker")
+            .await
+            .unwrap()
+            .unwrap();
+    let dispatch = bcode_workflow_store::representation::attempts::prepare(
+        &db,
+        &authority,
+        &bcode_workflow_store::PreparedAttempt {
+            run_id: run.run_id.clone(),
+            node_id: "worker".into(),
+            activation_id: activation,
+            attempt: 1,
+            side_effect: bcode_workflow::DispatchSideEffect::ReadOnly,
+            intent,
+            prepared_at_ms: 10,
+        },
+    )
+    .await
+    .unwrap();
+    let mut state = crate::tests::test_server_state(crate::SessionManager::default());
+    state.workflow_store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    (root, state, run.run_id, dispatch)
+}
+
+#[tokio::test]
+async fn retained_database_handle_keeps_snapshot_pages_readable_until_close() {
+    let (_root, state, run_id, dispatch) = seeded_activity_state(serde_json::json!({})).await;
+    let scans =
+        WorkflowActivityScans::new(std::num::NonZeroUsize::MIN, Duration::from_secs(1)).unwrap();
+    let mut query = request();
+    query.root_run_id.clone_from(&run_id);
+    query.run_id.clone_from(&run_id);
+    query.expected_revision = None;
+    let first = tokio::time::timeout(
+        Duration::from_millis(250),
+        page(&state, &scans, query.clone()),
+    )
+    .await
+    .expect("start_scan and first page must not deadlock")
+    .unwrap();
+    assert_eq!(first.attempts.len(), 1);
+    assert_eq!(first.attempts[0].dispatch_identity, dispatch);
+    assert!(!first.attempts[0].terminal);
+    assert!(matches!(
+        first.attempts[0].observation,
+        bcode_workflow_view_models::AttemptObservation::Unavailable { .. }
+    ));
+    assert!(first.inventory_exhausted);
+    assert!(!first.subtree_coverage_complete);
+    query.scan_id = Some(first.scan_id.clone());
+    query.expected_revision = Some(first.revision);
+    query.section = WorkflowActivitySection::Children;
+    let second = tokio::time::timeout(Duration::from_millis(250), page(&state, &scans, query))
+        .await
+        .expect("retained snapshot page must not deadlock")
+        .unwrap();
+    drop(state);
+    assert!(second.children.is_empty());
+    assert!(second.inventory_exhausted);
+    assert!(second.subtree_coverage_complete);
+    tokio::time::timeout(Duration::from_millis(250), scans.close(&first.scan_id))
+        .await
+        .expect("snapshot release must not deadlock")
+        .unwrap();
+}
+
+async fn fresh_attempt_page(state: &ServerState, run_id: &str) -> WorkflowActivityAttempt {
+    let scans =
+        WorkflowActivityScans::new(std::num::NonZeroUsize::MIN, Duration::from_secs(1)).unwrap();
+    let mut query = request();
+    query.root_run_id = run_id.into();
+    query.run_id = run_id.into();
+    query.expected_revision = None;
+    let result = tokio::time::timeout(Duration::from_millis(250), page(state, &scans, query))
+        .await
+        .unwrap()
+        .unwrap();
+    scans.close(&result.scan_id).await.unwrap();
+    result.attempts.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn sessionless_admission_and_settlement_advance_only_canonical_stage_transitions() {
+    use bcode_workflow_view_models::AttemptObservation;
+    let (_root, state, run_id, dispatch) = seeded_activity_state(serde_json::json!({
+        "owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+    }))
+    .await;
+    let pending = fresh_attempt_page(&state, &run_id).await;
+    assert!(
+        matches!(pending.observation, AttemptObservation::PendingReadiness { ref stage, .. }
+        if stage.sequence == 1 && stage.last_progress_at_ms == 10)
+    );
+    let db = super::super::open(&crate::workflow_store_path(&state), true).unwrap();
+    let authority =
+        bcode_workflow_store::representation::attempts::owner_boundary::execution_authority(
+            &db, &run_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    bcode_workflow_store::representation::attempts::attach_receipt(
+        &db,
+        &authority,
+        &bcode_workflow_store::DispatchReceipt {
+            run_id: run_id.clone(),
+            node_id: pending.node_id.clone(),
+            activation_id: pending.activation_id.clone(),
+            attempt: 1,
+            dispatch_identity: dispatch.clone(),
+            receipt: serde_json::json!({}),
+            admitted_at_ms: 11,
+        },
+    )
+    .await
+    .unwrap();
+    let admitted = fresh_attempt_page(&state, &run_id).await;
+    assert!(
+        matches!(admitted.observation, AttemptObservation::RuntimeStage { ref progress }
+        if progress.sequence == 2 && progress.last_progress_at_ms == 11)
+    );
+    assert_eq!(
+        admitted.observation,
+        fresh_attempt_page(&state, &run_id).await.observation
+    );
+    assert!(admitted.session_id.is_none());
+    bcode_workflow_store::representation::attempts::settle(
+        &db,
+        &authority,
+        &run_id,
+        &dispatch,
+        bcode_workflow_store::representation::attempts::TerminalOutcome::Failed,
+        12,
+    )
+    .await
+    .unwrap();
+    let terminal = fresh_attempt_page(&state, &run_id).await;
+    assert!(
+        matches!(terminal.observation, AttemptObservation::Terminal { ref stage }
+        if stage.sequence == 3 && stage.last_progress_at_ms == 12)
+    );
+    assert_eq!(
+        terminal.observation,
+        fresh_attempt_page(&state, &run_id).await.observation
+    );
+}
+
+#[tokio::test]
+async fn pending_agent_link_becomes_visible_only_in_a_fresh_scan() {
+    use bcode_workflow_view_models::AttemptObservation;
+    let (_root, state, run_id, _dispatch) = seeded_activity_state(serde_json::json!({
+        "owner": "bcode.server.agent-turn/v1",
+    }))
+    .await;
+    let pending = fresh_attempt_page(&state, &run_id).await;
+    assert!(matches!(
+        pending.observation,
+        AttemptObservation::PendingReadiness { .. }
+    ));
+    let db = super::super::open(&crate::workflow_store_path(&state), true).unwrap();
+    let authority =
+        bcode_workflow_store::representation::attempts::owner_boundary::execution_authority(
+            &db, &run_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let link = bcode_workflow_store::WorkflowExecutionSessionLink::new(
+        run_id.clone(),
+        pending.node_id,
+        pending.activation_id,
+        1,
+        bcode_session_models::SessionId::new().to_string(),
+        "fixture".into(),
+        11,
+    );
+    bcode_workflow_store::representation::attempts::owner_boundary::persist_execution_session_link(
+        &db, &authority, &link,
+    )
+    .await
+    .unwrap();
+    let linked = fresh_attempt_page(&state, &run_id).await;
+    assert!(
+        matches!(linked.observation, AttemptObservation::LinkedSession { ref progress, ref stage }
+        if stage.sequence == 1 && matches!(progress.observation, SessionProgressObservation::Unavailable { .. }))
+    );
+    assert_eq!(linked.session_id.as_deref(), Some(link.session_id.as_str()));
+}
+
+fn request() -> WorkflowActivityPageRequest {
+    WorkflowActivityPageRequest {
+        version: WORKFLOW_ACTIVITY_VERSION,
+        scan_id: None,
+        root_run_id: "run".into(),
+        run_id: "run".into(),
+        expected_revision: Some(2),
+        section: WorkflowActivitySection::Attempts,
+        cursor: None,
+        limit: 1,
+    }
+}
+
+#[test]
+fn cursor_is_bound_to_exact_run_revision_and_inventory_dimension() {
+    let token = hex::encode(
+        serde_json::to_vec(&Cursor {
+            scan_id: "scan".into(),
+            version: WORKFLOW_ACTIVITY_VERSION,
+            run_id: "run".into(),
+            revision: 2,
+            section: WorkflowActivitySection::Attempts,
+            after: "dispatch".into(),
+        })
+        .unwrap(),
+    );
+    let mut query = request();
+    query.scan_id = Some("scan".into());
+    query.cursor = Some(token);
+    assert_eq!(decode(&query).unwrap().unwrap().after, "dispatch");
+    query.expected_revision = Some(3);
+    assert!(decode(&query).is_err());
+    query.expected_revision = Some(2);
+    query.section = WorkflowActivitySection::Children;
+    assert!(decode(&query).is_err());
+    query.section = WorkflowActivitySection::Attempts;
+    query.run_id = "other".into();
+    assert!(decode(&query).is_err());
+}
+
+#[test]
+fn unknown_live_coverage_cannot_be_compared_as_progress_or_silence() {
+    let snapshot = unknown("session".into());
+    assert_eq!(snapshot.advanced_since(&snapshot), None);
+    assert!(matches!(
+        snapshot.observation,
+        SessionProgressObservation::Unavailable {
+            reason: SessionProgressUnavailableReason::CoverageUnavailable
+        }
+    ));
+}
+
+#[test]
+fn recursive_snapshot_coverage_requires_both_sections_of_every_descendant() {
+    let mut inventory = BTreeMap::new();
+    assert!(!inventory_complete(&inventory));
+    inventory.insert(
+        "root".into(),
+        RunCoverage {
+            attempts_done: true,
+            children_done: true,
+            ..RunCoverage::default()
+        },
+    );
+    assert!(inventory_complete(&inventory));
+    inventory.insert("child".into(), RunCoverage::default());
+    assert!(!inventory_complete(&inventory));
+    inventory.get_mut("child").unwrap().attempts_done = true;
+    assert!(!inventory_complete(&inventory));
+    inventory.get_mut("child").unwrap().children_done = true;
+    inventory.insert("grandchild".into(), RunCoverage::default());
+    assert!(!inventory_complete(&inventory));
+    let grandchild = inventory.get_mut("grandchild").unwrap();
+    grandchild.attempts_done = true;
+    grandchild.children_done = true;
+    assert!(inventory_complete(&inventory));
+}
+
+#[tokio::test]
+async fn scan_policy_rejects_zero_lifetime_and_close_is_idempotent() {
+    assert!(
+        WorkflowActivityScans::new(std::num::NonZeroUsize::MIN, std::time::Duration::ZERO,)
+            .is_err()
+    );
+    let scans = WorkflowActivityScans::new(
+        std::num::NonZeroUsize::MIN,
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    scans.close("missing").await.unwrap();
+    scans.close("missing").await.unwrap();
+    scans.expire().await.unwrap();
+    assert!(scans.scans.lock().await.is_empty());
+}
+
+#[test]
+fn invalid_versions_limits_and_cursor_bytes_fail_closed() {
+    let mut query = request();
+    query.version += 1;
+    assert!(decode(&query).is_err());
+    query = request();
+    query.limit = 0;
+    assert!(decode(&query).is_err());
+    query.limit = 101;
+    assert!(decode(&query).is_err());
+    query = request();
+    query.cursor = Some("not-hex".into());
+    assert!(decode(&query).is_err());
+}

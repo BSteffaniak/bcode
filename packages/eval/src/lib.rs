@@ -14,6 +14,27 @@
 mod agent_cleanup;
 mod agent_progress;
 mod capture;
+
+/// Capture supported public workflow history collections from verified inspection capabilities.
+/// Finite observation exhaustion does not certify semantic history completeness.
+///
+/// # Errors
+/// Returns an error for mismatched run identity, invalid/unavailable public pages or artifact writes.
+pub fn capture_workflow_history(
+    inspection: &bcode_workflow::WorkflowRunInspection,
+    directory: &std::path::Path,
+    invoke: impl Fn(&[String], &str, std::time::Duration) -> Result<serde_json::Value, EvalError>,
+) -> Result<(), EvalError> {
+    capture::capture_history_with_capabilities(
+        &inspection.run.run_id,
+        directory,
+        inspection
+            .unavailable_collections
+            .iter()
+            .any(|collection| collection == "events"),
+        invoke,
+    )
+}
 pub mod diagnosis;
 mod idle_timeout;
 mod introspection;
@@ -1534,6 +1555,7 @@ async fn execute_agent_variant_async(
                 session_id: session.id,
                 follow_up,
                 timeout,
+                timeout_policy: suite.run.resolved_timeout(case),
             })
             .await?;
             follow_up_timed_out = outcome.timed_out;
@@ -1600,6 +1622,7 @@ struct AgentFollowUpInput<'a> {
     session_id: bcode_session_models::SessionId,
     follow_up: &'a bcode_eval_models::EvalFollowUpConfig,
     timeout: std::time::Duration,
+    timeout_policy: bcode_eval_models::EvalResolvedTimeout,
 }
 
 struct AgentFollowUpOutcome {
@@ -1622,6 +1645,7 @@ async fn run_agent_follow_up(
         session_id,
         follow_up,
         timeout,
+        timeout_policy,
     } = input;
     let mut diagnostics = Vec::new();
     if follow_up.restart_daemon {
@@ -1669,7 +1693,7 @@ async fn run_agent_follow_up(
         timeout,
         variant,
         rep_dir,
-        None,
+        Some(timeout_policy),
     )
     .await?;
     trace_exports::export(client, &rep_dir.join("follow-up-transcript.jsonl"), &events).await?;
@@ -1794,8 +1818,15 @@ async fn wait_for_agent_turn(
             last_progress = Instant::now();
         }
         if idle {
-            agent_progress::observe(client, session_id, &mut progress_snapshot, &mut idle_since)
-                .await?;
+            agent_progress::observe(
+                client,
+                session_id,
+                &mut progress_snapshot,
+                &mut idle_since,
+                workflow::activity_scan_allowance(&BTreeMap::new())?,
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
         }
         if (if idle {
             idle_since.elapsed()

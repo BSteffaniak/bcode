@@ -6,6 +6,7 @@ use switchy_database::query::FilterableQuery;
 use switchy_database::schema::{Column, DataType, create_index, create_table};
 use switchy_database::{Database, DatabaseValue, TransactionMode};
 
+pub mod activity;
 mod admission_policy;
 mod admission_projection;
 mod registered;

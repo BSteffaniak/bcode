@@ -4,6 +4,9 @@
 
 //! Portable, renderer-neutral workflow projection contracts.
 
+mod workflow_activity;
+pub use workflow_activity::*;
+
 mod activity;
 pub use activity::*;
 

@@ -1,6 +1,60 @@
 use super::*;
 
 #[tokio::test]
+async fn current_public_capabilities_drive_eval_capture_without_legacy_events() {
+    let (_root, state) = fixture_with_store(true);
+    admit_extension_with_observations(&state, true).await;
+    let inspected = inspection::inspect(&state, "new", 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(inspected.unavailable_collections.contains(&"events".into()));
+    let wire = serde_json::to_value(&inspected).unwrap();
+    let capabilities: bcode_workflow::WorkflowRunInspection = serde_json::from_value(wire).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().to_path_buf();
+    let handle = tokio::runtime::Handle::current();
+    let state = std::sync::Arc::new(state);
+    tokio::task::spawn_blocking(move || {
+        bcode_eval::capture_workflow_history(&capabilities, &path, |args, _, _| {
+            let after = args
+                .windows(2)
+                .find(|pair| pair[0] == "--after-sequence")
+                .map(|pair| pair[1].parse::<u64>().unwrap());
+            let through = args
+                .windows(2)
+                .find(|pair| pair[0] == "--through-sequence")
+                .map(|pair| pair[1].parse::<u64>().unwrap());
+            match args[1].as_str() {
+                "observations" => Ok(serde_json::to_value(
+                    handle
+                        .block_on(discovery::observations(&state, "new", after, through, 100))
+                        .unwrap(),
+                )
+                .unwrap()),
+                "attempts" => Ok(serde_json::to_value(
+                    handle
+                        .block_on(discovery::attempts(&state, "new", None, 100))
+                        .unwrap(),
+                )
+                .unwrap()),
+                other => panic!("unsupported collection requested: {other}"),
+            }
+        })
+        .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("capture-completeness.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["boundaries"]["events"]["status"], "unsupported");
+        assert_eq!(manifest["boundaries"]["observations"]["status"], "complete");
+        assert_eq!(manifest["complete"], false);
+        assert!(!path.join("workflow-events-0000.json").exists());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn intermediate_exit_is_not_read_as_terminal_output() {
     let (_root, state) = fixture_with_store(true);
     admit_extension(&state).await;

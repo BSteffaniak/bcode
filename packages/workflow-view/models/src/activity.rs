@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Compatibility version of the independent session progress snapshot contract.
-pub const SESSION_PROGRESS_VERSION: u32 = 1;
+pub const SESSION_PROGRESS_VERSION: u32 = 2;
 
 /// A non-owning observation, not a durable checkpoint or proof of subtree coverage.
 ///
@@ -31,6 +31,9 @@ pub enum SessionProgressObservation {
         epoch: String,
         /// Increases only when the host delivers recognized substantive progress.
         counter: u64,
+        /// Actual host time of the last accepted substantive signal, never a poll timestamp.
+        /// None means host time was unavailable; counters remain the continuity authority.
+        last_progress_at_ms: Option<u64>,
     },
     /// Silence cannot be distinguished from missing observation coverage.
     Unavailable {
@@ -65,10 +68,11 @@ impl SessionProgressSnapshot {
         }
         match (&self.observation, &previous.observation) {
             (
-                SessionProgressObservation::Available { epoch, counter },
+                SessionProgressObservation::Available { epoch, counter, .. },
                 SessionProgressObservation::Available {
                     epoch: previous_epoch,
                     counter: previous_counter,
+                    ..
                 },
             ) if epoch == previous_epoch && counter >= previous_counter => {
                 Some(counter > previous_counter)
@@ -89,6 +93,7 @@ mod tests {
             observation: SessionProgressObservation::Available {
                 epoch: epoch.into(),
                 counter,
+                last_progress_at_ms: Some(123),
             },
         }
     }
@@ -130,9 +135,9 @@ mod tests {
         assert_eq!(
             encoded,
             serde_json::json!({
-                "version": 1,
+                "version": SESSION_PROGRESS_VERSION,
                 "session_id": "session",
-                "observation": {"status": "available", "epoch": "first", "counter": 2}
+                "observation": {"status": "available", "epoch": "first", "counter": 2, "last_progress_at_ms": 123}
             })
         );
         assert_eq!(
@@ -141,7 +146,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<SessionProgressSnapshot>(serde_json::json!({
-                "version": 1,
+                "version": SESSION_PROGRESS_VERSION,
                 "session_id": "session",
                 "observation": {"status": "future"}
             }))

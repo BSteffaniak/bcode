@@ -14,6 +14,38 @@ cumulative and duplicated; do not sum index rows. Existing canonical telemetry o
 usage accounting. Trace metadata is omitted from the index; raw transcripts and
 trace payloads are sensitive diagnostic artifacts, not public frontend contracts.
 
+## Shared-parent execution compatibility
+
+Current workflow representation links each shared-parent dispatch to its canonical
+session by exact run/node/activation/attempt identity; multiple sequential attempts
+may target that same session. Active progress additionally requires the held
+sequential permit's matching provenance, exact runtime-work association, ownership,
+and residency. Parent session provenance is not rewritten. Inspection verifies the
+explicit shared context and run workspace through bounded canonical reads.
+
+Legacy dispatch retains its existing no-link shared-parent behavior: its historical
+session-link schema permits only one dispatch per session. No schema migration or
+new progress guarantee is implied for that representation. Unknown or damaged
+representations fail closed, rather than falling back to legacy behavior.
+
+## Representation-aware workflow capture
+
+Capture follows the typed public inspection capability declaration. Current runs
+that declare semantic `events` unavailable retain that boundary as `unsupported`;
+the harness separately pages `workflow observations` at a fixed high-water and
+captures attempt summaries. Exhaustion proves only capture of the journal's
+explicit finite scalar source scope, not full semantic execution history. Disabled,
+malformed, future-version, or failed observation capture remains incomplete.
+Legacy event capture is unchanged. Session transcript coverage has independent
+receipts; workflow completion and quality grading do not establish evidence coverage.
+
+Current launch observation consent is derived from existing observability settings:
+`persist_model_requests || persist_tool_io`. There is no scalar-journal-only setting.
+Enabling either toggle also retains its declared model/tool trace payloads; it must
+not be described as scalar-only instrumentation. Paired experiments must record
+that configuration change and its storage/timing confound. Existing runs are not
+backfilled, and cancellation requests do not certify remote termination.
+
 ## Timeout diagnosis
 
 New repetition results can retain resolved `timeout` settings: `timeout_mode`,
@@ -34,6 +66,63 @@ evidence of remote-provider queueing or a provider failure.
 These model labels and diagnostic rules do not establish that all execution
 methods implement idle tracking. Runtime observation, cancellation, and result
 wiring require adapter-specific verification; no live validation is implied.
+
+## Retained evidence and current verification boundary
+
+The first complete idle run, `remaining-20261007/runs/idle-paired`, retains
+36/36 results and reports **0/36 execution passes**, not a performance comparison.
+Its immutable executable SHA-256 is
+`c39bda1aac8b28b0f2ed92550b91172bde01664a42fbf005199c7104cb878109`;
+source HEAD and diff hash, all nine collaboration outcomes, and the failure
+distribution are retained in
+[Controlled eval experiments](eval-controlled-experiments.md#first-complete-idle-run-2026-10-07).
+All trials resolve to idle 180000 ms without a total cap; none establishes idle
+exhaustion. Failures arise in activity/child discovery, execution-session coverage,
+inspection RPCs, or daemon setup. Three artifact oracles pass despite cancelled
+executions. Workflow capture is incomplete in all 27 trials; 24 cancellations are
+verified, three roots remain paused/unverified, and eight started direct session
+lifetimes are explicitly unverified. Neither complete result inventory nor endpoint
+loss proves that no actionable workers or unresolved effects remain. No foreign
+artifact was operated to resolve those lifetimes.
+
+The historical `wait-fixed-full-paired` report remains separate. It reports
+27/36 successful executions, with seven of its nine deadline-failed collaboration
+trials nevertheless passing the independent artifact oracle. Its all-nine
+collaboration table is preserved in
+[Historical full-run evidence](eval-controlled-experiments.md#historical-full-run-evidence-reviewed-2026-10-07).
+Artifact correctness, completion judgement, deadline enforcement, cancellation
+request, terminal cancellation, and capture availability are separate facts.
+The historical separable/1 root `inspection.json` records terminal `cancelled`; eight
+other failures retain inspection timeout errors and do not establish terminality.
+All 27 paired comparisons are marked evidence-incomplete, with no eligible speed
+samples. Complete result inventory is not complete causal capture.
+
+Post-execution capture contributes to repetition wall time without extending the
+execution allowance. For example, the older clean-run auto/handoff/3 result
+records 172937 ms workflow execution, 120000 ms capture, and 299309 ms repetition
+wall time. Its root inspection records terminal `failed`, not timeout; iteration-2
+`loop.evaluation` output keeps `condition_met: false` because inspectable evidence
+that Stage 2 consumed normalized.json was missing, despite correct file contents.
+This establishes the retained completion decision, not proof that consumption did
+not occur. Capture overhead alone does not establish token inflation.
+
+Current source uses comparable substantive progress marks and fails closed on
+unavailable coverage. The first idle run's infrastructure failures must not be
+attributed to historical provider or completion decisions. Subsequent corrections
+separate transaction-local workflow reads, release temporary session DB handles,
+bound initial-baseline acquisition, and retry normalized stale projections without
+counting retries as progress. These source mechanisms are not hash-matched proof
+that every c39b RPC timeout had the same cause. Coordinator-retained logs currently
+report 13 session-child, seven workflow-activity, and three workflow-store tests
+passing; regression logs and clippy are coordinator-owned and are not live
+full36 success evidence. The corrected immutable 8b916 pilot and corrected full36
+rerun remain separate validation; preserve the original c39b results unchanged.
+
+The existing offline commands below are reproducible validation entry points;
+their presence is not evidence they ran against today's source. Historical closure
+logs also retain a passing `attempt_timing_transport_tests::timing_transport_requires_explicit_acceptance`
+test. Neither that test nor the later critical2 timing report proves complete
+provider-round, remote-queue, tool, or workflow-wait attribution.
 
 ## Judgement diagnostics
 

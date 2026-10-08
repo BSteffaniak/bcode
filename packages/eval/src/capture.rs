@@ -126,14 +126,58 @@ pub fn capture_observations(
     }
 }
 
+#[cfg(test)]
 pub fn capture_history(
     run_id: &str,
     directory: &Path,
     invoke: impl Fn(&[String], &str, Duration) -> Result<Value, EvalError>,
 ) -> Result<(), EvalError> {
+    capture_history_with_capabilities(run_id, directory, false, invoke)
+}
+
+/// Capture only collections explicitly supported by canonical public inspection.
+/// `events_unsupported` must come from its typed unavailable-collection contract,
+/// never an inferred error string or empty events array.
+pub fn capture_history_with_capabilities(
+    run_id: &str,
+    directory: &Path,
+    events_unsupported: bool,
+    invoke: impl Fn(&[String], &str, Duration) -> Result<Value, EvalError>,
+) -> Result<(), EvalError> {
     let mut failures = Vec::new();
     let mut boundaries = serde_json::Map::new();
+    if events_unsupported {
+        boundaries.insert(
+            "events".into(),
+            serde_json::json!({
+                "status":"unsupported", "scope":"semantic execution history",
+                "reason":"canonical public inspection declares this collection unavailable"
+            }),
+        );
+        match capture_observations(run_id, directory, &invoke) {
+            Ok(()) => {
+                boundaries.insert("observations".into(), serde_json::json!({
+                    "status":"complete", "scope":"declared finite scalar sources at pinned high-water",
+                    "semantic_history_complete":false
+                }));
+            }
+            Err(error) => {
+                write_json(
+                    directory.join("workflow-observations-error.json"),
+                    &error.to_string(),
+                )?;
+                failures.push("observations");
+                boundaries.insert(
+                    "observations".into(),
+                    serde_json::json!({"status":"partial_or_unavailable"}),
+                );
+            }
+        }
+    }
     for collection in ["events", "attempts"] {
+        if collection == "events" && events_unsupported {
+            continue;
+        }
         if let Err(error) = capture_collection(run_id, directory, &invoke, collection) {
             write_json(
                 directory.join(format!("{collection}-capture-error.json")),
@@ -239,6 +283,57 @@ fn capture_collection(
 mod tests {
     use super::capture;
     use std::cell::Cell;
+
+    #[test]
+    fn current_capture_preserves_unsupported_events_and_finite_observation_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        super::capture_history_with_capabilities("run", directory.path(), true, |args, _, _| {
+            match args[1].as_str() {
+                "observations" => Ok(serde_json::json!({
+                    "version":1,"run_id":"run","origin":"admission","sources":[],
+                    "limitations":["finite scalar sources only"],"through_sequence":0,
+                    "next_after_sequence":null,"observations":[]
+                })),
+                "attempts" => Ok(serde_json::json!([])),
+                other => panic!("unsupported semantic collection requested: {other}"),
+            }
+        })
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("capture-completeness.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["boundaries"]["events"]["status"], "unsupported");
+        assert_eq!(manifest["boundaries"]["observations"]["status"], "complete");
+        assert_eq!(manifest["complete"], false);
+        assert_eq!(
+            manifest["boundaries"]["observations"]["semantic_history_complete"],
+            false
+        );
+    }
+
+    #[test]
+    fn current_capture_rejects_future_observation_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            super::capture_history_with_capabilities(
+                "run",
+                directory.path(),
+                true,
+                |args, _, _| {
+                    if args[1] == "attempts" {
+                        return Ok(serde_json::json!([]));
+                    }
+                    Ok(
+                        serde_json::json!({"version":2,"run_id":"run","origin":"admission",
+                "sources":[],"limitations":[],"through_sequence":0,
+                "next_after_sequence":null,"observations":[]}),
+                    )
+                }
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn observation_capture_pins_high_water_and_preserves_disabled_coverage() {

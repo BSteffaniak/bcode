@@ -28,6 +28,7 @@ pub enum ClockError {
     MissingBaseline,
     EpochChanged,
     CacheFull,
+    #[cfg(test)]
     CoverageUnavailable,
 }
 
@@ -78,8 +79,14 @@ impl<E: Eq> ExecutionClock<E> {
     ///
     /// Retirement is not progress. A later activation must establish a fresh baseline;
     /// neither replay of the old marker nor rediscovery extends the idle interval.
+    #[cfg(test)]
     pub fn retire(&mut self, session: &str) {
         self.progress.remove(session);
+    }
+
+    /// Retain only sessions certified active by a complete authoritative inventory.
+    pub fn retain_active(&mut self, active: &std::collections::BTreeSet<String>) {
+        self.progress.retain(|session, _| active.contains(session));
     }
 
     /// Register the first trustworthy mark without extending any deadline.
@@ -132,11 +139,58 @@ impl<E: Eq> ExecutionClock<E> {
         Ok(true)
     }
 
+    /// Apply a verified substantive event time without treating observation as progress.
+    ///
+    /// # Errors
+    /// Rejects backwards observation time or an event outside the execution interval.
+    pub fn substantive_at(&mut self, now: Duration, event: Duration) -> Result<(), ClockError> {
+        self.advance(now)?;
+        if event > now || event < self.start {
+            return Err(ClockError::TimeWentBackwards);
+        }
+        if self.terminal.is_none() {
+            self.last_progress = self.last_progress.max(event);
+        }
+        Ok(())
+    }
+
+    /// Evaluate inactivity as of an inventory start, while wall limits use current time.
+    ///
+    /// # Errors
+    /// Rejects backwards observation time or an as-of time later than observation.
+    pub fn expired_as_of(
+        &mut self,
+        now: Duration,
+        as_of: Duration,
+    ) -> Result<Option<TimeoutReason>, ClockError> {
+        self.advance(now)?;
+        if as_of > now {
+            return Err(ClockError::TimeWentBackwards);
+        }
+        if self.terminal.is_some() {
+            return Ok(self.terminal);
+        }
+        if self
+            .wall_limit
+            .is_some_and(|limit| now.saturating_sub(self.start) >= limit)
+        {
+            self.terminal = Some(TimeoutReason::Wall);
+        } else if self.last_progress <= as_of
+            && self
+                .idle_interval
+                .is_some_and(|limit| as_of.saturating_sub(self.last_progress) >= limit)
+        {
+            self.terminal = Some(TimeoutReason::Idle);
+        }
+        Ok(self.terminal)
+    }
+
     /// Decide expiration after observing activity from a bounded subtree scan.
     ///
     /// # Errors
     /// Returns an error for backwards time or unavailable/incomplete idle coverage.
     /// Explicit wall expiration remains decidable without activity coverage.
+    #[cfg(test)]
     pub fn expired(
         &mut self,
         now: Duration,
@@ -166,6 +220,7 @@ impl<E: Eq> ExecutionClock<E> {
     ///
     /// # Errors
     /// Returns the same observation errors as [`Self::expired`].
+    #[cfg(test)]
     pub fn remaining(
         &mut self,
         now: Duration,
@@ -329,6 +384,40 @@ mod tests {
         assert_eq!(
             clock.expired(seconds(180), true),
             Ok(Some(TimeoutReason::Idle))
+        );
+    }
+
+    #[test]
+    fn asof_idle_does_not_charge_page_latency_or_ignore_later_progress() {
+        let budget = NonZeroUsize::new(1).unwrap();
+        let mut clock: ExecutionClock<u64> =
+            ExecutionClock::new(Duration::ZERO, Some(seconds(180)), None, budget);
+        assert_eq!(
+            clock.expired_as_of(seconds(190), seconds(179)).unwrap(),
+            None
+        );
+        clock.substantive_at(seconds(191), seconds(185)).unwrap();
+        assert_eq!(
+            clock.expired_as_of(seconds(192), seconds(180)).unwrap(),
+            None
+        );
+        assert_eq!(
+            clock.expired_as_of(seconds(365), seconds(365)).unwrap(),
+            Some(TimeoutReason::Idle)
+        );
+    }
+
+    #[test]
+    fn first_seen_verified_event_uses_event_time_not_page_time() {
+        let mut clock: ExecutionClock<u64> = clock(true, None);
+        clock.substantive_at(seconds(190), seconds(170)).unwrap();
+        assert_eq!(
+            clock.expired_as_of(seconds(350), seconds(349)).unwrap(),
+            None
+        );
+        assert_eq!(
+            clock.expired_as_of(seconds(351), seconds(350)).unwrap(),
+            Some(TimeoutReason::Idle)
         );
     }
 

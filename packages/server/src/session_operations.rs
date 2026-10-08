@@ -1890,7 +1890,8 @@ async fn observe_activity(
         states.push(Status::Running);
     }
     let (observed, complete, mut evidence) = {
-        let observations = state.activity_observations.lock().await;
+        let mut observations = state.activity_observations.lock().await;
+        observations.drain_with(1024, |event| super::observe_substantive_stage(state, event));
         let (observed, complete) = observations.states(session_id);
         (observed, complete, observations.evidence(session_id))
     };
@@ -1910,7 +1911,15 @@ async fn observe_activity(
     }
     // Scheduler hints and work rows overlap; counts remain lower-bound observations,
     // never a claim of complete canonical runtime inventory.
-    evidence.counts_complete = complete && work_complete && runtime.is_some();
+    let verified_quiescent = complete
+        && work_complete
+        && running_work == 0
+        && evidence.queued == 0
+        && evidence.permission_waits == 0
+        && evidence.input_waits == 0
+        && state.sessions.session_is_owned(session_id).await;
+    evidence.counts_complete =
+        complete && work_complete && (runtime.is_some() || verified_quiescent);
     for status in observed {
         if !states.contains(&status)
             && (!matches!(status, Status::Failed | Status::Interrupted) || states.is_empty())
@@ -1918,7 +1927,7 @@ async fn observe_activity(
             states.push(status);
         }
     }
-    if runtime.is_none() || !complete {
+    if (runtime.is_none() && !verified_quiescent) || !complete {
         states.push(Status::Unknown);
         issues.push(format!(
             "{session_id}: nonresident scheduler or incomplete lifecycle observation"

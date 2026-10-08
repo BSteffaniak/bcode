@@ -7,6 +7,30 @@ fn registry(capacity: usize) -> SessionProgressRegistry {
 }
 
 #[test]
+fn snapshot_and_duplicate_delivery_do_not_refresh_host_progress_time() {
+    let mut observations = registry(1);
+    let id = SessionId::new();
+    observations.observe_event(id, 1);
+    let first = observations.snapshot(id);
+    assert!(matches!(
+        first.observation,
+        SessionProgressObservation::Available {
+            last_progress_at_ms: Some(_),
+            ..
+        }
+    ));
+    for _ in 0..100 {
+        observations.observe_event(id, 1);
+        assert_eq!(observations.snapshot(id), first);
+    }
+    observations.observe_tool_progress(id, "tool", 1);
+    let tool = observations.snapshot(id);
+    observations.observe_tool_progress(id, "tool", 1);
+    observations.observe_tool_progress(id, "tool", 0);
+    assert_eq!(observations.snapshot(id), tool);
+}
+
+#[test]
 fn canonical_stage_sequences_ignore_duplicate_and_lower_delivery() {
     let mut observations = registry(1);
     let id = SessionId::new();

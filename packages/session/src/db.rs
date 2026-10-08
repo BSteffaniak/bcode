@@ -2569,6 +2569,35 @@ impl SessionDb {
         validate_append_preconditions_without_writer(&**self.db, &probe).await
     }
 
+    /// Verify current read compatibility and projection readiness in one read snapshot.
+    ///
+    /// This does not acquire writer ownership, repair projections, or replay history.
+    /// # Errors
+    /// Rejects unsupported storage, inconsistent projections and database failures.
+    pub async fn validate_read_readiness(&self) -> SessionDbResult<()> {
+        let transaction = self.db.begin_transaction().await?;
+        let result = async {
+            validate_storage_writer_contract(&*transaction).await?;
+            let next_sequence = last_sequence(&*transaction)
+                .await?
+                .map_or(0, |sequence| sequence.saturating_add(1));
+            let probe = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: next_sequence,
+                timestamp_ms: 0,
+                session_id: self.session_id,
+                provenance: None,
+                kind: SessionEventKind::SessionRenamed { name: None },
+            };
+            validate_append_preconditions_without_writer(&*transaction, &probe).await
+        }
+        .await;
+        let release = transaction.rollback().await;
+        result?;
+        release?;
+        Ok(())
+    }
+
     /// Validate bounded current-open readiness for a database already classified current.
     ///
     /// # Errors

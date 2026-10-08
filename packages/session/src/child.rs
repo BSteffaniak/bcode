@@ -62,6 +62,19 @@ fn invalid(message: impl Into<String>) -> SessionError {
     SessionError::EventSerialization(message.into())
 }
 
+fn summary_lock_retry_budget(retries: usize, elapsed: std::time::Duration) -> bool {
+    retries < 10 && elapsed < std::time::Duration::from_millis(250)
+}
+
+fn summary_lock_retry_allowed(
+    error: &SessionError,
+    retries: usize,
+    elapsed: std::time::Duration,
+) -> bool {
+    summary_lock_retry_budget(retries, elapsed)
+        && matches!(error, SessionError::Db(error) if error.is_lock_error())
+}
+
 impl SessionManager {
     /// Observe exact current metadata without acquiring a session runtime lease or loading history.
     ///
@@ -69,6 +82,33 @@ impl SessionManager {
     /// Returns `NotFound` for absent storage, and existing storage/projection errors for damaged,
     /// stale, incompatible, or unverifiable state. This operation never repairs or migrates.
     pub async fn session_summary_non_owning(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, SessionError> {
+        let mut retries = 0;
+        let mut lock_retries = 0;
+        let started = std::time::Instant::now();
+        loop {
+            match self.session_summary_non_owning_once(session_id).await {
+                Err(error)
+                    if summary_lock_retry_allowed(&error, lock_retries, started.elapsed()) =>
+                {
+                    lock_retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(
+                    SessionError::ProjectionStale { .. }
+                    | SessionError::Db(db::SessionDbError::ProjectionStale { .. }),
+                ) if retries < 2 && summary_lock_retry_budget(0, started.elapsed()) => {
+                    retries += 1;
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn session_summary_non_owning_once(
         &self,
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionError> {
@@ -89,7 +129,7 @@ impl SessionManager {
         }
         let database = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
         let result: Result<SessionSummary, SessionError> = async {
-            database.validate_write_readiness().await?;
+            database.validate_read_readiness().await?;
             let summary = self
                 .load_db_session_state(session_id, &database)
                 .await?
@@ -759,6 +799,88 @@ fn verify_request(
 mod tests {
     use super::*;
 
+    #[test]
+    fn lock_retry_budget_is_bounded_and_damage_is_not_retryable() {
+        use std::time::Duration;
+        assert!(summary_lock_retry_budget(9, Duration::from_millis(249)));
+        assert!(!summary_lock_retry_budget(10, Duration::ZERO));
+        assert!(!summary_lock_retry_budget(0, Duration::from_millis(250)));
+        for error in [
+            db::SessionDbError::InvalidData("damaged".into()),
+            db::SessionDbError::WriterIncompatible {
+                actual: Some(999),
+                expected: 4,
+            },
+            db::SessionDbError::ProjectionStale {
+                projection: "summary",
+                checkpoint: None,
+                expected: 1,
+            },
+        ] {
+            assert!(!summary_lock_retry_allowed(
+                &SessionError::Db(error),
+                0,
+                Duration::ZERO
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_turso_writer_and_bounded_summary_observer() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let canonical_before = manager
+            .session_history_around(
+                parent.id,
+                bcode_session_models::SessionHistoryAroundQuery {
+                    sequence: 0,
+                    before: 0,
+                    after: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let writer = async {
+            for _ in 0..24 {
+                manager
+                    .append_context_compacted(parent.id, "context".into(), 0)
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        };
+        let reader = async {
+            for _ in 0..24 {
+                let summary = manager
+                    .session_summary_non_owning(parent.id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("observation category: {}", error.observation_category())
+                    });
+                assert_eq!(summary.id, parent.id);
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::join!(writer, reader);
+        let canonical_after = manager
+            .session_history_around(
+                parent.id,
+                bcode_session_models::SessionHistoryAroundQuery {
+                    sequence: 0,
+                    before: 0,
+                    after: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(canonical_before.events, canonical_after.events);
+        assert_eq!(canonical_after.last_available_sequence, Some(24));
+    }
+
     fn request(parent: SessionId) -> SessionChildCreateRequest {
         SessionChildCreateRequest {
             child_id: SessionId::new(),
@@ -766,6 +888,49 @@ mod tests {
             name: Some("child".into()),
             working_directory: std::env::current_dir().unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn fresh_active_parent_child_queries_preserve_trustworthy_empty_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, std::env::current_dir().unwrap())
+            .await
+            .unwrap();
+        let query = SessionChildQuery {
+            parent_id: parent.id,
+            after: None,
+            limit: 100,
+        };
+        let writer = async {
+            for index in 0..32 {
+                manager
+                    .append_model_changed(
+                        parent.id,
+                        "provider".into(),
+                        format!("model-{index}"),
+                        bcode_session_models::ModelSelectionSource::UserExplicit,
+                    )
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        };
+        let reader = async {
+            for _ in 0..32 {
+                let page = manager.query_child_sessions(query.clone()).await.unwrap();
+                assert!(
+                    page.complete,
+                    "fresh canonical parent must not need reconciliation"
+                );
+                assert!(page.children.is_empty());
+                assert!(page.next_after.is_none());
+                assert!(page.issues.is_empty());
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::join!(writer, reader);
     }
 
     #[tokio::test]

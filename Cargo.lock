@@ -1873,6 +1873,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_tool",
  "bcode_workflow",
+ "bcode_workflow_view_models",
  "hex",
  "regex",
  "serde",

@@ -138,6 +138,7 @@ impl RuntimeWorkSpec {
 struct ActiveRuntimeWork {
     spec: RuntimeWorkSpec,
     cancelled: bool,
+    shared_execution: Option<std::sync::Weak<bcode_session::SharedExecutionSessionObservation>>,
 }
 
 /// Active runtime-work identity returned by recursive cancellation routing.
@@ -175,9 +176,75 @@ impl RuntimeWorkManager {
             ActiveRuntimeWork {
                 spec,
                 cancelled: false,
+                shared_execution: None,
             },
         );
         (cancellable, replaced.is_none())
+    }
+
+    /// Bind a held sequential permit to an exact active workflow dispatch.
+    pub async fn bind_shared_execution(
+        &self,
+        session_id: SessionId,
+        work_id: &WorkId,
+        permit: &bcode_session::SharedExecutionSessionPermit,
+    ) -> bool {
+        if permit.session_id() != session_id {
+            return false;
+        }
+        let mut active = self.active.lock().await;
+        let Some(work) = active.get_mut(&(session_id, work_id.clone())) else {
+            return false;
+        };
+        if work.spec.kind != RuntimeWorkKind::WorkflowNode {
+            return false;
+        }
+        work.shared_execution = Some(permit.observation());
+        drop(active);
+        true
+    }
+
+    /// Verify exact shared-parent provenance while both dispatch and permit remain active.
+    pub async fn observes_shared_execution(
+        &self,
+        session_id: SessionId,
+        link: &bcode_workflow_store::WorkflowExecutionSessionLink,
+    ) -> bool {
+        if link.session_id != session_id.to_string() {
+            return false;
+        }
+        let identity = bcode_workflow_store::dispatch_identity(
+            &link.run_id,
+            &link.node_id,
+            &link.activation_id,
+            link.attempt,
+        );
+        let active = self.active.lock().await;
+        let Some(work) = active.get(&(session_id, WorkId::new(identity))) else {
+            return false;
+        };
+        let verified = work.spec.kind == RuntimeWorkKind::WorkflowNode
+            && work.spec.parent_work_id == Some(WorkId::new(format!("workflow:{}", link.run_id)))
+            && work
+                .shared_execution
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|observation| {
+                    let Some(proof) = observation.provenance() else {
+                        return false;
+                    };
+                    proof.context_mode
+                        == bcode_session_models::ExecutionSessionContextMode::SharedSequential
+                        && proof.parent_session_id == session_id
+                        && proof.run_id == link.run_id
+                        && proof.node_id == link.node_id
+                        && proof.activation_id.as_deref() == Some(link.activation_id.as_str())
+                        && proof.attempt == link.attempt
+                        && proof.workspace_snapshot.as_deref()
+                            == Some(link.workspace_snapshot.as_str())
+                });
+        drop(active);
+        verified
     }
 
     /// Replace the cancellation handle for existing active work.
@@ -490,6 +557,89 @@ mod tests {
         assert_eq!(cancelled[0].session_id, first_session);
         assert_eq!(cancelled[0].work_id, work_id);
         wait_for_count(&count, 1).await;
+    }
+
+    #[tokio::test]
+    async fn shared_execution_proof_is_exact_and_release_bound() {
+        let sessions = bcode_session::SessionManager::default();
+        let parent = sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap();
+        let provenance = bcode_session_models::ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+            owner: "bcode.workflow".into(),
+            run_id: "run".into(),
+            node_id: "node".into(),
+            activation_id: Some("activation".into()),
+            attempt: 1,
+            parent_session_id: parent.id,
+            context_mode: bcode_session_models::ExecutionSessionContextMode::SharedSequential,
+            workspace_snapshot: Some("workspace".into()),
+            parent_generation: None,
+        };
+        let permit = sessions
+            .admit_shared_execution_session(parent.id, &provenance)
+            .await
+            .unwrap();
+        let link = bcode_workflow_store::WorkflowExecutionSessionLink::new(
+            "run".into(),
+            "node".into(),
+            "activation".into(),
+            1,
+            parent.id.to_string(),
+            "workspace".into(),
+            1,
+        );
+        let manager = RuntimeWorkManager::default();
+        let work_id = WorkId::new(bcode_workflow_store::dispatch_identity(
+            "run",
+            "node",
+            "activation",
+            1,
+        ));
+        manager
+            .start(
+                parent.id,
+                RuntimeWorkSpec::new(
+                    work_id.clone(),
+                    RuntimeWorkKind::WorkflowNode,
+                    "node".into(),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                )
+                .with_parent_work_id(Some(WorkId::new("workflow:run"))),
+            )
+            .await;
+        assert!(!manager.observes_shared_execution(parent.id, &link).await);
+        assert!(
+            manager
+                .bind_shared_execution(parent.id, &work_id, &permit)
+                .await
+        );
+        assert!(manager.observes_shared_execution(parent.id, &link).await);
+        let mut spoofed = link.clone();
+        spoofed.attempt = 2;
+        assert!(!manager.observes_shared_execution(parent.id, &spoofed).await);
+        spoofed = link.clone();
+        spoofed.workspace_snapshot = "other".into();
+        assert!(!manager.observes_shared_execution(parent.id, &spoofed).await);
+        assert!(
+            !manager
+                .observes_shared_execution(SessionId::new(), &link)
+                .await
+        );
+        let retained_observation = permit.observation().upgrade().unwrap();
+        drop(permit);
+        assert!(retained_observation.provenance().is_none());
+        assert!(!manager.observes_shared_execution(parent.id, &link).await);
+        assert!(
+            sessions
+                .session_summary_non_owning(parent.id)
+                .await
+                .unwrap()
+                .execution
+                .is_none()
+        );
     }
 
     #[tokio::test]

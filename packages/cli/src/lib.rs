@@ -4,6 +4,7 @@
 
 //! Command-line interface for Bcode.
 
+pub mod clierror;
 mod plugin_cli;
 pub mod retired_catalogs;
 mod session_migration_adapter;
@@ -1706,6 +1707,68 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
+        }
+        WorkflowCommand::ActivityRun {
+            run_id,
+            root_run_id,
+            scan_id,
+            section,
+            after,
+            revision,
+            limit,
+            json,
+        } => {
+            let root_run_id = root_run_id.unwrap_or_else(|| run_id.clone());
+            let page = client
+                .workflow_activity_page(bcode_ipc::WorkflowActivityPageRequest {
+                    version: bcode_ipc::WORKFLOW_ACTIVITY_VERSION,
+                    scan_id,
+                    root_run_id,
+                    run_id,
+                    expected_revision: revision,
+                    section: if section == "children" {
+                        bcode_ipc::WorkflowActivitySection::Children
+                    } else {
+                        bcode_ipc::WorkflowActivitySection::Attempts
+                    },
+                    cursor: after,
+                    limit,
+                })
+                .await?;
+            if json {
+                print_json(&page)?;
+            } else {
+                println!(
+                    "scan={} root={} run={} revision={} exhausted={} current_idle_eligible={}",
+                    page.scan_id,
+                    page.root_run_id,
+                    page.run_id,
+                    page.revision,
+                    page.inventory_exhausted,
+                    page.current_idle_eligible
+                );
+                for attempt in &page.attempts {
+                    println!(
+                        "{}\tterminal={}\tsession={}",
+                        attempt.dispatch_identity,
+                        attempt.terminal,
+                        attempt.session_id.as_deref().unwrap_or("unavailable")
+                    );
+                }
+                for child in &page.children {
+                    println!("child\t{}", child.child_run_id);
+                }
+                if let Some(cursor) = &page.next_cursor {
+                    println!("after={cursor}");
+                }
+                for issue in &page.issues {
+                    println!("issue: {issue}");
+                }
+            }
+        }
+        WorkflowCommand::ActivityClose { scan_id } => {
+            client.workflow_activity_close(scan_id).await?;
+            print_json(&serde_json::json!({"closed": true}))?;
         }
         WorkflowCommand::RecoverOffline { .. } => {
             unreachable!("offline maintenance handled before client creation")
@@ -4066,6 +4129,8 @@ mod build_version_tests {
 #[derive(Debug, Parser)]
 #[command(name = "bcode", version, about = "TUI-first coding agent")]
 struct Cli {
+    #[command(flatten)]
+    error_output: clierror::CliErrorOutputOptions,
     /// Create a new session and open it in the terminal UI.
     #[arg(short = 'n', long = "new")]
     new: bool,
@@ -4364,6 +4429,32 @@ enum ThemeCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
+    /// Read one bounded page in a retained recursive workflow snapshot.
+    ActivityRun {
+        #[arg(long)]
+        run_id: String,
+        /// Canonical root scope; defaults to run-id for a new root scan.
+        #[arg(long)]
+        root_run_id: Option<String>,
+        #[arg(long)]
+        scan_id: Option<String>,
+        #[arg(long, value_parser = ["attempts", "children"], default_value = "attempts")]
+        section: String,
+        /// Opaque page cursor; bound to scan/run/revision/section.
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        revision: Option<u64>,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release retained read resources without cancelling workflow execution.
+    ActivityClose {
+        #[arg(long)]
+        scan_id: String,
+    },
     /// Commit an exact staged edit through publication policy; pending cancellation is rejected.
     PublishRunEdit {
         /// Bounded JSON `WorkflowRunGraphEditBatch` identical to the staged candidate.

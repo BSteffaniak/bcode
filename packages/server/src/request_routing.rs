@@ -94,6 +94,12 @@ pub enum SessionLifecycleRequest {
     SessionSummary {
         session_id: SessionId,
     },
+    WorkflowActivityPage {
+        request: bcode_workflow_view_models::WorkflowActivityPageRequest,
+    },
+    WorkflowActivityClose {
+        scan_id: String,
+    },
     SessionProgressSnapshot {
         session_id: SessionId,
     },
@@ -965,6 +971,16 @@ impl RoutedRequest {
             Request::SessionSummary { session_id } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionSummary {
                     session_id,
+                }))
+            }
+            Request::WorkflowActivityPage { request } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::WorkflowActivityPage {
+                    request,
+                }))
+            }
+            Request::WorkflowActivityClose { scan_id } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::WorkflowActivityClose {
+                    scan_id,
                 }))
             }
             Request::SessionProgressSnapshot { session_id } => {

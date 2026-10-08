@@ -29,6 +29,7 @@ pub mod read_view;
 pub mod recovery;
 pub mod scheduling;
 pub mod views;
+pub mod workflow_activity;
 
 #[cfg(test)]
 mod tests;

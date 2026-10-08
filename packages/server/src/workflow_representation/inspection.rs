@@ -135,19 +135,60 @@ async fn sessions(
     let mut summaries = Vec::new();
     for link in links {
         let id = link.session_id.parse().map_err(|_| unavailable())?;
-        let summary = state.sessions.session_summary(id).await?;
-        if summary.execution.as_ref().is_none_or(|execution| {
-            execution.provenance.run_id != run_id
-                || execution.provenance.node_id != link.node_id
-                || execution.provenance.activation_id.as_deref()
-                    != Some(link.activation_id.as_str())
-                || execution.provenance.attempt != link.attempt
-        }) {
+        let summary = state.sessions.session_summary_non_owning(id).await?;
+        let child_verified = summary.execution.as_ref().is_some_and(|execution| {
+            execution.provenance.run_id == run_id
+                && execution.provenance.node_id == link.node_id
+                && execution.provenance.activation_id.as_deref()
+                    == Some(link.activation_id.as_str())
+                && execution.provenance.attempt == link.attempt
+        });
+        if !child_verified && !shared_parent_link(db, run_id, &link).await? {
             return Err(unavailable());
         }
         summaries.push(summary);
     }
     Ok(summaries)
+}
+
+/// Verify the explicit canonical shared-parent target without rewriting session provenance.
+pub(super) async fn shared_parent_link(
+    db: &dyn switchy_database::Database,
+    run_id: &str,
+    link: &bcode_workflow_store::WorkflowExecutionSessionLink,
+) -> Result<bool, ServerError> {
+    let run = representation::runs::summary(db, run_id)
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(unavailable)?;
+    if link.run_id != run_id
+        || run.parent_session_id.as_deref() != Some(link.session_id.as_str())
+        || run.workspace_snapshot != link.workspace_snapshot
+    {
+        return Ok(false);
+    }
+    let canonical = representation::attempts::owner_boundary::execution_session_link(
+        db,
+        run_id,
+        &link.node_id,
+        &link.activation_id,
+        link.attempt,
+    )
+    .await
+    .map_err(|_| unavailable())?;
+    if canonical.as_ref() != Some(link) {
+        return Ok(false);
+    }
+    let node = representation::graph::execution_node(db, run_id, &link.node_id)
+        .await
+        .map_err(|_| unavailable())?;
+    if node.kind != bcode_workflow::NodeKind::Agent {
+        return Ok(false);
+    }
+    let configuration =
+        crate::workflow_prompt_configuration(&node.configuration).map_err(|_| unavailable())?;
+    Ok(configuration.execution_target
+        == bcode_workflow::PromptContextTarget::SharedParentSequential)
 }
 
 fn definition(
