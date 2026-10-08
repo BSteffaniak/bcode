@@ -1472,8 +1472,18 @@ impl SessionDb {
         metrics: MetricsRegistry,
     ) -> SessionDbResult<Self> {
         let db = Self::connect_turso_observed(session_id, path, metrics).await?;
+        let stage_timer = crate::child_creation_observation::timer(
+            session_id,
+            crate::child_creation_observation::ChildCreationStage::SchemaInitialization,
+        );
         run_session_migrations(&**db.db).await?;
+        drop(stage_timer);
+        let stage_timer = crate::child_creation_observation::timer(
+            session_id,
+            crate::child_creation_observation::ChildCreationStage::StorageContract,
+        );
         initialize_current_storage_contract(&**db.db).await?;
+        drop(stage_timer);
         Ok(db)
     }
 
@@ -1482,8 +1492,13 @@ impl SessionDb {
         path: &Path,
         metrics: MetricsRegistry,
     ) -> SessionDbResult<Self> {
+        let stage_timer = crate::child_creation_observation::timer(
+            session_id,
+            crate::child_creation_observation::ChildCreationStage::DatabaseConnect,
+        );
         let open_started = std::time::Instant::now();
         let db = init_turso_local_with_retry(path).await;
+        drop(stage_timer);
         metrics.increment_counter("session.db.open_total");
         DatabaseMetrics::new(metrics.clone(), "session", "turso").record(
             DatabaseOperation::Open,
@@ -1495,7 +1510,12 @@ impl SessionDb {
         let db = db?;
         let db: Box<dyn Database> =
             Box::new(ObservedDatabase::new(db, metrics, "session", "turso"));
+        let stage_timer = crate::child_creation_observation::timer(
+            session_id,
+            crate::child_creation_observation::ChildCreationStage::DatabaseConfiguration,
+        );
         configure_turso_connection(&*db).await?;
+        drop(stage_timer);
         Ok(Self {
             session_id,
             db: Arc::new(db),

@@ -24,6 +24,7 @@ mod attachment;
 mod catalog;
 pub(crate) mod catalog_updates;
 mod child;
+pub mod child_creation_observation;
 mod child_projection;
 mod context;
 mod current_schema;
@@ -9117,6 +9118,8 @@ mod tests {
             .create_session(Some("global catalog".to_string()), test_working_directory())
             .await
             .expect("session should create");
+        // This fixture tests persisted catalog reads, not background update scheduling.
+        manager.shutdown_catalog_updates().await;
         drop(manager);
         let session_db = db::session_db_path(&root, session.id);
         let hidden_db = session_db.with_extension("db.hidden");

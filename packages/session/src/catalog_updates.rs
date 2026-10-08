@@ -14,6 +14,34 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify, oneshot};
 
+#[cfg(test)]
+#[derive(Debug)]
+struct CatalogPersistGateState {
+    permits: tokio::sync::Semaphore,
+    entered: Notify,
+    reached: AtomicBool,
+}
+
+#[cfg(test)]
+pub struct CatalogPersistGate(Arc<CatalogPersistGateState>);
+
+#[cfg(test)]
+impl CatalogPersistGate {
+    pub(crate) async fn entered(&self) {
+        if !self.0.reached.load(Ordering::Acquire) {
+            self.0.entered.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CatalogPersistGate {
+    fn drop(&mut self) {
+        // Closing wakes every retained worker without changing its persistence result.
+        self.0.permits.close();
+    }
+}
+
 const CATALOG_FLUSH_DELAY: Duration = Duration::from_millis(500);
 const CATALOG_RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -31,6 +59,8 @@ struct CatalogUpdateShared {
     state: Mutex<CatalogUpdateState>,
     notify: Notify,
     worker_started: AtomicBool,
+    #[cfg(test)]
+    persist_gate: Mutex<Option<Arc<CatalogPersistGateState>>>,
     #[cfg(test)]
     fail_next_flush_before_commit: AtomicBool,
 }
@@ -58,6 +88,8 @@ impl CatalogUpdateCoordinator {
                 notify: Notify::new(),
                 worker_started: AtomicBool::new(false),
                 #[cfg(test)]
+                persist_gate: Mutex::new(None),
+                #[cfg(test)]
                 fail_next_flush_before_commit: AtomicBool::new(false),
             }),
         }
@@ -70,6 +102,19 @@ impl CatalogUpdateCoordinator {
         }
         let shared = Arc::clone(&self.shared);
         tokio::spawn(async move { shared.run().await });
+    }
+
+    #[cfg(test)]
+    pub(super) async fn gate_persistence(&self) -> CatalogPersistGate {
+        let gate = Arc::new(CatalogPersistGateState {
+            permits: tokio::sync::Semaphore::new(0),
+            entered: Notify::new(),
+            reached: AtomicBool::new(false),
+        });
+        let mut slot = self.shared.persist_gate.lock().await;
+        assert!(slot.is_none(), "one gate per catalog executor");
+        *slot = Some(Arc::clone(&gate));
+        CatalogPersistGate(gate)
     }
 
     #[cfg(test)]
@@ -345,6 +390,15 @@ impl CatalogUpdateShared {
         summaries: &BTreeMap<SessionId, SessionSummary>,
         deleted: &BTreeMap<SessionId, u64>,
     ) -> Result<(), CatalogFlushError> {
+        #[cfg(test)]
+        {
+            let gate = self.persist_gate.lock().await.clone();
+            if let Some(gate) = gate {
+                gate.reached.store(true, Ordering::Release);
+                gate.entered.notify_one();
+                let _permit = gate.permits.acquire().await;
+            }
+        }
         #[cfg(test)]
         if self
             .fail_next_flush_before_commit

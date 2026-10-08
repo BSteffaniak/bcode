@@ -126,6 +126,41 @@ async fn pass_allowed(
     Ok(!paused)
 }
 
+async fn next_agent_attempt(
+    state: &ServerState,
+    db: &dyn switchy_database::Database,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    pending: &bcode_workflow_store::PendingActivation,
+) -> Result<Option<u32>, ServerError> {
+    super::backpressure::queued(&crate::workflow_store_path(state), || {
+        owner_boundary::next_retry_attempt(
+            db,
+            authority,
+            &pending.run_id,
+            &pending.node_id,
+            &pending.activation_id,
+        )
+    })
+    .await
+    .map_err(super::backpressure::normalize)
+}
+
+async fn plan_agent_attempt(
+    state: &std::sync::Arc<ServerState>,
+    pending: &bcode_workflow_store::PendingActivation,
+) -> Result<Option<bcode_workflow_store::ActivationDispatchPlan>, ServerError> {
+    #[cfg(test)]
+    let _timer = super::fanout_stages::StageTimer::new(
+        &pending.run_id,
+        None,
+        None,
+        super::fanout_stages::FanoutAdmissionStage::OwnerPlan,
+    );
+    Ok(crate::WorkflowActivationOwner { state }
+        .plan(pending)
+        .await?)
+}
+
 async fn agent(
     state: &std::sync::Arc<ServerState>,
     db: &dyn switchy_database::Database,
@@ -134,18 +169,15 @@ async fn agent(
     activation: representation::graph::Activation,
     node: bcode_workflow::NodeDefinition,
 ) -> Result<bool, ServerError> {
+    #[cfg(test)]
+    let stage_timer = super::fanout_stages::StageTimer::new(
+        run_id,
+        None,
+        None,
+        super::fanout_stages::FanoutAdmissionStage::DriverPrepare,
+    );
     let pending = pending_activation(run_id, activation, node);
-    let retry_attempt = super::backpressure::queued(&crate::workflow_store_path(state), || {
-        owner_boundary::next_retry_attempt(
-            db,
-            authority,
-            run_id,
-            &pending.node_id,
-            &pending.activation_id,
-        )
-    })
-    .await
-    .map_err(super::backpressure::normalize)?;
+    let retry_attempt = next_agent_attempt(state, db, authority, &pending).await?;
     let existing = super::backpressure::queued(&crate::workflow_store_path(state), || {
         owner_boundary::latest_prepared(db, run_id, &pending.node_id, &pending.activation_id)
     })
@@ -168,10 +200,7 @@ async fn agent(
         }
         existing
     } else {
-        let Some(plan) = crate::WorkflowActivationOwner { state }
-            .plan(&pending)
-            .await?
-        else {
+        let Some(plan) = plan_agent_attempt(state, &pending).await? else {
             return Ok(false);
         };
         let prepared = PreparedAttempt {
@@ -194,6 +223,8 @@ async fn agent(
         }
         prepared
     };
+    #[cfg(test)]
+    drop(stage_timer);
     let identity = prepared.dispatch_identity();
     let dispatch = PreparedActivationDispatch {
         activation: pending,

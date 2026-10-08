@@ -32,6 +32,10 @@ pub mod views;
 pub mod workflow_activity;
 
 #[cfg(test)]
+#[path = "workflow_representation/tests/fanout_stages.rs"]
+pub mod fanout_stages;
+
+#[cfg(test)]
 mod tests;
 
 fn unavailable() -> ServerError {

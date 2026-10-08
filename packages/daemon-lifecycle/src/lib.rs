@@ -3449,6 +3449,46 @@ mod startup_lock_tests {
         drop(replacement);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listener_release_during_gated_cleanup_retains_inherited_startup_fence() {
+        let directory = tempfile::tempdir().expect("temporary daemon directory");
+        let path = directory.path().join("startup.lock");
+        let owner = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+            .await
+            .expect("launcher lock");
+        let inherited = startup_lock_stdio(owner.file.try_clone().expect("inherited lock"));
+        drop(owner);
+        let socket = directory.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("listener");
+        let contender = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("contender description");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let cleanup = async move {
+            drop(listener);
+            gate.await.expect("cleanup release");
+            // Model the daemon's lifetime stdin: release only after cleanup settles.
+            drop(inherited);
+        };
+        tokio::pin!(cleanup);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(cleanup.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        release.send(()).expect("cleanup still owns lifetime fence");
+        cleanup.await;
+        contender.try_lock().expect("fence released after cleanup");
+    }
+
     #[tokio::test]
     async fn concurrent_startup_lock_holders_are_exclusive() {
         let directory = tempfile::tempdir().expect("lock directory");

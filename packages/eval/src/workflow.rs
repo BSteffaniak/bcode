@@ -13,6 +13,34 @@ use std::time::Duration;
 #[path = "workflow_capture/mod.rs"]
 mod workflow_capture;
 
+/// Optional evidence cannot invalidate an independently settled execution result.
+fn retain_attempt_evidence(
+    output: &mut ExecutionOutput,
+    rep_dir: &Path,
+    observation: &super::diagnosis::EvalAttemptJudgementObservation,
+) {
+    let evidence = observation
+        .validate()
+        .ok()
+        .filter(|()| observation.terminal.is_some())
+        .and_then(|()| serde_json::to_value(observation).ok());
+    let exported = evidence.is_some_and(|value| {
+        write_json(rep_dir.join("eval-judgement-observation.json"), &value).is_ok()
+    });
+    if exported {
+        output.artifacts.push(EvalArtifactRef {
+            kind: "eval_judgement_observation".into(),
+            path: "eval-judgement-observation.json".into(),
+        });
+    } else {
+        output.diagnostics.push(EvalDiagnostic {
+            severity: EvalDiagnosticSeverity::Warning,
+            message: "optional eval judgement observation unavailable; evidence not promoted"
+                .into(),
+        });
+    }
+}
+
 fn execution_duration(start: Instant, observed_end: Instant) -> Duration {
     observed_end.saturating_duration_since(start)
 }
@@ -1693,26 +1721,19 @@ pub fn execute(
     let oracle_value = serde_json::json!({"completion_claimed":completed,"status":status,"capture_complete":capture_complete,"timed_out":timed_out,"artifact_correct":artifact_correct,"artifact_observed":artifact_observed,"false_completion":false_completion,"preservation_passed":preservation,"completion_failure":completion_failure});
     let mut diagnosis =
         super::diagnosis::classify(&oracle_value, &outputs, &final_inspection, &measurements);
-    if let Some(optional) = super::diagnosis::optional_request(&oracle_value, &diagnosis) {
-        // Only allowlisted measured facts enter this transient command argument. No request file,
-        // prompt, raw workflow output, credentials, or provider diagnostics are persisted here.
-        if let Ok(request_json) = serde_json::to_string(&optional) {
-            let args = [
-                "judgement".to_owned(),
-                "optional-judge".to_owned(),
-                "--request-json".to_owned(),
-                request_json,
-            ];
-            if let Ok(value) = invoke(
-                &args,
-                "optional-eval-categorization",
-                Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms)),
-            ) && let Ok(result) = serde_json::from_value(value)
-            {
-                super::diagnosis::attach_advisory(&mut diagnosis, &optional.request, result);
-            }
-        }
-    }
+    let operation = super::diagnosis::invoke_attempt(&oracle_value, &mut diagnosis, |args| {
+        invoke(
+            args,
+            "optional-eval-categorization",
+            Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms)),
+        )
+        .ok()
+    });
+    let observation = super::diagnosis::EvalAttemptJudgementObservation::new(
+        run_id.to_owned(),
+        status,
+        operation,
+    );
     write_json(rep_dir.join("diagnosis.json"), &diagnosis)?;
     measurements.insert(
         "workflow.capture_allowance_ms".into(),
@@ -1739,7 +1760,7 @@ pub fn execute(
     } else {
         Vec::new()
     };
-    Ok(ExecutionOutput {
+    let mut output = ExecutionOutput {
         exit_code: Some(if timed_out {
             124
         } else {
@@ -1757,7 +1778,9 @@ pub fn execute(
                 path: "inspection.json".into(),
             },
         ],
-    })
+    };
+    retain_attempt_evidence(&mut output, rep_dir, &observation);
+    Ok(output)
 }
 
 pub fn terminal_status(value: &serde_json::Value) -> bool {
@@ -2298,6 +2321,49 @@ mod observation_tests {
             );
             assert!(closed.get());
             assert!(clock.expired(Duration::from_secs(200), false).is_err());
+        }
+    }
+
+    #[test]
+    fn unavailable_optional_evidence_preserves_authoritative_result() {
+        let oracle = serde_json::json!({"status":"completed","passed":true});
+        let oracle_before = serde_json::to_vec(&oracle).unwrap();
+        let mut diagnosis = serde_json::json!({"labels":[]});
+        let operation = super::super::diagnosis::invoke_attempt(&oracle, &mut diagnosis, |_| {
+            panic!("no failure prerequisite")
+        });
+        for (run_id, status, version) in [
+            ("", "completed", 1),
+            ("actual-run", "running", 1),
+            ("actual-run", "completed", 2),
+        ] {
+            let mut observation = super::super::diagnosis::EvalAttemptJudgementObservation::new(
+                run_id.into(),
+                status,
+                operation.clone(),
+            );
+            observation.schema_version = version;
+            let measurements = std::collections::BTreeMap::from([
+                ("workflow.oracle_passed".to_owned(), 1.0),
+                ("workflow.artifact_correct".to_owned(), 1.0),
+            ]);
+            let mut output = ExecutionOutput {
+                exit_code: Some(0),
+                measurements: measurements.clone(),
+                diagnostics: Vec::new(),
+                artifacts: Vec::new(),
+            };
+            // Invalid/unresolved evidence must not attempt filesystem export.
+            retain_attempt_evidence(
+                &mut output,
+                Path::new("/unavailable-eval-artifact-root"),
+                &observation,
+            );
+            assert_eq!(output.exit_code, Some(0));
+            assert_eq!(output.measurements, measurements);
+            assert!(output.artifacts.is_empty());
+            assert_eq!(output.diagnostics.len(), 1);
+            assert_eq!(serde_json::to_vec(&oracle).unwrap(), oracle_before);
         }
     }
 

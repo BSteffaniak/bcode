@@ -17061,6 +17061,51 @@ async fn lock_turn_admission<'a>(
     }
 }
 
+fn submitted_turn_receipt(
+    admission: bcode_session_models::TurnAdmission,
+) -> Result<(bcode_session_models::TurnReceipt, bool), ServerError> {
+    use bcode_session_models::TurnAdmission;
+    match admission {
+        TurnAdmission::Accepted(receipt) => Ok((receipt, true)),
+        TurnAdmission::Existing(receipt) | TurnAdmission::Deferred(receipt) => Ok((receipt, false)),
+        TurnAdmission::Rejected(reason) => Err(WorkflowStoreError::InvalidData(format!(
+            "workflow turn admission rejected: {reason:?}"
+        ))
+        .into()),
+        TurnAdmission::CancelledBeforeStart(receipt) => Err(WorkflowStoreError::InvalidData(
+            format!("workflow turn cancelled before start: {}", receipt.turn_id),
+        )
+        .into()),
+    }
+}
+
+async fn queued_turn_ownership(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<bcode_session::SessionOwnershipGuard, ServerError> {
+    Ok(state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?)
+}
+
+async fn lock_turn_marker_commit(
+    cancellation: Option<&TurnCancelState>,
+) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, ServerError> {
+    let guard = if let Some(cancellation) = cancellation {
+        Some(cancellation.marker_commit.lock().await)
+    } else {
+        None
+    };
+    if cancellation.is_some_and(TurnCancelState::is_cancelled) {
+        return Err(WorkflowStoreError::CancellationPreventsControl.into());
+    }
+    Ok(guard)
+}
+
 async fn submit_session_model_turn_admission_inner(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -17070,27 +17115,34 @@ async fn submit_session_model_turn_admission_inner(
     cancel_state: Option<Arc<TurnCancelState>>,
 ) -> Result<SubmittedModelTurn, ServerError> {
     let (sender, receiver) = oneshot::channel();
+    #[cfg(test)]
+    let probe_correlation = admission_metadata.execution.correlation.clone();
+    #[cfg(test)]
+    let probe_timer = |stage| {
+        probe_correlation.as_ref().map(|correlation| {
+            workflow_representation::fanout_stages::turn_stage_timer(correlation, session_id, stage)
+        })
+    };
+    #[cfg(test)]
+    let stage_timer = probe_timer(
+        workflow_representation::fanout_stages::FanoutAdmissionStage::TurnAdmissionLock,
+    );
     let client_id = ClientId::new();
     let admission_lock = turn_admission_lock(state, session_id).await;
     let admission_guard = lock_turn_admission(&admission_lock, cancel_state.as_deref()).await?;
-    let ownership = state
-        .sessions
-        .acquire_session_ownership(
-            session_id,
-            bcode_session::SessionOwnershipKind::QueuedCommand,
-        )
-        .await?;
-    let admission_commit = if let Some(cancellation) = &cancel_state {
-        Some(cancellation.marker_commit.lock().await)
-    } else {
-        None
-    };
-    if cancel_state
-        .as_ref()
-        .is_some_and(|state| state.is_cancelled())
-    {
-        return Err(WorkflowStoreError::CancellationPreventsControl.into());
-    }
+    #[cfg(test)]
+    drop(stage_timer);
+    #[cfg(test)]
+    let stage_timer = probe_timer(
+        workflow_representation::fanout_stages::FanoutAdmissionStage::BeginTurnAdmission,
+    );
+    let ownership = queued_turn_ownership(state, session_id).await?;
+    let admission_commit = lock_turn_marker_commit(cancel_state.as_deref()).await?;
+    #[cfg(test)]
+    drop(stage_timer);
+    #[cfg(test)]
+    let stage_timer =
+        probe_timer(workflow_representation::fanout_stages::FanoutAdmissionStage::AdmitTurn);
     let (admission, user_event) = Box::pin(admit_turn_inner(
         state,
         session_id,
@@ -17100,47 +17152,36 @@ async fn submit_session_model_turn_admission_inner(
         runtime_context.clone(),
     ))
     .await?;
-    let receipt = match admission {
-        bcode_session_models::TurnAdmission::Accepted(receipt) => receipt,
-        bcode_session_models::TurnAdmission::Existing(receipt)
-        | bcode_session_models::TurnAdmission::Deferred(receipt) => {
-            let event = pending_turn_acceptance_event(state, session_id, &receipt).await?;
-            drop(admission_commit);
-            drop(admission_guard);
-            if let Some(event) = event {
-                enqueue_followup_command(
-                    state,
-                    session_id,
-                    FollowupCommand::ExecuteTurn {
-                        client_id,
-                        runtime_context,
-                        user_event: Box::new(event),
-                        queued_steering: None,
-                        cancel_state: cancel_state.clone(),
-                        completion: None,
-                        recovering: false,
-                        ownership,
-                    },
-                )
-                .await?;
-            }
-            return Ok(SubmittedModelTurn::Existing(receipt));
+    let (receipt, accepted) = submitted_turn_receipt(admission)?;
+    if !accepted {
+        let event = pending_turn_acceptance_event(state, session_id, &receipt).await?;
+        drop(admission_commit);
+        drop(admission_guard);
+        if let Some(event) = event {
+            enqueue_followup_command(
+                state,
+                session_id,
+                FollowupCommand::ExecuteTurn {
+                    client_id,
+                    runtime_context,
+                    user_event: Box::new(event),
+                    queued_steering: None,
+                    cancel_state: cancel_state.clone(),
+                    completion: None,
+                    recovering: false,
+                    ownership,
+                },
+            )
+            .await?;
         }
-        bcode_session_models::TurnAdmission::Rejected(reason) => {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow turn admission rejected: {reason:?}"
-            ))
-            .into());
-        }
-        bcode_session_models::TurnAdmission::CancelledBeforeStart(receipt) => {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow turn cancelled before start: {}",
-                receipt.turn_id
-            ))
-            .into());
-        }
-    };
+        return Ok(SubmittedModelTurn::Existing(receipt));
+    }
     let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
+    #[cfg(test)]
+    drop(stage_timer);
+    #[cfg(test)]
+    let stage_timer =
+        probe_timer(workflow_representation::fanout_stages::FanoutAdmissionStage::Enqueue);
     drop(admission_commit);
     drop(admission_guard);
     Box::pin(enqueue_followup_command(
@@ -17158,6 +17199,8 @@ async fn submit_session_model_turn_admission_inner(
         },
     ))
     .await?;
+    #[cfg(test)]
+    drop(stage_timer);
     Ok(SubmittedModelTurn::Started {
         receipt,
         completion: receiver,
@@ -26344,6 +26387,20 @@ async fn prepare_static_model_turn_context(
     cancel_state: &TurnCancelState,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
     let setup_labels = model_turn_metric_labels(session_id, turn_id);
+    #[cfg(test)]
+    let probe_timer = |stage| {
+        execution.correlation.as_ref().map(|c| {
+            workflow_representation::fanout_stages::StageTimer::new(
+                &c.execution_id,
+                Some(session_id),
+                None,
+                stage,
+            )
+        })
+    };
+    #[cfg(test)]
+    let stage_timer =
+        probe_timer(workflow_representation::fanout_stages::FanoutAdmissionStage::Catalog);
     let agent_timer = state.metrics.timer();
     let agent_id = execution
         .agent_profile
@@ -26374,8 +26431,16 @@ async fn prepare_static_model_turn_context(
         agent_timer.elapsed_ms(),
         setup_labels.clone(),
     );
+    #[cfg(test)]
+    drop(stage_timer);
+    #[cfg(test)]
+    let stage_timer = probe_timer(
+        workflow_representation::fanout_stages::FanoutAdmissionStage::RepositoryDiscovery,
+    );
     let working_directory = state.sessions.session_working_directory(session_id).await?;
     let repository_root = session_repository_root(state, session_id, &working_directory).await;
+    #[cfg(test)]
+    drop(stage_timer);
     let skills_timer = state.metrics.timer();
     let skills = state.session_skills(session_id).await;
     let newest_task = state
@@ -26486,6 +26551,9 @@ async fn prepare_static_model_turn_context(
         .lock()
         .await
         .remove(&session_id);
+    #[cfg(test)]
+    let stage_timer =
+        probe_timer(workflow_representation::fanout_stages::FanoutAdmissionStage::DynamicContext);
     let dynamic_system_context = build_dynamic_system_context(
         &working_directory,
         repository_root.as_deref(),
@@ -26501,6 +26569,11 @@ async fn prepare_static_model_turn_context(
         config.system_prompt.sections.runtime_mode,
         &state.bcode_runtime_context,
     );
+    #[cfg(test)]
+    drop(stage_timer);
+    #[cfg(test)]
+    let stage_timer =
+        probe_timer(workflow_representation::fanout_stages::FanoutAdmissionStage::SystemPrompt);
     let system_prompt_timer = state.metrics.timer();
     let (system_prompt, repository_system_context) = build_coding_system_prompt_parts(
         &working_directory,
@@ -26515,6 +26588,8 @@ async fn prepare_static_model_turn_context(
             .and_then(|context| context.system_prompt_suffix.as_deref()),
         Some(&skill_catalog),
     );
+    #[cfg(test)]
+    drop(stage_timer);
     state.metrics.record_histogram_with_labels(
         "model.turn.static_context.system_prompt_duration_ms",
         system_prompt_timer.elapsed_ms(),
@@ -28745,8 +28820,14 @@ fn read_only_git_command(cwd: &Path, args: &[&str]) -> Command {
 }
 
 fn run_bounded_repository_command(cwd: &Path, args: &[&str], deadline: Instant) -> Option<String> {
+    #[cfg(test)]
+    let mut probe_timer = workflow_representation::fanout_stages::RepositoryTimer::new(cwd, args);
     let mut command = read_only_git_command(cwd, args);
     let (stdout, stderr) = run_command_with_deadline(&mut command, deadline)?;
+    #[cfg(test)]
+    {
+        probe_timer.completed = true;
+    }
     let output = if stdout.is_empty() { stderr } else { stdout };
     let output = String::from_utf8_lossy(&output)
         .split_whitespace()
@@ -28777,9 +28858,19 @@ fn read_repository_invariants(
     repository_root: Option<&Path>,
     max_chars: Option<usize>,
 ) -> Option<String> {
+    #[cfg(test)]
+    let mut filesystem_timer = workflow_representation::fanout_stages::RepositoryTimer::for_probe(
+        cwd,
+        workflow_representation::fanout_stages::FanoutRepositoryProbe::RepositoryInvariants,
+    );
     let context_root = repository_root.unwrap_or(cwd);
     let path = context_root.join(REPOSITORY_INVARIANTS_FILE);
     let contents = fs::read_to_string(path).ok()?;
+    #[cfg(test)]
+    {
+        filesystem_timer.completed = true;
+        drop(filesystem_timer);
+    }
     let contents = contents.trim();
     if contents.is_empty() {
         return None;
@@ -28814,8 +28905,14 @@ fn run_repository_command(
     deadline: Instant,
     max_output_bytes: usize,
 ) -> Option<String> {
+    #[cfg(test)]
+    let mut probe_timer = workflow_representation::fanout_stages::RepositoryTimer::new(cwd, args);
     let mut command = read_only_git_command(cwd, args);
     let (stdout, _) = run_command_with_deadline(&mut command, deadline)?;
+    #[cfg(test)]
+    {
+        probe_timer.completed = true;
+    }
     String::from_utf8(stdout)
         .ok()
         .map(|output| output.chars().take(max_output_bytes).collect::<String>())
@@ -28835,11 +28932,22 @@ fn build_repository_context_parts(
         "* Detected project files: {}",
         detected_project_files(context_root).join(", ")
     ));
-    if let Ok(instructions) = bcode_project_instructions::discover_project_instructions(
+    #[cfg(test)]
+    let mut filesystem_timer = workflow_representation::fanout_stages::RepositoryTimer::for_probe(
+        cwd,
+        workflow_representation::fanout_stages::FanoutRepositoryProbe::ProjectInstructions,
+    );
+    let instructions = bcode_project_instructions::discover_project_instructions(
         context_root,
         &[cwd.to_path_buf()],
         bcode_project_instructions::DEFAULT_MAX_INSTRUCTION_BYTES,
-    ) {
+    );
+    #[cfg(test)]
+    {
+        filesystem_timer.completed = instructions.is_ok();
+        drop(filesystem_timer);
+    }
+    if let Ok(instructions) = instructions {
         let content = instructions.content();
         if !content.is_empty() {
             let content = repository_instructions_max_chars.map_or_else(
@@ -38347,10 +38455,26 @@ async fn dispatch_workflow_prompt_turn_after_admission(
     after_admission: impl FnOnce() -> Result<(), WorkflowStoreError> + Send,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
     let admission = workflow_prompt_admission(state, &request.dispatch_identity);
+    #[cfg(test)]
+    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        None,
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::AdmissionLock,
+    );
     let admission_guard = admission.lock.lock().await;
+    #[cfg(test)]
+    drop(stage_timer);
     if state.shutdown_requested.load(Ordering::SeqCst) {
         return Err(WorkflowStoreError::OwnerAccessDeferred);
     }
+    #[cfg(test)]
+    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        None,
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::ExecutionAuthority,
+    );
     let dispatch_guard =
         workflow_operations::execution_authority(state, &request.activation.run_id)
             .await
@@ -38360,10 +38484,21 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                     "workflow prompt dispatch requires execution authority".into(),
                 )
             })?;
+    #[cfg(test)]
+    drop(stage_timer);
     let dispatch_authority = dispatch_guard.authority.clone();
+    #[cfg(test)]
+    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        None,
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::CheckOwner,
+    );
     let existing_receipt =
         workflow_representation::owner::check_owner_admission(state, request, &dispatch_authority)
             .await?;
+    #[cfg(test)]
+    drop(stage_timer);
     if let Some(receipt) = existing_receipt {
         return Ok(receipt);
     }
@@ -38377,6 +38512,13 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         &workflow_skill_catalog_instruction(state),
         input,
     )?;
+    #[cfg(test)]
+    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        None,
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::RunStatus,
+    );
     let run = Box::pin(workflow_representation::status(
         state,
         &request.activation.run_id,
@@ -38384,6 +38526,8 @@ async fn dispatch_workflow_prompt_turn_after_admission(
     .await
     .map_err(|_| WorkflowStoreError::InvalidData("workflow run status unavailable".into()))?
     .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
+    #[cfg(test)]
+    drop(stage_timer);
     let parent_session_id = run
         .parent_session_id
         .as_deref()
@@ -38449,21 +38593,37 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             | bcode_workflow::PromptContextTarget::SharedParentSequential => None,
         },
     };
+    #[cfg(test)]
+    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        None,
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::ChildCreate,
+    );
     let (target_session_id, shared_permit) = match execution_target {
         bcode_workflow::PromptContextTarget::FreshIsolated
         | bcode_workflow::PromptContextTarget::FixedGenerationFork => {
             // Recovery keys include the complete run/node/activation/attempt tuple. Repeat
             // generations, retry attempts, fan-out members, and child runs therefore cannot share
             // isolated context accidentally, while exact duplicate delivery recovers one session.
-            let child = if let Some(existing) = workflow_child_session_for_activation(
+            #[cfg(test)]
+            let lookup_timer = workflow_representation::fanout_stages::StageTimer::new(
+                &request.activation.run_id,
+                None,
+                Some(&request.dispatch_identity),
+                workflow_representation::fanout_stages::FanoutAdmissionStage::ChildLookup,
+            );
+            let existing_child = workflow_child_session_for_activation(
                 state,
                 &request.activation.run_id,
                 &request.activation.node_id,
                 &request.activation.activation_id,
                 request.attempt,
             )
-            .await?
-            {
+            .await?;
+            #[cfg(test)]
+            drop(lookup_timer);
+            let child = if let Some(existing) = existing_child {
                 if existing.parent_id != Some(immediate_parent_id) {
                     return Err(WorkflowStoreError::InvalidData("recovered execution session has incompatible immediate parent; explicit maintenance required".into()));
                 }
@@ -38497,6 +38657,13 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                     immediate_parent_id,
                 )
                 .await?;
+                #[cfg(test)]
+                let link_timer = workflow_representation::fanout_stages::StageTimer::new(
+                    &request.activation.run_id,
+                    Some(child.id),
+                    Some(&request.dispatch_identity),
+                    workflow_representation::fanout_stages::FanoutAdmissionStage::SessionLink,
+                );
                 workflow_representation::owner::link_execution_session(
                     state,
                     &dispatch_authority,
@@ -38511,6 +38678,8 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                     ),
                 )
                 .await?;
+                #[cfg(test)]
+                drop(link_timer);
                 child
             };
             (child.id, None)
@@ -38538,6 +38707,8 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             (permit.session_id(), Some(permit))
         }
     };
+    #[cfg(test)]
+    drop(stage_timer);
     let cancellation = Arc::new(TurnCancelState::default());
     let run_work_id = WorkId::new(format!("workflow:{}", request.activation.run_id));
     register_workflow_node_runtime_work(
@@ -38619,6 +38790,13 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             ..TurnExecutionOptions::default()
         },
     };
+    #[cfg(test)]
+    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        Some(target_session_id),
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::Submit,
+    );
     let admission_started_at_ms = current_unix_millis();
     let submitted = tokio::time::timeout(
         Duration::from_millis(configuration.timeout_ms),
@@ -38639,6 +38817,8 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         ))
     })?
     .map_err(|error| workflow_prompt_admission_error(&error))?;
+    #[cfg(test)]
+    drop(stage_timer);
     drop(admission_guard);
     drop(admission);
     let (receipt, completion_receiver, existing_turn) = match submitted {
@@ -38659,6 +38839,13 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         "accepted_event_sequence": receipt.accepted_event_sequence,
         "output_schema_id": request.activation.node.output.type_name,
     });
+    #[cfg(test)]
+    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        Some(target_session_id),
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::OwnerPersistence,
+    );
     let receipt_commit = workflow_representation::owner::persist_receipt(
         state,
         &bcode_workflow_store::DispatchReceipt {
@@ -38673,6 +38860,8 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         &dispatch_authority,
     )
     .await;
+    #[cfg(test)]
+    drop(stage_timer);
     // Admission has already committed in the session domain. Even when its workflow
     // receipt write fails, keep observing the admitted turn and retain its shared permit.
     // The caller still receives the persistence failure; observation cannot bypass fencing.
@@ -97795,6 +97984,69 @@ event_symbol = "bcode_plugin_handle_event_v1"
             state.stop_catalog_workers().await,
             Err(ServerError::CatalogWorkerShutdown)
         ));
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn listener_release_preserves_owned_catalog_cleanup_past_diagnostic_deadline() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let directory = tempfile::tempdir().expect("listener directory");
+        let endpoint = IpcEndpoint::unix_socket(directory.path().join("shutdown.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        state
+            .catalog_workers
+            .lock()
+            .await
+            .push(tokio::spawn(async move {
+                gate.await.expect("cleanup gate released, not abandoned");
+            }));
+        let host_shutdown = bcode_agent_runtime::CancellationToken::new();
+        host_shutdown.cancel();
+        let daemon = bcode_config::DaemonConfig::default();
+        let shutdown = run_constructed_server(
+            Arc::clone(&state),
+            listener,
+            &daemon,
+            false,
+            &[],
+            host_shutdown,
+            None,
+        );
+        tokio::pin!(shutdown);
+        std::future::poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(state.shutdown_requested.load(Ordering::SeqCst));
+        assert!(
+            state.catalog_workers.try_lock().is_err(),
+            "catalog join owns cleanup"
+        );
+        assert!(
+            LocalIpcStream::connect(&endpoint).await.is_err(),
+            "listener released before cleanup completes"
+        );
+
+        // The slow-stage diagnostic must keep polling the same authoritative cleanup.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        std::future::poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            state.catalog_workers.try_lock().is_err(),
+            "diagnostic retains cleanup ownership"
+        );
+        release.send(()).expect("owned worker still awaits release");
+        shutdown
+            .await
+            .expect("cleanup completes after gate release");
+        assert!(state.catalog_workers.lock().await.is_empty());
+        assert_eq!(Arc::strong_count(&state), 1);
         drop(state);
     }
 

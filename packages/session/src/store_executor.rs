@@ -62,6 +62,13 @@ impl SessionStoreExecutor {
     }
 
     #[cfg(test)]
+    pub(crate) async fn gate_catalog_persistence(
+        &self,
+    ) -> crate::catalog_updates::CatalogPersistGate {
+        self.catalog_updates.gate_persistence().await
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_next_catalog_flush_before_commit(&self) {
         self.catalog_updates.fail_next_flush_before_commit();
     }

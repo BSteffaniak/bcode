@@ -215,6 +215,41 @@ impl CaptureTelemetry {
         Ok(())
     }
 
+    /// Retain the implemented eval-attempt producer, never a normal-turn coverage claim.
+    ///
+    /// # Errors
+    /// Rejects incompatible or internally inconsistent eval evidence.
+    pub fn retain_eval_observation(
+        &mut self,
+        observation: &crate::diagnosis::EvalAttemptJudgementObservation,
+    ) -> Result<(), &'static str> {
+        observation.validate()?;
+        for inference in &observation.operation.inference {
+            self.retain_optional_response(&bcode_model::judgement::OptionalResponse {
+                response: None,
+                observation: Some(inference.clone()),
+            });
+        }
+        // Explicit eval closure applies only after all retained inference facts.
+        self.optional_operations_complete =
+            observation.complete && !self.optional_counts_incomplete;
+        if !self.optional_operations_complete {
+            self.optional_counts_incomplete = true;
+            self.discovery_calls = None;
+            self.verification_calls = None;
+            self.inference_calls = None;
+        } else if observation.operation.inference.is_empty() && !self.optional_counts_incomplete {
+            self.discovery_calls = Some(0);
+            self.verification_calls = Some(0);
+            self.inference_calls = Some(0);
+        }
+        self.decisions.applied(Some(
+            observation.operation.application
+                == Some(bcode_model::judgement::ApplicationDisposition::Applied),
+        ));
+        Ok(())
+    }
+
     /// Read normalized product evidence without promoting partial or legacy coverage.
     pub(super) fn retain_turn_observation(
         &mut self,
@@ -536,7 +571,12 @@ async fn execute_public(
             let response = client.optional_judge(&query).await.map_err(|_| ())?;
             capture.telemetry.decisions.finish(stage, &query, &response);
             capture.telemetry.retain_optional_response(&response);
-            crate::diagnosis::attach_advisory(&mut diagnosis, &query.request, response);
+            let operation =
+                crate::diagnosis::settle_attempt(&mut diagnosis, Some(&query), Some(response));
+            capture.telemetry.decisions.applied(Some(
+                operation.application
+                    == Some(bcode_model::judgement::ApplicationDisposition::Applied),
+            ));
             let label = diagnosis["advisory_model_labels"]["failure_category"]
                 .as_str()
                 .map(str::to_owned);

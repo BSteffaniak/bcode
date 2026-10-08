@@ -7,7 +7,89 @@
 use bcode_model::judgement::{
     Answer, Feature, OptionalRequest, OptionalResponse, Question, Request, State,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// Eval-owned evidence boundary; workflow run identity is not a session turn identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalAttemptJudgementObservation {
+    /// Independently evolving eval envelope version; unsupported versions reject.
+    pub schema_version: u32,
+    /// Actual independently admitted workflow run, unique to this attempt.
+    pub run_id: String,
+    /// Verified authoritative terminal outcome; unresolved cancellation remains absent.
+    pub terminal: Option<bcode_model::judgement::ObservationTerminal>,
+    /// The one implemented eval producer and its downstream acknowledgment.
+    pub operation: bcode_model::judgement::ConsumerOperationObservation,
+    /// Terminal closure plus complete inference and application evidence.
+    pub complete: bool,
+}
+
+impl EvalAttemptJudgementObservation {
+    /// Build from the actual independently observed workflow status.
+    #[must_use]
+    pub fn new(
+        run_id: String,
+        status: &str,
+        operation: bcode_model::judgement::ConsumerOperationObservation,
+    ) -> Self {
+        use bcode_model::judgement::ObservationTerminal;
+        let terminal = match status {
+            "completed" => Some(ObservationTerminal::Completed),
+            "failed" => Some(ObservationTerminal::Failed),
+            "cancelled" => Some(ObservationTerminal::Cancelled),
+            _ => None,
+        };
+        let complete =
+            terminal.is_some() && operation.inference_complete && operation.application.is_some();
+        Self {
+            schema_version: 1,
+            run_id,
+            terminal,
+            operation,
+            complete,
+        }
+    }
+
+    /// Validate the implemented bounded eval producer scope without guessing future formats.
+    ///
+    /// # Errors
+    /// Rejects unknown versions, invalid identity, foreign producers and inconsistent closure.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        use bcode_model::judgement::{ApplicationDisposition, TriggerDisposition};
+        let op = &self.operation;
+        if self.schema_version != 1
+            || self.run_id.is_empty()
+            || self.run_id.len() > 128
+            || self.run_id.chars().any(char::is_control)
+            || op.operation_id != 0
+            || op.feature != Feature::EvalCategorization
+            || op.inference.len() > 1
+            || op.selection.is_some()
+            || op.application.is_none()
+            || matches!(
+                op.application,
+                Some(ApplicationDisposition::Unavailable | ApplicationDisposition::Cancelled)
+            )
+            || (op.trigger != TriggerDisposition::Triggered && !op.inference.is_empty())
+            || (op.trigger == TriggerDisposition::Triggered
+                && op.inference_complete
+                && op.inference.is_empty())
+            || (op.trigger != TriggerDisposition::Triggered && !op.inference_complete)
+            || (op.application == Some(ApplicationDisposition::Applied)
+                && op.trigger != TriggerDisposition::Triggered)
+            || self.complete != (self.terminal.is_some() && op.inference_complete)
+            || serde_json::to_vec(self)
+                .map_err(|_| "invalid eval observation")?
+                .len()
+                > 128 * 1024
+        {
+            return Err("invalid eval attempt observation");
+        }
+        Ok(())
+    }
+}
 
 const FAILURE_CATEGORIES: &[&str] = &[
     "execution_failure",
@@ -77,6 +159,76 @@ pub fn optional_request(oracle: &Value, diagnosis: &Value) -> Option<OptionalReq
             })]),
         },
     })
+}
+
+/// Execute the real optional-judge adapter after independent failure classification.
+///
+/// The invocation boundary receives only allowlisted measured facts. Failure to invoke
+/// or decode is retained as incomplete inference with an explicit baseline fallback.
+#[must_use]
+pub fn invoke_attempt(
+    oracle: &Value,
+    diagnosis: &mut Value,
+    invoke: impl FnOnce(&[String]) -> Option<Value>,
+) -> bcode_model::judgement::ConsumerOperationObservation {
+    let query = optional_request(oracle, diagnosis);
+    let result = query.as_ref().and_then(|query| {
+        let encoded = serde_json::to_string(query).ok()?;
+        let args = [
+            "judgement".to_owned(),
+            "optional-judge".to_owned(),
+            "--request-json".to_owned(),
+            encoded,
+        ];
+        serde_json::from_value(invoke(&args)?).ok()
+    });
+    settle_attempt(diagnosis, query.as_ref(), result)
+}
+
+/// Apply one settled eval producer invocation and acknowledge the actual fallback.
+///
+/// `query: None` means the measured failure prerequisite was checked and absent.
+/// Missing response telemetry is incomplete evidence, never a zero-call baseline.
+/// The caller retains authoritative oracle/status/measurements separately.
+#[must_use]
+pub fn settle_attempt(
+    diagnosis: &mut Value,
+    query: Option<&OptionalRequest>,
+    result: Option<OptionalResponse>,
+) -> bcode_model::judgement::ConsumerOperationObservation {
+    use bcode_model::judgement::{
+        ApplicationDisposition, ConsumerOperationObservation, TriggerDisposition,
+    };
+    // A prior attempt's advice is not this attempt's application acknowledgment.
+    if let Some(object) = diagnosis.as_object_mut() {
+        object.remove("advisory_model_labels");
+    }
+    let mut operation = ConsumerOperationObservation {
+        operation_id: 0,
+        feature: Feature::EvalCategorization,
+        trigger: if query.is_some() {
+            TriggerDisposition::Triggered
+        } else {
+            TriggerDisposition::NotApplicable
+        },
+        inference: Vec::new(),
+        inference_complete: query.is_none(),
+        application: Some(ApplicationDisposition::BaselineRetained),
+        selection: None,
+    };
+    if let Some(query) = query
+        && let Some(result) = result
+    {
+        if let Some(observation) = &result.observation {
+            operation.inference.push(observation.clone());
+            operation.inference_complete = true;
+        }
+        attach_advisory(diagnosis, &query.request, result);
+        if diagnosis.get("advisory_model_labels").is_some() {
+            operation.application = Some(ApplicationDisposition::Applied);
+        }
+    }
+    operation
 }
 
 /// Keep model labels distinct from deterministic observations and oracle verdicts.

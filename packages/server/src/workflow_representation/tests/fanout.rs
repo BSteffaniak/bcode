@@ -127,6 +127,7 @@ pub(super) struct ReleaseGate(pub(super) String);
 impl Drop for ReleaseGate {
     fn drop(&mut self) {
         bcode_fake_provider_plugin::release_fake_event_script_gate(&self.0);
+        bcode_fake_provider_plugin::forget_fake_event_script_gate_ready(&self.0);
     }
 }
 
@@ -210,6 +211,151 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
     }
 }
 
+#[tokio::test]
+#[ignore = "fixed-artifact causal measurement; no latency threshold"]
+async fn probe_real_repo_cap8() {
+    Box::pin(probe_workspace("real-cap8", false, Some(8))).await;
+}
+
+#[tokio::test]
+#[ignore = "fixed-artifact causal measurement; no latency threshold"]
+async fn probe_minimal_repo_cap8() {
+    Box::pin(probe_workspace("minimal-cap8", true, Some(8))).await;
+}
+
+#[tokio::test]
+#[ignore = "fixed-artifact causal measurement; no latency threshold"]
+async fn probe_real_repo_uncapped32() {
+    Box::pin(probe_workspace("real-32", false, None)).await;
+}
+
+#[tokio::test]
+#[ignore = "fixed-artifact causal measurement; no latency threshold"]
+async fn probe_minimal_repo_uncapped32() {
+    Box::pin(probe_workspace("minimal-32", true, None)).await;
+}
+
+async fn probe_workspace(experiment_id: &str, minimal: bool, cap: Option<u32>) {
+    let workspace_root = tempfile::tempdir().expect("minimal workspace");
+    let workspace = if minimal {
+        workspace_root
+            .path()
+            .canonicalize()
+            .expect("minimal workspace")
+    } else {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("checkout workspace")
+    };
+    let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+    let gate =
+        ReleaseGate(state.selected_provider_context.settings["delegation_fixture_gate"].clone());
+    bcode_fake_provider_plugin::forget_fake_event_script_gate_ready(&gate.0);
+    let experiment =
+        super::super::fanout_stages::Experiment::begin(experiment_id, experiment_id, &workspace);
+    let definition = fanout_definition(parallel_provider_definition().nodes["left"].clone(), 32);
+    let started = std::time::Instant::now();
+    let admission = start_public_in_workspace(
+        &state,
+        experiment_id,
+        definition,
+        serde_json::json!(vec![1; 32]),
+        cap,
+        workspace,
+        false,
+    );
+    let admission = bcode_session::child_creation_observation::observe_child_creation(
+        super::super::fanout_stages::child_creation_observer(experiment_id),
+        admission,
+    );
+    tokio::pin!(admission);
+    // Readiness observes one provider gate while retaining the authoritative admission.
+    let ready = async {
+        while !bcode_fake_provider_plugin::fake_event_script_gate_ready(&gate.0) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    tokio::pin!(ready);
+    tokio::select! {
+        () = &mut ready => {
+            eprintln!("fanout_probe experiment={experiment_id} first_gate_ready_us={}", started.elapsed().as_micros());
+            admission.await;
+        }
+        () = &mut admission => {
+            // Admission can finish before its queued provider begins; readiness still matters.
+            ready.await;
+        }
+    }
+    let admission_elapsed = started.elapsed();
+    let snapshot = experiment.snapshot();
+    eprintln!(
+        "fanout_probe experiment={experiment_id} cap={cap:?} admission_us={} dropped={}",
+        admission_elapsed.as_micros(),
+        snapshot.dropped
+    );
+    print_probe_observations(experiment_id, &snapshot.observations);
+    // Complete admitted work before assertions or fixture teardown.
+    bcode_fake_provider_plugin::release_fake_event_script_gate(&gate.0);
+    let result = wait_public(&state, experiment_id).await;
+    stop_fixture_driver(&state).await;
+    let final_snapshot = experiment.snapshot();
+    eprintln!(
+        "fanout_probe experiment={experiment_id} final_observations={} pre_release_observations={} final_dropped={}",
+        final_snapshot.observations.len(),
+        snapshot.observations.len(),
+        final_snapshot.dropped
+    );
+    for observation in final_snapshot
+        .observations
+        .iter()
+        .skip(snapshot.observations.len())
+    {
+        eprintln!("fanout_probe experiment={experiment_id} post_release={observation:?}");
+    }
+    bcode_fake_provider_plugin::forget_fake_event_script_gate_ready(&gate.0);
+    assert!(result.is_ok(), "probe run completion");
+    assert_eq!(final_snapshot.dropped, 0, "stage observation overflow");
+    assert!(
+        !snapshot.observations.is_empty(),
+        "stage hooks must be wired before matrix runs"
+    );
+}
+
+fn print_probe_observations(
+    experiment_id: &str,
+    observations: &[super::super::fanout_stages::Observation],
+) {
+    use super::super::fanout_stages::Observation;
+    for observation in observations {
+        match observation {
+            Observation::Stage {
+                session_id,
+                dispatch_identity,
+                stage,
+                elapsed,
+            } => eprintln!(
+                "fanout_probe experiment={experiment_id} session={session_id:?} dispatch={dispatch_identity:?} stage={stage:?} elapsed_us={}",
+                elapsed.as_micros()
+            ),
+            Observation::ChildCreation(observation) => eprintln!(
+                "fanout_probe experiment={experiment_id} child_session={} child_stage={:?} elapsed_us={}",
+                observation.session_id,
+                observation.stage,
+                observation.elapsed.as_micros()
+            ),
+            Observation::RepositoryProbe {
+                probe,
+                elapsed,
+                completed,
+            } => eprintln!(
+                "fanout_probe experiment={experiment_id} probe={probe:?} completed={completed} elapsed_us={}",
+                elapsed.as_micros()
+            ),
+        }
+    }
+}
+
 pub(super) async fn start_public(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
@@ -217,9 +363,30 @@ pub(super) async fn start_public(
     input: serde_json::Value,
     cap: Option<u32>,
 ) {
+    start_public_in_workspace(
+        state,
+        run_id,
+        definition,
+        input,
+        cap,
+        std::path::PathBuf::from("."),
+        true,
+    )
+    .await;
+}
+
+async fn start_public_in_workspace(
+    state: &std::sync::Arc<ServerState>,
+    run_id: &str,
+    definition: bcode_workflow::WorkflowDefinition,
+    input: serde_json::Value,
+    cap: Option<u32>,
+    workspace: std::path::PathBuf,
+    observe_timeout: bool,
+) {
     let parent = state
         .sessions
-        .create_session(None, std::path::PathBuf::from("."))
+        .create_session(None, workspace)
         .await
         .expect("parent");
     let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(run_id, &definition)
@@ -235,35 +402,59 @@ pub(super) async fn start_public(
         )
         .expect("definition");
     eprintln!("bounded provider delivery diagnosis run={run_id} cap={cap:?} starting");
-    let started = tokio::time::timeout(
-        std::time::Duration::from_secs(40),
-        crate::workflow_operations::start_run(
-            state,
-            bcode_workflow::WorkflowRunStartRequest {
-                definition_id: identity.definition_id,
-                definition_version: identity.definition_version,
-                run_id: Some(run_id.into()),
-                workspace_snapshot: "fixture".into(),
-                parent_session_id: parent.id,
-                parent_session_generation: None,
-                binding: None,
-                input: Some(input),
-                limits: bcode_workflow::WorkflowRunLimits {
-                    concurrency_cap: cap,
-                    ..Default::default()
-                },
+    let admission = crate::workflow_operations::start_run(
+        state,
+        bcode_workflow::WorkflowRunStartRequest {
+            definition_id: identity.definition_id,
+            definition_version: identity.definition_version,
+            run_id: Some(run_id.into()),
+            workspace_snapshot: "fixture".into(),
+            parent_session_id: parent.id,
+            parent_session_generation: None,
+            binding: None,
+            input: Some(input),
+            limits: bcode_workflow::WorkflowRunLimits {
+                concurrency_cap: cap,
+                ..Default::default()
             },
-            None,
-        ),
-    )
-    .await;
-    if started.is_err() {
-        let diagnostic = bounded_run_diagnostic(state, run_id).await;
-        panic!("bounded normal start cap={cap:?}, run={run_id}: {diagnostic}");
+        },
+        None,
+    );
+    tokio::pin!(admission);
+    // The observation deadline must not drop an authoritative admission future.
+    let overdue = if observe_timeout {
+        if let Ok(result) =
+            tokio::time::timeout(std::time::Duration::from_secs(40), &mut admission).await
+        {
+            result.expect("normal start");
+            false
+        } else {
+            eprintln!(
+                "normal start observation overdue: {}",
+                bounded_run_diagnostic(state, run_id).await
+            );
+            admission.await.expect("overdue admission settled");
+            true
+        }
+    } else {
+        admission.await.expect("probe admission settled");
+        false
+    };
+    if overdue {
+        // Release the fixture provider gate before reporting a failure, after admission settled.
+        if let Some(gate) = state
+            .selected_provider_context
+            .settings
+            .get("delegation_fixture_gate")
+        {
+            bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
+        }
+        let _ = wait_public(state, run_id).await;
+        stop_fixture_driver(state).await;
+        panic!(
+            "bounded normal start observation exceeded 40s cap={cap:?}; admission retained to settlement"
+        );
     }
-    started
-        .expect("bounded normal start")
-        .expect("normal start");
     eprintln!("bounded provider delivery diagnosis run={run_id} cap={cap:?} start returned");
 }
 

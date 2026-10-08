@@ -1,5 +1,6 @@
 //! Fresh-child publication and bounded non-owning relationship observation.
 
+use crate::child_creation_observation::{ChildCreationStage as Stage, timer};
 use crate::{SessionError, SessionManager, SessionState, db, lease, normalize_working_directory};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionChildCreateRequest, SessionChildPage,
@@ -427,6 +428,16 @@ impl SessionManager {
                 .await?;
             return Ok(summary);
         };
+        self.create_persistent_child(request, execution, store)
+            .await
+    }
+
+    async fn create_persistent_child(
+        &self,
+        request: SessionChildCreateRequest,
+        execution: Option<crate::ExecutionSessionProvenance>,
+        store: &crate::store_executor::SessionStoreExecutor,
+    ) -> Result<SessionSummary, SessionError> {
         let root = store.root_path();
         validate_session_path(&root, request.child_id)?;
         validate_session_path(&root, request.parent_id)?;
@@ -439,9 +450,13 @@ impl SessionManager {
             }
         }
         // This guard verifies all live owners and serializes both publication and crash recovery.
+        let stage_timer = timer(request.child_id, Stage::ParentIntent);
         self.record_child_link(request.parent_id, request.child_id, false)
             .await?;
+        drop(stage_timer);
+        let stage_timer = timer(request.child_id, Stage::MaintenanceOwnership);
         let ownership = lease::acquire_session_maintenance_guard(&root, request.child_id)?;
+        drop(stage_timer);
         let canonical = db::session_dir_path(&root, request.child_id);
         if canonical.exists() {
             let database =
@@ -471,16 +486,22 @@ impl SessionManager {
         }
         // Only exact local canonical storage establishes the parent; catalog metadata is not authority.
         self.session_summary_non_owning(request.parent_id).await?;
+        let stage_timer = timer(request.child_id, Stage::Staging);
         let staging = child_staging_path(&root, &request)?;
+        drop(stage_timer);
         let summary = self
             .prepare_child_storage(&staging, &request, execution.as_ref())
             .await?;
+        let stage_timer = timer(request.child_id, Stage::RenameAndSync);
         fs::rename(db::session_dir_path(&staging, request.child_id), &canonical)?;
         File::open(&root)?.sync_all()?;
+        drop(stage_timer);
         drop(ownership);
+        let stage_timer = timer(request.child_id, Stage::Publication);
         self.link_child_session(request.parent_id, request.child_id)
             .await?;
         self.register_child_summary(summary.clone()).await;
+        drop(stage_timer);
         Ok(summary)
     }
 
@@ -514,9 +535,11 @@ impl SessionManager {
             },
         };
         let result: Result<SessionSummary, SessionError> = async {
+            let stage_timer = timer(request.child_id, Stage::CreationEvents);
             database
                 .append_event_batch(&[(created, Some(now)), (relationship, Some(now))])
                 .await?;
+            drop(stage_timer);
             if let Some(provenance) = execution {
                 let event = SessionEvent {
                     schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -529,19 +552,30 @@ impl SessionManager {
                         visibility: bcode_session_models::SessionVisibility::Background,
                     },
                 };
+                let stage_timer = timer(request.child_id, Stage::ExecutionEvent);
                 database.append_event_batch(&[(event, Some(now))]).await?;
+                drop(stage_timer);
             }
+            let stage_timer = timer(request.child_id, Stage::Validation);
             database.validate_write_readiness().await?;
-            Ok(self
+            drop(stage_timer);
+            let stage_timer = timer(request.child_id, Stage::StateLoad);
+            let summary = self
                 .load_db_session_state(request.child_id, &database)
                 .await?
-                .summary())
+                .summary();
+            drop(stage_timer);
+            Ok(summary)
         }
         .await;
+        let stage_timer = timer(request.child_id, Stage::DatabaseClose);
         let close = database.close().await;
+        drop(stage_timer);
         let summary = result?;
         close?;
+        let stage_timer = timer(request.child_id, Stage::Manifest);
         crate::derivation::write_staged_manifest(staging, &summary)?;
+        drop(stage_timer);
         Ok(summary)
     }
 
@@ -703,10 +737,13 @@ impl SessionManager {
             .sessions
             .entry(summary.id)
             .or_insert(handle);
+        let stage_timer = timer(summary.id, Stage::CatalogSchedule);
         if let Some(store) = &self.store {
+            // Canonical child publication is already durable. The disposable catalog uses
+            // the existing coalescing worker; only explicit flush/shutdown needs a barrier.
             store.schedule_catalog_summary(summary).await;
-            store.flush_catalog_updates().await;
         }
+        drop(stage_timer);
     }
 }
 
@@ -1126,6 +1163,169 @@ mod tests {
         let after = maintenance.query_child_sessions(query).await.unwrap();
         assert!(after.complete);
         assert!(after.children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_publication_queues_catalog_without_flush_and_shutdown_converges() {
+        use crate::child_creation_observation::{ChildCreationObserver, observe_child_creation};
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, std::env::current_dir().unwrap())
+            .await
+            .unwrap();
+        manager.flush_catalog_updates().await;
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&observations);
+        let observer: ChildCreationObserver = std::sync::Arc::new(move |observation| {
+            recorded.lock().unwrap().push(observation);
+        });
+        let children = Box::pin(observe_child_creation(observer, async {
+            let mut children = Vec::new();
+            for _ in 0..3 {
+                children.push(
+                    manager
+                        .create_child_session(request(parent.id))
+                        .await
+                        .unwrap(),
+                );
+            }
+            children
+        }))
+        .await;
+        // Relationship discovery is canonical and must not depend on a catalog barrier.
+        let page = manager
+            .query_child_sessions(SessionChildQuery {
+                parent_id: parent.id,
+                after: None,
+                limit: 8,
+            })
+            .await
+            .unwrap();
+        assert!(page.complete);
+        assert_eq!(page.children.len(), children.len());
+        manager.shutdown_catalog_updates().await;
+        let catalog = manager
+            .store
+            .as_ref()
+            .unwrap()
+            .load_catalog()
+            .await
+            .unwrap();
+        for child in &children {
+            assert_eq!(
+                catalog.get(&child.id).unwrap().summary.parent_id,
+                Some(parent.id)
+            );
+        }
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|value| value.stage == Stage::CatalogFlush)
+                .count(),
+            0
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|value| value.stage == Stage::CatalogSchedule)
+                .count(),
+            children.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_publication_and_retry_do_not_wait_for_blocked_catalog_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, std::env::current_dir().unwrap())
+            .await
+            .unwrap();
+        manager.flush_catalog_updates().await;
+        let gate = manager
+            .store
+            .as_ref()
+            .unwrap()
+            .gate_catalog_persistence()
+            .await;
+        // Ensure the real persistence worker is blocked before authoritative creation starts.
+        manager
+            .store
+            .as_ref()
+            .unwrap()
+            .schedule_catalog_summary(parent.clone())
+            .await;
+        gate.entered().await;
+        let request = request(parent.id);
+        let creation = manager.create_child_session(request.clone());
+        tokio::pin!(creation);
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), &mut creation).await;
+        let child = if let Ok(result) = created {
+            result.unwrap()
+        } else {
+            drop(gate);
+            let _ = creation.await;
+            manager.shutdown_catalog_updates().await;
+            panic!("canonical child creation waited for blocked derived catalog");
+        };
+        let retry = manager.create_child_session(request);
+        tokio::pin!(retry);
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(5), &mut retry).await;
+        let retried = if let Ok(result) = retried {
+            result.unwrap()
+        } else {
+            drop(gate);
+            let _ = retry.await;
+            manager.shutdown_catalog_updates().await;
+            panic!("canonical retry waited for blocked derived catalog");
+        };
+        assert_eq!(child.id, retried.id);
+        let page = manager
+            .query_child_sessions(SessionChildQuery {
+                parent_id: parent.id,
+                after: None,
+                limit: 8,
+            })
+            .await
+            .unwrap();
+        assert!(page.complete);
+        assert_eq!(page.children.len(), 1);
+        assert_eq!(page.children[0].id, child.id);
+        let flush = manager.flush_catalog_updates();
+        tokio::pin!(flush);
+        let flush_pending = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            std::task::Poll::Ready(flush.as_mut().poll(cx).is_pending())
+        })
+        .await;
+        assert!(
+            flush_pending,
+            "explicit flush must wait for catalog persistence"
+        );
+        let shutdown = manager.shutdown_catalog_updates();
+        tokio::pin!(shutdown);
+        let pending = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_pending())
+        })
+        .await;
+        assert!(pending, "shutdown must drain the blocked catalog worker");
+        drop(gate);
+        flush.await;
+        shutdown.await;
+        let catalog = manager
+            .store
+            .as_ref()
+            .unwrap()
+            .load_catalog()
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.get(&child.id).unwrap().summary.parent_id,
+            Some(parent.id)
+        );
     }
 
     #[tokio::test]

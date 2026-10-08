@@ -36,6 +36,9 @@ static FAKE_COMPACTION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 static FAKE_COMPACTION_SUMMARY_SIGNALS: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
+#[cfg(feature = "static-bundled")]
+static FAKE_SCRIPT_WAITERS: LazyLock<Mutex<BTreeSet<String>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
 static FAKE_SCRIPT_GATES: LazyLock<(Mutex<BTreeSet<String>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
 
@@ -70,6 +73,23 @@ pub fn release_fake_event_script_gate(gate: &str) {
     if let Ok(mut gates) = gates.lock() {
         gates.insert(gate.to_owned());
         ready.notify_all();
+    }
+}
+
+/// Whether a script has reached this test-owned gate (not a timing counter).
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn fake_event_script_gate_ready(gate: &str) -> bool {
+    FAKE_SCRIPT_WAITERS
+        .lock()
+        .is_ok_and(|waiters| waiters.contains(gate))
+}
+
+/// Forget the readiness handshake for one test-owned gate.
+#[cfg(feature = "static-bundled")]
+pub fn forget_fake_event_script_gate_ready(gate: &str) {
+    if let Ok(mut waiters) = FAKE_SCRIPT_WAITERS.lock() {
+        waiters.remove(gate);
     }
 }
 
@@ -1002,6 +1022,13 @@ fn emit_fake_event_script(turn: &FakeTurn, script: FakeProviderEventScript) {
 }
 
 fn wait_for_fake_event_script_gate(turn: &FakeTurn, gate: &str) -> bool {
+    #[cfg(feature = "static-bundled")]
+    if let Ok(mut waiters) = FAKE_SCRIPT_WAITERS.lock() {
+        // Readiness is retained until explicit test cleanup; cap memory in non-test use.
+        if waiters.len() < 256 {
+            waiters.insert(gate.to_owned());
+        }
+    }
     let (gates, ready) = &*FAKE_SCRIPT_GATES;
     let Ok(mut gates) = gates.lock() else {
         return false;

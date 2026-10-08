@@ -1,5 +1,30 @@
 # Optional judgement evaluation: corpus v3 and readiness
 
+## Implemented eval-attempt producer evidence
+
+Workflow evaluation writes `eval-judgement-observation.json` after the independent oracle
+is evaluated. Invalid/incompatible identity or schema, unresolved terminal status, and export
+failure produce a bounded unavailable-evidence warning without changing the authoritative eval
+result; unavailable evidence is not advertised as an artifact or promoted. The eval-owned `EvalAttemptJudgementObservation` version-one envelope uses
+actual workflow run identity, not a fabricated session/turn identity. It retains the existing
+portable eval consumer operation: checked failure prerequisite, optional inference telemetry,
+and downstream application acknowledgment. Unresolved workflow status is not terminal closure.
+
+`diagnosis::invoke_attempt` is the workflow's real CLI adapter; `settle_attempt` is shared with
+public optional-judge service capture. Applied means the consumer validated and installed the
+advisory label, not merely that central inference returned advice. Called disabled responses
+remain triggered invocations with explicit baseline retention. An absent failure prerequisite
+is explicitly not applicable; missing response telemetry is unknown, not policy-off or zero.
+The capture telemetry adapter validates this envelope and closes only its implemented eval
+producer scope. Billing remains unknown without a complete priced call ledger. Oracle status,
+independent success measurements and deterministic diagnosis labels are not rewritten.
+
+`packages/eval/tests/eval_attempt_observation.rs` supplies deterministic callback responses
+through the real invocation encoding/application path, testing called-disabled zero counts,
+missing telemetry, absent prerequisites, invalid advice and actual advisory application. These
+are offline eval-adapter regressions, not six-feature normal-turn end-to-end coverage or gain
+claims. Normal context and recommendations capture gaps require upstream application evidence.
+
 ## Truth and evidence
 
 `fixtures/evals/judgement/development.json` is development **schema version 3**, with 36
