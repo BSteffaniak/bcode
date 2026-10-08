@@ -2,6 +2,8 @@
 
 use std::io::{self, Write};
 
+use bcode_plugin_sdk::tui::keymap::controls::ControlAction;
+#[cfg(test)]
 use bmux_keyboard::KeyCode;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::damage::Damage;
@@ -95,34 +97,57 @@ impl QuickProgram {
         })
     }
 
+    #[cfg(test)]
     fn key(&mut self, key: KeyCode) -> Lifecycle {
-        match key {
-            KeyCode::Escape | KeyCode::Char('q') => return Lifecycle::Exit,
-            KeyCode::F(2) => {
+        self.handle_stroke(bmux_keyboard::KeyStroke::simple(key))
+    }
+
+    fn handle_stroke(&mut self, stroke: bmux_keyboard::KeyStroke) -> Lifecycle {
+        match self.keymap.action("quick_onboarding", stroke) {
+            Some("tui.control.cancel") => return Lifecycle::Exit,
+            Some("tui.quick.advanced") => {
                 self.outcome = QuickOnboardingOutcome::Advanced;
                 return Lifecycle::Exit;
             }
-            KeyCode::Char('c') => self.form = Some(ConnectionForm::quick()),
-            KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::Home
-            | KeyCode::End => {
+            Some("tui.quick.connect") => self.form = Some(ConnectionForm::quick()),
+            Some(action)
+                if matches!(
+                    action,
+                    "tui.control.up"
+                        | "tui.control.down"
+                        | "tui.control.page_up"
+                        | "tui.control.page_down"
+                        | "tui.control.home"
+                        | "tui.control.end"
+                ) =>
+            {
+                let Some(action) = ControlAction::from_id(
+                    action,
+                    &[
+                        ControlAction::Up,
+                        ControlAction::Down,
+                        ControlAction::PageUp,
+                        ControlAction::PageDown,
+                        ControlAction::Home,
+                        ControlAction::End,
+                    ],
+                ) else {
+                    return Lifecycle::Continue;
+                };
                 let items = self.items();
                 let area = self.list_area();
                 let _ = choice_list(&items).handle_event(
                     area,
                     &mut self.list,
-                    &Event::Key(bmux_keyboard::KeyStroke::simple(key)),
+                    &Event::Key(action.native_stroke()),
                 );
                 self.selected = self.list.focused().unwrap_or(0);
                 self.list.set_selected(Some(self.selected));
             }
-            KeyCode::Enter if self.input.choices.is_empty() => {
+            Some("tui.control.submit") if self.input.choices.is_empty() => {
                 self.form = Some(ConnectionForm::quick());
             }
-            KeyCode::Enter => {
+            Some("tui.control.submit") => {
                 self.outcome = QuickOnboardingOutcome::Selected(self.selected);
                 return Lifecycle::Exit;
             }
@@ -171,6 +196,50 @@ impl QuickProgram {
         self.choice_area
     }
 
+    fn footer_rows(&self, width: u16) -> Vec<Line> {
+        let mut footer = Vec::new();
+        if let Some(choice) = self.input.choices.get(self.selected) {
+            footer.extend(wrapped_rows(&choice.detail, width, self.theme.muted));
+            footer.extend(wrapped_rows(
+                &format!(
+                    "{}: Use this and start",
+                    self.keymap.hint("quick_onboarding", "tui.control.submit")
+                ),
+                width,
+                self.theme.focused,
+            ));
+        } else {
+            footer.extend(wrapped_rows(
+                &format!(
+                    "{}: Sign in / Add key",
+                    self.keymap.hint("quick_onboarding", "tui.control.submit")
+                ),
+                width,
+                self.theme.focused,
+            ));
+        }
+        footer.extend(wrapped_rows(
+            &format!(
+                "{}: Connect another (Sign in / Add key) • {}: Advanced",
+                self.keymap.hint("quick_onboarding", "tui.quick.connect"),
+                self.keymap.hint("quick_onboarding", "tui.quick.advanced")
+            ),
+            width,
+            self.theme.text,
+        ));
+        footer.extend(wrapped_rows(
+            &format!(
+                "{}/{}: choose • {}: Close",
+                self.keymap.hint("quick_onboarding", "tui.control.up"),
+                self.keymap.hint("quick_onboarding", "tui.control.down"),
+                self.keymap.hint("quick_onboarding", "tui.control.cancel")
+            ),
+            width,
+            self.theme.muted,
+        ));
+        footer
+    }
+
     fn render(&mut self, frame: &mut PaintCx<'_, '_>) {
         let local = frame.area();
         self.area = Rect::new(0, 0, local.width, local.height);
@@ -189,36 +258,14 @@ impl QuickProgram {
             width,
             self.theme.text,
         ));
-        let mut footer = Vec::new();
-        if let Some(choice) = self.input.choices.get(self.selected) {
-            footer.extend(wrapped_rows(&choice.detail, width, self.theme.muted));
-            footer.extend(wrapped_rows(
-                "Enter: Use this and start",
-                width,
-                self.theme.focused,
-            ));
-        } else {
+        if self.input.choices.is_empty() {
             header.extend(wrapped_rows(
                 "No usable account is available.",
                 width,
                 self.theme.text,
             ));
-            footer.extend(wrapped_rows(
-                "Enter: Sign in / Add key",
-                width,
-                self.theme.focused,
-            ));
         }
-        footer.extend(wrapped_rows(
-            "c: Connect another (Sign in / Add key) • F2: Advanced",
-            width,
-            self.theme.text,
-        ));
-        footer.extend(wrapped_rows(
-            "↑/↓: choose • Esc: Close",
-            width,
-            self.theme.muted,
-        ));
+        let footer = self.footer_rows(width);
         let reserved = header.len().saturating_add(footer.len());
         let minimum = reserved.saturating_add(usize::from(!self.input.choices.is_empty()));
         if width == 0 || minimum > usize::from(self.area.height) {
@@ -227,7 +274,13 @@ impl QuickProgram {
                 frame,
                 0,
                 &wrapped_rows(
-                    "Resize to choose • Enter: continue • c: connect • F2: Advanced • Esc: close",
+                    &format!(
+                        "Resize to choose • {}: continue • {}: connect • {}: Advanced • {}: close",
+                        self.keymap.hint("quick_onboarding", "tui.control.submit"),
+                        self.keymap.hint("quick_onboarding", "tui.quick.connect"),
+                        self.keymap.hint("quick_onboarding", "tui.quick.advanced"),
+                        self.keymap.hint("quick_onboarding", "tui.control.cancel")
+                    ),
                     width,
                     self.theme.text,
                 ),
@@ -328,14 +381,16 @@ impl Program for QuickProgram {
         let mut lifecycle = Lifecycle::Continue;
         match event {
             RuntimeEvent::Message(QuickMessage::InputFailed(error)) => return Err(error.into()),
-            RuntimeEvent::Terminal(Event::Key(key)) if key.key == KeyCode::F(2) => {
+            RuntimeEvent::Terminal(Event::Key(key))
+                if self.keymap.action("quick_onboarding", key) == Some("tui.quick.advanced") =>
+            {
                 self.outcome = QuickOnboardingOutcome::Advanced;
                 lifecycle = Lifecycle::Exit;
             }
             RuntimeEvent::Terminal(ref event) if self.form.is_some() => {
                 lifecycle = self.handle_connection_event(event);
             }
-            RuntimeEvent::Terminal(Event::Key(key)) => lifecycle = self.key(key.key),
+            RuntimeEvent::Terminal(Event::Key(key)) => lifecycle = self.handle_stroke(key),
             _ => {}
         }
         if let Some((provider_id, profile)) =
@@ -462,6 +517,97 @@ mod tests {
         assert_eq!(program.outcome, QuickOnboardingOutcome::Advanced);
     }
     #[test]
+    fn remaps_dispatch_and_hints_without_default_fallbacks() {
+        let mut program = program();
+        program.input.choices.push(QuickConnectionChoice {
+            label: "Second".into(),
+            detail: "Ready".into(),
+        });
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "quick_onboarding".into(),
+            [
+                ("ctrl+j", "tui.control.down"),
+                ("ctrl+y", "tui.control.submit"),
+                ("ctrl+a", "tui.quick.advanced"),
+                ("c", ""),
+                ("escape", ""),
+                ("q", ""),
+            ]
+            .into_iter()
+            .map(|(key, action)| (key.into(), action.into()))
+            .collect(),
+        );
+        program.keymap = crate::keymap::BmuxKeyMap::from_config(&config);
+        assert!(program.keymap.error().is_none());
+        for key in [
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::F(2),
+            KeyCode::Char('c'),
+            KeyCode::Escape,
+            KeyCode::Char('q'),
+        ] {
+            assert_eq!(program.key(key), Lifecycle::Continue);
+        }
+        assert!(program.form.is_none());
+        assert_eq!(program.selected, 0);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 100, 24));
+        program.render(&mut PaintCx::new(&mut bmux_tui::frame::Frame::new(
+            &mut buffer,
+        )));
+        let rendered = (0..24)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<String>();
+        for (action, label) in [
+            ("tui.control.submit", "Use this and start"),
+            ("tui.quick.advanced", "Advanced"),
+            ("tui.quick.connect", "Connect another"),
+            ("tui.control.cancel", "Close"),
+        ] {
+            assert!(rendered.contains(&format!(
+                "{}: {label}",
+                program.keymap.hint("quick_onboarding", action)
+            )));
+        }
+        program.handle_stroke(bmux_keyboard::parse_key_stroke("ctrl+j").unwrap());
+        assert_eq!(program.selected, 1);
+        assert_eq!(
+            program.handle_stroke(bmux_keyboard::parse_key_stroke("ctrl+y").unwrap()),
+            Lifecycle::Exit
+        );
+        assert_eq!(program.outcome, QuickOnboardingOutcome::Selected(1));
+    }
+
+    #[test]
+    fn remapped_advanced_is_effective_during_enrollment() {
+        let mut program = program();
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "quick_onboarding".into(),
+            [("ctrl+a".into(), "tui.quick.advanced".into())].into(),
+        );
+        program.keymap = crate::keymap::BmuxKeyMap::from_config(&config);
+        program.form = Some(ConnectionForm::quick());
+        let event = |key| RuntimeEvent::Terminal(Event::Key(key));
+        assert_eq!(
+            program
+                .update(event(bmux_keyboard::KeyStroke::simple(KeyCode::F(2))))
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Continue
+        );
+        assert_eq!(
+            program
+                .update(event(bmux_keyboard::parse_key_stroke("ctrl+a").unwrap()))
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Exit
+        );
+        assert_eq!(program.outcome, QuickOnboardingOutcome::Advanced);
+    }
+
+    #[test]
     fn unicode_and_recovery_render_inside_zero_and_tiny_frames() {
         for (width, height) in [(0, 0), (1, 1), (2, 4), (18, 12), (80, 24)] {
             let mut program = program();
@@ -478,7 +624,12 @@ mod tests {
                     .join("\n");
                 assert!(rows.contains("账户"));
                 assert!(rows.contains("重新连接"));
-                assert!(rows.contains("Esc: Close"));
+                assert!(rows.contains(&format!(
+                        "{}: Close",
+                        program
+                            .keymap
+                            .hint("quick_onboarding", "tui.control.cancel")
+                    )));
             }
         }
     }

@@ -206,3 +206,19 @@ Typing `/` in the composer exposes slash-command completion. Common commands inc
 Available plugin commands depend on the active plugin selection. `/fork` and `/clone` are supplied
 by the bundled, disableable session-derivation plugin rather than by the TUI host. `/fork` opens a
 bounded prompt selector; `/clone` derives the current stable session snapshot.
+
+## Quick startup onboarding
+
+The account chooser uses the `quick_onboarding` scope for navigation, confirmation,
+close, connecting another account, and advanced setup. Its hints (including the
+narrow-screen fallback) resolve the same effective bindings as dispatch. Advanced
+setup remains available during enrollment through this scope; enrollment input
+uses the existing `setup_connection` and authentication scopes.
+
+```toml
+[tui.keybindings.scopes.quick_onboarding]
+"ctrl+j" = "tui.control.down"
+"ctrl+y" = "tui.control.submit"
+"ctrl+a" = "tui.quick.advanced"
+"c" = "" # Disable the connect shortcut.
+```

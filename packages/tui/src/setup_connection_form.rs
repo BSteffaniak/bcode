@@ -63,7 +63,7 @@ impl ConnectionForm {
             ),
             Ok(providers) => (
                 providers,
-                "Choose a provider to connect. Esc returns.".to_owned(),
+                "Choose a provider to connect. Cancel returns.".to_owned(),
             ),
             Err(message) => (Vec::new(), message),
         };

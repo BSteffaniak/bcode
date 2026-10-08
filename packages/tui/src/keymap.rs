@@ -394,7 +394,7 @@ fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option
         defaults.push("p");
     }
 
-    if scope == "onboarding" && id == "tui.control.cancel" {
+    if matches!(scope, "onboarding" | "quick_onboarding") && id == "tui.control.cancel" {
         defaults.push("q");
     }
     if scope == "onboarding" && id == "tui.control.up" {
@@ -438,6 +438,7 @@ fn register_control_actions(
         "thinking_dialog",
         "setup",
         "onboarding",
+        "quick_onboarding",
         "working_directory",
         "worktree_create",
         "ralph_start",
@@ -706,6 +707,17 @@ fn register_onboarding_actions(
     registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
 ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
     use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    for (id, description, defaults) in [
+        ("tui.quick.connect", "Connect another account", vec!["c"]),
+        ("tui.quick.advanced", "Open advanced setup", vec!["f2"]),
+    ] {
+        registry.register(KeymapAction {
+            id: id.into(),
+            scope: "quick_onboarding".into(),
+            description: description.into(),
+            defaults: defaults.into_iter().map(str::to_owned).collect(),
+        })?;
+    }
     for (action, description, key) in [
         ("provider", "Connect provider", "p"),
         ("auth", "Review authentication", "a"),
