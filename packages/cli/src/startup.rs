@@ -513,9 +513,24 @@ fn recommended_selection(
 }
 
 fn has_explicit_selection(config: &BcodeConfig) -> bool {
-    let selection = config.resolved_model_selection();
+    has_explicit_selection_with_environment(config, &bcode_config::ProcessConfigEnvironment)
+}
+
+fn has_explicit_selection_with_environment(
+    config: &BcodeConfig,
+    environment: &impl bcode_config::ConfigEnvironment,
+) -> bool {
+    let selection = config.resolved_model_selection_with_environment(environment);
+    let explicit_provider = match &selection.provider_source {
+        Some(bcode_config::ModelSelectionSource::Environment { variable }) => {
+            matches!(variable.as_str(), "BCODE_MODEL_PROVIDER" | "BCODE_PROVIDER")
+        }
+        Some(_) => true,
+        None => false,
+    };
     !config.startup_selection_applied
-        && (selection.provider_plugin_id.is_some()
+        && (config.model.provider_plugin_id.is_some()
+            || explicit_provider
             || selection.model_id.is_some()
             || selection.model_profile.is_some()
             || selection.auth_profile.is_some()
@@ -1007,6 +1022,45 @@ mod tests {
         );
         assert_eq!(selection.environment_auth_provider.as_deref(), Some("xai"));
         assert_eq!(selection.auth_profile, None);
+    }
+
+    #[test]
+    fn detected_xai_key_does_not_count_as_explicit_selection() {
+        let environment = bcode_config::ConfigEnvironmentSnapshot::new(
+            std::collections::BTreeMap::from([(
+                "XAI_API_KEY".to_owned(),
+                std::ffi::OsString::from("fake-offline-test-key"),
+            )]),
+            std::path::PathBuf::from("."),
+        );
+        let mut config = bcode_config::BcodeConfig::default();
+        assert!(
+            config
+                .resolved_model_selection_with_environment(&environment)
+                .provider_plugin_id
+                .is_some()
+        );
+        assert!(!super::has_explicit_selection_with_environment(
+            &config,
+            &environment
+        ));
+        assert_eq!(
+            super::startup_route(
+                false,
+                super::has_explicit_selection_with_environment(&config, &environment),
+                true,
+            ),
+            super::StartupRoute::Recover {
+                allow_choices: true
+            }
+        );
+        config.model.provider_plugin_id = Some("explicit.provider".to_owned());
+        // Environment precedence is unchanged; explicitly configured provider intent still
+        // prevents onboarding from replacing the user's selection.
+        assert!(super::has_explicit_selection_with_environment(
+            &config,
+            &environment
+        ));
     }
 
     #[test]
