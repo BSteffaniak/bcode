@@ -584,6 +584,7 @@ async fn service<T: serde::Serialize + Sync, R: serde::de::DeserializeOwned>(
         serde_json::to_value(input).unwrap(),
         &state.startup_config,
         cancel,
+        None,
     )
     .await?;
     serde_json::from_value(value).ok()
@@ -680,6 +681,7 @@ async fn ranking(
             candidates,
             &state.startup_config,
             cancel,
+            &ConsumerObservationGuard { operation: None },
         )
         .await
         .unwrap_or_else(|| {

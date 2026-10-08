@@ -23,6 +23,76 @@ class DatasetTests(unittest.TestCase):
         self.assertIn("exactly these top-level answer.json keys", prompt)
         self.assertIn("no extra keys: task", prompt)
 
+    def test_prompt_schemas_are_truth_value_independent_for_all_splits(self):
+        for split in ("development", "held_out", "independent_public"):
+            for case in b.load(split)["cases"]:
+                prompt = b.task_prompt(case)
+                changed = dict(case, answer={key: "not truth" for key in case["answer"]},
+                               expected={"kind": "absent"})
+                self.assertEqual(prompt, b.task_prompt(changed), case["id"])
+                for key in case["answer"]:
+                    self.assertIn(key + ": " + b.ANSWER_TYPES[key], prompt)
+                self.assertIn("no extra keys", prompt)
+        with self.assertRaises(KeyError):
+            b.task_prompt({"task": "Read evidence", "answer": {"unreviewed": True}})
+
+    def test_trigger_contracts_cover_six_features_without_claiming_execution(self):
+        self.assertEqual(set(b.FEATURES), set(b.TRIGGER_CONTRACTS))
+        self.assertEqual(len({c["operation"] for c in b.TRIGGER_CONTRACTS.values()}), 6)
+        for contract in b.TRIGGER_CONTRACTS.values():
+            self.assertTrue(contract["prerequisite"])
+            self.assertTrue(contract["application"])
+
+    def test_supported_operation_preflight_off_on_and_unknown_fail_closed(self):
+        for feature in b.FEATURES:
+            contract = b.TRIGGER_CONTRACTS[feature]
+            self.assertTrue(contract["supported_operation"])
+            self.assertFalse(contract["normal_turn_supported"])
+            facts = dict.fromkeys(b.PREFLIGHT_FACTS, True)
+            facts["optional_calls"] = 0
+            self.assertTrue(b.operation_preflight(feature, "global-off", facts)["ready"])
+            facts["optional_calls"] = 1
+            self.assertFalse(b.operation_preflight(feature, "global-off", facts)["ready"])
+            self.assertTrue(b.operation_preflight(feature, "only-" + feature, facts)["ready"])
+            facts["optional_calls"] = 0
+            self.assertFalse(b.operation_preflight(feature, "only-" + feature, facts)["ready"])
+            facts["explicit_fallback_or_abstention"] = True
+            self.assertTrue(b.operation_preflight(feature, "only-" + feature, facts)["ready"])
+            for key in b.PREFLIGHT_FACTS:
+                incomplete = dict(facts, **{key: None})
+                self.assertFalse(b.operation_preflight(feature, "global-off", incomplete)["ready"])
+            for value in (None, False, -1, 0.0):
+                self.assertFalse(b.operation_preflight(feature, "global-off",
+                    dict(facts, optional_calls=value))["ready"])
+            self.assertFalse(b.operation_preflight(feature, "global-off", facts)["normal_turn_ready"])
+
+    def test_repetition_schedule_does_not_depend_on_prior_shuffle(self):
+        root = Path(tempfile.mkdtemp(prefix="judgement-reproducible-"))
+        schedules = []
+        for count in (1, 2):
+            dest = root / str(count)
+            with contextlib.redirect_stdout(io.StringIO()):
+                b.materialize(SimpleNamespace(split="development", mode="direct",
+                    destination=str(dest), repetitions=count, seed=7))
+            schedule = json.loads((dest / "schedule.json").read_text())
+            schedules.append([e for e in schedule["entries"] if e["repetition"] == 0])
+            for repetition in range(count):
+                import random
+                cases = list(b.load("development")["cases"])
+                rng = random.Random(f"7:development:direct:{repetition}")
+                rng.shuffle(cases)
+                observed = [e["case_id"] for e in schedule["entries"]
+                            if e["repetition"] == repetition]
+                expected = [case["id"] for case in cases for _ in b.ARMS]
+                self.assertEqual(observed, expected)
+            self.assertFalse(schedule["direct_editing_distinct_execution"])
+            for entry in schedule["entries"]:
+                self.assertEqual(entry["trigger_evidence"], "unverified")
+                contract = json.loads((dest / entry["block"] / "trigger-contract.json").read_text())
+                self.assertFalse(contract["ordinary_task_success_is_trigger_evidence"])
+            self.assertEqual(schedule["corpus_sha256"], b.digest(b.ROOT / "development.json"))
+        self.assertEqual(*schedules)
+
     def test_all_features_disjoint_splits(self):
         development = b.load("development")["cases"]
         held = b.load("held_out")["cases"]
@@ -258,6 +328,31 @@ class DatasetTests(unittest.TestCase):
         report = json.loads(output.getvalue())
         self.assertEqual(report["observed_arms"], 0)
         self.assertTrue(all(c["accuracy_delta"] is None for c in report["comparisons"]))
+        self.assertFalse(report["promotion_eligible"])
+        self.assertEqual(len(report["coverage"]), len(b.FEATURES) * 3)
+        self.assertTrue(all(c["scheduled_attempts"] is None and c["missing_attempts"] is None
+                            and c["normal_path_gate"] == "unknown" for c in report["coverage"]))
+
+    def test_task_success_with_unknown_telemetry_cannot_promote(self):
+        case = b.load("development")["cases"][0]
+        observations = [{"case_id": case["id"], "arm": arm, "repetition": 0,
+            "mode": "direct", "path": "application_consumer", "trigger_observed": True,
+            "consumer_applied": arm != "global-off", "terminal_status": "completed",
+            "output": case["expected"], "measurements": {}}
+            for arm in ("global-off", "only-" + case["feature"])]
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "capture.json"
+            path.write_text(json.dumps({"schema_version": 1, "observations": observations}))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                b.summarize(SimpleNamespace(split="development", capture=str(path)))
+        report = json.loads(output.getvalue())
+        self.assertFalse(report["promotion_eligible"])
+        coverage = next(c for c in report["coverage"]
+                        if c["feature"] == case["feature"] and c["mode"] == "direct")
+        self.assertEqual(coverage["unknown_cost"], 2)
+        self.assertEqual(coverage["observed_attempts"], 2)
+        self.assertEqual(coverage["normal_path_gate"], "unknown")
 
 
 if __name__ == "__main__":

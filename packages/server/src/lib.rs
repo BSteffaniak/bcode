@@ -890,9 +890,39 @@ pub struct TurnCancelState {
     token: CancellationToken,
     diagnostic_advisories: StdMutex<Vec<DiagnosticAdvisory>>,
     marker_commit: Mutex<()>,
+    judgement_observation: StdMutex<Option<judgement::TurnObservationHandle>>,
+    settled_tool_observations: std::sync::atomic::AtomicUsize,
 }
 
 impl TurnCancelState {
+    fn observe_consumer(
+        &self,
+        feature: bcode_model::judgement::Feature,
+        enabled: bool,
+        applicable: bool,
+    ) -> Option<judgement::ConsumerOperationHandle> {
+        let trigger = if !enabled {
+            bcode_model::judgement::TriggerDisposition::Disabled
+        } else if !applicable {
+            bcode_model::judgement::TriggerDisposition::NotApplicable
+        } else {
+            bcode_model::judgement::TriggerDisposition::Triggered
+        };
+        let operation = self
+            .judgement_observation
+            .lock()
+            .ok()?
+            .as_ref()?
+            .begin_operation(feature, trigger);
+        if trigger != bcode_model::judgement::TriggerDisposition::Triggered {
+            operation.finish(
+                bcode_model::judgement::ApplicationDisposition::BaselineRetained,
+                None,
+            );
+        }
+        Some(operation)
+    }
+
     fn advisory_messages(&self) -> Vec<ModelMessage> {
         self.diagnostic_advisories.lock().map_or_else(
             |_| Vec::new(),
@@ -5469,16 +5499,20 @@ async fn run_constructed_server(
             }
         }
     };
+    tracing::info!(target: "bcode_server::shutdown", stage = "listener_release", "shutdown stage started");
     drop(listener);
+    tracing::info!(target: "bcode_server::shutdown", stage = "listener_release", "shutdown stage completed");
     state.request_shutdown();
     // Let admitted requests and registered-client cleanup finish before deactivating
     // the plugins they may still be using. Cancellation is not completion.
-    tracing::info!(target: "bcode_server::shutdown", "draining client connections");
-    while let Some(completed) = clients.join_next().await {
-        if let Err(error) = completed {
-            tracing::warn!(%error, "client connection task failed during shutdown");
+    trace_shutdown_stage("client_drain", async {
+        while let Some(completed) = clients.join_next().await {
+            if let Err(error) = completed {
+                tracing::warn!(%error, "client connection task failed during shutdown");
+            }
         }
-    }
+    })
+    .await;
     shutdown_constructed_server(state, accept_result).await
 }
 
@@ -5517,6 +5551,25 @@ async fn stop_catalog_refresh(state: &ServerState) {
     }
 }
 
+// A slow diagnostic never cancels cleanup or releases its ownership fences.
+async fn trace_shutdown_stage<T>(
+    stage: &'static str,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    let started = Instant::now();
+    tracing::info!(target: "bcode_server::shutdown", stage, "shutdown stage started");
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        result = &mut operation => result,
+        () = tokio::time::sleep(Duration::from_secs(10)) => {
+            tracing::warn!(target: "bcode_server::shutdown", stage, "shutdown stage still awaiting completion");
+            operation.await
+        }
+    };
+    tracing::info!(target: "bcode_server::shutdown", stage, elapsed_ms = started.elapsed().as_millis(), "shutdown stage completed");
+    result
+}
+
 async fn shutdown_constructed_server(
     state: Arc<ServerState>,
     accept_result: Result<(), ServerError>,
@@ -5529,27 +5582,37 @@ async fn shutdown_constructed_server(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     tracing::info!(target: "bcode_server::shutdown", "stopping storage maintenance");
-    if state.storage_worker.stop().await.is_err() {
+    if trace_shutdown_stage("storage_maintenance", state.storage_worker.stop())
+        .await
+        .is_err()
+    {
         tracing::warn!("storage maintenance worker failed during shutdown");
     }
     tracing::info!(target: "bcode_server::shutdown", "stopping search ingestion");
-    let ingestion = state.stop_session_search_ingestion().await;
-    let driver_task = state.workflow_driver_task.lock().await.take();
-    if let Some(task) = driver_task {
-        task.abort();
-        let _ = task.await;
-    }
-    tracing::info!(target: "bcode_server::shutdown", "stopping workflow forwarder");
-    let workflow_forwarder = state.stop_workflow_event_forwarder().await;
+    let ingestion =
+        trace_shutdown_stage("search_ingestion", state.stop_session_search_ingestion()).await;
+    trace_shutdown_stage("workflow_driver", async {
+        let driver_task = state.workflow_driver_task.lock().await.take();
+        if let Some(task) = driver_task {
+            task.abort();
+            let _ = task.await;
+        }
+    })
+    .await;
+    let workflow_forwarder =
+        trace_shutdown_stage("workflow_forwarder", state.stop_workflow_event_forwarder()).await;
     tracing::info!(target: "bcode_server::shutdown", "stopping catalog workers");
-    let catalog_workers = state.stop_catalog_workers().await;
+    let catalog_workers =
+        trace_shutdown_stage("catalog_workers", state.stop_catalog_workers()).await;
     tracing::info!(target: "bcode_server::shutdown", "stopping idle watcher");
-    let idle_watcher = state.stop_idle_shutdown_watcher().await;
-    stop_catalog_refresh(&state).await;
+    let idle_watcher =
+        trace_shutdown_stage("idle_watcher", state.stop_idle_shutdown_watcher()).await;
+    trace_shutdown_stage("catalog_refresh", stop_catalog_refresh(&state)).await;
     tracing::info!(target: "bcode_server::shutdown", "flushing catalog updates");
-    state.sessions.shutdown_catalog_updates().await;
+    trace_shutdown_stage("catalog_updates", state.sessions.shutdown_catalog_updates()).await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
-    let deactivation = state.plugins.deactivate_all().await;
+    let deactivation =
+        trace_shutdown_stage("plugin_deactivation", state.plugins.deactivate_all()).await;
     let metrics_status = state.metrics.shutdown_persistence();
     if metrics_status.dropped_events > 0 || metrics_status.writer_failed {
         tracing::warn!(
@@ -6028,9 +6091,14 @@ async fn run_client_operation(
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Option<Result<(), ServerError>> {
+    // Only this pure inspection is cancellable here. Mutating requests retain their
+    // existing completion semantics even after shutdown or peer disconnection.
+    let cancel_on_shutdown = matches!(&request, Request::ServerStatus { .. });
+    let mut shutdown = state.subscribe_shutdown();
     let cancel_on_disconnect = matches!(
         &request,
         Request::Judge { .. }
+            | Request::TurnJudgementObservation { .. }
             | Request::OptionalJudge { .. }
             | Request::SelectOptionalContext { .. }
             | Request::JudgementVerify { .. }
@@ -6044,6 +6112,13 @@ async fn run_client_operation(
         writer,
         attached_session,
     ));
+    if cancel_on_shutdown {
+        return tokio::select! {
+            biased;
+            _ = shutdown.recv() => None,
+            result = operation => Some(result),
+        };
+    }
     if !cancel_on_disconnect {
         return Some(operation.await);
     }
@@ -6223,6 +6298,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SessionProjectionHistoryPage { session_id, .. }
         | Request::SessionHistoryAround { session_id, .. }
         | Request::SessionCategorization { session_id }
+        | Request::TurnJudgementObservation { session_id, .. }
         | Request::SessionInspection { session_id, .. }
         | Request::PrepareSessionOpen { session_id }
         | Request::WaitSessionOpenProgress { session_id, .. }
@@ -6483,6 +6559,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::JudgementSetup => "judgement_setup",
         Request::JudgementSetupValidate { .. } => "judgement_setup_validate",
         Request::SelectOptionalContext { .. } => "select_optional_context",
+        Request::TurnJudgementObservation { .. } => "turn_judgement_observation",
         Request::OptionalJudge { .. } => "optional_judge",
         Request::JudgementVerify { .. } => "judgement_verify",
         Request::Judge { .. } => "judge",
@@ -9160,6 +9237,31 @@ async fn handle_core_runtime_request(
                 ))
             };
             send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::TurnJudgementObservation {
+            session_id,
+            turn_id,
+        } => {
+            if turn_id.is_empty() || turn_id.len() > 128 || turn_id.chars().any(char::is_control) {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "invalid_request",
+                        "invalid turn observation identity",
+                    )),
+                )
+                .await;
+            }
+            let observation_json = state
+                .optional_judgement
+                .turn_observation_json(session_id, &turn_id);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::TurnJudgementObservation { observation_json }),
+            )
+            .await
         }
         CoreRuntimeRequest::OptionalJudge { request_json } => {
             let result = if request_json.len() <= bcode_model::judgement::MAX_REQUEST_BYTES
@@ -20123,6 +20225,11 @@ async fn run_model_turn_lifecycle(
     let model_work_id = WorkId::new(format!("model_{turn_id}"));
     let cancel_state =
         supplied_cancel_state.unwrap_or_else(|| Arc::new(TurnCancelState::default()));
+    if let Ok(mut observation) = cancel_state.judgement_observation.lock() {
+        *observation = state
+            .optional_judgement
+            .begin_turn_observation(session_id, &turn_id);
+    }
     if recovering {
         register_recovered_model_runtime_work(
             state,
@@ -20219,6 +20326,45 @@ async fn run_model_turn_lifecycle(
         tracing::warn!(%session_id, %error, "terminal turn pending steering cancellation deferred");
     }
     finish_current_turn(command_context).await;
+    if cancel_state
+        .settled_tool_observations
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0
+    {
+        // The settled turn had no tool completion: these two prerequisite checks actually ran.
+        let _triage = consumer_observation(
+            &cancel_state,
+            &turn_config,
+            bcode_model::judgement::Feature::ToolResultTriage,
+            false,
+        );
+        let _progress = consumer_observation(
+            &cancel_state,
+            &turn_config,
+            bcode_model::judgement::Feature::ProgressMonitoring,
+            false,
+        );
+    }
+    if let Ok(observation) = cancel_state.judgement_observation.lock()
+        && let Some(observation) = observation.as_ref()
+    {
+        let terminal = match completion.outcome {
+            ModelTurnOutcome::Completed => bcode_model::judgement::ObservationTerminal::Completed,
+            ModelTurnOutcome::Cancelled => bcode_model::judgement::ObservationTerminal::Cancelled,
+            _ => bcode_model::judgement::ObservationTerminal::Failed,
+        };
+        // Producer coverage is declared only after its trigger and application hooks are wired.
+        observation.close(
+            terminal,
+            &[
+                bcode_model::judgement::Feature::ToolResultTriage,
+                bcode_model::judgement::Feature::ContextReranking,
+                bcode_model::judgement::Feature::Recommendations,
+                bcode_model::judgement::Feature::ProgressMonitoring,
+                bcode_model::judgement::Feature::SessionCategorization,
+            ],
+        );
+    }
     append_model_turn_finished_event(
         state,
         session_id,
@@ -20427,7 +20573,22 @@ async fn run_model_turn_inner(
         }
     };
     let static_context_timer = state.metrics.timer();
-    if !recovering
+    let categorization_applicable = !recovering
+        && execution.request_context_id.is_none()
+        && matches!(
+            &trigger_event.kind,
+            SessionEventKind::SubmissionActivated { .. }
+        );
+    let categorization_observation = consumer_observation(
+        &cancel_state,
+        &turn_config,
+        bcode_model::judgement::Feature::SessionCategorization,
+        categorization_applicable,
+    );
+    if turn_config
+        .judgement
+        .enabled(bcode_model::judgement::Feature::SessionCategorization)
+        && !recovering
         && execution.request_context_id.is_none()
         && let SessionEventKind::SubmissionActivated { text, .. } = &trigger_event.kind
     {
@@ -20448,6 +20609,7 @@ async fn run_model_turn_inner(
                 payload,
                 &turn_config,
                 &cancel_state,
+                categorization_observation.operation.as_ref(),
             )
             .await
             && let Ok(labels) =
@@ -20469,11 +20631,15 @@ async fn run_model_turn_inner(
             if cache.len() >= 256 && !cache.contains_key(&session_id) {
                 cache.clear();
             }
-            if cache
+            let accepted = cache
                 .get(&session_id)
-                .is_none_or(|current| current.source_sequence < labels.source_sequence)
-            {
+                .is_none_or(|current| current.source_sequence < labels.source_sequence);
+            if accepted {
                 cache.insert(session_id, labels);
+            }
+            drop(cache);
+            if accepted {
+                categorization_observation.finish(true, None);
             }
         }
     }
@@ -22379,6 +22545,14 @@ async fn run_model_turn_round(
     active_model_turn.provider_turn_id = provider_turn_id.clone();
     begin_provider_round(command_context, active_model_turn).await;
 
+    tracing::debug!(
+        target: "bcode_server::provider_delivery",
+        %session_id,
+        turn_id = %request.turn_id,
+        %provider_turn_id,
+        delivery_is_push,
+        "provider delivery admitted; recording round start"
+    );
     append_trace_event(
         state,
         session_id,
@@ -22728,6 +22902,22 @@ async fn ingest_provider_stream_event_payload(
             .observe(session_id);
     }
     let event = rebase_provider_output_event(event, output_position_base);
+    let delivery_diagnostic = outcome.stream.events_received <= 3
+        || matches!(
+            event,
+            ProviderTurnEvent::TurnFinished { .. } | ProviderTurnEvent::Cancelled
+        );
+    if delivery_diagnostic {
+        tracing::debug!(
+            target: "bcode_server::provider_delivery",
+            %session_id,
+            %turn_id,
+            %provider_turn_id,
+            event_index = outcome.stream.events_received,
+            event_kind = provider_turn_event_kind(&event),
+            "provider event ingestion started"
+        );
+    }
     handle_provider_turn_event(
         state,
         session_id,
@@ -22741,6 +22931,16 @@ async fn ingest_provider_stream_event_payload(
         command_context,
     )
     .await;
+    if delivery_diagnostic {
+        tracing::debug!(
+            target: "bcode_server::provider_delivery",
+            %session_id,
+            %turn_id,
+            %provider_turn_id,
+            event_index = outcome.stream.events_received,
+            "provider event ingestion finished"
+        );
+    }
     Some(is_progress)
 }
 
@@ -23002,6 +23202,13 @@ async fn stream_model_turn_events(
     let timeout_after = Duration::from_secs(streaming.no_progress_timeout_secs);
     let mut last_progress_at = Instant::now();
 
+    tracing::debug!(
+        target: "bcode_server::provider_delivery",
+        %session_id,
+        %turn_id,
+        %provider_turn_id,
+        "provider push receive loop entered"
+    );
     loop {
         service_runtime_priority_commands(state, session_id, command_context).await;
         if cancel_state.is_cancelled() {
@@ -23137,6 +23344,14 @@ async fn stream_model_turn_events(
                 }
             }
             Ok(StreamingServiceInvocationEvent::Response(response)) => {
+                tracing::debug!(
+                    target: "bcode_server::provider_delivery",
+                    %session_id,
+                    %turn_id,
+                    %provider_turn_id,
+                    events_received = outcome.stream.events_received,
+                    "provider push final response received"
+                );
                 outcome.stream.record_close("plugin_response");
                 while let Some(payload) = invocation.try_recv_event() {
                     outcome.stream.events_drained_after_response = outcome
@@ -26035,6 +26250,8 @@ struct PreparedModelRequest {
 
 #[derive(Clone)]
 struct StaticModelTurnContext {
+    /// Exact request owner retained from preparation, never discovered from a later current turn.
+    optional_context_owner: Option<(CancellationToken, Option<judgement::TurnObservationHandle>)>,
     tool_catalog: Option<Arc<tool_catalog::Snapshot>>,
     system_prompt: String,
     system_messages: Vec<ModelMessage>,
@@ -26211,6 +26428,16 @@ async fn prepare_static_model_turn_context(
             .len()
                 > budget
         });
+    let observation = consumer_observation(
+        cancel_state,
+        config,
+        if pressure {
+            bcode_model::judgement::Feature::ContextReranking
+        } else {
+            bcode_model::judgement::Feature::Recommendations
+        },
+        skill_catalog_eligible && shortlist.len() >= 2 && !newest_task.is_empty(),
+    );
     if let Some(purpose) =
         skill_catalog_ranking_purpose(skill_catalog_eligible, pressure, &config.judgement)
         && let Some(order) = optional_selection_order(
@@ -26220,11 +26447,12 @@ async fn prepare_static_model_turn_context(
             shortlist.clone(),
             config,
             cancel_state,
+            &observation,
         )
         .await
     {
         let original = skill_summaries.clone();
-        for (slot, id) in shortlist.iter().zip(order) {
+        for (slot, id) in shortlist.iter().zip(&order) {
             if let (Some(slot), Ok(index)) = (
                 slot.get("id")
                     .and_then(serde_json::Value::as_str)
@@ -26234,6 +26462,7 @@ async fn prepare_static_model_turn_context(
                 skill_summaries[slot] = original[index].clone();
             }
         }
+        observation.finish(true, selection_observation(&shortlist, &order, &order));
     }
     let skill_catalog = if config.system_prompt.sections.skill_catalog {
         format_skill_catalog_for_prompt(
@@ -26439,13 +26668,20 @@ async fn prepare_static_model_turn_context(
         let description = &tool.description;
         serde_json::json!({ "id": tool.name, "description": &description[..description.floor_char_boundary(description.len().min(1024))], "protected": execution.tool_allowlist.as_ref().is_some_and(|allowlist| allowlist.contains(&tool.name)) })
     }).collect();
+    let observation = consumer_observation(
+        cancel_state,
+        config,
+        bcode_model::judgement::Feature::Recommendations,
+        shortlist.len() >= 2 && !newest_task.is_empty(),
+    );
     if let Some(order) = optional_selection_order(
         state,
         newest_task,
         "recommendations",
-        shortlist,
+        shortlist.clone(),
         config,
         cancel_state,
+        &observation,
     )
     .await
     {
@@ -26455,6 +26691,7 @@ async fn prepare_static_model_turn_context(
                 base_tools[slot] = tool.clone();
             }
         }
+        observation.finish(true, selection_observation(&shortlist, &order, &order));
     }
     if !execution.allow_user_questions {
         system_messages.push(ModelMessage {
@@ -26481,6 +26718,14 @@ async fn prepare_static_model_turn_context(
     let tools = apply_tool_description_profile(base_tools, &profile);
     let tool_description_overrides = profile.tool_description_overrides.keys().cloned().collect();
     Ok(StaticModelTurnContext {
+        optional_context_owner: Some((
+            cancel_state.token.clone(),
+            cancel_state
+                .judgement_observation
+                .lock()
+                .ok()
+                .and_then(|value| value.clone()),
+        )),
         tool_catalog: Some(tool_catalog),
         system_prompt,
         system_messages,
@@ -26702,23 +26947,13 @@ async fn build_model_turn_request(
         }
     }
     // Optional evidence is request-local; canonical messages remain in their original order.
-    let cancel = state
-        .session_runtimes
-        .lock()
-        .await
-        .get(&session_id)
-        .cloned();
-    if let Some(runtime) = cancel {
-        let cancel = runtime
-            .current_turn
-            .lock()
-            .await
-            .as_ref()
-            .filter(|current| current.turn_id == execution_turn_id(trigger_event))
-            .map(|current| Arc::clone(&current.cancel_state));
-        if let Some(cancel) = cancel {
-            append_optional_context(state, session_id, &mut messages, config, &cancel).await;
-        }
+    if let Some((token, observation)) = &static_context.optional_context_owner {
+        let cancel = TurnCancelState {
+            token: token.clone(),
+            judgement_observation: StdMutex::new(observation.clone()),
+            ..TurnCancelState::default()
+        };
+        append_optional_context(state, session_id, &mut messages, config, &cancel).await;
     }
     // Recovery observations must follow historical snapshots to supersede them.
     if let Some(context) = &static_context.recovery_context {
@@ -29460,6 +29695,69 @@ fn skill_catalog_ranking_purpose(
         .then_some("recommendations")
 }
 
+struct ConsumerObservationGuard {
+    operation: Option<judgement::ConsumerOperationHandle>,
+}
+
+impl ConsumerObservationGuard {
+    fn finish(
+        &self,
+        applied: bool,
+        selection: Option<bcode_model::judgement::SelectionObservation>,
+    ) {
+        if let Some(operation) = &self.operation {
+            operation.finish(
+                if applied {
+                    bcode_model::judgement::ApplicationDisposition::Applied
+                } else {
+                    bcode_model::judgement::ApplicationDisposition::BaselineRetained
+                },
+                selection,
+            );
+        }
+    }
+}
+
+impl Drop for ConsumerObservationGuard {
+    fn drop(&mut self) {
+        // Missing inference remains incomplete; a cancelled future cannot certify no calls.
+        self.finish(false, None);
+    }
+}
+
+fn consumer_observation(
+    cancel: &TurnCancelState,
+    config: &bcode_config::BcodeConfig,
+    feature: bcode_model::judgement::Feature,
+    applicable: bool,
+) -> ConsumerObservationGuard {
+    ConsumerObservationGuard {
+        operation: cancel.observe_consumer(feature, config.judgement.enabled(feature), applicable),
+    }
+}
+
+fn selection_observation(
+    candidates: &[serde_json::Value],
+    order: &[String],
+    admitted: &[String],
+) -> Option<bcode_model::judgement::SelectionObservation> {
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.get("id")?.as_str())
+        .collect::<Option<Vec<_>>>()?;
+    Some(bcode_model::judgement::SelectionObservation {
+        candidate_count: ids.len(),
+        ordered: order
+            .iter()
+            .map(|id| ids.iter().position(|candidate| *candidate == id))
+            .collect::<Option<Vec<_>>>()?,
+        admitted: admitted
+            .iter()
+            .map(|id| ids.iter().position(|candidate| *candidate == id))
+            .collect::<Option<Vec<_>>>()?,
+    })
+}
+
 /// Apply a plugin-owned permutation only after verifying it preserves the entire shortlist
 /// and every protected position. Invalid or absent advice retains baseline order.
 async fn optional_selection_order(
@@ -29469,8 +29767,17 @@ async fn optional_selection_order(
     candidates: Vec<serde_json::Value>,
     config: &bcode_config::BcodeConfig,
     cancel: &TurnCancelState,
+    observation: &ConsumerObservationGuard,
 ) -> Option<Vec<String>> {
-    if candidates.len() < 2 || candidates.len() > 32 || task.is_empty() {
+    if candidates.len() < 2
+        || candidates.len() > 32
+        || task.is_empty()
+        || !config.judgement.enabled(if purpose == "context" {
+            bcode_model::judgement::Feature::ContextReranking
+        } else {
+            bcode_model::judgement::Feature::Recommendations
+        })
+    {
         return None;
     }
     let selection =
@@ -29482,6 +29789,7 @@ async fn optional_selection_order(
         selection.clone(),
         config,
         cancel,
+        observation.operation.as_ref(),
     )
     .await?;
     let input = serde_json::from_value::<bcode_model::judgement::OptionalRequest>(
@@ -29491,7 +29799,7 @@ async fn optional_selection_order(
     let judgement = tokio::select! {
         biased;
         () = cancel.cancelled() => return None,
-        result = state.optional_judgement.judge_with_config(state, config, input) => result,
+        result = plugin_operations::judge_correlated_optional(state, config, input, observation.operation.as_ref()) => result,
     };
     let applied = invoke_optional_feature_service(
         state,
@@ -29500,6 +29808,7 @@ async fn optional_selection_order(
         serde_json::json!({ "selection": selection, "judgement": judgement }),
         config,
         cancel,
+        observation.operation.as_ref(),
     )
     .await?;
     let ids: Vec<String> = serde_json::from_value(applied.get("ordered_ids")?.clone()).ok()?;
@@ -29636,6 +29945,12 @@ async fn select_optional_context(
     config: &bcode_config::BcodeConfig,
     cancel: &TurnCancelState,
 ) -> bcode_session_models::ContextSelectionResponse {
+    let observation = consumer_observation(
+        cancel,
+        config,
+        bcode_model::judgement::Feature::ContextReranking,
+        !input.task.is_empty() && input.candidates.len() >= 2 && input.candidates.len() <= 32,
+    );
     let baseline = || baseline_context_selection(input);
     if !config
         .judgement
@@ -29666,6 +29981,7 @@ async fn select_optional_context(
         payload.clone(),
         config,
         cancel,
+        None,
     )
     .await
     else {
@@ -29674,7 +29990,7 @@ async fn select_optional_context(
     let judgement = if let Some(request) = prepared.get("judgement").and_then(|value| {
         serde_json::from_value::<bcode_model::judgement::OptionalRequest>(value.clone()).ok()
     }) {
-        tokio::select! { biased; () = cancel.cancelled() => return baseline(), response = state.optional_judgement.judge_with_config(state, config, request) => response }
+        tokio::select! { biased; () = cancel.cancelled() => return baseline(), response = plugin_operations::judge_correlated_optional(state, config, request, observation.operation.as_ref()) => response }
     } else {
         bcode_model::judgement::OptionalResponse {
             observation: None,
@@ -29688,6 +30004,7 @@ async fn select_optional_context(
         serde_json::json!({"selection": payload, "judgement": judgement}),
         config,
         cancel,
+        None,
     )
     .await
     else {
@@ -29715,6 +30032,10 @@ async fn select_optional_context(
     {
         return baseline();
     }
+    observation.finish(
+        response.applied,
+        selection_observation(&originals, &response.ordered_ids, &response.included_ids),
+    );
     response
 }
 
@@ -29737,50 +30058,23 @@ async fn append_optional_context(
         .map(|(_, candidate)| candidate.clone())
         .collect::<Vec<_>>();
     let budget_bytes = config.model.tool_output.context_chars;
+    let observation = consumer_observation(
+        cancel,
+        config,
+        bcode_model::judgement::Feature::ContextReranking,
+        !candidates.is_empty(),
+    );
     if candidates.is_empty() || cancel.is_cancelled() {
         return;
     }
-    let task = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == MessageRole::User)
-        .and_then(|message| {
-            message.content.iter().find_map(|block| match block {
-                ContentBlock::Text { text } if text.len() <= 8192 => Some(text.clone()),
-                _ => None,
-            })
-        })
-        .unwrap_or_default();
+    let task = optional_context_task(messages);
     let selection =
         serde_json::json!({"task": task, "candidates": candidates, "budget_bytes": budget_bytes});
-    let judgement = if config
-        .judgement
-        .enabled(bcode_model::judgement::Feature::ContextReranking)
-        && let Some(prepared) = invoke_optional_feature_service(
-            state,
-            "bcode.context-selection/v1",
-            "prepare",
-            selection.clone(),
-            config,
-            cancel,
-        )
-        .await
-        && let Some(input) = prepared.get("judgement").cloned().and_then(|value| {
-            serde_json::from_value::<bcode_model::judgement::OptionalRequest>(value).ok()
-        })
-        && input.feature == bcode_model::judgement::Feature::ContextReranking
-    {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            reply = state.optional_judgement.judge_with_config(state, config, input) => reply,
-        }
-    } else {
-        bcode_model::judgement::OptionalResponse {
-            observation: None,
-            response: None,
-        }
-    };
+    let judgement =
+        prepare_context_judgement(state, &selection, config, cancel, &observation).await;
+    if cancel.is_cancelled() {
+        return;
+    }
     let baseline = || {
         let mut remaining = budget_bytes;
         candidates
@@ -29797,17 +30091,30 @@ async fn append_optional_context(
             })
             .collect::<Vec<_>>()
     };
-    let included = if let Some(applied) = invoke_optional_feature_service(
-        state,
-        "bcode.context-selection/v1",
-        "apply",
-        serde_json::json!({"selection": selection, "judgement": judgement}),
-        config,
-        cancel,
-    )
-    .await
+    let mut final_selection = None;
+    let included = if config
+        .judgement
+        .enabled(bcode_model::judgement::Feature::ContextReranking)
+        && let Some(applied) = invoke_optional_feature_service(
+            state,
+            "bcode.context-selection/v1",
+            "apply",
+            serde_json::json!({"selection": selection, "judgement": judgement}),
+            config,
+            cancel,
+            observation.operation.as_ref(),
+        )
+        .await
         && let Some(admitted) = validated_context_admission(&candidates, &applied, budget_bytes)
     {
+        let originals = candidates
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_default();
+        let order: Vec<String> =
+            serde_json::from_value(applied["ordered_ids"].clone()).unwrap_or_default();
+        final_selection = selection_observation(&originals, &order, &admitted);
         admitted
     } else {
         baseline()
@@ -29816,6 +30123,65 @@ async fn append_optional_context(
         return;
     }
     incorporate_optional_context(messages, &captured, &included);
+    observation.finish(
+        final_selection.is_some()
+            && config
+                .judgement
+                .enabled(bcode_model::judgement::Feature::ContextReranking),
+        final_selection,
+    );
+}
+
+fn optional_context_task(messages: &[ModelMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| {
+            message.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text } if text.len() <= 8192 => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default()
+}
+
+async fn prepare_context_judgement(
+    state: &ServerState,
+    selection: &serde_json::Value,
+    config: &bcode_config::BcodeConfig,
+    cancel: &TurnCancelState,
+    observation: &ConsumerObservationGuard,
+) -> bcode_model::judgement::OptionalResponse {
+    if config
+        .judgement
+        .enabled(bcode_model::judgement::Feature::ContextReranking)
+        && let Some(prepared) = invoke_optional_feature_service(
+            state,
+            "bcode.context-selection/v1",
+            "prepare",
+            selection.clone(),
+            config,
+            cancel,
+            observation.operation.as_ref(),
+        )
+        .await
+        && let Some(input) = prepared.get("judgement").cloned().and_then(|value| {
+            serde_json::from_value::<bcode_model::judgement::OptionalRequest>(value).ok()
+        })
+        && input.feature == bcode_model::judgement::Feature::ContextReranking
+    {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => bcode_model::judgement::OptionalResponse { observation: None, response: None },
+            reply = plugin_operations::judge_correlated_optional(state, config, input, observation.operation.as_ref()) => reply,
+        }
+    } else {
+        bcode_model::judgement::OptionalResponse {
+            observation: None,
+            response: None,
+        }
+    }
 }
 
 fn validated_context_admission(
@@ -29889,6 +30255,7 @@ async fn invoke_optional_feature_service(
     payload: serde_json::Value,
     config: &bcode_config::BcodeConfig,
     cancel_state: &TurnCancelState,
+    observation: Option<&judgement::ConsumerOperationHandle>,
 ) -> Option<serde_json::Value> {
     let plugin_id = state
         .plugins
@@ -29939,7 +30306,7 @@ async fn invoke_optional_feature_service(
                                 biased;
                                 () = cancel_state.cancelled() => { invocation.cancel.cancel(); return None; }
                                 () = &mut deadline => { invocation.cancel.cancel(); return None; }
-                                result = state.optional_judgement.judge_with_config(state, config, input) => result,
+                                result = plugin_operations::judge_correlated_optional(state, config, input, observation) => result,
                             };
                             serde_json::to_value(result).map_or(ToolInvocationServiceResolution::Unsupported, |payload| ToolInvocationServiceResolution::Responded { payload })
                         } else { ToolInvocationServiceResolution::Unsupported };
@@ -30031,7 +30398,32 @@ async fn finish_server_registered_tool(
     // Postsettlement advice cannot replace lifecycle, trace facts or the original outcome.
     // Raw bounded output remains transient in the plugin; only allowlisted indicators
     // may enter external judgement. No arguments or artifacts are reread.
-    if !invoker.cancel_state.is_cancelled() {
+    invoker
+        .cancel_state
+        .settled_tool_observations
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    observe_settled_tool_triage(invoker, &call, &result).await;
+    observe_settled_session_tool(invoker, &call, &result).await;
+    Ok(result)
+}
+
+async fn observe_settled_tool_triage(
+    invoker: &ServerToolInvoker<'_>,
+    call: &bcode_model::ToolCall,
+    result: &ToolInvocationResponse,
+) {
+    let triage_config = invoker.state.session_config(invoker.session_id).await;
+    let triage_observation = consumer_observation(
+        invoker.cancel_state,
+        &triage_config,
+        bcode_model::judgement::Feature::ToolResultTriage,
+        true,
+    );
+    if !invoker.cancel_state.is_cancelled()
+        && triage_config
+            .judgement
+            .enabled(bcode_model::judgement::Feature::ToolResultTriage)
+    {
         let end = result
             .output
             .floor_char_boundary(result.output.len().min(8192));
@@ -30048,16 +30440,16 @@ async fn finish_server_registered_tool(
                 "excerpt_truncated": end < result.output.len(),
                 "output_excerpt": &result.output[..end],
             }),
-            &invoker.state.session_config(invoker.session_id).await,
+            &triage_config,
             invoker.cancel_state,
+            triage_observation.operation.as_ref(),
         )
         .await;
         if let Some(advisory) = advisory.and_then(|response| response.get("advisory").cloned()) {
-            deliver_diagnostic_advisory(invoker, &call.id, advisory).await;
+            let accepted = deliver_diagnostic_advisory(invoker, &call.id, advisory).await;
+            triage_observation.finish(accepted, None);
         }
     }
-    observe_settled_session_tool(invoker, &call, &result).await;
-    Ok(result)
 }
 
 async fn observe_settled_workflow_activation(
@@ -30172,6 +30564,7 @@ async fn invoke_workflow_advisory_fenced(
         request.clone(),
         config,
         &cancel,
+        None,
     );
     tokio::pin!(operation);
     let mut fence = tokio::time::interval(Duration::from_millis(50));
@@ -30195,11 +30588,19 @@ async fn observe_settled_session_tool(
     result: &ToolInvocationResponse,
 ) {
     let config = invoker.state.session_config(invoker.session_id).await;
-    if invoker.cancel_state.is_cancelled()
-        || !config
-            .judgement
-            .enabled(bcode_model::judgement::Feature::ProgressMonitoring)
+    if invoker.cancel_state.is_cancelled() {
+        return;
+    }
+    if !config
+        .judgement
+        .enabled(bcode_model::judgement::Feature::ProgressMonitoring)
     {
+        let _observation = consumer_observation(
+            invoker.cancel_state,
+            &config,
+            bcode_model::judgement::Feature::ProgressMonitoring,
+            false,
+        );
         return;
     }
     let scope = serde_json::json!({"kind": "session", "id": invoker.session_id.to_string()});
@@ -30221,6 +30622,12 @@ async fn observe_settled_session_tool(
                 }),
             )
         });
+    let observation = consumer_observation(
+        invoker.cancel_state,
+        &config,
+        bcode_model::judgement::Feature::ProgressMonitoring,
+        request.is_some(),
+    );
     let Some(request) = request else {
         return;
     };
@@ -30231,6 +30638,7 @@ async fn observe_settled_session_tool(
         request.clone(),
         &config,
         invoker.cancel_state,
+        observation.operation.as_ref(),
     )
     .await
     else {
@@ -30252,6 +30660,15 @@ async fn observe_settled_session_tool(
     let Some(payload) = payload else {
         return;
     };
+    observation.finish(true, None);
+    deliver_progress_advisory(invoker, call, payload).await;
+}
+
+async fn deliver_progress_advisory(
+    invoker: &ServerToolInvoker<'_>,
+    call: &bcode_model::ToolCall,
+    payload: serde_json::Value,
+) {
     let Some(producer) = invoker
         .state
         .plugins
@@ -30292,16 +30709,16 @@ async fn deliver_diagnostic_advisory(
     invoker: &ServerToolInvoker<'_>,
     invocation_id: &str,
     payload: serde_json::Value,
-) {
+) -> bool {
     let Ok(advisory) = serde_json::from_value::<DiagnosticAdvisory>(payload.clone()) else {
-        return;
+        return false;
     };
     if advisory.message.is_empty()
         || advisory.message.len() > 512
         || advisory.message.chars().any(char::is_control)
         || invoker.cancel_state.is_cancelled()
     {
-        return;
+        return false;
     }
     let accepted = invoker
         .cancel_state
@@ -30315,7 +30732,7 @@ async fn deliver_diagnostic_advisory(
             true
         });
     if !accepted {
-        return;
+        return false;
     }
     let Some(producer) = invoker
         .state
@@ -30326,7 +30743,7 @@ async fn deliver_diagnostic_advisory(
         .ok()
         .map(str::to_owned)
     else {
-        return;
+        return false;
     };
     let envelope = bcode_session_models::ToolContributionEnvelope::new(
         bcode_session_models::ToolContributionPlacement::Supplemental,
@@ -30351,6 +30768,7 @@ async fn deliver_diagnostic_advisory(
         envelope,
     )
     .await;
+    true
 }
 
 fn pinned_tool_producer(
@@ -31428,7 +31846,7 @@ fn blocking_optional_judgement_resolution(
     let task = runtime.spawn(async move {
         let cancel = TurnCancelState::default();
         let response =
-            optional_judgement_payload_resolution(&state, &config, payload, &cancel).await;
+            optional_judgement_payload_resolution(&state, &config, payload, &cancel, None).await;
         let _ = sender.send(response);
     });
     loop {
@@ -31451,6 +31869,7 @@ async fn optional_judgement_payload_resolution(
     config: &bcode_config::BcodeConfig,
     payload: serde_json::Value,
     cancellation: &TurnCancelState,
+    scope: Option<&PluginInvocationScope>,
 ) -> ToolInvocationServiceResolution {
     let Ok(input) = serde_json::from_value::<bcode_model::judgement::OptionalRequest>(payload)
     else {
@@ -31459,11 +31878,22 @@ async fn optional_judgement_payload_resolution(
             message: "invalid optional judgement request".into(),
         };
     };
+    let operation = scope.and_then(|scope| {
+        plugin_operations::scoped_optional_operation(state, scope, input.feature)
+    });
     let response = tokio::select! {
         biased;
         () = cancellation.cancelled() => return ToolInvocationServiceResolution::Cancelled,
-        response = state.optional_judgement.judge_with_config(state, config, input) => response,
+        response = plugin_operations::judge_correlated_optional(state, config, input, operation.as_ref()) => response,
     };
+    // The native central surface does not certify downstream application. Its operation
+    // remains pending unless a producer-owned application acknowledgment is available.
+    if let Some(operation) = operation {
+        operation.finish(
+            bcode_model::judgement::ApplicationDisposition::Unavailable,
+            None,
+        );
+    }
     serde_json::to_value(response).map_or_else(
         |_| ToolInvocationServiceResolution::Failed {
             code: "invalid_result".into(),
@@ -32071,11 +32501,18 @@ impl InvocationServiceRouter for ServerServiceRouter<'_> {
                 && request.interface_id == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID
                 && request.operation == "optional_judge"
             {
+                let authenticated_scope = self
+                    .cancel_state
+                    .judgement_observation
+                    .lock()
+                    .ok()
+                    .and_then(|observation| observation.as_ref()?.invocation_scope());
                 return optional_judgement_payload_resolution(
                     self.state,
                     &self.state.session_config(self.session_id).await,
                     request.payload,
                     self.cancel_state,
+                    authenticated_scope.as_ref(),
                 )
                 .await;
             }
@@ -47424,6 +47861,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             serde_json::to_value(&request).unwrap(),
             &state.startup_config,
             &TurnCancelState::default(),
+            None,
         )
         .await
         .unwrap();
@@ -50329,6 +50767,163 @@ library = "test"
             .await
             .expect("active user");
         append_test_tool_result(sessions, session_id, "call-large", "z".repeat(20_000)).await;
+    }
+
+    #[tokio::test]
+    async fn normal_turn_observation_closes_off_and_preserves_on_gaps() {
+        for mode in [
+            bcode_config::JudgementMode::Off,
+            bcode_config::JudgementMode::Auto,
+        ] {
+            let sessions = SessionManager::default();
+            let session = sessions
+                .create_session(
+                    Some("observation lifecycle".into()),
+                    test_working_directory(),
+                )
+                .await
+                .unwrap();
+            let submission_id = bcode_session_models::SubmissionId("observation-submission".into());
+            let turn_id = bcode_session_models::TurnId::from_accepted_event(session.id, 1);
+            let client_id = ClientId::new();
+            sessions
+                .accept_submission(
+                    session.id,
+                    bcode_session_models::PromptSubmission {
+                        id: submission_id.clone(),
+                        client_id,
+                        text: "bounded ordinary task".into(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                        requested_placement: bcode_session_models::SubmissionPlacement::FollowUp,
+                        target: bcode_session_models::SubmissionTarget::OwnTurn { turn_id },
+                        execution_descriptor: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let activated = sessions
+                .activate_submission(session.id, submission_id)
+                .await
+                .unwrap();
+            let bcode_session_models::SubmissionStatus::Activated {
+                conversation_sequence,
+                ..
+            } = activated.status
+            else {
+                panic!("fixture activation must be settled");
+            };
+            let trigger = sessions
+                .session_events_range(session.id, conversation_sequence, conversation_sequence, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut state = test_server_state_with_fake_provider(sessions);
+            state.startup_config.judgement.mode = mode;
+            let cancel = Arc::new(TurnCancelState::default());
+            let completion = run_test_model_turn_with_cancel_state(
+                &state,
+                session.id,
+                &trigger,
+                ClientRuntimeContext {
+                    selected_provider_plugin_id: Some("bcode.fake-provider".into()),
+                    selected_model_id: Some("fake-echo".into()),
+                    ..ClientRuntimeContext::default()
+                },
+                Some(Arc::clone(&cancel)),
+            )
+            .await;
+            assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+            let json = state
+                .optional_judgement
+                .turn_observation_json(session.id, &execution_turn_id(&trigger))
+                .unwrap();
+            let snapshot: bcode_model::judgement::TurnJudgementObservation =
+                serde_json::from_str(&json).unwrap();
+            assert_normal_turn_observation(&snapshot, mode);
+            cancel.observe_consumer(bcode_model::judgement::Feature::Recommendations, true, true);
+            assert_eq!(
+                state
+                    .optional_judgement
+                    .turn_observation_json(session.id, &execution_turn_id(&trigger))
+                    .unwrap(),
+                json
+            );
+            drop(state);
+        }
+    }
+
+    fn assert_normal_turn_observation(
+        snapshot: &bcode_model::judgement::TurnJudgementObservation,
+        mode: bcode_config::JudgementMode,
+    ) {
+        assert_eq!(
+            snapshot.terminal,
+            Some(bcode_model::judgement::ObservationTerminal::Completed)
+        );
+        assert!(
+            snapshot
+                .covered_features
+                .iter()
+                .all(|feature| *feature != bcode_model::judgement::Feature::EvalCategorization)
+        );
+        assert!(
+            snapshot
+                .operations
+                .iter()
+                .any(|operation| operation.feature
+                    == bcode_model::judgement::Feature::ContextReranking),
+            "ordinary context hook was skipped"
+        );
+        for feature in [
+            bcode_model::judgement::Feature::ToolResultTriage,
+            bcode_model::judgement::Feature::ProgressMonitoring,
+        ] {
+            let operation = snapshot
+                .operations
+                .iter()
+                .find(|operation| operation.feature == feature)
+                .unwrap();
+            assert_ne!(
+                operation.trigger,
+                bcode_model::judgement::TriggerDisposition::Triggered,
+                "no-tool turn cannot execute a settled-tool consumer"
+            );
+        }
+        if mode == bcode_config::JudgementMode::Off {
+            assert!(snapshot.complete, "{snapshot:?}");
+            assert!(
+                snapshot
+                    .operations
+                    .iter()
+                    .all(|operation| operation.inference.is_empty()
+                        && operation.trigger
+                            == bcode_model::judgement::TriggerDisposition::Disabled)
+            );
+        } else {
+            let categorization = snapshot
+                .operations
+                .iter()
+                .find(|operation| {
+                    operation.feature == bcode_model::judgement::Feature::SessionCategorization
+                })
+                .unwrap();
+            assert_eq!(
+                categorization.trigger,
+                bcode_model::judgement::TriggerDisposition::Triggered
+            );
+            // This actual admitted request has no optional categorization producer in the fixture.
+            assert!(!categorization.inference_complete);
+            assert!(!snapshot.complete);
+            // Ineligible triggers can close without inference; eligible missing producers
+            // must remain incomplete rather than fabricate provider/application evidence.
+            if snapshot.operations.iter().any(|operation| {
+                operation.trigger == bcode_model::judgement::TriggerDisposition::Triggered
+                    && operation.inference.is_empty()
+            }) {
+                assert!(!snapshot.complete);
+            }
+        }
     }
 
     async fn run_test_model_turn(
@@ -95993,6 +96588,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     fn prefix_test_context() -> StaticModelTurnContext {
         StaticModelTurnContext {
+            optional_context_owner: None,
             tool_catalog: None,
             prefix_context: None,
             recovery_context: None,
@@ -96251,6 +96847,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
         let static_context = StaticModelTurnContext {
+            optional_context_owner: None,
             tool_catalog: None,
             prefix_context: None,
             recovery_context: None,
@@ -97954,6 +98551,99 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap();
         assert!(state.clients.lock().await.is_empty());
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn shutdown_diagnostic_wait_preserves_operation_completion() {
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        let mut stage = Box::pin(trace_shutdown_stage("test_join", completed));
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(stage.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        complete.send(7_u32).expect("operation still owned");
+        assert_eq!(stage.await.expect("completion evidence"), 7);
+    }
+
+    #[tokio::test]
+    async fn idle_watcher_shutdown_cancels_blocked_client_inspection() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let clients = state.clients.lock().await;
+        state
+            .start_idle_shutdown_watcher(Duration::from_millis(1))
+            .await;
+        // Let the watcher enter inspection while its clients lock is unavailable.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !state
+                .idle_shutdown_worker
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        state.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), state.stop_idle_shutdown_watcher())
+            .await
+            .expect("blocked inspection remains shutdown responsive")
+            .expect("watcher joins");
+        assert!(
+            state.clients.try_lock().is_err(),
+            "test still owns the blocker"
+        );
+        drop(clients);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn in_flight_server_status_cancels_on_shutdown_without_unlocking_clients() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("status.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let peer = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let stream = listener.accept().await.expect("accept");
+        let (_, stream_writer) = split(stream);
+        let (request_end, _) = tokio::sync::watch::channel(false);
+        let writer = Arc::new(ResponseWriter {
+            writer: Mutex::new(stream_writer),
+            metrics: state.metrics.clone(),
+            disconnect: Notify::new(),
+            request_end,
+        });
+        let clients = state.clients.lock().await;
+        let mut attached = None;
+        let mut operation = Box::pin(run_client_operation(
+            Request::ServerStatus {
+                working_directory: None,
+            },
+            1,
+            ClientId::new(),
+            &state,
+            &writer,
+            &mut attached,
+        ));
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(operation.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        state.request_shutdown();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), operation)
+                .await
+                .expect("read-only request must not block client drain")
+                .is_none()
+        );
+        assert!(
+            state.clients.try_lock().is_err(),
+            "blocker has not been released"
+        );
+        drop(clients);
+        drop(state);
+        drop(peer);
     }
 
     #[tokio::test]

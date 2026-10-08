@@ -3,6 +3,46 @@
 use super::{ServerState, plugin_event_metric_labels, plugin_service_metric_labels};
 use tokio::sync::mpsc;
 
+/// Derive operation correlation only from the host's authenticated invocation scope.
+/// Unscoped/legacy calls produce no correlated observation; no current-turn lookup occurs.
+pub fn scoped_optional_operation(
+    state: &ServerState,
+    scope: &bcode_plugin::PluginInvocationScope,
+    feature: bcode_model::judgement::Feature,
+) -> Option<super::judgement::ConsumerOperationHandle> {
+    state
+        .optional_judgement
+        .observation_for_scope(scope)
+        .map(|turn| {
+            turn.begin_operation(
+                feature,
+                bcode_model::judgement::TriggerDisposition::Triggered,
+            )
+        })
+}
+
+/// Route nested optional inference through a host-owned operation correlation.
+/// Plugin request IDs cannot select an observer or certify application/coverage.
+/// Dropping this future retains pending inference and prevents complete closure.
+pub async fn judge_correlated_optional(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+    input: bcode_model::judgement::OptionalRequest,
+    operation: Option<&super::judgement::ConsumerOperationHandle>,
+) -> bcode_model::judgement::OptionalResponse {
+    if let Some(operation) = operation {
+        state
+            .optional_judgement
+            .judge_observed_with_config(state, config, input, operation)
+            .await
+    } else {
+        state
+            .optional_judgement
+            .judge_with_config(state, config, input)
+            .await
+    }
+}
+
 /// Failure while routing input to an active plugin invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteInvocationInputError {
@@ -377,6 +417,7 @@ async fn drive_service_bridge<T>(
                             &state.startup_config,
                             request.payload.clone(),
                             &cancel,
+                            None,
                         ) => result,
                     };
                     Ok(bcode_plugin_sdk::ServiceBridgeResponse::Service(result))

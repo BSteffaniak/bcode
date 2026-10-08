@@ -5065,13 +5065,28 @@ fn execute_plugin_service_invocation(
         "plugin service invocation started"
     );
     let bridge = invocation.bridge.clone();
+    let mut delivered_events = 0_u64;
     let response = plugin.invoke_service_with_bridge(
         invocation.interface_id,
         invocation.operation,
         invocation.payload,
         |event| {
             if let Some(sender) = &invocation.event_sender {
-                let _ = sender.send(event);
+                let accepted = sender.send(event).is_ok();
+                delivered_events = delivered_events.saturating_add(1);
+                // Schema-neutral, bounded evidence: never log service payloads. The first few
+                // callbacks distinguish queued work from delivery without per-token log growth.
+                if delivered_events <= 3 {
+                    tracing::debug!(
+                        target: "bcode_plugin::runtime",
+                        plugin_id = %plugin.manifest.id,
+                        invocation_id = invocation.id.get(),
+                        scope = ?invocation.scope,
+                        event_index = delivered_events,
+                        accepted,
+                        "plugin streaming event callback"
+                    );
+                }
             }
         },
         move |request, cancellation| {
@@ -5088,6 +5103,8 @@ fn execute_plugin_service_invocation(
         target: "bcode_plugin::runtime",
         plugin_id = %plugin.manifest.id,
         invocation_id = invocation.id.get(),
+        scope = ?invocation.scope,
+        delivered_events,
         duration_ms = started_at.elapsed().as_millis(),
         success = response.is_ok(),
         "plugin service invocation finished"

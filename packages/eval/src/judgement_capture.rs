@@ -125,6 +125,10 @@ pub struct CaptureTelemetry {
     /// At least one executed optional operation lacked central facts; totals remain unknown.
     #[serde(default)]
     pub optional_counts_incomplete: bool,
+    /// Producer explicitly closed observation of all optional operations for this turn.
+    /// A connected stream or a successful conversational turn alone cannot establish this.
+    #[serde(default)]
+    pub optional_operations_complete: bool,
     /// All normalized optional operations, including every trajectory prefix.
     #[serde(default)]
     pub optional_operations: Vec<bcode_model::judgement::OptionalOperationObservation>,
@@ -139,6 +143,15 @@ impl CaptureTelemetry {
         &mut self,
         response: &bcode_model::judgement::OptionalResponse,
     ) {
+        // Retaining a new operation invalidates any previously closed observation window.
+        self.optional_operations_complete = false;
+        if self.optional_operations.len() >= 1024 {
+            self.optional_counts_incomplete = true;
+            self.discovery_calls = None;
+            self.verification_calls = None;
+            self.inference_calls = None;
+            return;
+        }
         if let Some(observation) = &response.observation {
             if self.optional_operations.is_empty() && !self.optional_counts_incomplete {
                 self.discovery_calls = Some(0);
@@ -182,6 +195,9 @@ impl CaptureTelemetry {
                 self.decisions
                     .observe_service(Some(observation.outcome), None);
             }
+            if let Some(applied) = response.get("applied").and_then(serde_json::Value::as_bool) {
+                self.decisions.applied(Some(applied));
+            }
             self.retain_optional_response(&bcode_model::judgement::OptionalResponse {
                 response: None,
                 observation: Some(observation),
@@ -195,6 +211,50 @@ impl CaptureTelemetry {
                 response: None,
                 observation: None,
             });
+        }
+        Ok(())
+    }
+
+    /// Read normalized product evidence without promoting partial or legacy coverage.
+    pub(super) fn retain_turn_observation(
+        &mut self,
+        observation: &bcode_model::judgement::TurnJudgementObservation,
+    ) -> Result<(), ()> {
+        if observation.scope != bcode_model::judgement::ObservationScope::NormalTurn {
+            return Err(());
+        }
+        observation.validate().map_err(|_| ())?;
+        for operation in &observation.operations {
+            for inference in &operation.inference {
+                if let Some(projection) = &inference.decision {
+                    self.decisions
+                        .observe_projection(projection, inference.outcome);
+                    self.decisions
+                        .applied(operation.application.map(|application| {
+                            application == bcode_model::judgement::ApplicationDisposition::Applied
+                        }));
+                }
+                self.retain_optional_response(&bcode_model::judgement::OptionalResponse {
+                    response: None,
+                    observation: Some(inference.clone()),
+                });
+            }
+        }
+        // Counts of observed operations are not complete turn totals until explicit closure.
+        self.optional_operations_complete = observation.complete;
+        if !observation.complete {
+            self.optional_counts_incomplete = true;
+            self.discovery_calls = None;
+            self.verification_calls = None;
+            self.inference_calls = None;
+        } else if observation
+            .operations
+            .iter()
+            .all(|operation| operation.inference.is_empty())
+        {
+            self.discovery_calls = Some(0);
+            self.verification_calls = Some(0);
+            self.inference_calls = Some(0);
         }
         Ok(())
     }
@@ -558,6 +618,12 @@ impl ConsumerCapture {
         let request_only = self
             .request_only
             .ok_or("request-only persistence unknown")?;
+        if self.telemetry.optional_counts_incomplete {
+            return Err("optional operation counts incomplete");
+        }
+        if self.scope == CaptureScope::NormalTurn && !self.telemetry.optional_operations_complete {
+            return Err("normal-turn optional observation coverage unknown");
+        }
         let discovery_calls = self
             .telemetry
             .discovery_calls

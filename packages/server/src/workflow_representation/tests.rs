@@ -673,6 +673,95 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
 }
 
 #[tokio::test]
+async fn owner_admission_waits_for_store_writer_and_rechecks_authority() {
+    use bcode_workflow_store::ActivationDispatchOwner;
+
+    let (_root, _sessions, state, definition) = typed_provider_fixture().await;
+    let path = crate::workflow_store_path(&state);
+    let db = open(&path, true).expect("db");
+    let guard = owner::local_authority(&state, "new")
+        .await
+        .expect("authority")
+        .expect("owner");
+    let activation = representation::graph::ready(&db, "new", 1, None, 1)
+        .await
+        .expect("ready")
+        .pop()
+        .expect("activation");
+    let pending = bcode_workflow_store::PendingActivation {
+        run_id: "new".into(),
+        node_id: activation.node_id.clone(),
+        activation_id: activation.activation_id,
+        dependency_generation: activation.generation,
+        input: Some(activation.input),
+        node: definition.node(&activation.node_id).expect("node").clone(),
+        created_at_ms: 1,
+    };
+    let plan = crate::WorkflowActivationOwner { state: &state }
+        .plan(&pending)
+        .await
+        .expect("plan")
+        .expect("supported");
+    let prepared = bcode_workflow_store::PreparedAttempt {
+        run_id: pending.run_id.clone(),
+        node_id: pending.node_id.clone(),
+        activation_id: pending.activation_id.clone(),
+        attempt: 1,
+        side_effect: plan.side_effect,
+        intent: plan.intent,
+        prepared_at_ms: crate::current_unix_millis(),
+    };
+    let identity = representation::attempts::prepare(&db, &guard.authority, &prepared)
+        .await
+        .expect("prepare");
+    let dispatch = bcode_workflow_store::PreparedActivationDispatch {
+        activation: pending,
+        attempt: 1,
+        dispatch_identity: identity,
+        intent: prepared.intent,
+    };
+    let queue = backpressure::write_queue(&path).expect("queue");
+    let writer = queue.lock().await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            owner::check_owner_admission(&state, &dispatch, &guard.authority),
+        )
+        .await
+        .is_err(),
+        "admission must not bypass an active persistence writer"
+    );
+    drop(writer);
+    assert!(
+        owner::check_owner_admission(&state, &dispatch, &guard.authority)
+            .await
+            .expect("released writer")
+            .is_none()
+    );
+    let mut obsolete_authority = guard.authority.clone();
+    obsolete_authority.fencing_token = "stale-owner".into();
+    assert!(
+        owner::check_owner_admission(&state, &dispatch, &obsolete_authority)
+            .await
+            .is_err(),
+        "queue admission does not confer execution authority"
+    );
+    assert!(
+        state
+            .sessions
+            .all_session_summaries()
+            .await
+            .iter()
+            .all(|session| {
+                session
+                    .execution
+                    .as_ref()
+                    .is_none_or(|execution| execution.provenance.run_id != "new")
+            })
+    );
+}
+
+#[tokio::test]
 async fn typed_agent_test_harness_uses_real_prompt_owner_and_fake_provider() {
     use bcode_workflow_store::ActivationDispatchOwner;
     let (_root, _sessions_root, state, definition) = typed_provider_fixture().await;
@@ -1621,6 +1710,7 @@ async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
             .await
             .expect("duplicate pause")
     );
+    crate::recover_workflow_continuation(&state, "new").await;
     crate::drive_workflow_run(&state, "new")
         .await
         .expect("paused drive");

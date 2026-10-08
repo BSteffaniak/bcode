@@ -136,6 +136,77 @@ means the oracle rejected them, not that quality passed. Preserve calibration ar
 
 ## Actual consumer capture readiness
 
+Direct and editing currently share the same agent boundary, prompt and bounded tools;
+mode labels are not evidence of distinct execution strategies. Swarm requires independently
+observed worker dispatch/integration; selecting `workflow` alone is not that evidence.
+Generated `schedule.json` records the corpus digest, execution boundary and unverified
+trigger evidence. Each block has a separate `trigger-contract.json`; the existing
+`request.json` remains exactly `{feature,input}` for capture compatibility.
+
+### Six normal-path trigger contracts
+
+| Feature | Required actual trigger | Required application evidence |
+| --- | --- | --- |
+| Tool-result triage | A bounded harness tool settles with supplied status/excerpt | Diagnostic annotation after settlement; unchanged success/failure; no retry |
+| Context reranking | Supplied candidates enter ordinary budgeted context admission | Applied ordering/admission, mandatory retention and protected positions |
+| Recommendations | Authorized bounded catalog enters ordinary recommendation selection | Advisory ordering only, no execution or permission grant |
+| Progress monitoring | Ordered observations enter active-turn progress hook | Bounded advice; unchanged turn authority; corpus time distinct from elapsed wall time |
+| Session categorization | Supplied newest request enters ordinary categorization hook | Advisory labels; unchanged canonical history and task authority |
+| Eval categorization | Independently judged terminal attempt enters eval hook | Advisory labels; unchanged terminal status, command oracle and nullable metrics |
+
+### Supported operation preflight (not normal-turn proof)
+
+Concrete supported capture inputs are `ConsumerRequest::Service` with producer-owned
+typed inputs for triage, context, recommendations, progress and session labels, and
+`ConsumerRequest::EvalDiagnosis` for terminal eval diagnosis. The operation identities are:
+
+* `bcode.loop.tool-result-triage/v1:triage`
+* `bcode.context-selection/v1:prepare+optional_judge+apply`
+* `bcode.skills-selection/v1:prepare+optional_judge+apply`
+* `bcode.loop.progress-monitoring/v1:observe` (trajectory replay uses ordered prefixes)
+* `bcode.session-categorization/v1:categorize`
+* `eval.diagnosis.optional_judge` (advisory attachment to independent oracle/diagnosis)
+
+These execute actual algorithms through the public application/plugin boundary, but remain
+**service microbenchmarks**, not downstream ordinary-turn treatments. Use the capture
+materializer's producer-schema adapters, not raw corpus inputs or expected answer values.
+Each trigger contract names its supported operation/scope; no environment hint invokes it.
+
+The offline `operation_preflight` gate requires independently established exact subject
+identity, effective arm, accepted typed input, observed public operation and producer
+execution, observed application or explicit fallback, unchanged authority, complete optional
+ledger and known billing. Off requires exactly zero optional calls. On requires measured
+invocation or explicit typed fallback/abstention; unknown counters, numeric booleans and
+missing facts fail closed. Passing this preflight still returns `normal_turn_ready: false`.
+Coordinator owns collecting these facts and applying overlays; tooling does not self-attest.
+
+There is currently no public turn-correlated optional ledger. Ordinary direct/editing/swarm
+artifact tasks therefore cannot claim Jev treatment or zero off-arm optional calls; their
+normal-path gates remain unknown even after successful artifacts. Direct tasks currently declare only
+`filesystem.read`, `filesystem.write`, `filesystem.edit`, `shell.run`; this declaration is
+not user approval. Workflow tools are
+not added to their allowlist. Swarm publication needs separate coordinator authorization.
+
+These contracts describe triggerable integration designs, not completed wiring. Reading
+recorded failure text does not create a failing tool result; reading observations does not
+create live progress. Merely placing catalog/candidate input in an environment request
+cannot prove the application used it. Capture/coordinator integration must establish each
+trigger, producer invocation (or explicit abstention/fallback), and consumer application.
+Ordinary artifact success remains separately scored and never establishes Jev execution.
+Global-off must establish zero optional discovery/verification/inference calls. Unknown
+telemetry, unavailable hooks and missing observations block normal-path coverage.
+
+Materialization resets source order before each seeded repetition shuffle, so scheduling
+is reproducible independently of previous shuffles. Prompts declare exact field names,
+JSON types and label vocabularies without embedding expected values; unsupported fields
+fail closed. Frozen held-out bytes and expected answers are unchanged.
+
+The legacy Python v1 summary is descriptive only: it reports observed/trigger/applied and
+unknown terminal/cost coverage, but lacks an authenticated schedule and producer, fallback,
+isolation and safety facts. Scheduled/missing attempts remain null and promotion is always
+ineligible; use shared capture reports for stronger gates, never infer missing attempts as
+zero or ordinary success as producer success.
+
 Coordinator-owned capture jobs and CLI dispatch are separate from task materialization.
 Use supported `CaptureJob`/`ServiceConsumer` schemas, not arbitrary command strings or
 expected provider answers. The implemented service paths run the actual producer
@@ -181,10 +252,74 @@ Reports include raw shared-oracle scores separately from promotion-eligible comp
 Unknown configuration, safety, persistence, billing or required task coverage blocks a
 positive verdict. Raw service scores never establish normal-turn quality or efficiency.
 
+## Executable serial producer preflight
+
+`fixtures/evals/judgement/product_preflight.py` reuses capture lane's
+`materialize(corpus, template, gates, repetitions, dimension, output)`,
+`adapt(case, dimension)` and `validate_service_input(consumer)` without modifying them.
+It selects the first authored development case per feature before observing results,
+generates twelve ordered off/on jobs with supported producer inputs, and writes
+`serial-suite.json` with exact argv, non-secret environment overlays and job digests.
+These are public service studies, never ordinary-turn downstream gain evidence.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 fixtures/evals/judgement/product_preflight.py prepare \
+  --provenance /ABS/provenance.json --request-template /ABS/request-template.json \
+  --gates /ABS/gates.json --output /ABS/NEW/public-preflight
+PYTHONDONTWRITEBYTECODE=1 python3 fixtures/evals/judgement/product_preflight.py check \
+  --suite /ABS/NEW/public-preflight/serial-suite.json --captures /ABS/captures
+```
+
+Preparation executes no Bcode commands. Every job has `allow_live: false`; `--allow-live`
+is rejected. Coordinator alone may admit execution after explicit user authorization,
+budget and independently verified subject/config/catalog/tool policy. Generated commands
+require a matching already-running daemon; CLI inline overlays do **not** reconfigure it.
+Each arm's resolved configuration digest must match the daemon actually serving that arm.
+No shared daemon restart, credential/config dump, PATH fallback or artifact existence
+assumption is involved.
+
+Provenance JSON has exactly six top-level fields: `schema_version: 1`, `launch`,
+`selection`, `jev_selection`, `tool_policy`, `subjects`:
+
+* `launch`: absolute `config_file` and `state_root`, nullable `context`, opaque non-secret
+  `endpoint_id`, and `inline_overrides_accounted: true`.
+* `selection`: explicit `provider`, `model`, `auth_profile`, `model_profile` references.
+  The request-only Sol selection is `bcode.openai-compatible/gpt-6.1-sol`, profile `sol`,
+  account reference `openai-2`; it remains subject to admission verification.
+* `jev_selection`: `provider_plugin_id`, concrete `model_id`, `auth_profile`. No version
+  is defaulted. `bcode.jev/jev-1.13.0` is usable only if current config/catalog and explicit
+  selection establish it; prior prompt statements do not authorize that pin.
+* `tool_policy`: boolean `approved` (declaration, not proof), ordered `allowed_tools`
+  matching the four declared file/shell tools, `workflow_tools_approved: false`.
+* `subjects`: all six feature names, each with `off` and `on` exact `SubjectIdentity`.
+  Executable/artifact/state identities must agree throughout; off/on configuration digests
+  must differ. `configuration_complete` is a caller declaration verified at admission.
+
+Request template and gates use capture lane's existing typed contracts. Neither expected
+answers nor credentials enter job consumer inputs. Six adapter-trigger subcases exercise
+actual supported input translation and validation offline; they are not producer execution
+claims. The checker requires captured consumer execution, verified isolation, explicit
+optional observations, known counters, and complete billing. Off requires a recorded
+`disabled` observation and exact zero discovery/verification/inference counts—not silence.
+Missing captures, stale request identities, unknown fallback or cost remain blocked.
+
+Current normal-path injection limits are precise: `NormalTurnRequest` accepts an existing
+session, prompt, admission metadata, event bound and categorization dimension; it has no
+caller-supplied settled-result, candidate budget/catalog or ordered-progress injection.
+Triage needs a real settled diagnostic tool result; context needs actual grep/retrieval
+pressure; recommendations need eligible filtered catalog entries; progress needs real
+settled work; categorization needs an admitted request; eval diagnosis needs measured
+terminal failure. None can be forced by the fixture request environment. A turn-correlated
+complete optional operation ledger and application decisions are still unavailable. The
+implemented improvement is runnable typed producer-job generation and capture preflight,
+not an invented normal-turn injection API or a claim to close those gaps.
+
 ## Budget, gates and honest readiness
 
-**No live calls by this lane; any additional approved live pilot is serial and capped at
-$1 aggregate.** Full generated schedules are not authorized by the cap. With development
+**No live budget, tool-policy approval, Jev version selection or artifact availability is
+established by this document.** Historical cap/approval statements are not authorization.
+Live execution requires explicit current user budget and verified config/catalog selection;
+source generation stays disabled-live. With development
 v3, two repetitions × 36 tasks × fourteen arms = 1,008 attempts per mode. A full three-mode
 study is 3,024 attempts and cannot be assumed affordable. Coordinator must approve a fresh
 subject, exact configuration/model/profile, verified current prices including retry/cache/

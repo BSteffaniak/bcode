@@ -139,6 +139,10 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
         );
         let definition =
             fanout_definition(parallel_provider_definition().nodes["left"].clone(), 32);
+        let expected_admissions = cap.unwrap_or(32);
+        eprintln!(
+            "normal fanout arm cap={cap:?}, expected_initial_admissions={expected_admissions}"
+        );
         start_public(
             &state,
             "normal-fanout",
@@ -153,6 +157,23 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
             .expect("attempts");
         assert_eq!(attempts.len(), cap.unwrap_or(32) as usize);
         assert!(attempts.iter().all(|a| a.receipt.is_some()));
+        crate::drive_workflow_run(&state, "normal-fanout")
+            .await
+            .expect("normal continuation while providers are gated");
+        let rescanned = representation::attempts::pending(&db, "normal-fanout", None, 100)
+            .await
+            .expect("rescanned attempts");
+        assert_eq!(rescanned.len(), attempts.len());
+        assert_eq!(
+            rescanned
+                .iter()
+                .map(|a| a.prepared.dispatch_identity())
+                .collect::<Vec<_>>(),
+            attempts
+                .iter()
+                .map(|a| a.prepared.dispatch_identity())
+                .collect::<Vec<_>>()
+        );
         state.start_workflow_driver().await;
         drop(gate);
         // Up to 24 members still need session setup after the cap8 gate releases.
@@ -163,13 +184,15 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
             std::time::Duration::from_secs(32 * 2),
         )
         .await;
+        let diagnostic = if result.is_err() {
+            bounded_run_diagnostic(&state, "normal-fanout").await
+        } else {
+            String::new()
+        };
         stop_fixture_driver(&state).await;
         assert!(
             result.is_ok(),
-            "normal scheduler completion cap={cap:?}, remaining={:?}",
-            representation::attempts::pending(&db, "normal-fanout", None, 100)
-                .await
-                .map(|v| v.len())
+            "normal scheduler completion cap={cap:?}: {diagnostic}"
         );
         let outputs = super::super::outputs::run_outputs(&state, "normal-fanout", 100)
             .await
@@ -211,7 +234,8 @@ pub(super) async fn start_public(
             &definition,
         )
         .expect("definition");
-    tokio::time::timeout(
+    eprintln!("bounded provider delivery diagnosis run={run_id} cap={cap:?} starting");
+    let started = tokio::time::timeout(
         std::time::Duration::from_secs(40),
         crate::workflow_operations::start_run(
             state,
@@ -232,9 +256,99 @@ pub(super) async fn start_public(
             None,
         ),
     )
+    .await;
+    if started.is_err() {
+        let diagnostic = bounded_run_diagnostic(state, run_id).await;
+        panic!("bounded normal start cap={cap:?}, run={run_id}: {diagnostic}");
+    }
+    started
+        .expect("bounded normal start")
+        .expect("normal start");
+    eprintln!("bounded provider delivery diagnosis run={run_id} cap={cap:?} start returned");
+}
+
+async fn bounded_run_diagnostic(state: &ServerState, run_id: &str) -> String {
+    use std::fmt::Write as _;
+
+    match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let db = open(&crate::workflow_store_path(state), false)?;
+        let snapshot = representation::scheduling::snapshot(&db, run_id, None, None, 100)
+            .await
+            .map_err(backpressure::normalize)?;
+        // Typed snapshot has identities, attempt numbers, receipt-presence and terminal
+        // facts only. No input, intent, receipt payload or provider-private metadata.
+        let mut diagnostic = format!("{snapshot:?}");
+        let pending = representation::attempts::pending(&db, run_id, None, 8)
+            .await
+            .map_err(backpressure::normalize)?;
+        for attempt in pending {
+            let Some(receipt) = attempt.receipt else {
+                continue;
+            };
+            let decoded = crate::workflow_receipts::AgentTurnReceipt::decode(&receipt.receipt);
+            if let Ok(receipt_owner) = decoded {
+                let session = receipt_owner.session_id;
+                let turn = receipt_owner.turn_id;
+                let live = state.session_current_turn(session).await;
+                let runtime = state.session_runtimes.lock().await.get(&session).cloned();
+                let runtime_facts = if let Some(runtime) = runtime {
+                    let phase = *runtime.phase.lock().await;
+                    format!(
+                        "phase={phase:?} queued_followups={} queued_steering={}",
+                        runtime.queued_followups.load(std::sync::atomic::Ordering::Acquire),
+                        runtime.queued_steering.load(std::sync::atomic::Ordering::Acquire),
+                    )
+                } else {
+                    "runtime_absent".into()
+                };
+                let admission = crate::turn_admission_lock(state, session).await;
+                let admission_locked = admission.try_lock().is_err();
+                let drive_gate = crate::workflow_drive_gate(state, run_id);
+                let drive_locked = drive_gate.try_lock().is_err();
+                let provider_admitted = live
+                    .as_ref()
+                    .and_then(|current| current.model.as_ref())
+                    .is_some_and(|model| !model.provider_turn_id.is_empty());
+                let request_present = live.as_ref().is_some_and(|current| current.model.is_some());
+                let provider_round = live
+                    .as_ref()
+                    .and_then(|current| current.model.as_ref())
+                    .map(|model| model.identity.round);
+                let evidence = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    state.sessions.session_turn_evidence(session, &turn),
+                )
+                .await;
+                let terminal = evidence
+                    .as_ref()
+                    .ok()
+                    .and_then(|result| result.as_ref().ok())
+                    .is_some_and(|events| {
+                        events.iter().any(|event| matches!(
+                            &event.kind,
+                            bcode_session_models::SessionEventKind::ModelTurnFinished { turn_id, .. }
+                                if turn_id == &turn
+                        ))
+                    });
+                write!(
+                    diagnostic,
+                    "\nnode={} local_turn={} session_terminal={} evidence_available={} request_present={request_present} provider_admitted={provider_admitted} provider_round={provider_round:?} admission_locked={admission_locked} drive_locked={drive_locked} {runtime_facts}",
+                    attempt.prepared.node_id,
+                    live.is_some_and(|current| current.turn_id == turn),
+                    terminal,
+                    matches!(evidence, Ok(Ok(_))),
+                )
+                .expect("write diagnostic string");
+            }
+        }
+        Ok::<_, ServerError>(diagnostic)
+    })
     .await
-    .expect("bounded normal start")
-    .expect("normal start");
+    {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(_)) => "canonical scheduling observation unavailable".into(),
+        Err(_) => "canonical scheduling observation timed out".into(),
+    }
 }
 
 pub(super) async fn wait_public(

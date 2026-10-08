@@ -233,6 +233,8 @@ pub async fn drive_if_represented(
     let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy | RunLookup::Missing => Ok(false),
+        // This representation stores every nonterminal run as Paused. User pause
+        // is a separate control checked by driver::drive; only terminal rows skip it.
         RunLookup::Available(run) if run.state != representation::runs::RunState::Paused => {
             Ok(true)
         }

@@ -819,6 +819,10 @@ pub enum CoreRuntimeRequest {
     SelectOptionalContext {
         request_json: String,
     },
+    TurnJudgementObservation {
+        session_id: SessionId,
+        turn_id: String,
+    },
     OptionalJudge {
         request_json: String,
     },
@@ -1708,6 +1712,13 @@ impl RoutedRequest {
                     request_json,
                 }))
             }
+            Request::TurnJudgementObservation {
+                session_id,
+                turn_id,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::TurnJudgementObservation {
+                session_id,
+                turn_id,
+            })),
             Request::OptionalJudge { request_json } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::OptionalJudge { request_json }))
             }

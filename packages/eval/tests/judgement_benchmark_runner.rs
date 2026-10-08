@@ -66,6 +66,71 @@ fn unknown_telemetry_is_not_free_or_zero() {
 }
 
 #[test]
+fn normal_turn_zero_counts_require_explicit_closed_coverage() {
+    let mut capture = capture();
+    capture.scope = CaptureScope::NormalTurn;
+    capture.telemetry.discovery_calls = Some(0);
+    capture.telemetry.verification_calls = Some(0);
+    capture.telemetry.inference_calls = Some(0);
+    assert_eq!(
+        capture.benchmark_observation().unwrap_err(),
+        "normal-turn optional observation coverage unknown"
+    );
+    capture.telemetry.optional_operations_complete = true;
+    assert!(capture.benchmark_observation().is_ok());
+    assert_eq!(capture.telemetry.total_cost_usd(), None);
+
+    // A later operation without facts reopens coverage and permanently invalidates totals.
+    capture
+        .telemetry
+        .retain_optional_response(&bcode_model::judgement::OptionalResponse {
+            response: None,
+            observation: None,
+        });
+    assert!(!capture.telemetry.optional_operations_complete);
+    assert_eq!(capture.telemetry.discovery_calls, None);
+    assert_eq!(capture.telemetry.verification_calls, None);
+    assert_eq!(capture.telemetry.inference_calls, None);
+    // Neither a caller-supplied completeness flag nor counters can erase the known gap.
+    capture.telemetry.optional_operations_complete = true;
+    capture.telemetry.discovery_calls = Some(0);
+    capture.telemetry.verification_calls = Some(0);
+    capture.telemetry.inference_calls = Some(0);
+    assert!(capture.benchmark_observation().is_err());
+}
+
+#[test]
+fn optional_operation_retention_is_bounded_without_false_totals() {
+    let mut telemetry = CaptureTelemetry::default();
+    let response = bcode_model::judgement::OptionalResponse {
+        response: None,
+        observation: Some(bcode_model::judgement::OptionalOperationObservation {
+            inference_invocations: 1,
+            ..Default::default()
+        }),
+    };
+    for _ in 0..1025 {
+        telemetry.retain_optional_response(&response);
+    }
+    assert_eq!(telemetry.optional_operations.len(), 1024);
+    assert!(telemetry.optional_counts_incomplete);
+    assert!(!telemetry.optional_operations_complete);
+    assert_eq!(telemetry.inference_calls, None);
+    assert_eq!(telemetry.total_cost_usd(), None);
+}
+
+#[test]
+fn legacy_capture_does_not_claim_normal_turn_coverage() {
+    let mut value = serde_json::to_value(capture()).unwrap();
+    value["telemetry"]
+        .as_object_mut()
+        .unwrap()
+        .remove("optional_operations_complete");
+    let legacy: ConsumerCapture = serde_json::from_value(value).unwrap();
+    assert!(!legacy.telemetry.optional_operations_complete);
+}
+
+#[test]
 fn off_work_future_versions_and_unverified_provenance_fail_closed() {
     let mut capture = capture();
     capture.telemetry = CaptureTelemetry {
@@ -79,6 +144,7 @@ fn off_work_future_versions_and_unverified_provenance_fail_closed() {
         optional_operation: None,
         optional_operations: vec![],
         optional_counts_incomplete: false,
+        optional_operations_complete: false,
         calls: vec![],
     };
     assert!(capture.telemetry.decisions.stages.is_empty());

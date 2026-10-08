@@ -106,9 +106,11 @@ pub async fn takeover(
         session_id,
         transition: transition.clone(),
     };
-    representation::safety::handoff_for_recovery(&db, &transition, &resolver)
-        .await
-        .map_err(|_| unsupported())?;
+    super::backpressure::queued(retained.path(), || {
+        representation::safety::handoff_for_recovery(&db, &transition, &resolver)
+    })
+    .await
+    .map_err(|_| unsupported())?;
     owner_boundary::verify(&db, run_id, &replacement)
         .await
         .map_err(|_| unavailable())?;
@@ -194,9 +196,11 @@ pub async fn reconcile(
         .0
         .is_empty()
     {
-        representation::safety::finish_recovery(&db, run_id, authority)
-            .await
-            .map_err(|_| unavailable())?;
+        super::backpressure::queued(retained.path(), || {
+            representation::safety::finish_recovery(&db, run_id, authority)
+        })
+        .await
+        .map_err(|_| unavailable())?;
     }
     Ok(())
 }

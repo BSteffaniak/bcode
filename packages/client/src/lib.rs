@@ -4237,6 +4237,48 @@ impl BcodeClient {
         }
     }
 
+    /// Read exact turn-correlated transient consumer evidence without canonical replay.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, unknown versions, oversized or mismatched snapshots,
+    /// and incompatible transport responses. Absence is unknown, never zero calls.
+    pub async fn turn_judgement_observation(
+        &self,
+        session_id: SessionId,
+        turn_id: &str,
+    ) -> Result<Option<bcode_model::judgement::TurnJudgementObservation>, ClientError> {
+        if turn_id.is_empty() || turn_id.len() > 128 {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        match self
+            .send_request(Request::TurnJudgementObservation {
+                session_id,
+                turn_id: turn_id.into(),
+            })
+            .await?
+        {
+            ResponsePayload::TurnJudgementObservation {
+                observation_json: Some(json),
+            } if json.len() <= bcode_model::judgement::MAX_TURN_OBSERVATION_BYTES => {
+                let observation: bcode_model::judgement::TurnJudgementObservation =
+                    serde_json::from_str(&json).map_err(|_| ClientError::UnexpectedResponse)?;
+                observation
+                    .validate()
+                    .map_err(|_| ClientError::UnexpectedResponse)?;
+                if observation.session_id != session_id.to_string()
+                    || observation.turn_id != turn_id
+                {
+                    return Err(ClientError::UnexpectedResponse);
+                }
+                Ok(Some(observation))
+            }
+            ResponsePayload::TurnJudgementObservation {
+                observation_json: None,
+            } => Ok(None),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Read bounded disposable advisory labels without replaying session history.
     /// Labels may be absent after eviction or daemon restart; they confer no authority.
     ///

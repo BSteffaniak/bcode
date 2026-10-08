@@ -3547,6 +3547,140 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
         ));
     }
 
+    #[cfg(feature = "static-bundled")]
+    fn assert_fake_push_completion(response: &ServiceResponse, events: &[ProviderTurnEvent]) {
+        assert_eq!(
+            events.len(),
+            3,
+            "push must deliver each lifecycle/output event"
+        );
+        assert!(matches!(events[0], ProviderTurnEvent::TurnStarted));
+        assert!(matches!(
+            &events[1],
+            ProviderTurnEvent::Output {
+                event: ProviderOutputEvent::TextDelta { text }, ..
+            } if text == "9"
+        ));
+        assert!(matches!(
+            events[2],
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn
+            }
+        ));
+        assert!(response.error.is_none(), "{response:?}");
+        let response: RunTurnResponse =
+            serde_json::from_slice(&response.payload).expect("run response");
+        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    /// Exercise the complete fake push path, not just script queue production. A released gate
+    /// remains released for later admissions, including a second batch sharing the same gate.
+    #[cfg(feature = "static-bundled")]
+    #[test]
+    fn fake_push_fanout_retains_gate_release_for_current_and_later_turns() {
+        extern "C" fn collect_event(
+            payload: *const u8,
+            length: usize,
+            user_data: *mut std::ffi::c_void,
+        ) {
+            // SAFETY: Each worker retains its event vector until its synchronous run_turn
+            // returns; the emitter invokes this callback only on that worker.
+            let (payload, events) = unsafe {
+                (
+                    std::slice::from_raw_parts(payload, length),
+                    &mut *user_data.cast::<Vec<ProviderTurnEvent>>(),
+                )
+            };
+            if let Ok(event) = serde_json::from_slice(payload) {
+                events.push(event);
+            }
+        }
+
+        for count in [8, 32] {
+            let plugin = Arc::new(FakeProviderPlugin::default());
+            let gate = format!("fake-push-fanout-{count}");
+            FAKE_SCRIPT_GATES.0.lock().expect("gates").remove(&gate);
+            let (responses, received) = std::sync::mpsc::channel();
+            let script = FakeProviderEventScript {
+                steps: vec![
+                    FakeProviderEventScriptStep {
+                        gate: Some(gate.clone()),
+                        delay_ms: None,
+                        event: ProviderTurnEvent::TextDelta { text: "9".into() },
+                    },
+                    FakeProviderEventScriptStep {
+                        gate: None,
+                        delay_ms: None,
+                        event: ProviderTurnEvent::TurnFinished {
+                            stop_reason: StopReason::EndTurn,
+                        },
+                    },
+                ],
+            };
+            let mut workers = Vec::new();
+            for batch in 0..2 {
+                for index in 0..count {
+                    let plugin = Arc::clone(&plugin);
+                    let responses = responses.clone();
+                    let script = script.clone();
+                    workers.push(std::thread::spawn(move || {
+                        let mut context: NativeServiceContext = serde_json::from_value(
+                            serde_json::json!({
+                                "plugin_id": "bcode.fake-provider",
+                                "request": {
+                                    "interface_id": MODEL_PROVIDER_INTERFACE_ID_V3,
+                                    "operation": OP_RUN_TURN,
+                                    "payload": serde_json::to_vec(&serde_json::json!({
+                                        "session_id": "00000000-0000-0000-0000-000000000000",
+                                        "turn_id": format!("batch-{batch}-{index}"),
+                                        "model_id": "fake-echo",
+                                        "messages": [],
+                                        "provider_context": {"settings": {
+                                            "fake_event_script": serde_json::to_string(&script).expect("script")
+                                        }}
+                                    })).expect("request")
+                                }
+                            }),
+                        ).expect("context");
+                        let mut events = Vec::<ProviderTurnEvent>::new();
+                        context.events = bcode_plugin_sdk::ServiceEventEmitter::new(
+                            Some(collect_event),
+                            std::ptr::from_mut(&mut events).cast(),
+                        );
+                        let response = plugin.run_turn(&context);
+                        responses.send((response, events)).expect("response receiver");
+                    }));
+                }
+                if batch == 0 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while plugin.state.lock().expect("state").turns.len() != count {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fake push turns did not register"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(
+                        received.try_recv().is_err(),
+                        "gated push returned before release"
+                    );
+                    release_fake_event_script_gate(&gate);
+                }
+                for _ in 0..count {
+                    let (response, events) = received
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("released push response");
+                    assert_fake_push_completion(&response, &events);
+                }
+                assert!(plugin.state.lock().expect("state").turns.is_empty());
+            }
+            for worker in workers {
+                worker.join().expect("push worker");
+            }
+            FAKE_SCRIPT_GATES.0.lock().expect("gates").remove(&gate);
+        }
+    }
+
     #[test]
     fn fake_event_script_gates_arbitrary_provider_events_in_declared_order() {
         let gate = "fake-event-script-test-tool";

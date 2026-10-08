@@ -170,6 +170,7 @@ impl VerificationCache {
 pub struct OptionalJudgementAccess {
     permit: tokio::sync::Semaphore,
     cache: Arc<Mutex<VerificationCache>>,
+    observations: Mutex<super::TurnObservationStore>,
 }
 
 /// Credential-refresh bridge without application state, credentials or routing authority.
@@ -202,7 +203,57 @@ impl OptionalJudgementAccess {
         Self {
             permit: tokio::sync::Semaphore::new(1),
             cache: Arc::new(Mutex::new(VerificationCache::default())),
+            observations: Mutex::new(super::TurnObservationStore::default()),
         }
+    }
+
+    /// Start request-only observation of an exact admitted turn; duplicate IDs fail closed.
+    pub fn begin_turn_observation(
+        &self,
+        session: bcode_session_models::SessionId,
+        turn: &str,
+    ) -> Option<super::TurnObservationHandle> {
+        self.observations.lock().ok()?.begin(session, turn)
+    }
+
+    /// Resolve observation correlation exclusively from authenticated plugin invocation scope.
+    pub fn observation_for_scope(
+        &self,
+        scope: &PluginInvocationScope,
+    ) -> Option<super::TurnObservationHandle> {
+        let PluginInvocationScope::Session {
+            session_id,
+            turn_id: Some(turn),
+            ..
+        } = scope
+        else {
+            return None;
+        };
+        let session = session_id.parse::<bcode_session_models::SessionId>().ok()?;
+        self.observations.lock().ok()?.handle(session, turn)
+    }
+
+    /// Bounded non-mutating observation read. Eviction/restart/legacy absence is unknown.
+    pub fn turn_observation_json(
+        &self,
+        session: bcode_session_models::SessionId,
+        turn: &str,
+    ) -> Option<String> {
+        self.observations.lock().ok()?.snapshot_json(session, turn)
+    }
+
+    /// Correlated central inference; dropping the future leaves explicit pending coverage.
+    pub async fn judge_observed_with_config(
+        &self,
+        state: &ServerState,
+        config: &bcode_config::BcodeConfig,
+        input: OptionalRequest,
+        operation: &super::ConsumerOperationHandle,
+    ) -> OptionalResponse {
+        operation.inference_started();
+        let response = self.judge_with_config(state, config, input).await;
+        operation.record_inference(&response);
+        response
     }
 
     /// Invalidate after auth, configuration or provider lifecycle changes.

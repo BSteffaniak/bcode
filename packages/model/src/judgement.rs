@@ -40,6 +40,236 @@ pub enum Feature {
     EvalCategorization,
 }
 
+/// Maximum transient turn observation export, independent of session history size.
+pub const MAX_TURN_OBSERVATION_BYTES: usize = 128 * 1024;
+/// Maximum retained consumer operations in one turn observation.
+pub const MAX_TURN_OPERATIONS: usize = 64;
+/// Compatibility boundary for transient product observations.
+pub const TURN_OBSERVATION_VERSION: u32 = 1;
+
+/// Actual trigger disposition; ineligible work is not consumer execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerDisposition {
+    /// The consumer's prerequisite was actually satisfied.
+    Triggered,
+    /// The resolved configuration disabled this consumer before optional calls.
+    Disabled,
+    /// The prerequisite was checked and was not satisfied.
+    NotApplicable,
+}
+
+/// Host acknowledgment after downstream validation, not central advice success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationDisposition {
+    /// Validated advice was installed at the actual consumer boundary.
+    Applied,
+    /// Baseline was explicitly retained after optional advice.
+    BaselineRetained,
+    /// Consumer or application evidence was unavailable.
+    Unavailable,
+    /// The operation was cancelled before application.
+    Cancelled,
+}
+
+/// Terminal observation state; this does not change authoritative turn outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationTerminal {
+    /// Authoritative turn completed.
+    Completed,
+    /// Authoritative turn failed.
+    Failed,
+    /// Authoritative turn was cancelled.
+    Cancelled,
+}
+
+/// Content-free final selection, with ordinals scoped to the producer candidate snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionObservation {
+    /// Original candidate count, at most 32.
+    pub candidate_count: usize,
+    /// Final permutation, not a proposed ranking.
+    pub ordered: Vec<usize>,
+    /// Actually admitted candidate ordinals.
+    pub admitted: Vec<usize>,
+}
+
+impl SelectionObservation {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.candidate_count > 32
+            || self.ordered.len() != self.candidate_count
+            || self.admitted.len() > self.candidate_count
+            || self
+                .ordered
+                .iter()
+                .any(|ordinal| *ordinal >= self.candidate_count)
+            || self
+                .admitted
+                .iter()
+                .any(|ordinal| *ordinal >= self.candidate_count)
+            || self
+                .ordered
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.ordered.len()
+            || self
+                .admitted
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.admitted.len()
+        {
+            return Err("invalid selection observation");
+        }
+        Ok(())
+    }
+}
+
+/// One correlated consumer invocation; no input, prose, credentials or provider wire data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumerOperationObservation {
+    /// Monotonic turn-local operation identity.
+    pub operation_id: u64,
+    /// Feature whose actual trigger was evaluated.
+    pub feature: Feature,
+    /// Independent trigger fact.
+    pub trigger: TriggerDisposition,
+    /// Central inference facts; missing facts never mean zero calls.
+    pub inference: Vec<OptionalOperationObservation>,
+    /// False if any attempted central operation lacked a response or was omitted.
+    pub inference_complete: bool,
+    /// Actual host application acknowledgment, absent while pending or legacy.
+    pub application: Option<ApplicationDisposition>,
+    /// Actual final selection, absent if not exposed by that consumer.
+    pub selection: Option<SelectionObservation>,
+}
+
+/// Producer domain whose completeness is certified; eval attempts are not conversational turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationScope {
+    /// Ordinary admitted turn; covers five automatic turn consumers, excluding eval diagnosis.
+    NormalTurn,
+    /// Independently judged eval attempt; covers only eval categorization.
+    EvalAttempt,
+}
+
+/// Disposable bounded snapshot. Absence after eviction/restart is unknown, not zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnJudgementObservation {
+    /// Independently evolving compatibility boundary; unknown versions reject.
+    pub schema_version: u32,
+    /// Exact producer domain; absent legacy scope must not be guessed.
+    pub scope: ObservationScope,
+    /// Canonical session ID encoded without introducing a model-to-session dependency.
+    pub session_id: String,
+    /// Exact admitted application turn identity.
+    pub turn_id: String,
+    /// Retained operations in invocation order.
+    pub operations: Vec<ConsumerOperationObservation>,
+    /// Explicit producer coverage certified at terminal settlement.
+    pub covered_features: Vec<Feature>,
+    /// Terminal closure; no later operation can alter the snapshot.
+    pub terminal: Option<ObservationTerminal>,
+    /// Operations/details omitted by capture bounds.
+    pub omitted: u64,
+    /// Explicit closure certified the scoped producer hooks and settled operations.
+    pub complete: bool,
+}
+
+impl TurnJudgementObservation {
+    /// Validate compatibility, correlation shapes and bounded export.
+    ///
+    /// # Errors
+    /// Rejects unsupported versions, invalid identities, selection ordinals or oversized data.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != TURN_OBSERVATION_VERSION
+            || self.session_id.is_empty()
+            || self.session_id.len() > 128
+            || self.turn_id.is_empty()
+            || self.turn_id.len() > 128
+            || self.session_id.chars().any(char::is_control)
+            || self.turn_id.chars().any(char::is_control)
+            || self.operations.len() > MAX_TURN_OPERATIONS
+            || self.covered_features.len() > 6
+        {
+            return Err("invalid turn observation");
+        }
+        for (index, operation) in self.operations.iter().enumerate() {
+            if operation.operation_id != index as u64 || operation.inference.len() > 8 {
+                return Err("invalid operation observation");
+            }
+            if operation.inference_complete
+                && operation.trigger == TriggerDisposition::Triggered
+                && operation.inference.is_empty()
+            {
+                return Err("triggered inference coverage has no evidence");
+            }
+            if operation.application == Some(ApplicationDisposition::Applied)
+                && operation.trigger != TriggerDisposition::Triggered
+            {
+                return Err("inactive trigger claims application");
+            }
+            if operation.trigger != TriggerDisposition::Triggered && !operation.inference.is_empty()
+            {
+                return Err("inactive trigger has inference");
+            }
+            if operation.selection.as_ref().is_some_and(|selection| {
+                selection.ordered.len() > 32 || selection.admitted.len() > 32
+            }) {
+                return Err("selection exceeds bound");
+            }
+            if let Some(selection) = &operation.selection {
+                selection.validate()?;
+            }
+        }
+        let all: &[Feature] = match self.scope {
+            ObservationScope::NormalTurn => &[
+                Feature::ToolResultTriage,
+                Feature::ContextReranking,
+                Feature::ProgressMonitoring,
+                Feature::Recommendations,
+                Feature::SessionCategorization,
+            ],
+            ObservationScope::EvalAttempt => &[Feature::EvalCategorization],
+        };
+        for feature in &self.covered_features {
+            if !all.contains(feature) {
+                return Err("feature outside observation scope");
+            }
+        }
+        if self.complete
+            && (self.terminal.is_none()
+                || self.omitted != 0
+                || !all.iter().all(|feature| {
+                    self.covered_features.contains(feature)
+                        && self.operations.iter().any(|op| op.feature == *feature)
+                })
+                || self.operations.iter().any(|op| {
+                    !op.inference_complete
+                        || op.application.is_none()
+                        || op.application == Some(ApplicationDisposition::Unavailable)
+                }))
+        {
+            return Err("invalid observation completeness");
+        }
+        if serde_json::to_vec(self)
+            .map_err(|_| "invalid turn observation")?
+            .len()
+            > MAX_TURN_OBSERVATION_BYTES
+        {
+            return Err("turn observation exceeds bound");
+        }
+        Ok(())
+    }
+}
+
 /// Transient provider verification envelope. Never persist or echo credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRequest {

@@ -27,7 +27,7 @@ pub async fn check_owner_admission(
         RunLookup::Legacy => retained.check_owner_admission(request, authority),
         RunLookup::Available(_) => {
             let db = open(retained.path(), true).map_err(store_error)?;
-            super::backpressure::retry(|| {
+            super::backpressure::queued(retained.path(), || {
                 owner_boundary::check_owner_admission(&db, request, authority)
             })
             .await
@@ -362,7 +362,7 @@ pub async fn cancel(state: &ServerState, run_id: &str) -> Result<Option<bool>, S
     })
     .await
     .map_err(|_| unavailable())?;
-    super::backpressure::retry(|| {
+    super::backpressure::queued(retained.path(), || {
         representation::safety::request_cancellation(
             &db,
             run_id,

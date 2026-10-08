@@ -438,16 +438,25 @@ async fn drive_page(
             progressed = true;
             continue;
         }
-        let started = std::time::Instant::now();
-        let diagnostic_node = activation.node_id.clone();
-        progressed |=
-            drive_activation(state, db, authority, run_id, revision, activation, node).await?;
         #[cfg(test)]
-        if run_id == "normal-fanout" {
-            eprintln!("admission-cost {diagnostic_node} {:?}", started.elapsed());
-        }
+        let diagnostic_node = activation.node_id.clone();
+        let operation = drive_activation(state, db, authority, run_id, revision, activation, node);
+        #[cfg(test)]
+        let advanced = {
+            tokio::pin!(operation);
+            tokio::select! {
+                result = &mut operation => result,
+                () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    // Diagnostic only: retain and await the original operation. A slow
+                    // admission may already have effects and must not be restarted.
+                    eprintln!("workflow activation still awaiting run={run_id}, node={diagnostic_node}");
+                    operation.await
+                }
+            }
+        };
         #[cfg(not(test))]
-        let _ = (started, diagnostic_node);
+        let advanced = operation.await;
+        progressed |= advanced?;
     }
     Ok(progressed)
 }

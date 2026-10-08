@@ -32,6 +32,8 @@ pub(super) async fn execute(
     input: NormalTurnRequest,
     capture: &mut ConsumerCapture,
 ) -> Result<(), ()> {
+    capture.scope = CaptureScope::NormalTurn;
+    capture.operation = "normal_turn.submit+live_contributions+terminal".into();
     if input.prompt.is_empty()
         || input.prompt.len() > 8192
         || input.max_events == 0
@@ -53,8 +55,6 @@ pub(super) async fn execute(
         // ordering has a bounded public observation. Do not spend on an uncapturable turn.
         return Err(());
     }
-    capture.scope = CaptureScope::NormalTurn;
-    capture.operation = "normal_turn.submit+live_contributions+terminal".into();
     // Subscribe before admission: transient contributions cannot be recovered by canonical replay.
     let mut connection = client.connect("judgement-capture").await.map_err(|_| ())?;
     connection
@@ -93,7 +93,22 @@ pub(super) async fn execute(
                         Feature::ToolResultTriage
                             if contribution.schema == "bcode.loop.diagnostic-advisory/v1" =>
                         {
-                            label = payload["category"].as_str().map(str::to_owned);
+                            // Only fixed plugin categories are portable evidence. Never retain
+                            // arbitrary strings supplied by an untrusted contribution producer.
+                            label = payload["category"]
+                                .as_str()
+                                .filter(|value| {
+                                    matches!(
+                                        *value,
+                                        "code"
+                                            | "environment"
+                                            | "auth"
+                                            | "transient"
+                                            | "partial"
+                                            | "inconclusive"
+                                    )
+                                })
+                                .map(str::to_owned);
                         }
                         Feature::ProgressMonitoring
                             if contribution.schema == "bcode.loop.progress-monitoring/v1"
@@ -160,10 +175,39 @@ pub(super) async fn execute(
                         Feature::Recommendations => None,
                         _ => return Err(()),
                     };
+                    let mut product_observation = None;
+                    // A terminal event may be published just before final producer closure.
+                    // Poll only this exact identity; absence remains unknown, never current-turn fallback.
+                    for _ in 0..5 {
+                        product_observation = client
+                            .turn_judgement_observation(input.session_id, &receipt.turn_id.0)
+                            .await
+                            .map_err(|_| ())?;
+                        if product_observation
+                            .as_ref()
+                            .is_some_and(|value| value.terminal.is_some())
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    if let Some(observation) = product_observation {
+                        capture.telemetry.retain_turn_observation(&observation)?;
+                        // NotApplicable and Disabled are not proof of consumer execution.
+                        capture.consumer_executed |=
+                            observation.operations.iter().any(|operation| {
+                                operation.feature == capture.request.feature
+                                    && operation.trigger
+                                        == bcode_model::judgement::TriggerDisposition::Triggered
+                                    && operation.application.is_some()
+                            });
+                    }
                     capture.status = if capture.output.is_some() && capture.consumer_executed {
                         CaptureStatus::Captured
                     } else {
-                        CaptureStatus::ConsumerUnavailable
+                        // Silence cannot distinguish baseline retention, disabled treatment,
+                        // an ineligible trigger, or a producer with missing observations.
+                        CaptureStatus::FallbackReasonUnknown
                     };
                     return Ok(());
                 }

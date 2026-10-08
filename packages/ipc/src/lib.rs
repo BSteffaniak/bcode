@@ -127,7 +127,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 48 adds scoped session discovery and bounded catalog pages.
 /// Version 49 adds content-free session progress snapshots; version 48 peers are rejected.
 /// Version 50 adds retained workflow activity snapshots and host progress timestamps.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 50;
+/// Version 51 adds bounded request-only turn judgement observations to that layout.
+/// Older positional request/response layouts are rejected rather than misinterpreted.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 51;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -996,6 +998,11 @@ pub enum Request {
     JudgementSetupValidate {
         /// Bounded JSON encoding of a portable selection.
         selection_json: String,
+    },
+    /// Read a disposable bounded observation; never replays or repairs canonical history.
+    TurnJudgementObservation {
+        session_id: SessionId,
+        turn_id: String,
     },
     /// Failure-optional judgement without session mutation.
     OptionalJudge {
@@ -2580,6 +2587,10 @@ pub enum ResponsePayload {
         outcome: SessionOwnershipReleaseOutcome,
     },
     /// Current disposable advisory labels, absent after eviction or daemon restart.
+    /// Codec-safe portable snapshot; absence is unknown after restart/eviction/legacy execution.
+    TurnJudgementObservation {
+        observation_json: Option<String>,
+    },
     SessionCategorization {
         categorization: Option<bcode_session_models::SessionCategorization>,
     },
@@ -5425,6 +5436,23 @@ mod tests {
             panic!("decoded response should be attached");
         };
         assert_eq!(session, summary);
+    }
+
+    #[test]
+    fn turn_observation_roundtrips_as_bounded_codec_safe_snapshot() {
+        let request = Request::TurnJudgementObservation {
+            session_id: SessionId::new(),
+            turn_id: "exact-turn".into(),
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded: Request = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        let response = Response::Ok(ResponsePayload::TurnJudgementObservation {
+            observation_json: None,
+        });
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: Response = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]
