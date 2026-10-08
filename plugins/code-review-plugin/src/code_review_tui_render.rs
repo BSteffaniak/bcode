@@ -17,7 +17,6 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::{display_width, truncate_to_display_width};
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
 };
@@ -556,156 +555,17 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme
     if area.is_empty() {
         return;
     }
-    let sidebar = if app.sidebar_visible { "on" } else { "off" };
-    let help = if app.help_visible {
-        "hide help"
-    } else {
-        "help"
-    };
-    if render_default_footer_hints(app, area, frame, theme) {
-        return;
-    }
-    let text = app.status_message.as_ref().map_or_else(
-        || {
-            if app.comment_editor.is_some() {
-                return " enter/ctrl+s save comment  esc cancel ".to_string();
-            }
-            if let Some(range) = app.range_selection_label() {
-                return format!(" {range}  c comment  a ask Bcode  esc clear ");
-            }
-            if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
-                return app.selected_thread_preview().unwrap_or_else(|| {
-                    " j/k thread  Enter jump  x publish  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
-                });
-            }
-            if app.sidebar_mode == ReviewSidebarMode::General && app.sidebar_visible {
-                return app.selected_thread_preview().unwrap_or_else(|| {
-                    " general review comments  C new review note  j/k thread  Enter jump  a ask/follow up  e edit  D delete  t files  ? help ".to_string()
-                });
-            }
-            if let Some(preview) = app.selected_suggestion_preview() {
-                return format!(" {preview}  ; accept  f refine  : reject  s suggest answer  m draft answer  a ask/follow up ");
-            }
-            if let Some(preview) = app.selected_comment_target_preview() {
-                return format!(" {preview}  c comment  v range  a ask Bcode  F file-comment  C review-comment ");
-            }
-            if let Some(preview) = app.selected_draft_preview() {
-                let linked = app
-                    .selected_draft_session_id()
-                    .map_or(String::new(), |_| "  🤖 session linked".to_string());
-                return format!(" {preview}{linked}  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  U expand  Z collapse  c reply  a ask/follow up  o open  e edit  D delete ");
-            }
-            if app.sidebar_mode == ReviewSidebarMode::Threads && app.sidebar_visible {
-                return app.selected_thread_preview().unwrap_or_else(|| {
-                    " j/k thread  Enter jump  x publish  a ask/follow up  o open  e edit  D delete  t files  ? help ".to_string()
-                });
-            }
-            if app.sidebar_mode == ReviewSidebarMode::General && app.sidebar_visible {
-                return app.selected_thread_preview().unwrap_or_else(|| {
-                    " general review comments  C new review note  j/k thread  Enter jump  a ask/follow up  e edit  D delete  t files  ? help ".to_string()
-                });
-            }
-            if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
-                return build_footer_hint(app);
-            }
-            if app.review.is_repository_review() {
-                return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  L/B AI-linked  ! attention-sidebar  c comment  F file-comment  C review-comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  H hide-viewed  v range  x publish  X import  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
-                );
-            }
-            format!(
-                " j/k move  [/]/ thread  {{/}} draft  Enter fold/action  r resolve  R resolved  T filter  H hide-viewed  U expand  Z collapse  n/p file  J/K hunk  P/O unresolved  L/B AI-linked  c comment/reply  F file-comment  C review-comment  v range  x publish  a ask Bcode  o open session  e edit  D delete draft  t sidebar-tab  b sidebar:{sidebar}  ? {help}  q exit "
-            )
-        },
-        |message| format!(" {message}"),
+    let text = app.status_message.as_deref().map_or_else(
+        || crate::keybindings::hints().unwrap_or_default().join("  "),
+        str::to_owned,
     );
-    frame.write_line_with_fallback_style(
+    frame.write_line(
         LocalRect::terminal(area),
         &Line::from_spans(vec![Span::styled(
-            truncate_to_display_width(&text, usize::from(area.width)),
-            theme.muted,
+            text,
+            theme.canvas.patch(theme.diff.text),
         )]),
-        theme.muted,
     );
-}
-
-fn render_default_footer_hints(
-    app: &ReviewApp,
-    area: Rect,
-    frame: &mut PaintCx<'_, '_>,
-    theme: ReviewTheme,
-) -> bool {
-    if app.status_message.is_some()
-        || app.comment_editor.is_some()
-        || app.range_selection_label().is_some()
-        || matches!(
-            app.sidebar_mode,
-            ReviewSidebarMode::Threads | ReviewSidebarMode::General
-        )
-        || app.selected_suggestion_preview().is_some()
-        || app.selected_thread_preview().is_some()
-        || app.selected_draft_preview().is_some()
-        || app.ux_mode == crate::code_review_tui::ReviewUxMode::Build
-    {
-        return false;
-    }
-    let hints = [
-        KeyHint::new("h/j/k/l", "navigate"),
-        KeyHint::new("c", "comment"),
-        KeyHint::new("a", "ask"),
-        KeyHint::new(
-            "b",
-            if app.sidebar_visible {
-                "hide sidebar"
-            } else {
-                "sidebar"
-            },
-        ),
-        KeyHint::new(
-            "?",
-            if app.help_visible {
-                "hide help"
-            } else {
-                "help"
-            },
-        ),
-        KeyHint::new("q", "exit"),
-    ];
-    let hints = KeyHintBarComponent::new("review.hints", &hints).styles(KeyHintBarStyles {
-        key: theme.focused,
-        label: theme.muted,
-        separator: theme.muted,
-        disabled: theme.muted,
-        background: theme.canvas,
-    });
-    let layout = hints.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    frame.with_child(
-        i32::from(area.x),
-        i64::from(area.y),
-        LocalRect::new(0, 0, area.width, area.height),
-        |cx| hints.paint(&layout, cx),
-    );
-    true
-}
-
-fn build_footer_hint(app: &ReviewApp) -> String {
-    if app.workspace.sources.is_empty() {
-        return " build mode  no sources yet — A source menu  + file  u/s/w/l quick add  ? help  q exit "
-            .to_string();
-    }
-    let source_count = app.workspace.sources.len();
-    let included_count = app.included_source_count();
-    let surface_count = app.review.surfaces().len();
-    let (info_sources, warning_sources, error_sources) = app.diagnostic_source_counts();
-    let pending = match (app.pending_workspace_save, app.pending_workspace_reload) {
-        (true, true) => "  pending save+reload",
-        (true, false) => "  pending save",
-        (false, true) => "  pending reload",
-        (false, false) => "",
-    };
-    format!(
-        " build mode  {included_count}/{source_count} included  {surface_count} surface(s)  diag i/w/e {info_sources}/{warning_sources}/{error_sources}{pending}  n empty  P dedupe  z exclude empty  C edit  m review "
-    )
 }
 
 fn render_separator(area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
@@ -1692,8 +1552,7 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
     }
     rows.push((String::new(), String::new(), false, false));
     rows.push((
-        "enter open/toggle   O open source   Y source for surface   C edit source   I/E/V include/exclude/invert   m review"
-            .to_string(),
+        crate::keybindings::hints().unwrap_or_default().join("  "),
         String::new(),
         false,
         false,
@@ -2543,7 +2402,7 @@ const fn syntax_style_to_tui(style: bcode_syntax_render::SyntaxStyle) -> Style {
     output
 }
 
-fn render_help(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
+fn render_help(_app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     let width = area.width.min(68);
     let height = 18;
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
@@ -2552,7 +2411,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: 
         .saturating_add(area.height.saturating_sub(height) / 2);
     let popup = Rect::new(x, y, width, height);
     frame.fill(LocalRect::terminal(popup), " ", theme.overlay);
-    let lines = help_lines(app);
+    let lines = crate::keybindings::hints().unwrap_or_default();
     for (index, text) in lines.iter().enumerate() {
         let y = popup
             .y
@@ -2574,107 +2433,6 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: 
         );
     }
 }
-
-fn help_lines(app: &ReviewApp) -> &'static [&'static str] {
-    if app.ux_mode == crate::code_review_tui::ReviewUxMode::Build {
-        BUILD_HELP_LINES
-    } else if app.review.is_repository_review() {
-        REPOSITORY_HELP_LINES
-    } else {
-        DIFF_HELP_LINES
-    }
-}
-
-const BUILD_HELP_LINES: &[&str] = &[
-    " Build Review Help",
-    "",
-    " m                   switch to review mode",
-    " g/G                first / last build row",
-    " j/k or arrows       move selection",
-    " A/+                add source menu / add file source",
-    " T                  rename workspace",
-    " R                  refresh/rematerialize sources",
-    " I/E/V              include all / exclude all / invert sources",
-    " n/N/z              next / previous / exclude empty sources",
-    " d/Z                next diagnostic source / exclude error sources",
-    " M/X/P              merge-base / remove excluded / remove duplicates",
-    " O/Y                open source surface / source for surface",
-    " f or ctrl-p         fuzzy file picker",
-    " enter               inspect/open selected item",
-    " t                   cycle included/repo/threads/sources/attention",
-    " !                   focus attention sidebar",
-    " M                   jump to next attention item",
-    " b                   toggle sidebar",
-    " ?                   toggle this help",
-    " ctrl+d              exit review",
-];
-
-const REPOSITORY_HELP_LINES: &[&str] = &[
-    " Repository Review Help",
-    "",
-    " j/k or arrows       move tree selection",
-    " enter/right         open file or expand directory",
-    " left                collapse directory/parent",
-    " f or ctrl-p         fuzzy file picker",
-    " :                   jump to line",
-    " /                   search current file",
-    " n/N                 next/previous search match",
-    " v                   select/clear line range",
-    " c                   create draft comment",
-    " a                   ask Bcode about selected line",
-    " x                   publish/export review",
-    " w                   mark selected file viewed/unviewed",
-    " W/I                 next/previous unviewed file",
-    " V                   mark all files viewed",
-    " E                   mark all files unviewed",
-    " t                   cycle included/repo/threads/sources/attention",
-    " !                   focus attention sidebar",
-    " M                   jump to next attention item",
-    " b                   toggle sidebar",
-    " ?                   toggle this help",
-    " ctrl+d              exit review",
-];
-
-const DIFF_HELP_LINES: &[&str] = &[
-    " Code Review Help",
-    "",
-    " j/k or arrows       move through diff, comments, and actions",
-    " n/p                 next/previous file",
-    " J/K                 next/previous hunk",
-    " [/]/                previous/next review thread",
-    " u/i                 next/previous unresolved thread in file",
-    " P/O                 next/previous unresolved thread globally",
-    " {/}                 previous/next draft comment",
-    " Enter               fold thread or activate selected action",
-    " r                   resolve/reopen selected thread",
-    " R                   show/hide resolved threads",
-    " T                   cycle thread sidebar filter",
-    " U/Z                 expand/collapse all inline threads",
-    " B                   switch to build/source mode",
-    " b                   toggle sidebar",
-    " t                   cycle included/repo/threads/sources/attention",
-    " !                   focus attention sidebar",
-    " M                   jump to next attention item",
-    " mouse wheel         scroll diff",
-    " click file          open file",
-    " c                   create draft comment or reply",
-    " x                   publish/export review",
-    " w                   mark selected file viewed/unviewed",
-    " W/I                 next/previous unviewed file",
-    " V                   mark all files viewed",
-    " E                   mark all files unviewed",
-    " v                   select/clear line range",
-    " a                   ask Bcode about selected line/thread",
-    " A                   expand/collapse linked Bcode answer",
-    " Y                   copy linked Bcode answer",
-    " s                   suggest comment from linked Bcode answer",
-    " 1/2/3/4/5           explain/risk/suggest/tests/summarize with Bcode",
-    " o                   open linked Bcode session",
-    " e                   edit selected/latest draft",
-    " D                   delete selected/latest draft",
-    " ?                   toggle this help",
-    " ctrl+d              exit review",
-];
 
 fn legacy_review_modal(
     area: Rect,
@@ -2783,7 +2541,10 @@ fn render_import_modal(
             frame.write_line(
                 LocalRect::terminal(header),
                 &Line::from_spans(vec![Span::styled(
-                    " Import external review  j/k select  Enter configure/import  Esc cancel ",
+                    format!(
+                        "Import external review  {}",
+                        crate::keybindings::hints().unwrap_or_default().join("  ")
+                    ),
                     theme.focused.add_modifier(Modifier::BOLD),
                 )]),
             );
@@ -2825,7 +2586,10 @@ fn render_import_modal(
             frame.write_line(
                 LocalRect::terminal(header),
                 &Line::from_spans(vec![Span::styled(
-                    " Import options  Tab/j/k field  ←/→ choice  Enter import  Esc cancel ",
+                    format!(
+                        "Import options  {}",
+                        crate::keybindings::hints().unwrap_or_default().join("  ")
+                    ),
                     theme.focused.add_modifier(Modifier::BOLD),
                 )]),
             );
@@ -2908,7 +2672,10 @@ fn render_publish_checklist(
             1,
         )),
         &Line::from_spans(vec![Span::styled(
-            " Publish checklist  ↑/↓ thread  Space include/exclude  Enter continue  ! attention  W unviewed  P open  Esc cancel ",
+            format!(
+                "Publish checklist  {}",
+                crate::keybindings::hints().unwrap_or_default().join("  ")
+            ),
             theme.selection.add_modifier(Modifier::BOLD),
         )]),
     );
@@ -2964,7 +2731,10 @@ fn render_publisher_picker(
             1,
         )),
         &Line::from_spans(vec![Span::styled(
-            " Publish review  Enter preview  Esc cancel ",
+            format!(
+                "Publish review  {}",
+                crate::keybindings::hints().unwrap_or_default().join("  ")
+            ),
             theme.focused.add_modifier(Modifier::BOLD),
         )]),
     );
@@ -3018,7 +2788,10 @@ fn render_publish_options(
             1,
         )),
         &Line::from_spans(vec![Span::styled(
-            " Publisher options  Enter preview  Tab next  ←/→ choice  Esc cancel ",
+            format!(
+                "Publisher options  {}",
+                crate::keybindings::hints().unwrap_or_default().join("  ")
+            ),
             theme.focused.add_modifier(Modifier::BOLD),
         )]),
     );
@@ -3089,9 +2862,15 @@ fn render_publish_preview(
         )),
         &Line::from_spans(vec![Span::styled(
             if confirming {
-                format!(" Confirm submit {publisher_id}  Enter publish  Esc cancel ")
+                format!(
+                    "Confirm submit {publisher_id}  {}",
+                    crate::keybindings::hints().unwrap_or_default().join("  ")
+                )
             } else {
-                format!(" Preview {publisher_id}  Enter confirm  Esc cancel ")
+                format!(
+                    "Preview {publisher_id}  {}",
+                    crate::keybindings::hints().unwrap_or_default().join("  ")
+                )
             },
             theme.focused.add_modifier(Modifier::BOLD),
         )]),
@@ -3121,7 +2900,7 @@ fn render_publish_preview(
         );
     }
     if confirming {
-        let warning = " This will publish the review. Press Enter again to submit. ";
+        let warning = " This will publish the review. Activate the configured submit action again to publish. ";
         frame.write_line(
             LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
@@ -3377,35 +3156,37 @@ fn register_footer_action(
 }
 
 fn comment_editor_footer(editor: &crate::code_review_tui::ReviewCommentEditor) -> String {
-    if matches!(
+    let actions = if matches!(
         editor.mode,
         crate::code_review_tui::ReviewCommentEditorMode::Create
     ) {
-        let save = if editor.action == crate::code_review_tui::ReviewCommentAction::SaveDraft {
-            "[save draft]"
-        } else {
-            " save draft "
-        };
-        let ask = if editor.action == crate::code_review_tui::ReviewCommentAction::AskBcode {
-            "[ask Bcode]"
-        } else {
-            " ask Bcode "
-        };
-        let publish = if editor.action == crate::code_review_tui::ReviewCommentAction::Publish {
-            "[publish]"
-        } else {
-            " publish "
-        };
-        if editor.preview {
-            format!(" ←/→ action  ctrl+p edit  enter {save}/{ask}/{publish}  esc cancel ")
-        } else {
-            format!(" tab/←/→ action  ctrl+p preview  enter {save}/{ask}/{publish}  esc cancel ")
-        }
-    } else if editor.preview {
-        " ctrl+p edit  enter/ctrl+s save edit  esc cancel ".to_string()
+        [
+            crate::code_review_tui::ReviewCommentAction::SaveDraft,
+            crate::code_review_tui::ReviewCommentAction::AskBcode,
+            crate::code_review_tui::ReviewCommentAction::Publish,
+        ]
+        .into_iter()
+        .map(|action| {
+            let label = match action {
+                crate::code_review_tui::ReviewCommentAction::SaveDraft => "save draft",
+                crate::code_review_tui::ReviewCommentAction::AskBcode => "ask Bcode",
+                crate::code_review_tui::ReviewCommentAction::Publish => "publish",
+            };
+            if action == editor.action {
+                format!("[{label}]")
+            } else {
+                label.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
     } else {
-        " ctrl+p preview  enter/ctrl+s save edit  esc cancel ".to_string()
-    }
+        "save edit".to_owned()
+    };
+    format!(
+        "{actions} / cancel  {}",
+        crate::keybindings::hints().unwrap_or_default().join("  ")
+    )
 }
 
 fn render_comment_editor_body(
@@ -3787,38 +3568,8 @@ fn render_prompt_choice(
     );
 }
 
-const fn prompt_footer_text(kind: &ReviewPromptKind) -> &'static str {
-    match kind {
-        ReviewPromptKind::AddSourceKind => {
-            " add source  ↑/↓ choose  enter select  type shortcut: worktree, staged, file, range, branch  esc cancel "
-        }
-        ReviewPromptKind::AddCommitPicker => {
-            " ↑/↓ choose commit  enter add commit source  esc cancel "
-        }
-        ReviewPromptKind::AddCommitRangeBasePicker => {
-            " ↑/↓ choose base commit  enter select  esc cancel "
-        }
-        ReviewPromptKind::AddCommitRangeHeadPicker { .. } => {
-            " ↑/↓ choose head commit  enter add range  esc cancel "
-        }
-        ReviewPromptKind::AddCommitRangeSource | ReviewPromptKind::AddBranchCompareSource => {
-            " enter base..head or base...head  esc cancel "
-        }
-        ReviewPromptKind::AddBranchCompareBasePicker => {
-            " ↑/↓ choose base branch  enter select  esc cancel "
-        }
-        ReviewPromptKind::AddBranchCompareHeadPicker { .. } => {
-            " ↑/↓ choose head branch  enter add compare  esc cancel "
-        }
-        ReviewPromptKind::AddFileRangeSource => " enter path:start-end  esc cancel ",
-        ReviewPromptKind::FilePicker => " ↑/↓ choose  enter open  esc cancel ",
-        ReviewPromptKind::AddFileSourcePicker => " ↑/↓ choose  enter add file source  esc cancel ",
-        ReviewPromptKind::AddFileRangePathPicker => {
-            " ↑/↓ choose file  enter pick file  esc cancel "
-        }
-        ReviewPromptKind::EditSourceSpec { .. } => " enter update source  esc cancel ",
-        _ => " enter submit  esc cancel ",
-    }
+fn prompt_footer_text(_kind: &ReviewPromptKind) -> String {
+    crate::keybindings::hints().unwrap_or_default().join("  ")
 }
 
 struct RenderedRow {

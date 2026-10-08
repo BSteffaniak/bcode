@@ -532,7 +532,7 @@ impl OnboardingShell {
     fn request_apply_confirmation(&mut self) -> OnboardingActionOutcome {
         self.pending_confirmation = Some(OnboardingPendingConfirmation {
             title: "Apply setup plan?".to_owned(),
-            body: "Bcode will persist onboarding metadata, run secure imports only when explicitly requested, and reconcile actual config/auth state after apply. Press y to confirm or n/Esc to cancel.".to_owned(),
+            body: "Bcode will persist onboarding metadata, run secure imports only when explicitly requested, and reconcile actual config/auth state after apply. Confirm or cancel the reviewed plan.".to_owned(),
             action: OnboardingInputAction::ApplyPlan,
         });
         self.status_message = Some("confirm setup apply".to_owned());
@@ -649,11 +649,16 @@ impl OnboardingShell {
         &mut self,
         area: bmux_tui::geometry::Rect,
         event: &bmux_tui::event::Event,
+        keymap: &super::keymap::BmuxKeyMap,
     ) -> SetupBoardOutcome {
         let spots = self.board_spots();
         let connections = onboarding_board_connections();
-        let outcome =
-            SetupBoard::new(&spots, &connections).handle_event(area, &mut self.board_state, event);
+        let outcome = SetupBoard::new(&spots, &connections).handle_event_with_keymap(
+            area,
+            &mut self.board_state,
+            event,
+            keymap,
+        );
         if let SetupBoardOutcome::Selected(section_id) | SetupBoardOutcome::Focused(section_id) =
             outcome
             && let Some(index) = self
@@ -732,7 +737,7 @@ impl OnboardingShell {
             map_lines,
             focused_detail: self.focused_detail(),
             footer_lines: vec![
-                "←/↑ previous  →/↓ next  Enter select  N new context  o choose context  A choose account  p connect  a import credentials  m model profile  M discover models  r/g/x settings  s skip  l start session  Esc close"
+                "Navigate setup sections; select a section to review its available actions."
                     .to_owned(),
                 self.status_message.clone().unwrap_or_else(|| {
                     "Setup state is persisted locally and user config remains TOML-backed."
@@ -1130,7 +1135,7 @@ mod tests {
             render
                 .footer_lines
                 .iter()
-                .any(|line| line.contains("Enter"))
+                .any(|line| line.contains("setup sections"))
         );
         assert!(render.degraded_panel.is_none());
     }

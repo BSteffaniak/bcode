@@ -1,5 +1,6 @@
 //! Terminal-native graph editor projection for portable workflow authoring documents.
 
+use crate::keybindings::{self, Hints};
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginStructuredGenerationRequest, PluginTuiAction, PluginTuiHost,
     PluginTuiSurface, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
@@ -224,6 +225,7 @@ impl AuthorSurfaceTheme {
 
 #[derive(Debug)]
 struct WorkflowAuthorSurface {
+    keymap_hints: Hints,
     document: Option<WorkflowAuthoringDocument>,
     catalog: Option<WorkflowAuthoringCatalogSnapshot>,
     preview: Option<WorkflowCompilationPreview>,
@@ -331,6 +333,7 @@ impl WorkflowAuthorSurface {
             |revision| format!("Loading exact immutable authored revision {revision}…"),
         );
         Self {
+            keymap_hints: Hints::default(),
             document,
             catalog: None,
             preview: None,
@@ -457,7 +460,7 @@ impl WorkflowAuthorSurface {
         self.refresh_preview();
         if let Some(conflict) = &self.pending_conflict {
             self.status = format!(
-                "Reloaded generation {}; conflict from generation {} is awaiting explicit R resolution",
+                "Reloaded generation {}; conflict from generation {} is awaiting explicit conflict resolution",
                 draft.generation, conflict.expected_generation
             );
         }
@@ -556,7 +559,7 @@ impl WorkflowAuthorSurface {
             },
             buffer: self.selected_schema_value(&field.path, source),
         });
-        self.status = "Editing bounded inspector value · Enter apply · Esc cancel".to_string();
+        self.status = "Editing bounded inspector value".to_string();
     }
 
     fn selected_schema_value(&self, path: &str, source: InspectorSchemaSource) -> String {
@@ -596,7 +599,7 @@ impl WorkflowAuthorSurface {
         };
         let buffer = inspector_edit_value(node, &target);
         self.inspector_edit = Some(InspectorTextEdit { target, buffer });
-        self.status = "Editing bounded inspector value · Enter apply · Esc cancel".to_string();
+        self.status = "Editing bounded inspector value".to_string();
     }
 
     fn handle_inspector_text_input(&mut self, key: KeyCode) -> bool {
@@ -674,8 +677,7 @@ impl WorkflowAuthorSurface {
 
     fn request_mutation(&mut self, mutation: PendingMutation) {
         if self.is_read_only_revision() {
-            self.status =
-                "This published revision is immutable; press f to fork it into a draft".to_string();
+            self.status = "This published revision is immutable; fork it into a draft".to_string();
             return;
         }
         if self.operations.contains(&AuthoringOperation::Edit) {
@@ -990,7 +992,7 @@ impl WorkflowAuthorSurface {
             return;
         }
         self.prompt_edit = Some(String::new());
-        self.status = "Describe the workflow · Enter generate · Esc cancel".to_string();
+        self.status = "Describe the workflow".to_string();
     }
 
     fn accept_generated_candidate(&mut self) {
@@ -1351,13 +1353,23 @@ impl WorkflowAuthorSurface {
                 footer.width.saturating_sub(status_width),
                 1,
             );
-            let hints = [
-                KeyHint::new("G", "generate"),
-                KeyHint::new("A", "accept"),
-                KeyHint::new("Tab", "panes"),
-                KeyHint::new("p", "publish"),
-                KeyHint::new("s", "start"),
-            ];
+            let scope = if self.prompt_edit.is_some() || self.inspector_edit.is_some() {
+                keybindings::EDIT
+            } else {
+                keybindings::AUTHOR
+            };
+            let hint_labels = keybindings::declarations()
+                .into_iter()
+                .filter(|action| action.scope == scope)
+                .filter_map(|action| {
+                    let keys = self.keymap_hints.keys(scope, &action.id);
+                    (!keys.is_empty()).then_some((keys, action.description))
+                })
+                .collect::<Vec<_>>();
+            let hints = hint_labels
+                .iter()
+                .map(|(keys, label)| KeyHint::new(keys, label))
+                .collect::<Vec<_>>();
             let hints = KeyHintBarComponent::new("workflow.author.hints", &hints).styles(
                 KeyHintBarStyles {
                     key: theme.focused,
@@ -1379,6 +1391,10 @@ impl WorkflowAuthorSurface {
 }
 
 impl PluginTuiSurface for WorkflowAuthorSurface {
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        self.keymap_hints.refresh(host);
+    }
+
     fn id(&self) -> &'static str {
         "bcode.workflow-author"
     }
@@ -1401,7 +1417,16 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let scope = if self.prompt_edit.is_some() || self.inspector_edit.is_some() {
+            keybindings::EDIT
+        } else {
+            keybindings::AUTHOR
+        };
+        let Some(event) = keybindings::routed_event(host, scope, event) else {
+            return PluginTuiAction::None;
+        };
+        let event = &event;
         if self.prompt_edit.is_some() {
             return if self.handle_prompt_edit(event) {
                 PluginTuiAction::Redraw
@@ -1422,7 +1447,11 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
                 return PluginTuiAction::Close { outcome: None };
             }
-            Event::Key(key) if key.key == KeyCode::Char('f') && self.is_read_only_revision() => {
+            Event::Key(key)
+                if key.key == KeyCode::Char('f')
+                    && key.modifiers.is_empty()
+                    && self.is_read_only_revision() =>
+            {
                 self.fork_viewed_revision();
                 true
             }
@@ -1434,19 +1463,31 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 self.focus = self.focus.next();
                 true
             }
-            Event::Key(key) if matches!(key.key, KeyCode::Up | KeyCode::Char('k')) => {
+            Event::Key(key)
+                if matches!(key.key, KeyCode::Up | KeyCode::Char('k'))
+                    && key.modifiers.is_empty() =>
+            {
                 self.move_selection(-1);
                 true
             }
-            Event::Key(key) if matches!(key.key, KeyCode::Down | KeyCode::Char('j')) => {
+            Event::Key(key)
+                if matches!(key.key, KeyCode::Down | KeyCode::Char('j'))
+                    && key.modifiers.is_empty() =>
+            {
                 self.move_selection(1);
                 true
             }
-            Event::Key(key) if matches!(key.key, KeyCode::Left | KeyCode::Char('h')) => {
+            Event::Key(key)
+                if matches!(key.key, KeyCode::Left | KeyCode::Char('h'))
+                    && key.modifiers.is_empty() =>
+            {
                 self.focus = self.focus.previous();
                 true
             }
-            Event::Key(key) if matches!(key.key, KeyCode::Right | KeyCode::Char('l')) => {
+            Event::Key(key)
+                if matches!(key.key, KeyCode::Right | KeyCode::Char('l'))
+                    && key.modifiers.is_empty() =>
+            {
                 self.focus = self.focus.next();
                 true
             }
@@ -1476,7 +1517,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                     } else {
                         self.connect_source = Some(node_id.clone());
                         self.status = format!(
-                            "Connection source selected: {node_id}; choose target and press c"
+                            "Connection source selected: {node_id}; choose target and connect"
                         );
                     }
                 }
@@ -1489,13 +1530,17 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('g') && self.focus == EditorPane::Canvas =>
+                if key.key == KeyCode::Char('g')
+                    && key.modifiers.is_empty()
+                    && self.focus == EditorPane::Canvas =>
             {
                 self.request_mutation(PendingMutation::ToggleGroup);
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('e') && self.focus == EditorPane::Canvas =>
+                if key.key == KeyCode::Char('e')
+                    && key.modifiers.is_empty()
+                    && self.focus == EditorPane::Canvas =>
             {
                 let edge_count = self
                     .document
@@ -1561,7 +1606,9 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('f') && self.focus == EditorPane::Inspector =>
+                if key.key == KeyCode::Char('f')
+                    && key.modifiers.is_empty()
+                    && self.focus == EditorPane::Inspector =>
             {
                 self.cycle_schema_field();
                 true
@@ -1605,7 +1652,9 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 true
             }
             Event::Key(key)
-                if key.key == KeyCode::Char('a') && self.focus == EditorPane::Inspector =>
+                if key.key == KeyCode::Char('a')
+                    && key.modifiers.is_empty()
+                    && self.focus == EditorPane::Inspector =>
             {
                 self.request_mutation(PendingMutation::CycleAgentProfile);
                 true
@@ -1958,7 +2007,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                     self.document = Some(revision.document);
                     self.refresh_preview();
                     self.status = format!(
-                        "Viewing immutable published revision {}; press f to fork into a draft",
+                        "Viewing immutable published revision {}; fork into a draft",
                         revision.revision
                     );
                 }
@@ -2015,7 +2064,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                     });
                     self.operations.remove(&AuthoringOperation::DraftLoad);
                     self.status = format!(
-                        "Draft conflict: expected generation {expected_generation}, current {current_generation}; reloading exact draft, then press R to reapply reviewed edits"
+                        "Draft conflict: expected generation {expected_generation}, current {current_generation}; reloading exact draft, then resolve the conflict to reapply reviewed edits"
                     );
                 }
                 AuthoringAsyncResult::Edit(Ok(PluginWorkflowAuthoringEditResult::Rejected {
@@ -2045,7 +2094,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                                     preview,
                                     repair_attempts: self.generation_repair_attempts,
                                 });
-                                self.status = "Generated candidate is review-only; press A to accept it as a mutable draft".to_string();
+                                self.status = "Generated candidate is review-only; accept it as a mutable draft".to_string();
                             } else if self.generation_repair_attempts
                                 < MAX_GENERATION_REPAIR_ATTEMPTS
                             {
@@ -2143,9 +2192,8 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
                 )) => {
                     self.operations.remove(&AuthoringOperation::Publishing);
                     self.published_revision = Some(revision);
-                    self.status = format!(
-                        "Published immutable revision {revision}; press s to start explicitly"
-                    );
+                    self.status =
+                        format!("Published immutable revision {revision}; start explicitly");
                 }
                 AuthoringAsyncResult::Publish(Ok(
                     PluginWorkflowAuthoringPublishResult::Conflict {
@@ -3090,7 +3138,7 @@ fn inspector_lines(
         {
             append_form(
                 &mut lines,
-                "Plugin operation defaults [f select · F edit]",
+                "Plugin operation defaults",
                 &block.input,
                 Some(*selected_schema_field),
             );
@@ -3102,7 +3150,7 @@ fn inspector_lines(
     }) {
         append_form(
             &mut lines,
-            "Configuration [f select · F edit]",
+            "Configuration",
             schema,
             Some(*selected_schema_field),
         );
@@ -3120,7 +3168,7 @@ fn inspector_lines(
             node.configuration.clone(),
         )
     {
-        lines.push("Agent controls [a profile · t read-only · M model]".to_string());
+        lines.push("Agent controls".to_string());
         lines.push(format!(
             "  profile={} · provider={} · model={} · read_only={} · capability={:?}",
             agent.agent_profile,
@@ -3132,7 +3180,7 @@ fn inspector_lines(
         lines.push(format!("  tools={}", agent.tool_allowlist.join(", ")));
     }
     if matches!(node.kind, NodeKind::Branch | NodeKind::Repeat) {
-        lines.push("Predicate control [v toggle · P path]".to_string());
+        lines.push("Predicate control".to_string());
         lines.push(format!("  {}", node.configuration["predicate"]));
     }
     if node.kind == NodeKind::Repeat {
@@ -3141,7 +3189,7 @@ fn inspector_lines(
             node.configuration["max_iterations"]
         ));
     }
-    lines.push("Node control [n edit name]".to_string());
+    lines.push("Node control".to_string());
     if node.kind == NodeKind::PluginBlock
         && let Ok(block) =
             serde_json::from_value::<WorkflowBlockDefinition>(node.configuration.clone())
@@ -3742,7 +3790,11 @@ mod tests {
             document: reloaded,
             producer: editor_producer(),
         });
-        assert!(surface.status.contains("awaiting explicit R resolution"));
+        assert!(
+            surface
+                .status
+                .contains("awaiting explicit conflict resolution")
+        );
         surface.resolve_conflict();
         let batch = surface.pending_edit_batch.expect("explicit reapply batch");
         assert_eq!(batch.expected_generation, 2);

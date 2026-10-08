@@ -1512,6 +1512,7 @@ name = "bcode_blims_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
+ "bcode_config",
  "bcode_ipc",
  "bcode_plugin_sdk",
  "bcode_session_models",
@@ -1709,6 +1710,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]
@@ -2578,6 +2580,7 @@ dependencies = [
 name = "bcode_read_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_config",
  "bcode_markdown_render",
  "bcode_plugin_sdk",
  "bmux_keyboard",

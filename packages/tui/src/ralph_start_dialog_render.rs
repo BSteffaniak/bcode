@@ -15,7 +15,23 @@ use super::ralph_start_dialog::{RalphStartDialog, RalphStartDialogField};
 use super::render::TuiTheme;
 
 /// Render the Ralph loop start dialog.
+#[cfg(test)]
 pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
+    render_dialog_with_keymap(
+        dialog,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render effective dialog shortcuts.
+pub fn render_dialog_with_keymap(
+    dialog: &mut RalphStartDialog,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
+) {
     let modal = modal_frame(theme);
     let area = Rect::new(0, 0, frame.area().width, frame.area().height);
     let content = modal.content_area(area);
@@ -67,7 +83,7 @@ pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut PaintCx<'_, '_>,
         "Validation",
         theme,
     );
-    render_line(&help_line(theme), &modal, content, &mut row, frame);
+    render_line(&help_line(theme, keymap), &modal, content, &mut row, frame);
     render_line(
         &setup_explanation_line(theme),
         &modal,
@@ -179,13 +195,22 @@ fn setup_explanation_line(theme: TuiTheme) -> Line {
     )])
 }
 
-fn help_line(theme: TuiTheme) -> Line {
+fn help_line(theme: TuiTheme, keymap: &super::keymap::BmuxKeyMap) -> Line {
     Line::from_spans(vec![
-        Span::styled("Enter", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("ralph_start", "tui.control.submit"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" start  ", theme.text),
-        Span::styled("Tab", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("ralph_start", "tui.control.focus_next"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" field  ", theme.text),
-        Span::styled("Esc", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("ralph_start", "tui.control.cancel"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" cancel", theme.text),
     ])
 }

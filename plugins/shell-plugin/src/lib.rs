@@ -2611,6 +2611,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    shell_run_tui::register_keymap(&mut registry);
     registry.register_visual_adapter(
         ["shell-run-request-card", "shell-run-terminal-card"],
         Box::new(shell_run_tui::ShellRunTuiVisualAdapter::default()),

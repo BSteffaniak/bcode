@@ -2,7 +2,7 @@
 
 use std::io;
 
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 use bmux_tui_components::text_input::{
@@ -31,7 +31,7 @@ pub enum TuiError {
 
 /// Shared helper functions needed by the code review TUI.
 pub mod helpers {
-    use super::{KeyCode, KeyStroke, Rect, Terminal, TextInputEnterBehavior, TextInputKeyOutcome};
+    use super::{KeyStroke, Rect, Terminal, TextInputEnterBehavior, TextInputKeyOutcome};
     use std::io::{self, Write};
 
     /// Apply a key stroke to a text buffer using the default text-input bindings.
@@ -40,11 +40,6 @@ pub mod helpers {
         stroke: KeyStroke,
         enter_behavior: TextInputEnterBehavior,
     ) -> TextInputKeyOutcome {
-        if let Some(ch) = shifted_text_character(stroke) {
-            buffer.insert_char(ch);
-            return TextInputKeyOutcome::Edited;
-        }
-
         let mut policy = bmux_tui_components::text_input::TextInputPolicy::chat_composer();
         policy.keyboard.enter = enter_behavior;
         let mut state = bmux_tui_components::text_input::TextInputState::new(buffer.clone());
@@ -52,24 +47,6 @@ pub mod helpers {
             .handle_key(&mut state, stroke);
         *buffer = state.buffer().clone();
         outcome
-    }
-
-    const fn shifted_text_character(stroke: KeyStroke) -> Option<char> {
-        if !stroke.modifiers.shift
-            || stroke.modifiers.ctrl
-            || stroke.modifiers.alt
-            || stroke.modifiers.super_key
-            || stroke.modifiers.hyper
-            || stroke.modifiers.meta
-        {
-            return None;
-        }
-
-        match stroke.key {
-            KeyCode::Char(ch) if ch.is_ascii_lowercase() => Some(ch.to_ascii_uppercase()),
-            KeyCode::Char(ch) => Some(ch),
-            _ => None,
-        }
     }
 
     /// Resize a terminal from current crossterm dimensions.

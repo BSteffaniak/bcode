@@ -13,6 +13,13 @@ pub(crate) fn prepare_input() -> io::Result<()> {
 }
 
 pub(crate) fn run(markdown: String, styled: bool) -> io::Result<()> {
+    // Resolve configuration and validate bindings before touching terminal state.
+    let config = bcode_config::load_config().map_err(io::Error::other)?;
+    let keymap = bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+        crate::pager::keymap_actions(),
+        config.tui.keybindings.scoped_overrides(),
+    )
+    .map_err(io::Error::other)?;
     if !std::io::stdout().is_terminal() {
         return Err(io::Error::other(
             "`bcode read --interactive` requires terminal stdout",
@@ -33,7 +40,7 @@ pub(crate) fn run(markdown: String, styled: bool) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("terminal writer is unavailable"))?,
         Rect::new(0, 0, width.max(1), height.max(1)),
     );
-    let mut pager = Pager::new(markdown, width, height, styled);
+    let mut pager = Pager::new(markdown, width, height, styled).with_keymap(keymap);
     pager.draw(&mut terminal)?;
 
     loop {

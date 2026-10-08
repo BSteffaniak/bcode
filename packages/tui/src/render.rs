@@ -557,7 +557,7 @@ fn paint_child_monitor(
                 bmux_tui_components::selectable_list::SelectableListItem::rich(
                     app.monitor_row_session(row).map_or_else(
                         || {
-                            if text.starts_with("Alt-N: load next") {
+                            if text.ends_with("load next bounded child page") {
                                 "child-monitor-more".to_owned()
                             } else {
                                 format!("monitor-chrome:{row}")
@@ -1691,7 +1691,10 @@ fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_
     }
     frame.fill(LocalRect::terminal(area), " ", app.presented_theme().canvas);
     let title = Line::from_spans(vec![Span::styled(
-        " Mermaid source · Alt+Enter closes ",
+        format!(
+            " Mermaid source · {} closes ",
+            app.shortcut_hint("chat", "tui.markdown.activate")
+        ),
         TuiTheme::for_app(app).info.add_modifier(Modifier::BOLD),
     )]);
     frame.write_line(
@@ -2366,6 +2369,7 @@ fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 pub fn transcript_item_rows_from_item(
     item: &TranscriptItem,
     width: u16,
@@ -2375,6 +2379,7 @@ pub fn transcript_item_rows_from_item(
     transcript_item_rows_from_item_with_markdown(item, width, plugin_host, diff_viewer_config, None)
 }
 
+#[cfg(test)]
 #[cfg(test)]
 pub fn transcript_item_rows_from_item_with_markdown(
     item: &TranscriptItem,
@@ -2388,12 +2393,36 @@ pub fn transcript_item_rows_from_item_with_markdown(
     rows
 }
 
+#[cfg(test)]
 pub fn transcript_item_layout_from_item(
     item: &TranscriptItem,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
     diff_viewer_config: TuiDiffViewerConfig,
     markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
+) -> (
+    Vec<Line>,
+    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+) {
+    transcript_item_layout_with_keymap(
+        item,
+        width,
+        plugin_host,
+        diff_viewer_config,
+        markdown,
+        &bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
+    )
+}
+
+/// Generate visual rows with the frontend's effective registry snapshot.
+pub fn transcript_item_layout_with_keymap(
+    item: &TranscriptItem,
+    width: u16,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    diff_viewer_config: TuiDiffViewerConfig,
+    markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
+    registry: &bcode_plugin_sdk::tui::keymap::KeymapRegistry,
 ) -> (
     Vec<Line>,
     Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
@@ -2409,7 +2438,10 @@ pub fn transcript_item_layout_from_item(
         &mut selection,
         item,
         width,
-        plugin_host,
+        TranscriptVisualHost {
+            presentation: plugin_host,
+            keymap: &RegistryVisualHost(registry),
+        },
         markdown,
     );
     (rows, anchors, selection)
@@ -2500,6 +2532,12 @@ pub fn pending_submission_signature(
     ))
 }
 
+#[derive(Clone, Copy)]
+struct TranscriptVisualHost<'a> {
+    presentation: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
+    keymap: &'a dyn bcode_plugin_sdk::tui::PluginTuiHost,
+}
+
 #[allow(clippy::too_many_lines)]
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
@@ -2507,9 +2545,13 @@ fn push_transcript_item_rows(
     selection: &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
     item: &TranscriptItem,
     width: u16,
-    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    visual_host: TranscriptVisualHost<'_>,
     markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
 ) {
+    let TranscriptVisualHost {
+        presentation: plugin_host,
+        keymap: keymap_host,
+    } = visual_host;
     let item_start = rows.len();
     let layout = TranscriptItemLayout::resolve(&semantic_state_theme(), item, width);
     let width = layout.content_width;
@@ -2597,6 +2639,7 @@ fn push_transcript_item_rows(
                     working_directory.as_deref(),
                     width,
                     plugin_host,
+                    keymap_host,
                 )
             }) {
                 push_routed_tool_surface(
@@ -2639,7 +2682,10 @@ fn push_transcript_item_rows(
                     has_file_preview: false,
                 },
                 width,
-                plugin_host,
+                TranscriptVisualHost {
+                    presentation: plugin_host,
+                    keymap: keymap_host,
+                },
             );
         }
         TranscriptItemKind::PermissionRequest {
@@ -2729,9 +2775,13 @@ fn push_transcript_item_rows(
             };
             let visual = CanonicalToolVisual::from_artifact(&artifact);
             let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
-            if let Some(routed) =
-                resolve_canonical_plugin_visual(plugin_visual, None, width, plugin_host)
-            {
+            if let Some(routed) = resolve_canonical_plugin_visual(
+                plugin_visual,
+                None,
+                width,
+                plugin_host,
+                keymap_host,
+            ) {
                 push_routed_tool_surface(
                     (rows, anchors, selection),
                     routed,
@@ -2784,6 +2834,7 @@ fn push_transcript_item_rows(
                 working_directory,
                 width,
                 plugin_host,
+                keymap_host,
             ) {
                 push_routed_tool_surface(
                     (rows, anchors, selection),
@@ -4648,14 +4699,35 @@ fn push_tool_request_rows(
     rows.push(Line::default());
 }
 
+struct RegistryVisualHost<'a>(&'a bcode_plugin_sdk::tui::keymap::KeymapRegistry);
+impl bcode_plugin_sdk::tui::PluginTuiHost for RegistryVisualHost<'_> {
+    fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+    fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+    fn request_redraw(&self) {}
+    fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+        self.0.action_for_key(scope, stroke).map(str::to_owned)
+    }
+    fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+        self.0
+            .keys_for_action(scope, action)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+    fn keymap_is_overridden(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> bool {
+        self.0.is_overridden_key(scope, stroke)
+    }
+}
+
 fn resolve_canonical_plugin_visual(
     visual: &CanonicalPluginVisual,
     working_directory: Option<&std::path::Path>,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    keymap_host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
 ) -> Option<crate::plugin_tui::RoutedTuiVisual> {
     let presentation = plugin_host?;
-    presentation.routed_visual(
+    presentation.routed_visual_with_host(
         visual
             .invocation_id
             .as_deref()
@@ -4666,6 +4738,7 @@ fn resolve_canonical_plugin_visual(
         visual.producer_plugin_id.as_deref(),
         &visual.payload,
         &plugin_visual_context(width, working_directory),
+        keymap_host,
     )
 }
 
@@ -4722,9 +4795,17 @@ fn push_canonical_tool_visual_rows(
     working_directory: Option<&std::path::Path>,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    keymap_host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
 ) -> bool {
     let CanonicalToolVisual::Plugin(plugin_visual) = visual;
-    push_canonical_plugin_visual_rows(rows, plugin_visual, working_directory, width, plugin_host)
+    push_canonical_plugin_visual_rows(
+        rows,
+        plugin_visual,
+        working_directory,
+        width,
+        plugin_host,
+        keymap_host,
+    )
 }
 
 fn push_canonical_plugin_visual_rows(
@@ -4733,12 +4814,14 @@ fn push_canonical_plugin_visual_rows(
     working_directory: Option<&std::path::Path>,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    keymap_host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
 ) -> bool {
     let Some(presentation) = plugin_host else {
         return false;
     };
     let visual_started = Instant::now();
-    let routed = resolve_canonical_plugin_visual(visual, working_directory, width, plugin_host);
+    let routed =
+        resolve_canonical_plugin_visual(visual, working_directory, width, plugin_host, keymap_host);
     if let Some(routed) = &routed {
         presentation.record_visual_timing(
             "render_rows",
@@ -4954,8 +5037,12 @@ fn push_tool_result_rows(
     item: &TranscriptItem,
     context: &ToolResultRenderContext<'_>,
     width: u16,
-    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    visual_host: TranscriptVisualHost<'_>,
 ) {
+    let TranscriptVisualHost {
+        presentation: plugin_host,
+        keymap: keymap_host,
+    } = visual_host;
     if let Some(artifact) = context.artifact {
         let visual = CanonicalToolVisual::from_artifact(artifact);
         let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
@@ -4964,6 +5051,7 @@ fn push_tool_result_rows(
             context.working_directory,
             width,
             plugin_host,
+            keymap_host,
         ) {
             let status = if context.is_error { "failed" } else { "ok" };
             let title = context.tool_name.map_or_else(
@@ -5018,6 +5106,7 @@ fn push_tool_result_rows(
             context.working_directory,
             width,
             plugin_host,
+            keymap_host,
         ) {
             rows.push(Line::default());
             return;
@@ -5538,7 +5627,7 @@ fn activity_label(
             message,
             retry_at_unix,
         } => format!(
-            "{} {message}; retrying in {} · Esc to cancel",
+            "{} {message}; retrying in {} · cancel to exit",
             spinner_frame(activity_frame),
             format_retry_remaining(*retry_at_unix)
         ),

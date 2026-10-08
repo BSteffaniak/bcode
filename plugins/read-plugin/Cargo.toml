@@ -14,6 +14,7 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bcode_config = { workspace = true, optional = true }
 bcode_markdown_render = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bmux_keyboard = { workspace = true }
@@ -35,4 +36,4 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []
+static-bundled   = ["dep:bcode_config", "bcode_plugin_sdk/tui"]

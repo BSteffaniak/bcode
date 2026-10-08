@@ -35,6 +35,10 @@ impl bcode_plugin_sdk::tui::PluginTuiTextInputResolver for InteractiveTextInputR
             .map(str::to_owned)
     }
 
+    fn is_overridden(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> bool {
+        self.keymap.registry().is_overridden_key(scope, stroke)
+    }
+
     fn keys(&self, scope: &str, action: &str) -> Vec<String> {
         self.keymap
             .registry()
@@ -310,6 +314,7 @@ impl InteractiveSurfaceState {
             .set_text_input_resolver(Arc::new(InteractiveTextInputResolver {
                 keymap: keymap.clone(),
             }));
+        self.surface.prepare_keymap(&self.host);
     }
 
     #[cfg(test)]
@@ -341,6 +346,7 @@ impl InteractiveSurfaceState {
     /// Return preferred rendered height at `width`.
     #[must_use]
     pub fn preferred_height(&mut self, width: u16) -> u16 {
+        self.surface.prepare_keymap(&self.host);
         self.last_width = width;
         self.last_preferred_height =
             bounded_surface_height(width, self.surface.preferred_height(width));
@@ -348,6 +354,7 @@ impl InteractiveSurfaceState {
     }
 
     fn preferred_height_for_event(&mut self) -> u16 {
+        self.surface.prepare_keymap(&self.host);
         bounded_surface_height(
             self.last_width,
             self.surface.preferred_height(self.last_width),
@@ -372,21 +379,27 @@ impl InteractiveSurfaceState {
         ) else {
             return;
         };
-        self.surface
-            .render_slice(logical_height, logical_row_offset, destination, frame);
+        self.surface.render_slice_with_host(
+            logical_height,
+            logical_row_offset,
+            destination,
+            frame,
+            &self.host,
+        );
     }
 
     /// Return focused logical rows for host-owned pinned reveal behavior.
     #[must_use]
     #[allow(dead_code)]
     pub fn focused_row_range(&mut self, width: u16) -> Option<std::ops::Range<u16>> {
+        self.surface.prepare_keymap(&self.host);
         self.surface.focused_row_range(width)
     }
 
     /// Render the interactive surface.
     #[cfg(test)]
     pub fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
-        self.surface.render(area, frame);
+        self.surface.render_with_host(area, frame, None, &self.host);
     }
 
     /// Render a clipped slice of the interactive surface using full-surface coordinates.
@@ -415,7 +428,10 @@ impl InteractiveSurfaceState {
                 destination.width,
                 destination.height,
             ),
-            |cx| self.surface.render(full_area, cx),
+            |cx| {
+                self.surface
+                    .render_with_host(full_area, cx, None, &self.host)
+            },
         );
     }
 

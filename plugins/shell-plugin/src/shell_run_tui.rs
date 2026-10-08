@@ -4,6 +4,26 @@
 //! that may interpret shell artifact schemas and terminal recording references; generic TUI and
 //! transcript code routes opaque plugin visuals without understanding those values.
 
+pub(super) fn register_keymap(registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry) {
+    for (action, key) in [
+        ("expand", "e"),
+        ("up", "up"),
+        ("down", "down"),
+        ("page-up", "page_up"),
+        ("page-down", "page_down"),
+        ("left", "left"),
+        ("right", "right"),
+        ("home", "home"),
+    ] {
+        registry.register_keymap_action(bcode_plugin_sdk::tui::keymap::KeymapAction {
+            id: format!("shell.terminal.{action}"),
+            scope: "shell.terminal".into(),
+            description: action.into(),
+            defaults: vec![key.into()],
+        });
+    }
+}
+
 #[cfg(test)]
 use crate::contracts::{SHELL_RECORDING_CONTENT_TYPE, SHELL_SCHEMA_VERSION};
 use crate::contracts::{
@@ -26,6 +46,8 @@ use std::fs;
 use std::sync::Mutex;
 
 thread_local! {
+    static ACTIVE_KEY_HINTS: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+
     static ACTIVE_THEME: std::cell::Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const {
         std::cell::Cell::new(None)
     };
@@ -437,7 +459,12 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         Some(row)
     }
 
-    fn content_event(&self, identity: &str, event: &bmux_tui::event::Event) -> bool {
+    fn content_event_with_host(
+        &self,
+        identity: &str,
+        event: &bmux_tui::event::Event,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bool {
         let Some((key, _, _)) = shell_content_identity(identity) else {
             return false;
         };
@@ -461,35 +488,37 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Right) => 0,
                 _ => return false,
             },
-            bmux_tui::event::Event::Key(key) if key.modifiers.is_empty() => match key.key {
-                bmux_keyboard::KeyCode::Char('e') => {
-                    replay.projection.expanded = !replay.projection.expanded;
-                    return true;
+            bmux_tui::event::Event::Key(key) => {
+                match host.keymap_action("shell.terminal", *key).as_deref() {
+                    Some("shell.terminal.expand") => {
+                        replay.projection.expanded = !replay.projection.expanded;
+                        return true;
+                    }
+                    Some("shell.terminal.up") => {
+                        replay.projection.vertical = replay.projection.vertical.saturating_sub(1);
+                        return true;
+                    }
+                    Some("shell.terminal.down") => {
+                        replay.projection.vertical = replay.projection.vertical.saturating_add(1);
+                        return true;
+                    }
+                    Some("shell.terminal.page-up") => {
+                        replay.projection.vertical = replay.projection.vertical.saturating_sub(28);
+                        return true;
+                    }
+                    Some("shell.terminal.page-down") => {
+                        replay.projection.vertical = replay.projection.vertical.saturating_add(28);
+                        return true;
+                    }
+                    Some("shell.terminal.left") => -8,
+                    Some("shell.terminal.right") => 8,
+                    Some("shell.terminal.home") => {
+                        replay.projection.horizontal = 0;
+                        return true;
+                    }
+                    _ => return false,
                 }
-                bmux_keyboard::KeyCode::Up => {
-                    replay.projection.vertical = replay.projection.vertical.saturating_sub(1);
-                    return true;
-                }
-                bmux_keyboard::KeyCode::Down => {
-                    replay.projection.vertical = replay.projection.vertical.saturating_add(1);
-                    return true;
-                }
-                bmux_keyboard::KeyCode::PageUp => {
-                    replay.projection.vertical = replay.projection.vertical.saturating_sub(28);
-                    return true;
-                }
-                bmux_keyboard::KeyCode::PageDown => {
-                    replay.projection.vertical = replay.projection.vertical.saturating_add(28);
-                    return true;
-                }
-                bmux_keyboard::KeyCode::Left => -8,
-                bmux_keyboard::KeyCode::Right => 8,
-                bmux_keyboard::KeyCode::Home => {
-                    replay.projection.horizontal = 0;
-                    return true;
-                }
-                _ => return false,
-            },
+            }
             _ => return false,
         };
         replay.projection.horizontal = replay.projection.horizontal.saturating_add_signed(delta);
@@ -580,6 +609,38 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             })
             .into_iter()
             .collect()
+    }
+
+    fn projection_with_host(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+        let hint = [
+            ("expand", "expand/collapse"),
+            ("up", "up"),
+            ("down", "down"),
+            ("left", "left"),
+            ("right", "right"),
+            ("page-up", "page up"),
+            ("page-down", "page down"),
+            ("home", "reset columns"),
+        ]
+        .into_iter()
+        .filter_map(|(action, label)| {
+            let keys = host
+                .keymap_keys("shell.terminal", &format!("shell.terminal.{action}"))
+                .join("/");
+            (!keys.is_empty()).then(|| format!("{keys}: {label}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let prior = ACTIVE_KEY_HINTS.with(|hints| hints.replace(hint));
+        let projection = self.projection(kind, payload, context);
+        ACTIVE_KEY_HINTS.with(|hints| hints.replace(prior));
+        projection
     }
 
     fn projection(
@@ -1654,13 +1715,21 @@ fn shell_terminal_grid_rows(
     }
     if grid.mode() == GridMode::Alternate {
         output.push(Line::from(format!(
-            "    columns {}–{} / {} · right-click: focus · e: expand/collapse · arrows/PgUp/PgDn: pan · Esc: leave",
+            "    columns {}–{} / {} · right-click: focus{}",
             projection.horizontal.saturating_add(1),
             projection
                 .horizontal
                 .saturating_add(usize::from(width.saturating_sub(4)))
                 .min(grid.width()),
             grid.width(),
+            ACTIVE_KEY_HINTS.with(|hints| {
+                let hints = hints.borrow();
+                if hints.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {hints}")
+                }
+            }),
         )));
     }
     output
@@ -3218,6 +3287,62 @@ mod tests {
         }
     }
 
+    struct ShellKeymapHost(bcode_plugin_sdk::tui::keymap::KeymapRegistry);
+    impl bcode_plugin_sdk::tui::PluginTuiHost for ShellKeymapHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            self.0.action_for_key(scope, stroke).map(str::to_owned)
+        }
+    }
+
+    fn shell_test_keymap() -> bcode_plugin_sdk::tui::keymap::KeymapRegistry {
+        let mut definitions = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+        register_keymap(&mut definitions);
+        let mut registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+        for action in definitions.keymap_actions() {
+            registry.register(action.clone()).unwrap();
+        }
+        registry
+    }
+
+    #[test]
+    fn positioned_remap_and_unbind_change_effective_routing() {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let key = "remapped";
+        adapter.update_live_replay(key, b"\x1b[?1049habcdefghijklmnop", None, 20, 3);
+        let identity = format!("terminal:{}:{}:0:0", key.len(), key);
+        let mut registry = shell_test_keymap();
+        registry
+            .configure(std::collections::BTreeMap::from([(
+                "shell.terminal".into(),
+                std::collections::BTreeMap::from([
+                    ("ctrl+l".into(), "shell.terminal.right".into()),
+                    ("left".into(), String::new()),
+                ]),
+            )]))
+            .unwrap();
+        let host = ShellKeymapHost(registry);
+        let event =
+            |key| bmux_tui::event::Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap());
+        assert!(!adapter.content_event_with_host(&identity, &event("right"), &host));
+        assert!(!adapter.content_event_with_host(&identity, &event("left"), &host));
+        assert!(adapter.content_event_with_host(&identity, &event("ctrl+l"), &host));
+        assert_eq!(
+            adapter
+                .live_replays
+                .lock()
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .projection
+                .horizontal,
+            8
+        );
+    }
+
     #[test]
     fn positioned_keyboard_pan_changes_only_local_columns() {
         use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
@@ -3231,7 +3356,11 @@ mod tests {
             key: bmux_keyboard::KeyCode::Right,
             modifiers: bmux_keyboard::Modifiers::default(),
         });
-        assert!(adapter.content_event(&identity, &event));
+        assert!(adapter.content_event_with_host(
+            &identity,
+            &event,
+            &ShellKeymapHost(shell_test_keymap())
+        ));
         let mut replays = adapter.live_replays.lock().unwrap();
         let replay = replays.get_mut(key).unwrap();
         let grid = replay.stream.as_ref().unwrap().grid();

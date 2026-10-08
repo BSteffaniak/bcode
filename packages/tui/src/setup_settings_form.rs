@@ -1,5 +1,6 @@
 //! In-terminal reviewed settings form. No terminal ownership handoff or stdin prompts.
 
+use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
@@ -22,6 +23,7 @@ pub enum SettingsFormOutcome {
 
 /// Non-secret fields and the exact pending edit awaiting explicit confirmation.
 pub struct SetupSettingsForm {
+    keymap: super::keymap::BmuxKeyMap,
     inputs: [TextInputState; 3],
     focused: usize,
     status: String,
@@ -40,10 +42,13 @@ impl SetupSettingsForm {
     #[must_use]
     pub fn new(path: &std::path::Path, key: &str) -> Self {
         Self {
+            keymap: super::keymap::BmuxKeyMap::from_registry(
+                bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
+            ),
             inputs: [path.to_string_lossy().into_owned(), key.to_owned(), String::new()]
                 .map(|value| TextInputState::new(TextEditBuffer::from_text(value))),
             focused: 1,
-            status: "Tab changes fields. Enter reviews. Empty value removes the override. Esc returns to setup.".to_owned(),
+            status: "Next field changes fields. Confirm reviews. Empty value removes the override. Cancel returns to setup.".to_owned(),
             pending: None,
             model_profiles: None,
             selected_profile: 0,
@@ -65,7 +70,7 @@ impl SetupSettingsForm {
     pub fn create_context(path: &std::path::Path) -> Self {
         let mut form = Self::new(path, "");
         form.create_context = true;
-        "Enter a stable context ID and display label. Enter reviews; Esc cancels. No accounts are copied.".clone_into(&mut form.status);
+        "Enter a stable context ID and display label. Confirm reviews; Cancel cancels. No accounts are copied.".clone_into(&mut form.status);
         form
     }
 
@@ -159,7 +164,7 @@ impl SetupSettingsForm {
             if let Some(account) = accounts.get(self.selected_profile) {
                 self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(account.clone()));
                 self.status = format!(
-                    "Context: {}; account: {account}. Up/Down selects; Enter reviews provider/account selection and clearing model/pool overrides.",
+                    "Context: {}; account: {account}. Navigation selects; Confirm reviews provider/account selection and clearing model/pool overrides.",
                     config.active_context.as_deref().unwrap_or("none")
                 );
             } else {
@@ -172,11 +177,12 @@ impl SetupSettingsForm {
             if let Some(model) = models.get(self.selected_profile) {
                 self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(model.clone()));
                 self.status = format!(
-                    "Context: {}; provider: {provider}; account: {account}; model: {model}. Up/Down selects; Enter reviews.",
+                    "Context: {}; provider: {provider}; account: {account}; model: {model}. Navigation selects; Confirm reviews.",
                     context.as_deref().unwrap_or("global")
                 );
             } else {
-                "No available models returned. Esc returns to setup.".clone_into(&mut self.status);
+                "No available models returned. Cancel returns to setup."
+                    .clone_into(&mut self.status);
             }
             return;
         }
@@ -186,10 +192,10 @@ impl SetupSettingsForm {
                     toml::Value::String(id.clone()).to_string(),
                 ));
                 self.status = format!(
-                    "{label} ({id}). Up/Down selects; Enter reviews the configuration edit."
+                    "{label} ({id}). Navigation selects; Confirm reviews the configuration edit."
                 );
             } else {
-                "No contexts defined. Esc returns; press N to create one."
+                "No contexts defined. Cancel returns; use Create context to add one."
                     .clone_into(&mut self.status);
             }
             return;
@@ -198,14 +204,14 @@ impl SetupSettingsForm {
             return;
         };
         let Some((name, selection)) = profiles.get(self.selected_profile) else {
-            "No configured model profiles. Esc returns to setup; use Settings to configure a model.".clone_into(&mut self.status);
+            "No configured model profiles. Cancel returns to setup; use Settings to configure a model.".clone_into(&mut self.status);
             return;
         };
         self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(
             toml::Value::String(name.clone()).to_string(),
         ));
         self.status = format!(
-            "{} — provider: {}; model: {}; account: {}; pool: {}. Up/Down selects; Enter reviews.",
+            "{} — provider: {}; model: {}; account: {}; pool: {}. Navigation selects; Confirm reviews.",
             name,
             selection
                 .provider_plugin_id
@@ -218,7 +224,55 @@ impl SetupSettingsForm {
     }
 
     /// Handle form input without changing terminal lifecycle.
+    #[cfg(test)]
     pub fn handle_event(&mut self, event: &Event) -> SettingsFormOutcome {
+        self.handle_event_with_keymap(
+            event,
+            &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        )
+    }
+
+    /// Admit only effective semantic operations and literal text to the form.
+    pub fn handle_event_with_keymap(
+        &mut self,
+        event: &Event,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> SettingsFormOutcome {
+        self.keymap = keymap.clone();
+        let mapped;
+        let event = if let Event::Key(stroke) = event {
+            let supported = ControlAction::TEXT
+                .iter()
+                .copied()
+                .chain([
+                    ControlAction::Submit,
+                    ControlAction::Cancel,
+                    ControlAction::FocusNext,
+                    ControlAction::FocusPrevious,
+                    ControlAction::PageUp,
+                    ControlAction::PageDown,
+                ])
+                .collect::<Vec<_>>();
+            let native = ControlInput::from_registry(
+                keymap.registry(),
+                "setup_settings",
+                *stroke,
+                &supported,
+                true,
+            )
+            .native_stroke();
+            let Some(native) = native else {
+                return SettingsFormOutcome::Continue;
+            };
+            mapped = Event::Key(native);
+            &mapped
+        } else {
+            event
+        };
+        self.handle_admitted_event(event)
+    }
+
+    fn handle_admitted_event(&mut self, event: &Event) -> SettingsFormOutcome {
         let policy = TextInputPolicy::default();
         if self.pending.is_none()
             && let Some(count) = self
@@ -263,7 +317,11 @@ impl SetupSettingsForm {
                 {
                     self.focused = 0;
                 } else {
-                    self.focused = (self.focused + 1) % self.inputs.len();
+                    self.focused = if key.modifiers.shift {
+                        (self.focused + self.inputs.len() - 1) % self.inputs.len()
+                    } else {
+                        (self.focused + 1) % self.inputs.len()
+                    };
                 }
             }
             Event::Key(key) if self.pending.is_none() => {
@@ -279,7 +337,7 @@ impl SetupSettingsForm {
         SettingsFormOutcome::Continue
     }
 
-    fn submit(&mut self) {
+    fn selection_snapshot_current(&mut self) -> bool {
         if let Some(expected) = &self.selection_snapshot {
             let current = bcode_config::load_config();
             if !current
@@ -288,8 +346,15 @@ impl SetupSettingsForm {
             {
                 self.pending = None;
                 "Configuration changed since these choices were loaded. Return to setup and reload the picker before saving.".clone_into(&mut self.status);
-                return;
+                return false;
             }
+        }
+        true
+    }
+
+    fn submit(&mut self) {
+        if !self.selection_snapshot_current() {
+            return;
         }
         if self.contexts.as_ref().is_some_and(Vec::is_empty) {
             self.refresh_profile();
@@ -307,8 +372,10 @@ impl SetupSettingsForm {
         }
         if let Some(edit) = self.pending.take() {
             self.status = match edit.apply() {
-                Ok(_) => "Saved. Higher-priority overrides may still apply. Esc returns to setup."
-                    .to_owned(),
+                Ok(_) => {
+                    "Saved. Higher-priority overrides may still apply. Cancel returns to setup."
+                        .to_owned()
+                }
                 Err(_) => "Could not save safely. Configuration may have changed; review again."
                     .to_owned(),
             };
@@ -324,7 +391,7 @@ impl SetupSettingsForm {
             match bcode_config::edit::plan_context_account_selection(path.into(), config, account) {
                 Ok(edit) => {
                     self.pending = Some(edit);
-                    "Review context/account selection. Enter saves; then M discovers models. No credentials change.".clone_into(&mut self.status);
+                    "Review context/account selection. Confirm saves; then M discovers models. No credentials change.".clone_into(&mut self.status);
                 }
                 Err(_) => "Cannot safely select account. Review context configuration."
                     .clone_into(&mut self.status),
@@ -344,7 +411,7 @@ impl SetupSettingsForm {
             ) {
                 Ok(edit) => {
                     self.pending = Some(edit);
-                    "Review provider, account, model, context and file. Enter saves this selection; Esc cancels.".clone_into(&mut self.status);
+                    "Review provider, account, model, context and file. Confirm saves this selection; Cancel cancels.".clone_into(&mut self.status);
                 }
                 Err(_) => "Cannot safely edit model selection. Review configuration."
                     .clone_into(&mut self.status),
@@ -355,7 +422,7 @@ impl SetupSettingsForm {
             match bcode_config::edit::plan_context_creation(path.into(), key, value) {
                 Ok(edit) => {
                     self.pending = Some(edit);
-                    "Review the file, stable ID, and label. Enter creates an empty context; Esc cancels.".clone_into(&mut self.status);
+                    "Review the file, stable ID, and label. Confirm creates an empty context; Cancel cancels.".clone_into(&mut self.status);
                 }
                 Err(_) => "Cannot create context: check the ID, duplicate definitions, and destination file.".clone_into(&mut self.status),
             }
@@ -374,7 +441,7 @@ impl SetupSettingsForm {
         let keys = key.split('/').map(str::to_owned).collect::<Vec<_>>();
         match bcode_config::edit::plan_field_edit(path.into(), &keys, parsed) {
             Ok(edit) => {
-                "Review the destination, field and value above. Enter confirms this exact edit; Esc cancels.".clone_into(&mut self.status);
+                "Review the destination, field and value above. Confirm this exact edit; Cancel cancels.".clone_into(&mut self.status);
                 self.pending = Some(edit);
             }
             Err(_) => "Unsupported field or invalid configuration. Use connection controls for secrets and theme controls for appearance.".clone_into(&mut self.status),
@@ -382,7 +449,19 @@ impl SetupSettingsForm {
     }
 
     /// Render form fields and review state within the existing terminal.
+    #[cfg(test)]
     pub fn render(&mut self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
+        self.render_with_keymap(frame, theme, &self.keymap.clone());
+    }
+
+    /// Render with the same effective bindings used for dispatch.
+    pub fn render_with_keymap(
+        &mut self,
+        frame: &mut PaintCx<'_, '_>,
+        theme: &PresentedTheme,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) {
+        self.keymap = keymap.clone();
         let area = Rect::new(0, 0, frame.area().width, frame.area().height);
         let policy = TextInputPolicy::default();
         let labels = if self.create_context {
@@ -449,7 +528,13 @@ impl SetupSettingsForm {
                 area.width.saturating_sub(2),
                 1,
             ),
-            &self.status,
+            &format!(
+                "{} · {} review/save · {} cancel · {} field",
+                self.status,
+                keymap.hint("setup_settings", "tui.control.submit"),
+                keymap.hint("setup_settings", "tui.control.cancel"),
+                keymap.hint("setup_settings", "tui.control.focus_next")
+            ),
             theme.text,
         );
     }

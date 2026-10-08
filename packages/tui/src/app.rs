@@ -457,6 +457,7 @@ pub struct BmuxApp {
     key_hints: String,
     jump_to_latest_key_label: String,
     tui_config: TuiConfig,
+    effective_keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
     diff_viewer_layout_override: Option<TuiDiffViewerLayout>,
     exit: ExitState,
     cursor: CursorBlink,
@@ -578,8 +579,7 @@ impl BmuxApp {
         input_history: &[SessionInputHistoryEntry],
         older_history: OlderHistoryState,
     ) -> Self {
-        let now = Instant::now();
-        let initial_theme = super::theme::resolve_initial_theme();
+        let (now, initial_theme) = Self::initial_presentation();
         Self {
             pending_session_link: None,
             child_request_fence: crate::child_request_fence::ChildRequestFence::default(),
@@ -657,10 +657,11 @@ impl BmuxApp {
             activity_started_at: now,
             daemon_connection: DaemonConnectionState::Connecting,
             execution_mode_indicator: None,
-            status: String::from("Connecting to daemon… Enter submits; Esc/Ctrl-C exits."),
-            key_hints: String::from("enter send · escape interrupt · ctrl+d exit · ctrl+p palette"),
+            status: String::from("Connecting to daemon…"),
+            key_hints: String::new(),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
             tui_config: TuiConfig::default(),
+            effective_keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
             diff_viewer_layout_override: None,
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
@@ -678,6 +679,10 @@ impl BmuxApp {
             #[cfg(test)]
             last_transcript_damage: TranscriptDocumentDamage::None,
         }
+    }
+
+    fn initial_presentation() -> (Instant, ResolvedTheme) {
+        (Instant::now(), super::theme::resolve_initial_theme())
     }
 
     fn with_initial_history(mut self, history: &[SessionEvent]) -> Self {
@@ -804,6 +809,43 @@ impl BmuxApp {
         self.plugin_presentation = Some(Arc::new(
             crate::plugin_tui::PluginTuiPresentation::from_shared(host),
         ));
+    }
+
+    /// Shortcut label from the effective terminal registry.
+    #[must_use]
+    pub fn shortcut_hint(&self, scope: &str, action: &str) -> String {
+        let keys = self.effective_keymap.keys_for_action(scope, action);
+        if keys.is_empty() {
+            "unbound".into()
+        } else {
+            keys.join(" / ")
+        }
+    }
+
+    /// Replace the terminal frontend's effective keymap snapshot without rereading config.
+    pub fn set_effective_keymap(
+        &mut self,
+        registry: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+    ) {
+        if self.effective_keymap != registry {
+            self.capture_stable_transcript_anchor();
+            self.effective_keymap = registry;
+            self.transcript_layout = TranscriptLayoutCache::default();
+            self.key_hints = format!(
+                "{} send · {} interrupt · {} exit · {} palette",
+                self.shortcut_hint("chat", crate::keymap::BmuxAction::InputSubmitSteering.id()),
+                self.shortcut_hint("chat", crate::keymap::BmuxAction::AppInterrupt.id()),
+                self.shortcut_hint("chat", crate::keymap::BmuxAction::AppExit.id()),
+                self.shortcut_hint("chat", crate::keymap::BmuxAction::CommandPaletteOpen.id())
+            );
+            self.elapsed_layout_revision = self.elapsed_layout_revision.saturating_add(1);
+        }
+    }
+
+    /// Effective bindings shared by visual rendering and terminal dispatch.
+    #[must_use]
+    pub const fn effective_keymap(&self) -> &bcode_plugin_sdk::tui::keymap::KeymapRegistry {
+        &self.effective_keymap
     }
 
     /// Set persistent local plugin presentation state.
@@ -937,20 +979,12 @@ impl BmuxApp {
             self.markdown_interaction.focus_next()
         };
         if changed && self.markdown_interaction.focused().is_some() {
-            let hint = match self.markdown_interaction.focused_contribution() {
-                Some(
-                    bcode_markdown_render::MarkdownContributionKind::Link { destination, .. }
-                    | bcode_markdown_render::MarkdownContributionKind::GitHubIssue {
-                        destination,
-                        ..
-                    },
-                ) if crate::markdown_activation::markdown_destination_text(destination)
-                    .is_some() =>
-                {
-                    "Alt+Enter opens; Ctrl+Alt+C copies; Ctrl/Alt+Tab moves"
-                }
-                _ => "Alt+Enter activates; Ctrl/Alt+Tab moves",
-            };
+            let hint = format!(
+                "{} activates; {} copies; {} moves",
+                self.shortcut_hint("chat", "tui.markdown.activate"),
+                self.shortcut_hint("chat", "tui.markdown.copyDestination"),
+                self.shortcut_hint("chat", "tui.markdown.focusNext")
+            );
             self.set_status(format!("Markdown contribution focused; {hint}"));
         }
         changed
@@ -1501,7 +1535,12 @@ impl BmuxApp {
         }
         self.child_activity_error.clone().unwrap_or_else(|| {
             self.child_activity.as_ref().map_or_else(
-                || "children: unknown · Ctrl-G monitor".to_owned(),
+                || {
+                    format!(
+                        "children: unknown · {} monitor",
+                        self.shortcut_hint("chat", "tui.monitor.toggle")
+                    )
+                },
                 bcode_session_view::child_activity::child_activity_label,
             )
         })
@@ -1823,14 +1862,7 @@ impl BmuxApp {
                 )
             },
         );
-        let mut rows = vec![format!(
-            "{overview} · {}",
-            if self.child_panel_focused() {
-                "MONITOR FOCUS · ↑↓ select Enter open → expand ← parent Alt-N more · Esc composer"
-            } else {
-                "COMPOSER FOCUS · click a child to open · Ctrl-G close"
-            }
-        )];
+        let mut rows = vec![format!("{overview} · {}", self.child_panel_focus_hint())];
         let tree = self.monitor_tree();
         let start = self.child_panel_selected.saturating_sub(4);
         let observations = bcode_session_view::child_attention::newest_observations(
@@ -1903,9 +1935,31 @@ impl BmuxApp {
             rows.extend(page.issues.iter().take(2).cloned());
         }
         if self.monitor_next_page().is_some() {
-            rows.push("Alt-N: load next bounded child page".to_owned());
+            rows.push(format!(
+                "{}: load next bounded child page",
+                self.shortcut_hint("monitor", "tui.monitor.nextPage")
+            ));
         }
         rows
+    }
+
+    fn child_panel_focus_hint(&self) -> String {
+        if self.child_panel_focused() {
+            format!(
+                "MONITOR FOCUS · {} select {} open {} expand {} parent {} more · {} composer",
+                self.shortcut_hint("monitor", "tui.control.down"),
+                self.shortcut_hint("monitor", "tui.control.submit"),
+                self.shortcut_hint("monitor", "tui.control.right"),
+                self.shortcut_hint("monitor", "tui.control.left"),
+                self.shortcut_hint("monitor", "tui.monitor.nextPage"),
+                self.shortcut_hint("monitor", "tui.control.cancel")
+            )
+        } else {
+            format!(
+                "COMPOSER FOCUS · click a child to open · {} close",
+                self.shortcut_hint("chat", "tui.monitor.toggle")
+            )
+        }
     }
 
     pub fn apply_session_summary(&mut self, summary: &bcode_session_models::SessionSummary) {
@@ -7256,6 +7310,51 @@ mod tests {
         let unknown_theme_accepted = app.preview_theme("does-not-exist");
         drop(app);
         assert!(!unknown_theme_accepted);
+    }
+
+    #[test]
+    fn effective_keymap_replacement_invalidates_cached_rows_once() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_pending_interactions(vec![interaction("keymap")]);
+        crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+        assert!(app.transcript_layout().total_rows() > 0);
+        let before = app.elapsed_layout_revision();
+        let registry = crate::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default())
+            .registry()
+            .clone();
+        app.set_effective_keymap(registry.clone());
+        assert_eq!(app.transcript_layout().total_rows(), 0);
+        assert_eq!(app.elapsed_layout_revision(), before + 1);
+        crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+        let rows = app.transcript_layout().total_rows();
+        assert!(rows > 0);
+        app.set_effective_keymap(registry);
+        assert_eq!(app.transcript_layout().total_rows(), rows);
+        assert_eq!(app.elapsed_layout_revision(), before + 1);
+
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "chat".into(),
+            std::collections::BTreeMap::from([("not-a-valid-key".into(), "app.exit".into())]),
+        );
+        let invalid = crate::keymap::BmuxKeyMap::from_config(&config);
+        assert!(invalid.error().is_some());
+        app.set_effective_keymap(invalid.registry().clone());
+        assert_eq!(app.transcript_layout().total_rows(), 0);
+        assert_eq!(
+            app.key_hints,
+            "unbound send · unbound interrupt · unbound exit · unbound palette"
+        );
+        assert_eq!(
+            app.effective_keymap().action_for_key(
+                "chat",
+                bcode_plugin_sdk::tui::keymap::parse_key_stroke("enter").unwrap(),
+            ),
+            None,
+        );
+        for width in [0, 1, 2, 80] {
+            crate::transcript_projection::sync_layout_for_test(&mut app, width);
+        }
     }
 
     #[test]

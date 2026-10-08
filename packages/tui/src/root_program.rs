@@ -776,7 +776,10 @@ impl BcodeRuntimeModel {
             return super::invalidation::UiInvalidation::Structural;
         }
         if self.loop_state.has_auth_pool_picker() {
-            match self.loop_state.handle_auth_pool_picker_event(&event) {
+            match self
+                .loop_state
+                .handle_auth_pool_picker_event(&event, self.settings.keymap())
+            {
                 super::chat_loop::AuthPoolPickerRootOutcome::Continue => {}
                 super::chat_loop::AuthPoolPickerRootOutcome::Cancel => {
                     self.chat
@@ -1038,8 +1041,7 @@ impl BcodeRuntimeModel {
             }
             Event::Key(stroke) => {
                 if !self.loop_state.modal_foreground()
-                    && stroke.key == bmux_keyboard::KeyCode::Char('g')
-                    && stroke.modifiers.ctrl
+                    && self.settings.keymap().action("chat", stroke) == Some("tui.monitor.toggle")
                 {
                     self.chat.app.toggle_child_panel();
                     if let Some(session_id) = self.chat.attached_session_id() {
@@ -1060,22 +1062,12 @@ impl BcodeRuntimeModel {
                 }
                 if !self.loop_state.modal_foreground()
                     && self.chat.app.child_panel_focused()
-                    && (matches!(
-                        stroke.key,
-                        bmux_keyboard::KeyCode::Up
-                            | bmux_keyboard::KeyCode::Down
-                            | bmux_keyboard::KeyCode::Left
-                            | bmux_keyboard::KeyCode::Right
-                            | bmux_keyboard::KeyCode::Enter
-                            | bmux_keyboard::KeyCode::Escape
-                    ) || (stroke.key == bmux_keyboard::KeyCode::Char('n')
-                        && stroke.modifiers.alt))
+                    && self.settings.keymap().action("monitor", stroke).is_some()
                 {
-                    use bmux_keyboard::KeyCode;
-                    match stroke.key {
-                        KeyCode::Up => self.chat.app.move_monitor_selection(false),
-                        KeyCode::Down => self.chat.app.move_monitor_selection(true),
-                        KeyCode::Right => {
+                    match self.settings.keymap().action("monitor", stroke) {
+                        Some("tui.control.up") => self.chat.app.move_monitor_selection(false),
+                        Some("tui.control.down") => self.chat.app.move_monitor_selection(true),
+                        Some("tui.control.right") => {
                             if let Some(session_id) = self.chat.app.expand_monitor_selected() {
                                 self.chat.replace_effect(
                                     super::effects::TuiEffect::LoadSessionChildren {
@@ -1093,7 +1085,7 @@ impl BcodeRuntimeModel {
                                 );
                             }
                         }
-                        KeyCode::Char('n') => {
+                        Some("tui.monitor.nextPage") => {
                             if let Some((parent_id, after)) = self.chat.app.monitor_next_page() {
                                 self.chat.replace_effect(
                                     super::effects::TuiEffect::LoadSessionChildren {
@@ -1104,8 +1096,10 @@ impl BcodeRuntimeModel {
                                 );
                             }
                         }
-                        KeyCode::Enter | KeyCode::Left => {
-                            let target = if stroke.key == KeyCode::Left {
+                        Some("tui.control.submit" | "tui.control.left") => {
+                            let target = if self.settings.keymap().action("monitor", stroke)
+                                == Some("tui.control.left")
+                            {
                                 self.chat
                                     .app
                                     .session_view_snapshot()
@@ -1125,7 +1119,7 @@ impl BcodeRuntimeModel {
                                 );
                             }
                         }
-                        KeyCode::Escape => self.chat.app.release_child_panel_focus(),
+                        Some("tui.control.cancel") => self.chat.app.release_child_panel_focus(),
                         _ => return super::invalidation::UiInvalidation::None,
                     }
                     return super::invalidation::UiInvalidation::Structural;
@@ -1133,16 +1127,27 @@ impl BcodeRuntimeModel {
                 if !self.loop_state.modal_foreground()
                     && let Some(identity) = &self.focused_visual
                 {
-                    if stroke.key == bmux_keyboard::KeyCode::Escape {
+                    if self.settings.keymap().action("visual", stroke) == Some("tui.control.cancel")
+                    {
                         self.focused_visual = None;
                         return super::invalidation::UiInvalidation::Structural;
                     }
+                    let host = super::plugin_surface_host::root_host(
+                        bmux_tui_runtime::InvalidationSignal::new(),
+                        self.loop_state.foreground_client(),
+                        self.fresh_session_settings(),
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    );
                     if self
                         .chat
                         .app
                         .plugin_presentation()
                         .is_some_and(|presentation| {
-                            presentation.content_event(identity, &Event::Key(stroke))
+                            presentation.content_event_with_host(
+                                identity,
+                                &Event::Key(stroke),
+                                &host,
+                            )
                         })
                     {
                         return super::invalidation::UiInvalidation::Structural;
@@ -1153,19 +1158,22 @@ impl BcodeRuntimeModel {
                     return self.handle_permission_key(stroke);
                 }
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Streaming)
-                    && self
-                        .loop_state
-                        .handle_streaming_configurator_key(&mut self.chat, stroke)
+                    && self.loop_state.handle_streaming_configurator_key(
+                        &mut self.chat,
+                        stroke,
+                        self.settings.keymap(),
+                    )
                 {
                     return super::invalidation::UiInvalidation::Structural;
                 }
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Streaming) {
                     return super::invalidation::UiInvalidation::None;
                 }
-                match self
-                    .loop_state
-                    .handle_timeline_dialog_key(&mut self.chat, stroke)
-                {
+                match self.loop_state.handle_timeline_dialog_key(
+                    &mut self.chat,
+                    stroke,
+                    self.settings.keymap(),
+                ) {
                     super::chat_loop::TimelineDialogRootOutcome::Handled => {
                         return super::invalidation::UiInvalidation::Structural;
                     }
@@ -1178,10 +1186,11 @@ impl BcodeRuntimeModel {
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Timeline) {
                     return super::invalidation::UiInvalidation::None;
                 }
-                match self
-                    .loop_state
-                    .handle_thinking_dialog_key(&mut self.chat, stroke)
-                {
+                match self.loop_state.handle_thinking_dialog_key(
+                    &mut self.chat,
+                    stroke,
+                    self.settings.keymap(),
+                ) {
                     super::chat_loop::ThinkingDialogRootOutcome::Handled => {
                         return super::invalidation::UiInvalidation::Structural;
                     }
@@ -1199,26 +1208,31 @@ impl BcodeRuntimeModel {
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Thinking) {
                     return super::invalidation::UiInvalidation::None;
                 }
-                if self
-                    .loop_state
-                    .handle_theme_picker_key(&mut self.chat, stroke)
-                {
+                if self.loop_state.handle_theme_picker_key(
+                    &mut self.chat,
+                    stroke,
+                    self.settings.keymap(),
+                ) {
                     return super::invalidation::UiInvalidation::Structural;
                 }
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Theme) {
                     return super::invalidation::UiInvalidation::None;
                 }
                 if self.loop_state.has_command_palette() {
-                    if let Some(action) = self.loop_state.handle_command_palette_key(stroke) {
+                    if let Some(action) = self
+                        .loop_state
+                        .handle_command_palette_key(stroke, self.settings.keymap())
+                    {
                         self.apply_root_command_action(action);
                     }
                     return super::invalidation::UiInvalidation::Structural;
                 }
                 if self.loop_state.has_slash_palette() {
-                    match self
-                        .loop_state
-                        .handle_slash_palette_key(&mut self.chat, stroke)
-                    {
+                    match self.loop_state.handle_slash_palette_key(
+                        &mut self.chat,
+                        stroke,
+                        self.settings.keymap(),
+                    ) {
                         super::chat_loop::SlashPaletteRootOutcome::Handled => {
                             return super::invalidation::UiInvalidation::Structural;
                         }
@@ -2405,6 +2419,8 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
                 .transcript_selection
                 .snapshot(&program.committed_selection)
                 .is_none();
+        let render_launch = program.fresh_session_settings();
+        program.loop_state.set_render_launch(render_launch);
         let (draw_stats, layout) = super::chat_loop::draw_chat_frame(
             self.terminal,
             &mut program.chat,

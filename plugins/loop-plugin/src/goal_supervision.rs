@@ -26,7 +26,9 @@ impl PluginTuiSurfaceFactory for Factory {
             });
             let mut view = crate::goal_live::GenerationView::default();
             view.title = "Goal · Supervision";
-            view.footer = "1–9 inspect execution session and return · Esc returns to conversation (does not stop work)";
+            view.footer =
+                "Inspect execution sessions · close returns to conversation (does not stop work)"
+                    .into();
             view.detail = "Connecting to the associated execution".into();
             Ok(Box::new(Supervision {
                 session,
@@ -80,6 +82,9 @@ fn content(snapshot: &WorkflowRunView) -> String {
 }
 
 impl PluginTuiSurface for Supervision {
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        self.prepare_hints(host);
+    }
     fn id(&self) -> &'static str {
         SURFACE
     }
@@ -167,19 +172,49 @@ impl PluginTuiSurface for Supervision {
         }
         PluginTuiAction::Redraw
     }
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&super::PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_hints(host);
+        self.render_with_theme(area, frame, theme);
+    }
+    fn render_slice_with_host(
+        &mut self,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_hints(host);
+        self.render_slice(logical_height, logical_row_offset, destination, frame);
+    }
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Event::Key(stroke) = event {
-            if stroke.key == KeyCode::Escape {
-                return PluginTuiAction::Close { outcome: None };
-            }
-            if let KeyCode::Char(key @ '1'..='9') = stroke.key
-                && let Some(snapshot) = &self.snapshot
-                && let Some(child) = snapshot.child_sessions.get(key as usize - '1' as usize)
-                && let Ok(session_id) = SessionId::from_str(&child.session_id)
-            {
-                return PluginTuiAction::OpenSession { session_id };
+            let action = host.keymap_action(super::keymap::SUPERVISION, *stroke);
+            for index in 1..=9 {
+                if action.as_deref() == Some(format!("bcode.loop.child_{index}").as_str())
+                    && let Some(snapshot) = &self.snapshot
+                    && let Some(child) = snapshot.child_sessions.get(index - 1)
+                    && let Ok(session_id) = SessionId::from_str(&child.session_id)
+                {
+                    return PluginTuiAction::OpenSession { session_id };
+                }
             }
         }
+        let Some(resolved) = super::keymap::event(host, super::keymap::SUPERVISION, event, false)
+        else {
+            return PluginTuiAction::None;
+        };
+        let event = &resolved;
+        if matches!(event, Event::Key(stroke) if stroke.key == KeyCode::Escape) {
+            return PluginTuiAction::Close { outcome: None };
+        }
+
         if let Some((area, layout)) = &self.view.layout {
             use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy};
             let _ = TextViewComponent::new("goal.live.output", &self.view.lines, &self.view.scroll)
@@ -187,6 +222,32 @@ impl PluginTuiSurface for Supervision {
                 .handle_event(*area, layout, event);
         }
         PluginTuiAction::Redraw
+    }
+}
+
+impl Supervision {
+    fn prepare_hints(&mut self, host: &dyn PluginTuiHost) {
+        let children = (1..=9)
+            .map(|index| {
+                format!(
+                    "{}: session {index}",
+                    super::keymap::hint(
+                        host,
+                        super::keymap::SUPERVISION,
+                        &format!("child_{index}")
+                    )
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        self.view.footer = format!(
+            "{children} · {} closes (does not stop work)",
+            super::keymap::control_hint(
+                host,
+                super::keymap::SUPERVISION,
+                super::keymap::ControlAction::Cancel
+            )
+        );
     }
 }
 

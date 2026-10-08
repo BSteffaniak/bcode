@@ -610,7 +610,8 @@ impl SessionPickerApp {
         };
         self.rename = super::text_input_flow::state_with_text(name, true);
         self.mode = SessionPickerMode::Rename;
-        "Enter saves rename; Esc cancels".clone_into(&mut self.status);
+        "Confirm saves the new name; Cancel returns to the session list"
+            .clone_into(&mut self.status);
         true
     }
 

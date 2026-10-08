@@ -15,10 +15,26 @@ use super::render::TuiTheme;
 use super::working_directory_dialog::WorkingDirectoryDialog;
 
 /// Render the working-directory dialog.
+#[cfg(test)]
 pub fn render_dialog(
     dialog: &mut WorkingDirectoryDialog,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
+) {
+    render_dialog_with_keymap(
+        dialog,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render effective dialog shortcuts.
+pub fn render_dialog_with_keymap(
+    dialog: &mut WorkingDirectoryDialog,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) {
     let modal = ModalFrame::new(
         ModalSizing::new(Size::new(56, 8), Size::new(80, 10), Insets::all(4)),
@@ -67,9 +83,15 @@ pub fn render_dialog(
     row = row.saturating_add(1);
     render_line(
         &Line::from_spans(vec![
-            Span::styled("Enter", Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                keymap.hint("working_directory", "tui.control.submit"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" apply  ", theme.text),
-            Span::styled("Esc", Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                keymap.hint("working_directory", "tui.control.cancel"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" cancel", theme.text),
         ]),
         &modal,

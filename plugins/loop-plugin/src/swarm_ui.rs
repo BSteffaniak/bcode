@@ -10,6 +10,8 @@ use bmux_tui_components::button::{
 };
 
 pub struct SwarmUi {
+    shortcut: String,
+    close_hint: String,
     pub open: bool,
     pub error: String,
     pub instructions: TextInputState,
@@ -26,6 +28,8 @@ pub struct SwarmUi {
 impl Default for SwarmUi {
     fn default() -> Self {
         Self {
+            shortcut: "unavailable".into(),
+            close_hint: "unavailable".into(),
             open: false,
             error: String::new(),
             instructions: text_state(""),
@@ -42,7 +46,16 @@ impl Default for SwarmUi {
 }
 
 impl SwarmUi {
-    pub fn launch_event(
+    pub fn prepare_hints(&mut self, host: &dyn super::PluginTuiHost) {
+        self.shortcut = super::keymap::hint(host, super::keymap::GOAL, "swarm");
+        self.close_hint = super::keymap::control_hint(
+            host,
+            super::keymap::SWARM,
+            super::keymap::ControlAction::Cancel,
+        );
+    }
+
+    pub fn resolved_launch_event(
         &mut self,
         mode: CollaborationMode,
         focused: bool,
@@ -97,10 +110,10 @@ impl SwarmUi {
 
     pub const fn label(mode: CollaborationMode) -> &'static str {
         match mode {
-            CollaborationMode::Requested => "Agents: Collaborate · Swarm settings (Ctrl+S)",
-            CollaborationMode::NoDelegation => "Agents: No delegation · Swarm settings (Ctrl+S)",
+            CollaborationMode::Requested => "Agents: Collaborate · Swarm settings",
+            CollaborationMode::NoDelegation => "Agents: No delegation · Swarm settings",
             CollaborationMode::Auto | CollaborationMode::Disabled => {
-                "Agents: Auto · Swarm settings (Ctrl+S)"
+                "Agents: Auto · Swarm settings"
             }
         }
     }
@@ -113,7 +126,8 @@ impl SwarmUi {
     ) -> Rect {
         let rect = Rect::new(content.x, content.y, content.width, 1).intersection(content);
         self.launcher_area = rect;
-        let button = ButtonComponent::new("goal.swarm", Self::label(mode), &self.launcher)
+        let label = format!("{} ({})", Self::label(mode), self.shortcut);
+        let button = ButtonComponent::new("goal.swarm", &label, &self.launcher)
             .policy(ButtonPolicy::interactive());
         paint(&button, rect, frame);
         let reserved = content.height.min(2);
@@ -198,6 +212,20 @@ impl SwarmUi {
             self.areas[0],
             frame,
         );
+        self.paint_inputs(frame, theme);
+        paint(
+            &ButtonComponent::new(
+                "goal.swarm.done",
+                &format!("Done ({})", self.close_hint),
+                &self.done_button,
+            )
+            .policy(ButtonPolicy::interactive()),
+            self.areas[4],
+            frame,
+        );
+    }
+
+    fn paint_inputs(&mut self, frame: &mut PaintCx<'_, '_>, theme: Option<&PluginTuiTheme>) {
         for (index, label, state) in [
             (
                 1,
@@ -225,15 +253,13 @@ impl SwarmUi {
                 theme,
             );
         }
-        paint(
-            &ButtonComponent::new("goal.swarm.done", "Done · Esc returns", &self.done_button)
-                .policy(ButtonPolicy::interactive()),
-            self.areas[4],
-            frame,
-        );
     }
 
-    pub fn event(&mut self, mode: &mut CollaborationMode, event: &Event) -> Result<(), String> {
+    pub fn resolved_event(
+        &mut self,
+        mode: &mut CollaborationMode,
+        event: &Event,
+    ) -> Result<(), String> {
         self.error.clear();
         if let Event::Key(key) = event {
             if key.key == KeyCode::Escape {
@@ -253,7 +279,7 @@ impl SwarmUi {
         }
         for (index, label, state) in [
             (0, Self::label(*mode), &self.mode_button),
-            (4, "Done · Esc returns", &self.done_button),
+            (4, "Done", &self.done_button),
         ] {
             let mut value = state.get();
             value.set_focused(self.focus == index);
@@ -351,20 +377,20 @@ mod tests {
             ..SwarmUi::default()
         };
         let mut mode = CollaborationMode::Auto;
-        ui.event(&mut mode, &key(KeyCode::Enter)).unwrap();
+        ui.resolved_event(&mut mode, &key(KeyCode::Enter)).unwrap();
         assert_eq!(mode, CollaborationMode::Requested);
-        ui.event(&mut mode, &key(KeyCode::Enter)).unwrap();
+        ui.resolved_event(&mut mode, &key(KeyCode::Enter)).unwrap();
         assert_eq!(mode, CollaborationMode::NoDelegation);
-        ui.event(&mut mode, &key(KeyCode::Enter)).unwrap();
+        ui.resolved_event(&mut mode, &key(KeyCode::Enter)).unwrap();
         assert_eq!(mode, CollaborationMode::Auto);
         ui.attempts = text_state("0");
-        assert!(ui.event(&mut mode, &key(KeyCode::Escape)).is_err());
+        assert!(ui.resolved_event(&mut mode, &key(KeyCode::Escape)).is_err());
         assert!(ui.open);
         ui.attempts = text_state("12");
         ui.concurrency = text_state("3");
         assert_eq!(ui.attempts().unwrap(), Some(12));
         assert_eq!(ui.concurrency().unwrap(), Some(3));
-        ui.event(&mut mode, &key(KeyCode::Escape)).unwrap();
+        ui.resolved_event(&mut mode, &key(KeyCode::Escape)).unwrap();
         assert!(!ui.open);
     }
 

@@ -15,6 +15,9 @@ pub const CODE_REVIEW_HOME_SURFACE_KIND: &str = "code-review-home";
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
+    for action in crate::keybindings::actions() {
+        registry.register_keymap_action(action);
+    }
     registry.register_factory(Box::new(CodeReviewHomeSurfaceFactory));
     registry.register_factory(Box::new(CodeReviewSurfaceFactory));
     registry

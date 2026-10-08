@@ -72,8 +72,16 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
         };
     }
 
-    let outcome =
-        TextInputControl::new(&composer_policy()).handle_key(app.composer_state_mut(), stroke);
+    let Some(text) = bcode_plugin_sdk::tui::keymap::controls::LiteralText::from_stroke(stroke)
+        .filter(|_| {
+            keymap.action("chat", stroke).is_none()
+                && !keymap.registry().is_overridden_key("chat", stroke)
+        })
+    else {
+        return KeyOutcome::default();
+    };
+    let outcome = TextInputControl::new(&composer_policy())
+        .handle_key(app.composer_state_mut(), text.native_stroke());
     match outcome {
         TextInputOutcome::Submitted => {
             app.clear_pending_key_activation();

@@ -13,12 +13,35 @@ use super::skill_picker::{SkillPickerApp, SkillPickerMode};
 use super::text_input_flow;
 
 /// Render the skill picker.
+#[cfg(test)]
 pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
+    render_skill_picker_with_keymap(
+        app,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render effective shortcut hints.
+pub fn render_skill_picker_with_keymap(
+    app: &mut SkillPickerApp,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
+) {
     let Some((inner, list_y)) = render_picker_chrome(
         " Skills ",
         &Line::from_spans(vec![
             Span::styled("Skills", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw("  Enter invoke  a activate  d deactivate  ? help  Esc cancel"),
+            Span::raw(format!(
+                "  {} invoke  {} activate  {} deactivate  {} help  {} cancel",
+                keymap.hint("skill_picker", "tui.skill.invoke"),
+                keymap.hint("skill_picker", "tui.skill.activate"),
+                keymap.hint("skill_picker", "tui.skill.deactivate"),
+                keymap.hint("skill_picker", "tui.skill.help"),
+                keymap.hint("skill_picker", "tui.select.cancel")
+            )),
         ]),
         app.filter_mut(),
         "Filter skills",

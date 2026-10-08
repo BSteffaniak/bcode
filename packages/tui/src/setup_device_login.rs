@@ -62,7 +62,7 @@ impl DeviceLogin {
             prompt: None,
             answer: String::new(),
             answers,
-            lines: vec!["Starting sign-in… Esc cancels.".to_owned()],
+            lines: vec!["Starting sign-in… Cancel stops sign-in.".to_owned()],
             terminal: false,
             succeeded: false,
             cancel,
@@ -93,8 +93,7 @@ impl DeviceLogin {
             }
             match update {
                 LoginUpdate::Succeeded => {
-                    self.lines =
-                        vec!["Account connected. Press Enter to return to setup.".to_owned()];
+                    self.lines = vec!["Account connected. Confirm to return to setup.".to_owned()];
                     self.terminal = true;
                     self.succeeded = true;
                     self.prompt = None;
@@ -231,7 +230,7 @@ fn flow(
         method_id.to_owned(),
         prepared.resolved.profile_name.clone(),
     );
-    let mut display = vec!["Waiting for sign-in… Esc cancels.".to_owned()];
+    let mut display = vec!["Waiting for sign-in… Cancel stops sign-in.".to_owned()];
     loop {
         if cancel.load(Ordering::Acquire) {
             request.operation = AuthFlowOperation::Cancel;
@@ -417,14 +416,14 @@ fn present_effects(effects: Vec<AuthFlowEffect>, display: &mut Vec<String>) -> u
                     "Open this URL in your browser:".to_owned(),
                     verification_url,
                     format!("Device code: {user_code}"),
-                    "Waiting for authorization… Esc cancels.".to_owned(),
+                    "Waiting for authorization… Cancel stops sign-in.".to_owned(),
                 ];
             }
             AuthFlowEffect::OpenBrowser { url } => {
                 *display = vec![
                     "Open this URL in your browser:".to_owned(),
                     url,
-                    "Waiting for authorization… Esc cancels.".to_owned(),
+                    "Waiting for authorization… Cancel stops sign-in.".to_owned(),
                 ];
             }
             AuthFlowEffect::Wait { millis } => wait = millis.max(100),

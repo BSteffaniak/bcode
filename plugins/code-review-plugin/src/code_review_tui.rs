@@ -40,7 +40,7 @@ use bcode_code_review_models::{
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{
     PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest, PluginSessionViewUpdate,
-    PluginTuiAction, PluginTuiHost, PluginTuiSurface,
+    PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme,
 };
 use bcode_session_models::{
     ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
@@ -425,8 +425,23 @@ impl PluginTuiSurface for CodeReviewSurface {
         crate::code_review_tui_render::render(&mut self.app, frame, self.theme.as_ref());
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        let scope = crate::keybindings::review_scope(&self.app);
+        crate::keybindings::set_hints(crate::keybindings::effective_hints(scope, |action| {
+            host.keymap_keys(scope, action)
+        }));
+        self.render_with_theme(area, frame, theme);
+        crate::keybindings::clear_hints();
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let mut needs_redraw = handle_event_no_resize(&mut self.app, event);
+        let mut needs_redraw = handle_effective_event(&mut self.app, event, host);
         needs_redraw |= self.app.flush_pending_clipboard_text(host);
         self.app.queue_selected_file_load();
         if self.ensure_selected_repository_file_load(host) {
@@ -2355,6 +2370,32 @@ fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
     }
 }
 
+fn handle_effective_event(app: &mut ReviewApp, event: &Event, host: &dyn PluginTuiHost) -> bool {
+    let scope = crate::keybindings::review_scope(app);
+    let resolved_event;
+    let event = if let Event::Key(stroke) = event {
+        let text = app.prompt_state.is_some()
+            || app.import_options_active()
+            || app.publish_options_active()
+            || app.comment_editor.is_some();
+        let Some(native) = crate::keybindings::from_host(host, scope, *stroke, text) else {
+            return false;
+        };
+        resolved_event = if host.keymap_action(scope, *stroke).is_none() {
+            match native.key {
+                KeyCode::Char(character) => Event::Paste(character.to_string()),
+                _ => Event::Key(native),
+            }
+        } else {
+            Event::Key(native)
+        };
+        &resolved_event
+    } else {
+        event
+    };
+    handle_event_no_resize(app, event)
+}
+
 fn handle_event_no_resize(app: &mut ReviewApp, event: &Event) -> bool {
     if let Event::Key(stroke) = event
         && is_review_exit_key(*stroke)
@@ -2411,10 +2452,10 @@ fn handle_prompt_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         app.submit_prompt();
         return true;
     }
-    if matches!(stroke.key, KeyCode::Down | KeyCode::Char('j')) && stroke.modifiers.is_empty() {
+    if stroke.key == KeyCode::Down && stroke.modifiers.is_empty() {
         return app.move_prompt_selection_down();
     }
-    if matches!(stroke.key, KeyCode::Up | KeyCode::Char('k')) && stroke.modifiers.is_empty() {
+    if stroke.key == KeyCode::Up && stroke.modifiers.is_empty() {
         return app.move_prompt_selection_up();
     }
     if let Some(prompt) = &mut app.prompt_state {
@@ -8140,7 +8181,7 @@ impl ReviewApp {
         }
     }
 
-    const fn import_options_active(&self) -> bool {
+    pub(crate) const fn import_options_active(&self) -> bool {
         matches!(self.import_state, Some(ReviewImportState::Options { .. }))
     }
 
@@ -13664,6 +13705,69 @@ pub(crate) mod tests {
         assert!(!handle_key(&mut app, KeyStroke::simple(KeyCode::Escape)));
 
         assert!(!app.should_exit);
+    }
+
+    #[test]
+    fn effective_sidebar_binding_remap_and_unbind_change_dispatch() {
+        use bcode_plugin_sdk::tui::keymap::controls::resolve_registry;
+        use std::collections::BTreeMap;
+        struct Host(bcode_plugin_sdk::tui::keymap::KeymapRegistry);
+        impl bcode_plugin_sdk::tui::PluginTuiHost for Host {
+            fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+            fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+            fn request_redraw(&self) {}
+            fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {
+                self.0.action_for_key(scope, stroke).map(str::to_owned)
+            }
+            fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+                self.0
+                    .keys_for_action(scope, action)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            }
+            fn keymap_is_overridden(&self, scope: &str, stroke: KeyStroke) -> bool {
+                self.0.is_overridden_key(scope, stroke)
+            }
+        }
+        let scope = crate::keybindings::REVIEW;
+        let host = Host(
+            resolve_registry(
+                crate::keybindings::actions(),
+                BTreeMap::from([(
+                    scope.into(),
+                    BTreeMap::from([("ctrl+b".into(), "bcode.code_review.sidebar".into())]),
+                )]),
+            )
+            .unwrap(),
+        );
+        let mut app = sample_app();
+        let before = app.sidebar_visible;
+        assert!(!handle_effective_event(
+            &mut app,
+            &Event::Key(bmux_keyboard::parse_key_stroke("b").unwrap()),
+            &host
+        ));
+        assert_eq!(app.sidebar_visible, before);
+        assert!(handle_effective_event(
+            &mut app,
+            &Event::Key(bmux_keyboard::parse_key_stroke("ctrl+b").unwrap()),
+            &host
+        ));
+        assert_eq!(app.sidebar_visible, !before);
+        let host = Host(
+            resolve_registry(
+                crate::keybindings::actions(),
+                BTreeMap::from([(scope.into(), BTreeMap::from([("b".into(), String::new())]))]),
+            )
+            .unwrap(),
+        );
+        assert!(!handle_effective_event(
+            &mut app,
+            &Event::Key(bmux_keyboard::parse_key_stroke("b").unwrap()),
+            &host
+        ));
+        assert_eq!(app.sidebar_visible, !before);
     }
 
     #[test]

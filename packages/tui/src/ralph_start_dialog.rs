@@ -45,7 +45,7 @@ impl RalphStartDialog {
                 &validation_commands,
             )),
             focused_field: RalphStartDialogField::LoopName,
-            status: "Enter starts, Tab switches optional fields, Esc cancels".to_owned(),
+            status: "Review the optional fields, then confirm to start or cancel.".to_owned(),
             form: FormState::new(Some(0)),
         }
     }
@@ -180,7 +180,6 @@ impl RalphStartDialog {
         event: &bmux_tui::event::Event,
         keymap: &super::keymap::BmuxKeyMap,
     ) -> RalphStartDialogOutcome {
-        use bmux_keyboard::KeyCode;
         use bmux_tui::event::Event;
         use bmux_tui_components::text_input::TextInputControl;
 
@@ -189,25 +188,17 @@ impl RalphStartDialog {
                 let _ = TextInputControl::new(&input_policy())
                     .handle_paste(self.focused_input_mut(), text);
             }
-            Event::Key(stroke) => match stroke.key {
-                KeyCode::Escape => return RalphStartDialogOutcome::Canceled,
-                KeyCode::Tab => self.focus_next(),
-                KeyCode::Enter => return RalphStartDialogOutcome::Submit,
+            Event::Key(stroke) => match keymap.action("ralph_start", *stroke) {
+                Some("tui.control.cancel") => return RalphStartDialogOutcome::Canceled,
+                Some("tui.control.focus_next") => self.focus_next(),
+                Some("tui.control.submit") => return RalphStartDialogOutcome::Submit,
                 _ => {
-                    if let Some(motion) = keymap.editor_selection_motion_for_key(*stroke) {
-                        self.focused_input_mut()
-                            .buffer_mut()
-                            .move_cursor_with_selection(motion, SelectionMode::Extend);
-                        self.focused_input_mut()
-                            .sync_scroll_to_cursor(&input_policy());
-                    } else if let Some(command) = keymap.editor_command_for_key(*stroke) {
-                        self.focused_input_mut().buffer_mut().apply_command(command);
-                        self.focused_input_mut()
-                            .sync_scroll_to_cursor(&input_policy());
-                    } else {
-                        let _ = TextInputControl::new(&input_policy())
-                            .handle_key(self.focused_input_mut(), *stroke);
-                    }
+                    let _ = super::text_input_flow::handle_key_in_scope(
+                        self.focused_input_mut(),
+                        keymap,
+                        "ralph_start",
+                        *stroke,
+                    );
                 }
             },
             Event::Mouse(mouse) => {

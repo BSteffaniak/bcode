@@ -28,7 +28,7 @@ impl PluginTuiSurfaceFactory for Factory {
                     let mut view = crate::goal_live::GenerationView::default();
                     view.title = "Goal · Progress document";
                     view.footer =
-                        "Saved working notes, not proof of readiness or completion · Esc closes";
+                        "Saved working notes, not proof of readiness or completion".into();
                     view
                 },
                 text: String::new(),
@@ -48,6 +48,9 @@ struct DocumentView {
     text: String,
 }
 impl PluginTuiSurface for DocumentView {
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        self.prepare_hints(host);
+    }
     fn id(&self) -> &'static str {
         SURFACE
     }
@@ -135,7 +138,33 @@ impl PluginTuiSurface for DocumentView {
         }
         PluginTuiAction::Redraw
     }
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&super::PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_hints(host);
+        self.render_with_theme(area, frame, theme);
+    }
+    fn render_slice_with_host(
+        &mut self,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_hints(host);
+        self.render_slice(logical_height, logical_row_offset, destination, frame);
+    }
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let Some(resolved) = super::keymap::event(host, super::keymap::DOCUMENT, event, false)
+        else {
+            return PluginTuiAction::None;
+        };
+        let event = &resolved;
         if matches!(event, Event::Key(stroke) if stroke.key == KeyCode::Escape) {
             return PluginTuiAction::Close { outcome: None };
         }
@@ -146,5 +175,18 @@ impl PluginTuiSurface for DocumentView {
                 .handle_event(*area, layout, event);
         }
         PluginTuiAction::Redraw
+    }
+}
+
+impl DocumentView {
+    fn prepare_hints(&mut self, host: &dyn PluginTuiHost) {
+        self.view.footer = format!(
+            "Saved working notes, not proof of completion · {} closes",
+            super::keymap::control_hint(
+                host,
+                super::keymap::DOCUMENT,
+                super::keymap::ControlAction::Cancel
+            )
+        );
     }
 }

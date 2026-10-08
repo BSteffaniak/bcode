@@ -8,7 +8,7 @@ use bcode_session_view::SessionView;
 use bcode_session_view_models::{
     StreamingInterpolationCurve, StreamingPresentationPolicy, TranscriptViewItemKind,
 };
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 use bmux_tui::event::{Event, MouseEvent};
 use bmux_tui::geometry::Rect;
 use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
@@ -506,35 +506,62 @@ impl StreamingConfiguratorState {
     }
 
     /// Handle one keyboard input event.
+    #[cfg(test)]
     pub fn handle_key(&mut self, stroke: KeyStroke, now: Instant) -> StreamingConfiguratorOutcome {
-        match stroke.key {
-            KeyCode::Up => {
+        self.handle_key_with_keymap(
+            stroke,
+            now,
+            &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        )
+    }
+
+    /// Route configurable input without inspecting raw shortcut keys.
+    pub fn handle_key_with_keymap(
+        &mut self,
+        stroke: KeyStroke,
+        now: Instant,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> StreamingConfiguratorOutcome {
+        match keymap.action("streaming_configurator", stroke) {
+            Some("tui.control.up") => {
                 self.move_focus(-1);
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::Down => {
+            Some("tui.control.down") => {
                 self.move_focus(1);
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::Left => {
-                self.adjust_focused(-1, stroke.modifiers.shift, now);
+            Some("tui.control.left" | "tui.streaming.coarseLeft") => {
+                self.adjust_focused(
+                    -1,
+                    keymap
+                        .action("streaming_configurator", stroke)
+                        .is_some_and(|id| id.starts_with("tui.streaming.coarse")),
+                    now,
+                );
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::Right => {
-                self.adjust_focused(1, stroke.modifiers.shift, now);
+            Some("tui.control.right" | "tui.streaming.coarseRight") => {
+                self.adjust_focused(
+                    1,
+                    keymap
+                        .action("streaming_configurator", stroke)
+                        .is_some_and(|id| id.starts_with("tui.streaming.coarse")),
+                    now,
+                );
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::Space => {
+            Some("tui.control.toggle") => {
                 self.adjust_focused(1, false, now);
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::Char('r') => {
+            Some("tui.streaming.restart") => {
                 self.controller.restart(now);
                 self.preview_scroll_rows = 0;
                 self.follow_latest = true;
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::Char('p') => {
+            Some("tui.streaming.pause") => {
                 if self.controller.is_paused() {
                     self.controller.resume(now);
                 } else {
@@ -542,24 +569,26 @@ impl StreamingConfiguratorState {
                 }
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::PageUp => {
+            Some("tui.control.page_up") => {
                 self.preview_scroll_rows = self.preview_scroll_rows.saturating_add(8);
                 self.follow_latest = false;
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::PageDown => {
+            Some("tui.control.page_down") => {
                 self.preview_scroll_rows = self.preview_scroll_rows.saturating_sub(8);
                 self.follow_latest = self.preview_scroll_rows == 0;
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::End => {
+            Some("tui.control.end") => {
                 self.preview_scroll_rows = 0;
                 self.follow_latest = true;
                 StreamingConfiguratorOutcome::Handled
             }
-            KeyCode::Enter if self.reset_pending => StreamingConfiguratorOutcome::Reset,
-            KeyCode::Enter => StreamingConfiguratorOutcome::Apply(self.selected_policy()),
-            KeyCode::Escape => StreamingConfiguratorOutcome::Cancel,
+            Some("tui.control.submit") if self.reset_pending => StreamingConfiguratorOutcome::Reset,
+            Some("tui.control.submit") => {
+                StreamingConfiguratorOutcome::Apply(self.selected_policy())
+            }
+            Some("tui.control.cancel") => StreamingConfiguratorOutcome::Cancel,
             _ => StreamingConfiguratorOutcome::Ignored,
         }
     }
@@ -1073,6 +1102,7 @@ fn projected_text(view: &SessionView) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_keyboard::KeyCode;
 
     #[test]
     fn configurator_controls_normalize_cycle_and_preserve_cancel_baseline() {

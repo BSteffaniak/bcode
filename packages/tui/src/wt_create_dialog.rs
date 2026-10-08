@@ -67,7 +67,7 @@ impl WorktreeCreateDialog {
             target,
             base: WorktreeCreateBase::Head,
             focus: WorktreeCreateFocus::Name,
-            status: "Enter name, Tab changes field, ←/→ changes value, Enter creates".to_owned(),
+            status: "Type a name, review target and base, then confirm to create.".to_owned(),
             current_session_available,
             form: FormState::new(Some(0)),
         }
@@ -130,10 +130,10 @@ impl WorktreeCreateDialog {
                 let _ =
                     TextInputControl::new(&name_input_policy()).handle_paste(&mut self.name, text);
             }
-            Event::Key(stroke) => match stroke.key {
-                bmux_keyboard::KeyCode::Escape => return WorktreeCreateDialogOutcome::Canceled,
-                bmux_keyboard::KeyCode::Tab => self.focus_next(),
-                bmux_keyboard::KeyCode::Enter => {
+            Event::Key(stroke) => match keymap.action("worktree_create", *stroke) {
+                Some("tui.control.cancel") => return WorktreeCreateDialogOutcome::Canceled,
+                Some("tui.control.focus_next") => self.focus_next(),
+                Some("tui.control.submit") => {
                     let name = self.name_text();
                     if name.is_empty() {
                         self.set_status("worktree name is required".to_owned());
@@ -145,25 +145,19 @@ impl WorktreeCreateDialog {
                         });
                     }
                 }
-                bmux_keyboard::KeyCode::Left if self.focus != WorktreeCreateFocus::Name => {
+                Some("tui.control.left") if self.focus != WorktreeCreateFocus::Name => {
                     self.previous_choice();
                 }
-                bmux_keyboard::KeyCode::Right if self.focus != WorktreeCreateFocus::Name => {
+                Some("tui.control.right") if self.focus != WorktreeCreateFocus::Name => {
                     self.next_choice();
                 }
                 _ if self.focus == WorktreeCreateFocus::Name => {
-                    if let Some(motion) = keymap.editor_selection_motion_for_key(*stroke) {
-                        self.name
-                            .buffer_mut()
-                            .move_cursor_with_selection(motion, SelectionMode::Extend);
-                        self.name.sync_scroll_to_cursor(&name_input_policy());
-                    } else if let Some(command) = keymap.editor_command_for_key(*stroke) {
-                        self.name.buffer_mut().apply_command(command);
-                        self.name.sync_scroll_to_cursor(&name_input_policy());
-                    } else {
-                        let _ = TextInputControl::new(&name_input_policy())
-                            .handle_key(&mut self.name, *stroke);
-                    }
+                    let _ = super::text_input_flow::handle_key_in_scope(
+                        &mut self.name,
+                        keymap,
+                        "worktree_create",
+                        *stroke,
+                    );
                 }
                 _ => {}
             },

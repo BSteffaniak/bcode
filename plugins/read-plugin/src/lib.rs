@@ -19,6 +19,17 @@ pub mod terminal;
 
 use bcode_plugin_sdk::prelude::*;
 
+/// Register standalone pager actions for effective registry discovery.
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    for action in pager::keymap_actions() {
+        registry.register_keymap_action(action);
+    }
+    registry
+}
+
 /// Terminal Markdown reader plugin.
 #[derive(Default)]
 pub struct ReadPlugin;

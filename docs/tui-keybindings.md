@@ -5,8 +5,11 @@
 The terminal SDK exposes `tui::keymap::KeymapRegistry`. Contributors register stable
 namespaced action IDs, input scopes, descriptions, and default strokes through
 `PluginTuiRegistry::register_keymap_action`. The frontend incorporates enabled
-static TUI contributors into its effective registry. Plugin surfaces query
-`PluginTuiHost::keymap_action` for dispatch and `keymap_keys` for shortcut hints.
+static TUI contributors and manifest-declared native dynamic plugin actions into
+one effective registry. Dynamic manifests declare actions with `[[keymap_actions]]`
+entries containing `id`, `scope`, `description`, and optional `defaults`.
+Plugin surfaces query `PluginTuiHost::keymap_action` for dispatch and `keymap_keys`
+for shortcut hints.
 Libraries can use the same registry API directly. This is frontend-owned state,
 not a process-wide singleton or a prerequisite for non-terminal operation.
 
@@ -27,11 +30,22 @@ Malformed strokes and conflicting registrations return errors rather than silent
 falling back. The TUI help command lists registered actions and their effective
 bindings, including unbound actions.
 
-**Migration status:** the existing chat/permission/session/skill keymap paths and
-metrics-dashboard actions use this registry. Other dialogs, bundled plugin surfaces,
-and generic component keyboard handling still need migration; their hardcoded
-handlers and hints are not yet covered by this configuration contract. Dynamic
-plugin action contribution is not yet wired into frontend registry discovery.
+Generic terminal controls receive BMUX adapter events only after a registered
+semantic action resolves; unresolved keys never fall back to component defaults.
+Literal text insertion is separate from shortcut dispatch. Explicitly overridden
+or unbound keys are not reinterpreted as text by the shared control adapter.
+
+Host-aware surface rendering and keymap preparation keep initial hints, measured
+geometry, and dispatch aligned. Configuration/runtime replacement refreshes the
+effective contributor snapshot; disabled plugins do not retain registered actions.
+Standalone readers resolve the same configuration before entering terminal mode.
+ASCII uppercase terminal events normalize to explicit `shift+letter` bindings;
+use `shift+a`, not bare `A`, in configuration. Unicode literal input remains unchanged.
+
+The child monitor toggle (`tui.monitor.toggle`) is registered but unbound by default
+so it does not shadow session search. Workflow scheduling-page navigation is also
+unbound where the former Shift-N shortcut was already consumed by new authoring.
+Both actions remain configurable and appear in effective action discovery.
 
 
 Bcode's terminal keybindings are scoped and configurable in `bcode.toml`. Each table maps a key to an action ID. Set a key to `""`, `"none"`, or `"unbind"` to remove its default binding.

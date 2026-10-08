@@ -60,6 +60,7 @@ mod goal_live;
 mod goal_status;
 mod goal_supervision;
 mod judgement_evaluation;
+mod keymap;
 mod progress;
 mod progress_monitoring;
 pub mod session_progress;
@@ -804,6 +805,7 @@ pub fn static_plugin() -> StaticPluginVtable {
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
+    keymap::register(&mut registry);
     registry.register_factory(Box::new(LoopSurfaceFactory));
     registry.register_factory(Box::new(goal::GoalSurfaceFactory));
     registry.register_factory(Box::new(goal_document_view::Factory));
@@ -965,6 +967,7 @@ impl SetupDiscovery {
 }
 
 struct LoopSurface {
+    hints: std::collections::BTreeMap<String, String>,
     origin: SetupKind,
     collaboration: CollaborationMode,
     worker_attempts: Option<u64>,
@@ -1110,9 +1113,66 @@ fn build_start_request(
 }
 
 impl LoopSurface {
+    fn modal_theme(&self) -> ModalTheme {
+        self.theme.map_or_else(
+            || ModalTheme::dark(Color::Cyan),
+            |theme| {
+                ModalTheme::new(
+                    theme.canvas,
+                    theme.border.patch(theme.canvas),
+                    theme.focused.patch(theme.canvas),
+                    theme.text.patch(theme.canvas),
+                    theme.muted.patch(theme.canvas),
+                    theme.focused.patch(theme.canvas),
+                )
+            },
+        )
+    }
+    fn prepare_hints(&mut self, host: &dyn PluginTuiHost) {
+        let scope = if self.origin == SetupKind::Goal {
+            keymap::GOAL
+        } else {
+            keymap::SETUP
+        };
+        for name in ["start", "delegation_check", "progress", "generate", "swarm"] {
+            self.hints
+                .insert(name.into(), keymap::hint(host, scope, name));
+        }
+        self.swarm_ui.prepare_hints(host);
+        for name in ["refresh", "threshold_up", "threshold_down", "fallback"] {
+            self.hints.insert(
+                format!("judgement.{name}"),
+                keymap::hint(host, keymap::JUDGEMENT, name),
+            );
+        }
+        for action in [
+            keymap::ControlAction::Toggle,
+            keymap::ControlAction::Left,
+            keymap::ControlAction::Right,
+            keymap::ControlAction::Up,
+            keymap::ControlAction::Down,
+        ] {
+            self.hints.insert(
+                format!("judgement.{}", action.id()),
+                keymap::control_hint(host, keymap::JUDGEMENT, action),
+            );
+        }
+        for action in [
+            keymap::ControlAction::Cancel,
+            keymap::ControlAction::FocusNext,
+            keymap::ControlAction::FocusPrevious,
+        ] {
+            self.hints
+                .insert(action.id(), keymap::control_hint(host, scope, action));
+        }
+    }
+    fn shortcut(&self, name: &str) -> &str {
+        self.hints.get(name).map_or("unavailable", String::as_str)
+    }
     fn new(session_id: Option<SessionId>) -> Self {
         Self {
             session_id,
+            hints: std::collections::BTreeMap::new(),
             origin: SetupKind::Loop,
             collaboration: CollaborationMode::Disabled,
             worker_attempts: None,
@@ -1184,7 +1244,7 @@ impl LoopSurface {
                             .collect()
                     });
             match stroke.key {
-                KeyCode::Char(' ') => {
+                KeyCode::Space | KeyCode::Char(' ') => {
                     self.judgement_enabled = if self.judgement_enabled == EvaluationMode::Standard {
                         EvaluationMode::Judgement
                     } else {
@@ -1261,7 +1321,7 @@ impl LoopSurface {
         let catalog = self
             .judgement_catalog
             .as_ref()
-            .ok_or("Judgement options are still loading; press R to refresh")?;
+            .ok_or("Judgement options are still loading; refresh judgement discovery")?;
         Self::configured_judgement(
             catalog,
             self.judgement_choice,
@@ -1295,7 +1355,7 @@ impl LoopSurface {
             .collect();
         let Some((provider, model)) = choices.get(choice) else {
             return Err(catalog.providers.first().map_or_else(
-                || "No judgement provider enabled; press R to refresh".into(),
+                || "No judgement provider enabled; refresh judgement discovery".into(),
                 |provider| {
                     format!(
                         "{}: {}",
@@ -1303,7 +1363,7 @@ impl LoopSurface {
                         provider
                             .unavailable_reason
                             .as_deref()
-                            .unwrap_or("No compatible YesNo model; press R to refresh")
+                            .unwrap_or("No compatible YesNo model; refresh judgement discovery")
                     )
                 },
             ));
@@ -1314,7 +1374,7 @@ impl LoopSurface {
             String::new()
         } else {
             return Err(format!(
-                "No usable account; run bcode auth login {} and press R",
+                "No usable account; run bcode auth login {} and refresh judgement discovery",
                 provider.auth_provider_id
             ));
         };
@@ -1371,7 +1431,7 @@ impl LoopSurface {
                         && self.judgement_profile == provider.profiles.len())
                     .then_some("daemon environment")
                 })
-                .unwrap_or("no account; bcode auth login and R refresh");
+                .unwrap_or("no account; bcode auth login and refresh judgement discovery");
             return format!(
                 "{} / {} · {} · {}% · {}",
                 provider.display_name,
@@ -1386,7 +1446,7 @@ impl LoopSurface {
             );
         }
         if matches!(self.judgement_catalog, SetupDiscovery::Failed) {
-            return "Evaluator discovery unavailable · R retry".into();
+            return "Evaluator discovery unavailable · retry judgement discovery".into();
         }
         self.judgement_catalog
             .as_ref()
@@ -1398,7 +1458,7 @@ impl LoopSurface {
                         provider
                             .unavailable_reason
                             .as_deref()
-                            .unwrap_or("no compatible YesNo model; R refresh")
+                            .unwrap_or("no compatible YesNo model; refresh judgement discovery")
                     )
                 })
             })
@@ -1406,7 +1466,7 @@ impl LoopSurface {
                 if matches!(self.judgement_catalog, SetupDiscovery::Loading) {
                     "Loading evaluator options…".into()
                 } else {
-                    "No judgement providers available · R refresh".into()
+                    "No judgement providers available · refresh judgement discovery".into()
                 }
             })
     }
@@ -1426,12 +1486,25 @@ impl LoopSurface {
         };
         let details = self.evaluation_preview();
         let label = if self.judgement_enabled == EvaluationMode::Judgement {
-            "Evaluation: agent evidence + judgement model"
+            "Evaluation: agent evidence + judgement model".to_owned()
         } else {
-            "Evaluation: standard agent (no extra key) · Space to change"
+            format!(
+                "Evaluation: standard agent (no extra key) · {} to change",
+                self.shortcut("judgement.tui.control.toggle")
+            )
         };
         let preview = if self.judgement_enabled == EvaluationMode::Judgement {
-            format!("{details} · ←/→ model ↑/↓ account +/- confidence F fallback R refresh")
+            format!(
+                "{details} · {}/{} model · {}/{} account · {}/{} confidence · {} fallback · {} refresh",
+                self.shortcut("judgement.tui.control.left"),
+                self.shortcut("judgement.tui.control.right"),
+                self.shortcut("judgement.tui.control.up"),
+                self.shortcut("judgement.tui.control.down"),
+                self.shortcut("judgement.threshold_up"),
+                self.shortcut("judgement.threshold_down"),
+                self.shortcut("judgement.fallback"),
+                self.shortcut("judgement.refresh")
+            )
         } else {
             "The current agent evaluates completion. Goal readiness also uses the agent.".into()
         };
@@ -1446,7 +1519,7 @@ impl LoopSurface {
         Self::render_input(
             self.evaluation_area,
             frame,
-            label,
+            &label,
             &mut self.evaluation,
             self.field == Field::Evaluation && self.goal_option_focus.is_none(),
             1,
@@ -1923,7 +1996,7 @@ impl LoopSurface {
                 self.active_workflow = run;
                 if self.failed_workflow_start.is_none() {
                     self.status = self.active_workflow.as_ref().map_or_else(
-                        || "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
+                        || "Configure the loop, then start".to_owned(),
                         format_plugin_workflow_status,
                     );
                 }
@@ -1947,7 +2020,8 @@ impl LoopSurface {
         } else {
             self.launch_state = LaunchState::Ready;
             self.status =
-                "Judgement model or account is no longer available; press R to refresh".into();
+                "Judgement model or account is no longer available; refresh judgement discovery"
+                    .into();
             self.field = Field::Evaluation;
         }
     }
@@ -2089,9 +2163,11 @@ impl LoopSurface {
             self.review_area = Rect::new(content.x, content.y.saturating_add(1), content.width, 1)
                 .intersection(content);
             self.sync_goal_controls();
+            let progress_label =
+                format!("{} ({})", goal::PROGRESS_LABEL, self.shortcut("progress"));
             let checkbox = CheckboxComponent::new(
                 "goal.progress-document",
-                goal::PROGRESS_LABEL,
+                &progress_label,
                 &self.progress_checkbox,
             )
             .fallback_style(
@@ -2112,11 +2188,19 @@ impl LoopSurface {
             let label = if matches!(self.goal_phase, goal::GoalPhase::Generating { .. }) {
                 "Generating instructions…"
             } else if self.goal_phase == goal::GoalPhase::Generated {
-                "Start goal (Ctrl+Enter)"
+                "Start goal"
             } else {
                 goal::REVIEW_LABEL
             };
-            let review = ButtonComponent::new("goal.review", label, &self.review_button)
+            let review_label = format!(
+                "{label} ({})",
+                self.shortcut(if self.goal_phase == goal::GoalPhase::Generated {
+                    "start"
+                } else {
+                    "generate"
+                })
+            );
+            let review = ButtonComponent::new("goal.review", &review_label, &self.review_button)
                 .policy(ButtonPolicy::interactive());
             let rect = self.review_area;
             let layout = review.layout(Constraints::tight(rect.size()), &mut LayoutCx::new());
@@ -2155,7 +2239,7 @@ impl LoopSurface {
             .evaluation_area
             .bottom()
             .saturating_add(1)
-            .min(content.bottom().saturating_sub(1));
+            .min(content.bottom().saturating_sub(2).max(content.y));
         if content.height > 0 && status_y < content.bottom() {
             let status = [StatusSegment::new(&self.status).severity(StatusSeverity::Muted)];
             let status = StatusBarComponent::new("loop.status")
@@ -2175,12 +2259,15 @@ impl LoopSurface {
         let hints_y = status_y.saturating_add(1);
         if hints_y < content.bottom() {
             let mut hints = vec![
-                KeyHint::new("Tab/Shift-Tab", "field"),
-                KeyHint::new("Ctrl-Enter", "start"),
-                KeyHint::new("Esc", "close"),
+                KeyHint::new(self.shortcut("tui.control.focus_next"), "field"),
+                KeyHint::new(self.shortcut("start"), "start"),
+                KeyHint::new(self.shortcut("tui.control.cancel"), "close"),
             ];
             if self.setup_kind == SetupKind::Goal {
-                hints.push(KeyHint::new("Ctrl-D", "delegation check"));
+                hints.push(KeyHint::new(
+                    self.shortcut("delegation_check"),
+                    "delegation check",
+                ));
             }
             let hints = KeyHintBarComponent::new("loop.hints", &hints)
                 .styles(loop_hint_styles(self.theme.as_ref()));
@@ -2262,6 +2349,9 @@ impl LoopSurface {
 }
 
 impl PluginTuiSurface for LoopSurface {
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        self.prepare_hints(host);
+    }
     fn session_navigation_finished(&mut self, session_id: SessionId, result: Result<(), String>) {
         if self.session_id != Some(session_id) || self.fresh_session != FreshSessionState::Attaching
         {
@@ -2291,19 +2381,7 @@ impl PluginTuiSurface for LoopSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
-        let modal_theme = self.theme.map_or_else(
-            || ModalTheme::dark(Color::Cyan),
-            |theme| {
-                ModalTheme::new(
-                    theme.canvas,
-                    theme.border.patch(theme.canvas),
-                    theme.focused.patch(theme.canvas),
-                    theme.text.patch(theme.canvas),
-                    theme.muted.patch(theme.canvas),
-                    theme.focused.patch(theme.canvas),
-                )
-            },
-        );
+        let modal_theme = self.modal_theme();
         let modal = ModalFrame::new(
             ModalSizing::new(Size::new(64, 26), Size::new(100, 36), Insets::all(2)),
             modal_theme,
@@ -2326,6 +2404,14 @@ impl PluginTuiSurface for LoopSurface {
         );
         let content = self.paint_swarm_launcher(content.intersection(area), frame);
         let content = self.paint_goal_options(content, frame);
+        // Reserve visible status and effective hints before laying out editable controls.
+        let footer_content = content;
+        let content = Rect::new(
+            content.x,
+            content.y,
+            content.width,
+            content.height.saturating_sub(2),
+        );
         let available = content.height.saturating_sub(12);
         let prompt_rows = available.saturating_mul(3) / 5;
         let condition_rows = available.saturating_sub(prompt_rows).max(3);
@@ -2385,7 +2471,7 @@ impl PluginTuiSurface for LoopSurface {
             self.theme.as_ref(),
         );
         self.paint_evaluation_field(content, area, frame);
-        self.paint_footer(content, frame);
+        self.paint_footer(footer_content, frame);
     }
 
     fn render_with_theme(
@@ -2398,6 +2484,46 @@ impl PluginTuiSurface for LoopSurface {
         self.render(area, frame);
     }
 
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.field == Field::Evaluation
+            && let Some(event) = keymap::event(host, keymap::JUDGEMENT, event, false)
+        {
+            let action = self.handle_judgement_key(&event, host);
+            if !matches!(action, PluginTuiAction::None) {
+                return action;
+            }
+        }
+        let scope = if self.origin == SetupKind::Goal {
+            keymap::GOAL
+        } else {
+            keymap::SETUP
+        };
+        let Some(event) = keymap::event(host, scope, event, self.field != Field::Evaluation) else {
+            return PluginTuiAction::None;
+        };
+        self.handle_resolved_event(&event, host)
+    }
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_hints(host);
+        self.render_with_theme(area, frame, theme);
+    }
+    fn render_slice_with_host(
+        &mut self,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_hints(host);
+        self.render_slice(logical_height, logical_row_offset, destination, frame);
+    }
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if matches!(self.judgement_catalog, SetupDiscovery::Pending) {
             self.refresh_judgement(host);
@@ -2413,8 +2539,14 @@ impl PluginTuiSurface for LoopSurface {
         self.begin_pending_host_work(host);
         self.apply_completions(host)
     }
+}
 
-    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+impl LoopSurface {
+    fn handle_resolved_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiAction {
         if matches!(event, Event::Key(stroke) if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty())
         {
             return PluginTuiAction::Close { outcome: None };
@@ -2483,7 +2615,7 @@ impl PluginTuiSurface for LoopSurface {
             return PluginTuiAction::Redraw;
         }
         if self.field == Field::Evaluation {
-            return self.handle_judgement_key(event, host);
+            return PluginTuiAction::None;
         }
         let state = self.active_state_mut();
         match bmux_tui_components::text_input::TextInputControl::new(
@@ -3772,6 +3904,19 @@ mod tests {
     }
 
     impl PluginTuiHost for TestHost {
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            keymap::test_registry()
+                .action_for_key(scope, stroke)
+                .map(str::to_owned)
+        }
+        fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+            keymap::test_registry()
+                .keys_for_action(scope, action)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+
         fn spawn(&self, task: bcode_plugin_sdk::tui::PluginTask) {
             drop(tokio::spawn(task));
         }
@@ -3815,6 +3960,11 @@ mod tests {
     }
 
     impl PluginTuiHost for FailingHost {
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            keymap::test_registry()
+                .action_for_key(scope, stroke)
+                .map(str::to_owned)
+        }
         fn spawn(&self, task: bcode_plugin_sdk::tui::PluginTask) {
             drop(tokio::spawn(task));
         }

@@ -702,6 +702,12 @@ pub trait PluginTuiHost: Send + Sync {
         None
     }
 
+    /// Explicit configured stroke ownership, including unbound and unresolved actions.
+    /// Hosts should override this alongside action resolution to prevent text fallback bypasses.
+    fn keymap_is_overridden(&self, _scope: &str, _stroke: KeyStroke) -> bool {
+        false
+    }
+
     /// Effective shortcuts for presentation. An empty list means unbound or unavailable.
     fn keymap_keys(&self, _scope: &str, _action: &str) -> Vec<String> {
         Vec::new()
@@ -1751,6 +1757,17 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         false
     }
 
+    /// Handle presentation navigation with current effective host bindings.
+    /// Existing adapters retain their original handler by default.
+    fn content_event_with_host(
+        &self,
+        identity: &str,
+        event: &Event,
+        _host: &dyn PluginTuiHost,
+    ) -> bool {
+        self.content_event(identity, event)
+    }
+
     /// Return correspondence for exactly the rows just prepared by this adapter.
     /// The default keeps older adapters usable with host item-level fallback.
     fn anchors(
@@ -1803,6 +1820,18 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         }
     }
 
+    /// Prepare a visual projection with effective shortcut metadata available.
+    /// The default preserves the coherent existing projection and source mappings.
+    fn projection_with_host(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &PluginTuiVisualRenderContext,
+        _host: &dyn PluginTuiHost,
+    ) -> PluginTuiVisualProjection {
+        self.projection(kind, payload, context)
+    }
+
     /// Build transcript rows for the artifact/view payload at the given width.
     fn rows(
         &self,
@@ -1833,6 +1862,10 @@ pub trait PluginTuiSurface: Send {
     /// Human-readable surface title.
     fn title(&self) -> &'static str;
 
+    /// Prepare effective binding presentation before any geometry measurement or painting.
+    /// Hosts call this before preferred height and focused row range queries, including reloads.
+    fn prepare_keymap(&mut self, _host: &dyn PluginTuiHost) {}
+
     /// Return preferred height for this surface at the given width.
     #[must_use]
     fn preferred_height(&mut self, _width: u16) -> u16 {
@@ -1857,6 +1890,19 @@ pub trait PluginTuiSurface: Send {
         self.render(destination, frame);
     }
 
+    /// Render a retained logical slice with current effective host bindings.
+    /// The default preserves existing slice geometry and rendering.
+    fn render_slice_with_host(
+        &mut self,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        _host: &dyn PluginTuiHost,
+    ) {
+        self.render_slice(logical_height, logical_row_offset, destination, frame);
+    }
+
     /// Return the focused control's logical row range, when the surface can provide one.
     #[must_use]
     fn focused_row_range(&mut self, _width: u16) -> Option<std::ops::Range<u16>> {
@@ -1873,6 +1919,18 @@ pub trait PluginTuiSurface: Send {
         _theme: Option<&PluginTuiTheme>,
     ) {
         self.render(area, frame);
+    }
+
+    /// Render using the current effective host bindings, including on the initial frame.
+    /// Existing surfaces retain their theme-aware rendering by default.
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        _host: &dyn PluginTuiHost,
+    ) {
+        self.render_with_theme(area, frame, theme);
     }
 
     /// Handle routed terminal input.
@@ -1941,6 +1999,19 @@ where
     #[must_use]
     fn preferred_height(&mut self, snapshot: &C::Snapshot, width: u16) -> u16;
 
+    /// Refresh effective bindings before measuring. Return true when geometry may have changed.
+    /// The compatibility default prepares existing renderers and conservatively invalidates
+    /// cached measurements. Override to report actual changes when retaining layout caches.
+    #[must_use]
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) -> bool {
+        self.prepare_render(host);
+        true
+    }
+
+    /// Refresh renderer-owned effective hints before host-aware rendering, including slices.
+    /// Canonical interaction state must not change; geometry changes require `prepare_keymap`.
+    fn prepare_render(&mut self, _host: &dyn PluginTuiHost) {}
+
     /// Render the snapshot.
     fn render(&mut self, snapshot: &C::Snapshot, area: Rect, frame: &mut PaintCx<'_, '_>);
 
@@ -1978,6 +2049,39 @@ where
         _theme: Option<&PluginTuiTheme>,
     ) {
         self.render(snapshot, area, frame);
+    }
+
+    /// Render with current bindings while preserving theme rendering by default.
+    fn render_with_host(
+        &mut self,
+        snapshot: &C::Snapshot,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_render(host);
+        self.render_with_theme(snapshot, area, frame, theme);
+    }
+
+    /// Render a retained slice with current bindings, preserving logical geometry.
+    fn render_slice_with_host(
+        &mut self,
+        snapshot: &C::Snapshot,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_render(host);
+        self.render_slice(
+            snapshot,
+            logical_height,
+            logical_row_offset,
+            destination,
+            frame,
+        );
     }
 
     /// Return renderer-owned deterministic work-shape counters.
@@ -2058,6 +2162,12 @@ where
         self.renderer.title()
     }
 
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        if self.renderer.prepare_keymap(host) {
+            self.invalidate_measurement();
+        }
+    }
+
     fn preferred_height(&mut self, width: u16) -> u16 {
         if let Some((cached_width, height)) = self.preferred_height
             && cached_width == width
@@ -2114,6 +2224,35 @@ where
     ) {
         self.renderer
             .render_with_theme(&self.snapshot, area, frame, theme);
+    }
+
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.renderer
+            .render_with_host(&self.snapshot, area, frame, theme, host);
+    }
+
+    fn render_slice_with_host(
+        &mut self,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.renderer.render_slice_with_host(
+            &self.snapshot,
+            logical_height,
+            logical_row_offset,
+            destination,
+            frame,
+            host,
+        );
     }
 
     fn work_shape(&self) -> PluginTuiWorkShape {
@@ -2277,6 +2416,80 @@ mod typed_interaction_surface_tests {
         }
     }
 
+    struct HintHost(&'static str);
+
+    impl PluginTuiHost for HintHost {
+        fn spawn(&self, _task: PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+        fn keymap_keys(&self, _scope: &str, _action: &str) -> Vec<String> {
+            vec![self.0.into()]
+        }
+    }
+
+    #[derive(Default)]
+    struct HintGeometryRenderer {
+        keys: Vec<String>,
+        measurements: usize,
+    }
+
+    impl TerminalInteractionRenderer<CountingController> for HintGeometryRenderer {
+        const SURFACE_KIND: &'static str = "test.hint.geometry";
+        fn id(&self) -> &'static str {
+            "hint.geometry"
+        }
+        fn title(&self) -> &'static str {
+            "Hint geometry"
+        }
+        fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) -> bool {
+            let keys = host.keymap_keys("test", "submit");
+            if self.keys == keys {
+                return false;
+            }
+            self.keys = keys;
+            true
+        }
+        fn preferred_height(&mut self, _snapshot: &usize, _width: u16) -> u16 {
+            self.measurements += 1;
+            if self.keys == ["enter"] { 1 } else { 3 }
+        }
+        fn focused_row_range(
+            &mut self,
+            _snapshot: &usize,
+            _width: u16,
+        ) -> Option<std::ops::Range<u16>> {
+            Some(if self.keys == ["enter"] { 0..1 } else { 2..3 })
+        }
+        fn render(&mut self, _snapshot: &usize, _area: Rect, _frame: &mut PaintCx<'_, '_>) {}
+        fn input(
+            &mut self,
+            _event: &Event,
+            _snapshot: &usize,
+            _host: &dyn PluginTuiHost,
+        ) -> TerminalInteractionInput {
+            TerminalInteractionInput::Ignored
+        }
+    }
+
+    #[test]
+    fn keymap_preparation_refreshes_geometry_before_measurement_and_retains_unchanged_cache() {
+        let _guard = TEST_COUNTERS.lock().expect("test counter lock");
+        let mut surface = TypedTerminalInteractionSurface::new(
+            CountingController::new(()),
+            HintGeometryRenderer::default(),
+        );
+        surface.prepare_keymap(&HintHost("enter"));
+        assert_eq!(surface.preferred_height(4), 1);
+        assert_eq!(surface.focused_row_range(4), Some(0..1));
+        surface.prepare_keymap(&HintHost("enter"));
+        assert_eq!(surface.preferred_height(4), 1);
+        assert_eq!(surface.renderer.measurements, 1);
+        surface.prepare_keymap(&HintHost("ctrl+alt+shift+enter"));
+        assert_eq!(surface.preferred_height(4), 3);
+        assert_eq!(surface.focused_row_range(4), Some(2..3));
+        assert_eq!(surface.renderer.measurements, 2);
+    }
+
     #[test]
     fn typed_surface_preserves_renderer_fallbacks() {
         let _guard = TEST_COUNTERS.lock().expect("test counter lock");
@@ -2296,6 +2509,23 @@ mod typed_interaction_surface_tests {
         let mut themed = bmux_tui::buffer::Buffer::empty(area);
         surface.render_with_theme(area, &mut PaintCx::new(&mut Frame::new(&mut themed)), None);
         assert_eq!(themed, sliced);
+        let mut host_slice = bmux_tui::buffer::Buffer::empty(area);
+        surface.render_slice_with_host(
+            8,
+            7,
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut host_slice)),
+            &TestHost,
+        );
+        assert_eq!(host_slice, sliced);
+        let mut host_themed = bmux_tui::buffer::Buffer::empty(area);
+        surface.render_with_host(
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut host_themed)),
+            None,
+            &TestHost,
+        );
+        assert_eq!(host_themed, themed);
         assert_eq!(
             surface.handle_event(&Event::Tick, &TestHost),
             PluginTuiAction::None
@@ -2667,6 +2897,20 @@ impl PluginTuiRegistry {
         }
     }
 
+    /// Route focused presentation navigation with current effective host bindings.
+    /// Execution input remains a separate contract.
+    #[must_use]
+    pub fn visual_content_event_with_host(
+        &self,
+        identity: &str,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> bool {
+        self.visual_adapters
+            .values()
+            .any(|adapter| adapter.content_event_with_host(identity, event, host))
+    }
+
     /// Route local visual navigation without invoking tools or services.
     #[must_use]
     pub fn visual_content_event(&self, identity: &str, event: &Event) -> bool {
@@ -2734,6 +2978,27 @@ impl PluginTuiRegistry {
         let projection = self
             .visual_adapter(adapter_id, kind)?
             .projection(kind, payload, context);
+        Self::validate_projection(projection)
+    }
+
+    /// Prepare a coherent native projection with effective bindings available to the adapter.
+    pub fn visual_projection_with_host(
+        &self,
+        adapter_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &PluginTuiVisualRenderContext,
+        host: &dyn PluginTuiHost,
+    ) -> Option<PluginTuiVisualProjection> {
+        let projection = self
+            .visual_adapter(adapter_id, kind)?
+            .projection_with_host(kind, payload, context, host);
+        Self::validate_projection(projection)
+    }
+
+    fn validate_projection(
+        projection: PluginTuiVisualProjection,
+    ) -> Option<PluginTuiVisualProjection> {
         crate::tui_visual::validate_visual_anchors(&projection.anchors, projection.rows.len())
             .ok()?;
         let mut selected_rows = std::collections::BTreeSet::new();
@@ -2818,6 +3083,11 @@ pub trait PluginTuiTextInputResolver: Send + Sync {
         None
     }
 
+    /// Whether an explicit configuration entry owns this stroke, including unbound entries.
+    fn is_overridden(&self, _scope: &str, _stroke: KeyStroke) -> bool {
+        false
+    }
+
     /// Effective shortcut labels for a registered action.
     fn keys(&self, _scope: &str, _action: &str) -> Vec<String> {
         Vec::new()
@@ -2887,6 +3157,12 @@ impl PluginTuiHost for TokioPluginTuiHost {
 
     fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {
         self.text_input.as_ref()?.action(scope, stroke)
+    }
+
+    fn keymap_is_overridden(&self, scope: &str, stroke: KeyStroke) -> bool {
+        self.text_input
+            .as_ref()
+            .is_some_and(|resolver| resolver.is_overridden(scope, stroke))
     }
 
     fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {

@@ -699,6 +699,7 @@ pub fn question_interaction_registry() -> bcode_plugin_sdk::interaction::PluginI
 #[must_use]
 pub fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    question_tui::register_keymap(&mut registry);
     registry.register_interactive_surface::<
         question_interaction::QuestionInteractionController,
         question_tui::QuestionTerminalRenderer,

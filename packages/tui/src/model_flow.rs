@@ -1,7 +1,7 @@
 //! Root-owned model picker input semantics.
 
 use bcode_plugin_sdk::path::display_from_current_dir;
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 
 use super::keymap::BmuxKeyMap;
 use super::{model_picker, text_input_flow};
@@ -20,7 +20,7 @@ pub fn handle_model_picker_key(
 ) -> ModelPickerAction {
     match picker.mode() {
         model_picker::ModelPickerMode::Actions => {
-            handle_model_picker_action_key(picker, provider_plugin_id, stroke)
+            handle_model_picker_action_key(picker, keymap, provider_plugin_id, stroke)
         }
         model_picker::ModelPickerMode::Filter => {
             handle_model_picker_filter_key(picker, keymap, stroke)
@@ -28,53 +28,46 @@ pub fn handle_model_picker_key(
     }
 }
 
-const fn action_shortcut_allows_shift(stroke: KeyStroke) -> bool {
-    !stroke.modifiers.ctrl
-        && !stroke.modifiers.alt
-        && !stroke.modifiers.super_key
-        && !stroke.modifiers.hyper
-        && !stroke.modifiers.meta
-}
-
 fn handle_model_picker_action_key(
     picker: &mut model_picker::ModelPickerApp,
+    keymap: &BmuxKeyMap,
     provider_plugin_id: Option<&str>,
     stroke: KeyStroke,
 ) -> ModelPickerAction {
-    match stroke.key {
-        KeyCode::Escape => ModelPickerAction::Cancel,
-        KeyCode::Char('/') if stroke.modifiers.is_empty() => {
+    match keymap.action("model_picker_actions", stroke) {
+        Some("tui.control.cancel") => ModelPickerAction::Cancel,
+        Some("tui.model.filter") => {
             picker.focus_filter();
             ModelPickerAction::Continue
         }
-        KeyCode::Char('I') if action_shortcut_allows_shift(stroke) => {
+        Some("tui.model.showIgnored") => {
             picker.toggle_show_ignored();
             ModelPickerAction::Continue
         }
-        KeyCode::Char('s') if stroke.modifiers.is_empty() => {
+        Some("tui.model.sort") => {
             picker.cycle_sort_key();
             ModelPickerAction::Continue
         }
-        KeyCode::Char('S') if action_shortcut_allows_shift(stroke) => {
+        Some("tui.model.reverseSort") => {
             picker.reverse_sort_direction();
             ModelPickerAction::Continue
         }
-        KeyCode::Char('i') if stroke.modifiers.is_empty() => {
+        Some("tui.model.ignore") => {
             ignore_selected_model(picker, provider_plugin_id);
             ModelPickerAction::Continue
         }
-        KeyCode::Char('u') if stroke.modifiers.is_empty() => {
+        Some("tui.model.unignore") => {
             unignore_selected_model(picker, provider_plugin_id);
             ModelPickerAction::Continue
         }
-        KeyCode::Enter => picker
+        Some("tui.control.submit") => picker
             .selected_model_id()
             .map_or(ModelPickerAction::Continue, ModelPickerAction::Select),
-        KeyCode::Up if stroke.modifiers.is_empty() => {
+        Some("tui.control.up") => {
             picker.select_previous();
             ModelPickerAction::Continue
         }
-        KeyCode::Down if stroke.modifiers.is_empty() => {
+        Some("tui.control.down") => {
             picker.select_next();
             ModelPickerAction::Continue
         }
@@ -87,25 +80,29 @@ fn handle_model_picker_filter_key(
     keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) -> ModelPickerAction {
-    match stroke.key {
-        KeyCode::Escape => {
+    match keymap.action("model_picker", stroke) {
+        Some("tui.control.cancel") => {
             picker.focus_actions();
             ModelPickerAction::Continue
         }
-        KeyCode::Enter => picker
+        Some("tui.control.submit") => picker
             .selected_model_id()
             .map_or(ModelPickerAction::Continue, ModelPickerAction::Select),
-        KeyCode::Up if stroke.modifiers.is_empty() => {
+        Some("tui.control.up") => {
             picker.select_previous();
             ModelPickerAction::Continue
         }
-        KeyCode::Down if stroke.modifiers.is_empty() => {
+        Some("tui.control.down") => {
             picker.select_next();
             ModelPickerAction::Continue
         }
         _ => {
-            if text_input_flow::handle_key(picker.filter_mut(), keymap, stroke)
-                != bmux_tui_components::text_input::TextInputOutcome::Ignored
+            if text_input_flow::handle_key_in_scope(
+                picker.filter_mut(),
+                keymap,
+                "model_picker",
+                stroke,
+            ) != bmux_tui_components::text_input::TextInputOutcome::Ignored
             {
                 picker.refresh_filter();
             }

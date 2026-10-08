@@ -1,13 +1,12 @@
 //! TUI command palette state and actions.
 
 use bcode_command::{CommandContribution, CommandSurface};
-use bmux_keyboard::KeyCode;
 use bmux_keyboard::KeyStroke;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui_components::selectable_list::SelectableListItem;
-use bmux_tui_components::text_input::{TextInputControl, TextInputState};
+use bmux_tui_components::text_input::TextInputState;
 
 /// Result of application-owned command filtering and activation.
 pub enum CommandPaletteKeyOutcome {
@@ -60,30 +59,40 @@ impl BmuxCommandPalette {
     }
 
     /// Handle one keyboard input through the palette component's policy.
-    pub fn handle_key(&mut self, stroke: KeyStroke, visible_rows: u16) -> CommandPaletteKeyOutcome {
-        match stroke.key {
-            KeyCode::Escape => return CommandPaletteKeyOutcome::Canceled,
-            KeyCode::Enter => {
+    /// Handle input through the effective frontend registry.
+    pub fn handle_key_with_keymap(
+        &mut self,
+        stroke: KeyStroke,
+        visible_rows: u16,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> CommandPaletteKeyOutcome {
+        match keymap.action("command_palette", stroke) {
+            Some("tui.control.cancel") => return CommandPaletteKeyOutcome::Canceled,
+            Some("tui.control.submit") => {
                 return self.list.selected_source_index().map_or(
                     CommandPaletteKeyOutcome::Ignored,
                     CommandPaletteKeyOutcome::Activated,
                 );
             }
-            KeyCode::Down => {
+            Some("tui.control.down") => {
                 self.list.select_next();
                 let _ = self.list.render_state(visible_rows);
                 return CommandPaletteKeyOutcome::SelectionMoved;
             }
-            KeyCode::Up => {
+            Some("tui.control.up") => {
                 self.list.select_previous();
                 let _ = self.list.render_state(visible_rows);
                 return CommandPaletteKeyOutcome::SelectionMoved;
             }
             _ => {}
         }
-        let policy = super::text_input_flow::single_line_policy();
         let before = self.query.buffer().text().to_owned();
-        TextInputControl::new(&policy).handle_key(&mut self.query, stroke);
+        super::text_input_flow::handle_key_in_scope(
+            &mut self.query,
+            keymap,
+            "command_palette",
+            stroke,
+        );
         if self.query.buffer().text() == before {
             return CommandPaletteKeyOutcome::Ignored;
         }

@@ -25,7 +25,7 @@ pub struct GenerationView {
     pub layout: Option<(bmux_tui::geometry::Rect, bmux_tui::component::LayoutNode)>,
     pub collapsed: bool,
     pub title: &'static str,
-    pub footer: &'static str,
+    pub footer: String,
     pub detail: String,
 }
 
@@ -46,7 +46,7 @@ impl Default for GenerationView {
             layout: None,
             collapsed: false,
             title: "Goal · Generating instructions",
-            footer: "Draft output · h opens live session (return to setup) · Tab folds output · Esc cancels",
+            footer: "Draft output · cancel stops generation".into(),
             detail: "Preparing source context".into(),
         }
     }

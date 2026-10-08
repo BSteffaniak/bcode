@@ -350,6 +350,418 @@ impl BmuxKeyBinding {
     }
 }
 
+/// Register host-owned dialog actions. Defaults are declarations, never dispatch fallbacks.
+fn register_host_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    register_control_actions(registry)?;
+    register_model_actions(registry)?;
+    register_picker_actions(registry)?;
+    register_streaming_actions(registry)?;
+    register_form_editor_actions(registry)?;
+    register_onboarding_actions(registry)?;
+    Ok(())
+}
+fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option<Vec<&'a str>> {
+    if id == "tui.control.toggle"
+        && matches!(
+            scope,
+            "setup_connection"
+                | "setup_settings"
+                | "setup_auth"
+                | "setup_auth_terminal"
+                | "provider_picker"
+                | "model_picker"
+                | "command_palette"
+                | "working_directory"
+                | "worktree_create"
+                | "ralph_start"
+                | "session_rename"
+                | "session_search"
+                | "slash_palette"
+        )
+    {
+        return None;
+    }
+    if scope == "session_picker" && id == "tui.control.focus_next" {
+        return None;
+    }
+    let mut defaults = defaults;
+    if scope == "setup" && id == "tui.control.focus_next" {
+        defaults.push("n");
+    }
+    if scope == "setup" && id == "tui.control.focus_previous" {
+        defaults.push("p");
+    }
+
+    if scope == "onboarding" && id == "tui.control.cancel" {
+        defaults.push("q");
+    }
+    if scope == "onboarding" && id == "tui.control.up" {
+        defaults.push("k");
+    }
+    if scope == "onboarding" && id == "tui.control.down" {
+        defaults.push("j");
+    }
+
+    if scope == "session_delete" && id == "tui.control.cancel" {
+        defaults.extend(["n", "shift+n"]);
+    }
+    if scope == "session_delete" && id == "tui.control.submit" {
+        defaults = vec!["y", "shift+y"];
+    }
+
+    if matches!(scope, "theme_picker" | "timeline") && id == "tui.control.up" {
+        defaults.push("k");
+    }
+    if matches!(scope, "theme_picker" | "timeline") && id == "tui.control.down" {
+        defaults.push("j");
+    }
+    Some(defaults)
+}
+
+fn register_control_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+
+    for scope in [
+        "provider_picker",
+        "model_picker_actions",
+        "model_picker",
+        "auth_pool_picker",
+        "worktree_picker",
+        "theme_picker",
+        "timeline",
+        "slash_palette",
+        "command_palette",
+        "thinking_dialog",
+        "setup",
+        "onboarding",
+        "working_directory",
+        "worktree_create",
+        "ralph_start",
+        "streaming_configurator",
+        "monitor",
+        "visual",
+        "session_rename",
+        "session_delete",
+        "session_search",
+        "setup_connection",
+        "setup_settings",
+        "setup_auth",
+        "setup_auth_terminal",
+        "setup_device_login",
+    ] {
+        for (id, description, defaults) in [
+            ("tui.control.cancel", "Cancel", vec!["escape"]),
+            ("tui.control.submit", "Confirm", vec!["enter"]),
+            ("tui.control.up", "Previous item", vec!["up"]),
+            ("tui.control.down", "Next item", vec!["down"]),
+            ("tui.control.left", "Previous value", vec!["left"]),
+            ("tui.control.right", "Next value", vec!["right"]),
+            ("tui.control.focus_next", "Next field", vec!["tab"]),
+            (
+                "tui.control.focus_previous",
+                "Previous field",
+                vec!["shift+tab"],
+            ),
+            ("tui.control.toggle", "Toggle", vec!["space"]),
+            ("tui.control.page_up", "Previous page", vec!["pageup"]),
+            ("tui.control.page_down", "Next page", vec!["pagedown"]),
+            ("tui.control.home", "First item", vec!["home"]),
+            ("tui.control.end", "Last item", vec!["end"]),
+        ] {
+            let Some(defaults) = control_defaults(scope, id, defaults) else {
+                continue;
+            };
+            registry.register(KeymapAction {
+                id: id.into(),
+                scope: scope.into(),
+                description: description.into(),
+                defaults: defaults.into_iter().map(str::to_owned).collect(),
+            })?;
+        }
+    }
+
+    Ok(())
+}
+fn register_model_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    for (id, description, defaults) in [
+        ("tui.model.filter", "Filter models", vec!["/"]),
+        (
+            "tui.model.showIgnored",
+            "Show ignored models",
+            vec!["shift+i"],
+        ),
+        ("tui.model.sort", "Cycle model sort", vec!["s"]),
+        (
+            "tui.model.reverseSort",
+            "Reverse model sort",
+            vec!["shift+s"],
+        ),
+        ("tui.model.ignore", "Ignore model", vec!["i"]),
+        ("tui.model.unignore", "Unignore model", vec!["u"]),
+    ] {
+        registry.register(KeymapAction {
+            id: id.into(),
+            scope: "model_picker_actions".into(),
+            description: description.into(),
+            defaults: defaults.into_iter().map(str::to_owned).collect(),
+        })?;
+    }
+
+    Ok(())
+}
+fn register_monitor_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    for (scope, id, description, defaults) in [
+        (
+            "auth_pool_picker",
+            "tui.auth.clear",
+            "Clear promotion",
+            vec!["c"],
+        ),
+        ("chat", "tui.monitor.toggle", "Toggle child monitor", vec![]),
+        (
+            "monitor",
+            "tui.monitor.nextPage",
+            "Load next child page",
+            vec!["alt+n"],
+        ),
+    ] {
+        registry.register(KeymapAction {
+            id: id.into(),
+            scope: scope.into(),
+            description: description.into(),
+            defaults: defaults.into_iter().map(str::to_owned).collect(),
+        })?;
+    }
+    Ok(())
+}
+
+fn register_picker_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    register_monitor_actions(registry)?;
+    for (scope, id, description, defaults) in [
+        (
+            "session_picker",
+            "tui.control.left",
+            "Select parent",
+            vec!["left"],
+        ),
+        (
+            "session_picker",
+            "tui.control.right",
+            "Expand children",
+            vec!["right"],
+        ),
+        (
+            "session_search",
+            "tui.search.mode",
+            "Cycle search mode",
+            vec!["alt+m"],
+        ),
+        (
+            "session_search",
+            "tui.search.deep",
+            "Toggle deep search",
+            vec!["alt+d"],
+        ),
+        (
+            "session_search",
+            "tui.search.content",
+            "Cycle search content",
+            vec!["alt+s"],
+        ),
+        (
+            "session_search",
+            "tui.search.nextMatch",
+            "Next match",
+            vec!["alt+n"],
+        ),
+        (
+            "session_search",
+            "tui.search.index",
+            "Index search",
+            vec!["alt+i"],
+        ),
+        (
+            "session_search",
+            "tui.search.migrate",
+            "Migrate session",
+            vec!["alt+g"],
+        ),
+        (
+            "session_search",
+            "tui.search.backfill",
+            "Backfill search",
+            vec!["alt+b"],
+        ),
+        (
+            "session_search",
+            "tui.search.cancelMaintenance",
+            "Cancel maintenance",
+            vec!["alt+x"],
+        ),
+        (
+            "session_search",
+            "tui.search.help",
+            "Search syntax",
+            vec!["?"],
+        ),
+    ] {
+        registry.register(KeymapAction {
+            id: id.into(),
+            scope: scope.into(),
+            description: description.into(),
+            defaults: defaults.into_iter().map(str::to_owned).collect(),
+        })?;
+    }
+
+    Ok(())
+}
+fn register_streaming_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    for (id, description, key) in [
+        ("tui.streaming.restart", "Restart preview", "r"),
+        ("tui.streaming.pause", "Pause preview", "p"),
+        (
+            "tui.streaming.coarseLeft",
+            "Decrease coarsely",
+            "shift+left",
+        ),
+        (
+            "tui.streaming.coarseRight",
+            "Increase coarsely",
+            "shift+right",
+        ),
+    ] {
+        registry.register(KeymapAction {
+            id: id.into(),
+            scope: "streaming_configurator".into(),
+            description: description.into(),
+            defaults: vec![key.into()],
+        })?;
+    }
+
+    Ok(())
+}
+fn register_form_editor_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    for scope in [
+        "setup_connection",
+        "setup_settings",
+        "setup_auth",
+        "provider_picker",
+        "model_picker",
+        "command_palette",
+        "working_directory",
+        "worktree_create",
+        "ralph_start",
+        "session_rename",
+        "session_search",
+    ] {
+        use bcode_plugin_sdk::tui::keymap::controls::ControlAction;
+        for action in ControlAction::TEXT {
+            if !matches!(
+                action,
+                ControlAction::Up
+                    | ControlAction::Down
+                    | ControlAction::Left
+                    | ControlAction::Right
+                    | ControlAction::Home
+                    | ControlAction::End
+            ) {
+                registry.register(action.definition(scope))?;
+            }
+        }
+    }
+    registry.register(KeymapAction {
+        id: "tui.setup.advanced".into(),
+        scope: "setup_connection".into(),
+        description: "Toggle advanced fields".into(),
+        defaults: vec!["f2".into()],
+    })?;
+
+    Ok(())
+}
+fn register_onboarding_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    for (action, description, key) in [
+        ("provider", "Connect provider", "p"),
+        ("auth", "Review authentication", "a"),
+        ("model", "Select model", "m"),
+        ("permissions", "Review permissions", "r"),
+        ("import", "Review import", "i"),
+        ("plugins", "Review plugins", "g"),
+        ("apply", "Apply plan", "x"),
+        ("confirm", "Confirm plan", "y"),
+        ("reject", "Reject plan", "n"),
+        ("complete", "Complete setup", "c"),
+        ("skip", "Skip setup", "s"),
+        ("launch", "Launch", "l"),
+        ("accounts", "Review accounts", "shift+a"),
+        ("newContext", "Create context", "shift+n"),
+        ("contexts", "Select context", "o"),
+        ("discover", "Discover models", "shift+m"),
+    ] {
+        registry.register(KeymapAction {
+            id: format!("tui.onboarding.{action}"),
+            scope: "onboarding".into(),
+            description: description.into(),
+            defaults: vec![key.into()],
+        })?;
+    }
+    for (id, description, key) in [
+        ("tui.session.scopeToggle", "Toggle directory scope", "tab"),
+        ("tui.session.catalogNextPage", "Next catalog page", "alt+p"),
+        ("tui.session.catalogRestart", "Restart catalog", "alt+r"),
+    ] {
+        registry.register(KeymapAction {
+            id: id.into(),
+            scope: "session_picker".into(),
+            description: description.into(),
+            defaults: vec![key.into()],
+        })?;
+    }
+    registry.register(KeymapAction {
+        id: "tui.session.childrenNextPage".into(),
+        scope: "session_picker".into(),
+        description: "Load next child page".into(),
+        defaults: vec!["alt+n".into()],
+    })?;
+    for (id, key) in [("tui.setup.retry", "r"), ("tui.setup.back", "b")] {
+        registry.register(KeymapAction {
+            id: id.into(),
+            scope: "setup_auth_terminal".into(),
+            description: id.into(),
+            defaults: vec![key.into()],
+        })?;
+    }
+    registry.register(KeymapAction {
+        id: "tui.session.search".into(),
+        scope: "session_picker".into(),
+        description: "Search transcripts".into(),
+        defaults: vec!["ctrl+f".into()],
+    })?;
+
+    Ok(())
+}
+
 /// Compiled TUI keymap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BmuxKeyMap {
@@ -359,6 +771,16 @@ pub struct BmuxKeyMap {
 }
 
 impl BmuxKeyMap {
+    /// Adapt an already effective registry for host rendering.
+    #[must_use]
+    pub const fn from_registry(registry: bcode_plugin_sdk::tui::keymap::KeymapRegistry) -> Self {
+        Self {
+            registry,
+            error: None,
+            activations: BTreeMap::new(),
+        }
+    }
+
     /// Build a keymap from TUI config.
     #[must_use]
     pub fn from_config(config: &TuiConfig) -> Self {
@@ -397,21 +819,9 @@ impl BmuxKeyMap {
                 })?;
             }
         }
-        let mut overrides = config.keybindings.scopes.clone();
-        for (scope, configured) in [
-            (BmuxScope::Chat, &config.keybindings.chat),
-            (BmuxScope::Permission, &config.keybindings.permission),
-            (BmuxScope::SessionPicker, &config.keybindings.session_picker),
-            (BmuxScope::SkillPicker, &config.keybindings.skill_picker),
-        ] {
-            let entries = overrides.entry(scope.id().into()).or_default();
-            entries.extend(configured.iter().map(|(key, id)| {
-                (
-                    key.clone(),
-                    BmuxAction::from_id(id).map_or_else(|| id.clone(), |action| action.id().into()),
-                )
-            }));
-        }
+        let overrides = config.keybindings.scoped_overrides_with(|id| {
+            BmuxAction::from_id(id).map_or_else(|| id.to_owned(), |action| action.id().into())
+        });
         for (scope, entries) in &overrides {
             for id in entries.values() {
                 if let Some(action) = BmuxAction::from_id(id) {
@@ -429,6 +839,7 @@ impl BmuxKeyMap {
                 }
             }
         }
+        register_host_actions(&mut registry)?;
         registry.configure(overrides)?;
         Ok(Self {
             error: None,
@@ -441,6 +852,23 @@ impl BmuxKeyMap {
     #[must_use]
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Resolve a contributor-extensible action in an arbitrary terminal scope.
+    #[must_use]
+    pub fn action(&self, scope: &str, stroke: KeyStroke) -> Option<&str> {
+        self.registry.action_for_key(scope, stroke)
+    }
+
+    /// Effective shortcut presentation; explicitly identifies unbound actions.
+    #[must_use]
+    pub fn hint(&self, scope: &str, action: &str) -> String {
+        let keys = self.registry.keys_for_action(scope, action);
+        if keys.is_empty() {
+            "unbound".into()
+        } else {
+            keys.join(" / ")
+        }
     }
 
     /// Effective registry shared with plugin input and shortcut presentation.
@@ -458,6 +886,29 @@ impl BmuxKeyMap {
         action: bcode_plugin_sdk::tui::keymap::KeymapAction,
     ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
         self.registry.register(action)
+    }
+
+    /// Atomically integrate enabled contributors; failures disable dispatch.
+    pub fn integrate_contributors(
+        &mut self,
+        actions: Result<
+            Vec<bcode_plugin_sdk::tui::keymap::KeymapAction>,
+            bcode_plugin_sdk::tui::keymap::KeymapError,
+        >,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let mut candidate = self.registry.clone();
+        let result = actions.and_then(|actions| candidate.register_all(actions));
+        match result {
+            Ok(()) => self.registry = candidate,
+            Err(error) => {
+                self.registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+                self.activations.clear();
+                self.error = Some(error.to_string());
+            }
+        }
     }
 
     /// Render help from registered descriptions and effective bindings, including unbound actions.
@@ -657,51 +1108,73 @@ impl BmuxKeyMap {
     }
 }
 
+fn default_chat_bindings() -> Vec<BmuxKeyBinding> {
+    vec![
+        bind("enter", BmuxAction::InputSubmitSteering),
+        bind("ctrl+shift+enter", BmuxAction::InputSubmitFollowUp),
+        bind("shift+enter", BmuxAction::InputNewLine),
+        bind("up", BmuxAction::InputHistoryPrevious),
+        bind("down", BmuxAction::InputHistoryNext),
+        bind("left", BmuxAction::EditorMoveLeft),
+        bind("right", BmuxAction::EditorMoveRight),
+        bind("home", BmuxAction::EditorMoveStart),
+        bind("ctrl+a", BmuxAction::EditorMoveStart),
+        bind("end", BmuxAction::EditorMoveEnd),
+        bind("ctrl+e", BmuxAction::EditorMoveEnd),
+        bind("ctrl+left", BmuxAction::EditorMoveWordLeft),
+        bind("alt+left", BmuxAction::EditorMoveWordLeft),
+        bind("alt+b", BmuxAction::EditorMoveWordLeft),
+        bind("ctrl+right", BmuxAction::EditorMoveWordRight),
+        bind("alt+right", BmuxAction::EditorMoveWordRight),
+        bind("alt+f", BmuxAction::EditorMoveWordRight),
+        bind("backspace", BmuxAction::EditorDeleteBackward),
+        bind("delete", BmuxAction::EditorDeleteForward),
+        bind("ctrl+w", BmuxAction::EditorDeleteWordBackward),
+        bind("ctrl+backspace", BmuxAction::EditorDeleteWordBackward),
+        bind("alt+backspace", BmuxAction::EditorDeleteWordBackward),
+        bind("ctrl+delete", BmuxAction::EditorDeleteWordForward),
+        bind("alt+delete", BmuxAction::EditorDeleteWordForward),
+        bind("ctrl+u", BmuxAction::EditorDeleteToStart),
+        bind("ctrl+k", BmuxAction::EditorDeleteToEnd),
+        bind("shift+left", BmuxAction::EditorSelectLeft),
+        bind("shift+right", BmuxAction::EditorSelectRight),
+        bind("shift+alt+left", BmuxAction::EditorSelectWordLeft),
+        bind("shift+alt+right", BmuxAction::EditorSelectWordRight),
+        bind("shift+ctrl+left", BmuxAction::EditorSelectWordLeft),
+        bind("shift+ctrl+right", BmuxAction::EditorSelectWordRight),
+        bind("shift+up", BmuxAction::EditorSelectUp),
+        bind("shift+down", BmuxAction::EditorSelectDown),
+        bind("ctrl+d", BmuxAction::AppExit),
+        multi_tap_bind(
+            "escape",
+            BmuxAction::AppInterrupt,
+            2,
+            1_500,
+            "repeat <binding> to cancel",
+        ),
+        bind("ctrl+v", BmuxAction::ClipboardPasteImage),
+        bind("ctrl+shift+c", BmuxAction::TranscriptCopySelection),
+        bind("ctrl+p", BmuxAction::CommandPaletteOpen),
+        bind("ctrl+g", BmuxAction::SessionSearchOpen),
+        bind("tab", BmuxAction::AgentCycle),
+        bind("shift+tab", BmuxAction::ThinkingEffortCycle),
+        bind("ctrl+tab", BmuxAction::MarkdownFocusNext),
+        bind("ctrl+shift+tab", BmuxAction::MarkdownFocusPrevious),
+        bind("alt+enter", BmuxAction::MarkdownActivate),
+        bind("ctrl+alt+c", BmuxAction::MarkdownCopyDestination),
+        bind("pageUp", BmuxAction::TranscriptPageUp),
+        bind("pageDown", BmuxAction::TranscriptPageDown),
+        bind("ctrl+home", BmuxAction::TranscriptTop),
+        bind("ctrl+end", BmuxAction::TranscriptBottom),
+        bind("ctrl+up", BmuxAction::TranscriptLineUp),
+        bind("ctrl+down", BmuxAction::TranscriptLineDown),
+        bind("ctrl+i", BmuxAction::InteractionFocusActive),
+    ]
+}
+
 fn default_bindings() -> BTreeMap<BmuxScope, Vec<BmuxKeyBinding>> {
     BTreeMap::from([
-        (
-            BmuxScope::Chat,
-            vec![
-                bind("enter", BmuxAction::InputSubmitSteering),
-                bind("ctrl+shift+enter", BmuxAction::InputSubmitFollowUp),
-                bind("shift+enter", BmuxAction::InputNewLine),
-                bind("up", BmuxAction::InputHistoryPrevious),
-                bind("down", BmuxAction::InputHistoryNext),
-                bind("shift+left", BmuxAction::EditorSelectLeft),
-                bind("shift+right", BmuxAction::EditorSelectRight),
-                bind("shift+alt+left", BmuxAction::EditorSelectWordLeft),
-                bind("shift+alt+right", BmuxAction::EditorSelectWordRight),
-                bind("shift+ctrl+left", BmuxAction::EditorSelectWordLeft),
-                bind("shift+ctrl+right", BmuxAction::EditorSelectWordRight),
-                bind("shift+up", BmuxAction::EditorSelectUp),
-                bind("shift+down", BmuxAction::EditorSelectDown),
-                bind("ctrl+d", BmuxAction::AppExit),
-                multi_tap_bind(
-                    "escape",
-                    BmuxAction::AppInterrupt,
-                    2,
-                    1_500,
-                    "repeat <binding> to cancel",
-                ),
-                bind("ctrl+v", BmuxAction::ClipboardPasteImage),
-                bind("ctrl+shift+c", BmuxAction::TranscriptCopySelection),
-                bind("ctrl+p", BmuxAction::CommandPaletteOpen),
-                bind("ctrl+g", BmuxAction::SessionSearchOpen),
-                bind("tab", BmuxAction::AgentCycle),
-                bind("shift+tab", BmuxAction::ThinkingEffortCycle),
-                bind("ctrl+tab", BmuxAction::MarkdownFocusNext),
-                bind("ctrl+shift+tab", BmuxAction::MarkdownFocusPrevious),
-                bind("alt+enter", BmuxAction::MarkdownActivate),
-                bind("ctrl+alt+c", BmuxAction::MarkdownCopyDestination),
-                bind("pageUp", BmuxAction::TranscriptPageUp),
-                bind("pageDown", BmuxAction::TranscriptPageDown),
-                bind("ctrl+home", BmuxAction::TranscriptTop),
-                bind("ctrl+end", BmuxAction::TranscriptBottom),
-                bind("ctrl+up", BmuxAction::TranscriptLineUp),
-                bind("ctrl+down", BmuxAction::TranscriptLineDown),
-                bind("ctrl+i", BmuxAction::InteractionFocusActive),
-            ],
-        ),
+        (BmuxScope::Chat, default_chat_bindings()),
         (
             BmuxScope::Permission,
             vec![
@@ -792,7 +1265,67 @@ mod tests {
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 
     use super::{BmuxAction, BmuxKeyMap, BmuxScope};
+    use bmux_keyboard::parse_key_stroke;
+    use std::collections::BTreeMap;
 
+    #[test]
+    fn conflicting_contributors_disable_all_dispatch_atomically() {
+        use bcode_plugin_sdk::tui::keymap::KeymapAction;
+        let mut keymap = BmuxKeyMap::from_config(&TuiConfig::default());
+        keymap.integrate_contributors(Ok(vec![
+            KeymapAction {
+                id: "test.valid".into(),
+                scope: "test".into(),
+                description: "Valid".into(),
+                defaults: vec!["x".into()],
+            },
+            KeymapAction {
+                id: "test.conflict".into(),
+                scope: "test".into(),
+                description: "Conflict".into(),
+                defaults: vec!["x".into()],
+            },
+        ]));
+        assert!(keymap.error().is_some());
+        assert_eq!(keymap.action("test", parse_key_stroke("x").unwrap()), None);
+        assert_eq!(
+            keymap.action("chat", parse_key_stroke("enter").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn host_remap_and_unbind_dispatch_and_hint_agree() {
+        let mut config = TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "theme_picker".into(),
+            BTreeMap::from([
+                ("ctrl+n".into(), "tui.control.down".into()),
+                ("escape".into(), String::new()),
+            ]),
+        );
+        let keymap = BmuxKeyMap::try_from_config(&config).expect("valid effective registry");
+        assert_eq!(
+            keymap.action("theme_picker", parse_key_stroke("down").unwrap()),
+            None
+        );
+        assert_eq!(
+            keymap.action("theme_picker", parse_key_stroke("j").unwrap()),
+            None
+        );
+        assert_eq!(
+            keymap.action("theme_picker", parse_key_stroke("ctrl+n").unwrap()),
+            Some("tui.control.down")
+        );
+        assert_eq!(
+            keymap.action("theme_picker", parse_key_stroke("escape").unwrap()),
+            None
+        );
+        assert_eq!(keymap.hint("theme_picker", "tui.control.down"), "ctrl+n");
+        assert_eq!(keymap.hint("theme_picker", "tui.control.cancel"), "unbound");
+    }
+
+    #[test]
     fn default_keymap() -> BmuxKeyMap {
         BmuxKeyMap::from_config(&TuiConfig::default())
     }
@@ -875,6 +1408,25 @@ mod tests {
                 .keys_for_action("skill_picker", "tui.skill.invoke"),
             ["ctrl+i"]
         );
+    }
+
+    #[test]
+    fn catalog_scope_actions_have_effective_bindings() {
+        let keymap = default_keymap();
+        for (key, action) in [
+            ("tab", "tui.session.scopeToggle"),
+            ("alt+p", "tui.session.catalogNextPage"),
+            ("alt+r", "tui.session.catalogRestart"),
+        ] {
+            assert_eq!(
+                keymap.action("session_picker", parse_key_stroke(key).unwrap()),
+                Some(action)
+            );
+            assert_eq!(
+                keymap.registry().keys_for_action("session_picker", action),
+                [key]
+            );
+        }
     }
 
     #[test]

@@ -64,6 +64,8 @@ fn resolve_repo_relative(path: PathBuf, repo_path: Option<&std::path::Path>) -> 
 /// Contributor-owned dashboard actions and default shortcuts.
 pub(crate) fn dashboard_keymap_actions() -> Vec<bcode_plugin_sdk::tui::keymap::KeymapAction> {
     [
+        ("previous_tab", "Previous tab", &["left"] as &[&str]),
+        ("next_tab", "Next tab", &["right"] as &[&str]),
         ("previous_row", "Previous row", &["up", "k"] as &[&str]),
         ("next_row", "Next row", &["down", "j"] as &[&str]),
         ("first_row", "First row", &["home"] as &[&str]),
@@ -92,6 +94,18 @@ pub(crate) fn dashboard_keymap_actions() -> Vec<bcode_plugin_sdk::tui::keymap::K
             description: description.into(),
             defaults: keys.iter().map(|key| (*key).into()).collect(),
         },
+    )
+    .chain(
+        [
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::PageUp,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::PageDown,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::FocusNext,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::FocusPrevious,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Submit,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Toggle,
+        ]
+        .into_iter()
+        .map(|action| action.definition("metrics-dashboard")),
     )
     .collect()
 }

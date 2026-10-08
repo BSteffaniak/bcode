@@ -17,12 +17,28 @@ const MIN_DIALOG_HEIGHT: u16 = 15;
 const MAX_DIALOG_HEIGHT: u16 = 22;
 
 /// Render a reasoning output settings dialog.
+#[cfg(test)]
 pub fn render_thinking_dialog(
     state: &ThinkingDialogState,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
-    let body = rows(state, theme);
+    render_thinking_dialog_with_keymap(
+        state,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render effective shortcuts from the same registry used by input.
+pub fn render_thinking_dialog_with_keymap(
+    state: &ThinkingDialogState,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
+) {
+    let body = rows_with_keymap(state, theme, keymap);
     let dialog = Dialog::new(&body, &[], theme.modal_theme())
         .title(" Reasoning output settings ")
         .sizing(dialog_sizing())
@@ -48,7 +64,11 @@ const fn dialog_sizing() -> ModalSizing {
     )
 }
 
-fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
+fn rows_with_keymap(
+    state: &ThinkingDialogState,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
+) -> Vec<Line> {
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
         "Control requested reasoning effort and provider-visible reasoning summaries.",
@@ -105,13 +125,25 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     ));
     rows.push(modal_blank_line(theme));
     rows.push(Line::from_spans(vec![
-        Span::styled("Enter", theme.selection.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("thinking_dialog", "tui.control.submit"),
+            theme.selection.add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" apply   ", theme.text),
-        Span::styled("Esc", theme.selection.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("thinking_dialog", "tui.control.cancel"),
+            theme.selection.add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" cancel   ", theme.text),
-        Span::styled("↑/↓", theme.focused.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("thinking_dialog", "tui.control.down"),
+            theme.focused.add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" move   ", theme.text),
-        Span::styled("Space", theme.focused.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("thinking_dialog", "tui.control.toggle"),
+            theme.focused.add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" change", theme.text),
     ]));
     rows

@@ -45,6 +45,17 @@ impl PresentationPluginBackend {
         }
     }
 
+    fn keymap_actions_page(
+        &self,
+        after: Option<(&str, &str, &str)>,
+        limit: usize,
+    ) -> bcode_plugin_sdk::keymap::KeymapActionPage {
+        match self {
+            Self::Synchronous(host) => host.keymap_actions_page(after, limit),
+            Self::Runtime(runtime) => runtime.registry().keymap_actions_page(after, limit),
+        }
+    }
+
     fn tool_presentation(
         &self,
         tool_name: &str,
@@ -490,6 +501,50 @@ impl PluginTuiPresentation {
         }
     }
 
+    /// Collect contributor actions from this loaded snapshot. Discovery pages are bounded;
+    /// callers perform collection only when replacing the frontend's configuration/runtime.
+    ///
+    /// # Errors
+    /// Rejects conflicting declarations rather than choosing a contributor by discovery order.
+    pub fn keymap_actions(
+        &self,
+    ) -> Result<
+        Vec<bcode_plugin_sdk::tui::keymap::KeymapAction>,
+        bcode_plugin_sdk::tui::keymap::KeymapError,
+    > {
+        let mut registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+        let mut after = None;
+        loop {
+            let page = self.backend.keymap_actions_page(
+                after
+                    .as_ref()
+                    .map(|(owner, scope, id): &(String, String, String)| {
+                        (owner.as_str(), scope.as_str(), id.as_str())
+                    }),
+                100,
+            );
+            for owned in page.actions {
+                registry.register(owned.action)?;
+            }
+            if page.next.is_none() {
+                break;
+            }
+            after = page.next;
+        }
+        for plugin in self.registry_factories.keys() {
+            let loaded = match &self.backend {
+                PresentationPluginBackend::Synchronous(host) => host.has_plugin(plugin),
+                PresentationPluginBackend::Runtime(runtime) => {
+                    runtime.registry().manifests().contains_key(plugin)
+                }
+            };
+            if loaded && let Some(contributor) = self.registry(plugin) {
+                registry.register_all(contributor.keymap_actions().iter().cloned())?;
+            }
+        }
+        Ok(registry.actions().cloned().collect())
+    }
+
     /// Send local input to a targeted visual; never to its running invocation.
     pub fn content_event(&self, identity: &str, event: &bmux_tui::event::Event) -> bool {
         let Some((plugin, identity)) = identity.split_once(':') else {
@@ -498,6 +553,25 @@ impl PluginTuiPresentation {
         let changed = self
             .registry(plugin)
             .is_some_and(|registry| registry.visual_content_event(identity, event));
+        if changed {
+            self.full_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
+    }
+
+    /// Route a focused visual through the current effective frontend keymap.
+    pub fn content_event_with_host(
+        &self,
+        identity: &str,
+        event: &bmux_tui::event::Event,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bool {
+        let Some((plugin, identity)) = identity.split_once(':') else {
+            return false;
+        };
+        let changed = self
+            .registry(plugin)
+            .is_some_and(|registry| registry.visual_content_event_with_host(identity, event, host));
         if changed {
             self.full_generation.fetch_add(1, Ordering::Relaxed);
         }
@@ -655,6 +729,32 @@ impl PluginTuiPresentation {
         changed
     }
 
+    /// Resolve native rows with the same effective keymap used for visual input.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // Exact routing identity remains explicit.
+    pub fn routed_visual_with_host(
+        &self,
+        invocation_id: &str,
+        payload_revision: u64,
+        schema: &str,
+        schema_version: u32,
+        producer_plugin_id: Option<&str>,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> Option<RoutedTuiVisual> {
+        self.routed_visual_impl(
+            invocation_id,
+            payload_revision,
+            schema,
+            schema_version,
+            producer_plugin_id,
+            payload,
+            context,
+            Some(host),
+        )
+    }
+
     /// Resolve native rows from the first ready candidate, enqueueing dynamic candidates off-frame.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // Exact cache identity and renderer context stay explicit.
@@ -668,38 +768,71 @@ impl PluginTuiPresentation {
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Option<RoutedTuiVisual> {
+        self.routed_visual_impl(
+            invocation_id,
+            payload_revision,
+            schema,
+            schema_version,
+            producer_plugin_id,
+            payload,
+            context,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Renderer-local host data is kept out of portable routing contracts.
+    fn routed_visual_impl(
+        &self,
+        invocation_id: &str,
+        payload_revision: u64,
+        schema: &str,
+        schema_version: u32,
+        producer_plugin_id: Option<&str>,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        host: Option<&dyn bcode_plugin_sdk::tui::PluginTuiHost>,
+    ) -> Option<RoutedTuiVisual> {
         for route in self.visual_routes(schema, schema_version, producer_plugin_id) {
             if let Some(registry) = self.registry(&route.plugin_id)
                 && let Some(bcode_plugin_sdk::tui::PluginTuiVisualProjection {
-                    mut rows,
+                    rows,
                     anchors,
                     selection,
-                }) =
-                    registry.visual_projection(&route.adapter_id, &route.schema, payload, context)
+                }) = host.map_or_else(
+                    || {
+                        registry.visual_projection(
+                            &route.adapter_id,
+                            &route.schema,
+                            payload,
+                            context,
+                        )
+                    },
+                    |host| {
+                        registry.visual_projection_with_host(
+                            &route.adapter_id,
+                            &route.schema,
+                            payload,
+                            context,
+                            host,
+                        )
+                    },
+                )
             {
-                if self
-                    .artifact_delivery_failures
-                    .lock()
-                    .is_ok_and(|failures| failures.contains(invocation_id))
-                {
-                    rows.push(bmux_tui::prelude::Line::from(
-                        "Artifact replay failed; showing last valid output. Recording requires inspection.",
-                    ));
-                }
                 let render_mode = registry
                     .visual_render_mode(&route.adapter_id, &route.schema, payload)
                     .unwrap_or_else(|| manifest_render_mode(route.render_mode));
                 let header = registry
                     .visual_transcript_header(&route.adapter_id, &route.schema, payload)
                     .unwrap_or_default();
-                return Some(RoutedTuiVisual {
+                return Some(self.native_routed_visual(
+                    invocation_id,
                     route,
                     render_mode,
-                    rows,
                     header,
+                    rows,
                     anchors,
                     selection,
-                });
+                ));
             }
             if !self.backend.has_service(
                 &route.plugin_id,
@@ -756,6 +889,36 @@ impl PluginTuiPresentation {
             });
         }
         None
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keep validated native rows and source mappings together.
+    fn native_routed_visual(
+        &self,
+        invocation_id: &str,
+        route: bcode_plugin::PluginVisualAdapterRoute,
+        render_mode: bcode_plugin_sdk::tui::PluginTuiVisualRenderMode,
+        header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader,
+        mut rows: Vec<bmux_tui::prelude::Line>,
+        anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+        selection: Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    ) -> RoutedTuiVisual {
+        if self
+            .artifact_delivery_failures
+            .lock()
+            .is_ok_and(|failures| failures.contains(invocation_id))
+        {
+            rows.push(bmux_tui::prelude::Line::from(
+                "Artifact replay failed; showing last valid output. Recording requires inspection.",
+            ));
+        }
+        RoutedTuiVisual {
+            route,
+            render_mode,
+            rows,
+            header,
+            anchors,
+            selection,
+        }
     }
 
     /// Return whether the host can route one visual to a native TUI adapter.

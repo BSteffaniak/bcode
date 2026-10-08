@@ -13,6 +13,7 @@ pub mod code_review_tui;
 pub mod code_review_tui_display;
 pub mod code_review_tui_render;
 pub mod code_review_tui_view;
+mod keybindings;
 pub mod terminal_events;
 pub mod tui;
 pub mod tui_host_types;

@@ -16,9 +16,17 @@ pub const EVAL_RUN_VIEWER_SURFACE_KIND: &str = "eval-run-viewer";
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
+    for action in keymap_actions() {
+        registry.register_keymap_action(action);
+    }
     registry.register_factory(Box::new(EvalRunPickerSurfaceFactory));
     registry.register_factory(Box::new(EvalRunViewerSurfaceFactory));
     registry
+}
+
+/// Contributor-owned eval actions for each independently routed surface.
+pub(crate) fn keymap_actions() -> Vec<bcode_plugin_sdk::tui::keymap::KeymapAction> {
+    crate::keybindings::actions()
 }
 
 #[derive(Debug, Default)]

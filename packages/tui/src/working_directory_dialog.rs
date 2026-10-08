@@ -36,7 +36,7 @@ impl WorkingDirectoryDialog {
         Self {
             path: TextInputState::new(path),
             base: current_working_directory.to_path_buf(),
-            status: "Enter an existing directory, Enter applies, Esc cancels".to_owned(),
+            status: "Type an existing directory, then confirm to apply or cancel.".to_owned(),
             submitting: false,
         }
     }
@@ -76,9 +76,9 @@ impl WorkingDirectoryDialog {
                     TextInputControl::new(&path_input_policy()).handle_paste(&mut self.path, text);
                 self.validate_for_display();
             }
-            Event::Key(stroke) => match stroke.key {
-                bmux_keyboard::KeyCode::Escape => return WorkingDirectoryDialogOutcome::Canceled,
-                bmux_keyboard::KeyCode::Enter if !self.submitting => match self.validated_path() {
+            Event::Key(stroke) => match keymap.action("working_directory", *stroke) {
+                Some("tui.control.cancel") => return WorkingDirectoryDialogOutcome::Canceled,
+                Some("tui.control.submit") if !self.submitting => match self.validated_path() {
                     Ok(path) => {
                         self.submitting = true;
                         "Changing working directory…".clone_into(&mut self.status);
@@ -87,18 +87,12 @@ impl WorkingDirectoryDialog {
                     Err(message) => self.status = message,
                 },
                 _ => {
-                    if let Some(motion) = keymap.editor_selection_motion_for_key(*stroke) {
-                        self.path
-                            .buffer_mut()
-                            .move_cursor_with_selection(motion, SelectionMode::Extend);
-                        self.path.sync_scroll_to_cursor(&path_input_policy());
-                    } else if let Some(command) = keymap.editor_command_for_key(*stroke) {
-                        self.path.buffer_mut().apply_command(command);
-                        self.path.sync_scroll_to_cursor(&path_input_policy());
-                    } else {
-                        let _ = TextInputControl::new(&path_input_policy())
-                            .handle_key(&mut self.path, *stroke);
-                    }
+                    let _ = super::text_input_flow::handle_key_in_scope(
+                        &mut self.path,
+                        keymap,
+                        "working_directory",
+                        *stroke,
+                    );
                     self.validate_for_display();
                 }
             },

@@ -21,7 +21,6 @@ use bcode_tui_components::tool_card::{ToolCardStyle, push_tool_card_detail, tool
 use bcode_worktree_models::{
     WorktreeCreateRequest, WorktreeInfo, WorktreeListRequest, WorktreeRemoveRequest,
 };
-use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::Event;
@@ -612,7 +611,34 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 
 #[must_use]
 pub fn worktree_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    use bcode_plugin_sdk::tui::keymap::controls::ControlAction;
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    for (scope, actions) in [
+        ("worktree.list", ControlAction::NAVIGATION),
+        ("worktree.create", ControlAction::TEXT),
+    ] {
+        for action in actions {
+            let mut definition = action.definition(scope);
+            if scope == "worktree.list" {
+                match *action {
+                    ControlAction::Up => definition.defaults.push("k".into()),
+                    ControlAction::Down => definition.defaults.push("j".into()),
+                    _ => {}
+                }
+            }
+            registry.register_keymap_action(definition);
+        }
+        if scope == "worktree.list" {
+            registry.register_keymap_action(ControlAction::Toggle.definition(scope));
+        }
+        for action in [ControlAction::Submit, ControlAction::Cancel] {
+            let mut definition = action.definition(scope);
+            if scope == "worktree.list" && action == ControlAction::Cancel {
+                definition.defaults.push("q".into());
+            }
+            registry.register_keymap_action(definition);
+        }
+    }
     registry.register_factory(Box::new(WorktreeCommandSurfaceFactory {
         surface_kind: "command.work-tree.attach",
         title: "Attach Worktree",
@@ -835,6 +861,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for WorktreeCommandSurfaceFa
                 .and_then(serde_json::Value::as_str)
                 .and_then(|value| bcode_session_models::SessionId::from_str(value).ok());
             Ok(Box::new(WorktreeCommandSurface {
+                hints: Vec::new(),
                 id: surface_kind,
                 title,
                 repo_path,
@@ -854,6 +881,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for WorktreeCommandSurfaceFa
 }
 
 struct WorktreeCommandSurface {
+    hints: Vec<(String, String)>,
     id: &'static str,
     title: &'static str,
     repo_path: PathBuf,
@@ -1011,20 +1039,12 @@ impl WorktreeCommandSurface {
                 Line::from_spans(vec![Span::styled(status.clone(), theme.focused)]),
             );
         }
-        let hints = if self.is_selectable() {
-            vec![
-                KeyHint::new("↑/↓", "select"),
-                KeyHint::new("Enter", "activate"),
-                KeyHint::new("Esc/q", "close"),
-            ]
-        } else if self.id == "command.work-tree.createSession" {
-            vec![
-                KeyHint::new("Enter", "create"),
-                KeyHint::new("Esc", "close"),
-            ]
-        } else {
-            vec![KeyHint::new("Enter/Esc/q", "close")]
-        };
+        let hints = self
+            .hints
+            .iter()
+            .filter(|(keys, _)| !keys.is_empty())
+            .map(|(keys, label)| KeyHint::new(keys.as_str(), label.as_str()))
+            .collect::<Vec<_>>();
         let hints =
             KeyHintBarComponent::new("worktree.hints", &hints).styles(worktree_hint_styles(theme));
         let layout = hints.layout(
@@ -1113,16 +1133,77 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
         self.render_themed(area, frame, theme);
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) {
+        use bcode_plugin_sdk::tui::keymap::controls::ControlAction;
+        let scope = if self.id == "command.work-tree.createSession" {
+            "worktree.create"
+        } else {
+            "worktree.list"
+        };
+        self.hints = [
+            ControlAction::Up,
+            ControlAction::Down,
+            ControlAction::Submit,
+            ControlAction::Cancel,
+        ]
+        .map(|action| (host.keymap_keys(scope, &action.id()).join("/"), action.id()))
+        .into();
+        self.render_themed(area, frame, theme);
+    }
+
     fn handle_event(
         &mut self,
         event: &Event,
-        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> bcode_plugin_sdk::tui::PluginTuiAction {
-        if let Event::Key(key) = event
-            && matches!(key.key, KeyCode::Escape | KeyCode::Char('q'))
-        {
-            return bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None };
-        }
+        use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
+        let creating = self.id == "command.work-tree.createSession";
+        let scope = if creating {
+            "worktree.create"
+        } else {
+            "worktree.list"
+        };
+        let supported = if creating {
+            ControlAction::TEXT
+        } else {
+            ControlAction::NAVIGATION
+        };
+        let event = match event {
+            Event::Key(stroke) => {
+                if host.keymap_action(scope, *stroke).as_deref()
+                    == Some(ControlAction::Cancel.id().as_str())
+                {
+                    return bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None };
+                }
+                if host.keymap_action(scope, *stroke).as_deref()
+                    == Some(ControlAction::Submit.id().as_str())
+                    || !creating
+                        && host.keymap_action(scope, *stroke).as_deref()
+                            == Some(ControlAction::Toggle.id().as_str())
+                {
+                    if creating {
+                        self.create_name = self.create_input.buffer().text().to_owned();
+                        return self.create_worktree();
+                    }
+                    return self.activate_selected();
+                }
+                let Some(stroke) =
+                    ControlInput::from_host(host, scope, *stroke, supported, creating)
+                        .native_stroke()
+                else {
+                    return bcode_plugin_sdk::tui::PluginTuiAction::None;
+                };
+                Event::Key(stroke)
+            }
+            event => event.clone(),
+        };
+        let event = &event;
         if self.id == "command.work-tree.createSession" {
             let policy = single_line_text_policy();
             let input = bmux_tui_components::text_input::TextInputControl::new(&policy);
@@ -1153,17 +1234,8 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
                 })
                 .collect::<Vec<_>>();
             let list = SelectableList::new(&items);
-            let list_event = match event {
-                Event::Key(key) if key.key == KeyCode::Char('k') => {
-                    Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Up))
-                }
-                Event::Key(key) if key.key == KeyCode::Char('j') => {
-                    Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Down))
-                }
-                _ => event.clone(),
-            };
             let mut state = worktree_list_state(self.selected);
-            return match list.handle_event(self.list_area, &mut state, &list_event) {
+            return match list.handle_event(self.list_area, &mut state, event) {
                 SelectableListOutcome::Focused(index) => {
                     self.selected = index;
                     bcode_plugin_sdk::tui::PluginTuiAction::Redraw
@@ -1179,12 +1251,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
                 SelectableListOutcome::Ignored => bcode_plugin_sdk::tui::PluginTuiAction::None,
             };
         }
-        match event {
-            Event::Key(key) if key.key == KeyCode::Enter => {
-                bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
-            }
-            _ => bcode_plugin_sdk::tui::PluginTuiAction::None,
-        }
+        bcode_plugin_sdk::tui::PluginTuiAction::None
     }
 }
 
@@ -1384,6 +1451,64 @@ mod tests {
         }
     }
 
+    struct KeymapHost(bcode_plugin_sdk::tui::keymap::KeymapRegistry);
+    impl bcode_plugin_sdk::tui::PluginTuiHost for KeymapHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            self.0.action_for_key(scope, stroke).map(str::to_owned)
+        }
+        fn keymap_is_overridden(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> bool {
+            self.0.is_overridden_key(scope, stroke)
+        }
+    }
+
+    #[test]
+    fn worktree_navigation_remap_preserves_home_page_and_space_activation() {
+        use bcode_plugin_sdk::tui::keymap::controls::{
+            ControlAction, ControlInput, resolve_registry,
+        };
+        let definitions = worktree_tui_registry();
+        let registry = resolve_registry(
+            definitions.keymap_actions().iter().cloned(),
+            std::collections::BTreeMap::from([(
+                "worktree.list".into(),
+                std::collections::BTreeMap::from([
+                    ("ctrl+p".into(), ControlAction::Up.id()),
+                    ("down".into(), String::new()),
+                ]),
+            )]),
+        )
+        .unwrap();
+        let host = KeymapHost(registry);
+        let input = |key| {
+            ControlInput::from_host(
+                &host,
+                "worktree.list",
+                bmux_keyboard::parse_key_stroke(key).unwrap(),
+                ControlAction::NAVIGATION,
+                false,
+            )
+        };
+        assert_eq!(input("up"), ControlInput::Ignored);
+        assert_eq!(input("k"), ControlInput::Ignored);
+        assert_eq!(input("down"), ControlInput::Ignored);
+        assert_eq!(input("ctrl+p"), ControlInput::Action(ControlAction::Up));
+        assert_eq!(input("home"), ControlInput::Action(ControlAction::Home));
+        assert_eq!(
+            input("page_down"),
+            ControlInput::Action(ControlAction::PageDown)
+        );
+        assert_eq!(
+            host.0.action_for_key(
+                "worktree.list",
+                bmux_keyboard::parse_key_stroke("space").unwrap()
+            ),
+            Some(ControlAction::Toggle.id().as_str())
+        );
+    }
+
     #[test]
     fn worktree_surface_uses_host_theme_at_narrow_sizes() {
         let worktree = WorktreeInfo {
@@ -1393,6 +1518,7 @@ mod tests {
             commit: Some("abc123".to_owned()),
         };
         let mut surface = WorktreeCommandSurface {
+            hints: Vec::new(),
             id: "command.work-tree.attach",
             title: "Attach worktree",
             repo_path: PathBuf::from("/tmp/repo"),

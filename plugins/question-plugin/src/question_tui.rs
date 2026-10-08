@@ -31,11 +31,56 @@ use super::question_interaction::{
 };
 use super::{QUESTION_INLINE_SURFACE, QuestionSelectionMode};
 
+const QUESTION_SCOPE: &str = "question";
+
+pub fn register_keymap(registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry) {
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    for (action, description, defaults) in [
+        ("next", "Next question control", vec!["tab"]),
+        ("previous", "Previous question control", vec!["shift+tab"]),
+        ("up", "Move to previous row", vec!["up"]),
+        ("down", "Move to next row", vec!["down"]),
+        ("left", "Move to previous option", vec!["left"]),
+        ("right", "Move to next option", vec!["right"]),
+        ("activate", "Activate question control", vec!["enter"]),
+        ("toggle", "Toggle option", vec!["space"]),
+        ("cancel", "Dismiss question", vec!["esc"]),
+        ("submit", "Submit answers", vec!["ctrl+enter"]),
+    ] {
+        registry.register_keymap_action(KeymapAction {
+            id: format!("question.{action}"),
+            scope: QUESTION_SCOPE.into(),
+            description: description.into(),
+            defaults: defaults.into_iter().map(str::to_owned).collect(),
+        });
+    }
+    registry.register_keymap_action(
+        bcode_plugin_sdk::tui::keymap::controls::ControlAction::Newline.definition("question.text"),
+    );
+    for action in bcode_plugin_sdk::tui::keymap::controls::ControlAction::TEXT {
+        registry.register_keymap_action(action.definition("question.text"));
+    }
+    for index in 0..10 {
+        registry.register_keymap_action(KeymapAction {
+            id: format!("question.option.{index}"),
+            scope: QUESTION_SCOPE.into(),
+            description: format!("Select option {}", index + 1),
+            defaults: vec![if index == 9 {
+                "0".into()
+            } else {
+                (index + 1).to_string()
+            }],
+        });
+    }
+}
+
 const DESCRIPTION_INDENT: &str = "        ";
 
 /// Terminal renderer for the question interaction.
 #[derive(Default)]
 pub struct QuestionTerminalRenderer {
+    option_keys: Vec<String>,
+    action_keys: Vec<String>,
     last_area: Rect,
     controls: Vec<ControlRegion>,
     logical_origin: u16,
@@ -142,6 +187,44 @@ struct ControlRegion {
 }
 
 impl QuestionTerminalRenderer {
+    fn refresh_keymap(&mut self, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) -> bool {
+        let option_keys = (0..10)
+            .map(|index| {
+                host.keymap_keys(QUESTION_SCOPE, &format!("question.option.{index}"))
+                    .join("/")
+            })
+            .collect::<Vec<_>>();
+        let action_keys: Vec<String> = [
+            vec!["next", "down", "right"],
+            vec!["previous", "up", "left"],
+            vec!["activate", "toggle"],
+            vec!["cancel"],
+        ]
+        .map(|actions| {
+            actions
+                .into_iter()
+                .flat_map(|action| host.keymap_keys(QUESTION_SCOPE, &format!("question.{action}")))
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .into();
+        let changed = self.option_keys != option_keys || self.action_keys != action_keys;
+        if changed {
+            self.option_keys = option_keys;
+            self.action_keys = action_keys;
+            self.measurement = None;
+        }
+        changed
+    }
+
+    fn option_shortcut_label(&self, option_index: usize) -> String {
+        self.option_keys
+            .get(option_index)
+            .filter(|keys| !keys.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "-".into())
+    }
+
     fn measurement(&mut self, snapshot: &QuestionSnapshot, width: u16) -> &QuestionMeasurement {
         let width = width.max(1);
         let layout_changed = self.measurement.as_ref().is_none_or(|measurement| {
@@ -299,8 +382,8 @@ impl QuestionTerminalRenderer {
             } else {
                 "( )"
             };
-            let shortcut = option_shortcut_label(option_index);
-            let shortcut_width = shortcut.len();
+            let shortcut = self.option_shortcut_label(option_index);
+            let shortcut_width = bmux_tui::text_width::display_width(&shortcut);
             let focused = matches!(
                 snapshot.focus,
                 QuestionFocusTarget::Option {
@@ -485,11 +568,13 @@ impl QuestionTerminalRenderer {
             );
         }
         *content_y = content_y.saturating_add(1);
-        let hints = [
-            KeyHint::new("Tab/Shift-Tab or arrows", "move"),
-            KeyHint::new("Enter/Space", "select"),
-            KeyHint::new("Esc", "dismiss"),
-        ];
+        let hints = self
+            .action_keys
+            .iter()
+            .zip(["next", "previous", "select", "dismiss"])
+            .filter(|(keys, _)| !keys.is_empty())
+            .map(|(keys, label)| KeyHint::new(keys.as_str(), label))
+            .collect::<Vec<_>>();
         if let Some(area) = self.control_area(*content_y, 1) {
             let hints = KeyHintBarComponent::new("question.hints", &hints)
                 .styles(question_hint_styles(&self.theme));
@@ -641,17 +726,22 @@ impl QuestionTerminalRenderer {
         let before = state.buffer().text().to_owned();
         match event {
             Event::Key(stroke) => {
-                if let Some(motion) = host.text_selection_motion(*stroke) {
-                    state
-                        .buffer_mut()
-                        .move_cursor_with_selection(motion, bmux_text_edit::SelectionMode::Extend);
-                    state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
-                } else if let Some(command) = host.text_edit_command(*stroke) {
-                    state.buffer_mut().apply_command(command);
-                    state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
-                } else {
-                    TextInputControl::new(&TextInputPolicy::chat_composer())
-                        .handle_key(state, *stroke);
+                use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
+                match ControlInput::from_host(
+                    host,
+                    "question.text",
+                    *stroke,
+                    &[ControlAction::TEXT, &[ControlAction::Newline]].concat(),
+                    true,
+                ) {
+                    ControlInput::Action(action) => {
+                        TextInputControl::new(&TextInputPolicy::chat_composer())
+                            .handle_key(state, action.native_stroke());
+                    }
+                    ControlInput::Text(text) => {
+                        state.buffer_mut().insert_char(text.0);
+                    }
+                    ControlInput::Ignored => return TerminalInteractionInput::Ignored,
                 }
             }
             Event::Paste(text) => {
@@ -712,8 +802,9 @@ impl QuestionTerminalRenderer {
             let mut options = Vec::with_capacity(question.options.len());
             for (option_index, option) in question.options.iter().enumerate() {
                 let option_start = height;
-                let prefix_width =
-                    7_usize.saturating_add(option_shortcut_label(option_index).len());
+                let prefix_width = 7_usize.saturating_add(bmux_tui::text_width::display_width(
+                    &self.option_shortcut_label(option_index),
+                ));
                 let available = width.saturating_sub(prefix_width).max(1);
                 let label = WrappedText::new(&option.label, available, available);
                 height = height.saturating_add(label.height());
@@ -870,12 +961,21 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         }
     }
 
+    fn prepare_keymap(&mut self, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) -> bool {
+        self.refresh_keymap(host)
+    }
+
+    fn prepare_render(&mut self, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) {
+        self.refresh_keymap(host);
+    }
+
     fn input(
         &mut self,
         event: &Event,
         snapshot: &QuestionSnapshot,
         host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> TerminalInteractionInput {
+        self.refresh_keymap(host);
         if let Event::Mouse(mouse) = event
             && let Some(question_index) =
                 self.custom_areas.iter().find_map(|(question_index, area)| {
@@ -893,7 +993,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
             });
         }
         if let Event::Key(stroke) = event
-            && host.text_submit(*stroke)
+            && host.keymap_action(QUESTION_SCOPE, *stroke).as_deref() == Some("question.submit")
             && matches!(
                 snapshot.focus,
                 QuestionFocusTarget::Custom { .. } | QuestionFocusTarget::Submit
@@ -901,161 +1001,83 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         {
             return TerminalInteractionInput::Semantic(InteractionInput::Submit);
         }
-        if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. })
-            && let Event::Key(stroke) = event
-            && matches!(stroke.key, KeyCode::Up | KeyCode::Down)
-            && no_modifiers(stroke.modifiers)
-        {
-            return self.custom_vertical_input(stroke.key, snapshot);
+        let action = match event {
+            Event::Key(stroke) => host.keymap_action(QUESTION_SCOPE, *stroke),
+            _ => None,
+        };
+        if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
+            if let Some(action) = action.as_deref() {
+                if action == "question.down" || action == "question.up" {
+                    return self.custom_vertical_input(
+                        if action == "question.up" {
+                            KeyCode::Up
+                        } else {
+                            KeyCode::Down
+                        },
+                        snapshot,
+                    );
+                }
+                if action == "question.next" || action == "question.previous" {
+                    return TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                        direction: if action == "question.next" {
+                            InteractionNavigation::Next
+                        } else {
+                            InteractionNavigation::Previous
+                        },
+                    });
+                }
+                if action == "question.activate" {
+                    return TerminalInteractionInput::Semantic(InteractionInput::Submit);
+                }
+                if action == "question.cancel" {
+                    return TerminalInteractionInput::Semantic(InteractionInput::Cancel);
+                }
+            }
+            return self.custom_input(event, snapshot, host);
         }
-        if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. })
-            && !matches!(
-                event,
-                Event::Key(stroke)
-                    if stroke.key == KeyCode::Tab
-                        || stroke.key == KeyCode::Escape
-                        || stroke.key == KeyCode::Enter && !stroke.modifiers.shift
-            )
-            && let input = self.custom_input(event, snapshot, host)
-            && !matches!(input, TerminalInteractionInput::Ignored)
-        {
-            return input;
-        }
-        standard_input(self, event, snapshot).map_or(
+        let input = match event {
+            Event::Mouse(mouse) => self.mouse_input(mouse),
+            Event::Key(_) => question_action_input(action.as_deref(), snapshot),
+            _ => None,
+        };
+        input.map_or(
             TerminalInteractionInput::Ignored,
             TerminalInteractionInput::Semantic,
         )
     }
 }
 
-const fn no_modifiers(modifiers: bmux_keyboard::Modifiers) -> bool {
-    !modifiers.shift
-        && !modifiers.ctrl
-        && !modifiers.alt
-        && !modifiers.super_key
-        && !modifiers.hyper
-        && !modifiers.meta
-}
-
-fn standard_input(
-    renderer: &QuestionTerminalRenderer,
-    event: &Event,
+fn question_action_input(
+    action: Option<&str>,
     snapshot: &QuestionSnapshot,
 ) -> Option<InteractionInput> {
-    match event {
-        Event::Key(stroke)
-            if stroke.key == KeyCode::Tab
-                && stroke.modifiers.shift
-                && !stroke.modifiers.ctrl
-                && !stroke.modifiers.alt
-                && !stroke.modifiers.super_key
-                && !stroke.modifiers.hyper
-                && !stroke.modifiers.meta =>
-        {
-            Some(InteractionInput::Navigate {
-                direction: InteractionNavigation::Previous,
-            })
-        }
-        Event::Key(stroke)
-            if !stroke.modifiers.ctrl
-                && !stroke.modifiers.alt
-                && !stroke.modifiers.super_key
-                && !stroke.modifiers.hyper
-                && !stroke.modifiers.meta =>
-        {
-            standard_key_input(stroke.key, snapshot)
-        }
-        Event::Mouse(mouse) => renderer.mouse_input(mouse),
-        Event::Paste(text) => custom_text_change(snapshot, |value| value.push_str(text)),
-        Event::Key(_) | Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => None,
-    }
-}
-
-fn standard_key_input(key: KeyCode, snapshot: &QuestionSnapshot) -> Option<InteractionInput> {
-    match key {
-        KeyCode::Tab | KeyCode::Down => Some(InteractionInput::Navigate {
+    match action? {
+        "question.next" | "question.down" | "question.right" => Some(InteractionInput::Navigate {
             direction: InteractionNavigation::Next,
         }),
-        KeyCode::Up => Some(InteractionInput::Navigate {
+        "question.previous" | "question.up" | "question.left" => Some(InteractionInput::Navigate {
             direction: InteractionNavigation::Previous,
         }),
-        KeyCode::Right => (!matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }))
-            .then_some(InteractionInput::Navigate {
-                direction: InteractionNavigation::Next,
-            }),
-        KeyCode::Left => (!matches!(snapshot.focus, QuestionFocusTarget::Custom { .. })).then_some(
-            InteractionInput::Navigate {
-                direction: InteractionNavigation::Previous,
-            },
-        ),
-        KeyCode::Enter | KeyCode::Space => Some(InteractionInput::Activate {
+        "question.activate" | "question.toggle" => Some(InteractionInput::Activate {
             control_id: snapshot.focused_control_id.clone(),
         }),
-        KeyCode::Escape => Some(InteractionInput::Cancel),
-        KeyCode::Backspace => custom_text_change(snapshot, |text| {
-            text.pop();
-        }),
-        KeyCode::Char(character) => option_shortcut_input(character, snapshot),
-        KeyCode::Home
-        | KeyCode::End
-        | KeyCode::PageUp
-        | KeyCode::PageDown
-        | KeyCode::Delete
-        | KeyCode::Insert
-        | KeyCode::F(_) => None,
+        "question.cancel" => Some(InteractionInput::Cancel),
+        "question.submit" => Some(InteractionInput::Submit),
+        action => {
+            let index = action
+                .strip_prefix("question.option.")?
+                .parse::<usize>()
+                .ok()?;
+            let QuestionFocusTarget::Option { question_index, .. } = snapshot.focus else {
+                return None;
+            };
+            (index < snapshot.request.questions[question_index].options.len()).then(|| {
+                InteractionInput::Activate {
+                    control_id: option_control_id(question_index, index),
+                }
+            })
+        }
     }
-}
-
-fn option_shortcut_input(character: char, snapshot: &QuestionSnapshot) -> Option<InteractionInput> {
-    if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
-        return custom_text_change(snapshot, |text| text.push(character));
-    }
-    let QuestionFocusTarget::Option { question_index, .. } = snapshot.focus else {
-        return None;
-    };
-    let option_index = option_shortcut(character).filter(|option_index| {
-        *option_index < snapshot.request.questions[question_index].options.len()
-    })?;
-    Some(InteractionInput::Activate {
-        control_id: option_control_id(question_index, option_index),
-    })
-}
-
-fn option_shortcut_label(option_index: usize) -> String {
-    match option_index {
-        0..=8 => option_index.saturating_add(1).to_string(),
-        9 => "0".to_owned(),
-        _ => "-".to_owned(),
-    }
-}
-
-fn option_shortcut(character: char) -> Option<usize> {
-    match character {
-        '1'..='9' => character
-            .to_digit(10)
-            .and_then(|digit| usize::try_from(digit).ok())
-            .and_then(|digit| digit.checked_sub(1)),
-        '0' => Some(9),
-        _ => None,
-    }
-}
-
-fn custom_text_change(
-    snapshot: &QuestionSnapshot,
-    change: impl FnOnce(&mut String),
-) -> Option<InteractionInput> {
-    let QuestionFocusTarget::Custom { question_index } = snapshot.focus else {
-        return None;
-    };
-    let mut text = snapshot.answers[question_index]
-        .custom
-        .clone()
-        .unwrap_or_default();
-    change(&mut text);
-    Some(InteractionInput::Change {
-        control_id: custom_control_id(question_index),
-        value: InteractionValue::String(text),
-    })
 }
 
 fn custom_input_height(state: &TextInputState, width: u16) -> u16 {
@@ -1140,6 +1162,7 @@ const fn question_input_styles(
 mod tests {
     use super::*;
     use bcode_plugin_sdk::interaction::PluginInteraction;
+    use bcode_plugin_sdk::tui::keymap::{KeymapRegistry, controls::ControlAction};
     use bcode_plugin_sdk::tui::{
         PluginTask, PluginTuiDiffTheme, PluginTuiHost, PluginTuiSourceTheme, PluginTuiSyntaxColor,
         PluginTuiSyntaxTheme,
@@ -1162,6 +1185,175 @@ mod tests {
         fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
 
         fn request_redraw(&self) {}
+
+        fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {
+            test_registry()
+                .action_for_key(scope, stroke)
+                .map(str::to_owned)
+        }
+        fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+            test_registry()
+                .keys_for_action(scope, action)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    struct RemappedHost(KeymapRegistry);
+    impl PluginTuiHost for RemappedHost {
+        fn spawn(&self, _task: PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+        fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {
+            self.0.action_for_key(scope, stroke).map(str::to_owned)
+        }
+        fn keymap_is_overridden(&self, scope: &str, stroke: KeyStroke) -> bool {
+            self.0.is_overridden_key(scope, stroke)
+        }
+        fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+            self.0
+                .keys_for_action(scope, action)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn remapping_and_unbinding_question_actions_changes_dispatch_and_labels() {
+        let mut registry = test_registry();
+        registry
+            .configure(BTreeMap::from([(
+                "question".into(),
+                BTreeMap::from([
+                    ("ctrl+j".into(), "question.down".into()),
+                    ("x".into(), "question.option.0".into()),
+                    ("esc".into(), String::new()),
+                ]),
+            )]))
+            .unwrap();
+        let host = RemappedHost(registry);
+        let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question("Pick", &[("A", None), ("B", None)], false, false)],
+        });
+        let snapshot = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        assert!(matches!(
+            renderer.input(&key(KeyCode::Down), &snapshot, &host),
+            TerminalInteractionInput::Ignored
+        ));
+        assert!(matches!(
+            renderer.input(&key(KeyCode::Escape), &snapshot, &host),
+            TerminalInteractionInput::Ignored
+        ));
+        let event = Event::Key(bmux_keyboard::parse_key_stroke("ctrl+j").unwrap());
+        assert!(matches!(
+            renderer.input(&event, &snapshot, &host),
+            TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                direction: InteractionNavigation::Next
+            })
+        ));
+        assert!(matches!(
+            renderer.input(&key(KeyCode::Char('1')), &snapshot, &host),
+            TerminalInteractionInput::Ignored
+        ));
+        assert!(matches!(
+            renderer.input(&key(KeyCode::Char('x')), &snapshot, &host),
+            TerminalInteractionInput::Semantic(InteractionInput::Activate { .. })
+        ));
+        assert_eq!(renderer.option_shortcut_label(0), "x");
+        assert_eq!(renderer.action_keys[3], "");
+    }
+
+    #[test]
+    fn preparing_unchanged_bindings_retains_question_measurement() {
+        let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question("Pick", &[("An option label", None)], false, false)],
+        });
+        let snapshot = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        assert!(renderer.prepare_keymap(&TEST_HOST));
+        let original_height = renderer.preferred_height(&snapshot, 24);
+        let original_measurement = renderer.measurement.clone();
+        assert!(!renderer.prepare_keymap(&TEST_HOST));
+        assert_eq!(renderer.measurement, original_measurement);
+
+        let mut registry = test_registry();
+        registry
+            .configure(BTreeMap::from([(
+                "question".into(),
+                BTreeMap::from([("ctrl+alt+shift+f12".into(), "question.option.0".into())]),
+            )]))
+            .unwrap();
+        let host = RemappedHost(registry);
+        assert!(renderer.prepare_keymap(&host));
+        assert!(renderer.measurement.is_none());
+        assert!(renderer.preferred_height(&snapshot, 24) > original_height);
+        let remapped_measurement = renderer.measurement.clone();
+        assert!(!renderer.prepare_keymap(&host));
+        assert_eq!(renderer.measurement, remapped_measurement);
+    }
+
+    #[test]
+    fn remapped_long_option_hint_measures_and_paints_narrow_geometry_consistently() {
+        let mut registry = test_registry();
+        registry
+            .configure(BTreeMap::from([(
+                "question".into(),
+                BTreeMap::from([("ctrl+alt+shift+f12".into(), "question.option.0".into())]),
+            )]))
+            .unwrap();
+        let host = RemappedHost(registry);
+        let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question(
+                "Pick",
+                &[("A long option label that wraps", None)],
+                false,
+                false,
+            )],
+        });
+        let snapshot = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        renderer.prepare_render(&host);
+        assert_eq!(renderer.option_shortcut_label(0), "ctrl+alt+shift+f12");
+        for width in [0, 1, 8, 24, 40] {
+            let height = renderer.preferred_height(&snapshot, width);
+            let geometry = renderer.content_geometry(&snapshot, width);
+            assert_eq!(height, geometry.height);
+            assert!(geometry.questions[0].options[0].rows.end <= height);
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            let mut backend = Frame::new(&mut buffer);
+            renderer.render_with_host(
+                &snapshot,
+                area,
+                &mut PaintCx::new(&mut backend),
+                None,
+                &host,
+            );
+            assert!(
+                renderer
+                    .controls
+                    .iter()
+                    .all(|control| control.area.intersection(area) == control.area)
+            );
+        }
+    }
+
+    fn test_registry() -> KeymapRegistry {
+        let mut definitions = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+        register_keymap(&mut definitions);
+        let mut registry = KeymapRegistry::default();
+        for action in definitions.keymap_actions() {
+            registry.register(action.clone()).unwrap();
+        }
+        for action in ControlAction::TEXT {
+            registry
+                .register(action.definition("question.text"))
+                .unwrap();
+        }
+        registry
     }
 
     const TEST_HOST: TestHost = TestHost;
@@ -1199,6 +1391,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut backend = Frame::new(&mut buffer);
         let mut frame = PaintCx::new(&mut backend);
+        renderer.prepare_render(&TEST_HOST);
         renderer.render(snapshot, area, &mut frame);
         buffer
     }
@@ -1212,6 +1405,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut backend = Frame::new(&mut buffer);
         let mut frame = PaintCx::new(&mut backend);
+        renderer.prepare_render(&TEST_HOST);
         renderer.render_with_theme(snapshot, area, &mut frame, Some(theme));
         buffer
     }
@@ -1460,7 +1654,7 @@ mod tests {
         let text = rendered_text(&buffer);
 
         assert!(text.contains("[ Submit ]"));
-        assert!(text.contains("Tab/Shift-Tab or arrows"));
+        assert!(text.contains("tab"));
         let selected_row = (0..buffer.area().height)
             .find(|row| {
                 buffer

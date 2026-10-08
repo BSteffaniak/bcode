@@ -60,6 +60,11 @@ pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExte
         "bcode.ocr",
         bcode_ocr_plugin::ocr_tui_registry,
     ));
+    #[cfg(feature = "static-bundled-read-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.read",
+        bcode_read_plugin::tui_registry,
+    ));
     #[cfg(feature = "static-bundled-question-plugin")]
     extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
         "bcode.question",
@@ -128,6 +133,8 @@ pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiR
         "bcode.model" => Some(bcode_model_plugin::model_tui_registry()),
         #[cfg(feature = "static-bundled-ocr-plugin")]
         "bcode.ocr" => Some(bcode_ocr_plugin::ocr_tui_registry()),
+        #[cfg(feature = "static-bundled-read-plugin")]
+        "bcode.read" => Some(bcode_read_plugin::tui_registry()),
         #[cfg(feature = "static-bundled-question-plugin")]
         "bcode.question" => Some(bcode_question_plugin::question_tui_registry()),
         #[cfg(feature = "static-bundled-session-derivation-plugin")]

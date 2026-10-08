@@ -31,6 +31,7 @@ pub enum OnboardingMessage {
 
 /// Serialized onboarding state owned by the BMUX runtime.
 pub struct OnboardingProgram {
+    keymap: super::keymap::BmuxKeyMap,
     store: bcode_settings::SettingsStore,
     shell: onboarding::OnboardingShell,
     health: bcode_settings::SettingsDbHealth,
@@ -55,7 +56,10 @@ impl OnboardingProgram {
     ) -> Result<Self, TuiError> {
         let health = store.health();
         let readiness = store.readiness_report()?;
+        let config = bcode_config::load_config()
+            .map_err(|error| TuiError::Io(std::io::Error::other(error.to_string())))?;
         Ok(Self {
+            keymap: super::keymap::BmuxKeyMap::from_config(&config.tui),
             store,
             shell,
             health,
@@ -167,51 +171,93 @@ impl OnboardingProgram {
         }
         self.model_discovery_requested = true;
         self.shell.set_status_message(
-            "Discovering models for the context's account… Any key cancels.".to_owned(),
+            "Discovering models for the context's account… Cancel stops discovery.".to_owned(),
         );
         true
     }
 
+    fn update_form(&mut self, terminal_event: Option<&Event>) -> Option<Update<OnboardingMessage>> {
+        if let Some(terminal_event) = terminal_event
+            && !matches!(terminal_event, Event::Resize(_))
+            && let Some(form) = &mut self.connection_form
+        {
+            if form.handle_event_with_keymap(terminal_event, &self.keymap) {
+                self.connection_form = None;
+            }
+            return Some(Update {
+                invalidation: Invalidation::Redraw,
+                ..Update::none()
+            });
+        }
+        if let Some(terminal_event) = terminal_event
+            && !matches!(terminal_event, Event::Resize(_))
+            && let Some(form) = &mut self.settings_form
+        {
+            if matches!(
+                form.handle_event_with_keymap(terminal_event, &self.keymap),
+                super::setup_settings_form::SettingsFormOutcome::Close
+            ) {
+                self.settings_form = None;
+            }
+            return Some(Update {
+                invalidation: Invalidation::Redraw,
+                ..Update::none()
+            });
+        }
+        None
+    }
+
+    fn selected_section_key(&mut self, code: KeyCode) -> Option<KeyCode> {
+        Some(
+            if code == KeyCode::Enter && !self.shell.has_pending_confirmation() {
+                use bcode_settings::SetupSectionId;
+                match self.shell.focused_section() {
+                    SetupSectionId::Providers => KeyCode::Char('p'),
+                    SetupSectionId::SecureVault => KeyCode::Char('a'),
+                    SetupSectionId::Models => KeyCode::Char('m'),
+                    SetupSectionId::Launch => KeyCode::Char('l'),
+                    SetupSectionId::Welcome => KeyCode::Down,
+                    SetupSectionId::Detection
+                    | SetupSectionId::Permissions
+                    | SetupSectionId::Imports
+                    | SetupSectionId::Plugins => {
+                        let message = match self.shell.focused_section() {
+                            SetupSectionId::Detection => {
+                                "Use Review authentication for credential imports or Connect provider for a provider."
+                            }
+                            SetupSectionId::Permissions => {
+                                "Permission editing is not implemented in this setup screen yet. Your existing policy is unchanged."
+                            }
+                            SetupSectionId::Imports => {
+                                "Session import is not implemented in this setup screen yet. It is optional; use Skip setup to continue."
+                            }
+                            _ => {
+                                "Plugin editing is available in Review plugins: choose plugins/enabled or plugins/disabled."
+                            }
+                        };
+                        self.shell.set_status_message(message.to_owned());
+                        return None;
+                    }
+                }
+            } else {
+                code
+            },
+        )
+    }
+
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
         if self.launch_pending {
+            if code != KeyCode::Escape {
+                return Ok(Lifecycle::Continue);
+            }
             self.launch_pending = false;
             self.launch_generation = self.launch_generation.wrapping_add(1);
         }
         if self.start_model_discovery(code) {
             return Ok(Lifecycle::Continue);
         }
-        let code = if code == KeyCode::Enter && !self.shell.has_pending_confirmation() {
-            use bcode_settings::SetupSectionId;
-            match self.shell.focused_section() {
-                SetupSectionId::Providers => KeyCode::Char('p'),
-                SetupSectionId::SecureVault => KeyCode::Char('a'),
-                SetupSectionId::Models => KeyCode::Char('m'),
-                SetupSectionId::Launch => KeyCode::Char('l'),
-                SetupSectionId::Welcome => KeyCode::Down,
-                SetupSectionId::Detection
-                | SetupSectionId::Permissions
-                | SetupSectionId::Imports
-                | SetupSectionId::Plugins => {
-                    let message = match self.shell.focused_section() {
-                        SetupSectionId::Detection => {
-                            "Press a to review a credential import, or p to connect a provider."
-                        }
-                        SetupSectionId::Permissions => {
-                            "Permission editing is not implemented in this setup screen yet. Your existing policy is unchanged."
-                        }
-                        SetupSectionId::Imports => {
-                            "Session import is not implemented in this setup screen yet. It is optional; press s to skip."
-                        }
-                        _ => {
-                            "Plugin editing is available in Settings: press g and choose plugins/enabled or plugins/disabled."
-                        }
-                    };
-                    self.shell.set_status_message(message.to_owned());
-                    return Ok(Lifecycle::Continue);
-                }
-            }
-        } else {
-            code
+        let Some(code) = self.selected_section_key(code) else {
+            return Ok(Lifecycle::Continue);
         };
         match code {
             KeyCode::Char('A' | 'N' | 'o' | 'r' | 'g' | 'x')
@@ -316,7 +362,7 @@ impl OnboardingProgram {
         self.launch_pending = true;
         self.launch_generation = self.launch_generation.wrapping_add(1);
         self.shell.set_status_message(
-            "Validating provider configuration… Any key cancels this launch attempt.".to_owned(),
+            "Validating provider configuration… Cancel stops this launch attempt.".to_owned(),
         );
         Lifecycle::Continue
     }
@@ -475,32 +521,13 @@ impl Program for OnboardingProgram {
             });
         }
         let had_connection = self.connection_form.is_some();
-        if let RuntimeEvent::Terminal(ref terminal_event) = event
-            && !matches!(terminal_event, Event::Resize(_))
-            && let Some(form) = &mut self.connection_form
-        {
-            if form.handle_event(terminal_event) {
-                self.connection_form = None;
-            }
-            return Ok(Update {
-                invalidation: Invalidation::Redraw,
-                ..Update::none()
-            });
-        }
-        if let RuntimeEvent::Terminal(ref terminal_event) = event
-            && !matches!(terminal_event, Event::Resize(_))
-            && let Some(form) = &mut self.settings_form
-        {
-            if matches!(
-                form.handle_event(terminal_event),
-                super::setup_settings_form::SettingsFormOutcome::Close
-            ) {
-                self.settings_form = None;
-            }
-            return Ok(Update {
-                invalidation: Invalidation::Redraw,
-                ..Update::none()
-            });
+        let terminal_event = if let RuntimeEvent::Terminal(ref event) = event {
+            Some(event)
+        } else {
+            None
+        };
+        if let Some(update) = self.update_form(terminal_event) {
+            return Ok(update);
         }
         let mut lifecycle = Lifecycle::Continue;
         let invalidation = match event {
@@ -509,7 +536,17 @@ impl Program for OnboardingProgram {
                 Invalidation::Redraw
             }
             RuntimeEvent::Terminal(Event::Key(key)) => {
-                lifecycle = self.handle_key(key.key)?;
+                let code = match self.keymap.action("onboarding", key) {
+                    Some("tui.control.submit") => Some(KeyCode::Enter),
+                    Some("tui.control.cancel") => Some(KeyCode::Escape),
+                    Some("tui.control.down" | "tui.control.right") => Some(KeyCode::Down),
+                    Some("tui.control.up" | "tui.control.left") => Some(KeyCode::Up),
+                    Some(id) => onboarding_native_action(id),
+                    None => None,
+                };
+                if let Some(code) = code {
+                    lifecycle = self.handle_key(code)?;
+                }
                 Invalidation::Redraw
             }
             RuntimeEvent::Terminal(Event::Mouse(mouse)) => {
@@ -546,6 +583,29 @@ impl Program for OnboardingProgram {
             ..Update::none()
         })
     }
+}
+
+fn onboarding_native_action(id: &str) -> Option<KeyCode> {
+    let character = match id {
+        "tui.onboarding.provider" => 'p',
+        "tui.onboarding.auth" => 'a',
+        "tui.onboarding.model" => 'm',
+        "tui.onboarding.permissions" => 'r',
+        "tui.onboarding.import" => 'i',
+        "tui.onboarding.plugins" => 'g',
+        "tui.onboarding.apply" => 'x',
+        "tui.onboarding.confirm" => 'y',
+        "tui.onboarding.reject" => 'n',
+        "tui.onboarding.complete" => 'c',
+        "tui.onboarding.skip" => 's',
+        "tui.onboarding.launch" => 'l',
+        "tui.onboarding.accounts" => 'A',
+        "tui.onboarding.newContext" => 'N',
+        "tui.onboarding.contexts" => 'o',
+        "tui.onboarding.discover" => 'M',
+        _ => return None,
+    };
+    Some(KeyCode::Char(character))
 }
 
 const fn onboarding_action_for_key(code: KeyCode) -> Option<onboarding::OnboardingInputAction> {
@@ -594,19 +654,20 @@ impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
     fn present(&mut self, program: &mut OnboardingProgram) -> Result<PresentReport, Self::Error> {
         let stats = self.terminal.draw_damage(Damage::Full, |frame| {
             if let Some(form) = &mut program.connection_form {
-                form.render(frame, &program.theme);
+                form.render_with_keymap(frame, &program.theme, &program.keymap);
                 return;
             }
             if let Some(form) = &mut program.settings_form {
-                form.render(frame, &program.theme);
+                form.render_with_keymap(frame, &program.theme, &program.keymap);
                 return;
             }
-            onboarding_render::render_onboarding(
+            onboarding_render::render_onboarding_with_keymap(
                 &program.shell,
                 frame,
                 &program.health,
                 program.readiness.clone(),
                 &program.theme,
+                &program.keymap,
             );
         })?;
         Ok(PresentReport {

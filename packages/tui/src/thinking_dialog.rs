@@ -1,7 +1,7 @@
 //! TUI reasoning output settings modal state.
 
 use bcode_model::SessionModelStatus;
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 
 /// Outcome from one reasoning-settings dialog keyboard update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,22 +206,35 @@ impl ThinkingDialogState {
     }
 
     /// Handle one keyboard input through the dialog's interaction policy.
+    #[cfg(test)]
     pub fn handle_key(&mut self, stroke: KeyStroke) -> ThinkingDialogOutcome {
-        match stroke.key {
-            KeyCode::Up => {
+        self.handle_key_with_keymap(
+            stroke,
+            &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        )
+    }
+
+    /// Handle input through the effective frontend registry.
+    pub fn handle_key_with_keymap(
+        &mut self,
+        stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> ThinkingDialogOutcome {
+        match keymap.action("thinking_dialog", stroke) {
+            Some("tui.control.up") => {
                 self.focus_previous();
                 ThinkingDialogOutcome::Handled
             }
-            KeyCode::Down => {
+            Some("tui.control.down") => {
                 self.focus_next();
                 ThinkingDialogOutcome::Handled
             }
-            KeyCode::Char(' ') => {
+            Some("tui.control.toggle") => {
                 self.cycle_focused();
                 ThinkingDialogOutcome::Handled
             }
-            KeyCode::Enter => ThinkingDialogOutcome::Apply,
-            KeyCode::Escape => ThinkingDialogOutcome::Cancel,
+            Some("tui.control.submit") => ThinkingDialogOutcome::Apply,
+            Some("tui.control.cancel") => ThinkingDialogOutcome::Cancel,
             _ => ThinkingDialogOutcome::Ignored,
         }
     }

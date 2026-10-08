@@ -1,5 +1,7 @@
 //! Workflow graph/status TUI surface.
 
+use crate::keybindings::{self, Hints};
+
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest,
     PluginSessionViewUpdate, PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
@@ -49,6 +51,9 @@ pub const WORKFLOW_AUTHOR_SURFACE_KIND: &str = "workflow.author";
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
+    for action in keybindings::declarations() {
+        registry.register_keymap_action(action);
+    }
     registry.register_factory(Box::new(WorkflowStatusFactory));
     registry.register_factory(Box::new(WorkflowAuthorFactory));
     registry
@@ -141,10 +146,10 @@ fn author_lines(options: &serde_json::Value) -> Vec<String> {
         .is_some_and(Vec::is_empty)
         && options.get("configuration").is_some()
     {
-        lines.push("s start exact template · Esc/q close".to_string());
+        lines.push("Start exact template or close preview".to_string());
     } else {
         lines.push("Resolve diagnostics and provide valid configuration before start".to_string());
-        lines.push("Esc/q close".to_string());
+        lines.push("Close workflow view".to_string());
     }
     lines
 }
@@ -188,6 +193,7 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
     fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
         Box::pin(async move {
             Ok(Box::new(WorkflowStatusSurface {
+                keymap_hints: Hints::default(),
                 options: request.options,
                 selected_approval: 0,
                 text_view: std::cell::Cell::new(
@@ -629,6 +635,7 @@ fn default_input_value(schema: Option<&serde_json::Value>) -> serde_json::Value 
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct WorkflowStatusSurface {
+    keymap_hints: Hints,
     options: serde_json::Value,
     selected_approval: usize,
     text_view: std::cell::Cell<bmux_tui_components::scroll_view::ScrollViewState>,
@@ -800,23 +807,21 @@ const fn workflow_run_status_is_terminal(
     )
 }
 
-const fn workflow_action_shortcut(
-    kind: bcode_workflow_view_models::WorkflowActionKind,
-) -> &'static str {
+const fn workflow_action_id(kind: bcode_workflow_view_models::WorkflowActionKind) -> &'static str {
     match kind {
         bcode_workflow_view_models::WorkflowActionKind::Pause
-        | bcode_workflow_view_models::WorkflowActionKind::Resume => "p",
-        bcode_workflow_view_models::WorkflowActionKind::Cancel => "c",
-        bcode_workflow_view_models::WorkflowActionKind::ProvideInput => "i",
+        | bcode_workflow_view_models::WorkflowActionKind::Resume => "workflow.pause",
+        bcode_workflow_view_models::WorkflowActionKind::Cancel => "workflow.cancel",
+        bcode_workflow_view_models::WorkflowActionKind::ProvideInput => "workflow.input",
         bcode_workflow_view_models::WorkflowActionKind::Approve
-        | bcode_workflow_view_models::WorkflowActionKind::ApproveMutation => "a",
+        | bcode_workflow_view_models::WorkflowActionKind::ApproveMutation => "workflow.approve",
         bcode_workflow_view_models::WorkflowActionKind::Deny
-        | bcode_workflow_view_models::WorkflowActionKind::DenyMutation => "d",
-        bcode_workflow_view_models::WorkflowActionKind::RetryNode => "r",
-        bcode_workflow_view_models::WorkflowActionKind::OpenSession => "o",
-        bcode_workflow_view_models::WorkflowActionKind::ViewDefinition => "V",
-        bcode_workflow_view_models::WorkflowActionKind::EditDraft => "E",
-        bcode_workflow_view_models::WorkflowActionKind::ForkDefinition => "F",
+        | bcode_workflow_view_models::WorkflowActionKind::DenyMutation => "workflow.deny",
+        bcode_workflow_view_models::WorkflowActionKind::RetryNode => "workflow.retry",
+        bcode_workflow_view_models::WorkflowActionKind::OpenSession => "workflow.session",
+        bcode_workflow_view_models::WorkflowActionKind::ViewDefinition => "workflow.view",
+        bcode_workflow_view_models::WorkflowActionKind::EditDraft => "workflow.edit",
+        bcode_workflow_view_models::WorkflowActionKind::ForkDefinition => "workflow.fork",
     }
 }
 
@@ -1228,7 +1233,20 @@ impl WorkflowStatusSurface {
                 &Line::from_spans(vec![
                     Span::styled("Search › ", theme.focused),
                     Span::styled(search, theme.text),
-                    Span::styled("  Enter apply · Esc cancel", theme.muted),
+                    Span::styled(
+                        format!(
+                            "  {} apply · {} cancel",
+                            self.keymap_hints.control(
+                                keybindings::SEARCH,
+                                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Submit
+                            ),
+                            self.keymap_hints.control(
+                                keybindings::SEARCH,
+                                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Cancel
+                            )
+                        ),
+                        theme.muted,
+                    ),
                 ]),
             );
         }
@@ -1596,52 +1614,41 @@ impl WorkflowStatusSurface {
                 &Line::from_spans(vec![
                     Span::styled("Search › ", theme.focused),
                     Span::styled(search, theme.text),
-                    Span::styled("  Enter apply · Esc cancel", theme.muted),
+                    Span::styled(
+                        format!(
+                            "  {} apply · {} cancel",
+                            self.keymap_hints.control(
+                                keybindings::SEARCH,
+                                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Submit
+                            ),
+                            self.keymap_hints.control(
+                                keybindings::SEARCH,
+                                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Cancel
+                            )
+                        ),
+                        theme.muted,
+                    ),
                 ]),
             );
             return;
         }
-        let mut hints = vec![
-            KeyHint::new("↑/↓", "focused pane"),
-            KeyHint::new("←/→", "tabs/selection"),
-            KeyHint::new("Tab", "focus/page"),
-            KeyHint::new("1-4", "page"),
-            KeyHint::new("[/]", "section"),
-            KeyHint::new("/", "search"),
-            KeyHint::new("f/s/g", "filter/sort/group"),
-            KeyHint::new("N", "next scheduling page"),
-            KeyHint::new("m", "more"),
-        ];
-        if footer.width >= 120 {
-            hints.push(KeyHint::new("D/T/N", "definitions/templates/new"));
-        }
-        if self.workspace_focus == WorkflowWorkspaceFocus::Inspector
-            && (1..=5).contains(&self.active_detail_tab)
-        {
-            hints.insert(2, KeyHint::new("↑/↓", "select exact item"));
-        }
-        if self
-            .selected_definition_action(
-                bcode_workflow_view_models::WorkflowActionKind::ViewDefinition,
-            )
-            .is_some()
-        {
-            hints.insert(0, KeyHint::new("V", "view definition"));
-        }
-        if self
-            .selected_definition_action(bcode_workflow_view_models::WorkflowActionKind::EditDraft)
-            .is_some()
-        {
-            hints.insert(0, KeyHint::new("E", "edit draft"));
-        }
-        if self
-            .selected_definition_action(
-                bcode_workflow_view_models::WorkflowActionKind::ForkDefinition,
-            )
-            .is_some()
-        {
-            hints.insert(0, KeyHint::new("F", "fork definition"));
-        }
+        let scope = if self.workspace_mode == WorkflowWorkspaceMode::Discover {
+            keybindings::DISCOVER
+        } else {
+            keybindings::RUNS
+        };
+        let hint_labels = keybindings::declarations()
+            .into_iter()
+            .filter(|action| action.scope == scope)
+            .filter_map(|action| {
+                let keys = self.keymap_hints.keys(scope, &action.id);
+                (!keys.is_empty()).then_some((keys, action.description))
+            })
+            .collect::<Vec<_>>();
+        let hints = hint_labels
+            .iter()
+            .map(|(keys, label)| KeyHint::new(keys, label))
+            .collect::<Vec<_>>();
         let component =
             KeyHintBarComponent::new("workflow.keyhintbar", &hints).styles(KeyHintBarStyles {
                 key: theme.focused,
@@ -2120,7 +2127,8 @@ impl WorkflowStatusSurface {
             .map(|action| {
                 let label = format!(
                     "{} {:?}",
-                    workflow_action_shortcut(action.kind),
+                    self.keymap_hints
+                        .keys(keybindings::RUNS, workflow_action_id(action.kind)),
                     action.kind
                 );
                 ActionButton::new(format!("{:?}", action.kind), label)
@@ -2600,7 +2608,8 @@ impl WorkflowStatusSurface {
                             format!("{:?}", action.kind),
                             format!(
                                 "{} {:?}",
-                                workflow_action_shortcut(action.kind),
+                                self.keymap_hints
+                                    .keys(keybindings::RUNS, workflow_action_id(action.kind)),
                                 action.kind
                             ),
                         )
@@ -3991,6 +4000,7 @@ impl WorkflowStatusSurface {
     }
 
     fn render_confirmation(
+        &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
@@ -4024,9 +4034,21 @@ impl WorkflowStatusSurface {
                     1,
                 )),
                 &Line::from_spans(vec![
-                    Span::styled("y/Enter", theme.focused),
+                    Span::styled(
+                        self.keymap_hints.control(
+                            keybindings::CONFIRM,
+                            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Submit,
+                        ),
+                        theme.focused,
+                    ),
                     Span::styled(" confirm  ", theme.text),
-                    Span::styled("n/Esc", theme.focused),
+                    Span::styled(
+                        self.keymap_hints.control(
+                            keybindings::CONFIRM,
+                            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Cancel,
+                        ),
+                        theme.focused,
+                    ),
                     Span::styled(" cancel", theme.text),
                 ]),
             );
@@ -4035,6 +4057,7 @@ impl WorkflowStatusSurface {
 
     #[allow(clippy::too_many_lines)]
     fn render_launch_form(
+        &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
@@ -4155,11 +4178,29 @@ impl WorkflowStatusSurface {
                 1,
             )),
             &Line::from_spans(vec![
-                Span::styled("Tab", theme.focused),
+                Span::styled(
+                    self.keymap_hints.control(
+                        keybindings::FORM,
+                        bcode_plugin_sdk::tui::keymap::controls::ControlAction::FocusNext,
+                    ),
+                    theme.focused,
+                ),
                 Span::styled(" switch  ", theme.text),
-                Span::styled("Ctrl+Enter", theme.focused),
+                Span::styled(
+                    self.keymap_hints.control(
+                        keybindings::FORM,
+                        bcode_plugin_sdk::tui::keymap::controls::ControlAction::Submit,
+                    ),
+                    theme.focused,
+                ),
                 Span::styled(" validate & start  ", theme.text),
-                Span::styled("Esc", theme.focused),
+                Span::styled(
+                    self.keymap_hints.control(
+                        keybindings::FORM,
+                        bcode_plugin_sdk::tui::keymap::controls::ControlAction::Cancel,
+                    ),
+                    theme.focused,
+                ),
                 Span::styled(" cancel", theme.text),
             ]),
         );
@@ -4167,6 +4208,7 @@ impl WorkflowStatusSurface {
 
     #[allow(clippy::too_many_lines)]
     fn render_input_form(
+        &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
@@ -4326,9 +4368,21 @@ impl WorkflowStatusSurface {
                 1,
             )),
             &Line::from_spans(vec![
-                Span::styled("Ctrl+Enter", theme.focused),
+                Span::styled(
+                    self.keymap_hints.control(
+                        keybindings::FORM,
+                        bcode_plugin_sdk::tui::keymap::controls::ControlAction::Submit,
+                    ),
+                    theme.focused,
+                ),
                 Span::styled(" submit  ", theme.text),
-                Span::styled("Esc", theme.focused),
+                Span::styled(
+                    self.keymap_hints.control(
+                        keybindings::FORM,
+                        bcode_plugin_sdk::tui::keymap::controls::ControlAction::Cancel,
+                    ),
+                    theme.focused,
+                ),
                 Span::styled(" cancel", theme.text),
             ]),
         );
@@ -4400,15 +4454,15 @@ impl WorkflowStatusSurface {
         self.action_row_state.interaction.focused =
             self.workspace_focus == WorkflowWorkspaceFocus::Actions;
         if let Some(form) = &self.launch_form {
-            Self::render_launch_form(content, frame, theme, form);
+            self.render_launch_form(content, frame, theme, form);
             return;
         }
         if let Some(confirmation) = &self.pending_confirmation {
-            Self::render_confirmation(content, frame, theme, confirmation);
+            self.render_confirmation(content, frame, theme, confirmation);
             return;
         }
         if let Some(form) = &self.input_form {
-            Self::render_input_form(content, frame, theme, form);
+            self.render_input_form(content, frame, theme, form);
             return;
         }
         if self.subscription_requested || self.catalog.is_some() {
@@ -4509,6 +4563,10 @@ impl WorkflowStatusSurface {
 }
 
 impl PluginTuiSurface for WorkflowStatusSurface {
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        self.keymap_hints.refresh(host);
+    }
+
     fn id(&self) -> &'static str {
         "bcode.workflow-status"
     }
@@ -4975,6 +5033,23 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let scope = if self.pending_confirmation.is_some() {
+            keybindings::CONFIRM
+        } else if self.input_form.is_some() || self.launch_form.is_some() {
+            keybindings::FORM
+        } else if self.catalog_search_buffer.is_some() || self.launch_search_buffer.is_some() {
+            keybindings::SEARCH
+        } else if self.workspace_mode == WorkflowWorkspaceMode::Discover
+            && (self.subscription_requested || self.catalog.is_some())
+        {
+            keybindings::DISCOVER
+        } else {
+            keybindings::RUNS
+        };
+        let Some(event) = keybindings::routed_event(host, scope, event) else {
+            return PluginTuiAction::None;
+        };
+        let event = &event;
         if self.subscription_requested || self.catalog.is_some() {
             return self.handle_control_center_event_with_host(event, Some(host));
         }
@@ -6970,10 +7045,10 @@ fn workflow_view_lines(
     lines.push(String::new());
     if let Some(input) = input_buffer {
         lines.push(format!("Input JSON › {input}"));
-        lines.push("Enter submit · Esc cancel".to_string());
+        lines.push("Submit or cancel input".to_string());
     } else {
         lines.push(
-            "←/→ run · ↑/↓ node · m more · p pause/resume · c cancel · r retry · a/d approval · i input · o session"
+            "Navigate runs and nodes · load more · manage run · review approvals · provide input · open session"
                 .to_string(),
         );
     }
@@ -7266,7 +7341,7 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
     lines.extend([
         String::new(),
         "Graph/history data is bounded and daemon-backed".to_string(),
-        "Esc/q close".to_string(),
+        "Close workflow view".to_string(),
     ]);
     lines
 }
@@ -7451,9 +7526,7 @@ fn append_mutation_approvals(
                 ));
             }
             if !approvals.is_empty() {
-                lines.push(
-                    "  ↑/↓ select · a approve exact request · d deny exact request".to_string(),
-                );
+                lines.push("  Select and approve or deny the exact request".to_string());
             }
         }
         None => lines.push("Mutation approvals unavailable".to_string()),
@@ -7941,6 +8014,7 @@ mod tests {
             health: bcode_workflow_view_models::WorkflowProjectionHealth::Current,
         };
         WorkflowStatusSurface {
+            keymap_hints: Hints::default(),
             options: serde_json::Value::Null,
             selected_approval: 0,
             text_view: std::cell::Cell::new(
@@ -8033,28 +8107,37 @@ mod tests {
     #[test]
     fn every_visible_action_has_a_documented_exact_target_shortcut() {
         use bcode_workflow_view_models::WorkflowActionKind as Kind;
-        for (kind, shortcut) in [
-            (Kind::Pause, "p"),
-            (Kind::Resume, "p"),
-            (Kind::Cancel, "c"),
-            (Kind::ProvideInput, "i"),
-            (Kind::Approve, "a"),
-            (Kind::Deny, "d"),
-            (Kind::ApproveMutation, "a"),
-            (Kind::DenyMutation, "d"),
-            (Kind::RetryNode, "r"),
-            (Kind::OpenSession, "o"),
-            (Kind::ViewDefinition, "V"),
-            (Kind::EditDraft, "E"),
-            (Kind::ForkDefinition, "F"),
+        let registry = bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+            keybindings::declarations(),
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        for kind in [
+            Kind::Pause,
+            Kind::Resume,
+            Kind::Cancel,
+            Kind::ProvideInput,
+            Kind::Approve,
+            Kind::Deny,
+            Kind::ApproveMutation,
+            Kind::DenyMutation,
+            Kind::RetryNode,
+            Kind::OpenSession,
+            Kind::ViewDefinition,
+            Kind::EditDraft,
+            Kind::ForkDefinition,
         ] {
-            assert_eq!(workflow_action_shortcut(kind), shortcut);
+            assert!(
+                !registry
+                    .keys_for_action(keybindings::RUNS, workflow_action_id(kind))
+                    .is_empty()
+            );
         }
 
         let mut surface = projected_surface();
         surface.narrow_page = WorkflowNarrowPage::Actions;
         let rendered = render_workspace_text(&mut surface, 62, 24);
-        for expected in ["p Pause", "c Cancel", "a Approve", "r RetryNode"] {
+        for expected in ["Pause", "Cancel", "Approve", "RetryNode"] {
             assert!(
                 rendered.contains(expected),
                 "missing visible action {expected}"
@@ -10651,6 +10734,27 @@ mod tests {
     struct TestHost;
 
     impl PluginTuiHost for TestHost {
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                keybindings::declarations(),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+            .action_for_key(scope, stroke)
+            .map(str::to_string)
+        }
+
+        fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+            bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                keybindings::declarations(),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+            .keys_for_action(scope, action)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        }
         fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
 
         fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}

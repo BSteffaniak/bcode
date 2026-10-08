@@ -2,10 +2,1655 @@ id      = "bcode.code_review"
 name    = "Bcode Code Review Plugin"
 version = "0.0.1"
 
+
+keymap_actions = [
+    { id = "bcode.code_review.search", scope = "code-review-home", description = "Search", defaults = [
+        "/",
+    ] },
+    { id = "bcode.code_review.rename", scope = "code-review-home", description = "Rename", defaults = [
+        "r",
+    ] },
+    { id = "bcode.code_review.down", scope = "code-review-home", description = "Next review", defaults = [
+        "j",
+        "down",
+    ] },
+    { id = "bcode.code_review.up", scope = "code-review-home", description = "Previous review", defaults = [
+        "k",
+        "up",
+    ] },
+    { id = "bcode.code_review.details", scope = "code-review-home", description = "Toggle details", defaults = [
+        "d",
+    ] },
+    { id = "bcode.code_review.draft_filter", scope = "code-review-home", description = "Draft filter", defaults = [
+        "shift+d",
+    ] },
+    { id = "bcode.code_review.attention_filter", scope = "code-review-home", description = "Attention filter", defaults = [
+        "shift+a",
+    ] },
+    { id = "bcode.code_review.help", scope = "code-review-home", description = "Help", defaults = [
+        "?",
+    ] },
+    { id = "bcode.code_review.open", scope = "code-review-home", description = "Open review", defaults = [
+        "enter",
+    ] },
+    { id = "bcode.code_review.recent", scope = "code-review-home", description = "Open recent", defaults = [
+        "c",
+    ] },
+    { id = "bcode.code_review.review", scope = "code-review-home", description = "Review mode", defaults = [
+        "o",
+    ] },
+    { id = "bcode.code_review.build", scope = "code-review-home", description = "Build mode", defaults = [
+        "b",
+    ] },
+    { id = "bcode.code_review.archive", scope = "code-review-home", description = "Archive", defaults = [
+        "x",
+    ] },
+    { id = "bcode.code_review.new", scope = "code-review-home", description = "New review", defaults = [
+        "n",
+        "e",
+    ] },
+    { id = "bcode.code_review.unstaged", scope = "code-review-home", description = "Unstaged review", defaults = [
+        "u",
+    ] },
+    { id = "bcode.code_review.staged", scope = "code-review-home", description = "Staged review", defaults = [
+        "s",
+    ] },
+    { id = "bcode.code_review.working", scope = "code-review-home", description = "Working tree review", defaults = [
+        "w",
+    ] },
+    { id = "bcode.code_review.last_commit", scope = "code-review-home", description = "Last commit review", defaults = [
+        "l",
+    ] },
+    { id = "bcode.code_review.repository", scope = "code-review-home", description = "Repository review", defaults = [
+        "v",
+    ] },
+    { id = "bcode.code_review.setup_next", scope = "code-review-home", description = "Next setup review", defaults = [
+        "shift+s",
+    ] },
+    { id = "bcode.code_review.setup_previous", scope = "code-review-home", description = "Previous setup review", defaults = [
+        "shift+u",
+    ] },
+    { id = "bcode.code_review.draft_next", scope = "code-review-home", description = "Next draft review", defaults = [
+        "shift+f",
+    ] },
+    { id = "bcode.code_review.draft_previous", scope = "code-review-home", description = "Previous draft review", defaults = [
+        "shift+b",
+    ] },
+    { id = "bcode.code_review.published_next", scope = "code-review-home", description = "Next published review", defaults = [
+        "p",
+    ] },
+    { id = "bcode.code_review.published_previous", scope = "code-review-home", description = "Previous published review", defaults = [
+        "shift+p",
+    ] },
+    { id = "bcode.code_review.attention_next", scope = "code-review-home", description = "Next attention review", defaults = [
+        "shift+m",
+    ] },
+    { id = "bcode.code_review.attention_previous", scope = "code-review-home", description = "Previous attention review", defaults = [
+        "shift+n",
+    ] },
+    { id = "bcode.code_review.archived", scope = "code-review-home", description = "Toggle archived", defaults = [
+        "a",
+    ] },
+    { id = "bcode.code_review.first", scope = "code-review-home", description = "First review", defaults = [
+        "g",
+    ] },
+    { id = "bcode.code_review.last", scope = "code-review-home", description = "Last review", defaults = [
+        "shift+g",
+    ] },
+    { id = "bcode.code_review.restore", scope = "code-review-home", description = "Restore", defaults = [
+        "shift+r",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-home", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.left", scope = "code-review-home", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "code-review-home", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "code-review-home", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-home", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-home", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-home", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-home", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-home", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-home", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-home", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-home", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-home", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-home", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-home", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-home", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-home", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-home", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-home", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-home", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-home", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-home", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-home", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-home", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-home", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-home", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-home", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.sidebar", scope = "code-review", description = "Toggle sidebar", defaults = [
+        "b",
+    ] },
+    { id = "bcode.code_review.build_mode", scope = "code-review", description = "Build mode", defaults = [
+        "shift+b",
+    ] },
+    { id = "bcode.code_review.mode", scope = "code-review", description = "Toggle review/build", defaults = [
+        "m",
+    ] },
+    { id = "bcode.code_review.sidebar_mode", scope = "code-review", description = "Cycle sidebar", defaults = [
+        "t",
+    ] },
+    { id = "bcode.code_review.file_picker", scope = "code-review", description = "File picker", defaults = [
+        "f",
+        "ctrl+p",
+    ] },
+    { id = "bcode.code_review.add_file", scope = "code-review", description = "Add file", defaults = [
+        "+",
+    ] },
+    { id = "bcode.code_review.add_source", scope = "code-review", description = "Add source", defaults = [
+        "shift+a",
+    ] },
+    { id = "bcode.code_review.down", scope = "code-review", description = "Move down", defaults = [
+        "j",
+        "down",
+    ] },
+    { id = "bcode.code_review.up", scope = "code-review", description = "Move up", defaults = [
+        "k",
+        "up",
+    ] },
+    { id = "bcode.code_review.first", scope = "code-review", description = "First row", defaults = [
+        "g",
+    ] },
+    { id = "bcode.code_review.last", scope = "code-review", description = "Last row", defaults = [
+        "shift+g",
+    ] },
+    { id = "bcode.code_review.help", scope = "code-review", description = "Help", defaults = [
+        "?",
+    ] },
+    { id = "bcode.code_review.attention_next", scope = "code-review", description = "Next attention item", defaults = [
+        "shift+m",
+    ] },
+    { id = "bcode.code_review.jump", scope = "code-review", description = "Jump to line", defaults = [
+        ":",
+    ] },
+    { id = "bcode.code_review.search", scope = "code-review", description = "Search file", defaults = [
+        "/",
+    ] },
+    { id = "bcode.code_review.search_previous", scope = "code-review", description = "Previous search match", defaults = [
+        "shift+n",
+    ] },
+    { id = "bcode.code_review.next_file", scope = "code-review", description = "Next file or search match", defaults = [
+        "n",
+    ] },
+    { id = "bcode.code_review.previous_file", scope = "code-review", description = "Previous file", defaults = [
+        "p",
+    ] },
+    { id = "bcode.code_review.draft_next", scope = "code-review", description = "Next inline draft", defaults = [
+        "}",
+    ] },
+    { id = "bcode.code_review.hunk_next", scope = "code-review", description = "Next hunk", defaults = [
+        "shift+j",
+    ] },
+    { id = "bcode.code_review.hunk_previous", scope = "code-review", description = "Previous hunk", defaults = [
+        "shift+k",
+    ] },
+    { id = "bcode.code_review.file_comment", scope = "code-review", description = "File comment", defaults = [
+        "shift+f",
+    ] },
+    { id = "bcode.code_review.delete_answer", scope = "code-review", description = "Delete AI exchange", defaults = [
+        "d",
+    ] },
+    { id = "bcode.code_review.import", scope = "code-review", description = "Import external review", defaults = [
+        "shift+x",
+    ] },
+    { id = "bcode.code_review.copy_answer", scope = "code-review", description = "Copy agent answer", defaults = [
+        "shift+y",
+    ] },
+    { id = "bcode.code_review.draft_previous", scope = "code-review", description = "Previous inline draft", defaults = [
+        "{",
+    ] },
+    { id = "bcode.code_review.thread_next", scope = "code-review", description = "Next inline thread", defaults = [
+        "]",
+    ] },
+    { id = "bcode.code_review.thread_previous", scope = "code-review", description = "Previous inline thread", defaults = [
+        "[",
+    ] },
+    { id = "bcode.code_review.attention", scope = "code-review", description = "Attention sidebar", defaults = [
+        "!",
+    ] },
+    { id = "bcode.code_review.thread_filter", scope = "code-review", description = "Thread filter", defaults = [
+        "shift+t",
+    ] },
+    { id = "bcode.code_review.unview_all", scope = "code-review", description = "Mark all unviewed", defaults = [
+        "shift+e",
+    ] },
+    { id = "bcode.code_review.view_all", scope = "code-review", description = "Mark all viewed", defaults = [
+        "shift+v",
+    ] },
+    { id = "bcode.code_review.unviewed_previous", scope = "code-review", description = "Previous unviewed file", defaults = [
+        "shift+i",
+    ] },
+    { id = "bcode.code_review.unviewed_next", scope = "code-review", description = "Next unviewed file", defaults = [
+        "shift+w",
+    ] },
+    { id = "bcode.code_review.viewed", scope = "code-review", description = "Toggle viewed", defaults = [
+        "w",
+    ] },
+    { id = "bcode.code_review.open_thread_next", scope = "code-review", description = "Next open thread", defaults = [
+        "u",
+    ] },
+    { id = "bcode.code_review.open_thread_previous", scope = "code-review", description = "Previous open thread", defaults = [
+        "i",
+    ] },
+    { id = "bcode.code_review.thread_previous_global", scope = "code-review", description = "Previous global thread", defaults = [
+        "shift+o",
+    ] },
+    { id = "bcode.code_review.thread_next_global", scope = "code-review", description = "Next global thread", defaults = [
+        "shift+p",
+    ] },
+    { id = "bcode.code_review.linked_next", scope = "code-review", description = "Next linked thread", defaults = [
+        "shift+l",
+    ] },
+    { id = "bcode.code_review.resolved_visibility", scope = "code-review", description = "Show resolved", defaults = [
+        "shift+r",
+    ] },
+    { id = "bcode.code_review.resolve", scope = "code-review", description = "Toggle resolved", defaults = [
+        "r",
+    ] },
+    { id = "bcode.code_review.hide_viewed", scope = "code-review", description = "Hide viewed", defaults = [
+        "shift+h",
+    ] },
+    { id = "bcode.code_review.expand_threads", scope = "code-review", description = "Expand threads", defaults = [
+        "shift+u",
+    ] },
+    { id = "bcode.code_review.collapse_threads", scope = "code-review", description = "Collapse threads", defaults = [
+        "shift+z",
+    ] },
+    { id = "bcode.code_review.delete", scope = "code-review", description = "Delete selected comment", defaults = [
+        "shift+d",
+    ] },
+    { id = "bcode.code_review.edit", scope = "code-review", description = "Edit selected comment", defaults = [
+        "e",
+    ] },
+    { id = "bcode.code_review.range", scope = "code-review", description = "Select line range", defaults = [
+        "v",
+    ] },
+    { id = "bcode.code_review.comment", scope = "code-review", description = "New comment", defaults = [
+        "c",
+    ] },
+    { id = "bcode.code_review.review_comment", scope = "code-review", description = "New review note", defaults = [
+        "shift+c",
+    ] },
+    { id = "bcode.code_review.publish", scope = "code-review", description = "Publish", defaults = [
+        "x",
+    ] },
+    { id = "bcode.code_review.ask", scope = "code-review", description = "Ask Bcode", defaults = [
+        "a",
+    ] },
+    { id = "bcode.code_review.suggest", scope = "code-review", description = "Suggest comment", defaults = [
+        "s",
+    ] },
+    { id = "bcode.code_review.accept", scope = "code-review", description = "Accept suggestion", defaults = [
+        ";",
+    ] },
+    { id = "bcode.code_review.retry", scope = "code-review", description = "Retry linked stream", defaults = [
+        "y",
+    ] },
+    { id = "bcode.code_review.open_linked", scope = "code-review", description = "Open linked session", defaults = [
+        "o",
+    ] },
+    { id = "bcode.code_review.explain", scope = "code-review", description = "Explain change", defaults = [
+        "1",
+    ] },
+    { id = "bcode.code_review.risk", scope = "code-review", description = "Find risk", defaults = [
+        "2",
+    ] },
+    { id = "bcode.code_review.suggest_ai", scope = "code-review", description = "Suggest comment with AI", defaults = [
+        "3",
+    ] },
+    { id = "bcode.code_review.tests", scope = "code-review", description = "Check tests", defaults = [
+        "4",
+    ] },
+    { id = "bcode.code_review.summarize", scope = "code-review", description = "Summarize file", defaults = [
+        "5",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.left", scope = "code-review", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "code-review", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "code-review", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.sidebar", scope = "code-review-build", description = "Toggle sidebar", defaults = [
+        "b",
+    ] },
+    { id = "bcode.code_review.build_mode", scope = "code-review-build", description = "Build mode", defaults = [
+        "shift+b",
+    ] },
+    { id = "bcode.code_review.mode", scope = "code-review-build", description = "Toggle review/build", defaults = [
+        "m",
+    ] },
+    { id = "bcode.code_review.sidebar_mode", scope = "code-review-build", description = "Cycle sidebar", defaults = [
+        "t",
+    ] },
+    { id = "bcode.code_review.file_picker", scope = "code-review-build", description = "File picker", defaults = [
+        "f",
+        "ctrl+p",
+    ] },
+    { id = "bcode.code_review.add_file", scope = "code-review-build", description = "Add file", defaults = [
+        "+",
+    ] },
+    { id = "bcode.code_review.add_source", scope = "code-review-build", description = "Add source", defaults = [
+        "shift+a",
+        "a",
+    ] },
+    { id = "bcode.code_review.down", scope = "code-review-build", description = "Move down", defaults = [
+        "j",
+        "down",
+    ] },
+    { id = "bcode.code_review.up", scope = "code-review-build", description = "Move up", defaults = [
+        "k",
+        "up",
+    ] },
+    { id = "bcode.code_review.first", scope = "code-review-build", description = "First row", defaults = [
+        "g",
+    ] },
+    { id = "bcode.code_review.last", scope = "code-review-build", description = "Last row", defaults = [
+        "shift+g",
+    ] },
+    { id = "bcode.code_review.help", scope = "code-review-build", description = "Help", defaults = [
+        "?",
+    ] },
+    { id = "bcode.code_review.refresh", scope = "code-review-build", description = "Rematerialize", defaults = [
+        "shift+r",
+    ] },
+    { id = "bcode.code_review.unstaged", scope = "code-review-build", description = "Add unstaged", defaults = [
+        "u",
+    ] },
+    { id = "bcode.code_review.staged", scope = "code-review-build", description = "Add staged", defaults = [
+        "s",
+    ] },
+    { id = "bcode.code_review.working", scope = "code-review-build", description = "Add working tree", defaults = [
+        "w",
+    ] },
+    { id = "bcode.code_review.last_commit", scope = "code-review-build", description = "Add last commit", defaults = [
+        "l",
+    ] },
+    { id = "bcode.code_review.include_all", scope = "code-review-build", description = "Include all", defaults = [
+        "shift+i",
+    ] },
+    { id = "bcode.code_review.exclude_all", scope = "code-review-build", description = "Exclude all", defaults = [
+        "shift+e",
+    ] },
+    { id = "bcode.code_review.invert", scope = "code-review-build", description = "Invert inclusion", defaults = [
+        "shift+v",
+    ] },
+    { id = "bcode.code_review.empty_next", scope = "code-review-build", description = "Next empty source", defaults = [
+        "n",
+    ] },
+    { id = "bcode.code_review.empty_previous", scope = "code-review-build", description = "Previous empty source", defaults = [
+        "shift+n",
+    ] },
+    { id = "bcode.code_review.exclude_empty", scope = "code-review-build", description = "Exclude empty sources", defaults = [
+        "z",
+    ] },
+    { id = "bcode.code_review.diagnostic_next", scope = "code-review-build", description = "Next diagnostic source", defaults = [
+        "d",
+    ] },
+    { id = "bcode.code_review.exclude_errors", scope = "code-review-build", description = "Exclude error sources", defaults = [
+        "shift+z",
+    ] },
+    { id = "bcode.code_review.edit_source", scope = "code-review-build", description = "Edit source specification", defaults = [
+        "shift+c",
+    ] },
+    { id = "bcode.code_review.merge_base", scope = "code-review-build", description = "Toggle merge base", defaults = [
+        "shift+m",
+    ] },
+    { id = "bcode.code_review.remove_excluded", scope = "code-review-build", description = "Remove excluded sources", defaults = [
+        "shift+x",
+    ] },
+    { id = "bcode.code_review.remove_duplicates", scope = "code-review-build", description = "Remove duplicate sources", defaults = [
+        "shift+p",
+    ] },
+    { id = "bcode.code_review.include", scope = "code-review-build", description = "Toggle source inclusion", defaults = [
+        "space",
+    ] },
+    { id = "bcode.code_review.rename_workspace", scope = "code-review-build", description = "Rename workspace", defaults = [
+        "shift+t",
+    ] },
+    { id = "bcode.code_review.source_surface", scope = "code-review-build", description = "Open source surface", defaults = [
+        "shift+o",
+    ] },
+    { id = "bcode.code_review.source_for_surface", scope = "code-review-build", description = "Open source for surface", defaults = [
+        "shift+y",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-build", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.left", scope = "code-review-build", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "code-review-build", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "code-review-build", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-build", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-build", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-build", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-build", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-build", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-build", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-build", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-build", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-build", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-build", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-build", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-build", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-build", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-build", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-build", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-build", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-build", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-build", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-build", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-build", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-build", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-build", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-build", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.save", scope = "code-review-prompt", description = "Submit prompt", defaults = [
+        "ctrl+s",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-prompt", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.up", scope = "code-review-prompt", description = "Move up", defaults = [
+        "up",
+        "k",
+        "ctrl+p",
+    ] },
+    { id = "tui.control.down", scope = "code-review-prompt", description = "Move down", defaults = [
+        "down",
+        "j",
+        "ctrl+n",
+    ] },
+    { id = "tui.control.left", scope = "code-review-prompt", description = "Move left", defaults = [
+        "left",
+        "ctrl+b",
+    ] },
+    { id = "tui.control.right", scope = "code-review-prompt", description = "Move right", defaults = [
+        "right",
+        "ctrl+f",
+    ] },
+    { id = "tui.control.home", scope = "code-review-prompt", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-prompt", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-prompt", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-prompt", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-prompt", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-prompt", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-prompt", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-prompt", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-prompt", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-prompt", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-prompt", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-prompt", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-prompt", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-prompt", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-prompt", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-prompt", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+        "super+left",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-prompt", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+        "super+right",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-prompt", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-prompt", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-prompt", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-prompt", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-prompt", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-prompt", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-prompt", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-prompt", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.down", scope = "code-review-import", description = "Next option", defaults = [
+        "j",
+        "down",
+    ] },
+    { id = "bcode.code_review.up", scope = "code-review-import", description = "Previous option", defaults = [
+        "k",
+        "up",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-import", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.left", scope = "code-review-import", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "code-review-import", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "code-review-import", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-import", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-import", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-import", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-import", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-import", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-import", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-import", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-import", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-import", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-import", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-import", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-import", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-import", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-import", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-import", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-import", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-import", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-import", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-import", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-import", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-import", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-import", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-import", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-import", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.attention", scope = "code-review-publish", description = "Attention sidebar", defaults = [
+        "!",
+    ] },
+    { id = "bcode.code_review.unviewed_next", scope = "code-review-publish", description = "Next unviewed file", defaults = [
+        "shift+w",
+    ] },
+    { id = "bcode.code_review.thread_next_global", scope = "code-review-publish", description = "Next open thread", defaults = [
+        "shift+p",
+    ] },
+    { id = "bcode.code_review.down", scope = "code-review-publish", description = "Next option", defaults = [
+        "j",
+        "down",
+    ] },
+    { id = "bcode.code_review.up", scope = "code-review-publish", description = "Previous option", defaults = [
+        "k",
+        "up",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-publish", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.left", scope = "code-review-publish", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "code-review-publish", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "code-review-publish", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-publish", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-publish", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-publish", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-publish", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-publish", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-publish", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-publish", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-publish", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-publish", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-publish", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-publish", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-publish", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-publish", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-publish", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-publish", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-publish", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-publish", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-publish", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-publish", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-publish", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-publish", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-publish", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-publish", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-publish", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.save", scope = "code-review-comment", description = "Save comment", defaults = [
+        "ctrl+s",
+    ] },
+    { id = "bcode.code_review.preview", scope = "code-review-comment", description = "Toggle preview", defaults = [
+        "ctrl+p",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-comment", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.up", scope = "code-review-comment", description = "Move up", defaults = [
+        "up",
+    ] },
+    { id = "tui.control.down", scope = "code-review-comment", description = "Move down", defaults = [
+        "down",
+        "ctrl+n",
+    ] },
+    { id = "tui.control.left", scope = "code-review-comment", description = "Move left", defaults = [
+        "left",
+        "ctrl+b",
+    ] },
+    { id = "tui.control.right", scope = "code-review-comment", description = "Move right", defaults = [
+        "right",
+        "ctrl+f",
+    ] },
+    { id = "tui.control.home", scope = "code-review-comment", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-comment", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-comment", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-comment", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-comment", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.newline", scope = "code-review-comment", description = "Insert newline", defaults = [
+        "shift+enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-comment", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-comment", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-comment", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-comment", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-comment", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-comment", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-comment", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-comment", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-comment", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-comment", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-comment", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+        "super+left",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-comment", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+        "super+right",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-comment", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-comment", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-comment", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-comment", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-comment", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-comment", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-comment", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-comment", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-home-search", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.up", scope = "code-review-home-search", description = "Move up", defaults = [
+        "up",
+    ] },
+    { id = "tui.control.down", scope = "code-review-home-search", description = "Move down", defaults = [
+        "down",
+    ] },
+    { id = "tui.control.left", scope = "code-review-home-search", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "code-review-home-search", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "code-review-home-search", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-home-search", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-home-search", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-home-search", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-home-search", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-home-search", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-home-search", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-home-search", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-home-search", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-home-search", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-home-search", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-home-search", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-home-search", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-home-search", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-home-search", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-home-search", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-home-search", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-home-search", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-home-search", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-home-search", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-home-search", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-home-search", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-home-search", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-home-search", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-home-search", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-home-new", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.up", scope = "code-review-home-new", description = "Move up", defaults = [
+        "up",
+    ] },
+    { id = "tui.control.down", scope = "code-review-home-new", description = "Move down", defaults = [
+        "down",
+    ] },
+    { id = "tui.control.left", scope = "code-review-home-new", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "code-review-home-new", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "code-review-home-new", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-home-new", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-home-new", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-home-new", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-home-new", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-home-new", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-home-new", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-home-new", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-home-new", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-home-new", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-home-new", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-home-new", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-home-new", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-home-new", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-home-new", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-home-new", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-home-new", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-home-new", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-home-new", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-home-new", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-home-new", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-home-new", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-home-new", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-home-new", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-home-new", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-home-rename", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.up", scope = "code-review-home-rename", description = "Move up", defaults = [
+        "up",
+    ] },
+    { id = "tui.control.down", scope = "code-review-home-rename", description = "Move down", defaults = [
+        "down",
+    ] },
+    { id = "tui.control.left", scope = "code-review-home-rename", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "code-review-home-rename", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "code-review-home-rename", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-home-rename", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-home-rename", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-home-rename", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-home-rename", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-home-rename", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-home-rename", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-home-rename", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-home-rename", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-home-rename", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-home-rename", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-home-rename", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-home-rename", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-home-rename", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-home-rename", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-home-rename", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-home-rename", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-home-rename", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-home-rename", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-home-rename", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-home-rename", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-home-rename", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-home-rename", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-home-rename", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-home-rename", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "tui.control.down", scope = "code-review-import-options", description = "Next option", defaults = [
+        "down",
+        "j",
+        "ctrl+n",
+    ] },
+    { id = "tui.control.up", scope = "code-review-import-options", description = "Previous option", defaults = [
+        "up",
+        "k",
+        "ctrl+p",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-import-options", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.left", scope = "code-review-import-options", description = "Move left", defaults = [
+        "left",
+        "ctrl+b",
+    ] },
+    { id = "tui.control.right", scope = "code-review-import-options", description = "Move right", defaults = [
+        "right",
+        "ctrl+f",
+    ] },
+    { id = "tui.control.home", scope = "code-review-import-options", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-import-options", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-import-options", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-import-options", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-import-options", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-import-options", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-import-options", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-import-options", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-import-options", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-import-options", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-import-options", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-import-options", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-import-options", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-import-options", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-import-options", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-import-options", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+        "super+left",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-import-options", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+        "super+right",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-import-options", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-import-options", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-import-options", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-import-options", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-import-options", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-import-options", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-import-options", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-import-options", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.attention", scope = "code-review-publish-options", description = "Attention sidebar", defaults = [
+        "!",
+    ] },
+    { id = "bcode.code_review.unviewed_next", scope = "code-review-publish-options", description = "Next unviewed file", defaults = [
+        "shift+w",
+    ] },
+    { id = "bcode.code_review.thread_next_global", scope = "code-review-publish-options", description = "Next open thread", defaults = [
+        "shift+p",
+    ] },
+    { id = "tui.control.down", scope = "code-review-publish-options", description = "Next option", defaults = [
+        "down",
+        "j",
+        "ctrl+n",
+    ] },
+    { id = "tui.control.up", scope = "code-review-publish-options", description = "Previous option", defaults = [
+        "up",
+        "k",
+        "ctrl+p",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-publish-options", description = "Exit review", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "tui.control.left", scope = "code-review-publish-options", description = "Move left", defaults = [
+        "left",
+        "ctrl+b",
+    ] },
+    { id = "tui.control.right", scope = "code-review-publish-options", description = "Move right", defaults = [
+        "right",
+        "ctrl+f",
+    ] },
+    { id = "tui.control.home", scope = "code-review-publish-options", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "code-review-publish-options", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "code-review-publish-options", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "code-review-publish-options", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "code-review-publish-options", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "code-review-publish-options", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "code-review-publish-options", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "code-review-publish-options", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "code-review-publish-options", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "code-review-publish-options", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "code-review-publish-options", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "code-review-publish-options", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "code-review-publish-options", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "code-review-publish-options", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "code-review-publish-options", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "code-review-publish-options", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+        "super+left",
+    ] },
+    { id = "tui.control.line_end", scope = "code-review-publish-options", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+        "super+right",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "code-review-publish-options", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "code-review-publish-options", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "code-review-publish-options", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "code-review-publish-options", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "code-review-publish-options", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "code-review-publish-options", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "code-review-publish-options", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "code-review-publish-options", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.code_review.publish_back", scope = "code-review-publish", description = "Back to preview", defaults = [
+        "p",
+    ] },
+    { id = "bcode.code_review.text.select_start", scope = "code-review-prompt", description = "Select to boundary start", defaults = [
+        "shift+home",
+    ] },
+    { id = "bcode.code_review.text.select_end", scope = "code-review-prompt", description = "Select to boundary end", defaults = [
+        "shift+end",
+    ] },
+    { id = "bcode.code_review.text.select_start", scope = "code-review-comment", description = "Select to boundary start", defaults = [
+        "shift+home",
+    ] },
+    { id = "bcode.code_review.text.select_end", scope = "code-review-comment", description = "Select to boundary end", defaults = [
+        "shift+end",
+    ] },
+    { id = "bcode.code_review.text.select_start", scope = "code-review-import-options", description = "Select to boundary start", defaults = [
+        "shift+home",
+    ] },
+    { id = "bcode.code_review.text.select_end", scope = "code-review-import-options", description = "Select to boundary end", defaults = [
+        "shift+end",
+    ] },
+    { id = "bcode.code_review.text.select_start", scope = "code-review-publish-options", description = "Select to boundary start", defaults = [
+        "shift+home",
+    ] },
+    { id = "bcode.code_review.text.select_end", scope = "code-review-publish-options", description = "Select to boundary end", defaults = [
+        "shift+end",
+    ] },
+]
+
+
 [config]
 section = "code_review"
 
 categories = ["review"]
+
 
 [[services]]
 class        = "service"

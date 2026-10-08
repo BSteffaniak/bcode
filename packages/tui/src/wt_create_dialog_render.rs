@@ -15,10 +15,26 @@ use super::render::TuiTheme;
 use super::wt_create_dialog::{WorktreeCreateDialog, WorktreeCreateFocus};
 
 /// Render the worktree create dialog.
+#[cfg(test)]
 pub fn render_dialog(
     dialog: &mut WorktreeCreateDialog,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
+) {
+    render_dialog_with_keymap(
+        dialog,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render effective dialog shortcuts.
+pub fn render_dialog_with_keymap(
+    dialog: &mut WorktreeCreateDialog,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) {
     let modal = modal_frame(theme);
     let area = Rect::new(0, 0, frame.area().width, frame.area().height);
@@ -43,7 +59,7 @@ pub fn render_dialog(
         theme,
     );
     render_line(&base, &modal, content, &mut row, frame);
-    let help = help_line(theme);
+    let help = help_line(theme, keymap);
     render_line(&help, &modal, content, &mut row, frame);
     let status = Line::from_spans(vec![Span::styled(dialog.status().to_owned(), theme.muted)]);
     render_line(&status, &modal, content, &mut row, frame);
@@ -121,15 +137,27 @@ fn render_line(
     *row = row.saturating_add(1);
 }
 
-fn help_line(theme: TuiTheme) -> Line {
+fn help_line(theme: TuiTheme, keymap: &super::keymap::BmuxKeyMap) -> Line {
     Line::from_spans(vec![
-        Span::styled("Enter", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("worktree_create", "tui.control.submit"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" create  ", theme.text),
-        Span::styled("Tab", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("worktree_create", "tui.control.focus_next"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" field  ", theme.text),
-        Span::styled("←/→", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("worktree_create", "tui.control.right"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" value  ", theme.text),
-        Span::styled("Esc", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            keymap.hint("worktree_create", "tui.control.cancel"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" cancel", theme.text),
     ])
 }

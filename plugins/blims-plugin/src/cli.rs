@@ -5,12 +5,12 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 
 use bcode_client::BcodeClient;
 use bcode_plugin_sdk::path::display_from_current_dir;
+use bcode_plugin_sdk::tui::keymap::{KeymapAction, KeymapRegistry, controls::LiteralText};
 use bcode_plugin_sdk::{
     StaticCliFuture, StaticCliHostAction, StaticCliOutcome, StaticCliRegistration,
 };
 use bcode_session_models::SessionId;
 use bcode_worktree_models::{WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse};
-use bmux_keyboard::KeyCode;
 use bmux_tui::prelude::{
     Color, Constraint, Direction, Event, Insets, Line, Modifier, Rect, Size, Span, Style, Terminal,
     event_from_crossterm, split,
@@ -923,6 +923,95 @@ async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliErro
     Ok(())
 }
 
+fn blims_keymap_definitions() -> Vec<KeymapAction> {
+    let mut definitions = Vec::new();
+    for (scope, actions) in [
+        (
+            "blims.office",
+            vec![
+                ("close", vec!["esc", "q"]),
+                ("help", vec!["?"]),
+                ("dashboard", vec!["d"]),
+                ("worlds", vec!["w"]),
+                ("refresh", vec!["r"]),
+                ("left", vec!["left", "h"]),
+                ("right", vec!["right", "l"]),
+                ("up", vec!["up", "k"]),
+                ("down", vec!["down", "j"]),
+                ("act", vec!["e", "enter"]),
+                ("next", vec!["tab"]),
+                ("talk", vec!["t"]),
+                ("inbox-next", vec!["n"]),
+                ("inbox-previous", vec!["shift+n"]),
+                ("room-previous", vec!["shift+h"]),
+                ("room-next", vec!["shift+l"]),
+            ],
+        ),
+        (
+            "blims.conversation",
+            vec![
+                ("close", vec!["esc"]),
+                ("send", vec!["enter"]),
+                ("backspace", vec!["backspace"]),
+            ],
+        ),
+        (
+            "blims.dashboard",
+            vec![
+                ("close", vec!["esc", "d"]),
+                ("refresh", vec!["r"]),
+                ("next", vec!["tab", "right", "l"]),
+                ("previous", vec!["left", "h"]),
+                ("up", vec!["up", "k"]),
+                ("down", vec!["down", "j"]),
+                ("hint", vec!["enter"]),
+                ("approve", vec!["a"]),
+                ("reject", vec!["x"]),
+                ("defer", vec!["f"]),
+            ],
+        ),
+        (
+            "blims.picker",
+            vec![
+                ("close", vec!["esc"]),
+                ("quit", vec!["q"]),
+                ("up", vec!["up"]),
+                ("down", vec!["down"]),
+                ("select", vec!["enter"]),
+            ],
+        ),
+    ] {
+        for (action, defaults) in actions {
+            definitions.push(KeymapAction {
+                id: format!("{scope}.{action}"),
+                scope: scope.into(),
+                description: action.into(),
+                defaults: defaults.into_iter().map(str::to_owned).collect(),
+            });
+        }
+    }
+    definitions
+}
+
+fn load_blims_keymap() -> Result<KeymapRegistry, CliError> {
+    let config = bcode_config::load_config().map_err(|_| {
+        CliError::Blims("Blims keybinding configuration could not be loaded".into())
+    })?;
+    bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+        blims_keymap_definitions(),
+        config.tui.keybindings.scoped_overrides(),
+    )
+    .map_err(|_| CliError::Blims("Blims keybinding configuration is invalid".into()))
+}
+
+fn blims_keys(registry: &KeymapRegistry, scope: &str, actions: &[&str]) -> String {
+    actions
+        .iter()
+        .flat_map(|action| registry.keys_for_action(scope, &format!("{scope}.{action}")))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 async fn enter_blims_office() -> Result<(), CliError> {
     Box::pin(run_blims_tui()).await
 }
@@ -935,6 +1024,7 @@ async fn run_blims_tui() -> Result<(), CliError> {
         ));
     }
 
+    let keymap = load_blims_keymap()?;
     let mut guard = BlimsTerminalGuard::enter()?;
     let mut terminal = Terminal::new(
         guard
@@ -943,7 +1033,7 @@ async fn run_blims_tui() -> Result<(), CliError> {
         blims_terminal_area()?,
     );
     terminal.draw(render_blims_loading)?;
-    let mut app = BlimsTuiApp::load().await?;
+    let mut app = BlimsTuiApp::load(keymap).await?;
     if should_show_world_picker().await? {
         app.show_world_picker = true;
     }
@@ -1105,37 +1195,53 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
             );
         }
         Event::Key(stroke) => {
-            if handle_blims_tui_conversation_key(app, stroke.key).await? {
+            let scope = match app.mode {
+                BlimsTuiMode::Conversation(_) => "blims.conversation",
+                BlimsTuiMode::Dashboard(_) => "blims.dashboard",
+                BlimsTuiMode::Office if app.show_world_picker => "blims.picker",
+                BlimsTuiMode::Office => "blims.office",
+            };
+            let action = app.keymap.action_for_key(scope, stroke).map(str::to_owned);
+            if scope == "blims.conversation" {
+                let literal = if action.is_none() && !app.keymap.is_overridden_key(scope, stroke) {
+                    LiteralText::from_stroke(stroke)
+                } else {
+                    None
+                };
+                handle_blims_tui_conversation_key(app, action.as_deref(), literal).await?;
                 return Ok(false);
             }
-            if handle_blims_tui_dashboard_key(app, stroke.key).await? {
+            if scope == "blims.dashboard" {
+                handle_blims_tui_dashboard_key(app, action.as_deref()).await?;
                 return Ok(false);
             }
-            if matches!(stroke.key, KeyCode::Escape | KeyCode::Char('q')) {
-                return Ok(true);
-            }
-            if handle_blims_tui_picker_key(app, stroke.key) {
+            if scope == "blims.picker" {
+                if action.as_deref() == Some("blims.picker.quit") {
+                    return Ok(true);
+                }
+                handle_blims_tui_picker_key(app, action.as_deref());
                 return Ok(false);
             }
-            match stroke.key {
-                KeyCode::Char('?') => app.show_help = !app.show_help,
-                KeyCode::Char('d') => app.open_ceo_dashboard(),
-                KeyCode::Char('w') => app.show_world_picker = true,
-                KeyCode::Char('r') => {
+            match action.as_deref() {
+                Some("blims.office.close") => return Ok(true),
+                Some("blims.office.help") => app.show_help = !app.show_help,
+                Some("blims.office.dashboard") => app.open_ceo_dashboard(),
+                Some("blims.office.worlds") => app.show_world_picker = true,
+                Some("blims.office.refresh") => {
                     app.report = load_blims_report().await?;
                     app.status = "Morning report refreshed.".to_string();
                 }
-                KeyCode::Char('e') | KeyCode::Enter => app.activate_primary_action().await?,
-                KeyCode::Tab => app.select_next_interaction(),
-                KeyCode::Char('n') => app.select_next_inbox_item(),
-                KeyCode::Char('N') => app.select_previous_inbox_item(),
-                KeyCode::Char('t') => app.open_nearest_agent_conversation().await?,
-                KeyCode::Char('h') | KeyCode::Left => app.move_player_by(-1, 0),
-                KeyCode::Char('l') | KeyCode::Right => app.move_player_by(1, 0),
-                KeyCode::Char('k') | KeyCode::Up => app.move_player_by(0, -1),
-                KeyCode::Char('j') | KeyCode::Down => app.move_player_by(0, 1),
-                KeyCode::Char('H') => app.move_previous().await?,
-                KeyCode::Char('L') => app.move_next().await?,
+                Some("blims.office.left") => app.move_player_by(-1, 0),
+                Some("blims.office.right") => app.move_player_by(1, 0),
+                Some("blims.office.up") => app.move_player_by(0, -1),
+                Some("blims.office.down") => app.move_player_by(0, 1),
+                Some("blims.office.act") => app.activate_primary_action().await?,
+                Some("blims.office.next") => app.select_next_interaction(),
+                Some("blims.office.talk") => app.open_nearest_agent_conversation().await?,
+                Some("blims.office.room-previous") => app.move_previous().await?,
+                Some("blims.office.room-next") => app.move_next().await?,
+                Some("blims.office.inbox-next") => app.select_next_inbox_item(),
+                Some("blims.office.inbox-previous") => app.select_previous_inbox_item(),
                 _ => {}
             }
         }
@@ -1145,17 +1251,18 @@ async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<b
 
 async fn handle_blims_tui_conversation_key(
     app: &mut BlimsTuiApp,
-    key: KeyCode,
+    action: Option<&str>,
+    literal: Option<LiteralText>,
 ) -> Result<bool, CliError> {
     let BlimsTuiMode::Conversation(conversation) = &mut app.mode else {
         return Ok(false);
     };
-    match key {
-        KeyCode::Escape => {
+    match action {
+        Some("blims.conversation.close") => {
             app.mode = BlimsTuiMode::Office;
             app.status = "Returned to office.".to_string();
         }
-        KeyCode::Enter => {
+        Some("blims.conversation.send") => {
             let text = conversation.input.trim().to_string();
             if text.is_empty() {
                 conversation.status = "Type a message first.".to_string();
@@ -1180,10 +1287,14 @@ async fn handle_blims_tui_conversation_key(
                 refresh_conversation_transcript(conversation).await?;
             }
         }
-        KeyCode::Backspace => {
+        Some("blims.conversation.backspace") => {
             conversation.input.pop();
         }
-        KeyCode::Char(value) => conversation.input.push(value),
+        None => {
+            if let Some(text) = literal {
+                conversation.input.push(text.0);
+            }
+        }
         _ => {}
     }
     Ok(true)
@@ -1191,18 +1302,18 @@ async fn handle_blims_tui_conversation_key(
 
 async fn handle_blims_tui_dashboard_key(
     app: &mut BlimsTuiApp,
-    key: KeyCode,
+    action: Option<&str>,
 ) -> Result<bool, CliError> {
     let BlimsTuiMode::Dashboard(dashboard) = &mut app.mode else {
         return Ok(false);
     };
-    match key {
-        KeyCode::Escape | KeyCode::Char('d') => {
+    match action {
+        Some("blims.dashboard.close") => {
             app.mode = BlimsTuiMode::Office;
             app.jobs.dashboard_load = None;
             app.status = "Returned to office.".to_string();
         }
-        KeyCode::Char('r') => {
+        Some("blims.dashboard.refresh") => {
             dashboard.status = "Refreshing CEO dashboard…".to_string();
             if app.jobs.dashboard_load.is_none() {
                 app.jobs.dashboard_load = Some(BlimsBackgroundJob::DashboardLoad(
@@ -1210,12 +1321,12 @@ async fn handle_blims_tui_dashboard_key(
                 ));
             }
         }
-        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => dashboard.select_next_section(),
-        KeyCode::Left | KeyCode::Char('h') => dashboard.select_previous_section(),
-        KeyCode::Down | KeyCode::Char('j') => dashboard.select_next_item(),
-        KeyCode::Up | KeyCode::Char('k') => dashboard.select_previous_item(),
-        KeyCode::Enter => dashboard.status = dashboard.selected_action_hint(),
-        KeyCode::Char('a') => {
+        Some("blims.dashboard.next") => dashboard.select_next_section(),
+        Some("blims.dashboard.previous") => dashboard.select_previous_section(),
+        Some("blims.dashboard.down") => dashboard.select_next_item(),
+        Some("blims.dashboard.up") => dashboard.select_previous_item(),
+        Some("blims.dashboard.hint") => dashboard.status = dashboard.selected_action_hint(),
+        Some("blims.dashboard.approve") => {
             if let Some(proposal_id) = dashboard.selected_proposal_id() {
                 let proposal =
                     update_blims_proposal_status("proposal.approve", proposal_id).await?;
@@ -1230,7 +1341,7 @@ async fn handle_blims_tui_dashboard_key(
                 dashboard.status = "Select a proposal or artifact to approve.".to_string();
             }
         }
-        KeyCode::Char('x') => {
+        Some("blims.dashboard.reject") => {
             if let Some(proposal_id) = dashboard.selected_proposal_id() {
                 let proposal = update_blims_proposal_status("proposal.reject", proposal_id).await?;
                 dashboard.update_proposal(proposal);
@@ -1243,7 +1354,7 @@ async fn handle_blims_tui_dashboard_key(
                 dashboard.status = "Select a proposal or artifact to reject.".to_string();
             }
         }
-        KeyCode::Char('f') => {
+        Some("blims.dashboard.defer") => {
             if let Some(proposal_id) = dashboard.selected_proposal_id() {
                 let proposal = update_blims_proposal_status("proposal.defer", proposal_id).await?;
                 dashboard.update_proposal(proposal);
@@ -1261,15 +1372,15 @@ async fn handle_blims_tui_dashboard_key(
     Ok(true)
 }
 
-fn handle_blims_tui_picker_key(app: &mut BlimsTuiApp, key: KeyCode) -> bool {
+fn handle_blims_tui_picker_key(app: &mut BlimsTuiApp, action: Option<&str>) -> bool {
     if !app.show_world_picker {
         return false;
     }
-    match key {
-        KeyCode::Escape => app.show_world_picker = false,
-        KeyCode::Up => app.select_previous_template(),
-        KeyCode::Down => app.select_next_template(),
-        KeyCode::Enter => app.activate_selected_template(),
+    match action {
+        Some("blims.picker.close") => app.show_world_picker = false,
+        Some("blims.picker.up") => app.select_previous_template(),
+        Some("blims.picker.down") => app.select_next_template(),
+        Some("blims.picker.select") => app.activate_selected_template(),
         _ => return false,
     }
     true
@@ -1340,6 +1451,7 @@ impl BlimsBackgroundJobs {
 
 #[derive(Debug)]
 struct BlimsTuiApp {
+    keymap: KeymapRegistry,
     world: BlimsWorldSnapshot,
     report: BlimsMorningReport,
     interactions: BlimsAvailableInteractions,
@@ -1366,7 +1478,7 @@ struct BlimsTuiApp {
 }
 
 impl BlimsTuiApp {
-    async fn load() -> Result<Self, CliError> {
+    async fn load(keymap: KeymapRegistry) -> Result<Self, CliError> {
         let world = load_blims_world().await?;
         let report = load_blims_report().await?;
         let interactions = load_blims_interactions().await?;
@@ -1379,6 +1491,7 @@ impl BlimsTuiApp {
         let geometry = BlimsWorldGeometry::from_world(&world);
         let agent_sprites = initial_agent_sprites(&world, &geometry);
         Ok(Self {
+            keymap,
             world,
             report,
             interactions,
@@ -1401,7 +1514,7 @@ impl BlimsTuiApp {
             mode: BlimsTuiMode::Office,
             show_world_picker: false,
             show_help: false,
-            status: "Welcome CEO — choose a world with w, move with arrows/h/l.".to_string(),
+            status: "Welcome CEO — choose a world or explore the office.".to_string(),
         })
     }
 
@@ -1505,7 +1618,7 @@ impl BlimsTuiApp {
 
     async fn open_nearest_agent_conversation(&mut self) -> Result<(), CliError> {
         let Some(agent_id) = self.nearest_talkable_agent_id() else {
-            self.status = "Walk next to a coworker, then press t to talk.".to_string();
+            self.status = "Walk next to a coworker to start a conversation.".to_string();
             return Ok(());
         };
         self.open_agent_conversation(agent_id).await
@@ -1973,13 +2086,13 @@ impl BlimsTuiApp {
             render_world_picker(self, area, frame);
         }
         if self.show_help {
-            render_blims_help_modal(area, frame);
+            render_blims_help_modal(&self.keymap, area, frame);
         }
         if let BlimsTuiMode::Conversation(conversation) = &self.mode {
-            render_conversation_modal(conversation, area, frame);
+            render_conversation_modal(conversation, &self.keymap, area, frame);
         }
         if let BlimsTuiMode::Dashboard(dashboard) = &self.mode {
-            render_ceo_dashboard_modal(dashboard, area, frame);
+            render_ceo_dashboard_modal(dashboard, &self.keymap, area, frame);
         }
     }
 }
@@ -2266,16 +2379,38 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_
     let shell = PaneComponent::new("blims.pane", pane.clone(), &retained, TextBlock::new(""));
     paint_blims_component(&shell, area, frame);
     let status = app.status.clone();
-    let hints = [
-        KeyHint::new("arrows/hjkl", "walk"),
-        KeyHint::new("e/enter", "act"),
-        KeyHint::new("n/N", "inbox"),
-        KeyHint::new("t", "talk"),
-        KeyHint::new("Esc", "back"),
-        KeyHint::new("w", "worlds"),
-        KeyHint::new("r/?/q", "report/help/quit"),
-        KeyHint::new("", &status),
+    let shortcut_keys = [
+        blims_keys(
+            &app.keymap,
+            "blims.office",
+            &["up", "down", "left", "right"],
+        ),
+        blims_keys(&app.keymap, "blims.office", &["act"]),
+        blims_keys(
+            &app.keymap,
+            "blims.office",
+            &["inbox-next", "inbox-previous"],
+        ),
+        blims_keys(&app.keymap, "blims.office", &["talk"]),
+        blims_keys(&app.keymap, "blims.office", &["close"]),
+        blims_keys(&app.keymap, "blims.office", &["worlds"]),
+        blims_keys(&app.keymap, "blims.office", &["refresh", "help", "close"]),
     ];
+    let mut hints = shortcut_keys
+        .iter()
+        .zip([
+            "walk",
+            "act",
+            "inbox",
+            "talk",
+            "back",
+            "worlds",
+            "report/help/quit",
+        ])
+        .filter(|(keys, _)| !keys.is_empty())
+        .map(|(keys, label)| KeyHint::new(keys.as_str(), label))
+        .collect::<Vec<_>>();
+    hints.push(KeyHint::new("", &status));
     let component =
         KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
     paint_blims_component(&component, pane.inner_area(&state), frame);
@@ -2717,11 +2852,27 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_
             Style::new().bg(bg),
         );
     }
-    let hints = [
-        KeyHint::new("Enter", "select"),
-        KeyHint::new("↑/↓", "move"),
-        KeyHint::new("q", "exit"),
+    render_world_picker_hints(&app.keymap, content, background, frame);
+}
+
+fn render_world_picker_hints(
+    keymap: &KeymapRegistry,
+    content: Rect,
+    background: Color,
+    frame: &mut PaintCx<'_, '_>,
+) {
+    let shortcut_keys = [
+        blims_keys(keymap, "blims.picker", &["select"]),
+        blims_keys(keymap, "blims.picker", &["up", "down"]),
+        blims_keys(keymap, "blims.picker", &["close"]),
+        blims_keys(keymap, "blims.picker", &["quit"]),
     ];
+    let hints = shortcut_keys
+        .iter()
+        .zip(["select", "move", "close", "exit"])
+        .filter(|(keys, _)| !keys.is_empty())
+        .map(|(keys, label)| KeyHint::new(keys.as_str(), label))
+        .collect::<Vec<_>>();
     let component =
         KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
     paint_blims_component(
@@ -2738,6 +2889,7 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_
 
 fn render_ceo_dashboard_modal(
     dashboard: &BlimsCeoDashboardState,
+    keymap: &KeymapRegistry,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
 ) {
@@ -2802,14 +2954,20 @@ fn render_ceo_dashboard_modal(
         render_dashboard_guidance(dashboard, bottom_columns[1], frame);
     }
     let status_label = dashboard.status.clone();
-    let hints = [
-        KeyHint::new("Tab/←/→", "section"),
-        KeyHint::new("↑/↓", "select"),
-        KeyHint::new("a/x/f", "decision"),
-        KeyHint::new("r", "refresh"),
-        KeyHint::new("d/Esc", "close"),
-        KeyHint::new("", &status_label),
+    let shortcut_keys = [
+        blims_keys(keymap, "blims.dashboard", &["next", "previous"]),
+        blims_keys(keymap, "blims.dashboard", &["up", "down"]),
+        blims_keys(keymap, "blims.dashboard", &["approve", "reject", "defer"]),
+        blims_keys(keymap, "blims.dashboard", &["refresh"]),
+        blims_keys(keymap, "blims.dashboard", &["close"]),
     ];
+    let mut hints = shortcut_keys
+        .iter()
+        .zip(["section", "select", "decision", "refresh", "close"])
+        .filter(|(keys, _)| !keys.is_empty())
+        .map(|(keys, label)| KeyHint::new(keys.as_str(), label))
+        .collect::<Vec<_>>();
+    hints.push(KeyHint::new("", &status_label));
     let component =
         KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
     paint_blims_component(&component, rows[3], frame);
@@ -2986,6 +3144,7 @@ fn dashboard_line(selected: bool, text: String) -> Line {
 
 fn render_conversation_modal(
     conversation: &BlimsConversationState,
+    keymap: &KeymapRegistry,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
 ) {
@@ -3045,18 +3204,23 @@ fn render_conversation_modal(
         .styles(blims_text_view_styles(Color::Rgb(24, 18, 36)));
     paint_blims_component(&component, rows[1], frame);
     let session_label = format!("session {}", conversation.handle.session);
-    let hints = [
-        KeyHint::new("Enter", "send"),
-        KeyHint::new("Esc", "office"),
-        KeyHint::new("d", "CEO dashboard"),
-        KeyHint::new("", &session_label),
+    let shortcut_keys = [
+        blims_keys(keymap, "blims.conversation", &["send"]),
+        blims_keys(keymap, "blims.conversation", &["close"]),
     ];
+    let mut hints = shortcut_keys
+        .iter()
+        .zip(["send", "office"])
+        .filter(|(keys, _)| !keys.is_empty())
+        .map(|(keys, label)| KeyHint::new(keys.as_str(), label))
+        .collect::<Vec<_>>();
+    hints.push(KeyHint::new("", &session_label));
     let component =
         KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
     paint_blims_component(&component, rows[2], frame);
 }
 
-fn render_blims_help_modal(area: Rect, frame: &mut PaintCx<'_, '_>) {
+fn render_blims_help_modal(keymap: &KeymapRegistry, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let background = Color::Rgb(18, 20, 38);
     let modal = ModalFrame::new(
         ModalSizing::fixed(Size::new(70, 10), Insets::all(0)),
@@ -3067,14 +3231,21 @@ fn render_blims_help_modal(area: Rect, frame: &mut PaintCx<'_, '_>) {
     .padding(Insets::all(1));
     let shell = ModalFrameComponent::new("blims.modal", modal.clone(), TextBlock::new(""));
     paint_blims_component(&shell, area, frame);
-    let lines = vec![
-        Line::raw("arrows/hjkl walk one tile around the top-down office"),
-        Line::raw("e/enter uses the selected nearby interaction"),
-        Line::raw("t opens native in-game coworker chat; tab cycles interactions"),
-        Line::raw("d opens CEO dashboard with initiatives, tasks, proposals, artifacts"),
-        Line::raw("w opens starter office picker; escape closes modals"),
-        Line::raw("r refreshes the morning report"),
-    ];
+    let lines = blims_keymap_definitions()
+        .into_iter()
+        .map(|action| {
+            let keys = keymap.keys_for_action(&action.scope, &action.id).join("/");
+            Line::raw(format!(
+                "{}: {}",
+                action.description,
+                if keys.is_empty() {
+                    "unbound"
+                } else {
+                    keys.as_str()
+                }
+            ))
+        })
+        .collect::<Vec<_>>();
     let content = modal.content_area(area);
     let help_area = Rect::new(
         content.x,
@@ -3087,10 +3258,16 @@ fn render_blims_help_modal(area: Rect, frame: &mut PaintCx<'_, '_>) {
         .policy(blims_static_text_policy())
         .styles(blims_text_view_styles(background));
     paint_blims_component(&component, help_area, frame);
-    let hints = [
-        KeyHint::new("?", "close help"),
-        KeyHint::new("q", "exit office"),
+    let shortcut_keys = [
+        blims_keys(keymap, "blims.office", &["help"]),
+        blims_keys(keymap, "blims.office", &["close"]),
     ];
+    let hints = shortcut_keys
+        .iter()
+        .zip(["close help", "exit office"])
+        .filter(|(keys, _)| !keys.is_empty())
+        .map(|(keys, label)| KeyHint::new(keys.as_str(), label))
+        .collect::<Vec<_>>();
     let component =
         KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
     paint_blims_component(
@@ -4903,4 +5080,43 @@ fn paint_blims_component(component: &impl Component, area: Rect, cx: &mut PaintC
         LocalRect::new(0, 0, area.width, area.height),
         |cx| component.paint(&layout, cx),
     );
+}
+
+#[cfg(test)]
+mod keymap_tests {
+    use super::*;
+
+    #[test]
+    fn remapping_and_unbinding_are_scoped_and_update_hints() {
+        let mut registry = bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+            blims_keymap_definitions(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        registry
+            .configure(BTreeMap::from([(
+                "blims.office".into(),
+                BTreeMap::from([
+                    ("ctrl+e".into(), "blims.office.act".into()),
+                    ("q".into(), String::new()),
+                ]),
+            )]))
+            .unwrap();
+        let parse = |key| bmux_keyboard::parse_key_stroke(key).unwrap();
+        assert_eq!(registry.action_for_key("blims.office", parse("e")), None);
+        assert_eq!(
+            registry.action_for_key("blims.office", parse("enter")),
+            None
+        );
+        assert_eq!(registry.action_for_key("blims.office", parse("q")), None);
+        assert_eq!(
+            registry.action_for_key("blims.office", parse("ctrl+e")),
+            Some("blims.office.act")
+        );
+        assert_eq!(
+            registry.action_for_key("blims.conversation", parse("enter")),
+            Some("blims.conversation.send")
+        );
+        assert_eq!(blims_keys(&registry, "blims.office", &["act"]), "ctrl+e");
+    }
 }

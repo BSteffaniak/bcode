@@ -1,7 +1,9 @@
 use bcode_markdown_render::{MarkdownRenderOptions, MarkdownTheme, render_markdown_lines};
 #[cfg(test)]
+use bmux_keyboard::KeyCode;
+use bmux_keyboard::KeyStroke;
+#[cfg(test)]
 use bmux_keyboard::Modifiers;
-use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutNode};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
@@ -14,8 +16,32 @@ use std::cell::{Cell, RefCell};
 
 const FOOTER_HEIGHT: u16 = 1;
 
+/// Contributor-owned actions for the standalone Markdown pager.
+pub(crate) fn keymap_actions() -> Vec<bcode_plugin_sdk::tui::keymap::KeymapAction> {
+    [
+        ("close", "Close", &["escape", "q"] as &[&str]),
+        ("line_down", "Scroll down", &["down", "j"] as &[&str]),
+        ("line_up", "Scroll up", &["up", "k"] as &[&str]),
+        ("page_down", "Next page", &["pagedown", "space"] as &[&str]),
+        ("page_up", "Previous page", &["pageup", "b"] as &[&str]),
+        ("first", "Start", &["home", "g"] as &[&str]),
+        ("last", "End", &["end", "shift+g"] as &[&str]),
+    ]
+    .into_iter()
+    .map(
+        |(id, description, defaults)| bcode_plugin_sdk::tui::keymap::KeymapAction {
+            id: format!("bcode.read.{id}"),
+            scope: "read-pager".into(),
+            description: description.into(),
+            defaults: defaults.iter().map(|key| (*key).into()).collect(),
+        },
+    )
+    .collect()
+}
+
 #[derive(Debug)]
 pub(crate) struct Pager {
+    keymap: Option<bcode_plugin_sdk::tui::keymap::KeymapRegistry>,
     markdown: String,
     lines: Vec<Line>,
     width: u16,
@@ -28,6 +54,7 @@ pub(crate) struct Pager {
 impl Pager {
     pub(crate) fn new(markdown: String, width: u16, height: u16, styled: bool) -> Self {
         let mut pager = Self {
+            keymap: None,
             markdown,
             lines: Vec::new(),
             width: width.max(1),
@@ -59,22 +86,33 @@ impl Pager {
         self.presented_layout.replace(None);
     }
 
+    pub(crate) fn with_keymap(
+        mut self,
+        keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+    ) -> Self {
+        self.keymap = Some(keymap);
+        self
+    }
+
     pub(crate) fn handle_key(&self, stroke: KeyStroke) -> bool {
-        if !stroke.modifiers.is_empty() {
+        use bcode_plugin_sdk::tui::keymap::controls::ControlAction;
+        let Some(registry) = &self.keymap else {
             return false;
-        }
-        if matches!(stroke.key, KeyCode::Escape | KeyCode::Char('q')) {
-            return true;
-        }
-        let event = match stroke.key {
-            KeyCode::Char('j') => Event::Key(KeyStroke::simple(KeyCode::Down)),
-            KeyCode::Char('k') => Event::Key(KeyStroke::simple(KeyCode::Up)),
-            KeyCode::Space => Event::Key(KeyStroke::simple(KeyCode::PageDown)),
-            KeyCode::Char('b') => Event::Key(KeyStroke::simple(KeyCode::PageUp)),
-            KeyCode::Char('g') => Event::Key(KeyStroke::simple(KeyCode::Home)),
-            KeyCode::Char('G') => Event::Key(KeyStroke::simple(KeyCode::End)),
-            _ => Event::Key(stroke),
         };
+        let Some(action) = registry.action_for_key("read-pager", stroke) else {
+            return false;
+        };
+        let control = match action {
+            "bcode.read.close" => return true,
+            "bcode.read.line_down" => ControlAction::Down,
+            "bcode.read.line_up" => ControlAction::Up,
+            "bcode.read.page_down" => ControlAction::PageDown,
+            "bcode.read.page_up" => ControlAction::PageUp,
+            "bcode.read.first" => ControlAction::Home,
+            "bcode.read.last" => ControlAction::End,
+            _ => return false,
+        };
+        let event = Event::Key(control.native_stroke());
         let area = Rect::new(0, 0, self.width, self.content_height());
         let view = TextViewComponent::new("read.body", &self.lines, &self.view_state)
             .policy(TextViewPolicy::scrollable());
@@ -116,12 +154,19 @@ impl Pager {
                 view.paint(&layout, frame);
                 candidate = Some(layout);
                 if self.height > 1 {
-                    let hints = [
-                        KeyHint::new("j/k", "scroll"),
-                        KeyHint::new("space/b", "page"),
-                        KeyHint::new("g/G", "ends"),
-                        KeyHint::new("q", "quit"),
-                    ];
+                    let labels = self.keymap.as_ref().map_or_else(Vec::new, |registry| {
+                        keymap_actions()
+                            .into_iter()
+                            .filter_map(|action| {
+                                let keys = registry.keys_for_action(&action.scope, &action.id);
+                                (!keys.is_empty()).then(|| (keys.join("/"), action.description))
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    let hints = labels
+                        .iter()
+                        .map(|(keys, description)| KeyHint::new(keys, description))
+                        .collect::<Vec<_>>();
                     let styles = pager_hint_styles(self.styled);
                     let footer_area = Rect::new(0, self.height - 1, self.width, 1);
                     let hints = KeyHintBarComponent::new("read.hints", &hints).styles(styles);
@@ -250,11 +295,53 @@ mod tests {
             write!(output, "{line}\n\n").expect("writing to a string cannot fail");
             output
         });
-        Pager::new(markdown, 40, 6, true)
+        Pager::new(markdown, 40, 6, true).with_keymap(
+            bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                keymap_actions(),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+        )
     }
 
     fn key(key: KeyCode) -> KeyStroke {
-        KeyStroke::simple(key)
+        match key {
+            KeyCode::Char(ch) if ch.is_ascii_uppercase() => KeyStroke::with_modifiers(
+                KeyCode::Char(ch.to_ascii_lowercase()),
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::NONE
+                },
+            ),
+            _ => KeyStroke::simple(key),
+        }
+    }
+
+    #[test]
+    fn remapped_and_unbound_pager_keys_do_not_fall_back() {
+        let registry = bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+            keymap_actions(),
+            std::collections::BTreeMap::from([(
+                "read-pager".into(),
+                std::collections::BTreeMap::from([
+                    ("ctrl+n".into(), "bcode.read.line_down".into()),
+                    ("q".into(), String::new()),
+                ]),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            registry.keys_for_action("read-pager", "bcode.read.line_down"),
+            ["ctrl+n"]
+        );
+        let pager = long_pager().with_keymap(registry);
+        pager.handle_key(key(KeyCode::Down));
+        pager.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(pager.view_state.get().vertical_offset(), 0);
+        pager.handle_key(bmux_keyboard::parse_key_stroke("ctrl+n").unwrap());
+        assert_eq!(pager.view_state.get().vertical_offset(), 1);
+        assert!(!pager.handle_key(key(KeyCode::Char('q'))));
+        assert!(pager.handle_key(key(KeyCode::Escape)));
     }
 
     #[test]
@@ -281,7 +368,13 @@ mod tests {
 
     #[test]
     fn resize_reflows_and_clamps_offset() {
-        let mut pager = Pager::new("word ".repeat(100), 10, 4, true);
+        let mut pager = Pager::new("word ".repeat(100), 10, 4, true).with_keymap(
+            bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                keymap_actions(),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+        );
         pager.handle_key(key(KeyCode::End));
         assert!(pager.view_state.get().vertical_offset() > 0);
         pager.resize(200, 50);
@@ -303,7 +396,13 @@ mod tests {
             ("short".to_owned(), 80, 24),
             ("word ".repeat(20), 1, 1),
         ] {
-            let pager = Pager::new(markdown, width, height, true);
+            let pager = Pager::new(markdown, width, height, true).with_keymap(
+                bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                    keymap_actions(),
+                    std::collections::BTreeMap::new(),
+                )
+                .unwrap(),
+            );
             pager.handle_key(key(KeyCode::Down));
             pager.handle_key(key(KeyCode::PageDown));
             assert!(pager.view_state.get().vertical_offset() <= pager.max_offset());

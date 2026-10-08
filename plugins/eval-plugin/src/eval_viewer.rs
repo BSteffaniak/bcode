@@ -48,6 +48,7 @@ const ACTION_HEIGHT: u16 = 1;
 const STATUS_HEIGHT: u16 = 1;
 
 thread_local! {
+    static ACTIVE_HINTS: std::cell::RefCell<Option<Vec<(String, String)>>> = const { std::cell::RefCell::new(None) };
     static ACTIVE_THEME: std::cell::Cell<Option<PluginTuiTheme>> = const { std::cell::Cell::new(None) };
 }
 
@@ -443,12 +444,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
         render_eval_table(frame, self.table_area, &columns, &rows, &self.table_state);
         let actions = picker_actions();
         paint_eval_actions(&actions, action_area, &self.action_state, frame);
-        let hints = [
-            KeyHint::new("Click/Enter", "open"),
-            KeyHint::new("r", "refresh"),
-            KeyHint::new("q", "close"),
-        ];
-        render_status(status_area, frame, &hints);
+        render_status(status_area, frame, &[]);
     }
 
     fn render_with_theme(
@@ -465,9 +461,40 @@ impl PluginTuiSurface for EvalRunPickerSurface {
         ACTIVE_THEME.with(|active| active.set(None));
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        if let Some(viewer) = self.embedded_viewer.as_mut() {
+            viewer.render_with_host(area, frame, theme, host);
+            return;
+        }
+        if let Some(viewer) = self.embedded_campaign.as_mut() {
+            viewer.render_with_host(area, frame, theme, host);
+            return;
+        }
+        if self.active_wizard.is_some() {
+            ACTIVE_HINTS.with(|hints| {
+                *hints.borrow_mut() =
+                    Some(crate::keybindings::hints(host, crate::keybindings::WIZARD));
+            });
+            self.render_with_theme(area, frame, theme);
+            ACTIVE_HINTS.with(|hints| *hints.borrow_mut() = None);
+            return;
+        }
+        ACTIVE_HINTS.with(|hints| {
+            *hints.borrow_mut() = Some(crate::keybindings::hints(host, crate::keybindings::PICKER));
+        });
+        self.render_with_theme(area, frame, theme);
+        ACTIVE_HINTS.with(|hints| *hints.borrow_mut() = None);
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Some(wizard) = self.active_wizard.as_mut() {
-            match wizard.handle_event(self.surface_area, event) {
+            match wizard.handle_host_event(self.surface_area, event, host) {
                 EvalWizardOutcome::Continue => return PluginTuiAction::None,
                 EvalWizardOutcome::Redraw => return PluginTuiAction::Redraw,
                 EvalWizardOutcome::Cancel => {
@@ -497,6 +524,12 @@ impl PluginTuiSurface for EvalRunPickerSurface {
             }
             return action;
         }
+        let Some(resolved_event) =
+            crate::keybindings::event(event, host, crate::keybindings::PICKER)
+        else {
+            return PluginTuiAction::None;
+        };
+        let event = &resolved_event;
         let columns = overview_columns();
         let rows = overview_table_rows(&self.runs, &self.campaigns);
         if handle_eval_table_event(
@@ -948,6 +981,23 @@ impl EvalWizard {
             Self::DecideGeneration(wizard) => wizard.render(area, frame),
             Self::Help(wizard) => wizard.render(area, frame),
         }
+        render_status(
+            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+            frame,
+            &[],
+        );
+    }
+
+    fn handle_host_event(
+        &mut self,
+        area: Rect,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> EvalWizardOutcome {
+        crate::keybindings::event(event, host, crate::keybindings::WIZARD)
+            .map_or(EvalWizardOutcome::Continue, |event| {
+                self.handle_event(area, &event)
+            })
     }
 
     fn handle_event(&mut self, area: Rect, event: &Event) -> EvalWizardOutcome {
@@ -1323,7 +1373,9 @@ impl StartCampaignWizard {
             Line::from(""),
             Line::from(""),
             Line::from(format!("Objective: {}", objective_label(self.objective))),
-            Line::from("Click fields/buttons or use Tab and Esc. Enter submits the field."),
+            Line::from(
+                "Click fields/buttons or use the configured focus, cancel, and submit actions.",
+            ),
         ];
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
@@ -1468,7 +1520,7 @@ impl RecordGenerationWizard {
             self.metadata_field_label()
         )));
         body.push(Line::from(
-            "Click fields/buttons or use Tab and Esc. Enter submits the field.",
+            "Click fields/buttons or use the configured focus, cancel, and submit actions.",
         ));
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
@@ -2412,13 +2464,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             &self.generation_state,
         );
         paint_eval_actions(&campaign_actions(), action_area, &self.action_state, frame);
-        let hints = [
-            KeyHint::new("Enter", "details"),
-            KeyHint::new("O", "open run"),
-            KeyHint::new("V", "cycle view"),
-            KeyHint::new("Esc", "back"),
-        ];
-        render_status(status_area, frame, &hints);
+        render_status(status_area, frame, &[]);
     }
 
     fn render_with_theme(
@@ -2435,9 +2481,43 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
         ACTIVE_THEME.with(|active| active.set(None));
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        if let Some(viewer) = self.selected_run_viewer.as_mut() {
+            viewer.render_with_host(area, frame, theme, host);
+            return;
+        }
+        if let Some(viewer) = self.detail_view.as_mut() {
+            viewer.render_with_host(area, frame, theme, host);
+            return;
+        }
+        if self.active_wizard.is_some() {
+            ACTIVE_HINTS.with(|hints| {
+                *hints.borrow_mut() =
+                    Some(crate::keybindings::hints(host, crate::keybindings::WIZARD));
+            });
+            self.render_with_theme(area, frame, theme);
+            ACTIVE_HINTS.with(|hints| *hints.borrow_mut() = None);
+            return;
+        }
+        ACTIVE_HINTS.with(|hints| {
+            *hints.borrow_mut() = Some(crate::keybindings::hints(
+                host,
+                crate::keybindings::CAMPAIGN,
+            ));
+        });
+        self.render_with_theme(area, frame, theme);
+        ACTIVE_HINTS.with(|hints| *hints.borrow_mut() = None);
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Some(wizard) = self.active_wizard.as_mut() {
-            match wizard.handle_event(self.surface_area, event) {
+            match wizard.handle_host_event(self.surface_area, event, host) {
                 EvalWizardOutcome::Continue => return PluginTuiAction::None,
                 EvalWizardOutcome::Redraw => return PluginTuiAction::Redraw,
                 EvalWizardOutcome::Cancel => {
@@ -2467,6 +2547,12 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             }
             return action;
         }
+        let Some(resolved_event) =
+            crate::keybindings::event(event, host, crate::keybindings::CAMPAIGN)
+        else {
+            return PluginTuiAction::None;
+        };
+        let event = &resolved_event;
         let (columns, rows) = match self.view_mode {
             CampaignViewMode::CaseHistory => case_history_table(&self.data),
             CampaignViewMode::Metrics => campaign_metric_table(
@@ -2962,12 +3048,7 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
             &self.action_state,
             frame,
         );
-        let hints = [
-            KeyHint::new("Tab", "pane"),
-            KeyHint::new("O", "open run"),
-            KeyHint::new("Esc", "back"),
-        ];
-        render_status(status_area, frame, &hints);
+        render_status(status_area, frame, &[]);
     }
 
     fn render_with_theme(
@@ -2984,9 +3065,36 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
         ACTIVE_THEME.with(|active| active.set(None));
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        if let Some(viewer) = self.selected_run_viewer.as_mut() {
+            viewer.render_with_host(area, frame, theme, host);
+            return;
+        }
+        if self.active_wizard.is_some() {
+            ACTIVE_HINTS.with(|hints| {
+                *hints.borrow_mut() =
+                    Some(crate::keybindings::hints(host, crate::keybindings::WIZARD));
+            });
+            self.render_with_theme(area, frame, theme);
+            ACTIVE_HINTS.with(|hints| *hints.borrow_mut() = None);
+            return;
+        }
+        ACTIVE_HINTS.with(|hints| {
+            *hints.borrow_mut() = Some(crate::keybindings::hints(host, crate::keybindings::DETAIL));
+        });
+        self.render_with_theme(area, frame, theme);
+        ACTIVE_HINTS.with(|hints| *hints.borrow_mut() = None);
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Some(wizard) = self.active_wizard.as_mut() {
-            match wizard.handle_event(self.surface_area, event) {
+            match wizard.handle_host_event(self.surface_area, event, host) {
                 EvalWizardOutcome::Continue => return PluginTuiAction::None,
                 EvalWizardOutcome::Redraw => return PluginTuiAction::Redraw,
                 EvalWizardOutcome::Cancel => {
@@ -3008,6 +3116,12 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
             }
             return action;
         }
+        let Some(resolved_event) =
+            crate::keybindings::event(event, host, crate::keybindings::DETAIL)
+        else {
+            return PluginTuiAction::None;
+        };
+        let event = &resolved_event;
         let tabs = generation_detail_tabs();
         match TabBar::new(&tabs).styles(eval_tab_styles()).handle_event(
             self.tab_area,
@@ -3255,13 +3369,7 @@ impl PluginTuiSurface for EvalRunViewerSurface {
         }
         let actions = viewer_actions(self.selected_tab());
         paint_eval_actions(&actions, action_area, &self.action_state, frame);
-        let hints = [
-            KeyHint::new("Tab", "pane"),
-            KeyHint::new("d/t/c", "artifact"),
-            KeyHint::new("r", "refresh"),
-            KeyHint::new("q", "close"),
-        ];
-        render_status(status_area, frame, &hints);
+        render_status(status_area, frame, &[]);
     }
 
     fn render_with_theme(
@@ -3278,7 +3386,26 @@ impl PluginTuiSurface for EvalRunViewerSurface {
         ACTIVE_THEME.with(|active| active.set(None));
     }
 
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        ACTIVE_HINTS.with(|hints| {
+            *hints.borrow_mut() = Some(crate::keybindings::hints(host, crate::keybindings::RUN));
+        });
+        self.render_with_theme(area, frame, theme);
+        ACTIVE_HINTS.with(|hints| *hints.borrow_mut() = None);
+    }
+
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let Some(resolved_event) = crate::keybindings::event(event, host, crate::keybindings::RUN)
+        else {
+            return PluginTuiAction::None;
+        };
+        let event = &resolved_event;
         let tabs = viewer_tabs();
         match TabBar::new(&tabs).styles(eval_tab_styles()).handle_event(
             self.tab_area,
@@ -3707,11 +3834,7 @@ impl EvalRunViewerSurface {
     fn render_artifact(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let Some((title, text, truncated, binary)) = &self.artifact else {
             render_panel_title(area, frame, "Artifact viewer");
-            let hints = [KeyHint::new(
-                "Select repetition",
-                "then Diff/Transcript/Tool Calls",
-            )];
-            render_status(inset_top(area, 1), frame, &hints);
+            render_status(inset_top(area, 1), frame, &[]);
             return;
         };
         render_panel_title(area, frame, title);
@@ -3851,12 +3974,22 @@ fn render_header(area: Rect, frame: &mut PaintCx<'_, '_>, title: &str, status: &
     }
 }
 
-fn render_status(area: Rect, frame: &mut PaintCx<'_, '_>, hints: &[KeyHint<'_>]) {
-    paint_eval_component(
-        &KeyHintBarComponent::new("eval.keyhintbar", hints).styles(eval_hint_styles()),
-        area,
-        frame,
-    );
+fn render_status(area: Rect, frame: &mut PaintCx<'_, '_>, _hints: &[KeyHint<'_>]) {
+    ACTIVE_HINTS.with(|effective| {
+        let effective = effective.borrow();
+        let resolved: Vec<_> = effective
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .map(|(key, label)| KeyHint::new(key, label))
+            .collect();
+        let hints = resolved.as_slice();
+        paint_eval_component(
+            &KeyHintBarComponent::new("eval.keyhintbar", hints).styles(eval_hint_styles()),
+            area,
+            frame,
+        );
+    });
 }
 
 fn render_panel_title(area: Rect, frame: &mut PaintCx<'_, '_>, title: &str) {
@@ -5002,16 +5135,16 @@ fn campaign_comparison_row(
 
 fn campaign_actions() -> Vec<ActionButton> {
     vec![
-        ActionButton::new("details", "Enter Details"),
-        ActionButton::new("open-run", "O Open Run"),
-        ActionButton::new("view-mode", "V View"),
-        ActionButton::new("record-generation", "R Record"),
-        ActionButton::new("run-next", "U Run Next"),
-        ActionButton::new("promote", "P Promote"),
-        ActionButton::new("reject", "X Reject"),
-        ActionButton::new("help", "? Help"),
+        ActionButton::new("details", "Details"),
+        ActionButton::new("open-run", "Open Run"),
+        ActionButton::new("view-mode", "View"),
+        ActionButton::new("record-generation", "Record"),
+        ActionButton::new("run-next", "Run Next"),
+        ActionButton::new("promote", "Promote"),
+        ActionButton::new("reject", "Reject"),
+        ActionButton::new("help", "Help"),
         ActionButton::new("refresh", "Refresh"),
-        ActionButton::new("back", "Esc Back"),
+        ActionButton::new("back", "Back"),
     ]
 }
 
@@ -5025,12 +5158,12 @@ fn generation_detail_tabs() -> Vec<TabItem<'static>> {
 
 fn generation_detail_actions() -> Vec<ActionButton> {
     vec![
-        ActionButton::new("open-run", "O Open Run"),
-        ActionButton::new("rerun", "R Rerun"),
-        ActionButton::new("branch", "B Branch"),
-        ActionButton::new("promote", "P Promote"),
-        ActionButton::new("reject", "X Reject"),
-        ActionButton::new("back", "Esc Back"),
+        ActionButton::new("open-run", "Open Run"),
+        ActionButton::new("rerun", "Rerun"),
+        ActionButton::new("branch", "Branch"),
+        ActionButton::new("promote", "Promote"),
+        ActionButton::new("reject", "Reject"),
+        ActionButton::new("back", "Back"),
     ]
 }
 
@@ -5288,14 +5421,14 @@ fn format_signed_number(value: f64) -> String {
 
 fn picker_actions() -> Vec<ActionButton> {
     vec![
-        ActionButton::new("open", "Enter Open"),
-        ActionButton::new("run-suite", "U Run Suite"),
-        ActionButton::new("new-campaign", "N New Campaign"),
-        ActionButton::new("start-campaign", "S Start Campaign"),
-        ActionButton::new("attach-run", "A Attach Run"),
-        ActionButton::new("refresh", "R Refresh"),
-        ActionButton::new("help", "? Help"),
-        ActionButton::new("close", "Esc Close"),
+        ActionButton::new("open", "Open"),
+        ActionButton::new("run-suite", "Run Suite"),
+        ActionButton::new("new-campaign", "New Campaign"),
+        ActionButton::new("start-campaign", "Start Campaign"),
+        ActionButton::new("attach-run", "Attach Run"),
+        ActionButton::new("refresh", "Refresh"),
+        ActionButton::new("help", "Help"),
+        ActionButton::new("close", "Close"),
     ]
 }
 
@@ -5314,16 +5447,16 @@ fn viewer_tabs() -> Vec<TabItem<'static>> {
 fn viewer_actions(tab: ViewerTab) -> Vec<ActionButton> {
     match tab {
         ViewerTab::Repetitions => vec![
-            ActionButton::new("diff", "D Diff"),
-            ActionButton::new("transcript", "T Transcript"),
-            ActionButton::new("tools", "C Tool Calls"),
-            ActionButton::new("refresh", "R Refresh"),
-            ActionButton::new("close", "Esc Close"),
+            ActionButton::new("diff", "Diff"),
+            ActionButton::new("transcript", "Transcript"),
+            ActionButton::new("tools", "Tool Calls"),
+            ActionButton::new("refresh", "Refresh"),
+            ActionButton::new("close", "Close"),
         ],
         ViewerTab::Artifact => vec![
             ActionButton::new("repetitions", "Back to Repetitions"),
-            ActionButton::new("refresh", "R Refresh"),
-            ActionButton::new("close", "Esc Close"),
+            ActionButton::new("refresh", "Refresh"),
+            ActionButton::new("close", "Close"),
         ],
         ViewerTab::Overview
         | ViewerTab::Analysis
@@ -5331,8 +5464,8 @@ fn viewer_actions(tab: ViewerTab) -> Vec<ActionButton> {
         | ViewerTab::Tools
         | ViewerTab::Derivations => vec![
             ActionButton::new("repetitions", "Open Repetitions"),
-            ActionButton::new("refresh", "R Refresh"),
-            ActionButton::new("close", "Esc Close"),
+            ActionButton::new("refresh", "Refresh"),
+            ActionButton::new("close", "Close"),
         ],
     }
 }
@@ -5617,6 +5750,12 @@ mod interaction_tests {
 
     #[test]
     fn eval_status_uses_bounded_shared_key_hints() {
+        super::ACTIVE_HINTS.with(|hints| {
+            *hints.borrow_mut() = Some(vec![
+                ("Tab".into(), "pane".into()),
+                ("q".into(), "close".into()),
+            ]);
+        });
         let hints = [KeyHint::new("Tab", "pane"), KeyHint::new("q", "close")];
         let area = Rect::new(0, 0, 14, 1);
         let mut buffer = Buffer::empty(area);
@@ -5627,6 +5766,7 @@ mod interaction_tests {
         );
 
         let text = buffer.row_symbols(0).expect("status row");
+        super::ACTIVE_HINTS.with(|hints| *hints.borrow_mut() = None);
         assert!(text.starts_with("Tab pane"));
         assert_eq!(text.chars().count(), usize::from(area.width));
     }

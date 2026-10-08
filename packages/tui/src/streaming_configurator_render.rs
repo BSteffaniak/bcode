@@ -99,10 +99,26 @@ pub fn streaming_configurator_geometry(
 }
 
 /// Render the opaque streaming configurator surface.
+#[cfg(test)]
 pub fn render_streaming_configurator(
     state: &StreamingConfiguratorState,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
+) {
+    render_streaming_configurator_with_keymap(
+        state,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render effective hints.
+pub fn render_streaming_configurator_with_keymap(
+    state: &StreamingConfiguratorState,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) {
     let modal = configurator_modal(theme);
     let root = Rect::new(0, 0, frame.area().width, frame.area().height);
@@ -147,7 +163,7 @@ pub fn render_streaming_configurator(
         frame,
         theme,
     );
-    render_controls(state, controls_area, frame, theme);
+    render_controls(state, controls_area, frame, theme, keymap);
 }
 
 fn preview_text(text: &str) -> Text {
@@ -255,6 +271,7 @@ fn render_controls(
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) {
     let policy = state.selected_policy();
     let curve = match policy.curve {
@@ -323,7 +340,19 @@ fn render_controls(
             ),
         ]),
         Line::from_spans(vec![Span::styled(
-            "↑↓ select  ←→ adjust  shift+←→ coarse  space toggle  pgup/pgdn scroll  end follow  r restart  p pause  enter apply  esc cancel",
+            format!(
+                "{} select  {} adjust  {} coarse  {} toggle  {} scroll  {} follow  {} restart  {} pause  {} apply  {} cancel",
+                keymap.hint("streaming_configurator", "tui.control.down"),
+                keymap.hint("streaming_configurator", "tui.control.right"),
+                keymap.hint("streaming_configurator", "tui.streaming.coarseRight"),
+                keymap.hint("streaming_configurator", "tui.control.toggle"),
+                keymap.hint("streaming_configurator", "tui.control.page_down"),
+                keymap.hint("streaming_configurator", "tui.control.end"),
+                keymap.hint("streaming_configurator", "tui.streaming.restart"),
+                keymap.hint("streaming_configurator", "tui.streaming.pause"),
+                keymap.hint("streaming_configurator", "tui.control.submit"),
+                keymap.hint("streaming_configurator", "tui.control.cancel")
+            ),
             theme.muted,
         )]),
     ];

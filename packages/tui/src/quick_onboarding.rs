@@ -65,6 +65,7 @@ struct QuickProgram {
     outcome: QuickOnboardingOutcome,
     form: Option<ConnectionForm>,
     theme: PresentedTheme,
+    keymap: crate::keymap::BmuxKeyMap,
 }
 
 enum QuickMessage {
@@ -73,7 +74,7 @@ enum QuickMessage {
 }
 
 impl QuickProgram {
-    const fn new(input: QuickOnboardingInput, theme: &PresentedTheme) -> Self {
+    fn new(input: QuickOnboardingInput, theme: &PresentedTheme) -> Self {
         Self {
             input,
             selected: 0,
@@ -83,6 +84,7 @@ impl QuickProgram {
             outcome: QuickOnboardingOutcome::Close,
             form: None,
             theme: *theme,
+            keymap: crate::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
         }
     }
 
@@ -147,7 +149,7 @@ impl QuickProgram {
         if !self
             .form
             .as_mut()
-            .is_some_and(|form| form.handle_event(event))
+            .is_some_and(|form| form.handle_event_with_keymap(event, &self.keymap))
         {
             return Lifecycle::Continue;
         }
@@ -174,7 +176,7 @@ impl QuickProgram {
         self.area = Rect::new(0, 0, local.width, local.height);
         self.choice_area = Rect::new(0, 0, 0, 0);
         if let Some(form) = &mut self.form {
-            form.render(frame, &self.theme);
+            form.render_with_keymap(frame, &self.theme, &self.keymap);
             return;
         }
         let width = self.area.width;
@@ -392,6 +394,8 @@ pub async fn run_quick_onboarding(
 ) -> Result<QuickOnboardingOutcome, TuiError> {
     let config = bcode_config::load_config()?;
     let theme = crate::theme::resolve_configured_theme(&config.tui, std::path::Path::new("."));
+    let mut program = QuickProgram::new(input, &theme);
+    program.keymap = crate::keymap::BmuxKeyMap::from_config(&config.tui);
     let mut guard = crate::CrosstermTerminalGuard::enter(io::stdout())?;
     let result = {
         let mut terminal = Terminal::new(
@@ -401,7 +405,7 @@ pub async fn run_quick_onboarding(
             crate::terminal_area()?,
         );
         let (runtime, handle) = bmux_tui_runtime::Runtime::new(
-            QuickProgram::new(input, &theme),
+            program,
             QuickPresenter {
                 terminal: &mut terminal,
             },

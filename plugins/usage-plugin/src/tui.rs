@@ -1,5 +1,7 @@
 //! BMUX-native usage surface. All source access goes through typed host capabilities.
 mod filters;
+#[cfg(test)]
+mod keymap_tests;
 mod model_picker;
 mod timeline;
 
@@ -9,7 +11,6 @@ use bcode_plugin_sdk::tui::{
 };
 use bcode_session_models::{SessionCostRange, SessionId, SessionUsageQuery};
 use bcode_usage_models::{USAGE_VERSION, UsageQuery, UsageReport};
-use bmux_keyboard::KeyCode;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::geometry::Size;
 use bmux_tui::{
@@ -30,9 +31,99 @@ use std::{
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
+    for action in keymap_actions() {
+        registry.register_keymap_action(action);
+    }
     registry.register_factory(Box::new(Factory));
     registry
 }
+/// Contributor-owned usage actions and defaults.
+fn keymap_actions() -> Vec<bcode_plugin_sdk::tui::keymap::KeymapAction> {
+    [
+        ("close", "Close", &["escape", "q"] as &[&str]),
+        ("models", "Choose models", &["m"] as &[&str]),
+        ("filters", "Edit filters", &["f"] as &[&str]),
+        ("summary", "Next summary page", &["s"] as &[&str]),
+        ("refresh", "Refresh / cancel summary", &["r"] as &[&str]),
+        ("next", "Next report page", &["n"] as &[&str]),
+        ("collect", "Collect active session", &["c"] as &[&str]),
+        ("details", "Toggle details", &["d"] as &[&str]),
+        ("export_json", "Copy JSON", &["j"] as &[&str]),
+        ("export_csv", "Copy CSV", &["x"] as &[&str]),
+        (
+            "filter_selected",
+            "Filter selected row",
+            &["enter"] as &[&str],
+        ),
+        (
+            "filter_provider",
+            "Filter selected provider",
+            &["p"] as &[&str],
+        ),
+        ("range_day", "Last day", &["1"] as &[&str]),
+        ("range_week", "Last week", &["7"] as &[&str]),
+        ("range_month", "Last month", &["3"] as &[&str]),
+        ("clear_filters", "Clear filters", &["a"] as &[&str]),
+    ]
+    .into_iter()
+    .map(
+        |(id, description, defaults)| bcode_plugin_sdk::tui::keymap::KeymapAction {
+            id: format!("bcode.usage.{id}"),
+            scope: "usage".into(),
+            description: description.into(),
+            defaults: defaults.iter().map(|key| (*key).into()).collect(),
+        },
+    )
+    .chain(
+        [
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Up,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Down,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Home,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::End,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Left,
+            bcode_plugin_sdk::tui::keymap::controls::ControlAction::Right,
+        ]
+        .into_iter()
+        .map(|action| action.definition("usage")),
+    )
+    .chain(
+        ["usage-model-picker", "usage-filters"]
+            .into_iter()
+            .flat_map(|scope| {
+                use bcode_plugin_sdk::tui::keymap::controls::ControlAction;
+                ControlAction::TEXT
+                    .iter()
+                    .copied()
+                    .chain([
+                        ControlAction::Submit,
+                        ControlAction::Cancel,
+                        ControlAction::FocusNext,
+                        ControlAction::FocusPrevious,
+                        ControlAction::PageUp,
+                        ControlAction::PageDown,
+                    ])
+                    .map(move |action| action.definition(scope))
+            }),
+    )
+    .chain(std::iter::once(
+        bcode_plugin_sdk::tui::keymap::controls::ControlAction::Toggle
+            .definition("usage-model-picker"),
+    ))
+    .collect()
+}
+
+fn scope_hints(host: &dyn PluginTuiHost, scope: &str) -> String {
+    keymap_actions()
+        .into_iter()
+        .filter(|action| action.scope == scope)
+        .filter_map(|action| {
+            let keys = host.keymap_keys(scope, &action.id);
+            (!keys.is_empty()).then(|| format!("{} {}", keys.join("/"), action.description))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 struct Factory;
 impl PluginTuiSurfaceFactory for Factory {
     fn surface_kind(&self) -> &'static str {
@@ -51,6 +142,7 @@ enum Update {
 }
 struct Dashboard {
     summary: Option<bcode_usage::summary::UsageSummaryAccumulator>,
+    shortcuts: String,
     report_scope: &'static str,
     model_picker: Option<model_picker::ModelPicker>,
     filters: Option<filters::Filters>,
@@ -66,6 +158,31 @@ struct Dashboard {
     details: bool,
 }
 impl Dashboard {
+    fn handle_table_key(&mut self, stroke: bmux_keyboard::KeyStroke, host: &dyn PluginTuiHost) {
+        if let Some(stroke) = bcode_plugin_sdk::tui::keymap::controls::ControlInput::from_host(
+            host,
+            "usage",
+            stroke,
+            &[
+                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Up,
+                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Down,
+                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Home,
+                bcode_plugin_sdk::tui::keymap::controls::ControlAction::End,
+                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Left,
+                bcode_plugin_sdk::tui::keymap::controls::ControlAction::Right,
+            ],
+            false,
+        )
+        .native_stroke()
+        {
+            Table::new(&self.columns(), &self.rows()).handle_event(
+                self.area,
+                &mut self.table,
+                &Event::Key(stroke),
+            );
+        }
+    }
+
     fn new(session: Option<SessionId>) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -74,6 +191,7 @@ impl Dashboard {
             });
         Self {
             summary: None,
+            shortcuts: String::new(),
             report_scope: "PAGE SUBTOTALS",
             model_picker: None,
             filters: None,
@@ -95,7 +213,7 @@ impl Dashboard {
             report: None,
             updates: Arc::new(Mutex::new(None)),
             busy: false,
-            status: "r query snapshots | c collect active session (one page per press)".into(),
+            status: "Query snapshots or collect active session (one page per action)".into(),
             collection: SessionUsageQuery {
                 range: SessionCostRange {
                     from_timestamp_ms: 0,
@@ -120,9 +238,9 @@ impl Dashboard {
                     self.collection.after = page.next_after;
                     self.collection.generation = Some(page.generation);
                     self.status = if self.collection.after.is_some() {
-                        "Collection incomplete: c next page"
+                        "Collection incomplete: collect next page"
                     } else {
-                        "Session snapshot published: r query; c recollect"
+                        "Session snapshot published: query or recollect"
                     }
                     .into();
                 }
@@ -145,7 +263,7 @@ impl Dashboard {
             if report.next_after.is_some() {
                 self.query.after = report.next_after;
                 self.query.revision = Some(report.revision);
-                self.status = "Summary incomplete: s next bounded page; r cancel".into();
+                self.status = "Summary incomplete: next bounded page or cancel".into();
                 return;
             }
             let Some(summary) = self.summary.take() else {
@@ -186,7 +304,7 @@ impl Dashboard {
         host.spawn(Box::pin(async move {
             let result = future
                 .await
-                .map_err(|_| "Query failed; r restart".to_owned());
+                .map_err(|_| "Query failed; restart query".to_owned());
             if let Ok(mut slot) = updates.lock() {
                 *slot = Some(Update::Report(result));
             }
@@ -235,12 +353,12 @@ impl Dashboard {
             return false;
         };
         if let Event::Key(stroke) = event {
-            match stroke.key {
-                KeyCode::Escape => {
+            match host.keymap_action("usage-model-picker", *stroke).as_deref() {
+                Some("tui.control.cancel") => {
                     self.model_picker = None;
                     return true;
                 }
-                KeyCode::Enter => {
+                Some("tui.control.submit") => {
                     self.query.models = picker.selection();
                     self.query.after = None;
                     self.query.revision = None;
@@ -251,7 +369,7 @@ impl Dashboard {
                 _ => {}
             }
         }
-        picker.event(event);
+        picker.event(event, host);
         true
     }
 
@@ -260,12 +378,12 @@ impl Dashboard {
             return false;
         };
         if let Event::Key(stroke) = event {
-            match stroke.key {
-                KeyCode::Escape => {
+            match host.keymap_action("usage-filters", *stroke).as_deref() {
+                Some("tui.control.cancel") => {
                     self.filters = None;
                     return true;
                 }
-                KeyCode::Enter => {
+                Some("tui.control.submit") => {
                     match filters.apply(&self.query) {
                         Ok(query) => {
                             self.query = query;
@@ -279,17 +397,17 @@ impl Dashboard {
                 _ => {}
             }
         }
-        filters.event(event);
+        filters.event(event, host);
         true
     }
 
-    fn filter_key(&mut self, key: KeyCode, host: &dyn PluginTuiHost) -> bool {
+    fn filter_key(&mut self, action: &str, host: &dyn PluginTuiHost) -> bool {
         if self.busy {
             return false;
         }
         let selected = self.table.selected().unwrap_or(0);
-        match key {
-            KeyCode::Enter if self.details => {
+        match action {
+            "bcode.usage.filter_selected" if self.details => {
                 let Some(row) = self
                     .report
                     .as_ref()
@@ -299,7 +417,7 @@ impl Dashboard {
                 };
                 self.query.session_id = Some(row.session_id);
             }
-            KeyCode::Enter => {
+            "bcode.usage.filter_selected" => {
                 let Some(row) = self
                     .report
                     .as_ref()
@@ -309,7 +427,7 @@ impl Dashboard {
                 };
                 self.query.models = BTreeSet::from([row.model.clone()]);
             }
-            KeyCode::Char('p') if !self.details => {
+            "bcode.usage.filter_provider" if !self.details => {
                 let Some(provider) = self
                     .report
                     .as_ref()
@@ -320,10 +438,10 @@ impl Dashboard {
                 };
                 self.query.providers = BTreeSet::from([provider]);
             }
-            KeyCode::Char('1' | '7' | '3') => {
-                let days = match key {
-                    KeyCode::Char('1') => 1,
-                    KeyCode::Char('7') => 7,
+            "bcode.usage.range_day" | "bcode.usage.range_week" | "bcode.usage.range_month" => {
+                let days = match action {
+                    "bcode.usage.range_day" => 1,
+                    "bcode.usage.range_week" => 7,
                     _ => 30,
                 };
                 self.query.range.from_timestamp_ms = self
@@ -332,7 +450,7 @@ impl Dashboard {
                     .to_timestamp_ms
                     .saturating_sub(days * 86_400_000);
             }
-            KeyCode::Char('a') => {
+            "bcode.usage.clear_filters" => {
                 self.query.models.clear();
                 self.query.providers.clear();
                 self.query.session_id = None;
@@ -390,9 +508,22 @@ impl PluginTuiSurface for Dashboard {
             "Usage | UTC {}..{} | {}",
             self.query.range.from_timestamp_ms, self.query.range.to_timestamp_ms, self.report_scope
         );
-        for (index, text) in [heading.as_str(), self.status.as_str(), "r refresh c collect n next Enter drill-down p provider a all 1/7/3 days d requests j JSON x CSV q close"].into_iter().enumerate() {
+        for (index, text) in [
+            heading.as_str(),
+            self.status.as_str(),
+            self.shortcuts.as_str(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let row = u16::try_from(index).unwrap_or_default();
-            if row < area.height { frame.write_line_with_fallback_style(LocalRect::terminal(Rect::new(area.x, area.y + row, area.width, 1)), &Line::from(text), Style::new()); }
+            if row < area.height {
+                frame.write_line_with_fallback_style(
+                    LocalRect::terminal(Rect::new(area.x, area.y + row, area.width, 1)),
+                    &Line::from(text),
+                    Style::new(),
+                );
+            }
         }
         if !self.details
             && self.area.height >= 12
@@ -466,26 +597,49 @@ impl PluginTuiSurface for Dashboard {
         }
         self.render(area, frame);
     }
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        self.shortcuts = scope_hints(host, "usage");
+        if let Some(picker) = &mut self.model_picker {
+            picker.update_hints(host);
+        }
+        if let Some(filters) = &mut self.filters {
+            filters.update_hints(host);
+        }
+    }
+
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.prepare_keymap(host);
+        self.render_with_theme(area, frame, theme);
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         self.receive();
         if self.summary.is_some()
-            && matches!(event, Event::Key(stroke) if !matches!(stroke.key, KeyCode::Char('s' | 'r' | 'q') | KeyCode::Escape))
+            && matches!(event, Event::Key(stroke) if !matches!(host.keymap_action("usage", *stroke).as_deref(), Some("bcode.usage.summary" | "bcode.usage.refresh" | "bcode.usage.close")))
         {
-            self.status = "Summary in progress: s next page; r cancel".into();
+            self.status = "Summary in progress: next summary page or refresh to cancel".into();
             return PluginTuiAction::Redraw;
         }
         if self.picker_event(event, host) || self.filter_event(event, host) {
             return PluginTuiAction::Redraw;
         }
         if let Event::Key(stroke) = event {
-            if self.filter_key(stroke.key, host) {
+            let action = host.keymap_action("usage", *stroke);
+            let action = action.as_deref().unwrap_or("");
+            if self.filter_key(action, host) {
                 return PluginTuiAction::Redraw;
             }
-            match stroke.key {
-                KeyCode::Escape | KeyCode::Char('q') => {
+            match action {
+                "bcode.usage.close" => {
                     return PluginTuiAction::Close { outcome: None };
                 }
-                KeyCode::Char('m') if !self.busy => {
+                "bcode.usage.models" if !self.busy => {
                     self.model_picker = Some(model_picker::ModelPicker::new(
                         self.report
                             .iter()
@@ -493,17 +647,17 @@ impl PluginTuiSurface for Dashboard {
                         self.query.models.clone(),
                     ));
                 }
-                KeyCode::Char('f') if !self.busy => {
+                "bcode.usage.filters" if !self.busy => {
                     self.filters = Some(filters::Filters::new(&self.query));
                 }
-                KeyCode::Char('s') if !self.busy => self.start_summary_page(host),
-                KeyCode::Char('r') if !self.busy => {
+                "bcode.usage.summary" if !self.busy => self.start_summary_page(host),
+                "bcode.usage.refresh" if !self.busy => {
                     self.summary = None;
                     self.query.after = None;
                     self.query.revision = None;
                     self.refresh(host);
                 }
-                KeyCode::Char('n') if !self.busy => {
+                "bcode.usage.next" if !self.busy => {
                     if let Some(report) = &self.report
                         && report.next_after.is_some()
                     {
@@ -512,7 +666,7 @@ impl PluginTuiSurface for Dashboard {
                         self.refresh(host);
                     }
                 }
-                KeyCode::Char('c') if !self.busy => {
+                "bcode.usage.collect" if !self.busy => {
                     if let Some(session) = self.session {
                         let future = host.collect_usage(session, self.collection.clone());
                         let updates = Arc::clone(&self.updates);
@@ -520,7 +674,7 @@ impl PluginTuiSurface for Dashboard {
                         host.spawn(Box::pin(async move {
                             let result = future
                                 .await
-                                .map_err(|_| "Collection failed; c restart".to_owned());
+                                .map_err(|_| "Collection failed; restart collection".to_owned());
                             if let Ok(mut slot) = updates.lock() {
                                 *slot = Some(Update::Collection(result));
                             }
@@ -529,13 +683,13 @@ impl PluginTuiSurface for Dashboard {
                         self.status = "Open /usage from a session to collect it".into();
                     }
                 }
-                KeyCode::Char('d') => {
+                "bcode.usage.details" => {
                     self.details = !self.details;
                     self.table = TableState::default();
                 }
-                KeyCode::Char('j' | 'x') => {
+                "bcode.usage.export_json" | "bcode.usage.export_csv" => {
                     if let Some(report) = &self.report {
-                        let output = if stroke.key == KeyCode::Char('x') {
+                        let output = if action == "bcode.usage.export_csv" {
                             Ok(bcode_usage::export_csv(report))
                         } else {
                             bcode_usage::export_json(report).map_err(|_| "serialization failed")
@@ -550,11 +704,7 @@ impl PluginTuiSurface for Dashboard {
                     }
                 }
                 _ => {
-                    Table::new(&self.columns(), &self.rows()).handle_event(
-                        self.area,
-                        &mut self.table,
-                        event,
-                    );
+                    self.handle_table_key(*stroke, host);
                 }
             }
         } else {

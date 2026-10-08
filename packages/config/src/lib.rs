@@ -3593,6 +3593,45 @@ impl TuiKeyBindingConfig {
     }
 }
 
+impl TuiKeyBindingConfig {
+    /// Combine compatibility scopes with contributor-defined scoped overrides.
+    /// Explicit compatibility sections take precedence for the same key in their named scope.
+    /// The terminal registry owns stroke parsing and unknown-action diagnostics.
+    #[must_use]
+    pub fn scoped_overrides(&self) -> BTreeMap<String, BTreeMap<String, String>> {
+        self.scoped_overrides_with(str::to_owned)
+    }
+
+    /// Combine scopes while normalizing action aliases through the action owner's resolver.
+    /// Empty action IDs remain explicit unbinds; unknown identities should be returned unchanged.
+    #[must_use]
+    pub fn scoped_overrides_with(
+        &self,
+        canonicalize: impl Fn(&str) -> String,
+    ) -> BTreeMap<String, BTreeMap<String, String>> {
+        let mut scopes = self.scopes.clone();
+        for (scope, bindings) in [
+            ("chat", &self.chat),
+            ("permission", &self.permission),
+            ("session_picker", &self.session_picker),
+            ("skill_picker", &self.skill_picker),
+        ] {
+            scopes
+                .entry(scope.into())
+                .or_default()
+                .extend(bindings.clone());
+        }
+        for bindings in scopes.values_mut() {
+            for action in bindings.values_mut() {
+                if !action.is_empty() {
+                    *action = canonicalize(action);
+                }
+            }
+        }
+        scopes
+    }
+}
+
 impl<'de> Deserialize<'de> for TuiKeyBindingConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -3629,6 +3668,10 @@ impl<'de> Deserialize<'de> for TuiKeyBindingConfig {
                         config
                             .legacy_actions
                             .insert(legacy_action.to_string(), keys);
+                    } else {
+                        return Err(D::Error::custom(format!(
+                            "unknown tui keybinding section or invalid legacy entry '{legacy_action}'"
+                        )));
                     }
                 }
             }

@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_client = { workspace = true }
+bcode_config = { workspace = true, optional = true }
 bcode_ipc = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
@@ -42,4 +43,4 @@ tokio = { workspace = true, features = ["rt", "time"] }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []
+static-bundled   = ["dep:bcode_config", "bcode_plugin_sdk/tui"]

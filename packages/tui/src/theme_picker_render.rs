@@ -19,12 +19,33 @@ const PREVIEW_GAP: u16 = 2;
 const PREVIEW_MIN_WIDTH: u16 = 26;
 
 /// Render the theme picker overlay.
+#[cfg(test)]
 pub fn render_theme_picker(
     picker: &mut ThemePickerState,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
-    let modal = theme_picker_modal(theme);
+    render_theme_picker_with_keymap(
+        picker,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render hints from effective bindings.
+pub fn render_theme_picker_with_keymap(
+    picker: &mut ThemePickerState,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
+) {
+    let modal = theme_picker_modal(theme).title(format!(
+        " Themes · {} preview · {} apply · {} cancel ",
+        keymap.hint("theme_picker", "tui.control.down"),
+        keymap.hint("theme_picker", "tui.control.submit"),
+        keymap.hint("theme_picker", "tui.control.cancel")
+    ));
     let area = Rect::new(0, 0, frame.area().width, frame.area().height);
     let content = modal.content_area(area);
     let component = ModalFrameComponent::new("theme.modal", modal, TextBlock::new(""));
@@ -219,7 +240,7 @@ fn theme_picker_modal(theme: TuiTheme) -> ModalFrame {
         ModalSizing::new(Size::new(48, 8), Size::new(112, 20), Insets::all(2)),
         theme.modal_theme(),
     )
-    .title(" Themes · ↑/↓ preview · enter apply · esc cancel ")
+    .title(" Themes ")
     .padding(Insets::new(1, 1, 1, 1))
     .placement(ModalPlacement::UpperThird)
 }
@@ -286,7 +307,7 @@ mod tests {
         );
         let panel = theme_picker_modal(theme).panel_area(area);
         let row = buffer.row_symbols(panel.y).expect("modal top row");
-        assert!(row.contains(" Themes · ↑/↓ preview · enter apply · esc cancel "));
+        assert!(row.contains(" Themes "));
         assert!(row.contains("─╮"), "title erased border: {row}");
         assert_eq!(
             buffer

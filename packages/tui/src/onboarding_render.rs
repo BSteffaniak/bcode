@@ -33,12 +33,32 @@ pub const fn onboarding_board_area(area: Rect) -> Rect {
 }
 
 /// Render the onboarding shell into a terminal frame.
+#[cfg(test)]
 pub fn render_onboarding(
     shell: &OnboardingShell,
     frame: &mut PaintCx<'_, '_>,
     health: &SettingsDbHealth,
     readiness: Option<SetupReadinessReport>,
     theme: &PresentedTheme,
+) {
+    render_onboarding_with_keymap(
+        shell,
+        frame,
+        health,
+        readiness,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render setup shortcuts from effective terminal bindings.
+pub fn render_onboarding_with_keymap(
+    shell: &OnboardingShell,
+    frame: &mut PaintCx<'_, '_>,
+    health: &SettingsDbHealth,
+    readiness: Option<SetupReadinessReport>,
+    theme: &PresentedTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) {
     let area = Rect::new(0, 0, frame.area().width, frame.area().height);
     let model = shell.render_model(health, readiness);
@@ -83,7 +103,22 @@ pub fn render_onboarding(
     }
 
     let footer_y = area.y.saturating_add(area.height).saturating_sub(3);
-    for (offset, footer) in model.footer_lines.iter().take(2).enumerate() {
+    let footer_lines = [
+        format!(
+            "{} navigate · {} select · {} cancel",
+            keymap.hint("onboarding", "tui.control.down"),
+            keymap.hint("onboarding", "tui.control.submit"),
+            keymap.hint("onboarding", "tui.control.cancel")
+        ),
+        format!(
+            "{} provider · {} account · {} model · {} launch",
+            keymap.hint("onboarding", "tui.onboarding.provider"),
+            keymap.hint("onboarding", "tui.onboarding.auth"),
+            keymap.hint("onboarding", "tui.onboarding.model"),
+            keymap.hint("onboarding", "tui.onboarding.launch")
+        ),
+    ];
+    for (offset, footer) in footer_lines.iter().enumerate() {
         render_status_line(
             footer,
             footer_y.saturating_add(u16::try_from(offset).unwrap_or(0)),
@@ -92,8 +127,24 @@ pub fn render_onboarding(
             frame,
         );
     }
+    if let Some(status) = shell.status_message() {
+        render_status_line(
+            status,
+            area.bottom().saturating_sub(1),
+            area,
+            theme.muted,
+            frame,
+        );
+    }
     if let Some(confirmation) = model.pending_confirmation {
-        render_confirmation_modal(&confirmation.title, &confirmation.body, area, frame, theme);
+        render_confirmation_modal(
+            &confirmation.title,
+            &confirmation.body,
+            area,
+            frame,
+            theme,
+            keymap,
+        );
     }
 }
 
@@ -179,6 +230,7 @@ fn render_confirmation_modal(
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
     theme: &PresentedTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) {
     let modal_width = area.width.saturating_mul(2) / 3;
     let modal_height = 6;
@@ -190,7 +242,12 @@ fn render_confirmation_modal(
         .saturating_add(area.height.saturating_sub(modal_height) / 2);
     let modal = Rect::new(modal_x, modal_y, modal_width, modal_height);
     render_box(modal, title, theme.warning, frame);
-    let lines = [body, "Press y to confirm, n or Esc to cancel."];
+    let hints = format!(
+        "{} confirms · {} cancels",
+        keymap.hint("onboarding", "tui.onboarding.confirm"),
+        keymap.hint("onboarding", "tui.control.cancel")
+    );
+    let lines = [body, hints.as_str()];
     for (offset, line) in lines.iter().enumerate() {
         frame.write_line_with_fallback_style(
             LocalRect::terminal(Rect::new(

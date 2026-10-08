@@ -94,16 +94,20 @@ impl ProviderPickerApp {
                 let _ = super::text_input_flow::handle_paste(&mut self.filter, text);
                 self.refresh_filter();
             }
-            Event::Key(stroke) => match stroke.key {
-                bmux_keyboard::KeyCode::Escape => return ProviderPickerOutcome::Cancel,
-                bmux_keyboard::KeyCode::Enter => {
+            Event::Key(stroke) => match keymap.action("provider_picker", *stroke) {
+                Some("tui.control.cancel") => return ProviderPickerOutcome::Cancel,
+                Some("tui.control.submit") => {
                     return ProviderPickerOutcome::Select(self.selected_provider_id());
                 }
-                bmux_keyboard::KeyCode::Up => self.select_previous(),
-                bmux_keyboard::KeyCode::Down => self.select_next(),
+                Some("tui.control.up") => self.select_previous(),
+                Some("tui.control.down") => self.select_next(),
                 _ => {
-                    if super::text_input_flow::handle_key(&mut self.filter, keymap, *stroke)
-                        != bmux_tui_components::text_input::TextInputOutcome::Ignored
+                    if super::text_input_flow::handle_key_in_scope(
+                        &mut self.filter,
+                        keymap,
+                        "provider_picker",
+                        *stroke,
+                    ) != bmux_tui_components::text_input::TextInputOutcome::Ignored
                     {
                         self.refresh_filter();
                     }

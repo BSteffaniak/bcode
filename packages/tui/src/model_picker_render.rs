@@ -11,13 +11,39 @@ use super::picker_render::{
 use super::render::TuiTheme;
 
 /// Render the model picker.
+#[cfg(test)]
 pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
-    let help = match app.mode() {
-        ModelPickerMode::Actions => {
-            "  Enter selects  / filter  Esc cancels  s sort  S reverse  i ignore  u unignore  I ignored"
-        }
-        ModelPickerMode::Filter => "  Typing filters  Enter selects  Esc exits filter",
+    render_model_picker_with_keymap(
+        app,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render shortcuts from effective bindings.
+pub fn render_model_picker_with_keymap(
+    app: &mut ModelPickerApp,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
+) {
+    let scope = if app.mode() == ModelPickerMode::Actions {
+        "model_picker_actions"
+    } else {
+        "model_picker"
     };
+    let help = format!(
+        "  {} selects  {} cancels  {} filter  {} sort  {} reverse  {} ignore  {} unignore  {} ignored",
+        keymap.hint(scope, "tui.control.submit"),
+        keymap.hint(scope, "tui.control.cancel"),
+        keymap.hint("model_picker_actions", "tui.model.filter"),
+        keymap.hint("model_picker_actions", "tui.model.sort"),
+        keymap.hint("model_picker_actions", "tui.model.reverseSort"),
+        keymap.hint("model_picker_actions", "tui.model.ignore"),
+        keymap.hint("model_picker_actions", "tui.model.unignore"),
+        keymap.hint("model_picker_actions", "tui.model.showIgnored")
+    );
     let Some((inner, list_y)) = render_picker_chrome(
         " Models ",
         &Line::from_spans(vec![

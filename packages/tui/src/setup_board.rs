@@ -210,12 +210,57 @@ impl<'a> SetupBoard<'a> {
     }
 
     /// Handle input for this board.
+    #[cfg(test)]
     pub fn handle_event(
         self,
         area: Rect,
         state: &mut SetupBoardState,
         event: &Event,
     ) -> SetupBoardOutcome {
+        self.handle_event_with_keymap(
+            area,
+            state,
+            event,
+            &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        )
+    }
+
+    /// Route effective navigation to the board without BMUX default fallback.
+    pub fn handle_event_with_keymap(
+        self,
+        area: Rect,
+        state: &mut SetupBoardState,
+        event: &Event,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> SetupBoardOutcome {
+        use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
+        let mapped;
+        let event = if let Event::Key(stroke) = event {
+            let supported = [
+                ControlAction::Up,
+                ControlAction::Down,
+                ControlAction::Left,
+                ControlAction::Right,
+                ControlAction::Submit,
+                ControlAction::Toggle,
+                ControlAction::FocusNext,
+                ControlAction::FocusPrevious,
+                ControlAction::PageUp,
+                ControlAction::PageDown,
+                ControlAction::Home,
+                ControlAction::End,
+            ];
+            let Some(native) =
+                ControlInput::from_registry(keymap.registry(), "setup", *stroke, &supported, false)
+                    .native_stroke()
+            else {
+                return SetupBoardOutcome::Ignored;
+            };
+            mapped = Event::Key(native);
+            &mapped
+        } else {
+            event
+        };
         let lines = self.render_lines(state);
         let scroll = Cell::new(state.scroll);
         let scroll_area =
@@ -238,7 +283,11 @@ impl<'a> SetupBoard<'a> {
             return outcome;
         }
         if let Event::Key(key) = event
-            && let Some(outcome) = self.handle_key(state, key.key)
+            && let Some(outcome) = if key.modifiers.shift && key.key == KeyCode::Tab {
+                self.focus_relative(state, FocusStep::Previous)
+            } else {
+                self.handle_key(state, key.key)
+            }
         {
             return outcome;
         }
@@ -272,9 +321,10 @@ impl<'a> SetupBoard<'a> {
 
     fn handle_key(self, state: &mut SetupBoardState, key: KeyCode) -> Option<SetupBoardOutcome> {
         match key {
-            KeyCode::Enter | KeyCode::Space => Some(SetupBoardOutcome::Selected(state.focused)),
-            KeyCode::Tab | KeyCode::Char('n') => self.focus_relative(state, FocusStep::Next),
-            KeyCode::Char('p') => self.focus_relative(state, FocusStep::Previous),
+            KeyCode::Enter | KeyCode::Space | KeyCode::Char(' ') => {
+                Some(SetupBoardOutcome::Selected(state.focused))
+            }
+            KeyCode::Tab => self.focus_relative(state, FocusStep::Next),
             KeyCode::Left => self.focus_direction(state, Direction::Left),
             KeyCode::Right => self.focus_direction(state, Direction::Right),
             KeyCode::Up => self.focus_direction(state, Direction::Up),
@@ -869,6 +919,44 @@ mod tests {
             .iter()
             .map(|span| span.content.as_str())
             .collect::<String>()
+    }
+
+    #[test]
+    fn board_remap_and_unbind_have_no_native_fallback() {
+        let spots = vec![BoardSpot::new(
+            SetupSectionId::Welcome,
+            "Welcome",
+            "Base Camp",
+            SetupSectionStatus::Current,
+        )];
+        let board = SetupBoard::new(&spots, &[]);
+        let mut state = SetupBoardState::new(SetupSectionId::Welcome);
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "setup".into(),
+            std::collections::BTreeMap::from([
+                ("ctrl+y".into(), "tui.control.submit".into()),
+                ("space".into(), String::new()),
+            ]),
+        );
+        let keymap = super::super::keymap::BmuxKeyMap::try_from_config(&config).unwrap();
+        for key in ["enter", "space"] {
+            let event = Event::Key(bcode_plugin_sdk::tui::keymap::parse_key_stroke(key).unwrap());
+            assert_eq!(
+                board.handle_event_with_keymap(
+                    Rect::new(0, 0, 80, 24),
+                    &mut state,
+                    &event,
+                    &keymap
+                ),
+                SetupBoardOutcome::Ignored,
+            );
+        }
+        let event = Event::Key(bcode_plugin_sdk::tui::keymap::parse_key_stroke("ctrl+y").unwrap());
+        assert_eq!(
+            board.handle_event_with_keymap(Rect::new(0, 0, 80, 24), &mut state, &event, &keymap),
+            SetupBoardOutcome::Selected(SetupSectionId::Welcome),
+        );
     }
 
     #[test]

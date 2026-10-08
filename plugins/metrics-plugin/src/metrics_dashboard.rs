@@ -497,6 +497,30 @@ impl MetricsDashboardSurface {
         )
     }
 
+    /// Route only semantic native events (or pointer events) through the original
+    /// component priority; unresolved physical keyboard input never reaches here.
+    fn handle_control_event(&mut self, event: &Event) -> PluginTuiAction {
+        match TabBar::new(&dashboard_tabs())
+            .styles(metric_tab_styles())
+            .handle_event(self.tab_area, &mut self.tab_state, event)
+        {
+            TabBarOutcome::Selected(_) | TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
+            TabBarOutcome::Ignored => {}
+        }
+        if self.handle_tables(event) {
+            return PluginTuiAction::Redraw;
+        }
+        match themed_action_row(&dashboard_actions()).handle_event(
+            self.action_area,
+            &mut self.action_state,
+            event,
+        ) {
+            ActionRowOutcome::Activated { id, .. } => self.handle_action(&id),
+            outcome if outcome.needs_redraw() => PluginTuiAction::Redraw,
+            _ => PluginTuiAction::None,
+        }
+    }
+
     fn handle_key_event(
         &mut self,
         event: &Event,
@@ -505,27 +529,49 @@ impl MetricsDashboardSurface {
         let Event::Key(stroke) = event else {
             return None;
         };
-        match host.keymap_action("metrics-dashboard", *stroke)?.as_str() {
-            "bcode.metrics.previous_row"
-            | "bcode.metrics.next_row"
-            | "bcode.metrics.first_row"
-            | "bcode.metrics.last_row" => {
-                let count = self
-                    .selected_summary()
-                    .map_or(0, |summary| summary.rows.len());
-                if count > 0 {
-                    let selected = self.row_state.selected().unwrap_or(0);
-                    let action = host.keymap_action("metrics-dashboard", *stroke)?;
-                    let next = match action.as_str() {
-                        "bcode.metrics.previous_row" => selected.saturating_sub(1),
-                        "bcode.metrics.next_row" => selected.saturating_add(1).min(count - 1),
-                        "bcode.metrics.first_row" => 0,
-                        _ => count - 1,
-                    };
-                    self.row_state.set_selected(Some(next));
-                }
-                Some(PluginTuiAction::Redraw)
+        let action = host.keymap_action("metrics-dashboard", *stroke)?;
+        let control = match action.as_str() {
+            "bcode.metrics.previous_tab" => {
+                Some(bcode_plugin_sdk::tui::keymap::controls::ControlAction::Left)
             }
+            "bcode.metrics.next_tab" => {
+                Some(bcode_plugin_sdk::tui::keymap::controls::ControlAction::Right)
+            }
+            "bcode.metrics.previous_row" => {
+                Some(bcode_plugin_sdk::tui::keymap::controls::ControlAction::Up)
+            }
+            "bcode.metrics.next_row" => {
+                Some(bcode_plugin_sdk::tui::keymap::controls::ControlAction::Down)
+            }
+            "bcode.metrics.first_row" => {
+                Some(bcode_plugin_sdk::tui::keymap::controls::ControlAction::Home)
+            }
+            "bcode.metrics.last_row" => {
+                Some(bcode_plugin_sdk::tui::keymap::controls::ControlAction::End)
+            }
+            _ => None,
+        };
+        let native = control.map(|action| action.native_stroke()).or_else(|| {
+            bcode_plugin_sdk::tui::keymap::controls::ControlInput::from_host(
+                host,
+                "metrics-dashboard",
+                *stroke,
+                &[
+                    bcode_plugin_sdk::tui::keymap::controls::ControlAction::PageUp,
+                    bcode_plugin_sdk::tui::keymap::controls::ControlAction::PageDown,
+                    bcode_plugin_sdk::tui::keymap::controls::ControlAction::FocusNext,
+                    bcode_plugin_sdk::tui::keymap::controls::ControlAction::FocusPrevious,
+                    bcode_plugin_sdk::tui::keymap::controls::ControlAction::Submit,
+                    bcode_plugin_sdk::tui::keymap::controls::ControlAction::Toggle,
+                ],
+                false,
+            )
+            .native_stroke()
+        });
+        if let Some(stroke) = native {
+            return Some(self.handle_control_event(&Event::Key(stroke)));
+        }
+        match action.as_str() {
             "bcode.metrics.close" => Some(PluginTuiAction::Close { outcome: None }),
             "bcode.metrics.refresh" => {
                 self.reload();
@@ -625,6 +671,21 @@ impl PluginTuiSurface for MetricsDashboardSurface {
         }
         self.render_dashboard(area, frame);
         ACTIVE_THEME.with(|active| active.set(None));
+    }
+
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        self.update_shortcuts(host);
+    }
+
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.update_shortcuts(host);
+        self.render_with_theme(area, frame, theme);
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -1276,6 +1337,9 @@ mod tests {
             ) -> Option<String> {
                 self.0.action_for_key(scope, stroke).map(str::to_owned)
             }
+            fn keymap_is_overridden(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> bool {
+                self.0.is_overridden_key(scope, stroke)
+            }
             fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
                 self.0
                     .keys_for_action(scope, action)
@@ -1291,13 +1355,32 @@ mod tests {
         registry
             .configure(std::collections::BTreeMap::from([(
                 "metrics-dashboard".into(),
-                std::collections::BTreeMap::from([("ctrl+x".into(), "bcode.metrics.close".into())]),
+                std::collections::BTreeMap::from([
+                    ("ctrl+x".into(), "bcode.metrics.close".into()),
+                    ("ctrl+n".into(), "bcode.metrics.next_tab".into()),
+                    ("space".into(), String::new()),
+                ]),
             )]))
             .unwrap();
         let host = Host(registry);
         let mut surface =
             MetricsDashboardSurface::load(PathBuf::new(), MetricsDashboardQuery::default());
         surface.update_shortcuts(&host);
+        let selected = surface.tab_state.selected();
+        let old_arrow = Event::Key(bmux_keyboard::parse_key_stroke("right").unwrap());
+        assert!(matches!(
+            surface.handle_event(&old_arrow, &host),
+            PluginTuiAction::None
+        ));
+        assert_eq!(surface.tab_state.selected(), selected);
+        let next_tab = Event::Key(bmux_keyboard::parse_key_stroke("ctrl+n").unwrap());
+        surface.handle_event(&next_tab, &host);
+        assert_eq!(surface.tab_state.selected(), Some(1));
+        let disabled = Event::Key(bmux_keyboard::parse_key_stroke("space").unwrap());
+        assert!(matches!(
+            surface.handle_event(&disabled, &host),
+            PluginTuiAction::None
+        ));
         assert!(
             surface
                 .shortcuts

@@ -8,6 +8,8 @@
 //! and serde defaults preserve existing decoding; schema versions in config metadata
 //! describe plugin-owned schemas, not host implementation versions.
 
+pub mod keymap;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;

@@ -92,6 +92,18 @@ struct ReviewHomeApp {
     outcome: Option<ReviewHomeOutcome>,
 }
 
+const fn keymap_scope(app: &ReviewHomeApp) -> &'static str {
+    if app.new_review_buffer.is_some() {
+        crate::keybindings::NEW
+    } else if app.rename_buffer.is_some() {
+        crate::keybindings::RENAME
+    } else if app.search_active {
+        crate::keybindings::SEARCH
+    } else {
+        crate::keybindings::HOME
+    }
+}
+
 impl ReviewHomeApp {
     const fn new(repo_path: PathBuf, workspace_items: Vec<ReviewWorkspaceListItem>) -> Self {
         Self {
@@ -336,7 +348,8 @@ impl ReviewHomeApp {
 
     fn start_new_review(&mut self) -> bool {
         self.new_review_buffer = Some(String::new());
-        self.status_message = Some("new review title; enter uses Untitled review".to_string());
+        self.status_message =
+            Some("new review title; submitting an empty title uses Untitled review".to_string());
         true
     }
 
@@ -772,11 +785,32 @@ impl PluginTuiSurface for ReviewHomeSurface {
         render(&self.app, frame, ReviewHomeTheme::resolve(theme));
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        let scope = keymap_scope(&self.app);
+        crate::keybindings::set_hints(crate::keybindings::effective_hints(scope, |action| {
+            host.keymap_keys(scope, action)
+        }));
+        self.render_with_theme(area, frame, theme);
+        crate::keybindings::clear_hints();
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         let Event::Key(key) = event else {
             return PluginTuiAction::None;
         };
-        let needs_redraw = handle_plugin_key_event(&mut self.app, *key, &mut self.pending_action);
+        let scope = keymap_scope(&self.app);
+        let Some(key) =
+            crate::keybindings::from_host(host, scope, *key, scope != crate::keybindings::HOME)
+        else {
+            return PluginTuiAction::None;
+        };
+        let needs_redraw = handle_plugin_key_event(&mut self.app, key, &mut self.pending_action);
         self.spawn_pending_action(host);
         self.action_after_state_update(needs_redraw)
     }
@@ -809,6 +843,7 @@ pub async fn run<W: Write>(
             app
         }
     };
+    let keymap = crate::keybindings::load_registry()?;
     let mut input = TuiInput::start();
     let mut needs_redraw = true;
 
@@ -817,14 +852,31 @@ pub async fn run<W: Write>(
             needs_redraw = true;
         }
         if needs_redraw {
+            let scope = keymap_scope(&app);
+            crate::keybindings::set_hints(crate::keybindings::effective_hints(scope, |action| {
+                keymap
+                    .keys_for_action(scope, action)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            }));
             terminal.draw(|frame| render(&app, frame, ReviewHomeTheme::resolve(None)))?;
+            crate::keybindings::clear_hints();
             needs_redraw = false;
         }
         let Some(event) = input.recv().await? else {
             continue;
         };
         if let Event::Key(key) = event {
-            needs_redraw = handle_key_event(&client, &mut app, key).await;
+            let scope = keymap_scope(&app);
+            if let Some(key) = crate::keybindings::from_registry(
+                &keymap,
+                scope,
+                key,
+                scope != crate::keybindings::HOME,
+            ) {
+                needs_redraw = handle_key_event(&client, &mut app, key).await;
+            }
         }
     }
 
@@ -1614,7 +1666,8 @@ fn render_header(
         LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
         &Line::from_spans(vec![Span::styled(
             format!(
-                " {filter_label}  enter open   c latest   n new   u/s/w/l/v presets   S setup   F drafts   / search   ? help "
+                " {filter_label}  {} ",
+                crate::keybindings::hints().unwrap_or_default().join("  ")
             ),
             theme.muted,
         )]),
@@ -1677,34 +1730,6 @@ fn active_filter_label(app: &ReviewHomeApp) -> String {
     format!("[{archived} {drafts} {attention} {search}]")
 }
 
-const fn review_home_help_lines() -> &'static [&'static str] {
-    &[
-        " Review Picker Help",
-        "",
-        " enter               open selected review; setup opens in build mode",
-        " c                   continue latest visible active review",
-        " o                   force-open selected review in review mode",
-        " build mode: attach sources, fix diagnostics, then m to review",
-        " n                   new empty review: name it, then add sources",
-        " u/s/w/l/v           quick-create unstaged/staged/worktree/last/repo",
-        " S/U                 next/previous setup review",
-        " F/B                 next/previous draft review",
-        " p/P                 next/previous published review",
-        " M/N                 next/previous review needing attention",
-        " j/k or arrows       move selection",
-        " /                   search title, health, source, branch, commit, publish, id",
-        " a                   show/hide archived reviews",
-        " D                   show only reviews with drafts",
-        " A                   show only reviews needing attention",
-        " d                   show/hide details pane",
-        " r                   rename selected review",
-        " x                   archive selected review",
-        " archived             press R to restore before opening",
-        " R                   restore selected archived review",
-        " ctrl+d              exit",
-    ]
-}
-
 fn render_workspaces(
     app: &ReviewHomeApp,
     area: Rect,
@@ -1734,17 +1759,8 @@ fn render_empty_review_home(
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
 ) {
-    let lines = [
-        "No review workspaces yet.",
-        "",
-        "Start fast:",
-        "  u  unstaged changes",
-        "  s  staged changes",
-        "  w  working tree review",
-        "  v  repository browser review",
-        "",
-        "Or press n to name a custom review, then attach sources in build mode.",
-    ];
+    let mut lines = vec!["No review workspaces yet.".to_owned(), String::new()];
+    lines.extend(crate::keybindings::hints().unwrap_or_default());
     for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
         let style = if row == 0 {
             theme.focused.add_modifier(Modifier::BOLD)
@@ -2195,7 +2211,7 @@ fn relative_time_label(timestamp_ms: u64) -> String {
 }
 
 fn render_help(area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewHomeTheme) {
-    let lines = review_home_help_lines();
+    let lines = crate::keybindings::hints().unwrap_or_default();
     let width = area.width.min(72);
     let height = area.height.min(
         u16::try_from(lines.len())
@@ -2231,7 +2247,7 @@ fn render_help(area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewHomeTheme) 
                 1,
             )),
             &Line::from_spans(vec![Span::styled(
-                text.to_string(),
+                text.clone(),
                 theme.canvas.patch(theme.text),
             )]),
         );
@@ -2248,34 +2264,16 @@ fn render_footer(
         || {
             app.rename_buffer.as_ref().map_or_else(
                 || {
-                    if app.search_active || !app.search_query.is_empty() {
+                    if app.search_active {
                         format!("search: {}", app.search_query)
-                    } else if let Some(item) = app
-                        .selected_workspace_index()
-                        .and_then(|index| app.workspace_item(index))
-                    {
-                        format!(
-                            "{}: {}  · enter open  c latest  b build  o review  ? help",
-                            workspace_health_label(item),
-                            workspace_next_action(item)
-                        )
                     } else {
-                        app.status_message.clone().unwrap_or_else(|| {
-                            "review home: n new, u/s/w/l/v presets, / search title/health/source/publish, ? help"
-                        .to_string()
-                        })
+                        crate::keybindings::hints().unwrap_or_default().join("  ")
                     }
                 },
-                |rename| format!("rename: {rename}"),
+                |title| format!("rename: {title}"),
             )
         },
-        |title| {
-            if title.is_empty() {
-                "new review title: <enter for Untitled review>".to_string()
-            } else {
-                format!("new review title: {title}")
-            }
-        },
+        |title| format!("new review title: {title}"),
     );
     frame.write_line(
         LocalRect::terminal(Rect::new(

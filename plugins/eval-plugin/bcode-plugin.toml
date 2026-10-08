@@ -4,6 +4,574 @@ version = "0.0.1"
 
 categories = ["eval"]
 
+keymap_actions = [
+    { id = "bcode.eval.picker.open", scope = "eval-run-picker", description = "Open run", defaults = [
+        "enter",
+    ] },
+    { id = "bcode.eval.picker.campaign", scope = "eval-run-picker", description = "Start campaign", defaults = [
+        "s",
+    ] },
+    { id = "bcode.eval.picker.run", scope = "eval-run-picker", description = "Run suite", defaults = [
+        "u",
+    ] },
+    { id = "bcode.eval.picker.new", scope = "eval-run-picker", description = "New campaign", defaults = [
+        "n",
+    ] },
+    { id = "bcode.eval.picker.attach", scope = "eval-run-picker", description = "Attach run", defaults = [
+        "a",
+    ] },
+    { id = "bcode.eval.picker.refresh", scope = "eval-run-picker", description = "Refresh", defaults = [
+        "r",
+    ] },
+    { id = "bcode.eval.picker.help", scope = "eval-run-picker", description = "Help", defaults = [
+        "?",
+    ] },
+    { id = "bcode.eval.close", scope = "eval-run-picker", description = "Close", defaults = [
+        "q",
+        "escape",
+    ] },
+    { id = "tui.control.up", scope = "eval-run-picker", description = "Move up", defaults = [
+        "up",
+    ] },
+    { id = "tui.control.down", scope = "eval-run-picker", description = "Move down", defaults = [
+        "down",
+    ] },
+    { id = "tui.control.left", scope = "eval-run-picker", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "eval-run-picker", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "eval-run-picker", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "eval-run-picker", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "eval-run-picker", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "eval-run-picker", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.focus_next", scope = "eval-run-picker", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "eval-run-picker", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "eval-run-picker", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "eval-run-picker", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "eval-run-picker", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "eval-run-picker", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "eval-run-picker", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "eval-run-picker", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "eval-run-picker", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "eval-run-picker", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "eval-run-picker", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "eval-run-picker", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "eval-run-picker", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "eval-run-picker", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "eval-run-picker", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "eval-run-picker", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "eval-run-picker", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "eval-run-picker", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "eval-run-picker", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.eval.viewer.next_tab", scope = "eval-run-viewer", description = "Next tab", defaults = [
+        "tab",
+    ] },
+    { id = "bcode.eval.viewer.diff", scope = "eval-run-viewer", description = "Diff", defaults = [
+        "d",
+    ] },
+    { id = "bcode.eval.viewer.transcript", scope = "eval-run-viewer", description = "Transcript", defaults = [
+        "t",
+    ] },
+    { id = "bcode.eval.viewer.tools", scope = "eval-run-viewer", description = "Tools", defaults = [
+        "c",
+    ] },
+    { id = "bcode.eval.viewer.refresh", scope = "eval-run-viewer", description = "Refresh", defaults = [
+        "r",
+    ] },
+    { id = "bcode.eval.close", scope = "eval-run-viewer", description = "Close", defaults = [
+        "q",
+        "escape",
+    ] },
+    { id = "tui.control.up", scope = "eval-run-viewer", description = "Move up", defaults = [
+        "up",
+    ] },
+    { id = "tui.control.down", scope = "eval-run-viewer", description = "Move down", defaults = [
+        "down",
+    ] },
+    { id = "tui.control.left", scope = "eval-run-viewer", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "eval-run-viewer", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "eval-run-viewer", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "eval-run-viewer", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "eval-run-viewer", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "eval-run-viewer", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "eval-run-viewer", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.focus_previous", scope = "eval-run-viewer", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "eval-run-viewer", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "eval-run-viewer", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "eval-run-viewer", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "eval-run-viewer", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "eval-run-viewer", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "eval-run-viewer", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "eval-run-viewer", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "eval-run-viewer", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "eval-run-viewer", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "eval-run-viewer", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "eval-run-viewer", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "eval-run-viewer", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "eval-run-viewer", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "eval-run-viewer", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "eval-run-viewer", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "eval-run-viewer", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "eval-run-viewer", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.eval.campaign.open", scope = "eval-campaign", description = "Generation details", defaults = [
+        "enter",
+    ] },
+    { id = "bcode.eval.campaign.run", scope = "eval-campaign", description = "Open run", defaults = [
+        "o",
+    ] },
+    { id = "bcode.eval.campaign.view", scope = "eval-campaign", description = "Cycle view", defaults = [
+        "v",
+    ] },
+    { id = "bcode.eval.campaign.metric", scope = "eval-campaign", description = "Cycle metric", defaults = [
+        "m",
+    ] },
+    { id = "bcode.eval.campaign.record", scope = "eval-campaign", description = "Record generation", defaults = [
+        "r",
+    ] },
+    { id = "bcode.eval.campaign.next", scope = "eval-campaign", description = "Run next", defaults = [
+        "u",
+    ] },
+    { id = "bcode.eval.campaign.promote", scope = "eval-campaign", description = "Promote", defaults = [
+        "p",
+    ] },
+    { id = "bcode.eval.campaign.reject", scope = "eval-campaign", description = "Reject", defaults = [
+        "x",
+    ] },
+    { id = "bcode.eval.campaign.help", scope = "eval-campaign", description = "Help", defaults = [
+        "?",
+    ] },
+    { id = "bcode.eval.close", scope = "eval-campaign", description = "Close", defaults = [
+        "q",
+        "escape",
+    ] },
+    { id = "tui.control.up", scope = "eval-campaign", description = "Move up", defaults = [
+        "up",
+    ] },
+    { id = "tui.control.down", scope = "eval-campaign", description = "Move down", defaults = [
+        "down",
+    ] },
+    { id = "tui.control.left", scope = "eval-campaign", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "eval-campaign", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "eval-campaign", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "eval-campaign", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "eval-campaign", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "eval-campaign", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.focus_next", scope = "eval-campaign", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "eval-campaign", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "eval-campaign", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "eval-campaign", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "eval-campaign", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "eval-campaign", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "eval-campaign", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "eval-campaign", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "eval-campaign", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "eval-campaign", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "eval-campaign", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "eval-campaign", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "eval-campaign", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "eval-campaign", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "eval-campaign", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "eval-campaign", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "eval-campaign", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "eval-campaign", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "eval-campaign", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.eval.generation.tab", scope = "eval-generation", description = "Next tab", defaults = [
+        "tab",
+    ] },
+    { id = "bcode.eval.generation.open", scope = "eval-generation", description = "Open run", defaults = [
+        "o",
+    ] },
+    { id = "bcode.eval.generation.record", scope = "eval-generation", description = "Record", defaults = [
+        "r",
+    ] },
+    { id = "bcode.eval.generation.baseline", scope = "eval-generation", description = "Baseline", defaults = [
+        "b",
+    ] },
+    { id = "bcode.eval.generation.promote", scope = "eval-generation", description = "Promote", defaults = [
+        "p",
+    ] },
+    { id = "bcode.eval.generation.reject", scope = "eval-generation", description = "Reject", defaults = [
+        "x",
+    ] },
+    { id = "bcode.eval.close", scope = "eval-generation", description = "Close", defaults = [
+        "q",
+        "escape",
+    ] },
+    { id = "tui.control.up", scope = "eval-generation", description = "Move up", defaults = [
+        "up",
+    ] },
+    { id = "tui.control.down", scope = "eval-generation", description = "Move down", defaults = [
+        "down",
+    ] },
+    { id = "tui.control.left", scope = "eval-generation", description = "Move left", defaults = [
+        "left",
+    ] },
+    { id = "tui.control.right", scope = "eval-generation", description = "Move right", defaults = [
+        "right",
+    ] },
+    { id = "tui.control.home", scope = "eval-generation", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "eval-generation", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "eval-generation", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "eval-generation", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "eval-generation", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.focus_previous", scope = "eval-generation", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "eval-generation", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "eval-generation", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "eval-generation", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "eval-generation", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "eval-generation", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "eval-generation", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "eval-generation", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "eval-generation", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+    ] },
+    { id = "tui.control.line_end", scope = "eval-generation", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "eval-generation", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "eval-generation", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "eval-generation", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "eval-generation", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "eval-generation", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "eval-generation", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "eval-generation", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "eval-generation", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "tui.control.up", scope = "eval-wizard", description = "Move up", defaults = [
+        "up",
+        "ctrl+p",
+    ] },
+    { id = "tui.control.down", scope = "eval-wizard", description = "Move down", defaults = [
+        "down",
+        "ctrl+n",
+    ] },
+    { id = "tui.control.left", scope = "eval-wizard", description = "Move left", defaults = [
+        "left",
+        "ctrl+b",
+    ] },
+    { id = "tui.control.right", scope = "eval-wizard", description = "Move right", defaults = [
+        "right",
+        "ctrl+f",
+    ] },
+    { id = "tui.control.home", scope = "eval-wizard", description = "Move to beginning", defaults = [
+        "home",
+    ] },
+    { id = "tui.control.end", scope = "eval-wizard", description = "Move to end", defaults = [
+        "end",
+    ] },
+    { id = "tui.control.page_up", scope = "eval-wizard", description = "Move one page up", defaults = [
+        "pageup",
+    ] },
+    { id = "tui.control.page_down", scope = "eval-wizard", description = "Move one page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "tui.control.submit", scope = "eval-wizard", description = "Activate or submit", defaults = [
+        "enter",
+    ] },
+    { id = "tui.control.cancel", scope = "eval-wizard", description = "Cancel or close", defaults = [
+        "escape",
+    ] },
+    { id = "tui.control.focus_next", scope = "eval-wizard", description = "Focus next control", defaults = [
+        "tab",
+    ] },
+    { id = "tui.control.focus_previous", scope = "eval-wizard", description = "Focus previous control", defaults = [
+        "shift+tab",
+    ] },
+    { id = "tui.control.toggle", scope = "eval-wizard", description = "Toggle selection", defaults = [
+        "space",
+    ] },
+    { id = "tui.control.backspace", scope = "eval-wizard", description = "Delete previous character", defaults = [
+        "backspace",
+    ] },
+    { id = "tui.control.delete", scope = "eval-wizard", description = "Delete next character", defaults = [
+        "delete",
+    ] },
+    { id = "tui.control.word_left", scope = "eval-wizard", description = "Move to previous word", defaults = [
+        "ctrl+left",
+        "alt+left",
+        "alt+b",
+    ] },
+    { id = "tui.control.word_right", scope = "eval-wizard", description = "Move to next word", defaults = [
+        "ctrl+right",
+        "alt+right",
+        "alt+f",
+    ] },
+    { id = "tui.control.delete_word_backward", scope = "eval-wizard", description = "Delete previous word", defaults = [
+        "ctrl+w",
+        "ctrl+backspace",
+        "alt+backspace",
+    ] },
+    { id = "tui.control.delete_word_forward", scope = "eval-wizard", description = "Delete next word", defaults = [
+        "ctrl+delete",
+        "alt+delete",
+    ] },
+    { id = "tui.control.line_start", scope = "eval-wizard", description = "Move to boundary start", defaults = [
+        "ctrl+a",
+        "super+left",
+    ] },
+    { id = "tui.control.line_end", scope = "eval-wizard", description = "Move to boundary end", defaults = [
+        "ctrl+e",
+        "super+right",
+    ] },
+    { id = "tui.control.delete_to_start", scope = "eval-wizard", description = "Delete to boundary start", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "tui.control.delete_to_end", scope = "eval-wizard", description = "Delete to boundary end", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "tui.control.select_left", scope = "eval-wizard", description = "Select left", defaults = [
+        "shift+left",
+    ] },
+    { id = "tui.control.select_right", scope = "eval-wizard", description = "Select right", defaults = [
+        "shift+right",
+    ] },
+    { id = "tui.control.select_up", scope = "eval-wizard", description = "Select up", defaults = [
+        "shift+up",
+    ] },
+    { id = "tui.control.select_down", scope = "eval-wizard", description = "Select down", defaults = [
+        "shift+down",
+    ] },
+    { id = "tui.control.select_word_left", scope = "eval-wizard", description = "Select previous word", defaults = [
+        "ctrl+shift+left",
+        "alt+shift+left",
+    ] },
+    { id = "tui.control.select_word_right", scope = "eval-wizard", description = "Select next word", defaults = [
+        "ctrl+shift+right",
+        "alt+shift+right",
+    ] },
+    { id = "bcode.eval.text.select_start", scope = "eval-wizard", description = "Select to boundary start", defaults = [
+        "shift+home",
+    ] },
+    { id = "bcode.eval.text.select_end", scope = "eval-wizard", description = "Select to boundary end", defaults = [
+        "shift+end",
+    ] },
+]
+
 [[services]]
 class        = "service"
 description  = "Versioned SDK evaluation artifact loader"

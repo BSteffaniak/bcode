@@ -21,7 +21,6 @@ use bcode_session_models::{
     SessionDerivationRequest, SessionDerivationSourcePolicy, SessionDerivationTerminalOutcome,
 };
 use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
-use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -365,6 +364,19 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
 #[must_use]
 pub fn session_derivation_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    for (action, keys) in [
+        ("close", vec!["esc", "q"]),
+        ("previous", vec!["up"]),
+        ("next", vec!["down"]),
+        ("select", vec!["enter"]),
+    ] {
+        registry.register_keymap_action(bcode_plugin_sdk::tui::keymap::KeymapAction {
+            id: format!("session-derivation.{action}"),
+            scope: "session-derivation".into(),
+            description: action.into(),
+            defaults: keys.into_iter().map(str::to_owned).collect(),
+        });
+    }
     registry.register_factory(Box::new(ForkSelectSurfaceFactory));
     registry
 }
@@ -392,6 +404,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ForkSelectSurfaceFactory
             )?;
             Ok(Box::new(ForkSelectSurface {
                 candidates,
+                hint: String::new(),
                 selected: 0,
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
@@ -400,6 +413,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ForkSelectSurfaceFactory
 }
 
 struct ForkSelectSurface {
+    hint: String,
     candidates: Vec<bcode_session_models::SessionDerivationPromptCandidate>,
     selected: usize,
 }
@@ -442,6 +456,10 @@ impl ForkSelectSurface {
                 "Select the prompt to edit in the fork",
                 focused,
             )]),
+        );
+        frame.write_line(
+            LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
+            &Line::from(self.hint.clone()),
         );
         for (index, candidate) in self
             .candidates
@@ -497,30 +515,55 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
         self.render_with_presentation(area, frame, theme);
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) {
+        self.hint = ["previous", "next", "select", "close"]
+            .map(|action| {
+                let keys = host
+                    .keymap_keys(
+                        "session-derivation",
+                        &format!("session-derivation.{action}"),
+                    )
+                    .join("/");
+                if keys.is_empty() {
+                    format!("{action} (unbound)")
+                } else {
+                    format!("{keys}: {action}")
+                }
+            })
+            .join("  ");
+        self.render_with_presentation(area, frame, theme);
+    }
+
     fn handle_event(
         &mut self,
         event: &Event,
-        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> bcode_plugin_sdk::tui::PluginTuiAction {
         let Event::Key(key) = event else {
             return bcode_plugin_sdk::tui::PluginTuiAction::None;
         };
-        match key.key {
-            KeyCode::Escape | KeyCode::Char('q') => {
+        match host.keymap_action("session-derivation", *key).as_deref() {
+            Some("session-derivation.close") => {
                 bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
             }
-            KeyCode::Up => {
+            Some("session-derivation.previous") => {
                 self.selected = self.selected.saturating_sub(1);
                 bcode_plugin_sdk::tui::PluginTuiAction::Redraw
             }
-            KeyCode::Down => {
+            Some("session-derivation.next") => {
                 self.selected = self
                     .selected
                     .saturating_add(1)
                     .min(self.candidates.len().saturating_sub(1));
                 bcode_plugin_sdk::tui::PluginTuiAction::Redraw
             }
-            KeyCode::Enter => {
+            Some("session-derivation.select") => {
                 if self.candidates.get(self.selected).is_none() {
                     return bcode_plugin_sdk::tui::PluginTuiAction::None;
                 }
@@ -551,6 +594,41 @@ bcode_plugin_sdk::export_plugin!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_selector_remap_and_unbind_change_dispatch_keys() {
+        let definitions = session_derivation_tui_registry();
+        let mut registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+        registry
+            .register_all(definitions.keymap_actions().iter().cloned())
+            .unwrap();
+        registry
+            .configure(BTreeMap::from([(
+                "session-derivation".into(),
+                BTreeMap::from([
+                    ("ctrl+n".into(), "session-derivation.next".into()),
+                    ("q".into(), String::new()),
+                ]),
+            )]))
+            .unwrap();
+        let parse = |key| bmux_keyboard::parse_key_stroke(key).unwrap();
+        assert_eq!(
+            registry.action_for_key("session-derivation", parse("down")),
+            None
+        );
+        assert_eq!(
+            registry.action_for_key("session-derivation", parse("q")),
+            None
+        );
+        assert_eq!(
+            registry.action_for_key("session-derivation", parse("ctrl+n")),
+            Some("session-derivation.next")
+        );
+        assert_eq!(
+            registry.keys_for_action("session-derivation", "session-derivation.next"),
+            ["ctrl+n"]
+        );
+    }
 
     #[test]
     fn commands_are_plugin_owned_first_class_entries() {
@@ -616,6 +694,7 @@ mod tests {
     #[test]
     fn fork_surface_selection_returns_plugin_command_continuation() {
         let mut surface = ForkSelectSurface {
+            hint: String::new(),
             candidates: vec![
                 bcode_session_models::SessionDerivationPromptCandidate {
                     sequence: 4,

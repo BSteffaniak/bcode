@@ -625,6 +625,10 @@ pub struct PluginManifest {
     pub visual_adapters: Vec<PluginVisualAdapterDeclaration>,
     #[serde(default)]
     pub tool_presentations: Vec<PluginToolPresentationDeclaration>,
+    /// Portable action declarations contributed by either native or static plugin manifests.
+    /// Missing collections decode empty; declarations use strings, never terminal input types.
+    #[serde(default)]
+    pub keymap_actions: Vec<bcode_plugin_models::keymap::KeymapAction>,
     #[serde(default)]
     pub command_contributions: Vec<PluginCommandContribution>,
     #[serde(default)]
@@ -3304,10 +3308,75 @@ impl PluginExecutorHandle {
 #[derive(Debug, Clone)]
 pub struct PluginRegistry {
     manifests: BTreeMap<String, PluginManifest>,
+    keymap_actions: BTreeMap<(String, String, String), bcode_plugin_models::keymap::KeymapAction>,
     template_order: Vec<(String, usize)>,
     template_lookup: BTreeMap<String, BTreeMap<String, BTreeMap<u32, usize>>>,
     service_registry: PluginServiceRegistry,
     service_policies: BTreeMap<(String, String), ServiceRuntimePolicy>,
+}
+
+fn index_keymap_actions(
+    manifests: &BTreeMap<String, PluginManifest>,
+) -> BTreeMap<(String, String, String), bcode_plugin_models::keymap::KeymapAction> {
+    manifests
+        .iter()
+        .flat_map(|(owner, manifest)| {
+            manifest.keymap_actions.iter().map(|action| {
+                (
+                    (owner.clone(), action.scope.clone(), action.id.clone()),
+                    action.clone(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn index_service_policies(
+    manifests: &BTreeMap<String, PluginManifest>,
+) -> BTreeMap<(String, String), ServiceRuntimePolicy> {
+    manifests
+        .values()
+        .flat_map(|manifest| {
+            manifest.services.iter().map(|service| {
+                (
+                    (manifest.id.clone(), service.interface_id.clone()),
+                    ServiceRuntimePolicy {
+                        concurrency: service.concurrency.as_ref().map_or_else(
+                            || PluginConcurrency::from(&manifest.concurrency),
+                            PluginConcurrency::from,
+                        ),
+                        class: service.class,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn keymap_actions_page(
+    index: &BTreeMap<(String, String, String), bcode_plugin_models::keymap::KeymapAction>,
+    after: Option<(&str, &str, &str)>,
+    limit: usize,
+) -> bcode_plugin_models::keymap::KeymapActionPage {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let bound = after.map_or(Unbounded, |(owner, scope, id)| {
+        Excluded((owner.to_owned(), scope.to_owned(), id.to_owned()))
+    });
+    let mut entries = index.range((bound, Unbounded));
+    let limit = limit.clamp(1, 100);
+    let mut actions = Vec::with_capacity(limit);
+    let mut last = None;
+    for (identity, action) in entries.by_ref().take(limit) {
+        last = Some(identity.clone());
+        actions.push(bcode_plugin_models::keymap::PluginOwnedKeymapAction {
+            plugin_id: identity.0.clone(),
+            action: action.clone(),
+        });
+    }
+    bcode_plugin_models::keymap::KeymapActionPage {
+        actions,
+        next: if entries.next().is_some() { last } else { None },
+    }
 }
 
 impl PluginRegistry {
@@ -3378,21 +3447,7 @@ impl PluginRegistry {
             }
         }
         let service_registry = PluginServiceRegistry::from_manifests(manifests.values());
-        let mut service_policies = BTreeMap::new();
-        for manifest in manifests.values() {
-            for service in &manifest.services {
-                service_policies.insert(
-                    (manifest.id.clone(), service.interface_id.clone()),
-                    ServiceRuntimePolicy {
-                        concurrency: service.concurrency.as_ref().map_or_else(
-                            || PluginConcurrency::from(&manifest.concurrency),
-                            PluginConcurrency::from,
-                        ),
-                        class: service.class,
-                    },
-                );
-            }
-        }
+        let service_policies = index_service_policies(&manifests);
         let mut template_order = Vec::new();
         let mut template_lookup = BTreeMap::<String, BTreeMap<String, BTreeMap<u32, usize>>>::new();
         for (owner, manifest) in &manifests {
@@ -3406,13 +3461,27 @@ impl PluginRegistry {
                     .insert(template.template_version, index);
             }
         }
+        let keymap_actions = index_keymap_actions(&manifests);
         Self {
             manifests,
+            keymap_actions,
             template_order,
             template_lookup,
             service_registry,
             service_policies,
         }
+    }
+
+    /// Discover enabled loaded-plugin declarations without terminal dependencies or execution.
+    /// `after` is an exclusive `(plugin_id, scope, action_id)` from the previous page.
+    /// Limits are clamped to 1..=100. Restart when the loaded runtime generation changes.
+    #[must_use]
+    pub fn keymap_actions_page(
+        &self,
+        after: Option<(&str, &str, &str)>,
+        limit: usize,
+    ) -> bcode_plugin_models::keymap::KeymapActionPage {
+        keymap_actions_page(&self.keymap_actions, after, limit)
     }
 
     /// Return loaded plugin manifests keyed by plugin ID.
@@ -3929,6 +3998,17 @@ impl PluginRuntimeHost {
     #[must_use]
     pub fn registry(&self) -> &PluginRegistry {
         &self.registry
+    }
+
+    /// Bounded action discovery for enabled loaded plugins, including native dynamic plugins.
+    /// Cursor identities are exclusive; restart when this runtime generation changes.
+    #[must_use]
+    pub fn keymap_actions_page(
+        &self,
+        after: Option<(&str, &str, &str)>,
+        limit: usize,
+    ) -> bcode_plugin_models::keymap::KeymapActionPage {
+        self.registry.keymap_actions_page(after, limit)
     }
 
     /// Return command contributions registered by loaded plugins.
@@ -5217,6 +5297,9 @@ fn manifest_event_subscriptions<'a>(
 /// Loaded plugin host retaining activated plugins.
 #[derive(Debug)]
 pub struct PluginHost {
+    keymap_index: std::sync::OnceLock<
+        BTreeMap<(String, String, String), bcode_plugin_models::keymap::KeymapAction>,
+    >,
     loaded: Vec<LoadedPlugin>,
     cleanup_pending: Vec<LoadedPlugin>,
     configs: BTreeMap<String, ResolvedPluginConfig>,
@@ -5234,6 +5317,7 @@ impl Default for PluginHost {
             command_registry,
             auth_provider_registry: AuthProviderRegistry::new(),
             cleanup_pending: Vec::new(),
+            keymap_index: std::sync::OnceLock::new(),
         }
     }
 }
@@ -5396,6 +5480,7 @@ impl PluginHost {
             },
             auth_provider_registry: AuthProviderRegistry::new(),
             cleanup_pending: Vec::new(),
+            keymap_index: std::sync::OnceLock::new(),
         };
         host.load_static_plugins_into(&static_plugins)?;
         host.load_registered_plugins_into(&plugins)?;
@@ -5474,6 +5559,7 @@ impl PluginHost {
             return Err(error);
         }
         self.loaded.push(loaded);
+        self.keymap_index.take();
         Ok(())
     }
 
@@ -5590,6 +5676,40 @@ impl PluginHost {
             self.validate_loaded_tool_presentation_ownership(&plugin.manifest().id, &tools)?;
         }
         Ok(())
+    }
+
+    /// Return whether this host has successfully loaded the requested plugin.
+    #[must_use]
+    pub fn has_plugin(&self, plugin_id: &str) -> bool {
+        self.loaded
+            .iter()
+            .any(|plugin| plugin.manifest().id == plugin_id)
+    }
+
+    /// Discover declarations from successfully loaded plugins in bounded ordered pages.
+    /// Limits are clamped to 1..=100; cursors are exclusive `(plugin_id, scope, action_id)`.
+    /// Restart after changing the loaded plugin selection. Failed activation is never included.
+    #[must_use]
+    pub fn keymap_actions_page(
+        &self,
+        after: Option<(&str, &str, &str)>,
+        limit: usize,
+    ) -> bcode_plugin_models::keymap::KeymapActionPage {
+        let index = self.keymap_index.get_or_init(|| {
+            self.loaded
+                .iter()
+                .flat_map(|plugin| {
+                    let manifest = plugin.manifest();
+                    manifest.keymap_actions.iter().map(|action| {
+                        (
+                            (manifest.id.clone(), action.scope.clone(), action.id.clone()),
+                            action.clone(),
+                        )
+                    })
+                })
+                .collect()
+        });
+        keymap_actions_page(index, after, limit)
     }
 
     /// Return loaded plugins.
@@ -5737,6 +5857,7 @@ impl PluginHost {
     /// Returns the first deactivation error after attempting every plugin. Failed plugins
     /// remain loaded for retry; successfully deactivated plugins are removed.
     pub fn deactivate_all(&mut self) -> Result<(), PluginLoadError> {
+        self.keymap_index.take();
         let mut failed = Vec::new();
         let mut first_error = None;
         while let Some(plugin) = self.loaded.pop() {
@@ -6745,6 +6866,7 @@ library = "libauth_test.dylib"
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
+            keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
             workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),
@@ -6793,6 +6915,7 @@ library = "libauth_test.dylib"
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
+            keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
             workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),
@@ -7151,6 +7274,7 @@ library = "libexample_plugin.dylib"
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
             cleanup_pending: Vec::new(),
+            keymap_index: std::sync::OnceLock::new(),
         };
 
         let error = host
@@ -9105,6 +9229,7 @@ library = "libexample_plugin.dylib"
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
             cleanup_pending: Vec::new(),
+            keymap_index: std::sync::OnceLock::new(),
             loaded: vec![LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest,
@@ -9266,6 +9391,7 @@ library = "libexample_plugin.dylib"
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
             cleanup_pending: Vec::new(),
+            keymap_index: std::sync::OnceLock::new(),
             loaded,
         };
         assert!(host.deactivate_all().is_err());
@@ -9299,6 +9425,7 @@ library = "libexample_plugin.dylib"
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
                 cleanup_pending: Vec::new(),
+                keymap_index: std::sync::OnceLock::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest,
@@ -9887,6 +10014,7 @@ library = "libexample_plugin.dylib"
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
             cleanup_pending: Vec::new(),
+            keymap_index: std::sync::OnceLock::new(),
             loaded: ["z-failed", "a-healthy"]
                 .into_iter()
                 .map(|id| LoadedPlugin {
@@ -10769,6 +10897,7 @@ library = "libexample_plugin.dylib"
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
             cleanup_pending: Vec::new(),
+            keymap_index: std::sync::OnceLock::new(),
             loaded: ["a-healthy", "z-unknown"]
                 .into_iter()
                 .map(|id| LoadedPlugin {
@@ -10815,6 +10944,7 @@ library = "libexample_plugin.dylib"
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
             cleanup_pending: Vec::new(),
+            keymap_index: std::sync::OnceLock::new(),
             loaded: vec![LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest: test_manifest("unpolled-cleanup"),
@@ -10874,6 +11004,7 @@ library = "libexample_plugin.dylib"
                     command_registry: bcode_command::CommandRegistry::new(),
                     auth_provider_registry: AuthProviderRegistry::new(),
                     cleanup_pending: Vec::new(),
+                    keymap_index: std::sync::OnceLock::new(),
                     loaded: vec![LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
                         manifest,
@@ -10930,6 +11061,7 @@ library = "libexample_plugin.dylib"
                     command_registry: bcode_command::CommandRegistry::new(),
                     auth_provider_registry: AuthProviderRegistry::new(),
                     cleanup_pending: Vec::new(),
+                    keymap_index: std::sync::OnceLock::new(),
                     loaded: vec![
                         LoadedPlugin {
                             config: ResolvedPluginConfig::default(),
@@ -11027,6 +11159,7 @@ library = "libexample_plugin.dylib"
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
                 cleanup_pending: Vec::new(),
+                keymap_index: std::sync::OnceLock::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest,
@@ -11092,6 +11225,7 @@ library = "libexample_plugin.dylib"
                     command_registry: bcode_command::CommandRegistry::new(),
                     auth_provider_registry: AuthProviderRegistry::new(),
                     cleanup_pending: Vec::new(),
+                    keymap_index: std::sync::OnceLock::new(),
                     loaded,
                 });
                 let result = runtime.deactivate_all().await;
@@ -11258,6 +11392,7 @@ library = "libexample_plugin.dylib"
                 tui_surfaces: Vec::new(),
                 visual_adapters: Vec::new(),
                 tool_presentations: Vec::new(),
+                keymap_actions: Vec::new(),
                 command_contributions: Vec::new(),
                 workflow_templates: Vec::new(),
                 event_subscriptions: Vec::new(),
@@ -11286,6 +11421,7 @@ library = "libexample_plugin.dylib"
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
                 cleanup_pending: Vec::new(),
+                keymap_index: std::sync::OnceLock::new(),
                 loaded: vec![
                     LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
@@ -11500,6 +11636,7 @@ library = "libexample_plugin.dylib"
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
                 cleanup_pending: Vec::new(),
+                keymap_index: std::sync::OnceLock::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
@@ -11638,6 +11775,7 @@ library = "libexample_plugin.dylib"
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
                 cleanup_pending: Vec::new(),
+                keymap_index: std::sync::OnceLock::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
@@ -12142,6 +12280,74 @@ library = "libexample_plugin.dylib"
         assert_eq!(routes[0].adapter_reference(), "bcode.producer/producer");
     }
 
+    #[test]
+    fn synchronous_host_keymap_pages_match_runtime_discovery() {
+        let mut manifest = test_manifest("plugin.enabled");
+        manifest.keymap_actions = (0..3)
+            .map(|index| bcode_plugin_models::keymap::KeymapAction {
+                id: format!("plugin.action.{index}"),
+                scope: "viewer".into(),
+                description: format!("Action {index}"),
+                defaults: Vec::new(),
+            })
+            .collect();
+        let host = PluginHost {
+            loaded: vec![LoadedPlugin {
+                manifest: manifest.clone(),
+                config: ResolvedPluginConfig::default(),
+                backend: LoadedPluginBackend::Static {
+                    vtable: test_streaming_vtable(),
+                },
+            }],
+            cleanup_pending: Vec::new(),
+            configs: BTreeMap::new(),
+            command_registry: bcode_command::CommandRegistry::new(),
+            auth_provider_registry: AuthProviderRegistry::new(),
+            keymap_index: std::sync::OnceLock::new(),
+        };
+        let registry =
+            PluginRegistry::from_manifests(BTreeMap::from([(manifest.id.clone(), manifest)]));
+        assert!(host.has_plugin("plugin.enabled"));
+        assert!(!host.has_plugin("plugin.disabled"));
+        let first = host.keymap_actions_page(None, 2);
+        assert_eq!(first, registry.keymap_actions_page(None, 2));
+        let cursor = first.next.unwrap();
+        assert_eq!(
+            host.keymap_actions_page(Some((&cursor.0, &cursor.1, &cursor.2)), 2),
+            registry.keymap_actions_page(Some((&cursor.0, &cursor.1, &cursor.2)), 2)
+        );
+    }
+
+    #[test]
+    fn indexed_keymap_discovery_pages_only_loaded_contributors() {
+        use bcode_plugin_models::keymap::KeymapAction;
+        let mut loaded = test_manifest("plugin.enabled");
+        loaded.keymap_actions = (0..3)
+            .map(|index| KeymapAction {
+                id: format!("plugin.action.{index}"),
+                scope: "viewer".into(),
+                description: format!("Action {index}"),
+                defaults: Vec::new(),
+            })
+            .collect();
+        let registry =
+            PluginRegistry::from_manifests(BTreeMap::from([(loaded.id.clone(), loaded)]));
+        let first = registry.keymap_actions_page(None, 2);
+        assert_eq!(first.actions.len(), 2);
+        assert!(
+            first
+                .actions
+                .iter()
+                .all(|entry| entry.plugin_id == "plugin.enabled")
+        );
+        let cursor = first.next.unwrap();
+        let second = registry.keymap_actions_page(Some((&cursor.0, &cursor.1, &cursor.2)), 2);
+        assert_eq!(second.actions.len(), 1);
+        assert_eq!(second.actions[0].action.id, "plugin.action.2");
+        assert!(second.next.is_none());
+        assert_eq!(registry.keymap_actions_page(None, 0).actions.len(), 1);
+    }
+
     fn test_manifest(id: &str) -> PluginManifest {
         PluginManifest {
             config: None,
@@ -12161,6 +12367,7 @@ library = "libexample_plugin.dylib"
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
+            keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
             workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),

@@ -81,12 +81,13 @@ fn transcript_item_rows(
         return TranscriptLayoutRows::BlankSpan(usize::from(height.max(1)));
     }
     let markdown = render::transcript_markdown_projection_for_layout(app, item, input.width);
-    let (rows, anchors, selection) = render::transcript_item_layout_from_item(
+    let (rows, anchors, selection) = render::transcript_item_layout_with_keymap(
         item,
         input.width,
         input.plugin_host,
         input.diff_viewer_config,
         markdown.as_deref(),
+        app.effective_keymap(),
     );
     if let Some(projection) = markdown
         && matches!(

@@ -16,7 +16,23 @@ use super::render::TuiTheme;
 use super::session_picker::{SessionPickerApp, SessionPickerMode};
 
 /// Render the session picker.
+#[cfg(test)]
 pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
+    render_picker_with_keymap(
+        app,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render effective session shortcuts.
+pub fn render_picker_with_keymap(
+    app: &mut SessionPickerApp,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
+) {
     app.set_list_area(None);
     let mode = app.mode();
     let Some((inner, list_y)) = render_picker_chrome(
@@ -25,7 +41,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, th
         } else {
             " Sessions · This directory "
         },
-        &header_line(mode),
+        &header_line_with_keymap(mode, keymap),
         app.active_input_mut(),
         input_placeholder(mode),
         frame,
@@ -35,7 +51,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, th
     };
 
     if mode == SessionPickerMode::Filter && inner.height > 1 {
-        render_scope_controls(app.all_directories(), inner, frame, theme);
+        render_scope_controls(app.all_directories(), inner, frame, theme, keymap);
     }
     let bottom_y = render_picker_status(inner, app.status(), theme.muted, frame, theme);
     if let Some((session, warnings)) = app.last_import()
@@ -97,7 +113,21 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, th
     );
 }
 
-fn render_scope_controls(all: bool, inner: Rect, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
+fn render_scope_controls(
+    all: bool,
+    inner: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
+) {
+    let next = format!(
+        "Next page {}",
+        keymap.hint("session_picker", "tui.session.catalogNextPage")
+    );
+    let restart = format!(
+        "Restart {}",
+        keymap.hint("session_picker", "tui.session.catalogRestart")
+    );
     let buttons = [
         ActionButton::new(
             "local",
@@ -115,8 +145,8 @@ fn render_scope_controls(all: bool, inner: Rect, frame: &mut PaintCx<'_, '_>, th
                 "All directories"
             },
         ),
-        ActionButton::new("next", "Next page Alt-P"),
-        ActionButton::new("restart", "Restart Alt-R"),
+        ActionButton::new("next", &next),
+        ActionButton::new("restart", &restart),
     ];
     let state = std::cell::Cell::new(ActionRowState::new());
     let component =
@@ -145,17 +175,44 @@ const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn header_line(mode: SessionPickerMode) -> Line {
-    let help = match mode {
-        SessionPickerMode::Filter => {
-            "  Tab scope · All: native/ID-order/substring · Alt-P next · Alt-R restart · Enter open · Ctrl-F search · Ctrl-N new · Ctrl-R rename · Ctrl-D delete · Esc close"
-        }
-        SessionPickerMode::Rename => "  Rename  ·  Enter save  ·  Esc cancel",
-        SessionPickerMode::DeleteConfirm => "  Delete session?  ·  Y confirm  ·  N/Esc cancel",
-        SessionPickerMode::TranscriptSearch => {
-            "  Enter search/open  ·  ↑↓ browse  ·  Alt-M mode  ·  Alt-D deep  ·  Alt-S sort  ·  Alt-N next  ·  Alt-I inventory  ·  Alt-G migrate  ·  Alt-B backfill  ·  Alt-X cancel  ·  ? details  ·  Esc sessions"
-        }
+    header_line_with_keymap(
+        mode,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    )
+}
+
+fn header_line_with_keymap(mode: SessionPickerMode, keymap: &super::keymap::BmuxKeyMap) -> Line {
+    let scope = match mode {
+        SessionPickerMode::Filter => "session_picker",
+        SessionPickerMode::Rename => "session_rename",
+        SessionPickerMode::DeleteConfirm => "session_delete",
+        SessionPickerMode::TranscriptSearch => "session_search",
     };
+    let control = if mode == SessionPickerMode::Filter {
+        "tui.select.confirm"
+    } else {
+        "tui.control.submit"
+    };
+    let cancel = if mode == SessionPickerMode::Filter {
+        "tui.select.cancel"
+    } else {
+        "tui.control.cancel"
+    };
+    let help = format!(
+        "  {} open/save  ·  {} cancel  ·  {} search  ·  {} new  ·  {} rename  ·  {} delete  ·  {} inventory  ·  {} migrate  ·  {} backfill  ·  {} cancel maintenance",
+        keymap.hint(scope, control),
+        keymap.hint(scope, cancel),
+        keymap.hint("session_picker", "tui.session.search"),
+        keymap.hint("session_picker", "tui.session.new"),
+        keymap.hint("session_picker", "tui.session.rename"),
+        keymap.hint("session_picker", "tui.session.delete"),
+        keymap.hint("session_search", "tui.search.index"),
+        keymap.hint("session_search", "tui.search.migrate"),
+        keymap.hint("session_search", "tui.search.backfill"),
+        keymap.hint("session_search", "tui.search.cancelMaintenance")
+    );
     Line::from_spans(vec![
         Span::styled("SESSIONS", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw(help),
@@ -187,7 +244,7 @@ fn format_import_warnings(
         String::new()
     };
     format!(
-        "Imported [{source}] with {} warnings: {details}{suffix}. Esc dismisses.",
+        "Imported [{source}] with {} warnings: {details}{suffix}; cancel dismisses.",
         warnings.len()
     )
 }
@@ -224,10 +281,10 @@ mod tests {
             .map(|span| span.content.as_str())
             .collect::<String>();
         for expected in [
-            "Alt-I inventory",
-            "Alt-G migrate",
-            "Alt-B backfill",
-            "Alt-X cancel",
+            "alt+i inventory",
+            "alt+g migrate",
+            "alt+b backfill",
+            "alt+x cancel",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }

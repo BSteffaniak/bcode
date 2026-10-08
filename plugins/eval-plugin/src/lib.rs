@@ -9,6 +9,7 @@ mod cli;
 
 pub mod eval_data;
 pub mod eval_viewer;
+mod keybindings;
 pub mod tui;
 
 use bcode_command::{

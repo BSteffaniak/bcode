@@ -1,6 +1,6 @@
 //! Timeline dialog state for browsing user-sent messages.
 
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 
 /// Outcome from one timeline-dialog keyboard update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,34 +136,47 @@ impl TimelineDialogState {
     }
 
     /// Handle one keyboard input through the dialog's navigation policy.
+    #[cfg(test)]
     pub fn handle_key(&mut self, stroke: KeyStroke) -> TimelineDialogOutcome {
-        match stroke.key {
-            KeyCode::Up | KeyCode::Char('k') => {
+        self.handle_key_with_keymap(
+            stroke,
+            &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        )
+    }
+
+    /// Handle input through the effective registry.
+    pub fn handle_key_with_keymap(
+        &mut self,
+        stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> TimelineDialogOutcome {
+        match keymap.action("timeline", stroke) {
+            Some("tui.control.up") => {
                 self.select_previous();
                 TimelineDialogOutcome::Handled
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            Some("tui.control.down") => {
                 self.select_next();
                 TimelineDialogOutcome::Handled
             }
-            KeyCode::PageUp => {
+            Some("tui.control.page_up") => {
                 self.page_previous(10);
                 TimelineDialogOutcome::Handled
             }
-            KeyCode::PageDown => {
+            Some("tui.control.page_down") => {
                 self.page_next(10);
                 TimelineDialogOutcome::Handled
             }
-            KeyCode::Home => {
+            Some("tui.control.home") => {
                 self.select_first();
                 TimelineDialogOutcome::Handled
             }
-            KeyCode::End => {
+            Some("tui.control.end") => {
                 self.select_last();
                 TimelineDialogOutcome::Handled
             }
-            KeyCode::Enter => TimelineDialogOutcome::Activate,
-            KeyCode::Escape => TimelineDialogOutcome::Cancel,
+            Some("tui.control.submit") => TimelineDialogOutcome::Activate,
+            Some("tui.control.cancel") => TimelineDialogOutcome::Cancel,
             _ => TimelineDialogOutcome::Ignored,
         }
     }

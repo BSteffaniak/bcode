@@ -13,7 +13,6 @@ use bcode_provider_auth_models::{
     AUTH_HOST_INTERFACE_ID, AUTH_SECURITY_INSPECTION_SCHEMA_VERSION, AuthSecurityInspectionRequest,
     AuthSecurityInspectionResponse, OP_INSPECT_SECURITY,
 };
-use bmux_keyboard::KeyCode;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::{Column, TextBlock};
 use bmux_tui::event::Event;
@@ -235,6 +234,12 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn model_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_keymap_action(bcode_plugin_sdk::tui::keymap::KeymapAction {
+        id: "model.close".into(),
+        scope: "model".into(),
+        description: "Close the model surface".into(),
+        defaults: ["enter", "esc", "q"].map(str::to_owned).into(),
+    });
     for (surface_kind, title) in [
         ("model.status", "Model Status"),
         ("model.serverStatus", "Server Model Status"),
@@ -269,6 +274,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ModelCommandSurfaceFacto
             Ok(Box::new(ModelCommandSurface {
                 id: surface_kind,
                 title,
+                close_hint: "Close".into(),
                 lines: model_surface_lines(surface_kind, &request.options),
                 text_view: std::cell::Cell::new(
                     bmux_tui_components::scroll_view::ScrollViewState::default(),
@@ -280,6 +286,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ModelCommandSurfaceFacto
 }
 
 struct ModelCommandSurface {
+    close_hint: String,
     id: &'static str,
     title: &'static str,
     lines: Vec<String>,
@@ -359,7 +366,7 @@ impl ModelCommandSurface {
             .empty("No model status available");
         let body = Column::new()
             .child(text)
-            .child(TextBlock::new("Enter/Esc/q closes"));
+            .child(TextBlock::new(self.close_hint.as_str()));
         let component = PaneComponent::new("model.status", pane, &pane_state, body);
         let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
         frame.with_child(
@@ -393,17 +400,36 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ModelCommandSurface {
         self.render_themed(area, frame, theme);
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) {
+        let keys = host.keymap_keys("model", "model.close").join("/");
+        self.close_hint = if keys.is_empty() {
+            "Close (unbound)".into()
+        } else {
+            format!("{keys} closes")
+        };
+        self.render_themed(area, frame, theme);
+    }
+
     fn handle_event(
         &mut self,
         event: &Event,
-        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        let keys = host.keymap_keys("model", "model.close").join("/");
+        self.close_hint = if keys.is_empty() {
+            "Close (unbound)".into()
+        } else {
+            format!("{keys} closes")
+        };
         match event {
             Event::Key(key)
-                if matches!(
-                    key.key,
-                    KeyCode::Enter | KeyCode::Escape | KeyCode::Char('q')
-                ) =>
+                if host.keymap_action("model", *key).as_deref() == Some("model.close") =>
             {
                 bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
             }
@@ -558,6 +584,59 @@ bcode_plugin_sdk::export_plugin!(ModelPlugin, include_str!("../bcode-plugin.toml
 mod tests {
     use super::*;
 
+    struct KeymapHost(bcode_plugin_sdk::tui::keymap::KeymapRegistry);
+    impl bcode_plugin_sdk::tui::PluginTuiHost for KeymapHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            self.0.action_for_key(scope, stroke).map(str::to_owned)
+        }
+        fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+            self.0
+                .keys_for_action(scope, action)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn close_remap_changes_dispatch_and_effective_hint() {
+        use bcode_plugin_sdk::tui::PluginTuiSurface;
+        let definitions = model_tui_registry();
+        let mut registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+        registry
+            .register_all(definitions.keymap_actions().iter().cloned())
+            .unwrap();
+        registry
+            .configure(std::collections::BTreeMap::from([(
+                "model".into(),
+                std::collections::BTreeMap::from([("ctrl+x".into(), "model.close".into())]),
+            )]))
+            .unwrap();
+        let host = KeymapHost(registry);
+        let mut surface = ModelCommandSurface {
+            id: "model.status",
+            title: "Status",
+            close_hint: String::new(),
+            lines: Vec::new(),
+            text_view: std::cell::Cell::new(
+                bmux_tui_components::scroll_view::ScrollViewState::default(),
+            ),
+        };
+        let event = |key| Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap());
+        assert!(matches!(
+            surface.handle_event(&event("enter"), &host),
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        ));
+        assert_eq!(surface.close_hint, "ctrl+x closes");
+        assert!(matches!(
+            surface.handle_event(&event("ctrl+x"), &host),
+            bcode_plugin_sdk::tui::PluginTuiAction::Close { .. }
+        ));
+    }
+
     #[test]
     fn model_surface_uses_shared_pane_and_text_view_with_host_theme() {
         use bcode_plugin_sdk::tui::{
@@ -613,6 +692,7 @@ mod tests {
             },
         };
         let surface = ModelCommandSurface {
+            close_hint: "Close".into(),
             id: "model.status",
             title: "Model Status",
             lines: vec!["Provider: example".to_owned()],

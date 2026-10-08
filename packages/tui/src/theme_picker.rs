@@ -1,6 +1,6 @@
 //! Interactive theme picker state.
 
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 use bmux_tui_components::selectable_list::SelectableListState as ListState;
 
 use std::collections::BTreeMap;
@@ -112,16 +112,29 @@ impl ThemePickerState {
     }
 
     /// Handle one picker key.
+    #[cfg(test)]
     pub fn handle_key(&mut self, stroke: KeyStroke) -> ThemePickerOutcome {
-        match stroke.key {
-            KeyCode::Escape => ThemePickerOutcome::Cancel,
-            KeyCode::Enter => self
+        self.handle_key_with_keymap(
+            stroke,
+            &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        )
+    }
+
+    /// Handle input using the frontend's effective registry.
+    pub fn handle_key_with_keymap(
+        &mut self,
+        stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> ThemePickerOutcome {
+        match keymap.action("theme_picker", stroke) {
+            Some("tui.control.cancel") => ThemePickerOutcome::Cancel,
+            Some("tui.control.submit") => self
                 .selected_id()
                 .map_or(ThemePickerOutcome::Ignored, |id| {
                     ThemePickerOutcome::Apply(id.to_owned())
                 }),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            Some("tui.control.up") => self.move_selection(-1),
+            Some("tui.control.down") => self.move_selection(1),
             _ => ThemePickerOutcome::Ignored,
         }
     }
@@ -145,6 +158,7 @@ impl ThemePickerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_keyboard::KeyCode;
 
     fn entry(id: &str, selected: bool) -> ThemeCatalogEntry {
         ThemeCatalogEntry {
@@ -156,6 +170,37 @@ mod tests {
             validation: "valid".to_owned(),
             selected,
         }
+    }
+
+    #[test]
+    fn remapped_preview_and_unbound_cancel_have_no_default_fallback() {
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "theme_picker".into(),
+            BTreeMap::from([
+                ("ctrl+n".into(), "tui.control.down".into()),
+                ("escape".into(), String::new()),
+            ]),
+        );
+        let keymap = super::super::keymap::BmuxKeyMap::from_config(&config);
+        let mut picker =
+            ThemePickerState::new(vec![entry("one", true), entry("two", false)], Vec::new());
+        assert_eq!(
+            picker.handle_key_with_keymap(KeyStroke::simple(KeyCode::Down), &keymap),
+            ThemePickerOutcome::Ignored
+        );
+        assert_eq!(picker.selected_id(), Some("one"));
+        assert_eq!(
+            picker.handle_key_with_keymap(
+                bmux_keyboard::parse_key_stroke("ctrl+n").unwrap(),
+                &keymap
+            ),
+            ThemePickerOutcome::Preview("two".into())
+        );
+        assert_eq!(
+            picker.handle_key_with_keymap(KeyStroke::simple(KeyCode::Escape), &keymap),
+            ThemePickerOutcome::Ignored
+        );
     }
 
     #[test]

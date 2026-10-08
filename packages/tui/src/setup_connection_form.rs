@@ -1,6 +1,7 @@
 //! Native connection/import form. Never reads stdin or owns terminal lifecycle.
 
 use super::theme::PresentedTheme;
+use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
@@ -33,6 +34,7 @@ enum EnrollmentStatus {
 }
 
 pub struct ConnectionForm {
+    keymap: super::keymap::BmuxKeyMap,
     presentation: Presentation,
     providers: Vec<bcode_provider_auth_models::AuthProviderContribution>,
     picker: Option<bool>,
@@ -66,6 +68,9 @@ impl ConnectionForm {
             Err(message) => (Vec::new(), message),
         };
         Self {
+            keymap: super::keymap::BmuxKeyMap::from_registry(
+                bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
+            ),
             presentation: Presentation::Guided,
             providers,
             picker: Some(false),
@@ -117,7 +122,74 @@ impl ConnectionForm {
         })
     }
 
+    #[cfg(test)]
     pub fn handle_event(&mut self, event: &Event) -> bool {
+        self.handle_event_with_keymap(
+            event,
+            &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        )
+    }
+
+    /// Admit only effective semantic operations and literal text to the form.
+    pub fn handle_event_with_keymap(
+        &mut self,
+        event: &Event,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> bool {
+        self.keymap = keymap.clone();
+        let mapped;
+        let event = if let Event::Key(stroke) = event {
+            let supported = ControlAction::TEXT
+                .iter()
+                .copied()
+                .chain([
+                    ControlAction::Submit,
+                    ControlAction::Cancel,
+                    ControlAction::FocusNext,
+                    ControlAction::FocusPrevious,
+                    ControlAction::PageUp,
+                    ControlAction::PageDown,
+                ])
+                .collect::<Vec<_>>();
+            let scope = if self.device.as_ref().is_some_and(|device| device.terminal) {
+                "setup_auth_terminal"
+            } else if self.device.is_some() {
+                "setup_auth"
+            } else {
+                "setup_connection"
+            };
+            let native = if keymap.action(scope, *stroke) == Some("tui.setup.advanced") {
+                Some(bmux_keyboard::KeyStroke::simple(KeyCode::F(2)))
+            } else {
+                ControlInput::from_registry(keymap.registry(), scope, *stroke, &supported, true)
+                    .native_stroke()
+            };
+            let native = if self.device.as_ref().is_some_and(|device| device.terminal) {
+                match keymap.action(scope, *stroke) {
+                    Some("tui.setup.retry") => {
+                        Some(bmux_keyboard::KeyStroke::simple(KeyCode::Char('r')))
+                    }
+                    Some("tui.setup.back") => {
+                        Some(bmux_keyboard::KeyStroke::simple(KeyCode::Escape))
+                    }
+                    Some("tui.control.submit" | "tui.control.cancel") => native,
+                    _ => None,
+                }
+            } else {
+                native
+            };
+            let Some(native) = native else {
+                return false;
+            };
+            mapped = Event::Key(native);
+            &mapped
+        } else {
+            event
+        };
+        self.handle_admitted_event(event)
+    }
+
+    fn handle_admitted_event(&mut self, event: &Event) -> bool {
         if self.pending_declaration.is_some() {
             self.handle_declaration_review(event);
             return false;
@@ -128,6 +200,7 @@ impl ConnectionForm {
         if self.device.is_some() {
             return self.handle_device_event(event);
         }
+
         match event {
             Event::Key(key) if key.key == KeyCode::Escape => {
                 if self.review {
@@ -152,7 +225,11 @@ impl ConnectionForm {
             }
             Event::Key(key) if key.key == KeyCode::Tab && !self.review => {
                 self.focus = if self.presentation == Presentation::Advanced {
-                    (self.focus + 1) % 5
+                    if key.modifiers.shift {
+                        (self.focus + 4) % 5
+                    } else {
+                        (self.focus + 1) % 5
+                    }
                 } else {
                     4
                 };
@@ -177,7 +254,7 @@ impl ConnectionForm {
                     self.review = false;
                 } else {
                     self.review = true;
-                    "Review destination and provider. Enter saves; Esc cancels. No remote verification is performed.".clone_into(&mut self.status);
+                    "Review destination and provider. Confirm saves; Cancel cancels. No remote verification is performed.".clone_into(&mut self.status);
                 }
             }
             Event::Key(key) if !self.review && self.focus == 4 => match key.key {
@@ -220,11 +297,10 @@ impl ConnectionForm {
                     self.picker = Some(true);
                     self.query.clear();
                     self.selected = 0;
-                    "Choose a method to retry or Esc to choose another provider."
+                    "Choose a method to retry or Cancel to choose another provider."
                         .clone_into(&mut self.status);
                 }
-            } else if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')))
-            {
+            } else if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Escape)) {
                 device.cancel();
             }
         }
@@ -263,7 +339,7 @@ impl ConnectionForm {
         match self.context_declaration() {
             Ok(Some(edit)) => {
                 self.status = format!(
-                    "Create context-local account declaration in {}? Enter confirms configuration only; Esc cancels. Sign-in starts separately.",
+                    "Create context-local account declaration in {}? Confirm configuration only; Cancel cancels. Sign-in starts separately.",
                     edit.path().display()
                 );
                 self.pending_declaration = Some(edit);
@@ -287,7 +363,7 @@ impl ConnectionForm {
                 if let Some(edit) = self.pending_declaration.take() {
                     self.status = match edit.apply() {
                         Ok(_) => {
-                            "Account declaration saved. Enter again to start sign-in.".to_owned()
+                            "Account declaration saved. Confirm again to start sign-in.".to_owned()
                         }
                         Err(_) => {
                             "Could not save declaration safely. Review configuration and retry."
@@ -451,7 +527,7 @@ impl ConnectionForm {
                 TextInputState::new(TextEditBuffer::from_text(method.method_id().to_owned()));
             self.focus = 4;
             self.review = self.interactive;
-            "Enter confirms connection using the selected method and default secure destination. Tab reviews advanced fields.".clone_into(&mut self.status);
+            "Confirm connection using the selected method and default secure destination. Next field reviews advanced fields.".clone_into(&mut self.status);
             self.picker = None;
         }
         self.query.clear();
@@ -615,7 +691,12 @@ impl ConnectionForm {
             frame,
             area,
             area.height.saturating_sub(2),
-            "Type to search • ↑/↓ select • Enter continue • Esc back",
+            &format!(
+                "Type to search • {} select • {} continue • {} back",
+                self.keymap.hint("setup_connection", "tui.control.down"),
+                self.keymap.hint("setup_connection", "tui.control.submit"),
+                self.keymap.hint("setup_connection", "tui.control.cancel")
+            ),
             theme.muted,
         );
     }
@@ -670,7 +751,12 @@ impl ConnectionForm {
             frame,
             area,
             area.height.saturating_sub(3),
-            "Enter continue/confirm • F2 Advanced • Esc back",
+            &format!(
+                "{} confirm • {} Advanced • {} back",
+                self.keymap.hint("setup_connection", "tui.control.submit"),
+                self.keymap.hint("setup_connection", "tui.setup.advanced"),
+                self.keymap.hint("setup_connection", "tui.control.cancel")
+            ),
             theme.focused,
         );
         write(
@@ -682,15 +768,11 @@ impl ConnectionForm {
         );
     }
 
-    pub fn render(&mut self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
-        if self.picker.is_some() {
-            self.render_picker(frame, theme);
-            return;
-        }
+    fn render_device(&mut self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
         if let Some(device) = &mut self.device {
             device.refresh();
             let area = Rect::new(0, 0, frame.area().width, frame.area().height);
-            if render_auth_prompt(device, frame, area, theme) {
+            if render_auth_prompt(device, frame, area, theme, &self.keymap) {
                 return;
             }
             render_login_text(frame, area, &device.lines, theme.text);
@@ -698,15 +780,46 @@ impl ConnectionForm {
                 frame,
                 area,
                 area.height.saturating_sub(2),
-                if device.terminal {
-                    "Enter / r: choose method and retry • Esc / b: back"
+                &if device.terminal {
+                    format!(
+                        "{} retry · {} back",
+                        self.keymap.hint("setup_auth_terminal", "tui.setup.retry"),
+                        self.keymap
+                            .hint("setup_auth_terminal", "tui.control.cancel")
+                    )
                 } else {
-                    "Esc: cancel sign-in"
+                    format!(
+                        "{} cancel sign-in",
+                        self.keymap.hint("setup_auth", "tui.control.cancel")
+                    )
                 },
                 theme.focused,
             );
+        }
+    }
+
+    #[cfg(test)]
+    pub fn render(&mut self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
+        self.render_with_keymap(frame, theme, &self.keymap.clone());
+    }
+
+    /// Render with the same effective bindings used for dispatch.
+    pub fn render_with_keymap(
+        &mut self,
+        frame: &mut PaintCx<'_, '_>,
+        theme: &PresentedTheme,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) {
+        self.keymap = keymap.clone();
+        if self.picker.is_some() {
+            self.render_picker(frame, theme);
             return;
         }
+        if self.device.is_some() {
+            self.render_device(frame, theme);
+            return;
+        }
+
         if self.presentation == Presentation::Guided {
             self.render_guided(frame, theme);
             return;
@@ -785,6 +898,7 @@ fn render_auth_prompt(
     frame: &mut PaintCx<'_, '_>,
     area: Rect,
     theme: &PresentedTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) -> bool {
     if let Some(bcode_provider_auth_models::AuthFlowEffect::Prompt {
         message, choices, ..
@@ -815,7 +929,11 @@ fn render_auth_prompt(
             frame,
             area,
             area.height.saturating_sub(2),
-            "Enter submits • Esc cancels sign-in",
+            &format!(
+                "{} submits • {} cancels sign-in",
+                keymap.hint("setup_auth", "tui.control.submit"),
+                keymap.hint("setup_auth", "tui.control.cancel")
+            ),
             theme.muted,
         );
         return true;
@@ -938,6 +1056,9 @@ mod tests {
         device.refresh();
         device.succeeded = true;
         let mut form = ConnectionForm {
+            keymap: super::super::keymap::BmuxKeyMap::from_config(
+                &bcode_config::TuiConfig::default(),
+            ),
             presentation: Presentation::Guided,
             providers: Vec::new(),
             picker: None,
@@ -969,6 +1090,9 @@ mod tests {
     #[test]
     fn cancelled_form_has_no_success_reference() {
         let mut form = ConnectionForm {
+            keymap: super::super::keymap::BmuxKeyMap::from_config(
+                &bcode_config::TuiConfig::default(),
+            ),
             presentation: Presentation::Guided,
             providers: Vec::new(),
             picker: None,
@@ -1005,6 +1129,9 @@ mod tests {
             KeyCode::Char('b'),
         ] {
             let mut form = ConnectionForm {
+                keymap: super::super::keymap::BmuxKeyMap::from_config(
+                    &bcode_config::TuiConfig::default(),
+                ),
                 presentation: Presentation::Guided,
                 providers: Vec::new(),
                 picker: None,

@@ -126,6 +126,10 @@ impl PluginTuiHost for BcodePluginTuiHost {
             .map(str::to_owned)
     }
 
+    fn keymap_is_overridden(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> bool {
+        self.launch.keymap.is_overridden_key(scope, stroke)
+    }
+
     fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
         self.launch
             .keymap

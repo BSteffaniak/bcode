@@ -24,6 +24,7 @@ const LABELS: [&str; 6] = [
 ];
 
 pub(super) struct Filters {
+    hints: String,
     fields: [RefCell<TextInputState>; 6],
     selected: usize,
     pub error: String,
@@ -39,6 +40,7 @@ impl Filters {
             query.bucket_ms.to_string(),
         ];
         Self {
+            hints: String::new(),
             fields: values.map(|value| {
                 let mut state = TextInputState::default();
                 state.buffer_mut().paste(&value);
@@ -89,11 +91,34 @@ impl Filters {
         query.validate()?;
         Ok(query)
     }
-    pub fn event(&mut self, event: &Event) {
+    pub fn event(&mut self, event: &Event, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) {
+        let adapted;
+        let event = if let Event::Key(stroke) = event {
+            use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
+            let supported = ControlAction::TEXT
+                .iter()
+                .copied()
+                .chain([ControlAction::FocusNext, ControlAction::FocusPrevious])
+                .collect::<Vec<_>>();
+            let Some(stroke) =
+                ControlInput::from_host(host, "usage-filters", *stroke, &supported, true)
+                    .native_stroke()
+            else {
+                return;
+            };
+            adapted = Event::Key(stroke);
+            &adapted
+        } else {
+            event
+        };
         if let Event::Key(stroke) = event
             && stroke.key == KeyCode::Tab
         {
-            self.selected = (self.selected + 1) % self.fields.len();
+            self.selected = if stroke.modifiers.shift {
+                (self.selected + self.fields.len() - 1) % self.fields.len()
+            } else {
+                (self.selected + 1) % self.fields.len()
+            };
             return;
         }
         let mut state = self.fields[self.selected].borrow_mut();
@@ -104,11 +129,16 @@ impl Filters {
             self.error = "Filter field exceeds 64 KiB".into();
         }
     }
+    pub fn update_hints(&mut self, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) {
+        self.hints = super::scope_hints(host, "usage-filters");
+    }
+
     pub fn paint(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let label = format!(
-            "Filters {}/6: {} | Tab next; Enter apply; Esc cancel",
+            "Filters {}/6: {} | {}",
             self.selected + 1,
-            LABELS[self.selected]
+            LABELS[self.selected],
+            self.hints
         );
         for (offset, text) in [label.as_str(), self.error.as_str()]
             .into_iter()

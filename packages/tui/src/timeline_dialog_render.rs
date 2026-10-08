@@ -19,10 +19,26 @@ const MAX_DIALOG_HEIGHT: u16 = 28;
 const TIMESTAMP_WIDTH: usize = 19;
 
 /// Render the timeline dialog.
+#[cfg(test)]
 pub fn render_timeline_dialog(
     state: &mut TimelineDialogState,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
+) {
+    render_timeline_dialog_with_keymap(
+        state,
+        frame,
+        theme,
+        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+    );
+}
+
+/// Render shortcuts from effective bindings.
+pub fn render_timeline_dialog_with_keymap(
+    state: &mut TimelineDialogState,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) {
     let sizing = dialog_sizing();
     let action_state = std::cell::Cell::new(bmux_tui_components::action_row::ActionRowState::new());
@@ -43,12 +59,22 @@ pub fn render_timeline_dialog(
     let visible_entries =
         usize::try_from(body_layout.size.height.saturating_sub(3)).unwrap_or(usize::MAX);
     state.sync_scroll(visible_entries);
-    let body = rows(
+    let mut body = rows(
         state,
         u16::try_from(body_layout.size.width).unwrap_or(u16::MAX),
         visible_entries,
         theme,
     );
+    body.push(Line::from_spans(vec![Span::styled(
+        format!(
+            "{} select · {} page · {} go · {} close",
+            keymap.hint("timeline", "tui.control.down"),
+            keymap.hint("timeline", "tui.control.page_down"),
+            keymap.hint("timeline", "tui.control.submit"),
+            keymap.hint("timeline", "tui.control.cancel")
+        ),
+        theme.muted,
+    )]));
     let dialog = DialogComponent::new(
         "timeline",
         Dialog::new(&body, &[], theme.modal_theme())
@@ -96,10 +122,6 @@ fn rows(
                 .map(|(index, entry)| entry_line(entry, index == state.selected(), width, theme)),
         );
     }
-    rows.push(Line::from_spans(vec![Span::styled(
-        "↑/↓ select · PgUp/PgDn jump · Enter go · Esc close",
-        theme.muted,
-    )]));
     rows
 }
 

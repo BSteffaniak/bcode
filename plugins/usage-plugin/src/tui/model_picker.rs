@@ -15,6 +15,7 @@ use bmux_tui_components::{
 use std::{cell::RefCell, collections::BTreeSet};
 
 pub(super) struct ModelPicker {
+    hints: String,
     models: Vec<UsageModel>,
     selected: BTreeSet<UsageModel>,
     search: RefCell<TextInputState>,
@@ -25,6 +26,7 @@ impl ModelPicker {
     pub fn new(models: impl Iterator<Item = UsageModel>, selected: BTreeSet<UsageModel>) -> Self {
         let models: BTreeSet<_> = models.take(256).chain(selected.iter().cloned()).collect();
         Self {
+            hints: String::new(),
             models: models.into_iter().collect(),
             selected,
             search: RefCell::new(TextInputState::default()),
@@ -57,7 +59,30 @@ impl ModelPicker {
             })
             .collect()
     }
-    pub fn event(&mut self, event: &Event) {
+    pub fn event(&mut self, event: &Event, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) {
+        let adapted;
+        let event = if let Event::Key(stroke) = event {
+            use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
+            let supported = ControlAction::TEXT
+                .iter()
+                .copied()
+                .chain([
+                    ControlAction::Toggle,
+                    ControlAction::PageUp,
+                    ControlAction::PageDown,
+                ])
+                .collect::<Vec<_>>();
+            let Some(stroke) =
+                ControlInput::from_host(host, "usage-model-picker", *stroke, &supported, true)
+                    .native_stroke()
+            else {
+                return;
+            };
+            adapted = Event::Key(stroke);
+            &adapted
+        } else {
+            event
+        };
         if let Event::Key(stroke) = event {
             match stroke.key {
                 KeyCode::Char(' ') => {
@@ -91,7 +116,23 @@ impl ModelPicker {
         }
         self.table = TableState::default();
     }
+    pub fn update_hints(&mut self, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) {
+        self.hints = super::scope_hints(host, "usage-model-picker");
+    }
+
     pub fn paint(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
+        if area.height > 0 {
+            frame.write_line(
+                LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
+                &Line::from(self.hints.clone()),
+            );
+        }
+        let area = Rect::new(
+            area.x,
+            area.y.saturating_add(area.height.min(1)),
+            area.width,
+            area.height.saturating_sub(1),
+        );
         let height = area.height.min(2);
         let policy = TextInputPolicy::chat_composer();
         let input =
@@ -118,7 +159,7 @@ impl ModelPicker {
 const fn columns() -> [TableColumn<'static>; 2] {
     [
         TableColumn::new("Select").fixed(4),
-        TableColumn::new("Models in report page; type search, Space toggle, Enter accept"),
+        TableColumn::new("Models in report page; type search"),
     ]
 }
 fn label(model: &UsageModel) -> String {

@@ -256,6 +256,11 @@ fn apply_initial_config(
         );
     };
     settings.apply_tui_config(&config.tui);
+    if let Some(presentation) = chat.app.plugin_presentation() {
+        settings.integrate_keymap_contributors(presentation.keymap_actions());
+    }
+    chat.app
+        .set_effective_keymap(settings.keymap().registry().clone());
     settings.set_completion_settings(config.presentation.completion);
     chat.app.apply_tui_config(config.tui.clone());
     let declarative = config.presentation.streaming.policy();

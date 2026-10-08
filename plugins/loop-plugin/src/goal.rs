@@ -523,8 +523,8 @@ pub enum GoalOption {
     Review,
 }
 
-pub const PROGRESS_LABEL: &str = "Maintain a progress document (Ctrl+P)";
-pub const REVIEW_LABEL: &str = "Generate instructions… (Ctrl+R)";
+pub const PROGRESS_LABEL: &str = "Maintain a progress document";
+pub const REVIEW_LABEL: &str = "Generate instructions…";
 
 struct GoalSurface {
     editor: LoopSurface,
@@ -577,7 +577,7 @@ async fn preflight_message_with_timeout(
         Ok(Err(error)) => format!(
             "Delegation prerequisites could not be verified: {error}. No authority changed."
         ),
-        Err(_) => "Delegation prerequisites could not be verified: check timed out; retry with Ctrl-D. No authority changed.".into(),
+        Err(_) => "Delegation prerequisites could not be verified: check timed out; retry the delegation check. No authority changed.".into(),
     }
 }
 
@@ -709,7 +709,7 @@ impl GoalSurface {
         }
         let editor = &mut self.editor;
         editor.sync_goal_controls();
-        if editor.swarm_ui.launch_event(
+        if editor.swarm_ui.resolved_launch_event(
             editor.collaboration,
             editor.goal_option_focus == Some(GoalOption::Swarm),
             true,
@@ -916,7 +916,7 @@ impl GoalSurface {
         }
         self.source = Some((objective.clone(), guidance.clone(), limit));
         self.phase = GoalPhase::Generating { review };
-        self.editor.status = "Preparing source context… Esc cancels generation.".into();
+        self.editor.status = "Preparing source context… Cancel stops generation.".into();
         let mut request = generation_request(
             &objective,
             &guidance,
@@ -987,7 +987,72 @@ pub fn paint_generation(
     }
 }
 
+impl GoalSurface {
+    fn resolve_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> Result<Event, PluginTuiAction> {
+        let scope = if self.editor.swarm_ui.open {
+            keymap::SWARM
+        } else if self.live.is_some() {
+            keymap::LIVE
+        } else {
+            keymap::GOAL
+        };
+        if self.editor.field == Field::Evaluation
+            && scope == keymap::GOAL
+            && let Some(resolved) = keymap::event(host, keymap::JUDGEMENT, event, false)
+        {
+            let action = self.editor.handle_judgement_key(&resolved, host);
+            if !matches!(action, PluginTuiAction::None) {
+                return Err(action);
+            }
+        }
+        let text = if self.editor.swarm_ui.open {
+            true
+        } else {
+            self.live.is_none()
+                && self.editor.goal_option_focus.is_none()
+                && self.editor.field != Field::Evaluation
+        };
+        keymap::event(host, scope, event, text).ok_or(PluginTuiAction::None)
+    }
+    fn handle_live_event(&mut self, event: &Event) -> Option<PluginTuiAction> {
+        if let Some(live) = &mut self.live {
+            if let Event::Key(stroke) = event {
+                if stroke.key == KeyCode::Escape {
+                    live.control.cancel();
+                } else if stroke.key == KeyCode::Char('h')
+                    && let Some(session_id) = live.control.session_id()
+                {
+                    return Some(PluginTuiAction::OpenSession { session_id });
+                } else if stroke.key == KeyCode::Tab {
+                    live.collapsed = !live.collapsed;
+                    live.layout = None;
+                }
+            }
+            if !live.collapsed
+                && let Some((area, layout)) = &live.layout
+            {
+                use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy};
+                let _ = TextViewComponent::new("goal.live.output", &live.lines, &live.scroll)
+                    .policy(TextViewPolicy::scrollable())
+                    .handle_event(*area, layout, event);
+            }
+            return Some(PluginTuiAction::Redraw);
+        }
+        None
+    }
+}
+
 impl PluginTuiSurface for GoalSurface {
+    fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
+        self.editor.prepare_hints(host);
+        if let Some(live) = &mut self.live {
+            live.footer = keymap::live_hint(host);
+        }
+    }
     fn session_navigation_finished(&mut self, session_id: SessionId, result: Result<(), String>) {
         if self
             .live
@@ -1034,6 +1099,33 @@ impl PluginTuiSurface for GoalSurface {
     ) {
         self.editor.theme = theme.copied();
         self.render(area, frame);
+    }
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&PluginTuiTheme>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.editor.prepare_hints(host);
+        if let Some(live) = &mut self.live {
+            live.footer = keymap::live_hint(host);
+        }
+        self.render_with_theme(area, frame, theme);
+    }
+    fn render_slice_with_host(
+        &mut self,
+        logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        host: &dyn PluginTuiHost,
+    ) {
+        self.editor.prepare_hints(host);
+        if let Some(live) = &mut self.live {
+            live.footer = keymap::live_hint(host);
+        }
+        self.render_slice(logical_height, logical_row_offset, destination, frame);
     }
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if self.phase == GoalPhase::Closed {
@@ -1101,7 +1193,7 @@ impl PluginTuiSurface for GoalSurface {
                 self.editor.setup_kind = SetupKind::Loop;
                 self.editor.goal_option_focus = None;
                 self.phase = GoalPhase::Generated;
-                self.editor.status = "Review generated prompts · Ctrl+Enter starts the loop".into();
+                self.editor.status = "Review generated prompts · start launches the loop".into();
                 if !review {
                     let action = self.editor.start();
                     self.editor.begin_pending_host_work(host);
@@ -1115,11 +1207,16 @@ impl PluginTuiSurface for GoalSurface {
         PluginTuiAction::Redraw
     }
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let resolved = match self.resolve_event(event, host) {
+            Ok(resolved) => resolved,
+            Err(action) => return action,
+        };
+        let event = &resolved;
         if self.editor.swarm_ui.open {
             if let Err(error) = self
                 .editor
                 .swarm_ui
-                .event(&mut self.editor.collaboration, event)
+                .resolved_event(&mut self.editor.collaboration, event)
             {
                 self.editor.swarm_ui.error.clone_from(&error);
                 self.editor.status = error;
@@ -1134,28 +1231,8 @@ impl PluginTuiSurface for GoalSurface {
             self.open_swarm();
             return PluginTuiAction::Redraw;
         }
-        if let Some(live) = &mut self.live {
-            if let Event::Key(stroke) = event {
-                if stroke.key == KeyCode::Escape {
-                    live.control.cancel();
-                } else if stroke.key == KeyCode::Char('h')
-                    && let Some(session_id) = live.control.session_id()
-                {
-                    return PluginTuiAction::OpenSession { session_id };
-                } else if stroke.key == KeyCode::Tab {
-                    live.collapsed = !live.collapsed;
-                    live.layout = None;
-                }
-            }
-            if !live.collapsed
-                && let Some((area, layout)) = &live.layout
-            {
-                use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy};
-                let _ = TextViewComponent::new("goal.live.output", &live.lines, &live.scroll)
-                    .policy(TextViewPolicy::scrollable())
-                    .handle_event(*area, layout, event);
-            }
-            return PluginTuiAction::Redraw;
+        if let Some(action) = self.handle_live_event(event) {
+            return action;
         }
         if let Event::Key(stroke) = event {
             if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
@@ -1215,7 +1292,7 @@ impl PluginTuiSurface for GoalSurface {
         ) {
             return PluginTuiAction::None;
         }
-        self.editor.handle_event(event, host)
+        self.editor.handle_resolved_event(event, host)
     }
 }
 
@@ -1410,6 +1487,19 @@ mod tests {
         generations: Mutex<usize>,
     }
     impl PluginTuiHost for Host {
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            keymap::test_registry()
+                .action_for_key(scope, stroke)
+                .map(str::to_owned)
+        }
+        fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+            keymap::test_registry()
+                .keys_for_action(scope, action)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+
         fn workflow_delegation_preflight(
             &self,
             plugin_id: String,

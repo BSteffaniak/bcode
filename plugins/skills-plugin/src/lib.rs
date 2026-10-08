@@ -17,7 +17,6 @@ use bcode_command::{
 use bcode_plugin_sdk::prelude::*;
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::SkillSourceKind;
-use bmux_keyboard::KeyCode;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::{Column, TextBlock};
 use bmux_tui::event::Event;
@@ -198,6 +197,12 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn skills_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_keymap_action(bcode_plugin_sdk::tui::keymap::KeymapAction {
+        id: "skills.close".into(),
+        scope: "skills".into(),
+        description: "Close the skills surface".into(),
+        defaults: ["enter", "esc", "q"].map(str::to_owned).into(),
+    });
     for (surface_kind, title) in [
         ("skills.list", "Available Skills"),
         ("skills.active", "Active Skills"),
@@ -230,6 +235,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for SkillsCommandSurfaceFact
             Ok(Box::new(SkillsCommandSurface {
                 id: surface_kind,
                 title,
+                close_hint: "Close".into(),
                 lines: skills_surface_lines(surface_kind, &request.options),
                 text_view: std::cell::Cell::new(
                     bmux_tui_components::scroll_view::ScrollViewState::default(),
@@ -241,6 +247,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for SkillsCommandSurfaceFact
 }
 
 struct SkillsCommandSurface {
+    close_hint: String,
     id: &'static str,
     title: &'static str,
     lines: Vec<String>,
@@ -320,7 +327,7 @@ impl SkillsCommandSurface {
             .empty("No skills available");
         let body = Column::new()
             .child(text)
-            .child(TextBlock::new("Enter/Esc/q closes"));
+            .child(TextBlock::new(self.close_hint.as_str()));
         let component = PaneComponent::new("skills.status", pane, &pane_state, body);
         let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
         frame.with_child(
@@ -354,17 +361,36 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for SkillsCommandSurface {
         self.render_themed(area, frame, theme);
     }
 
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) {
+        let keys = host.keymap_keys("skills", "skills.close").join("/");
+        self.close_hint = if keys.is_empty() {
+            "Close (unbound)".into()
+        } else {
+            format!("{keys} closes")
+        };
+        self.render_themed(area, frame, theme);
+    }
+
     fn handle_event(
         &mut self,
         event: &Event,
-        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        let keys = host.keymap_keys("skills", "skills.close").join("/");
+        self.close_hint = if keys.is_empty() {
+            "Close (unbound)".into()
+        } else {
+            format!("{keys} closes")
+        };
         match event {
             Event::Key(key)
-                if matches!(
-                    key.key,
-                    KeyCode::Enter | KeyCode::Escape | KeyCode::Char('q')
-                ) =>
+                if host.keymap_action("skills", *key).as_deref() == Some("skills.close") =>
             {
                 bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None }
             }
@@ -503,6 +529,59 @@ bcode_plugin_sdk::export_plugin!(SkillsPlugin, include_str!("../bcode-plugin.tom
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct KeymapHost(bcode_plugin_sdk::tui::keymap::KeymapRegistry);
+    impl bcode_plugin_sdk::tui::PluginTuiHost for KeymapHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            self.0.action_for_key(scope, stroke).map(str::to_owned)
+        }
+        fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+            self.0
+                .keys_for_action(scope, action)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn close_remap_changes_dispatch_and_effective_hint() {
+        use bcode_plugin_sdk::tui::PluginTuiSurface;
+        let definitions = skills_tui_registry();
+        let mut registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+        registry
+            .register_all(definitions.keymap_actions().iter().cloned())
+            .unwrap();
+        registry
+            .configure(std::collections::BTreeMap::from([(
+                "skills".into(),
+                std::collections::BTreeMap::from([("ctrl+x".into(), "skills.close".into())]),
+            )]))
+            .unwrap();
+        let host = KeymapHost(registry);
+        let mut surface = SkillsCommandSurface {
+            id: "skills.status",
+            title: "Status",
+            close_hint: String::new(),
+            lines: Vec::new(),
+            text_view: std::cell::Cell::new(
+                bmux_tui_components::scroll_view::ScrollViewState::default(),
+            ),
+        };
+        let event = |key| Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap());
+        assert!(matches!(
+            surface.handle_event(&event("enter"), &host),
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        ));
+        assert_eq!(surface.close_hint, "ctrl+x closes");
+        assert!(matches!(
+            surface.handle_event(&event("ctrl+x"), &host),
+            bcode_plugin_sdk::tui::PluginTuiAction::Close { .. }
+        ));
+    }
 
     #[test]
     fn skills_plugin_registers_palette_commands_from_plugin_code() {

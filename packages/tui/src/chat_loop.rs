@@ -229,6 +229,7 @@ pub enum InteractiveSurfaceOpenCompletion {
 }
 
 pub struct ChatLoopState {
+    render_launch: Option<super::plugin_surface_host::FreshSessionSettings>,
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
     slash_completion: slash_palette::SlashCompletionState,
@@ -296,6 +297,7 @@ impl ChatLoopState {
         metrics_enabled: bool,
     ) -> Self {
         Self {
+            render_launch: None,
             palette: None,
             slash_palette: None,
             slash_completion: slash_palette::SlashCompletionState::default(),
@@ -345,6 +347,19 @@ impl ChatLoopState {
             streaming_presentation_override: None,
             frame_index: 0,
         }
+    }
+
+    pub fn set_render_launch(&mut self, launch: super::plugin_surface_host::FreshSessionSettings) {
+        if let Some(surface) = self.plugin_surface.as_mut() {
+            let host = super::plugin_surface_host::root_host(
+                surface.invalidation.clone(),
+                self.foreground_client.clone(),
+                launch.clone(),
+                std::sync::Arc::clone(&surface.active_tasks),
+            );
+            surface.surface.prepare_keymap(&host);
+        }
+        self.render_launch = Some(launch);
     }
 
     pub fn streaming_configurator_deadline(&self, now: Instant) -> Option<Instant> {
@@ -423,11 +438,12 @@ impl ChatLoopState {
         &mut self,
         chat: &mut ActiveChat,
         stroke: KeyStroke,
+        keymap: &BmuxKeyMap,
     ) -> bool {
         let Some(configurator) = self.streaming_configurator.as_mut() else {
             return false;
         };
-        match configurator.handle_key(stroke, Instant::now()) {
+        match configurator.handle_key_with_keymap(stroke, Instant::now(), keymap) {
             super::streaming_configurator::StreamingConfiguratorOutcome::Handled
             | super::streaming_configurator::StreamingConfiguratorOutcome::Ignored => true,
             super::streaming_configurator::StreamingConfiguratorOutcome::Apply(policy) => {
@@ -695,11 +711,16 @@ impl ChatLoopState {
         self.theme_picker = None;
     }
 
-    pub fn handle_theme_picker_key(&mut self, chat: &mut ActiveChat, stroke: KeyStroke) -> bool {
+    pub fn handle_theme_picker_key(
+        &mut self,
+        chat: &mut ActiveChat,
+        stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> bool {
         let Some(picker) = self.theme_picker.as_mut() else {
             return false;
         };
-        let outcome = picker.handle_key(stroke);
+        let outcome = picker.handle_key_with_keymap(stroke, keymap);
         self.apply_theme_picker_outcome(chat, outcome);
         true
     }
@@ -780,9 +801,10 @@ impl ChatLoopState {
     pub fn handle_command_palette_key(
         &mut self,
         stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
     ) -> Option<CommandDispatchRequest> {
         let palette = self.palette.as_mut()?;
-        match palette.handle_key(stroke, 12) {
+        match palette.handle_key_with_keymap(stroke, 12, keymap) {
             super::command_palette::CommandPaletteKeyOutcome::Ignored
             | super::command_palette::CommandPaletteKeyOutcome::QueryEdited
             | super::command_palette::CommandPaletteKeyOutcome::SelectionMoved => None,
@@ -825,8 +847,9 @@ impl ChatLoopState {
         &mut self,
         chat: &mut ActiveChat,
         stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
     ) -> SlashPaletteRootOutcome {
-        if stroke.key == bmux_keyboard::KeyCode::Escape && stroke.modifiers.is_empty() {
+        if keymap.action("slash_palette", stroke) == Some("tui.control.cancel") {
             self.slash_completion.dismiss(chat.app.composer().text());
             if self.slash_palette.take().is_some() {
                 chat.app.set_status("slash completions hidden".to_owned());
@@ -836,16 +859,16 @@ impl ChatLoopState {
         let Some(palette) = self.slash_palette.as_mut() else {
             return SlashPaletteRootOutcome::Unhandled;
         };
-        match stroke.key {
-            bmux_keyboard::KeyCode::Up if stroke.modifiers.is_empty() => {
+        match keymap.action("slash_palette", stroke) {
+            Some("tui.control.up") => {
                 palette.move_previous();
                 SlashPaletteRootOutcome::Handled
             }
-            bmux_keyboard::KeyCode::Down if stroke.modifiers.is_empty() => {
+            Some("tui.control.down") => {
                 palette.move_next();
                 SlashPaletteRootOutcome::Handled
             }
-            bmux_keyboard::KeyCode::Tab if stroke.modifiers.is_empty() => {
+            Some("tui.control.focus_next") => {
                 let command = palette.selected_command().map(str::to_owned);
                 self.slash_completion.dismiss(chat.app.composer().text());
                 self.slash_palette = None;
@@ -855,7 +878,7 @@ impl ChatLoopState {
                 }
                 SlashPaletteRootOutcome::Handled
             }
-            bmux_keyboard::KeyCode::Enter if stroke.modifiers.is_empty() => {
+            Some("tui.control.submit") => {
                 if palette.selected_matches(chat.app.composer().text()) {
                     self.slash_completion.dismiss(chat.app.composer().text());
                     self.slash_palette = None;
@@ -872,7 +895,7 @@ impl ChatLoopState {
                     SlashPaletteRootOutcome::Handled
                 }
             }
-            bmux_keyboard::KeyCode::Escape if stroke.modifiers.is_empty() => {
+            Some("tui.control.cancel") => {
                 self.slash_completion.dismiss(chat.app.composer().text());
                 self.slash_palette = None;
                 chat.app.set_status("slash completions hidden".to_owned());
@@ -1179,28 +1202,32 @@ impl ChatLoopState {
         self.auth_pool_picker.is_some()
     }
 
-    pub fn handle_auth_pool_picker_event(&mut self, event: &Event) -> AuthPoolPickerRootOutcome {
+    pub fn handle_auth_pool_picker_event(
+        &mut self,
+        event: &Event,
+        keymap: &BmuxKeyMap,
+    ) -> AuthPoolPickerRootOutcome {
         let Some(picker) = self.auth_pool_picker.as_mut() else {
             return AuthPoolPickerRootOutcome::Continue;
         };
         let action = match event {
-            Event::Key(stroke) => match stroke.key {
-                bmux_keyboard::KeyCode::Escape => AuthPoolPickerRootOutcome::Cancel,
-                bmux_keyboard::KeyCode::Enter => picker
+            Event::Key(stroke) => match keymap.action("auth_pool_picker", *stroke) {
+                Some("tui.control.cancel") => AuthPoolPickerRootOutcome::Cancel,
+                Some("tui.control.submit") => picker
                     .selected()
                     .map_or(AuthPoolPickerRootOutcome::Continue, |(pool, profile)| {
                         AuthPoolPickerRootOutcome::Promote { pool, profile }
                     }),
-                bmux_keyboard::KeyCode::Char('c') if stroke.modifiers.is_empty() => picker
+                Some("tui.auth.clear") => picker
                     .selected_pool()
                     .map_or(AuthPoolPickerRootOutcome::Continue, |pool| {
                         AuthPoolPickerRootOutcome::Clear { pool }
                     }),
-                bmux_keyboard::KeyCode::Up => {
+                Some("tui.control.up") => {
                     picker.select_previous();
                     AuthPoolPickerRootOutcome::Continue
                 }
-                bmux_keyboard::KeyCode::Down => {
+                Some("tui.control.down") => {
                     picker.select_next();
                     AuthPoolPickerRootOutcome::Continue
                 }
@@ -1241,11 +1268,11 @@ impl ChatLoopState {
             }
         }
         let model = self.model_picker.as_mut()?;
-        if matches!(event, Event::Key(stroke) if stroke.key == bmux_keyboard::KeyCode::Enter)
+        if matches!(event, Event::Key(stroke) if keymap.action("model_picker", *stroke) == Some("tui.control.submit") || keymap.action("model_picker_actions", *stroke) == Some("tui.control.submit"))
             && let Some(model_id) = model.picker.selected_ignored_model_id()
         {
             model.picker.set_status(format!(
-                "{model_id} is ignored; press u to remove state ignore or I to hide ignored models"
+                "{model_id} is ignored; use Unignore to remove state ignore or Show ignored to hide ignored models"
             ));
             return None;
         }
@@ -1422,11 +1449,12 @@ impl ChatLoopState {
         &mut self,
         chat: &mut ActiveChat,
         stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
     ) -> TimelineDialogRootOutcome {
         let Some(dialog) = self.timeline_dialog.as_mut() else {
             return TimelineDialogRootOutcome::Unhandled;
         };
-        match dialog.handle_key(stroke) {
+        match dialog.handle_key_with_keymap(stroke, keymap) {
             super::timeline_dialog::TimelineDialogOutcome::Handled => {
                 chat.app.set_status("timeline".to_owned());
                 TimelineDialogRootOutcome::Handled
@@ -1454,11 +1482,12 @@ impl ChatLoopState {
         &mut self,
         chat: &mut ActiveChat,
         stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
     ) -> ThinkingDialogRootOutcome {
         let Some(dialog) = self.thinking_dialog.as_mut() else {
             return ThinkingDialogRootOutcome::Unhandled;
         };
-        match dialog.handle_key(stroke) {
+        match dialog.handle_key_with_keymap(stroke, keymap) {
             super::thinking_dialog::ThinkingDialogOutcome::Handled => {
                 chat.app
                     .set_status("reasoning output setting changed".to_owned());
@@ -1902,20 +1931,17 @@ impl ChatLoopState {
         event: &Event,
     ) -> SessionPickerRootOutcome {
         if let Event::Key(stroke) = event {
-            let control = if stroke.key == bmux_keyboard::KeyCode::Tab {
-                self.session_picker.as_ref().map(|picker| {
+            let control = match keymap.action("session_picker", *stroke) {
+                Some("tui.session.scopeToggle") => self.session_picker.as_ref().map(|picker| {
                     if picker.all_directories() {
                         "session.scope.local"
                     } else {
                         "session.scope.all"
                     }
-                })
-            } else if stroke.modifiers.alt && stroke.key == bmux_keyboard::KeyCode::Char('p') {
-                Some("session.scope.next")
-            } else if stroke.modifiers.alt && stroke.key == bmux_keyboard::KeyCode::Char('r') {
-                Some("session.scope.restart")
-            } else {
-                None
+                }),
+                Some("tui.session.catalogNextPage") => Some("session.scope.next"),
+                Some("tui.session.catalogRestart") => Some("session.scope.restart"),
+                _ => None,
             };
             if let Some(control) = control
                 && self.handle_session_catalog_control(chat, control)
@@ -1936,16 +1962,10 @@ impl ChatLoopState {
             }
             Event::Key(stroke) => match picker.mode() {
                 super::session_picker::SessionPickerMode::Filter => {
-                    let search = *stroke
-                        == bmux_keyboard::KeyStroke::with_modifiers(
-                            bmux_keyboard::KeyCode::Char('f'),
-                            bmux_keyboard::Modifiers {
-                                ctrl: true,
-                                ..bmux_keyboard::Modifiers::NONE
-                            },
-                        );
-                    if stroke.key == bmux_keyboard::KeyCode::Char('n')
-                        && stroke.modifiers.alt
+                    let search =
+                        keymap.action("session_picker", *stroke) == Some("tui.session.search");
+                    if keymap.action("session_picker", *stroke)
+                        == Some("tui.session.childrenNextPage")
                         && !picker.all_directories()
                     {
                         if let Some((parent_id, after)) = picker.next_child_page() {
@@ -1957,7 +1977,9 @@ impl ChatLoopState {
                         }
                         return SessionPickerRootOutcome::Handled;
                     }
-                    if stroke.key == bmux_keyboard::KeyCode::Right && !picker.all_directories() {
+                    if keymap.action("session_picker", *stroke) == Some("tui.control.right")
+                        && !picker.all_directories()
+                    {
                         if let Some(parent_id) = picker.toggle_selected_branch() {
                             chat.replace_effect(TuiEffect::LoadSessionChildren {
                                 parent_id,
@@ -1967,7 +1989,7 @@ impl ChatLoopState {
                         }
                         return SessionPickerRootOutcome::Handled;
                     }
-                    if stroke.key == bmux_keyboard::KeyCode::Left {
+                    if keymap.action("session_picker", *stroke) == Some("tui.control.left") {
                         picker.select_parent();
                         return SessionPickerRootOutcome::Handled;
                     }
@@ -1975,13 +1997,14 @@ impl ChatLoopState {
                         let query = picker.filter().buffer().text().trim().to_owned();
                         if query.is_empty() {
                             picker.set_status(
-                                "Type a transcript query, then press Ctrl-F".to_owned(),
+                                "Type a transcript query, then invoke Search".to_owned(),
                             );
                         } else {
                             picker.start_transcript_search();
                             let Ok((request, policy)) = picker.search_request(&query, false) else {
                                 picker.set_status(
-                                    "Invalid search controls; press ? for syntax".to_owned(),
+                                    "Invalid search controls; invoke Search syntax for details"
+                                        .to_owned(),
                                 );
                                 return SessionPickerRootOutcome::Handled;
                             };
@@ -2029,9 +2052,10 @@ impl ChatLoopState {
                             super::keymap::BmuxAction::SelectDown => picker.select_next(),
                             _ => {}
                         }
-                    } else if super::text_input_flow::handle_key(
+                    } else if super::text_input_flow::handle_key_in_scope(
                         picker.filter_mut(),
                         keymap,
+                        "session_picker",
                         *stroke,
                     ) != bmux_tui_components::text_input::TextInputOutcome::Ignored
                     {
@@ -2039,9 +2063,10 @@ impl ChatLoopState {
                     }
                 }
                 super::session_picker::SessionPickerMode::Rename => {
-                    if stroke.key == bmux_keyboard::KeyCode::Escape {
+                    if keymap.action("session_rename", *stroke) == Some("tui.control.cancel") {
                         picker.cancel_rename();
-                    } else if stroke.key == bmux_keyboard::KeyCode::Enter {
+                    } else if keymap.action("session_rename", *stroke) == Some("tui.control.submit")
+                    {
                         if let Some(session_id) = picker.selected_session_id() {
                             let name = picker.rename().buffer().text().trim();
                             let name = (!name.is_empty()).then(|| name.to_owned());
@@ -2049,40 +2074,47 @@ impl ChatLoopState {
                             chat.replace_effect(TuiEffect::RenameSession { session_id, name });
                         }
                     } else {
-                        let _ = super::text_input_flow::handle_key(
+                        let _ = super::text_input_flow::handle_key_in_scope(
                             picker.rename_mut(),
                             keymap,
+                            "session_rename",
                             *stroke,
                         );
                     }
                 }
-                super::session_picker::SessionPickerMode::DeleteConfirm => match stroke.key {
-                    bmux_keyboard::KeyCode::Escape | bmux_keyboard::KeyCode::Char('n' | 'N') => {
-                        picker.cancel_delete();
-                    }
-                    bmux_keyboard::KeyCode::Char('y' | 'Y') => {
-                        if let Some(session_id) = picker.selected_session_id() {
-                            picker.finish_mutation("Deleting session…".to_owned());
-                            chat.replace_effect(TuiEffect::DeleteSession { session_id });
+                super::session_picker::SessionPickerMode::DeleteConfirm => {
+                    match keymap.action("session_delete", *stroke) {
+                        Some("tui.control.cancel") => {
+                            picker.cancel_delete();
                         }
+                        Some("tui.control.submit") => {
+                            if let Some(session_id) = picker.selected_session_id() {
+                                picker.finish_mutation("Deleting session…".to_owned());
+                                chat.replace_effect(TuiEffect::DeleteSession { session_id });
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
-                super::session_picker::SessionPickerMode::TranscriptSearch => match stroke.key {
-                    bmux_keyboard::KeyCode::Escape => picker.close_search_results(),
-                    bmux_keyboard::KeyCode::Enter => {
+                }
+                super::session_picker::SessionPickerMode::TranscriptSearch => match keymap
+                    .action("session_search", *stroke)
+                {
+                    Some("tui.control.cancel") => picker.close_search_results(),
+                    Some("tui.control.submit") => {
                         if let Some(hit) = picker.selected_search_result().cloned() {
                             self.session_picker = None;
                             return SessionPickerRootOutcome::SearchHit(hit);
                         }
                         let query = picker.filter().buffer().text().trim().to_owned();
                         if query.is_empty() {
-                            picker
-                                .set_status("Type a transcript query, then press Enter".to_owned());
+                            picker.set_status(
+                                "Type a transcript query, then confirm Search".to_owned(),
+                            );
                         } else {
                             let Ok((request, policy)) = picker.search_request(&query, false) else {
                                 picker.set_status(
-                                    "Invalid search controls; press ? for syntax".to_owned(),
+                                    "Invalid search controls; invoke Search syntax for details"
+                                        .to_owned(),
                                 );
                                 return SessionPickerRootOutcome::Handled;
                             };
@@ -2093,23 +2125,24 @@ impl ChatLoopState {
                             });
                         }
                     }
-                    bmux_keyboard::KeyCode::Char('m' | 'M') if stroke.modifiers.alt => {
+                    Some("tui.search.mode") => {
                         picker.cycle_search_match_mode();
                     }
-                    bmux_keyboard::KeyCode::Char('d' | 'D') if stroke.modifiers.alt => {
+                    Some("tui.search.deep") => {
                         picker.toggle_search_depth();
                     }
-                    bmux_keyboard::KeyCode::Char('s' | 'S') if stroke.modifiers.alt => {
+                    Some("tui.search.content") => {
                         picker.cycle_search_sort();
                     }
-                    bmux_keyboard::KeyCode::Char('n' | 'N') if stroke.modifiers.alt => {
+                    Some("tui.search.nextMatch") => {
                         let query = picker.filter().buffer().text().trim().to_owned();
                         if query.is_empty() || !picker.has_next_search_page() {
                             picker.set_status("No next search page available".to_owned());
                         } else {
                             let Ok((request, policy)) = picker.search_request(&query, true) else {
                                 picker.set_status(
-                                    "Invalid search controls; press ? for syntax".to_owned(),
+                                    "Invalid search controls; invoke Search syntax for details"
+                                        .to_owned(),
                                 );
                                 return SessionPickerRootOutcome::Handled;
                             };
@@ -2120,7 +2153,7 @@ impl ChatLoopState {
                             });
                         }
                     }
-                    bmux_keyboard::KeyCode::Char('i' | 'I') if stroke.modifiers.alt => {
+                    Some("tui.search.index") => {
                         picker.set_status("Inventorying canonical compatibility…".to_owned());
                         chat.replace_effect(TuiEffect::StartBulkMigration {
                             request: bcode_ipc::SessionBulkMigrationStartRequest {
@@ -2132,7 +2165,7 @@ impl ChatLoopState {
                             },
                         });
                     }
-                    bmux_keyboard::KeyCode::Char('g' | 'G') if stroke.modifiers.alt => {
+                    Some("tui.search.migrate") => {
                         if picker.confirm_canonical_migration() {
                             picker.set_status("Starting confirmed canonical migration…".to_owned());
                             chat.replace_effect(TuiEffect::StartBulkMigration {
@@ -2148,12 +2181,12 @@ impl ChatLoopState {
                             });
                         } else {
                             picker.set_status(
-                                "Canonical migration is separate from indexing and creates verified backups. Press Alt-G again to confirm"
+                                "Canonical migration is separate from indexing and creates verified backups. Invoke Migrate again to confirm"
                                     .to_owned(),
                             );
                         }
                     }
-                    bmux_keyboard::KeyCode::Char('b' | 'B') if stroke.modifiers.alt => {
+                    Some("tui.search.backfill") => {
                         picker.set_status("Starting separate derived search backfill…".to_owned());
                         chat.replace_effect(TuiEffect::StartSearchIndexing {
                             request: bcode_session_search::CompleteSessionSearchBackfillRequest {
@@ -2165,7 +2198,7 @@ impl ChatLoopState {
                             },
                         });
                     }
-                    bmux_keyboard::KeyCode::Char('x' | 'X') if stroke.modifiers.alt => {
+                    Some("tui.search.cancelMaintenance") => {
                         if let Some(operation_id) = picker.take_bulk_migration_operation_id() {
                             picker.set_status(
                                 "Cancelling canonical migration between sessions…".to_owned(),
@@ -2181,15 +2214,16 @@ impl ChatLoopState {
                                 .set_status("No active maintenance operation to cancel".to_owned());
                         }
                     }
-                    bmux_keyboard::KeyCode::Char('?') => {
+                    Some("tui.search.help") => {
                         picker.set_status(super::session_search::SEARCH_CONTROL_HELP.to_owned());
                     }
-                    bmux_keyboard::KeyCode::Up => picker.select_previous(),
-                    bmux_keyboard::KeyCode::Down => picker.select_next(),
+                    Some("tui.control.up") => picker.select_previous(),
+                    Some("tui.control.down") => picker.select_next(),
                     _ => {
-                        let _ = super::text_input_flow::handle_key(
+                        let _ = super::text_input_flow::handle_key_in_scope(
                             picker.filter_mut(),
                             keymap,
+                            "session_search",
                             *stroke,
                         );
                     }
@@ -2585,6 +2619,16 @@ impl TuiRuntimeSettings {
     /// Update command completion preferences without rereading configuration.
     pub const fn set_completion_settings(&mut self, settings: bcode_config::CompletionConfig) {
         self.completion_settings = settings;
+    }
+
+    pub fn integrate_keymap_contributors(
+        &mut self,
+        actions: Result<
+            Vec<bcode_plugin_sdk::tui::keymap::KeymapAction>,
+            bcode_plugin_sdk::tui::keymap::KeymapError,
+        >,
+    ) {
+        self.keymap.integrate_contributors(actions);
     }
 
     pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
@@ -3094,7 +3138,7 @@ pub fn apply_effect_result(
                     Ok(started) => {
                         picker.set_search_backfill_operation_id(started.operation_id.clone());
                         picker.set_status(format!(
-                            "Derived search backfill started: {}. Press Alt-X to cancel",
+                            "Derived search backfill started: {}. Invoke Cancel maintenance to cancel",
                             started.operation_id
                         ));
                         chat.replace_effect(TuiEffect::WaitSearchIndexing {
@@ -3481,29 +3525,32 @@ pub fn apply_config_result(
                 &config,
                 &default_plugin_ids,
             );
-            for extension in &settings.tui_extensions {
-                if settings.keymap().error().is_none()
-                    && selection.is_enabled(extension.plugin_id())
-                {
-                    for action in extension.registry().keymap_actions() {
-                        if let Err(error) = settings.keymap.register(action.clone()) {
-                            chat.app
-                                .set_status(format!("plugin keymap unavailable: {error}"));
-                        }
-                    }
-                }
-            }
             match super::plugin_tui::load_default_presentation_with_static_bundled(
                 &selection,
                 config.tui.visual_adapters.clone(),
                 settings.static_plugins(),
                 settings.tui_extensions(),
             ) {
-                Ok(presentation) => chat.app.set_plugin_presentation(Arc::new(presentation)),
-                Err(error) => chat
-                    .app
-                    .set_status(format!("plugin presentation unavailable: {error}")),
+                Ok(presentation) => {
+                    settings
+                        .keymap
+                        .integrate_contributors(presentation.keymap_actions());
+                    if let Some(error) = settings.keymap.error() {
+                        chat.app
+                            .set_status(format!("plugin keymap unavailable: {error}"));
+                    }
+                    chat.app.set_plugin_presentation(Arc::new(presentation));
+                }
+                Err(error) => {
+                    settings.keymap.integrate_contributors(Err(
+                        bcode_plugin_sdk::tui::keymap::KeymapError(error.to_string()),
+                    ));
+                    chat.app
+                        .set_status(format!("plugin presentation unavailable: {error}"));
+                }
             }
+            chat.app
+                .set_effective_keymap(settings.keymap.registry().clone());
             chat.app.apply_tui_config(config.tui.clone());
             if previous_interactions.placement != config.tui.interactions.placement {
                 loop_state.pinned_interaction_viewport = None;
@@ -5294,6 +5341,63 @@ pub fn draw_chat_frame<W: Write>(
     Ok((draw_stats, layout))
 }
 
+fn paint_launch_dialogs(
+    loop_state: &mut ChatLoopState,
+    foreground: Option<super::foreground::Foreground>,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    theme: render::TuiTheme,
+    effective: &BmuxKeyMap,
+) {
+    if let Some(dialog) = &mut loop_state.ralph_start_dialog
+        && foreground == Some(super::foreground::Foreground::Ralph)
+    {
+        super::ralph_start_dialog_render::render_dialog_with_keymap(
+            dialog, frame, theme, effective,
+        );
+    }
+    if let Some(dialog) = &mut loop_state.working_directory_dialog
+        && foreground == Some(super::foreground::Foreground::WorkingDirectory)
+    {
+        super::working_directory_dialog_render::render_dialog_with_keymap(
+            dialog, frame, theme, effective,
+        );
+    }
+    if let Some(dialog) = &mut loop_state.worktree_create_dialog
+        && foreground == Some(super::foreground::Foreground::Worktree)
+    {
+        super::wt_create_dialog_render::render_dialog_with_keymap(dialog, frame, theme, effective);
+    }
+}
+
+fn paint_plugin_foreground(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    foreground: Option<super::foreground::Foreground>,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+) {
+    if let Some(surface) = &mut loop_state.plugin_surface
+        && foreground == Some(super::foreground::Foreground::Plugin)
+    {
+        let area = Rect::new(0, 0, frame.area().width, frame.area().height);
+        let plugin_theme = render::plugin_theme_for_app(&chat.app);
+        if let Some(launch) = loop_state.render_launch.clone() {
+            let host = super::plugin_surface_host::root_host(
+                surface.invalidation.clone(),
+                loop_state.foreground_client.clone(),
+                launch,
+                std::sync::Arc::clone(&surface.active_tasks),
+            );
+            surface
+                .surface
+                .render_with_host(area, frame, Some(&plugin_theme), &host);
+        } else {
+            surface
+                .surface
+                .render_with_theme(area, frame, Some(&plugin_theme));
+        }
+    }
+}
+
 /// Compose every foreground surface in the same order for full and temporal frames.
 /// Preparation may be skipped; composition must never be skipped.
 fn paint_foreground(
@@ -5303,6 +5407,7 @@ fn paint_foreground(
     frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
 ) {
     let foreground = loop_state.foreground();
+    let effective = super::keymap::BmuxKeyMap::from_registry(chat.app.effective_keymap().clone());
     if loop_state.modal_foreground() {
         frame.set_cursor(bmux_tui::geometry::Point::new(0, 0), false);
         frame.set_focus_scope(Some(bmux_tui::hit::HitId::new("bcode.foreground")));
@@ -5323,11 +5428,13 @@ fn paint_foreground(
     {
         command_palette_render::render_palette(palette, frame, theme);
     }
-    paint_foreground_configurator(chat, loop_state, frame);
+    paint_foreground_configurator(chat, loop_state, frame, &effective);
     if let Some(picker) = &mut loop_state.theme_picker
         && foreground == Some(super::foreground::Foreground::Theme)
     {
-        super::theme_picker_render::render_theme_picker(picker, frame, theme);
+        super::theme_picker_render::render_theme_picker_with_keymap(
+            picker, frame, theme, &effective,
+        );
     }
     if let Some(dialog) = &loop_state.permission_dialog
         && foreground == Some(super::foreground::Foreground::Permission)
@@ -5337,68 +5444,62 @@ fn paint_foreground(
     if let Some(dialog) = &loop_state.thinking_dialog
         && foreground == Some(super::foreground::Foreground::Thinking)
     {
-        thinking_dialog_render::render_thinking_dialog(dialog, frame, theme);
+        thinking_dialog_render::render_thinking_dialog_with_keymap(
+            dialog, frame, theme, &effective,
+        );
     }
     if let Some(dialog) = &mut loop_state.timeline_dialog
         && foreground == Some(super::foreground::Foreground::Timeline)
     {
-        timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
+        timeline_dialog_render::render_timeline_dialog_with_keymap(
+            dialog, frame, theme, &effective,
+        );
     }
     if let Some(picker) = &mut loop_state.session_picker
         && foreground == Some(super::foreground::Foreground::Sessions)
     {
-        super::session_picker_render::render_picker(picker, frame, theme);
+        super::session_picker_render::render_picker_with_keymap(picker, frame, theme, &effective);
     }
-    if let Some(surface) = &mut loop_state.plugin_surface
-        && foreground == Some(super::foreground::Foreground::Plugin)
-    {
-        let area = Rect::new(0, 0, frame.area().width, frame.area().height);
-        let plugin_theme = render::plugin_theme_for_app(&chat.app);
-        surface
-            .surface
-            .render_with_theme(area, frame, Some(&plugin_theme));
-    }
+    paint_plugin_foreground(chat, loop_state, foreground, frame);
     if let Some(picker) = &mut loop_state.provider_picker
         && foreground == Some(super::foreground::Foreground::Model)
     {
-        super::provider_picker_render::render_provider_picker(picker, frame, theme);
+        super::provider_picker_render::render_provider_picker_with_keymap(
+            picker, frame, theme, &effective,
+        );
     }
     if let Some(model) = &mut loop_state.model_picker
         && foreground == Some(super::foreground::Foreground::Model)
     {
-        super::model_picker_render::render_model_picker(&mut model.picker, frame, theme);
+        super::model_picker_render::render_model_picker_with_keymap(
+            &mut model.picker,
+            frame,
+            theme,
+            &effective,
+        );
     }
     if let Some(picker) = &mut loop_state.auth_pool_picker
         && foreground == Some(super::foreground::Foreground::AuthPool)
     {
-        super::auth_pool_picker_render::render_auth_pool_picker(picker, frame, theme);
+        super::auth_pool_picker_render::render_auth_pool_picker_with_keymap(
+            picker, frame, theme, &effective,
+        );
     }
     if let Some(picker) = &mut loop_state.skill_picker
         && foreground == Some(super::foreground::Foreground::Skill)
     {
-        super::skill_picker_render::render_skill_picker(picker, frame, theme);
+        super::skill_picker_render::render_skill_picker_with_keymap(
+            picker, frame, theme, &effective,
+        );
     }
-    if let Some(dialog) = &mut loop_state.ralph_start_dialog
-        && foreground == Some(super::foreground::Foreground::Ralph)
-    {
-        super::ralph_start_dialog_render::render_dialog(dialog, frame, theme);
-    }
-    if let Some(dialog) = &mut loop_state.working_directory_dialog
-        && foreground == Some(super::foreground::Foreground::WorkingDirectory)
-    {
-        super::working_directory_dialog_render::render_dialog(dialog, frame, theme);
-    }
-    if let Some(dialog) = &mut loop_state.worktree_create_dialog
-        && foreground == Some(super::foreground::Foreground::Worktree)
-    {
-        super::wt_create_dialog_render::render_dialog(dialog, frame, theme);
-    }
+    paint_launch_dialogs(loop_state, foreground, frame, theme, &effective);
 }
 
 fn paint_foreground_configurator(
     chat: &ActiveChat,
     loop_state: &mut ChatLoopState,
     frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    keymap: &BmuxKeyMap,
 ) {
     let foreground = loop_state.foreground();
     let theme = render::TuiTheme::for_app(&chat.app);
@@ -5411,10 +5512,11 @@ fn paint_foreground_configurator(
             theme,
         );
         configurator.commit_geometry(geometry);
-        super::streaming_configurator_render::render_streaming_configurator(
+        super::streaming_configurator_render::render_streaming_configurator_with_keymap(
             configurator,
             frame,
             theme,
+            keymap,
         );
     }
 }

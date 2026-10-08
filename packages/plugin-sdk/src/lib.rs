@@ -7,6 +7,8 @@
 
 pub mod generation;
 pub mod interaction;
+/// Portable contributor-owned action declarations.
+pub use bcode_plugin_models::keymap;
 pub mod path;
 #[doc(hidden)]
 pub mod static_lifecycle;

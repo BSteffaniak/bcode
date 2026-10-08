@@ -1,6 +1,6 @@
 //! Root-owned skill picker and action semantics.
 
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 
 use bcode_skill_models::SkillId;
 
@@ -30,37 +30,26 @@ fn handle_skill_filter_key(
     if let Some(action) = keymap.action_for_key(BmuxScope::SkillPicker, stroke) {
         return handle_skill_picker_action(picker, action);
     }
-    match stroke.key {
-        KeyCode::Escape => skill_picker::SkillPickerAction::Cancel,
-        KeyCode::Enter => {
-            if picker.selected_skill_id().is_some() {
-                picker.start_argument();
-            }
-            skill_picker::SkillPickerAction::Continue
-        }
-        KeyCode::Up if stroke.modifiers.is_empty() => {
-            picker.select_previous();
-            skill_picker::SkillPickerAction::Continue
-        }
-        KeyCode::Down if stroke.modifiers.is_empty() => {
-            picker.select_next();
-            skill_picker::SkillPickerAction::Continue
-        }
-        KeyCode::Char('a') if stroke.modifiers.is_empty() => picker.selected_skill_id().map_or(
+    match keymap.action("skill_picker", stroke) {
+        Some("tui.skill.activate") => picker.selected_skill_id().map_or(
             skill_picker::SkillPickerAction::Continue,
             skill_picker::SkillPickerAction::Activate,
         ),
-        KeyCode::Char('d') if stroke.modifiers.is_empty() => picker.selected_skill_id().map_or(
+        Some("tui.skill.deactivate") => picker.selected_skill_id().map_or(
             skill_picker::SkillPickerAction::Continue,
             skill_picker::SkillPickerAction::Deactivate,
         ),
-        KeyCode::Char('?') if stroke.modifiers.is_empty() => picker.selected_skill_id().map_or(
+        Some("tui.skill.help") => picker.selected_skill_id().map_or(
             skill_picker::SkillPickerAction::Continue,
             skill_picker::SkillPickerAction::Help,
         ),
         _ => {
-            if text_input_flow::handle_key(picker.filter_mut(), keymap, stroke)
-                != bmux_tui_components::text_input::TextInputOutcome::Ignored
+            if text_input_flow::handle_key_in_scope(
+                picker.filter_mut(),
+                keymap,
+                "skill_picker",
+                stroke,
+            ) != bmux_tui_components::text_input::TextInputOutcome::Ignored
             {
                 picker.refresh_filter();
             }
@@ -158,9 +147,9 @@ fn handle_skill_argument_key(
     keymap: &BmuxKeyMap,
     stroke: KeyStroke,
 ) -> skill_picker::SkillPickerAction {
-    match stroke.key {
-        KeyCode::Escape => skill_picker::SkillPickerAction::Cancel,
-        KeyCode::Enter => picker.selected_skill_id().map_or(
+    match keymap.action("skill_picker", stroke) {
+        Some("tui.select.cancel") => skill_picker::SkillPickerAction::Cancel,
+        Some("tui.skill.invoke") => picker.selected_skill_id().map_or(
             skill_picker::SkillPickerAction::Continue,
             |skill_id| skill_picker::SkillPickerAction::Invoke {
                 skill_id,
@@ -168,7 +157,12 @@ fn handle_skill_argument_key(
             },
         ),
         _ => {
-            let _outcome = text_input_flow::handle_key(picker.argument_mut(), keymap, stroke);
+            let _outcome = text_input_flow::handle_key_in_scope(
+                picker.argument_mut(),
+                keymap,
+                "skill_picker",
+                stroke,
+            );
             skill_picker::SkillPickerAction::Continue
         }
     }
