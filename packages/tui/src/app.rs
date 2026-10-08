@@ -7346,15 +7346,14 @@ mod tests {
             "unbound send · unbound interrupt · unbound exit · unbound palette"
         );
         assert_eq!(
-            app.effective_keymap().action_for_key(
-                "chat",
-                bcode_plugin_sdk::tui::keymap::parse_key_stroke("enter").unwrap(),
-            ),
+            app.effective_keymap()
+                .action_for_key("chat", bmux_keyboard::parse_key_stroke("enter").unwrap(),),
             None,
         );
         for width in [0, 1, 2, 80] {
             crate::transcript_projection::sync_layout_for_test(&mut app, width);
         }
+        drop(app);
     }
 
     #[test]

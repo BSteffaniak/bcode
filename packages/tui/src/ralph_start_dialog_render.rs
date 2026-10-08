@@ -15,16 +15,7 @@ use super::ralph_start_dialog::{RalphStartDialog, RalphStartDialogField};
 use super::render::TuiTheme;
 
 /// Render the Ralph loop start dialog.
-#[cfg(test)]
-pub fn render_dialog(dialog: &mut RalphStartDialog, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
-    render_dialog_with_keymap(
-        dialog,
-        frame,
-        theme,
-        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
-    );
-}
-
+///
 /// Render effective dialog shortcuts.
 pub fn render_dialog_with_keymap(
     dialog: &mut RalphStartDialog,

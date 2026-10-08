@@ -252,6 +252,7 @@ impl OnboardingProgram {
             }
             self.launch_pending = false;
             self.launch_generation = self.launch_generation.wrapping_add(1);
+            return Ok(Lifecycle::Continue);
         }
         if self.start_model_discovery(code) {
             return Ok(Lifecycle::Continue);
@@ -789,7 +790,7 @@ mod tests {
         program.finish_launch_selection(Ok(selection));
         let cancelled_generation = program.launch_generation;
         assert_eq!(
-            program.handle_key(KeyCode::Down).unwrap(),
+            program.handle_key(KeyCode::Escape).unwrap(),
             bmux_tui_runtime::Lifecycle::Continue
         );
         assert!(!program.launch_pending);

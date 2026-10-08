@@ -341,7 +341,9 @@ fn render_controls(
         ]),
         Line::from_spans(vec![Span::styled(
             format!(
-                "{} select  {} adjust  {} coarse  {} toggle  {} scroll  {} follow  {} restart  {} pause  {} apply  {} cancel",
+                "{} apply  {} cancel  {} select  {} adjust  {} coarse  {} toggle  {} scroll  {} follow  {} restart  {} pause",
+                keymap.hint("streaming_configurator", "tui.control.submit"),
+                keymap.hint("streaming_configurator", "tui.control.cancel"),
                 keymap.hint("streaming_configurator", "tui.control.down"),
                 keymap.hint("streaming_configurator", "tui.control.right"),
                 keymap.hint("streaming_configurator", "tui.streaming.coarseRight"),
@@ -349,9 +351,7 @@ fn render_controls(
                 keymap.hint("streaming_configurator", "tui.control.page_down"),
                 keymap.hint("streaming_configurator", "tui.control.end"),
                 keymap.hint("streaming_configurator", "tui.streaming.restart"),
-                keymap.hint("streaming_configurator", "tui.streaming.pause"),
-                keymap.hint("streaming_configurator", "tui.control.submit"),
-                keymap.hint("streaming_configurator", "tui.control.cancel")
+                keymap.hint("streaming_configurator", "tui.streaming.pause")
             ),
             theme.muted,
         )]),

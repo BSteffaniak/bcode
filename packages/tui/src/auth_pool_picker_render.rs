@@ -8,20 +8,7 @@ use super::picker_render::{picker_list_area, render_picker_chrome};
 use super::render::TuiTheme;
 
 /// Render the auth-pool profile picker.
-#[cfg(test)]
-pub fn render_auth_pool_picker(
-    app: &mut AuthPoolPickerApp,
-    frame: &mut PaintCx<'_, '_>,
-    theme: TuiTheme,
-) {
-    render_auth_pool_picker_with_keymap(
-        app,
-        frame,
-        theme,
-        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
-    );
-}
-
+///
 /// Render shortcuts from effective bindings.
 pub fn render_auth_pool_picker_with_keymap(
     app: &mut AuthPoolPickerApp,

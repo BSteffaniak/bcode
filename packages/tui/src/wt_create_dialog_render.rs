@@ -15,20 +15,7 @@ use super::render::TuiTheme;
 use super::wt_create_dialog::{WorktreeCreateDialog, WorktreeCreateFocus};
 
 /// Render the worktree create dialog.
-#[cfg(test)]
-pub fn render_dialog(
-    dialog: &mut WorktreeCreateDialog,
-    frame: &mut PaintCx<'_, '_>,
-    theme: TuiTheme,
-) {
-    render_dialog_with_keymap(
-        dialog,
-        frame,
-        theme,
-        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
-    );
-}
-
+///
 /// Render effective dialog shortcuts.
 pub fn render_dialog_with_keymap(
     dialog: &mut WorktreeCreateDialog,

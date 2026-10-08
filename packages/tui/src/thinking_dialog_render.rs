@@ -17,20 +17,7 @@ const MIN_DIALOG_HEIGHT: u16 = 15;
 const MAX_DIALOG_HEIGHT: u16 = 22;
 
 /// Render a reasoning output settings dialog.
-#[cfg(test)]
-pub fn render_thinking_dialog(
-    state: &ThinkingDialogState,
-    frame: &mut PaintCx<'_, '_>,
-    theme: TuiTheme,
-) {
-    render_thinking_dialog_with_keymap(
-        state,
-        frame,
-        theme,
-        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
-    );
-}
-
+///
 /// Render effective shortcuts from the same registry used by input.
 pub fn render_thinking_dialog_with_keymap(
     state: &ThinkingDialogState,

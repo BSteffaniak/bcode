@@ -85830,6 +85830,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await;
     }
 
+    async fn verify_resumed_replacement(
+        state: &Arc<ServerState>,
+        key: &bcode_workflow_store::WorkflowRunBindingKey,
+        new_run: bcode_workflow_store::NewWorkflowRun,
+    ) {
+        Box::pin(verify_associated_replacement_withdrawal(
+            state,
+            key,
+            new_run.clone(),
+        ))
+        .await;
+        Box::pin(verify_authorized_replacement_completion(
+            state, key, new_run,
+        ))
+        .await;
+    }
+
     async fn assert_associated_resume_pending_inner(recovering: bool, allowance_only: bool) {
         let sessions = SessionManager::default();
         let session = sessions
@@ -85924,11 +85941,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("resume");
 
         assert_resumed_pending(&state, changed);
-        verify_associated_replacement_withdrawal(&state, &key, new_run.clone()).await;
-        Box::pin(verify_authorized_replacement_completion(
-            &state, &key, new_run,
-        ))
-        .await;
+        Box::pin(verify_resumed_replacement(&state, &key, new_run)).await;
     }
 
     #[tokio::test]

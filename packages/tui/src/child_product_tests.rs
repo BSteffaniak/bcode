@@ -81,6 +81,12 @@ async fn published_parent_card_opens_child_through_root_route_without_parent_his
 #[tokio::test]
 async fn monitor_explicit_focus_escape_returns_composer_and_typing_is_not_swallowed() {
     let mut model = root_test_model_with_history(SessionId::new(), &[]);
+    let mut config = bcode_config::TuiConfig::default();
+    config
+        .keybindings
+        .chat
+        .insert("ctrl+g".into(), "tui.monitor.toggle".into());
+    model.settings.apply_tui_config(&config);
     let ctrl_g = KeyStroke::with_modifiers(
         KeyCode::Char('g'),
         Modifiers {

@@ -1368,7 +1368,16 @@ impl BcodeRuntimeModel {
                                 area.contains(mouse.position).then_some(identity)
                             })
                     && let Some(presentation) = self.chat.app.plugin_presentation()
-                    && presentation.content_event(identity, &Event::Mouse(mouse))
+                    && presentation.content_event_with_host(
+                        identity,
+                        &Event::Mouse(mouse),
+                        &super::plugin_surface_host::root_host(
+                            bmux_tui_runtime::InvalidationSignal::new(),
+                            self.loop_state.foreground_client(),
+                            self.fresh_session_settings(),
+                            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        ),
+                    )
                 {
                     if matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_)) {
                         self.focused_visual = Some(identity.clone());
@@ -6492,6 +6501,10 @@ mod tests {
                 },
             },
         });
+        model
+            .chat
+            .app
+            .set_effective_keymap(model.settings.keymap().registry().clone());
         let registry = model
             .chat
             .app
@@ -7543,6 +7556,11 @@ mod tests {
             &[],
         );
         settings.apply_tui_config(tui_config);
+        let mut actions = bcode_question_plugin::question_tui_registry()
+            .keymap_actions()
+            .to_vec();
+        actions.extend_from_slice(bcode_shell_plugin::shell_tui_registry().keymap_actions());
+        settings.integrate_keymap_contributors(Ok(actions));
         let client = bcode_client::BcodeClient::default_endpoint();
         let passive_client = client
             .clone()
@@ -9383,10 +9401,15 @@ mod tests {
         history: &[bcode_session_models::SessionEvent],
     ) -> super::BcodeRuntimeModel {
         let chat = root_test_chat_with_history(session_id, history);
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+        let mut settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
             std::path::PathBuf::from("."),
             &[],
         );
+        let mut actions = bcode_question_plugin::question_tui_registry()
+            .keymap_actions()
+            .to_vec();
+        actions.extend_from_slice(bcode_shell_plugin::shell_tui_registry().keymap_actions());
+        settings.integrate_keymap_contributors(Ok(actions));
         let client = bcode_client::BcodeClient::default_endpoint();
         let passive_client = client
             .clone()
@@ -9413,12 +9436,16 @@ mod tests {
             &[plugin],
         )
         .expect("question plugin runtime");
+        let mut effective_keymap = keymap.clone();
+        effective_keymap.integrate_contributors(Ok(bcode_question_plugin::question_tui_registry()
+            .keymap_actions()
+            .to_vec()));
         super::super::interactive_surface::InteractiveSurfaceState::open(
             &runtime,
             "question-root-test",
             "bcode.question.inline",
             &serde_json::json!({ "questions": questions }).to_string(),
-            keymap,
+            &effective_keymap,
         )
         .await
         .expect("question surface")
@@ -11701,16 +11728,20 @@ mod tests {
     #[tokio::test]
     async fn streaming_configurator_apply_cancel_and_reset_own_input_and_effects() {
         let mut apply = root_test_model();
+        let apply_keymap =
+            super::super::keymap::BmuxKeyMap::from_config(apply.chat.app.tui_config());
         apply
             .loop_state
             .open_streaming_configurator(&mut apply.chat);
         assert!(apply.loop_state.handle_streaming_configurator_key(
             &mut apply.chat,
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char('x')),
+            &apply_keymap,
         ));
         assert!(apply.loop_state.handle_streaming_configurator_key(
             &mut apply.chat,
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Enter),
+            &apply_keymap,
         ));
         assert!(apply.chat.pending_effects.contains_effect(
             &super::super::effects::TuiEffect::PersistStreamingPresentation {
@@ -11726,17 +11757,22 @@ mod tests {
         drop(apply);
 
         let mut cancel = root_test_model();
+        let cancel_keymap =
+            super::super::keymap::BmuxKeyMap::from_config(cancel.chat.app.tui_config());
         cancel
             .loop_state
             .open_streaming_configurator(&mut cancel.chat);
         assert!(cancel.loop_state.handle_streaming_configurator_key(
             &mut cancel.chat,
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Escape),
+            &cancel_keymap,
         ));
         assert_eq!(cancel.chat.queued_effect_count(), 0);
         drop(cancel);
 
         let mut reset = root_test_model();
+        let reset_keymap =
+            super::super::keymap::BmuxKeyMap::from_config(reset.chat.app.tui_config());
         reset
             .loop_state
             .open_streaming_configurator(&mut reset.chat);
@@ -11744,15 +11780,18 @@ mod tests {
             assert!(reset.loop_state.handle_streaming_configurator_key(
                 &mut reset.chat,
                 bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Down),
+                &reset_keymap,
             ));
         }
         assert!(reset.loop_state.handle_streaming_configurator_key(
             &mut reset.chat,
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Space),
+            &reset_keymap,
         ));
         assert!(reset.loop_state.handle_streaming_configurator_key(
             &mut reset.chat,
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Enter),
+            &reset_keymap,
         ));
         assert!(
             reset
@@ -11766,6 +11805,8 @@ mod tests {
     #[tokio::test]
     async fn streaming_configurator_deadline_stops_on_pause_and_close() {
         let mut model = root_test_model();
+        let model_keymap =
+            super::super::keymap::BmuxKeyMap::from_config(model.chat.app.tui_config());
         model
             .loop_state
             .open_streaming_configurator(&mut model.chat);
@@ -11779,6 +11820,7 @@ mod tests {
         assert!(model.loop_state.handle_streaming_configurator_key(
             &mut model.chat,
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char('p')),
+            &model_keymap,
         ));
         assert!(
             model
@@ -11789,6 +11831,7 @@ mod tests {
         assert!(model.loop_state.handle_streaming_configurator_key(
             &mut model.chat,
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Escape),
+            &model_keymap,
         ));
         assert!(
             model

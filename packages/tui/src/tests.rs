@@ -933,7 +933,7 @@ fn escape_requires_double_tap_to_interrupt_without_exiting_chat() {
 
     assert_eq!(first.request, KeyRequest::None);
     assert!(first.redraw);
-    assert_eq!(app.status(), "hit esc twice to cancel");
+    assert_eq!(app.status(), "repeat escape to cancel");
     assert_eq!(second.request, KeyRequest::Interrupt);
     assert!(!app.should_exit());
     drop(app);

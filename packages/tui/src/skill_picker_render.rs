@@ -13,16 +13,7 @@ use super::skill_picker::{SkillPickerApp, SkillPickerMode};
 use super::text_input_flow;
 
 /// Render the skill picker.
-#[cfg(test)]
-pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
-    render_skill_picker_with_keymap(
-        app,
-        frame,
-        theme,
-        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
-    );
-}
-
+///
 /// Render effective shortcut hints.
 pub fn render_skill_picker_with_keymap(
     app: &mut SkillPickerApp,

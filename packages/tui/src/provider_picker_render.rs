@@ -9,20 +9,7 @@ use super::provider_picker::ProviderPickerApp;
 use super::render::TuiTheme;
 
 /// Render the provider picker.
-#[cfg(test)]
-pub fn render_provider_picker(
-    app: &mut ProviderPickerApp,
-    frame: &mut PaintCx<'_, '_>,
-    theme: TuiTheme,
-) {
-    render_provider_picker_with_keymap(
-        app,
-        frame,
-        theme,
-        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
-    );
-}
-
+///
 /// Render shortcuts from effective bindings.
 pub fn render_provider_picker_with_keymap(
     app: &mut ProviderPickerApp,

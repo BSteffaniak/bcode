@@ -430,7 +430,7 @@ impl InteractiveSurfaceState {
             ),
             |cx| {
                 self.surface
-                    .render_with_host(full_area, cx, None, &self.host)
+                    .render_with_host(full_area, cx, None, &self.host);
             },
         );
     }
@@ -633,12 +633,17 @@ mod tests {
             &[plugin],
         )
         .expect("load local question plugin runtime");
+        let mut keymap = BmuxKeyMap::from_config(config);
+        keymap.integrate_contributors(Ok(bcode_question_plugin::question_tui_registry()
+            .keymap_actions()
+            .to_vec()));
+        assert!(keymap.error().is_none(), "{:?}", keymap.error());
         InteractiveSurfaceState::open(
             &runtime,
             "question-call-question",
             "bcode.question.inline",
             &serde_json::json!({ "questions": questions }).to_string(),
-            &BmuxKeyMap::from_config(config),
+            &keymap,
         )
         .await
         .expect("open local question TUI surface")
@@ -1062,7 +1067,7 @@ mod tests {
         assert!(area_points(area).all(|point| {
             buffer
                 .get(point)
-                .is_some_and(|cell| cell.symbol != "x" && cell.style != sentinel)
+                .is_some_and(|cell| !(cell.symbol == "x" && cell.style == sentinel))
         }));
     }
 
@@ -1199,12 +1204,16 @@ mod tests {
         let mut config = bcode_config::TuiConfig::default();
         config
             .keybindings
-            .chat
-            .insert("ctrl+b".to_owned(), "tui.editor.moveCursorLeft".to_owned());
-        config.keybindings.chat.insert(
-            "ctrl+d".to_owned(),
-            "tui.editor.deleteCharForward".to_owned(),
-        );
+            .scopes
+            .entry("question.text".into())
+            .or_default()
+            .insert("ctrl+b".to_owned(), "tui.control.left".to_owned());
+        config
+            .keybindings
+            .scopes
+            .entry("question.text".into())
+            .or_default()
+            .insert("ctrl+d".to_owned(), "tui.control.delete".to_owned());
         let mut surface = question_surface_with_config(
             serde_json::json!([{
                 "header": null,
@@ -1286,6 +1295,10 @@ mod tests {
             )],
         )
         .expect("question runtime");
+        let mut keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+        keymap.integrate_contributors(Ok(bcode_question_plugin::question_tui_registry()
+            .keymap_actions()
+            .to_vec()));
         let mut surface = InteractiveSurfaceState::open(
             &plugin_runtime,
             "question-call-question",
@@ -1303,7 +1316,7 @@ mod tests {
                 }]
             })
             .to_string(),
-            &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+            &keymap,
         )
         .await
         .expect("question surface");
@@ -1341,6 +1354,10 @@ mod tests {
             &[plugin],
         )
         .expect("load local question plugin runtime");
+        let mut keymap = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+        keymap.integrate_contributors(Ok(bcode_question_plugin::question_tui_registry()
+            .keymap_actions()
+            .to_vec()));
         let mut surface = InteractiveSurfaceState::open(
             &runtime,
             "question-call-question",
@@ -1362,7 +1379,7 @@ mod tests {
                 }]
             })
             .to_string(),
-            &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+            &keymap,
         )
         .await
         .expect("open local question TUI surface");

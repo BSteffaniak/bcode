@@ -449,11 +449,7 @@ impl SetupSettingsForm {
     }
 
     /// Render form fields and review state within the existing terminal.
-    #[cfg(test)]
-    pub fn render(&mut self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
-        self.render_with_keymap(frame, theme, &self.keymap.clone());
-    }
-
+    ///
     /// Render with the same effective bindings used for dispatch.
     pub fn render_with_keymap(
         &mut self,

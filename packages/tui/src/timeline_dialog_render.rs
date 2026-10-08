@@ -19,20 +19,7 @@ const MAX_DIALOG_HEIGHT: u16 = 28;
 const TIMESTAMP_WIDTH: usize = 19;
 
 /// Render the timeline dialog.
-#[cfg(test)]
-pub fn render_timeline_dialog(
-    state: &mut TimelineDialogState,
-    frame: &mut PaintCx<'_, '_>,
-    theme: TuiTheme,
-) {
-    render_timeline_dialog_with_keymap(
-        state,
-        frame,
-        theme,
-        &super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
-    );
-}
-
+///
 /// Render shortcuts from effective bindings.
 pub fn render_timeline_dialog_with_keymap(
     state: &mut TimelineDialogState,

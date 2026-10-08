@@ -941,7 +941,7 @@ mod tests {
         );
         let keymap = super::super::keymap::BmuxKeyMap::try_from_config(&config).unwrap();
         for key in ["enter", "space"] {
-            let event = Event::Key(bcode_plugin_sdk::tui::keymap::parse_key_stroke(key).unwrap());
+            let event = Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap());
             assert_eq!(
                 board.handle_event_with_keymap(
                     Rect::new(0, 0, 80, 24),
@@ -952,7 +952,7 @@ mod tests {
                 SetupBoardOutcome::Ignored,
             );
         }
-        let event = Event::Key(bcode_plugin_sdk::tui::keymap::parse_key_stroke("ctrl+y").unwrap());
+        let event = Event::Key(bmux_keyboard::parse_key_stroke("ctrl+y").unwrap());
         assert_eq!(
             board.handle_event_with_keymap(Rect::new(0, 0, 80, 24), &mut state, &event, &keymap),
             SetupBoardOutcome::Selected(SetupSectionId::Welcome),

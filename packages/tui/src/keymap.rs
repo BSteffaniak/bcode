@@ -684,7 +684,12 @@ fn register_form_editor_actions(
                     | ControlAction::Home
                     | ControlAction::End
             ) {
-                registry.register(action.definition(scope))?;
+                let mut definition = action.definition(scope);
+                // Transcript maintenance owns Alt-B in the search form.
+                if scope == "session_search" && *action == ControlAction::WordLeft {
+                    definition.defaults.retain(|key| key != "alt+b");
+                }
+                registry.register(definition)?;
             }
         }
     }
@@ -839,6 +844,12 @@ impl BmuxKeyMap {
                 }
             }
         }
+        registry.register(KeymapAction {
+            id: BmuxAction::TranscriptClearSelection.id().into(),
+            scope: "chat".into(),
+            description: BmuxAction::TranscriptClearSelection.description().into(),
+            defaults: Vec::new(),
+        })?;
         register_host_actions(&mut registry)?;
         registry.configure(overrides)?;
         Ok(Self {
@@ -1325,7 +1336,6 @@ mod tests {
         assert_eq!(keymap.hint("theme_picker", "tui.control.cancel"), "unbound");
     }
 
-    #[test]
     fn default_keymap() -> BmuxKeyMap {
         BmuxKeyMap::from_config(&TuiConfig::default())
     }
