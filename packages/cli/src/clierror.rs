@@ -28,20 +28,208 @@ pub struct CliDiagnosticError {
 impl CliDiagnosticError {
     /// Normalize a returned error without formatting its underlying payload.
     #[must_use]
-    pub const fn from_error(error: &CliError) -> Self {
+    pub fn from_error(error: &CliError) -> Self {
         match error {
-            CliError::Client(bcode_client::ClientError::ConnectTimeout { .. }) => Self {
-                schema_version: 1,
-                code: "connection_timeout",
-                phase: "connect",
-                message: "Verified daemon connection timed out.",
-            },
-            _ => Self {
-                schema_version: 1,
-                code: "cli_failure",
-                phase: "operation",
-                message: "CLI operation failed.",
-            },
+            CliError::Client(error)
+            | CliError::ChildSessionCreate { source: error, .. }
+            | CliError::SessionListingInterrupted { source: error } => Self::from_client(error),
+            CliError::WorkflowApplication { code, .. } => Self::application(code),
+            CliError::Signal(error) | CliError::ThemeIo(error) => Self::io(error.kind()),
+            CliError::Json(_) => Self::diagnostic(
+                "json_decode_failed",
+                "decode",
+                "JSON could not be decoded; check response compatibility and retained output.",
+            ),
+            CliError::Config(_) => Self::diagnostic(
+                "configuration_failed",
+                "configuration",
+                "Configuration could not be resolved; validate the selected configuration without exposing credentials.",
+            ),
+            CliError::Session(_) | CliError::SessionDb(_) | CliError::SessionStore(_) => {
+                Self::diagnostic(
+                    "session_storage_failed",
+                    "session_storage",
+                    "Session storage operation failed; inspect session health through supported maintenance diagnostics before retrying.",
+                )
+            }
+            CliError::WorkflowStore(_) => Self::diagnostic(
+                "workflow_storage_failed",
+                "workflow_storage",
+                "Workflow storage operation failed; inspect compatibility, maintenance status and execution ownership.",
+            ),
+            CliError::InvalidArguments(_)
+            | CliError::InvalidSessionHistoryRange
+            | CliError::NewSessionWithCommand => Self::diagnostic(
+                "invalid_arguments",
+                "validation",
+                "Invalid command arguments; consult command help.",
+            ),
+            _ => Self::diagnostic(
+                "unclassified_cli_error",
+                "operation",
+                "This CLI error category has no normalized diagnostic yet; retain the operation and artifact identity. Its cause and side effects are unknown.",
+            ),
+        }
+    }
+
+    const fn diagnostic(code: &'static str, phase: &'static str, message: &'static str) -> Self {
+        Self {
+            schema_version: 1,
+            code,
+            phase,
+            message,
+        }
+    }
+
+    fn from_client(error: &bcode_client::ClientError) -> Self {
+        use bcode_client::ClientError;
+        match error {
+            ClientError::ConnectTimeout { .. } => Self::diagnostic(
+                "connection_timeout",
+                "connect",
+                "Verified daemon connection timed out.",
+            ),
+            ClientError::RequestTimeout { .. } => Self::diagnostic(
+                "request_timeout",
+                "request",
+                "Daemon request deadline elapsed; the operation may have committed. Inspect its outcome before retrying mutations.",
+            ),
+            ClientError::DaemonStartupTimeout { .. } => Self::diagnostic(
+                "daemon_startup_timeout",
+                "startup",
+                "Daemon startup deadline elapsed; inspect matching-artifact startup coordination and startup reports.",
+            ),
+            ClientError::Transport(_) => Self::diagnostic(
+                "ipc_transport_failed",
+                "transport",
+                "IPC transport failed; inspect the matching daemon endpoint and ownership. Delivery and operation outcome may be unknown.",
+            ),
+            ClientError::Codec(_) => Self::diagnostic(
+                "ipc_decode_failed",
+                "decode",
+                "IPC response decoding failed; verify exact client/daemon artifact compatibility.",
+            ),
+            ClientError::DaemonStart(_) => Self::diagnostic(
+                "daemon_start_failed",
+                "startup",
+                "Matching daemon startup failed; inspect startup reports, storage availability and startup coordination.",
+            ),
+            ClientError::Server { code, .. } => Self::application(code),
+            ClientError::IncompatibleDaemon { .. } => Self::diagnostic(
+                "daemon_incompatible",
+                "handshake",
+                "Daemon compatibility verification failed; use the exact target artifact and state location.",
+            ),
+            ClientError::Protocol(_) => Self::diagnostic(
+                "ipc_protocol_failed",
+                "protocol",
+                "IPC protocol validation failed; inspect client/daemon compatibility and retained operation evidence.",
+            ),
+            ClientError::WorktreeCreate { .. } => Self::diagnostic(
+                "worktree_create_failed",
+                "worktree",
+                "Worktree creation failed; creation may have partially committed. Inspect registered worktrees before retrying.",
+            ),
+            ClientError::UnexpectedResponse => Self::diagnostic(
+                "unexpected_response",
+                "decode",
+                "Daemon returned an unexpected response payload; inspect protocol compatibility.",
+            ),
+            ClientError::UnexpectedEnvelope => Self::diagnostic(
+                "unexpected_envelope",
+                "decode",
+                "Daemon returned an unexpected IPC envelope; inspect protocol compatibility.",
+            ),
+        }
+    }
+
+    fn application(code: &str) -> Self {
+        match code {
+            "workflow_activity_snapshot_start_failed" => Self::diagnostic(
+                "workflow_activity_snapshot_start_failed",
+                "snapshot_start",
+                "Workflow activity could not establish a snapshot; inspect storage compatibility, capacity and ownership.",
+            ),
+            "workflow_activity_inventory_failed" => Self::diagnostic(
+                "workflow_activity_inventory_failed",
+                "inventory_read",
+                "Workflow activity inventory failed; inspect scan lifetime, cursor revision, ledger consistency and database availability.",
+            ),
+            "workflow_activity_live_observation_failed" => Self::diagnostic(
+                "workflow_activity_live_observation_failed",
+                "live_adaptation",
+                "Workflow live observation failed; inspect session provenance, ownership, resident connection and metadata readiness.",
+            ),
+            "workflow_activity_unavailable" => Self::diagnostic(
+                "workflow_activity_unavailable",
+                "workflow_activity",
+                "Workflow activity snapshot is unavailable, expired or unsupported; inspect scan identity, cursor revision, snapshot lifetime and storage health. This is not an idle or terminal observation.",
+            ),
+            "workflow_unavailable" => Self::diagnostic(
+                "workflow_unavailable",
+                "workflow",
+                "Workflow state is unavailable; inspect domain health, storage compatibility and execution ownership. This does not establish a terminal outcome.",
+            ),
+            "session_database_locked" => Self::diagnostic(
+                "session_database_locked",
+                "session_create",
+                "Session database is locked; inspect verified ownership and resident connection lifecycle. Do not delete the WAL or substitute storage.",
+            ),
+            "session_parent_not_found" => Self::diagnostic(
+                "session_parent_not_found",
+                "session_create",
+                "Canonical parent session was not found in the selected state location; reconcile its identity without substituting storage.",
+            ),
+            "session_storage_migration_required" => Self::diagnostic(
+                "session_storage_migration_required",
+                "session_create",
+                "Session storage requires explicit migration before child creation; preserve the canonical data.",
+            ),
+            "session_create_failed" => Self::diagnostic(
+                "session_create_failed",
+                "session_create",
+                "Session creation failed; verify parent session health and storage availability. Retain the child identity for exact reconciliation.",
+            ),
+            "session_children_unavailable" => Self::diagnostic(
+                "session_children_unavailable",
+                "session_discovery",
+                "Child discovery is unavailable; inspect query coverage and parent session health. Missing results do not prove absence of children.",
+            ),
+            "session_not_found" => Self::diagnostic(
+                "session_not_found",
+                "session_lookup",
+                "Session was not found in the selected state location; verify its canonical location and identity without substituting storage.",
+            ),
+            _ => Self::diagnostic(
+                "unclassified_application_error",
+                "application",
+                "The application returned a code not recognized by this diagnostic contract; its cause and side effects remain unknown. Do not infer retry safety.",
+            ),
+        }
+    }
+
+    const fn io(kind: std::io::ErrorKind) -> Self {
+        match kind {
+            std::io::ErrorKind::PermissionDenied => Self::diagnostic(
+                "io_permission_denied",
+                "io",
+                "Filesystem access was denied; verify permissions for the selected operation.",
+            ),
+            std::io::ErrorKind::NotFound => Self::diagnostic(
+                "io_not_found",
+                "io",
+                "A required filesystem resource was not found; verify the selected operation's paths.",
+            ),
+            std::io::ErrorKind::StorageFull => Self::diagnostic(
+                "io_storage_full",
+                "io",
+                "Storage is full; free space in the selected storage location before retrying. Partial effects require reconciliation.",
+            ),
+            _ => Self::diagnostic(
+                "io_failed",
+                "io",
+                "An I/O operation failed; inspect storage availability and operation evidence. Raw I/O payloads are withheld because they may contain secrets.",
+            ),
         }
     }
 }
@@ -69,7 +257,7 @@ mod tests {
             message: "SECRET_FIXTURE_MARKER".into(),
         };
         let diagnostic = CliDiagnosticError::from_error(&error);
-        assert_eq!(diagnostic.code, "cli_failure");
+        assert_eq!(diagnostic.code, "unclassified_application_error");
         assert!(
             !serde_json::to_string(&diagnostic)
                 .unwrap()
@@ -82,15 +270,67 @@ mod tests {
         let error = CliError::Client(bcode_client::ClientError::RequestTimeout {
             timeout: std::time::Duration::from_secs(5),
         });
-        assert_eq!(CliDiagnosticError::from_error(&error).code, "cli_failure");
+        assert_eq!(
+            CliDiagnosticError::from_error(&error).code,
+            "request_timeout"
+        );
+    }
+
+    #[test]
+    fn known_application_codes_are_actionable_without_echoing_payloads() {
+        for code in [
+            "workflow_unavailable",
+            "session_create_failed",
+            "session_database_locked",
+            "session_parent_not_found",
+            "session_storage_migration_required",
+            "session_children_unavailable",
+            "session_not_found",
+        ] {
+            let error = CliError::Client(bcode_client::ClientError::Server {
+                code: code.into(),
+                message: "SECRET_FIXTURE_MARKER".into(),
+            });
+            let diagnostic = CliDiagnosticError::from_error(&error);
+            assert_eq!(diagnostic.code, code);
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("SECRET_FIXTURE_MARKER")
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_child_errors_preserve_typed_connection_classification() {
+        let error = CliError::ChildSessionCreate {
+            child_id: bcode_session_models::SessionId::new(),
+            parent_id: bcode_session_models::SessionId::new(),
+            source: bcode_client::ClientError::RequestTimeout {
+                timeout: std::time::Duration::from_secs(15),
+            },
+        };
+        assert_eq!(
+            CliDiagnosticError::from_error(&error).code,
+            "request_timeout"
+        );
+    }
+
+    #[test]
+    fn storage_full_is_actionable_without_raw_path_disclosure() {
+        let error = CliError::Signal(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert_eq!(
+            CliDiagnosticError::from_error(&error).code,
+            "io_storage_full"
+        );
     }
 
     #[test]
     fn io_failure_is_secret_safe_and_not_a_connection_timeout() {
         let error = CliError::Signal(std::io::Error::other("SECRET_FIXTURE_MARKER"));
         let diagnostic = CliDiagnosticError::from_error(&error);
-        assert_eq!(diagnostic.phase, "operation");
-        assert_eq!(diagnostic.code, "cli_failure");
+        assert_eq!(diagnostic.phase, "io");
+        assert_eq!(diagnostic.code, "io_failed");
         assert!(
             !serde_json::to_string(&diagnostic)
                 .unwrap()

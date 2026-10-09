@@ -9,6 +9,26 @@ use bcode_session_models::{
 use std::fs::{self, File};
 use std::ops::Bound::{Excluded, Included};
 
+fn verify_summary_prefix(
+    summary: &SessionSummary,
+    prefix: &[SessionEvent],
+    session_id: SessionId,
+) -> Result<(), SessionError> {
+    let relationship = prefix.iter().find_map(|event| match &event.kind {
+        SessionEventKind::ChildSessionCreated { request } => Some(request.parent_id),
+        _ => None,
+    });
+    if relationship != summary.parent_id {
+        return Err(invalid(
+            "parent projection disagrees with canonical creation prefix",
+        ));
+    }
+    if relationship.is_some() {
+        validate_child_prefix(prefix, session_id)?;
+    }
+    Ok(())
+}
+
 fn child_staging_path(
     root: &std::path::Path,
     request: &SessionChildCreateRequest,
@@ -128,6 +148,12 @@ impl SessionManager {
         if !db::session_db_path(&root, session_id).exists() {
             return Err(SessionError::NotFound(session_id));
         }
+        let resident = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = resident {
+            let (summary, prefix) = handle.observed_summary().await?;
+            verify_summary_prefix(&summary, &prefix, session_id)?;
+            return Ok(summary);
+        }
         let database = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
         let result: Result<SessionSummary, SessionError> = async {
             database.validate_read_readiness().await?;
@@ -136,18 +162,7 @@ impl SessionManager {
                 .await?
                 .summary();
             let prefix = database.events_range(0, 1, 2).await?;
-            let relationship = prefix.iter().find_map(|event| match &event.kind {
-                SessionEventKind::ChildSessionCreated { request } => Some(request.parent_id),
-                _ => None,
-            });
-            if relationship != summary.parent_id {
-                return Err(invalid(
-                    "parent projection disagrees with canonical creation prefix",
-                ));
-            }
-            if relationship.is_some() {
-                validate_child_prefix(&prefix, session_id)?;
-            }
+            verify_summary_prefix(&summary, &prefix, session_id)?;
             Ok(summary)
         }
         .await;
@@ -165,6 +180,42 @@ impl SessionManager {
     ///
     /// # Errors
     /// Returns an error for an invalid work budget; individual observation failures are page issues.
+    async fn observed_child_index(
+        &self,
+        store: &crate::SessionStoreExecutor,
+        query: &SessionChildQuery,
+    ) -> Result<(Vec<SessionId>, bool), SessionError> {
+        let resident = self
+            .inner
+            .lock()
+            .await
+            .sessions
+            .get(&query.parent_id)
+            .cloned();
+        if let Some(handle) = resident {
+            return handle
+                .observed_child_page(query.after, query.limit + 1)
+                .await;
+        }
+        let database =
+            db::SessionDb::open_existing_turso_in_root(query.parent_id, &store.root_path()).await?;
+        let result = database
+            .direct_child_page(query.after, query.limit + 1)
+            .await
+            .map_err(SessionError::from);
+        let close = database.close().await;
+        match (result, close) {
+            (Ok(page), Ok(())) => Ok(page),
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error.into()),
+        }
+    }
+
+    /// Read a bounded indexed child window without owning sessions or replaying history.
+    ///
+    /// Unresolved publication and damaged projection coverage remain explicit.
+    /// # Errors
+    /// Rejects invalid query limits and unavailable parent metadata; individual child failures are page issues.
     pub async fn query_child_sessions(
         &self,
         query: SessionChildQuery,
@@ -176,14 +227,8 @@ impl SessionManager {
         let mut index_issue = None;
         let coverage;
         let candidates = if let Some(store) = &self.store {
-            let database =
-                db::SessionDb::open_existing_turso_in_root(query.parent_id, &store.root_path())
-                    .await?;
-            let result = database
-                .direct_child_page(query.after, query.limit + 1)
-                .await;
-            let close = database.close().await;
-            if let (Ok((ids, complete)), Ok(())) = (result, close) {
+            let result = self.observed_child_index(store, &query).await;
+            if let Ok((ids, complete)) = result {
                 coverage = complete;
                 if !complete {
                     index_issue = Some("parent child publication is pending or historical coverage requires explicit reconciliation".into());
@@ -604,14 +649,8 @@ impl SessionManager {
         let handle = self.session_handle(parent).await?;
         for _ in 0..8 {
             let generation = self.current_session_generation(parent).await?;
-            let receipt = if let Some(store) = &self.store {
-                let database =
-                    db::SessionDb::open_existing_turso_in_root(parent, &store.root_path()).await?;
-                let result = database.child_publication_receipt(child).await;
-                let close = database.close().await;
-                let receipt = result?;
-                close?;
-                receipt
+            let receipt = if self.store.is_some() {
+                handle.observed_child_receipt(child).await?
             } else {
                 self.child_receipts
                     .lock()
@@ -916,6 +955,49 @@ mod tests {
             .unwrap();
         assert_eq!(canonical_before.events, canonical_after.events);
         assert_eq!(canonical_after.last_available_sequence, Some(24));
+    }
+
+    #[tokio::test]
+    async fn live_parent_observation_and_child_publication_reuse_owned_database() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let guard = manager
+            .acquire_session_ownership(parent.id, crate::SessionOwnershipKind::RuntimeWork)
+            .await
+            .unwrap();
+        manager
+            .append_context_compacted(parent.id, "context".into(), 0)
+            .await
+            .unwrap();
+        assert!(manager.session_is_owned(parent.id).await);
+        assert_eq!(
+            manager
+                .session_summary_non_owning(parent.id)
+                .await
+                .unwrap()
+                .id,
+            parent.id
+        );
+        let child = manager
+            .create_child_session(request(parent.id))
+            .await
+            .unwrap();
+        let page = manager
+            .query_child_sessions(SessionChildQuery {
+                parent_id: parent.id,
+                after: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert!(page.complete);
+        assert!(page.children.iter().any(|summary| summary.id == child.id));
+        assert!(manager.session_is_owned(parent.id).await);
+        drop(guard);
     }
 
     fn request(parent: SessionId) -> SessionChildCreateRequest {

@@ -409,6 +409,13 @@ fn scan_workflow_progress_with_ipc(
                             .map(str::to_owned);
                     }
                     let page: WorkflowActivityPage = serde_json::from_value(value)?;
+                    if page
+                        .issues
+                        .iter()
+                        .any(|issue| issue.starts_with("session_progress:"))
+                    {
+                        return Err(EvalError::Validation("workflow live session progress prerequisites unavailable; inspect retained activity page issues for metadata, provenance, ownership and residency categories".into()));
+                    }
                     if page.version != WORKFLOW_ACTIVITY_VERSION || page.run_id != run || page.root_run_id != root
                         || guard.id.as_deref() != Some(page.scan_id.as_str()) || page.scan_id.is_empty()
                         || page.section != if section == "attempts" { WorkflowActivitySection::Attempts } else { WorkflowActivitySection::Children } || revision.is_some_and(|value| value != page.revision)
@@ -773,11 +780,39 @@ fn observe(
     }
 }
 
+struct CancellationVerification {
+    terminal: Option<serde_json::Value>,
+    observations: Vec<serde_json::Value>,
+}
+
 fn verify_cancellation(
     run_id: &str,
     invoke: &impl Fn(&[String], &str, Duration) -> Result<serde_json::Value, EvalError>,
-) -> Option<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    directory: &Path,
+) -> Result<Option<serde_json::Value>, EvalError> {
+    let verification =
+        cancellation_verification(run_id, invoke, Duration::from_secs(15), std::thread::sleep);
+    write_json(
+        directory.join("cancellation-verification.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "terminal_observed": verification.terminal.is_some(),
+            "observations": verification.observations,
+            "limitation": "A terminal root snapshot does not by itself verify descendant settlement, resource release or absence of effects."
+        }),
+    )?;
+    Ok(verification.terminal)
+}
+
+fn cancellation_verification(
+    run_id: &str,
+    invoke: &impl Fn(&[String], &str, Duration) -> Result<serde_json::Value, EvalError>,
+    allowance: Duration,
+    wait: impl Fn(Duration),
+) -> CancellationVerification {
+    let deadline = Instant::now() + allowance;
+    let mut observations = Vec::new();
     while Instant::now() < deadline {
         let args = [
             "workflow".into(),
@@ -787,19 +822,33 @@ fn verify_cancellation(
             "--limit".into(),
             "1".into(),
         ];
-        if let Ok(value) = invoke(
-            &args,
-            "cancel-verification",
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(3)),
-        ) && terminal_status(&value)
-        {
-            return Some(value);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match invoke(&args, "cancel-verification", remaining) {
+            Ok(value) => {
+                let terminal = terminal_status(&value);
+                observations.push(serde_json::json!({
+                    "outcome": if terminal { "terminal_observed" } else { "nonterminal_observed" },
+                    "status": value.pointer("/run/status"),
+                    "remaining_ms": deadline.saturating_duration_since(Instant::now()).as_millis()
+                }));
+                if terminal {
+                    return CancellationVerification {
+                        terminal: Some(value),
+                        observations,
+                    };
+                }
+            }
+            Err(error) => observations.push(serde_json::json!({
+                "outcome": "inspection_failed", "error": error.to_string(),
+                "remaining_ms": deadline.saturating_duration_since(Instant::now()).as_millis()
+            })),
         }
-        std::thread::sleep(Duration::from_millis(100));
+        wait(Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())));
     }
-    None
+    CancellationVerification {
+        terminal: None,
+        observations,
+    }
 }
 
 struct IsolatedDaemonCleanup<'a> {
@@ -1196,7 +1245,7 @@ pub fn execute(
                     "observation-cancellation",
                     Duration::from_secs(15),
                 );
-                let terminal = verify_cancellation(run_id, &invoke);
+                let terminal = verify_cancellation(run_id, &invoke, rep_dir)?;
                 let verified = terminal.is_some();
                 if terminal.is_some() {
                     last_observed = terminal;
@@ -1229,7 +1278,7 @@ pub fn execute(
                 "repair-cancellation",
                 Duration::from_secs(15),
             );
-            let terminal = verify_cancellation(run_id, &invoke);
+            let terminal = verify_cancellation(run_id, &invoke, rep_dir)?;
             let verified = terminal.is_some();
             if terminal.is_some() {
                 last_observed = terminal;
@@ -1309,7 +1358,7 @@ pub fn execute(
                     "activity-observation-cancellation",
                     Duration::from_secs(15),
                 );
-                let terminal = verify_cancellation(run_id, &invoke);
+                let terminal = verify_cancellation(run_id, &invoke, rep_dir)?;
                 let verified = terminal.is_some();
                 if terminal.is_some() {
                     last_observed = terminal;
@@ -1350,7 +1399,7 @@ pub fn execute(
             Duration::from_secs(15),
         );
         let requested = cancel.is_ok();
-        let terminal = verify_cancellation(run_id, &invoke);
+        let terminal = verify_cancellation(run_id, &invoke, rep_dir)?;
         let terminal_verified = terminal.is_some();
         if terminal.is_some() {
             last_observed = terminal;
@@ -2661,9 +2710,37 @@ mod observation_tests {
     fn cancellation_verification_retains_exact_terminal_snapshot() {
         let snapshot = serde_json::json!({"run":{"status":"failed"},"attempts":[{"id":"exact"}]});
         assert_eq!(
-            verify_cancellation("run", &|_, _, _| Ok(snapshot.clone())),
+            cancellation_verification(
+                "run",
+                &|_, _, _| Ok(snapshot.clone()),
+                Duration::from_secs(15),
+                |_| {}
+            )
+            .terminal,
             Some(snapshot)
         );
+    }
+
+    #[test]
+    fn cancellation_observation_keeps_failure_and_uses_remaining_budget() {
+        let calls = std::cell::Cell::new(0);
+        let result = cancellation_verification(
+            "run",
+            &|_, _, allowance| {
+                assert!(allowance > Duration::from_secs(5));
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(EvalError::Validation("typed inspection unavailable".into()))
+                } else {
+                    Ok(serde_json::json!({"run":{"status":"cancelled"}}))
+                }
+            },
+            Duration::from_secs(15),
+            |_| {},
+        );
+        assert!(result.terminal.is_some());
+        assert_eq!(result.observations[0]["outcome"], "inspection_failed");
+        assert_eq!(result.observations[1]["outcome"], "terminal_observed");
     }
 
     #[test]

@@ -393,9 +393,17 @@ pub async fn page(
 ) -> Result<WorkflowActivityPage, ServerError> {
     let cursor = decode(&request)?;
     scans.expire().await?;
-    let scan_id = start_scan(state, scans, &request).await?;
+    let scan_id = start_scan(state, scans, &request).await.map_err(|_| {
+        ServerError::WorkflowActivityObservation {
+            phase: "snapshot_start",
+        }
+    })?;
     let (inventory, snapshot_started_at_ms, subtree_coverage_complete) =
-        read_inventory(scans, &request, &scan_id, cursor.as_ref()).await?;
+        read_inventory(scans, &request, &scan_id, cursor.as_ref())
+            .await
+            .map_err(|_| ServerError::WorkflowActivityObservation {
+                phase: "inventory_read",
+            })?;
     let next_cursor = inventory
         .next_after
         .map(|after| {
@@ -416,7 +424,13 @@ pub async fn page(
     ];
     let mut attempts = Vec::with_capacity(inventory.attempts.len());
     for attempt in inventory.attempts {
-        attempts.push(observe_attempt(state, &request.run_id, attempt, &mut issues).await?);
+        attempts.push(
+            observe_attempt(state, &request.run_id, attempt, &mut issues)
+                .await
+                .map_err(|_| ServerError::WorkflowActivityObservation {
+                    phase: "live_adaptation",
+                })?,
+        );
     }
     // Do not publish coverage for a scan evicted or expired during live adaptation.
     let retained = scans.scans.lock().await;
@@ -475,7 +489,7 @@ async fn observe_attempt(
         match source {
             Some(bcode_workflow_view_models::WorkflowAttemptSource::LinkedSession) => {
                 if let Some(link) = attempt.session {
-                    let snapshot = observe_linked_session(state, run_id, link).await?;
+                    let snapshot = observe_linked_session(state, run_id, link, issues).await?;
                     progress = Some(snapshot.clone());
                     bcode_workflow_view_models::AttemptObservation::LinkedSession {
                         progress: snapshot,
@@ -571,9 +585,17 @@ async fn observe_linked_session(
     state: &ServerState,
     run_id: &str,
     link: bcode_workflow_store::WorkflowExecutionSessionLink,
+    issues: &mut Vec<String>,
 ) -> Result<SessionProgressSnapshot, ServerError> {
     let id: bcode_session_models::SessionId = link.session_id.parse().map_err(|_| unavailable())?;
     let summary = state.sessions.session_summary_non_owning(id).await;
+    if let Err(error) = &summary {
+        issues.push(format!(
+            "session_progress:{}:metadata:{}",
+            link.session_id,
+            error.observation_category()
+        ));
+    }
     let provenance_verified = summary.as_ref().is_ok_and(|summary| {
         summary.execution.as_ref().is_some_and(|execution| {
             execution.provenance.run_id == run_id
@@ -598,6 +620,24 @@ async fn observe_linked_session(
     };
     let owned = state.sessions.session_is_owned(id).await;
     let resident = state.session_runtimes.lock().await.contains_key(&id);
+    if !provenance_verified && !shared_verified {
+        issues.push(format!(
+            "session_progress:{}:provenance_unverified",
+            link.session_id
+        ));
+    }
+    if !owned {
+        issues.push(format!(
+            "session_progress:{}:ownership_released_or_foreign",
+            link.session_id
+        ));
+    }
+    if !resident {
+        issues.push(format!(
+            "session_progress:{}:runtime_nonresident",
+            link.session_id
+        ));
+    }
     Ok(
         if (provenance_verified || shared_verified) && owned && resident {
             state.progress_observations.lock().map_or_else(

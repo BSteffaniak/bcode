@@ -19,7 +19,7 @@ use bcode_metrics::MetricsContext;
 use bcode_session_models::{
     ProjectionWindowAnchor, SessionHistoryAroundQuery, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
-    SessionInspectionPage, SessionInspectionQuery,
+    SessionId, SessionInspectionPage, SessionInspectionQuery,
 };
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -652,6 +652,35 @@ impl SessionHandle {
             .await?
     }
 
+    pub(crate) async fn observed_child_page(
+        &self,
+        after: Option<SessionId>,
+        limit: usize,
+    ) -> Result<(Vec<SessionId>, bool), SessionError> {
+        self.send(|reply| SessionCommand::ObservedChildPage {
+            after,
+            limit,
+            reply,
+        })
+        .await?
+    }
+
+    pub(crate) async fn observed_child_receipt(
+        &self,
+        child: SessionId,
+    ) -> Result<Option<bool>, SessionError> {
+        self.send(|reply| SessionCommand::ObservedChildReceipt { child, reply })
+            .await?
+    }
+
+    /// Read bounded canonical metadata through this actor's owned connection.
+    /// This does not acquire ownership, repair projections, or close the runtime database.
+    pub(crate) async fn observed_summary(
+        &self,
+    ) -> Result<(SessionSummary, Vec<SessionEvent>), SessionError> {
+        self.send(SessionCommand::ObservedSummary).await?
+    }
+
     pub async fn summary(&self) -> Result<SessionSummary, SessionError> {
         self.send(SessionCommand::Summary).await
     }
@@ -1060,6 +1089,16 @@ enum SessionCommand {
         client_id: ClientId,
         reply: oneshot::Sender<Result<bool, SessionError>>,
     },
+    ObservedChildPage {
+        after: Option<SessionId>,
+        limit: usize,
+        reply: oneshot::Sender<Result<(Vec<SessionId>, bool), SessionError>>,
+    },
+    ObservedChildReceipt {
+        child: SessionId,
+        reply: oneshot::Sender<Result<Option<bool>, SessionError>>,
+    },
+    ObservedSummary(oneshot::Sender<Result<(SessionSummary, Vec<SessionEvent>), SessionError>>),
     Summary(oneshot::Sender<SessionSummary>),
     WorkingDirectory(oneshot::Sender<PathBuf>),
     SetComposerDraft {
@@ -1485,6 +1524,32 @@ impl SessionActor {
             }
             SessionCommand::Detach { client_id, reply } => {
                 let _ = reply.send(Ok(self.detach(client_id).await));
+            }
+            SessionCommand::ObservedChildPage {
+                after,
+                limit,
+                reply,
+            } => {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db.direct_child_page(after, limit).await.map_err(Into::into),
+                    Ok(None) => Err(SessionError::NotFound(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            SessionCommand::ObservedChildReceipt { child, reply } => {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .child_publication_receipt(child)
+                        .await
+                        .map_err(Into::into),
+                    Ok(None) => Err(SessionError::NotFound(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            SessionCommand::ObservedSummary(reply) => {
+                let _ = reply.send(self.observed_summary().await);
             }
             SessionCommand::Summary(reply) => {
                 let _ = reply.send(self.state.summary());
@@ -1981,6 +2046,20 @@ impl SessionActor {
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         Ok(())
+    }
+
+    async fn observed_summary(
+        &mut self,
+    ) -> Result<(SessionSummary, Vec<SessionEvent>), SessionError> {
+        let session_id = self.state.summary.id;
+        let db = self
+            .existing_session_db()
+            .await?
+            .ok_or(SessionError::NotFound(session_id))?;
+        db.validate_read_readiness().await?;
+        let state = crate::SessionManager::read_db_session_state(session_id, db).await?;
+        let prefix = db.events_range(0, 1, 2).await?;
+        Ok((state.summary(), prefix))
     }
 
     /// Bounded health through the cached database, opening it once if the file exists.

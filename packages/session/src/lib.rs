@@ -1018,6 +1018,13 @@ impl SessionManager {
         session_id: SessionId,
         db: &db::SessionDb,
     ) -> Result<SessionState, SessionError> {
+        Self::read_db_session_state(session_id, db).await
+    }
+
+    async fn read_db_session_state(
+        session_id: SessionId,
+        db: &db::SessionDb,
+    ) -> Result<SessionState, SessionError> {
         let Some(db_state) = db.session_state().await? else {
             return Err(SessionError::ProjectionStale {
                 session_id,
@@ -9383,7 +9390,9 @@ mod tests {
             .create_session(Some("global catalog".to_string()), test_working_directory())
             .await
             .expect("session should create");
-        // This fixture tests persisted catalog reads, not background update scheduling.
+        // Catalog writes are asynchronous. Persist the derived row before hiding
+        // canonical storage so the test exercises catalog reads, not queue teardown.
+        manager.flush_catalog_updates().await;
         manager.shutdown_catalog_updates().await;
         drop(manager);
         let session_db = db::session_db_path(&root, session.id);

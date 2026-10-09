@@ -219,6 +219,9 @@ pub const SESSION_EVENT_PLUGIN_TOPIC: &str = "bcode.session.event";
 /// Errors returned by the local server.
 #[derive(Debug, Error)]
 pub enum ServerError {
+    /// A content-free workflow observation failure at a defined boundary.
+    #[error("workflow activity observation failed at {phase}")]
+    WorkflowActivityObservation { phase: &'static str },
     /// An embedded application callback panicked; its payload is not disclosed.
     #[error("embedded workflow application callback failed")]
     EmbeddedWorkflowCallbackFailed,
@@ -6804,11 +6807,14 @@ async fn handle_request_inner(
             ))
             .await
             .map_or_else(
-                |_| {
-                    Response::Err(ErrorResponse::new(
-                        "workflow_activity_unavailable",
-                        "workflow activity snapshot unavailable, expired, or unsupported",
-                    ))
+                |error| {
+                    let (code, message) = match error {
+                        ServerError::WorkflowActivityObservation { phase: "snapshot_start" } => ("workflow_activity_snapshot_start_failed", "Workflow activity could not establish a retained snapshot; inspect storage compatibility, capacity and ownership."),
+                        ServerError::WorkflowActivityObservation { phase: "inventory_read" } => ("workflow_activity_inventory_failed", "Workflow activity inventory read failed; inspect scan lifetime, cursor revision, canonical ledger consistency and database availability."),
+                        ServerError::WorkflowActivityObservation { phase: "live_adaptation" } => ("workflow_activity_live_observation_failed", "Workflow live-session observation failed; inspect session provenance, ownership, resident connection and canonical metadata readiness."),
+                        _ => ("workflow_activity_unavailable", "Workflow activity snapshot unavailable, expired, or unsupported."),
+                    };
+                    Response::Err(ErrorResponse::new(code, message))
                 },
                 |page| Response::Ok(ResponsePayload::WorkflowActivityPage { page }),
             );
@@ -10245,7 +10251,7 @@ fn handle_create_child_session<'a>(
     request: bcode_session_models::SessionChildCreateRequest,
 ) -> ProviderCallFuture<'a, Result<(), ServerError>> {
     Box::pin(async move {
-        let response = match session_operations::create_child(state, request).await {
+        let response = match Box::pin(session_operations::create_child(state, request)).await {
             Ok(session) => Response::Ok(ResponsePayload::SessionCreated { session }),
             Err(error) => Response::Err(ErrorResponse::new(error.code(), error.message())),
         };
@@ -64921,6 +64927,19 @@ library = "test"
         assert_eq!(private.message(), "session creation failed");
         assert!(!private.message().contains("secret-create-detail"));
         assert!(!private.message().contains(&session_id.to_string()));
+        let missing = session_operations::CreateSessionError::Session(
+            bcode_session::SessionError::NotFound(session_id),
+        );
+        assert_eq!(missing.code(), "session_parent_not_found");
+        assert!(!missing.message().contains(&session_id.to_string()));
+        let migration = session_operations::CreateSessionError::Session(
+            bcode_session::SessionError::StorageMigrationRequired {
+                actual: 99,
+                expected: 1,
+            },
+        );
+        assert_eq!(migration.code(), "session_storage_migration_required");
+        assert!(!migration.message().contains("99"));
     }
 
     #[test]

@@ -1357,18 +1357,34 @@ pub enum CreateSessionError {
 impl CreateSessionError {
     /// Stable public operation error code.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::WorkingDirectoryMustBeAbsolute => "session_working_directory_must_be_absolute",
+            Self::Session(error) if error.observation_category() == "database_locked" => {
+                "session_database_locked"
+            }
+            Self::Session(bcode_session::SessionError::NotFound(_)) => "session_parent_not_found",
+            Self::Session(bcode_session::SessionError::StorageMigrationRequired { .. }) => {
+                "session_storage_migration_required"
+            }
             Self::Session(_) => "session_create_failed",
         }
     }
 
     /// Secret-safe public operation error message.
     #[must_use]
-    pub const fn message(&self) -> &'static str {
+    pub fn message(&self) -> &'static str {
         match self {
             Self::WorkingDirectoryMustBeAbsolute => "session working directory must be absolute",
+            Self::Session(error) if error.observation_category() == "database_locked" => {
+                "session database is locked; inspect the verified session owner and resident connection lifecycle; do not delete the WAL or substitute storage"
+            }
+            Self::Session(bcode_session::SessionError::NotFound(_)) => {
+                "canonical parent session was not found in the selected state location"
+            }
+            Self::Session(bcode_session::SessionError::StorageMigrationRequired { .. }) => {
+                "session storage requires explicit migration before child creation"
+            }
             Self::Session(_) => "session creation failed",
         }
     }
