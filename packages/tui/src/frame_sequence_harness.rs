@@ -2703,6 +2703,144 @@ mod tests {
         );
     }
 
+    fn shell_streamed_draft_step(
+        session_id: SessionId,
+        generation: u64,
+        revision: u64,
+        preview: &str,
+    ) -> TranscriptFrameStep {
+        TranscriptFrameStep {
+            label: "streamed-draft",
+            input: live_input(SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: Some(bcode_session_models::TurnOutputPosition::new(
+                            revision,
+                        )),
+                        turn_id: "turn-long-shell".to_owned(),
+                        tool_call_id: "call-long-shell".to_owned(),
+                        tool_name: "shell.run".to_owned(),
+                        producer_plugin_id: Some("bcode.shell".to_owned()),
+                        schema: "bcode.tool.request.shell.run".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Request,
+                        generation,
+                        revision,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: preview.to_owned(),
+                        },
+                        argument_bytes: preview.len(),
+                        truncated: false,
+                    },
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn long_shell_draft_frames_survive_resize_idle_and_delayed_updates() {
+        let session_id = SessionId::new();
+        let command = "printf '%s\\n' alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
+        let arguments =
+            serde_json::json!({"command": command, "cwd": "/tmp/project", "format_commands": true})
+                .to_string();
+        let draft = |generation, revision, preview: &str| {
+            shell_streamed_draft_step(session_id, generation, revision, preview)
+        };
+        let observe = || TranscriptFrameStep {
+            label: "idle",
+            input: TranscriptFrameInput::Observe,
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(&mut app, 72, 30)
+            .with_plugin_host(std::sync::Arc::new(shell_plugin_host()))
+            .run([
+                draft(1, 1, r#"{"command":"printf '%s\\n' alpha beta gamma"#),
+                draft(1, 2, &arguments),
+                observe(),
+                TranscriptFrameStep {
+                    label: "narrow",
+                    input: TranscriptFrameInput::Resize(36, 30),
+                },
+                observe(),
+                draft(2, 1, &arguments),
+                observe(),
+                TranscriptFrameStep {
+                    label: "assembled",
+                    input: durable_input(durable(
+                        session_id,
+                        1,
+                        SessionEventKind::ToolCallRequested {
+                            tool_call_id: "call-long-shell".to_owned(),
+                            producer_plugin_id: Some("bcode.shell".to_owned()),
+                            tool_name: "shell.run".to_owned(),
+                            arguments_json: arguments,
+                            working_directory: None,
+                        },
+                    )),
+                },
+                draft(3, 99, r#"{"command":"obsolete"}"#),
+                observe(),
+                TranscriptFrameStep {
+                    label: "wide",
+                    input: TranscriptFrameInput::Resize(72, 30),
+                },
+                observe(),
+                TranscriptFrameStep {
+                    label: "terminal",
+                    input: durable_input(durable(
+                        session_id,
+                        2,
+                        SessionEventKind::ToolInvocationResultRecorded {
+                            record: bcode_session_models::ToolInvocationResultRecord {
+                                invocation_id: "call-long-shell".to_owned(),
+                                model_output: "complete".to_owned(),
+                                content: Vec::new(),
+                                is_error: false,
+                                presentation: None,
+                                result: None,
+                            },
+                        },
+                    )),
+                },
+                draft(4, 100, r#"{"command":"obsolete"}"#),
+                observe(),
+            ]);
+        for (accepted, idle) in [
+            (1, 2),
+            (3, 4),
+            (5, 6),
+            (7, 8),
+            (8, 9),
+            (10, 11),
+            (12, 13),
+            (13, 14),
+        ] {
+            assert_eq!(frames[accepted].text, frames[idle].text);
+            assert_eq!(
+                frames[accepted].observation.semantic_items,
+                frames[idle].observation.semantic_items
+            );
+        }
+        let id = &frames[0].observation.semantic_items[0].0;
+        for frame in &frames {
+            assert_eq!(frame.observation.semantic_items.len(), 1);
+            assert_eq!(&frame.observation.semantic_items[0].0, id);
+            assert_eq!(frame.observation.terminal_items.len(), 1);
+            assert!(!frame.text.contains("obsolete"));
+            assert!(!frame.text.contains("{\"command\""));
+        }
+        for index in [1, 3, 5, 7, 10] {
+            assert!(
+                frames[index].text.contains("omega"),
+                "{}",
+                frames[index].text
+            );
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // Every user-visible shell lifecycle frame is asserted.
     fn shell_draft_request_live_and_result_keep_one_adapter_owned_identity() {

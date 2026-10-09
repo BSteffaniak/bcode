@@ -230,6 +230,9 @@ fn interaction_status_detail(
 #[derive(Debug, Clone, Default)]
 struct ToolInvocationAggregate {
     projection: ToolInvocationProjection,
+    // Draft fences survive resident history replacement without retaining old projections.
+    request_assembled: bool,
+    drafts_terminal: bool,
     terminal_status: Option<ToolInvocationViewStatus>,
     request_draft: Option<ToolRequestDraftView>,
     terminal_request_draft: Option<(u64, u64)>,
@@ -1045,6 +1048,20 @@ impl SessionView {
     pub fn clear_history_window(&mut self) {
         let previous = self.snapshot.clone();
         let terminal_runtime_work = self.terminal_runtime_work.clone();
+        let invocation_fences = self
+            .tool_invocations
+            .iter()
+            .filter(|(_, aggregate)| {
+                aggregate.request_assembled || aggregate.drafts_terminal || aggregate.is_terminal()
+            })
+            .map(|(id, aggregate)| {
+                (
+                    id.clone(),
+                    aggregate.request_assembled,
+                    aggregate.drafts_terminal || aggregate.is_terminal(),
+                )
+            })
+            .collect::<Vec<_>>();
         let live_tool_request_drafts = self
             .tool_invocations
             .values()
@@ -1126,6 +1143,11 @@ impl SessionView {
         replacement.snapshot.transcript.has_older_history = previous.transcript.has_older_history;
         replacement.snapshot.transcript.has_newer_history = previous.transcript.has_newer_history;
         replacement.terminal_runtime_work = terminal_runtime_work;
+        for (id, request_assembled, drafts_terminal) in invocation_fences {
+            let aggregate = replacement.tool_invocations.entry(id).or_default();
+            aggregate.request_assembled = request_assembled;
+            aggregate.drafts_terminal = drafts_terminal;
+        }
         for (invocation_id, terminal) in terminal_tool_request_drafts {
             replacement
                 .tool_invocations
@@ -1209,6 +1231,13 @@ impl SessionView {
                 .tool_invocations
                 .entry(invocation_id.to_owned())
                 .or_default();
+            if matches!(
+                event.kind,
+                SessionEventKind::ToolCallRequested { .. }
+                    | SessionEventKind::PositionedToolCallRequested { .. }
+            ) {
+                aggregate.request_assembled = true;
+            }
             let projection = if aggregate.projection.tool_call_id.is_empty() {
                 ToolInvocationProjection {
                     tool_call_id: invocation_id.to_owned(),
@@ -1677,21 +1706,28 @@ impl SessionView {
                             | ToolInvocationLifecycleStage::Waiting => unreachable!(),
                         };
                         if !matches!(status, ToolInvocationViewStatus::Finished) {
-                            self.tool_invocations
+                            let aggregate = self
+                                .tool_invocations
                                 .entry(lifecycle.invocation_id.clone())
-                                .or_default()
-                                .terminal_status = Some(status);
-                            self.apply_terminal_tool_status(
-                                &lifecycle.invocation_id,
-                                status,
-                                lifecycle.message.as_deref(),
-                                event.sequence,
-                                Some(event.timestamp_ms),
-                            );
-                            if let Some(aggregate) =
-                                self.tool_invocations.get_mut(&lifecycle.invocation_id)
-                            {
-                                aggregate.request_draft = None;
+                                .or_default();
+                            let draft_only = aggregate.request_draft.is_some()
+                                && !aggregate.request_assembled
+                                && aggregate.projection.started_at_ms.is_none();
+                            aggregate.request_draft = None;
+                            aggregate.terminal_status = Some(status);
+                            if draft_only {
+                                self.snapshot.tools.remove(&lifecycle.invocation_id);
+                                self.remove_transcript_item(&TranscriptViewItemId::tool(
+                                    &lifecycle.invocation_id,
+                                ));
+                            } else {
+                                self.apply_terminal_tool_status(
+                                    &lifecycle.invocation_id,
+                                    status,
+                                    lifecycle.message.as_deref(),
+                                    event.sequence,
+                                    Some(event.timestamp_ms),
+                                );
                             }
                             let result_id = TranscriptViewItemId::tool(&lifecycle.invocation_id);
                             if !matches!(
@@ -2605,13 +2641,14 @@ impl SessionView {
                 self.apply_presentation_update(update);
             }
             SessionLiveEventKind::ToolRequestDraft { event } => {
-                self.apply_tool_request_draft(event);
-                let id = self
-                    .tool_item_ids
-                    .get(&event.tool_call_id)
-                    .cloned()
-                    .unwrap_or_else(|| TranscriptViewItemId::tool(&event.tool_call_id));
-                self.assign_output_location(&id, &event.turn_id, event.output_position);
+                if self.apply_tool_request_draft(event) {
+                    let id = self
+                        .tool_item_ids
+                        .get(&event.tool_call_id)
+                        .cloned()
+                        .unwrap_or_else(|| TranscriptViewItemId::tool(&event.tool_call_id));
+                    self.assign_output_location(&id, &event.turn_id, event.output_position);
+                }
             }
             SessionLiveEventKind::ToolInvocationProgress { event } => {
                 if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress
@@ -2732,10 +2769,21 @@ impl SessionView {
     }
 
     #[allow(clippy::too_many_lines)] // Draft generation, revision, and UTF-8 offsets form one atomic reducer transition.
-    fn apply_tool_request_draft(&mut self, event: &bcode_session_models::ToolRequestDraftEvent) {
-        use bcode_session_models::ToolRequestDraftOperation;
+    fn apply_tool_request_draft(
+        &mut self,
+        event: &bcode_session_models::ToolRequestDraftEvent,
+    ) -> bool {
+        use bcode_session_models::{ToolContributionPlacement, ToolRequestDraftOperation};
 
         let key = event.tool_call_id.clone();
+        if self.tool_invocations.get(&key).is_some_and(|aggregate| {
+            aggregate.is_terminal()
+                || aggregate.drafts_terminal
+                || (aggregate.request_assembled
+                    && event.placement == ToolContributionPlacement::Request)
+        }) {
+            return false;
+        }
         let previous_placement = self
             .tool_invocations
             .get(&key)
@@ -2762,20 +2810,15 @@ impl SessionView {
                                 && !(terminal_update && event.revision == u64::MAX))))
             })
         {
-            return;
-        }
-        if current
-            .as_ref()
-            .is_some_and(|current| event.generation > current.generation)
-        {
-            self.tool_invocations
-                .entry(key.clone())
-                .or_default()
-                .request_draft = None;
+            return false;
         }
         if let ToolRequestDraftOperation::Remove { reason } = event.operation {
             let aggregate = self.tool_invocations.entry(key).or_default();
-            if reason != bcode_session_models::ToolRequestDraftTerminalReason::Completed {
+            if reason != bcode_session_models::ToolRequestDraftTerminalReason::Completed
+                || current
+                    .as_ref()
+                    .is_some_and(|draft| event.generation > draft.generation)
+            {
                 aggregate.request_draft = None;
             }
             aggregate.terminal_request_draft =
@@ -2788,12 +2831,8 @@ impl SessionView {
             } else {
                 self.refresh_tool_from_aggregate(&event.tool_call_id, 0, None);
             }
-            return;
+            return true;
         }
-        self.tool_invocations
-            .entry(key.clone())
-            .or_default()
-            .terminal_request_draft = None;
         let mut draft = current
             .filter(|current| current.generation == event.generation)
             .unwrap_or_else(|| ToolRequestDraftView {
@@ -2821,7 +2860,7 @@ impl SessionView {
                     .preview_start_offset
                     .saturating_add(draft.preview.len());
                 if *offset != expected {
-                    return;
+                    return false;
                 }
                 draft.preview.push_str(text);
             }
@@ -2849,16 +2888,19 @@ impl SessionView {
         draft.argument_bytes = event.argument_bytes;
         draft.truncated = event.truncated;
         let aggregate = self.tool_invocations.entry(key).or_default();
+        aggregate.terminal_request_draft = None;
         aggregate
             .projection
             .tool_call_id
             .clone_from(&event.tool_call_id);
-        aggregate
-            .projection
-            .producer_plugin_id
-            .clone_from(&event.producer_plugin_id);
-        aggregate.projection.tool_name = Some(event.tool_name.clone());
-        aggregate.projection.arguments_json = Some(draft.preview.clone());
+        if !aggregate.request_assembled {
+            aggregate
+                .projection
+                .producer_plugin_id
+                .clone_from(&event.producer_plugin_id);
+            aggregate.projection.tool_name = Some(event.tool_name.clone());
+            aggregate.projection.arguments_json = Some(draft.preview.clone());
+        }
         aggregate.request_draft = Some(draft);
         if previous_placement.is_some_and(|placement| placement != event.placement) {
             let previous_id = legacy_contribution_projection::item_id(
@@ -2876,6 +2918,7 @@ impl SessionView {
             0,
             None,
         );
+        true
     }
 
     fn refresh_reasoning_items(&mut self) {
@@ -3787,6 +3830,7 @@ impl SessionView {
             return;
         };
         tool.status = status;
+        tool.request_draft = None;
         if matches!(status, ToolInvocationViewStatus::Failed) {
             tool.is_error = Some(true);
         }
@@ -8105,6 +8149,257 @@ mod tests {
         );
     }
 
+    fn lifecycle_draft_event(
+        session_id: SessionId,
+        generation: u64,
+        revision: u64,
+        placement: bcode_session_models::ToolContributionPlacement,
+        operation: bcode_session_models::ToolRequestDraftOperation,
+    ) -> SessionLiveEvent {
+        SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: Some(bcode_session_models::TurnOutputPosition::new(revision)),
+                    turn_id: "turn-dominance".to_owned(),
+                    tool_call_id: "call-dominance".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    schema: "bcode.tool.request.shell.run".to_owned(),
+                    schema_version: 1,
+                    placement,
+                    generation,
+                    revision,
+                    operation,
+                    argument_bytes: 32,
+                    truncated: false,
+                },
+            },
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One sequence proves request, result-preview, terminal, and history-window dominance.
+    fn assembled_request_and_terminal_result_reject_delayed_drafts_atomically() {
+        use bcode_session_models::{ToolContributionPlacement, ToolRequestDraftOperation};
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let checkpoint = || ToolRequestDraftOperation::Checkpoint {
+            start_offset: 0,
+            text: "delayed partial arguments".to_owned(),
+        };
+        view.apply_live_event(&lifecycle_draft_event(
+            session_id,
+            1,
+            1,
+            ToolContributionPlacement::Request,
+            checkpoint(),
+        ));
+        let arguments = r#"{"command":"printf complete"}"#;
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-dominance".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: arguments.to_owned(),
+                working_directory: None,
+            },
+        ));
+        let before = view.snapshot().clone();
+        for operation in [
+            checkpoint(),
+            ToolRequestDraftOperation::Remove {
+                reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+            },
+        ] {
+            view.apply_live_event(&lifecycle_draft_event(
+                session_id,
+                2,
+                20,
+                ToolContributionPlacement::Request,
+                operation,
+            ));
+            assert_eq!(view.snapshot(), &before);
+        }
+        // Result previews remain supported without rewriting the durable request.
+        view.apply_live_event(&lifecycle_draft_event(
+            session_id,
+            2,
+            21,
+            ToolContributionPlacement::Result,
+            checkpoint(),
+        ));
+        assert_eq!(
+            view.snapshot().tools["call-dominance"]
+                .arguments_json
+                .as_deref(),
+            Some(arguments)
+        );
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-dominance".to_owned(),
+                    model_output: "done".to_owned(),
+                    content: Vec::new(),
+                    is_error: false,
+                    presentation: None,
+                    result: None,
+                },
+            },
+        ));
+        let terminal = view.snapshot().clone();
+        for placement in [
+            ToolContributionPlacement::Request,
+            ToolContributionPlacement::Result,
+        ] {
+            for operation in [
+                checkpoint(),
+                ToolRequestDraftOperation::Remove {
+                    reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                },
+            ] {
+                view.apply_live_event(&lifecycle_draft_event(
+                    session_id, 3, 30, placement, operation,
+                ));
+                assert_eq!(view.snapshot(), &terminal);
+            }
+        }
+        assert_eq!(
+            view.snapshot().tools["call-dominance"]
+                .arguments_json
+                .as_deref(),
+            Some(arguments)
+        );
+        view.clear_history_window();
+        let cleared = view.snapshot().clone();
+        view.apply_live_event(&lifecycle_draft_event(
+            session_id,
+            4,
+            40,
+            ToolContributionPlacement::Request,
+            checkpoint(),
+        ));
+        assert_eq!(view.snapshot(), &cleared);
+    }
+
+    #[test]
+    fn positioned_request_rejects_delayed_draft_after_history_replacement() {
+        use bcode_session_models::{ToolContributionPlacement, ToolRequestDraftOperation};
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let request = event(
+            session_id,
+            1,
+            SessionEventKind::PositionedToolCallRequested {
+                turn_id: "turn-dominance".to_owned(),
+                output_position: bcode_session_models::TurnOutputPosition::new(4),
+                tool_call_id: "call-dominance".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: "shell.run".to_owned(),
+                arguments_json: r#"{"command":"complete"}"#.to_owned(),
+                working_directory: None,
+            },
+        );
+        view.apply_event(&request);
+        view.rebuild_history_window(&[request]);
+        let before = view.snapshot().clone();
+        view.apply_live_event(&lifecycle_draft_event(
+            session_id,
+            99,
+            99,
+            ToolContributionPlacement::Request,
+            ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: "obsolete".to_owned(),
+            },
+        ));
+        assert_eq!(view.snapshot(), &before);
+    }
+
+    #[test]
+    fn rejected_draft_offsets_and_generations_preserve_preview_fence_and_placement() {
+        use bcode_session_models::{ToolContributionPlacement, ToolRequestDraftOperation};
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let checkpoint = || ToolRequestDraftOperation::Checkpoint {
+            start_offset: 0,
+            text: "λ🙂".to_owned(),
+        };
+        view.apply_live_event(&lifecycle_draft_event(
+            session_id,
+            2,
+            10,
+            ToolContributionPlacement::Request,
+            checkpoint(),
+        ));
+        let before = view.snapshot().clone();
+        for (generation, revision, operation) in [
+            (1, 20, checkpoint()),
+            (2, 9, checkpoint()),
+            (
+                2,
+                11,
+                ToolRequestDraftOperation::Append {
+                    offset: 2,
+                    text: "wrong".to_owned(),
+                },
+            ),
+            (
+                3,
+                1,
+                ToolRequestDraftOperation::Append {
+                    offset: 6,
+                    text: "wrong".to_owned(),
+                },
+            ),
+        ] {
+            view.apply_live_event(&lifecycle_draft_event(
+                session_id,
+                generation,
+                revision,
+                ToolContributionPlacement::Request,
+                operation,
+            ));
+            assert_eq!(view.snapshot(), &before);
+        }
+        view.apply_live_event(&lifecycle_draft_event(
+            session_id,
+            2,
+            11,
+            ToolContributionPlacement::Request,
+            ToolRequestDraftOperation::Remove {
+                reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+            },
+        ));
+        let removed = view.snapshot().clone();
+        let fence = view.terminal_tool_request_drafts();
+        view.apply_live_event(&lifecycle_draft_event(
+            session_id,
+            3,
+            1,
+            ToolContributionPlacement::Request,
+            ToolRequestDraftOperation::Append {
+                offset: 99,
+                text: "wrong".to_owned(),
+            },
+        ));
+        assert_eq!(view.snapshot(), &removed);
+        assert_eq!(view.terminal_tool_request_drafts(), fence);
+        view.apply_live_event(&lifecycle_draft_event(
+            session_id,
+            3,
+            1,
+            ToolContributionPlacement::Request,
+            checkpoint(),
+        ));
+        assert_eq!(view.tool_request_drafts()["call-dominance"].generation, 3);
+        assert!(view.terminal_tool_request_drafts().is_empty());
+    }
+
     #[test]
     fn durable_tool_request_reconciles_live_draft_without_duplicate_rows() {
         let session_id = SessionId::new();
@@ -8830,6 +9125,28 @@ mod tests {
                     },
                 },
             ));
+            assert!(
+                view.tool_request_drafts().is_empty(),
+                "{cancellation_point}"
+            );
+            assert!(
+                view.snapshot()
+                    .tools
+                    .values()
+                    .all(|tool| tool.request_draft.is_none())
+            );
+            if cancellation_point == "before-request" {
+                assert!(!view.snapshot().tools.contains_key("call-cancel"));
+                assert!(
+                    !view
+                        .snapshot()
+                        .transcript
+                        .items
+                        .iter()
+                        .any(|item| item.id == result_id)
+                );
+            }
+            let terminal_snapshot = view.snapshot().clone();
             view.apply_live_event(&SessionLiveEvent {
                 session_id,
                 kind: SessionLiveEventKind::ToolRequestDraft {
@@ -8853,6 +9170,7 @@ mod tests {
                 },
             });
 
+            assert_eq!(view.snapshot(), &terminal_snapshot);
             if cancellation_point == "before-request" {
                 assert_eq!(
                     view.snapshot()

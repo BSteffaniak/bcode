@@ -6533,9 +6533,10 @@ mod tests {
             .unwrap();
         let (target, identity) = model
             .committed_visual_targets
-            .first()
+            .iter()
+            .find(|(_, identity)| identity.contains(":terminal:"))
             .cloned()
-            .expect("visible shell target");
+            .expect("visible shell terminal target");
         assert!(target.height == 1 && target.width <= 24);
         assert!(!model.committed_visual_text.is_empty());
         let event = Event::Mouse(MouseEvent::new(

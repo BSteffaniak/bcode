@@ -93,7 +93,11 @@ struct DynamicVisualKey {
     schema: String,
     schema_version: u32,
     payload_revision: u64,
+    // Exact serialized payload includes artifact identity and draft generation; revisions may reset.
+    payload_identity: String,
     width: u16,
+    diff_layout: String,
+    working_directory: Option<std::path::PathBuf>,
     theme_fingerprint: u64,
 }
 
@@ -847,7 +851,10 @@ impl PluginTuiPresentation {
                 schema: schema.to_owned(),
                 schema_version,
                 payload_revision,
+                payload_identity: payload.to_string(),
                 width: context.width(),
+                diff_layout: format!("{:?}", context.diff_layout()),
+                working_directory: context.working_directory().map(ToOwned::to_owned),
                 theme_fingerprint: context.theme().as_ref().map_or(0, theme_fingerprint),
             };
             let response = {
@@ -1553,9 +1560,9 @@ library = "libdynamic_visual_test.dylib"
                                     timeout_ms: Some(321),
                                     rows: vec![bcode_plugin_sdk::tui_visual::SerializedTuiRow {
                                         spans: vec![bcode_plugin_sdk::tui_visual::SerializedTuiSpan {
-                                            text: format!(
-                                                "dynamic:{}:artifact-{artifact_revision}",
-                                                request.adapter_id
+                                            text: request.payload.get("cache_probe").map_or_else(
+                                                || format!("dynamic:{}:artifact-{artifact_revision}", request.adapter_id),
+                                                |_| format!("{}:{}:{:?}", request.payload, request.context.diff_layout, request.context.working_directory),
                                             ),
                                             role: Some(
                                                 bcode_plugin_sdk::tui_visual::SerializedTuiStyleRole::Success,
@@ -1739,7 +1746,10 @@ library = "libdynamic_visual_test.dylib"
             schema: "bcode.shell.run".to_owned(),
             schema_version: 1,
             payload_revision: 0,
+            payload_identity: "{}".to_owned(),
             width: 80,
+            diff_layout: "Unified".to_owned(),
+            working_directory: None,
             theme_fingerprint,
         };
         assert_ne!(key(1), key(2));
@@ -1764,6 +1774,79 @@ library = "libdynamic_visual_test.dylib"
         if let Some(visual) = changed {
             assert_eq!(visual.route.plugin_id, "bcode.shell");
         }
+    }
+
+    #[test]
+    fn serialized_visual_cache_separates_generation_payload_and_render_context() {
+        use bcode_plugin_sdk::tui::{PluginTuiDiffLayout, PluginTuiVisualRenderContext};
+        let presentation = dynamic_test_presentation("success", &[]);
+        let payload = |generation, preview| {
+            serde_json::json!({
+                "cache_probe": true,
+                "generation": generation,
+                "preview": preview,
+                "_bcode_artifact": {"artifact_id": format!("draft-{generation}")},
+            })
+        };
+        let cases = [
+            (payload(1, "first"), PluginTuiDiffLayout::Unified, None),
+            (payload(2, "second"), PluginTuiDiffLayout::Unified, None),
+            (payload(2, "changed"), PluginTuiDiffLayout::Unified, None),
+            (
+                payload(2, "changed"),
+                PluginTuiDiffLayout::Unified,
+                Some(std::path::PathBuf::from("/tmp/changed")),
+            ),
+            (
+                payload(2, "changed"),
+                PluginTuiDiffLayout::SideBySide,
+                Some(std::path::PathBuf::from("/tmp/changed")),
+            ),
+        ];
+        for (payload, layout, cwd) in &cases {
+            let context = PluginTuiVisualRenderContext::new(80, *layout, cwd.clone());
+            let render = || {
+                presentation.routed_visual(
+                    "cache-boundary",
+                    1,
+                    "bcode.shell.run",
+                    1,
+                    None,
+                    payload,
+                    &context,
+                )
+            };
+            // Even with a repeated revision, a new payload/context cannot hit the prior response.
+            if let Some(fallback) = render() {
+                assert_ne!(fallback.route.plugin_id, "test.dynamic-visual");
+            }
+            wait_for_dynamic_completion(&presentation);
+            let visual = render().expect("completed serialized projection");
+            assert_eq!(visual.route.plugin_id, "test.dynamic-visual");
+            assert_eq!(
+                routed_text(&visual),
+                format!("{payload}:{layout:?}:{cwd:?}")
+            );
+            assert_eq!(
+                routed_text(&render().expect("idle cache hit")),
+                routed_text(&visual)
+            );
+        }
+        // Revisit the first context after newer completions: its exact response is still correct.
+        let context = PluginTuiVisualRenderContext::new(80, PluginTuiDiffLayout::Unified, None);
+        let visual = presentation
+            .routed_visual(
+                "cache-boundary",
+                1,
+                "bcode.shell.run",
+                1,
+                None,
+                &cases[0].0,
+                &context,
+            )
+            .expect("retained exact cache entry");
+        drop(presentation);
+        assert_eq!(routed_text(&visual), format!("{}:Unified:None", cases[0].0));
     }
 
     fn dynamic_test_visual_with_context(

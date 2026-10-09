@@ -2753,27 +2753,7 @@ fn push_transcript_item_rows(
             );
         }
         TranscriptItemKind::ToolRequestDraft { draft } => {
-            let artifact = bcode_session_models::ToolArtifact {
-                artifact_id: format!("{}-request-draft-{}", draft.tool_call_id, draft.generation),
-                producer_plugin_id: draft
-                    .producer_plugin_id
-                    .clone()
-                    .unwrap_or_else(|| "bcode.unknown".to_owned()),
-                schema: draft.schema.clone(),
-                schema_version: draft.schema_version,
-                tool_call_id: Some(draft.tool_call_id.clone()),
-                title: Some("Tool request draft".to_owned()),
-                metadata: serde_json::json!({
-                    "tool_name": draft.tool_name,
-                    "argument_bytes": draft.argument_bytes,
-                    "preview_start_offset": draft.preview_start_offset,
-                    "preview": draft.preview,
-                    "truncated": draft.truncated,
-                    "streaming": true,
-                }),
-                refs: Vec::new(),
-            };
-            let visual = CanonicalToolVisual::from_artifact(&artifact);
+            let visual = tool_request_draft_visual(item, draft);
             let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
             if let Some(routed) = resolve_canonical_plugin_visual(
                 plugin_visual,
@@ -4717,6 +4697,81 @@ impl bcode_plugin_sdk::tui::PluginTuiHost for RegistryVisualHost<'_> {
     fn keymap_is_overridden(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> bool {
         self.0.is_overridden_key(scope, stroke)
     }
+}
+
+fn tool_request_draft_visual(
+    item: &TranscriptItem,
+    draft: &bcode_session_view_models::ToolRequestDraftView,
+) -> CanonicalToolVisual {
+    CanonicalToolVisual::from_artifact(&bcode_session_models::ToolArtifact {
+        artifact_id: format!("{}-request-draft-{}", draft.tool_call_id, draft.generation),
+        producer_plugin_id: draft
+            .producer_plugin_id
+            .clone()
+            .unwrap_or_else(|| "bcode.unknown".to_owned()),
+        schema: draft.schema.clone(),
+        schema_version: draft.schema_version,
+        tool_call_id: Some(draft.tool_call_id.clone()),
+        title: Some("Tool request draft".to_owned()),
+        metadata: serde_json::json!({
+            "tool_name": draft.tool_name,
+            "argument_bytes": draft.argument_bytes,
+            "preview_start_offset": draft.preview_start_offset,
+            "preview": draft.preview,
+            "truncated": draft.truncated,
+            "streaming": true,
+            "generation": draft.generation,
+            // Shared item revisions advance across draft generation resets; provider revisions do not.
+            "_bcode_presentation_revision": item.source_view_item_revision().unwrap_or_else(|| item.revision()),
+        }),
+        refs: Vec::new(),
+    })
+}
+
+#[test]
+fn draft_visual_revision_advances_across_provider_revision_and_generation_changes() {
+    use bcode_session_models::{ToolContributionPlacement, ToolRequestDraftOperation};
+    let session_id = bcode_session_models::SessionId::new();
+    let mut view = bcode_session_view::SessionView::new();
+    let mut revisions = Vec::new();
+    for (generation, revision, preview) in
+        [(1, 1, "first"), (1, 2, "second"), (2, 1, "replacement")]
+    {
+        view.apply_live_event(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
+                    turn_id: "turn-cache".to_owned(),
+                    tool_call_id: "call-cache".to_owned(),
+                    tool_name: "shell.run".to_owned(),
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    schema: "bcode.tool.request.shell.run".to_owned(),
+                    schema_version: 1,
+                    placement: ToolContributionPlacement::Request,
+                    generation,
+                    revision,
+                    operation: ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: preview.to_owned(),
+                    },
+                    argument_bytes: preview.len(),
+                    truncated: false,
+                },
+            },
+        });
+        let item =
+            super::transcript::terminal_item_from_shared(&view.snapshot().transcript.items[0]);
+        let TranscriptItemKind::ToolRequestDraft { draft } = item.kind() else {
+            panic!("draft projection required")
+        };
+        let CanonicalToolVisual::Plugin(visual) = tool_request_draft_visual(&item, draft);
+        assert_eq!(visual.payload["preview"], preview);
+        assert_eq!(visual.invocation_id.as_deref(), Some("call-cache"));
+        revisions.push(visual.revision);
+    }
+    assert!(revisions[0] < revisions[1]);
+    assert!(revisions[1] < revisions[2]);
 }
 
 fn resolve_canonical_plugin_visual(

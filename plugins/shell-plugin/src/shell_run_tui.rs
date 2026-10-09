@@ -4,6 +4,10 @@
 //! that may interpret shell artifact schemas and terminal recording references; generic TUI and
 //! transcript code routes opaque plugin visuals without understanding those values.
 
+mod command;
+mod formatter;
+mod partial_json;
+
 pub(super) fn register_keymap(registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry) {
     for (action, key) in [
         ("expand", "e"),
@@ -651,10 +655,15 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
     ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
         ACTIVE_THEME.with(|theme| theme.set(context.theme()));
         let mut projection = bcode_plugin_sdk::tui::PluginTuiVisualProjection::default();
-        projection.rows = self.rows_with_active_theme(kind, payload, context, &mut projection);
+        let command = shell_command_projection(payload, context);
+        projection.rows =
+            self.rows_with_active_theme(kind, payload, context, &command.rows, &mut projection);
+        let body_start = command.rows.len();
+        let has_terminal_anchors = !projection.anchors.is_empty();
+        command::append_metadata(&mut projection, command);
         ACTIVE_THEME.with(|theme| theme.set(None));
-        if projection.anchors.is_empty() && payload.get("preview").is_none() {
-            let row = shell_terminal_prompt_rows(payload, context.width(), context).len();
+        if !has_terminal_anchors && payload.get("preview").is_none() {
+            let row = body_start;
             if row < projection.rows.len() {
                 projection
                     .anchors
@@ -684,11 +693,12 @@ impl ShellRunTuiVisualAdapter {
         kind: &str,
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        prompt: &[Line],
         projection: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     ) -> Vec<Line> {
         let width = context.width();
         if kind == "bcode.tool.request.shell.run" {
-            return self.shell_request_rows(payload, width, context, projection);
+            return self.shell_request_rows(payload, width, prompt, projection);
         }
         if kind == SHELL_RUN_SCHEMA
             && let Some(key) = payload
@@ -697,7 +707,7 @@ impl ShellRunTuiVisualAdapter {
                 .and_then(serde_json::Value::as_str)
             && let Some(replay) = self.live_replay_data(key)
         {
-            return self.live_shell_result_rows(key, payload, context, &replay, projection);
+            return self.live_shell_result_rows(key, payload, context, &replay, prompt, projection);
         }
         let mode = payload
             .get("mode")
@@ -736,7 +746,7 @@ impl ShellRunTuiVisualAdapter {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
         };
-        Self::shell_result_rows(payload, width, context, &replay, replay_error)
+        Self::shell_result_rows(payload, width, &replay, replay_error, prompt)
     }
 }
 
@@ -832,10 +842,11 @@ impl ShellRunTuiVisualAdapter {
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
         replay: &TerminalReplayData,
+        prompt: &[Line],
         projection: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     ) -> Vec<Line> {
         let width = context.width();
-        let mut lines = shell_terminal_prompt_rows(payload, width, context);
+        let mut lines = prompt.to_vec();
         lines.extend(shell_replay_status_rows(replay));
         let input = TerminalViewerInput {
             output: "",
@@ -870,11 +881,11 @@ impl ShellRunTuiVisualAdapter {
     fn shell_result_rows(
         payload: &serde_json::Value,
         width: u16,
-        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
         replay: &TerminalReplayData,
         replay_error: Option<String>,
+        prompt: &[Line],
     ) -> Vec<Line> {
-        let mut lines = shell_terminal_prompt_rows(payload, width, context);
+        let mut lines = prompt.to_vec();
         lines.extend(shell_replay_status_rows(replay));
         if let Some(error) = replay_error {
             lines.push(Line::from_spans(vec![Span::styled(
@@ -912,14 +923,14 @@ impl ShellRunTuiVisualAdapter {
         &self,
         payload: &serde_json::Value,
         width: u16,
-        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        prompt: &[Line],
         projection: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     ) -> Vec<Line> {
         if payload.get("preview").is_some() {
-            return shell_request_draft_rows(payload, width, context);
+            return shell_request_draft_rows_with_prompt(payload, width, prompt.to_vec());
         }
         let Some(runtime) = payload.get("_bcode_runtime") else {
-            return shell_terminal_prompt_rows(payload, width, context);
+            return prompt.to_vec();
         };
         let output = runtime
             .get("output")
@@ -936,7 +947,7 @@ impl ShellRunTuiVisualAdapter {
             })
             .unwrap_or("shell-live-terminal");
         if output.is_empty() && self.live_replay_data(key).is_none() {
-            return shell_terminal_prompt_rows(payload, width, context);
+            return prompt.to_vec();
         }
         let initial_columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
         let initial_rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
@@ -970,7 +981,7 @@ impl ShellRunTuiVisualAdapter {
                 max_rows: MAX_INLINE_TERMINAL_ROWS,
             };
         }
-        let mut lines = shell_terminal_prompt_rows(payload, width, context);
+        let mut lines = prompt.to_vec();
         lines.extend(self.live_replay_status_rows(key, runtime));
         let retained_rows = self.live_grid_rows(key, input, width, lines.len(), projection);
         let used_retained_grid = retained_rows.is_some();
@@ -1193,61 +1204,33 @@ fn shell_status_rows(payload: &serde_json::Value) -> Vec<Line> {
     ])]
 }
 
+#[cfg(test)]
 fn shell_request_draft_rows(
     payload: &serde_json::Value,
-    _width: u16,
+    width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
-    let preview = payload
-        .get("preview")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let parsed = serde_json::from_str::<serde_json::Value>(preview).ok();
-    let command = parsed
-        .as_ref()
-        .and_then(|arguments| arguments.get("command"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| partial_json_string(preview, "command"));
-    let cwd = parsed
-        .as_ref()
-        .and_then(|arguments| arguments.get("cwd"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| partial_json_string(preview, "cwd"));
-    let format_commands = parsed
-        .as_ref()
-        .and_then(|arguments| arguments.get("format_commands"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let mut rows = command.as_deref().map_or_else(Vec::new, |command| {
-        let display = if format_commands {
-            format_shell_command_for_display(command)
-        } else {
-            command.to_owned()
-        };
-        display
-            .lines()
-            .enumerate()
-            .map(|(index, line)| {
-                let mut spans = if index == 0 {
-                    prompt_spans(cwd.as_deref(), context)
-                } else {
-                    vec![Span::styled("    ", muted_style())]
-                };
-                spans.extend(shell_command_spans(line));
-                Line::from_spans(spans)
-            })
-            .collect()
-    });
+    shell_request_draft_rows_with_prompt(
+        payload,
+        width,
+        shell_command_projection(payload, context).rows,
+    )
+}
+
+fn shell_request_draft_rows_with_prompt(
+    payload: &serde_json::Value,
+    width: u16,
+    mut rows: Vec<Line>,
+) -> Vec<Line> {
     if rows.is_empty() {
-        rows.push(Line::from_spans(vec![
-            Span::styled("  ", muted_style()),
-            Span::styled("Shell command · assembling…", muted_style()),
-        ]));
-        if let Some(cwd) = cwd.as_deref() {
-            rows.push(Line::from_spans(prompt_spans(Some(cwd), context)));
-        }
+        rows.extend(bmux_tui::text::wrap_line_bounded(
+            &Line::from_spans(vec![
+                Span::styled("  ", muted_style()),
+                Span::styled("Shell command · assembling…", muted_style()),
+            ]),
+            bmux_tui::text::TextWrapGeometry::uniform(usize::from(width)),
+            bmux_tui::text::TextWrap::Character,
+        ));
     }
     let argument_bytes = payload
         .get("argument_bytes")
@@ -1262,59 +1245,24 @@ fn shell_request_draft_rows(
     } else {
         format!("  assembling · received {argument_bytes} bytes")
     };
-    rows.push(Line::from_spans(vec![Span::styled(status, muted_style())]));
+    if width == 0 {
+        return Vec::new();
+    }
+    rows.extend(bmux_tui::text::wrap_line_bounded(
+        &Line::from_spans(vec![Span::styled(status, muted_style())]),
+        bmux_tui::text::TextWrapGeometry::uniform(usize::from(width)),
+        bmux_tui::text::TextWrap::Character,
+    ));
     rows
 }
 
 fn partial_json_string(input: &str, key: &str) -> Option<String> {
-    let key = serde_json::to_string(key).ok()?;
-    let tail = input.get(input.find(&key)?.saturating_add(key.len())..)?;
-    let encoded = tail
-        .trim_start()
-        .strip_prefix(':')?
-        .trim_start()
-        .strip_prefix('"')?;
-    decode_partial_json_string(encoded)
-}
-
-fn decode_partial_json_string(encoded: &str) -> Option<String> {
-    let mut escaped = false;
-    let mut unicode_digits = 0_u8;
-    let mut end = encoded.len();
-    for (index, character) in encoded.char_indices() {
-        if unicode_digits > 0 {
-            if !character.is_ascii_hexdigit() {
-                end = index;
-                break;
-            }
-            unicode_digits = unicode_digits.saturating_sub(1);
-            continue;
-        }
-        if escaped {
-            if character == 'u' {
-                unicode_digits = 4;
-            }
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => escaped = true,
-            '"' => {
-                end = index;
-                break;
-            }
-            _ => {}
-        }
-    }
-    let candidate = &encoded[..end];
-    serde_json::from_str::<String>(&format!("\"{candidate}\""))
-        .ok()
-        .or_else(|| Some(candidate.replace("\\\"", "\"").replace("\\\\", "\\")))
+    partial_json::string_field(input, key)
 }
 
 fn shell_terminal_prompt_rows(
     payload: &serde_json::Value,
-    _width: u16,
+    width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
@@ -1327,28 +1275,41 @@ fn shell_terminal_prompt_rows(
         .get("format_commands")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
-    if command.is_empty() {
-        return Vec::new();
-    }
+    command::project(command, cwd, format_commands, width, context).rows
+}
 
-    let display_command = if format_commands {
-        format_shell_command_for_display(command)
-    } else {
-        command.to_owned()
-    };
-    display_command
-        .lines()
-        .enumerate()
-        .map(|(index, line)| {
-            let mut spans = if index == 0 {
-                prompt_spans(cwd, context)
-            } else {
-                vec![Span::styled("    ", muted_style())]
-            };
-            spans.extend(shell_command_spans(line));
-            Line::from_spans(spans)
-        })
-        .collect()
+fn shell_command_projection(
+    payload: &serde_json::Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+    let draft = payload.get("preview").and_then(serde_json::Value::as_str);
+    let arguments = payload.get("arguments").unwrap_or(payload);
+    let source = draft
+        .map_or_else(
+            || {
+                arguments
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            },
+            |preview| partial_json_string(preview, "command"),
+        )
+        .unwrap_or_default();
+    let cwd = draft.map_or_else(
+        || {
+            arguments
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        },
+        |preview| partial_json_string(preview, "cwd"),
+    );
+    let format = draft.is_none()
+        && arguments
+            .get("format_commands")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+    command::project(&source, cwd.as_deref(), format, context.width(), context)
 }
 
 fn prompt_spans(
@@ -1369,44 +1330,59 @@ fn prompt_spans(
 }
 
 fn format_shell_command_for_display(command: &str) -> String {
-    use shuck_formatter::{
-        FormattedSource, IndentStyle, ShellDialect, ShellFormatOptions, format_source,
-    };
-
-    let options = ShellFormatOptions::default()
-        .with_dialect(ShellDialect::Bash)
-        .with_indent_style(IndentStyle::Space)
-        .with_indent_width(2);
-    match format_source(command, None, &options) {
-        Ok(FormattedSource::Formatted(formatted)) => trim_formatted_shell_command(&formatted),
-        Ok(FormattedSource::Unchanged) | Err(_) => command.to_owned(),
-    }
-}
-
-fn trim_formatted_shell_command(command: &str) -> String {
-    command.trim_end_matches(['\r', '\n']).to_owned()
+    formatter::display(command)
 }
 
 fn shell_command_spans(command: &str) -> Vec<Span> {
+    // Styling partitions source without rewriting any bytes. Quotes and escaped whitespace
+    // remain in their original token, including incomplete quoted streamed arguments.
     let mut spans = Vec::new();
-    for (index, token) in command.split_whitespace().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw(" "));
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut whitespace = command.chars().next().is_some_and(char::is_whitespace);
+    let mut first = true;
+    for (offset, character) in command.char_indices() {
+        if !escaped && quote.is_none() && character.is_whitespace() != whitespace {
+            push_shell_span(&mut spans, &command[start..offset], whitespace, &mut first);
+            start = offset;
+            whitespace = character.is_whitespace();
         }
-        let style = if index == 0 {
-            command_style()
-        } else if token.starts_with('-') {
-            flag_style()
-        } else if token.starts_with('\'') || token.starts_with('"') {
-            string_style()
-        } else if matches!(token, "|" | "&&" | "||" | ";" | ">" | ">>" | "<") {
-            operator_style()
-        } else {
-            argument_style()
-        };
-        spans.push(Span::styled(token.to_owned(), style));
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if quote == Some(character) {
+            quote = None;
+        } else if quote.is_none() && matches!(character, '\'' | '"') {
+            quote = Some(character);
+        }
     }
+    push_shell_span(&mut spans, &command[start..], whitespace, &mut first);
     spans
+}
+
+fn push_shell_span(spans: &mut Vec<Span>, token: &str, whitespace: bool, first: &mut bool) {
+    if token.is_empty() {
+        return;
+    }
+    let style = if whitespace {
+        argument_style()
+    } else if *first {
+        command_style()
+    } else if token.starts_with('-') {
+        flag_style()
+    } else if token.starts_with(['\'', '"']) {
+        string_style()
+    } else if matches!(token, "|" | "&&" | "||" | ";" | ">" | ">>" | "<") {
+        operator_style()
+    } else {
+        argument_style()
+    };
+    spans.push(Span::styled(token.to_owned(), style));
+    if !whitespace {
+        *first = false;
+    }
 }
 
 fn theme_style(
@@ -3546,7 +3522,7 @@ mod tests {
             "command": "if true;then echo 'hello world';else echo nope;fi",
             "cwd": "/Users/example/project"
         });
-        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+        let projection = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::projection(
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
@@ -3556,11 +3532,15 @@ mod tests {
                 None,
             ),
         );
-        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
-
-        assert!(rendered.contains("; then"), "{rendered}");
-        assert!(rendered.contains("; else"), "{rendered}");
-        assert!(!rendered.contains(";then"), "{rendered}");
+        let copied = command::declared_copy(&projection);
+        assert!(projection.rows.iter().all(|row| row.width() <= 64));
+        assert_eq!(
+            copied,
+            format_shell_command_for_display(payload["command"].as_str().unwrap())
+        );
+        assert!(copied.contains("; then"), "{copied}");
+        assert!(copied.contains("; else"), "{copied}");
+        assert!(!copied.contains(";then"), "{copied}");
     }
 
     #[test]
@@ -3570,7 +3550,7 @@ mod tests {
             "command": command,
             "format_commands": false
         });
-        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+        let projection = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::projection(
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
             &payload,
@@ -3580,10 +3560,9 @@ mod tests {
                 None,
             ),
         );
-        let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
-
-        assert_eq!(rendered.lines().count(), 1, "{rendered}");
-        assert!(rendered.contains(command), "{rendered}");
+        assert!(projection.rows.len() > 1);
+        assert!(projection.rows.iter().all(|row| row.width() <= 48));
+        assert_eq!(command::declared_copy(&projection), command);
     }
 
     #[test]
@@ -3604,7 +3583,10 @@ mod tests {
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
         assert!(
-            rendered.contains("'hello world from a quoted argument'"),
+            rows.iter()
+                .map(line_text)
+                .collect::<String>()
+                .contains("'hello world from a quoted argument'"),
             "{rendered}"
         );
     }
@@ -3673,17 +3655,13 @@ mod tests {
                 None,
             ),
         };
-        ShellRunTuiVisualAdapter::shell_result_rows(
-            payload,
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
             100,
-            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
-                100,
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
-                None,
-            ),
-            &replay,
-            error,
-        )
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            None,
+        );
+        let prompt = shell_terminal_prompt_rows(payload, 100, &context);
+        ShellRunTuiVisualAdapter::shell_result_rows(payload, 100, &replay, error, &prompt)
     }
 
     fn authoritative_recording_payload(path: &std::path::Path) -> serde_json::Value {

@@ -262,7 +262,6 @@ impl TranscriptItem {
     }
 
     /// Return the renderer-neutral source revision, when this item adapts shared session state.
-    #[cfg(test)]
     #[must_use]
     pub const fn source_view_item_revision(
         &self,
