@@ -10,6 +10,11 @@ or repair. Missing, unsupported or unavailable evidence is not certified as succ
 empty retrieval. Excerpts already in mandatory messages are excluded. Admitted excerpts
 are request-only, explicitly untrusted quotations; mandatory content is not rewritten.
 There is no automatic memory retrieval or dedicated CLI reference flag yet.
+The ordinary-turn capture driver supports context reranking through exact terminal-turn
+selection observations and maps ordinals back to explicit history references. A disabled
+baseline with observed admission is capturable; absent, ambiguous, incomplete or cancelled
+application evidence is not treated as successful capture. This records admission, not
+independent task correctness or live benefit.
 
 `packages/server/src/tests/judgement_quality/history_context.rs` verifies actual base-model
 request content for off/on admission, missing credentials, provider errors and missing judge

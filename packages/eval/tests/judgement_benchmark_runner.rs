@@ -325,6 +325,25 @@ fn opt_in_bounds_and_unsupported_consumers_need_no_service() {
     );
 }
 
+#[test]
+fn context_product_status_and_snapshot_shape_do_not_guess_future_evidence() {
+    use bcode_model::judgement::{
+        ApplicationDisposition, SelectionObservation, TriggerDisposition,
+    };
+    let disabled: TriggerDisposition = serde_json::from_str("\"disabled\"").unwrap();
+    assert_eq!(disabled, TriggerDisposition::Disabled);
+    let retained: ApplicationDisposition = serde_json::from_str("\"baseline_retained\"").unwrap();
+    assert_eq!(retained, ApplicationDisposition::BaselineRetained);
+    assert!(serde_json::from_str::<TriggerDisposition>("\"future_trigger\"").is_err());
+    assert!(serde_json::from_str::<ApplicationDisposition>("\"future_application\"").is_err());
+    assert!(
+        serde_json::from_value::<SelectionObservation>(serde_json::json!({
+            "candidate_count": 2, "ordered": [1, 0], "admitted": [1], "task_correct": true
+        }))
+        .is_err()
+    );
+}
+
 fn bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> T {
     let mut bytes = Vec::new();
     File::open(path)

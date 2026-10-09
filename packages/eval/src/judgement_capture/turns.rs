@@ -27,6 +27,96 @@ pub struct NormalTurnRequest {
     pub categorization_dimension: super::CategorizationDimension,
 }
 
+/// Convert only a closed exact-turn product snapshot, not a fixture ranking or oracle.
+///
+/// Source IDs are the admitted turn's original history references in producer order.
+/// If mandatory-context deduplication changes that snapshot, count mismatch rejects
+/// rather than guessing ordinals. Ranking is admission evidence, not task correctness.
+fn context_output(
+    observation: &bcode_model::judgement::TurnJudgementObservation,
+    session_id: &str,
+    turn_id: &str,
+    outcome: TerminalOutcome,
+    arm: crate::judgement_benchmark::Arm,
+    source_ids: &[String],
+) -> Result<Option<ConsumerOutput>, ()> {
+    use bcode_model::judgement::{
+        ApplicationDisposition as Application, ObservationScope, ObservationTerminal,
+        TriggerDisposition as Trigger,
+    };
+    observation.validate().map_err(|_| ())?;
+    let terminal = match outcome {
+        TerminalOutcome::Succeeded => ObservationTerminal::Completed,
+        TerminalOutcome::Failed => ObservationTerminal::Failed,
+        TerminalOutcome::Cancelled => ObservationTerminal::Cancelled,
+        _ => return Err(()),
+    };
+    if observation.scope != ObservationScope::NormalTurn
+        || observation.session_id != session_id
+        || observation.turn_id != turn_id
+        || observation.terminal != Some(terminal)
+        || !observation.complete
+        || observation.omitted != 0
+    {
+        return Err(());
+    }
+    let mut operations = observation
+        .operations
+        .iter()
+        .filter(|operation| operation.feature == Feature::ContextReranking);
+    let operation = operations.next().ok_or(())?;
+    if operations.next().is_some() {
+        return Err(());
+    }
+    if operation.trigger == Trigger::NotApplicable {
+        return if operation.selection.is_none() {
+            Ok(None)
+        } else {
+            Err(())
+        };
+    }
+    if !matches!(
+        operation.application,
+        Some(Application::Applied | Application::BaselineRetained)
+    ) || terminal == ObservationTerminal::Cancelled
+    {
+        return Err(());
+    }
+    if arm == crate::judgement_benchmark::Arm::Off
+        && (operation.trigger != Trigger::Disabled
+            || operation.application != Some(Application::BaselineRetained)
+            || !operation.inference.is_empty())
+    {
+        return Err(());
+    }
+    if arm == crate::judgement_benchmark::Arm::On && operation.trigger != Trigger::Triggered {
+        return Err(());
+    }
+    let selection = operation.selection.as_ref().ok_or(())?;
+    if selection.candidate_count == 0
+        || selection.candidate_count != source_ids.len()
+        || source_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != source_ids.len()
+    {
+        return Err(());
+    }
+    Ok(Some(ConsumerOutput::Ranking {
+        order: selection
+            .ordered
+            .iter()
+            .map(|ordinal| source_ids[*ordinal].clone())
+            .collect(),
+        admitted: selection
+            .admitted
+            .iter()
+            .map(|ordinal| source_ids[*ordinal].clone())
+            .collect(),
+    }))
+}
+
 pub(super) async fn execute(
     client: &BcodeClient,
     input: NormalTurnRequest,
@@ -47,6 +137,7 @@ pub(super) async fn execute(
             | Feature::ProgressMonitoring
             | Feature::SessionCategorization
             | Feature::Recommendations
+            | Feature::ContextReranking
     ) {
         return Err(());
     }
@@ -55,6 +146,13 @@ pub(super) async fn execute(
         // ordering has a bounded public observation. Do not spend on an uncapturable turn.
         return Err(());
     }
+    let context_ids: Vec<_> = input
+        .admission
+        .execution
+        .historical_context
+        .iter()
+        .map(|reference| format!("history:{}:{}", reference.session_id, reference.sequence))
+        .collect();
     // Subscribe before admission: transient contributions cannot be recovered by canonical replay.
     let mut connection = client.connect("judgement-capture").await.map_err(|_| ())?;
     connection
@@ -172,8 +270,8 @@ pub(super) async fn execute(
                         }
                         // Current public stream lacks the final available-tool permutation. The turn ran,
                         // but raw provider requests must not be exposed or inferred from model prose.
-                        Feature::Recommendations => None,
-                        _ => return Err(()),
+                        Feature::Recommendations | Feature::ContextReranking => None,
+                        Feature::EvalCategorization => return Err(()),
                     };
                     let mut product_observation = None;
                     // A terminal event may be published just before final producer closure.
@@ -192,10 +290,22 @@ pub(super) async fn execute(
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                     if let Some(observation) = product_observation {
+                        if capture.request.feature == Feature::ContextReranking {
+                            capture.output = context_output(
+                                &observation,
+                                &input.session_id.to_string(),
+                                &receipt.turn_id.0,
+                                capture.outcome,
+                                capture.request.arm,
+                                &context_ids,
+                            )?;
+                            capture.consumer_executed = capture.output.is_some();
+                        }
                         capture.telemetry.retain_turn_observation(&observation)?;
                         // NotApplicable and Disabled are not proof of consumer execution.
-                        capture.consumer_executed |=
-                            observation.operations.iter().any(|operation| {
+                        capture.consumer_executed |= capture.request.feature
+                            != Feature::ContextReranking
+                            && observation.operations.iter().any(|operation| {
                                 operation.feature == capture.request.feature
                                     && operation.trigger
                                         == bcode_model::judgement::TriggerDisposition::Triggered
@@ -218,4 +328,155 @@ pub(super) async fn execute(
         }
     }
     Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::judgement_benchmark::Arm;
+    use bcode_model::judgement::{
+        ApplicationDisposition as Application, ConsumerOperationObservation, ObservationScope,
+        ObservationTerminal, SelectionObservation, TriggerDisposition as Trigger,
+        TurnJudgementObservation,
+    };
+
+    fn snapshot() -> TurnJudgementObservation {
+        let features = [
+            Feature::ToolResultTriage,
+            Feature::ContextReranking,
+            Feature::Recommendations,
+            Feature::ProgressMonitoring,
+            Feature::SessionCategorization,
+        ];
+        TurnJudgementObservation {
+            schema_version: bcode_model::judgement::TURN_OBSERVATION_VERSION,
+            scope: ObservationScope::NormalTurn,
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            operations: features
+                .into_iter()
+                .enumerate()
+                .map(|(index, feature)| ConsumerOperationObservation {
+                    operation_id: index as u64,
+                    feature,
+                    trigger: Trigger::Disabled,
+                    inference: Vec::new(),
+                    inference_complete: true,
+                    application: Some(Application::BaselineRetained),
+                    selection: (feature == Feature::ContextReranking).then_some(
+                        SelectionObservation {
+                            candidate_count: 2,
+                            ordered: vec![0, 1],
+                            admitted: vec![0],
+                        },
+                    ),
+                })
+                .collect(),
+            covered_features: features.into_iter().collect(),
+            terminal: Some(ObservationTerminal::Completed),
+            omitted: 0,
+            complete: true,
+        }
+    }
+    fn convert(
+        snapshot: &TurnJudgementObservation,
+        arm: Arm,
+    ) -> Result<Option<ConsumerOutput>, ()> {
+        context_output(
+            snapshot,
+            "session",
+            "turn",
+            TerminalOutcome::Succeeded,
+            arm,
+            &["history:session:2".into(), "history:session:7".into()],
+        )
+    }
+
+    #[test]
+    fn disabled_baseline_and_on_final_selection_use_original_source_ordinals() {
+        let mut snapshot = snapshot();
+        let Some(ConsumerOutput::Ranking { order, admitted }) =
+            convert(&snapshot, Arm::Off).unwrap()
+        else {
+            panic!("missing baseline selection");
+        };
+        assert_eq!(order, ["history:session:2", "history:session:7"]);
+        assert_eq!(admitted, ["history:session:2"]);
+        let operation = &mut snapshot.operations[1];
+        operation.trigger = Trigger::Triggered;
+        operation.application = Some(Application::Applied);
+        operation
+            .inference
+            .push(bcode_model::judgement::OptionalOperationObservation {
+                inference_invocations: 1,
+                ..Default::default()
+            });
+        operation.selection = Some(SelectionObservation {
+            candidate_count: 2,
+            ordered: vec![1, 0],
+            admitted: vec![1],
+        });
+        let Some(ConsumerOutput::Ranking { order, admitted }) =
+            convert(&snapshot, Arm::On).unwrap()
+        else {
+            panic!("missing installed selection");
+        };
+        assert_eq!(order, ["history:session:7", "history:session:2"]);
+        assert_eq!(admitted, ["history:session:7"]);
+        assert!(convert(&snapshot, Arm::Off).is_err());
+    }
+
+    #[test]
+    fn no_prerequisite_is_not_execution_and_unavailable_is_not_success() {
+        let mut snapshot = snapshot();
+        snapshot.operations[1].trigger = Trigger::NotApplicable;
+        snapshot.operations[1].selection = None;
+        assert!(convert(&snapshot, Arm::On).unwrap().is_none());
+        snapshot.operations[1].trigger = Trigger::Disabled;
+        assert!(convert(&snapshot, Arm::Off).is_err());
+        snapshot.operations[1].application = Some(Application::Unavailable);
+        assert!(convert(&snapshot, Arm::Off).is_err());
+    }
+
+    #[test]
+    fn partial_wrong_turn_future_and_cancelled_observations_fail_closed() {
+        let mutations: [fn(&mut TurnJudgementObservation); 9] = [
+            |value| value.complete = false,
+            |value| value.omitted = 1,
+            |value| value.session_id = "other-session".into(),
+            |value| value.turn_id = "other-turn".into(),
+            |value| value.schema_version += 1,
+            |value| value.terminal = None,
+            |value| {
+                value.operations[1]
+                    .selection
+                    .as_mut()
+                    .unwrap()
+                    .candidate_count = 3;
+            },
+            |value| value.operations[1].selection.as_mut().unwrap().ordered = vec![0, 0],
+            |value| value.operations[1].application = Some(Application::Cancelled),
+        ];
+        for mutate in mutations {
+            let mut value = snapshot();
+            mutate(&mut value);
+            assert!(convert(&value, Arm::Off).is_err());
+        }
+        let mut value = snapshot();
+        value.terminal = Some(ObservationTerminal::Cancelled);
+        assert!(
+            context_output(
+                &value,
+                "session",
+                "turn",
+                TerminalOutcome::Cancelled,
+                Arm::Off,
+                &["history:session:2".into(), "history:session:7".into()]
+            )
+            .is_err()
+        );
+        let mut serialized = serde_json::to_value(snapshot()).unwrap();
+        serialized["operations"][1]["trigger"] = serde_json::json!("future_trigger");
+        assert!(serde_json::from_value::<TurnJudgementObservation>(serialized).is_err());
+    }
 }
