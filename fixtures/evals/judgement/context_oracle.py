@@ -86,11 +86,30 @@ def grade(scenario_id, workspace):
         # Retry's 0..31 catches exact cap transition; minutes cover the whole
         # domain; routing crosses many periods and includes large keys.
         if scenario_id == "retry-window-v1":
-            cases = [(i, min(75 * (2 ** i), 900)) for i in range(32)]
+            cases = []
+            delay = 75
+            for i in range(32):
+                cases.append((i, delay))
+                delay = 900 if delay * 2 > 900 else delay * 2
         elif scenario_id == "local-minute-v1":
-            cases = [(i, (i - 345) % 1440) for i in range(1440)]
+            cases = [(i, i - 345 if i >= 345 else i + 1095) for i in range(1440)]
+        elif scenario_id == "bucket-route-v1":
+            cycle = [3, 10, 6, 2, 9, 5, 1, 8, 4, 0, 7]
+            cases = [(i, cycle[i % 11]) for i in list(range(256)) + [10000, 100001]]
+        elif scenario_id == "storage-blocks-v1":
+            values = [0, 1, 4095, 4096, 4097, 8191, 8192, 8193, 1000001]
+            # Quotient and remainder reference, independent of ceiling idiom.
+            cases = [(i, i // 4096 + int(i % 4096 != 0)) for i in values]
+        elif scenario_id == "sensor-clamp-v1":
+            cases = [(i, -40 if i < -40 else 125 if i > 125 else i)
+                     for i in range(-200, 301)]
+        elif scenario_id == "invoice-rounding-v1":
+            cases = []
+            for i in list(range(1000)) + [100001, 999999]:
+                whole, remainder = divmod(i * 7, 100)
+                cases.append((i, whole + int(remainder >= 50)))
         else:
-            cases = [(i, (7 * i + 3) % 11) for i in list(range(256)) + [10000, 100001]]
+            raise ValueError("oracle implementation missing")
         for value, expected in cases:
             actual = _expression(function.body[0].value, argument, value)
             if actual != expected:

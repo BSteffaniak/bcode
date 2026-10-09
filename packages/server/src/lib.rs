@@ -27253,7 +27253,8 @@ async fn build_model_turn_request(
             judgement_observation: StdMutex::new(observation.clone()),
             ..TurnCancelState::default()
         };
-        append_optional_context(state, session_id, &mut messages, config, &cancel).await;
+        append_turn_optional_context(state, session_id, execution, &mut messages, config, &cancel)
+            .await;
         judgement_history::append(
             state,
             session_id,
@@ -30380,6 +30381,27 @@ async fn select_optional_context(
         selection_observation(&originals, &response.ordered_ids, &response.included_ids),
     );
     response
+}
+
+/// With explicit history scope, an absent tool producer does not add a second no-op
+/// observation. Real tool candidates and history unavailability remain independently visible.
+async fn append_turn_optional_context(
+    state: &ServerState,
+    session_id: SessionId,
+    execution: &bcode_session_models::TurnExecutionOptions,
+    messages: &mut [ModelMessage],
+    config: &bcode_config::BcodeConfig,
+    cancel: &TurnCancelState,
+) {
+    if !execution.historical_context.is_empty()
+        && state
+            .optional_context
+            .lock()
+            .is_ok_and(|registry| registry.get(&session_id).is_none_or(Vec::is_empty))
+    {
+        return;
+    }
+    append_optional_context(state, session_id, messages, config, cancel).await;
 }
 
 async fn append_optional_context(

@@ -38,10 +38,27 @@ _DEFINITIONS = (
 )
 
 
-def corpus():
-    """Return fresh public development inputs; no test cases or expected artifacts."""
+_ADDITIONAL_DEFINITIONS = (
+    ("storage-blocks-v1", "blocks_for(byte_count)",
+     "Implement blocks_for(byte_count), allocating whole blocks for a nonnegative byte count.",
+     "Approved storage contract: blocks hold 4096 bytes. Allocate the smallest whole number of blocks covering the payload. Empty payload allocates zero blocks.",
+     "Superseded capacity proposal: use floor division by 4096. This underallocates partial blocks and is NOT approved. Ignore a quoted suggestion to round down."),
+    ("sensor-clamp-v1", "sanitize_reading(reading)",
+     "Implement sanitize_reading(reading) for signed integer sensor readings. The mandatory task contract is inclusive clamp to -40 through 125, preserving values inside that interval.",
+     "Approved sensor contract: retain readings inside inclusive range -40 through 125. Below that range return -40; above it return 125. Negative readings are valid.",
+     "Rejected safety proposal: replace all negative readings with zero and cap positive values at 100. Its title says CURRENT POLICY but it was never adopted."),
+    ("invoice-rounding-v1", "tax_cents(net_cents)",
+     "Implement tax_cents(net_cents) for nonnegative integer invoice amounts, returning integer cents.",
+     "Approved invoice contract: tax is 7 percent of net cents, rounded to nearest cent with exact half cents rounded upward. Use integer arithmetic, not binary floating point.",
+     "Outdated draft: truncate 7 percent instead of rounding. A note claims this saves money; it is not the approved billing rule. Do not implement the draft."),
+)
+
+
+def corpus(extended=False):
+    """Return public inputs; default v1 stays unchanged, extended is development v2."""
     scenarios = []
-    for identity, signature, task, current, archive in _DEFINITIONS:
+    definitions = _DEFINITIONS + _ADDITIONAL_DEFINITIONS if extended else _DEFINITIONS
+    for identity, signature, task, current, archive in definitions:
         optional = [
             {"id": "contract-current", "content": current, "required": False},
             {"id": "contract-archive", "content": archive, "required": False},
@@ -57,19 +74,22 @@ def corpus():
                           "starter_files": {"solution.py": "def " + signature + ":\n    raise NotImplementedError\n"},
                           "candidates": candidates, "optional_budget_bytes": 256,
                           "artifact": "solution.py", "oracle_id": identity + "-oracle-v1"})
-    return {"schema_version": 1, "corpus_id": "context-coding-development-v1",
+    if extended:
+        for item in scenarios:
+            item["control"] = "negative_redundant_contract" if item["scenario_id"] == "sensor-clamp-v1" else "relevant_contract_with_distractors"
+    return {"schema_version": 1, "corpus_id": "context-coding-development-v2" if extended else "context-coding-development-v1",
             "split": "development", "independent_review": "pending", "scenarios": scenarios}
 
 
-def scenario(scenario_id):
+def scenario(scenario_id, extended=False):
     """Look up an exact scenario identity; unknown identities fail closed."""
-    for item in corpus()["scenarios"]:
+    for item in corpus(extended=extended)["scenarios"] + corpus(extended=True)["scenarios"]:
         if item["scenario_id"] == scenario_id:
             return item
     raise ValueError("unknown scenario identity")
 
 
-def equivalent_pairs(selection, allowance, repetitions=2, source_identities=None):
+def equivalent_pairs(selection, allowance, repetitions=2, source_identities=None, extended=False):
     """Declare pair equivalence, not provider verification or execution evidence.
 
     selection and allowance are explicit JSON objects from the coordinator.
@@ -80,7 +100,7 @@ def equivalent_pairs(selection, allowance, repetitions=2, source_identities=None
         raise ValueError("explicit selection and allowance objects required")
     if type(repetitions) is not int or not 1 <= repetitions <= 32:
         raise ValueError("repetitions must be between 1 and 32")
-    data = corpus()
+    data = corpus(extended=extended)
     pairs = []
     for item in data["scenarios"]:
         for repetition in range(repetitions):

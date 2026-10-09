@@ -1,11 +1,16 @@
 """Offline behavioral calibration; no provider calls or admission simulation."""
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 
 import context_oracle as oracle
 import context_scenarios as scenarios
+
+
+def workspace():
+    return tempfile.TemporaryDirectory(dir=os.environ.get("BCODE_EVAL_TMP", "/Volumes/ehdd/bcode-eval-artifacts/tmp"))
 
 
 class ContextScenarioTests(unittest.TestCase):
@@ -32,7 +37,7 @@ class ContextScenarioTests(unittest.TestCase):
             self.assertTrue(all(len(c["content"].encode()) == 256 for c in optional))
             self.assertEqual(item["optional_budget_bytes"], 256)
             order = [c["id"] for c in reversed(item["candidates"])]
-            with tempfile.TemporaryDirectory() as root:
+            with workspace() as root:
                 payload = scenarios.materialize(item["scenario_id"], root, order)
                 self.assertEqual([c["id"] for c in payload["candidates"]], order)
                 self.assertEqual(set(p.name for p in Path(root).iterdir()),
@@ -49,7 +54,7 @@ class ContextScenarioTests(unittest.TestCase):
             "bucket-route-v1": ("bucket_for(key)", "(key * 7 + 3) % 11", "key % 8"),
         }
         for identity, (signature, correct, wrong) in answers.items():
-            with tempfile.TemporaryDirectory() as root:
+            with workspace() as root:
                 path = Path(root) / "solution.py"
                 self.assertEqual(oracle.grade(identity, root)["status"], "fail")
                 for expression, expected in [(correct, "pass"), (wrong, "fail"), ("0", "fail")]:
@@ -103,8 +108,59 @@ class ContextScenarioTests(unittest.TestCase):
             self.assertEqual(task["pairing_id"], pair["shared_input_digest"])
             self.assertEqual(task["test_ids"], scenarios.test_ids(pair["scenario_id"]))
 
+    def test_extended_independent_domains_and_controls(self):
+        self.assertEqual(len(scenarios.corpus()["scenarios"]), 3)
+        self.assertEqual(len(scenarios.corpus(extended=True)["scenarios"]), 6)
+        extended = scenarios.corpus(extended=True)
+        negative = next(s for s in extended["scenarios"] if s["scenario_id"] == "sensor-clamp-v1")
+        self.assertEqual(negative["control"], "negative_redundant_contract")
+        self.assertIn("-40 through 125", negative["prompt"])
+        for item in extended["scenarios"]:
+            self.assertEqual([len(c["content"].encode()) for c in item["candidates"] if not c["required"]], [256] * 3)
+        controls = {
+            "storage-blocks-v1": ("blocks_for(byte_count)", "(byte_count + 4095) // 4096", "byte_count // 4096"),
+            "sensor-clamp-v1": ("sanitize_reading(reading)", "max(-40, min(125, reading))", "max(0, min(100, reading))"),
+            "invoice-rounding-v1": ("tax_cents(net_cents)", "(net_cents * 7 + 50) // 100", "net_cents * 7 // 100"),
+        }
+        for identity, (signature, correct, misleading) in controls.items():
+            with workspace() as root:
+                path = Path(root) / "solution.py"
+                for expression, expected in [(correct, "pass"), (misleading, "fail"), ("0", "fail")]:
+                    path.write_text("def " + signature + ":\n    return " + expression + "\n")
+                    self.assertEqual(oracle.grade(identity, root)["status"], expected)
+                path.write_text("def " + signature + ":\n    return 1 / 0\n")
+                self.assertEqual(oracle.grade(identity, root)["status"], "fail")
+
+    def test_live_plan_history_shape_and_counterbalance(self):
+        import context_live_plan as plans
+        manifest = scenarios.equivalent_pairs({"model": "test"}, {"turns": 1}, 2, extended=True)
+        bindings = {}
+        for index, pair in enumerate(manifest["pairs"]):
+            item = scenarios.scenario(pair["scenario_id"])
+            bindings[pair["pair_id"]] = {}
+            for arm_index, arm in enumerate(["off", "on"]):
+                bindings[pair["pair_id"]][arm] = {
+                    "session_id": "00000000-0000-0000-0000-" + str(index * 2 + arm_index + 1).zfill(12),
+                    "turn_sequence": 20,
+                    "excerpts": {c["id"]: {"sequence": i + 1, "snippet": c["content"]}
+                                 for i, c in enumerate(item["candidates"]) if not c["required"]}}
+        plan = plans.live_development_plan({"model": "test"}, {"turns": 1}, bindings)
+        self.assertEqual(len(plan["jobs"]), 24)
+        self.assertEqual(len({t["family_id"] for t in plan["tasks"]}), 6)
+        self.assertEqual(sum(t["repetitions"] for t in plan["tasks"]), 12)
+        self.assertEqual([j["arm"] for j in plan["jobs"][:4]], ["off", "on", "on", "off"])
+        for job in plan["jobs"]:
+            self.assertEqual(len(job["historical_context"]), 3)
+            self.assertEqual(job["repetition"], 0)
+            self.assertNotIn("tests", job)
+            self.assertNotIn("expected", job)
+        first = bindings[manifest["pairs"][0]["pair_id"]]["off"]
+        first["excerpts"]["contract-current"]["sequence"] = 20
+        with self.assertRaises(ValueError):
+            plans.live_development_plan({"model": "test"}, {"turns": 1}, bindings)
+
     def test_unsafe_artifacts_and_unknown_identity_fail_closed(self):
-        with tempfile.TemporaryDirectory() as root:
+        with workspace() as root:
             target = Path(root) / "external.py"
             target.write_text("def bucket_for(key):\n    return (key * 7 + 3) % 11\n")
             (Path(root) / "solution.py").symlink_to(target)

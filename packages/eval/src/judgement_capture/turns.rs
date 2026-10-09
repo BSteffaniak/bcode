@@ -60,12 +60,19 @@ fn context_output(
     {
         return Err(());
     }
-    let mut operations = observation
+    let operations: Vec<_> = observation
         .operations
         .iter()
-        .filter(|operation| operation.feature == Feature::ContextReranking);
-    let operation = operations.next().ok_or(())?;
-    if operations.next().is_some() {
+        .filter(|operation| operation.feature == Feature::ContextReranking)
+        .collect();
+    let operation = operations.first().ok_or(())?;
+    // The legacy output has one selection, not a trajectory. Multiple rounds
+    // qualify only if every consumer decision agrees; never pick a favorable round.
+    if operations.iter().skip(1).any(|other| {
+        other.trigger != operation.trigger
+            || other.application != operation.application
+            || other.selection != operation.selection
+    }) {
         return Err(());
     }
     if operation.trigger == Trigger::NotApplicable {
@@ -436,6 +443,32 @@ mod tests {
         assert!(convert(&snapshot, Arm::Off).is_err());
         snapshot.operations[1].application = Some(Application::Unavailable);
         assert!(convert(&snapshot, Arm::Off).is_err());
+    }
+
+    #[test]
+    fn repeated_rounds_require_identical_decisions_not_a_favorable_final_pick() {
+        let mut value = snapshot();
+        let mut repeated = value.operations[1].clone();
+        repeated.operation_id = value.operations.len() as u64;
+        value.operations.push(repeated);
+        let Some(ConsumerOutput::Ranking { admitted, .. }) = convert(&value, Arm::Off).unwrap()
+        else {
+            panic!("identical baseline rounds must remain capturable");
+        };
+        assert_eq!(admitted, ["history:session:2"]);
+        value
+            .operations
+            .last_mut()
+            .unwrap()
+            .selection
+            .as_mut()
+            .unwrap()
+            .admitted = vec![1];
+        assert!(convert(&value, Arm::Off).is_err());
+        value.operations.last_mut().unwrap().selection = value.operations[1].selection.clone();
+        value.operations.last_mut().unwrap().application = Some(Application::Unavailable);
+        value.complete = false;
+        assert!(convert(&value, Arm::Off).is_err());
     }
 
     #[test]
