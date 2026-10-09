@@ -637,6 +637,12 @@ notes = "Maximum API input: 922,000 tokens. Chat Completions does not support to
 
 [[models."gpt-6.1-sol".deployments]]
 provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+
+[[models."gpt-6.1-sol".deployments]]
+provider = "openai"
 auth_mode = "api_key"
 api_surface = "responses_api"
 integration = "bcode"
@@ -810,6 +816,12 @@ notes = "Maximum API input: 922,000 tokens. Chat Completions function calling re
 
 [[models."gpt-6-sol".deployments]]
 provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+
+[[models."gpt-6-sol".deployments]]
+provider = "openai"
 auth_mode = "api_key"
 api_surface = "responses_api"
 integration = "bcode"
@@ -980,6 +992,12 @@ context_window = 1050000
 max_output_tokens = 128000
 documentation_url = "https://developers.openai.com/api/docs/models/gpt-6-luna"
 notes = "Maximum API input: 922,000 tokens. Chat Completions function calling requires reasoning effort none; use Responses for reasoning with tools. Codex subscription availability and limits are not verified. Pricing rules cover Standard and Fast processing; regional, Batch, and Flex adjustments are not represented."
+
+[[models."gpt-6-luna".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
 
 [[models."gpt-6-luna".deployments]]
 provider = "openai"

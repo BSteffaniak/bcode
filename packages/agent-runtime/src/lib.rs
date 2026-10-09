@@ -4343,6 +4343,7 @@ fn normalize_provider_event(
     usage_buffer: &mut Option<TokenUsage>,
 ) -> Result<EventDisposition> {
     match event {
+        ProviderTurnEvent::ModelAvailability { .. } => Ok(EventDisposition::PrivateMetadata),
         ProviderTurnEvent::TurnStarted => {
             Ok(EventDisposition::Continue(AgentRuntimeEvent::TurnStarted))
         }

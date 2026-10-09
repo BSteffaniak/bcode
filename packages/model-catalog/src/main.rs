@@ -42,6 +42,39 @@ enum Command {
         #[arg(long, default_value = "pretty-json")]
         format: CliOutputFormat,
     },
+    /// Prepare a local, reviewed support patch; never uploads evidence.
+    SupportPatchPrepare {
+        /// Catalog document JSON (not provider TOML).
+        #[arg(long)]
+        catalog: PathBuf,
+        /// Normalized evidence document JSON.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// Explicit trusted scope policy JSON.
+        #[arg(long)]
+        policy: PathBuf,
+        /// New patch artifact; existing files are not overwritten.
+        #[arg(long)]
+        output: PathBuf,
+        /// Evaluation time in Unix milliseconds.
+        #[arg(long)]
+        now_ms: u64,
+    },
+    /// Apply a trusted patch to a new catalog JSON artifact, preserving other deployments.
+    SupportPatchApply {
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long)]
+        patch: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        now_ms: u64,
+        #[arg(long)]
+        revision: String,
+    },
     /// Show bundled/remote catalog status.
     Status,
     /// Verify catalog/provider models with a tiny live completion request.
@@ -113,6 +146,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             format,
         } => build_artifacts_with_live(&source, live.as_deref(), &output, format.into())?,
+        Command::SupportPatchPrepare {
+            catalog,
+            evidence,
+            policy,
+            output,
+            now_ms,
+        } => {
+            let catalog = read_bounded_json(&catalog)?;
+            let evidence = read_bounded_json(&evidence)?;
+            let policy = read_bounded_json(&policy)?;
+            let patch = bcode_model_catalog::support_patch::prepare_support_patch(
+                &catalog, evidence, &policy, now_ms,
+            )?;
+            publish_json(&output, &patch)?;
+        }
+        Command::SupportPatchApply {
+            catalog,
+            patch,
+            policy,
+            output,
+            now_ms,
+            revision,
+        } => {
+            let mut catalog = read_bounded_json(&catalog)?;
+            let patch = read_bounded_json(&patch)?;
+            let policy = read_bounded_json(&policy)?;
+            bcode_model_catalog::support_patch::apply_support_patch(
+                &mut catalog,
+                &patch,
+                &policy,
+                now_ms,
+                &revision,
+            )?;
+            publish_json(&output, &catalog)?;
+        }
         Command::Status => print_status()?,
         Command::Verify {
             provider,
@@ -148,6 +216,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn read_bounded_json<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("catalog support input exceeds bounded limit".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "invalid catalog support JSON input".into())
+}
+
+fn publish_json<T: serde::Serialize>(
+    path: &std::path::Path,
+    value: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    // The temporary resides on the destination filesystem; hard-link publication
+    // atomically refuses an existing destination rather than overwriting it.
+    let temporary = path.with_extension("publication.tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        std::fs::hard_link(&temporary, path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
 }
 
 fn validate_catalog(source: PathBuf) -> Result<(), Box<dyn std::error::Error>> {

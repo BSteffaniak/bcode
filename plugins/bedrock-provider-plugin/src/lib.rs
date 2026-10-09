@@ -4853,7 +4853,10 @@ impl BedrockProviderPlugin {
             };
             return ModelList {
                 models,
-                catalog: ModelCatalogHints { policy },
+                catalog: ModelCatalogHints {
+                    policy,
+                    ..ModelCatalogHints::default()
+                },
             };
         }
         if settings.model_ids_are_explicit {
@@ -4868,6 +4871,7 @@ impl BedrockProviderPlugin {
                         target: None,
                         authority: bcode_model::ModelListAuthority::Explicit,
                     },
+                    ..ModelCatalogHints::default()
                 },
             };
         }
@@ -4903,6 +4907,7 @@ impl BedrockProviderPlugin {
                     target: mantle_openai_support_hint(),
                     authority: bcode_model::ModelListAuthority::Authoritative,
                 },
+                ..ModelCatalogHints::default()
             },
         }
     }

@@ -1,9 +1,11 @@
 //! TUI model picker state.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use bcode_model::{
-    ModelInfo, ModelPricingInfo, ModelTokenPrice, ModelVisibility, ModelVisibilitySource,
+    ModelAvailability, ModelAvailabilityReason, ModelAvailabilityStatus, ModelInfo, ModelList,
+    ModelPricingInfo, ModelTokenPrice, ModelVisibility, ModelVisibilitySource,
 };
 use bmux_tui::prelude::Line as ListItem;
 use bmux_tui::prelude::{Line, Span};
@@ -40,6 +42,10 @@ pub enum ModelSortDirection {
 pub enum ModelPickerMode {
     /// Picker actions are focused.
     Actions,
+    /// User is confirming a quota-consuming request for one selected model.
+    ConfirmCheck,
+    /// A bounded provider request is in progress.
+    Checking,
     /// Filter text input is focused.
     Filter,
 }
@@ -48,6 +54,10 @@ pub enum ModelPickerMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPickerApp {
     models: Vec<ModelInfo>,
+    availability: BTreeMap<String, ModelAvailability>,
+    rendered_item_area: Option<bmux_tui::geometry::Rect>,
+    check_model_id: Option<String>,
+    check_consent_visible: bool,
     filter: TextInputState,
     list: FilteredListState,
     status: String,
@@ -64,6 +74,10 @@ impl ModelPickerApp {
         let list = FilteredListState::new(models.len());
         let mut app = Self {
             models,
+            availability: BTreeMap::new(),
+            rendered_item_area: None,
+            check_model_id: None,
+            check_consent_visible: false,
             filter: super::text_input_flow::empty_state(),
             list,
             status: status.into(),
@@ -74,6 +88,133 @@ impl ModelPickerApp {
         };
         app.refresh_filter();
         app
+    }
+
+    /// Create a picker retaining centralized, scope-specific availability decisions.
+    #[must_use]
+    pub fn from_model_list(models: ModelList, status: impl Into<String>) -> Self {
+        let mut app = Self::new_with_status(models.models, status);
+        app.availability = models.catalog.availability;
+        app
+    }
+
+    /// Return selected availability scope without exposing endpoint or credential material.
+    #[must_use]
+    pub fn selected_scope_summary(&self) -> String {
+        let Some(index) = self.list.selected_source_index() else {
+            return "Scope: active provider configuration".to_owned();
+        };
+        self.availability
+            .get(&self.models[index].model_id)
+            .map_or_else(
+                || "Scope: active provider configuration (no scoped evidence)".to_owned(),
+                |availability| {
+                    let target = &availability.target;
+                    format!(
+                        "Scope: {} / {} / {}{}",
+                        target.provider,
+                        target.auth_mode,
+                        target.api_surface,
+                        target
+                            .integration
+                            .as_ref()
+                            .map_or_else(String::new, |value| format!(" / {value}"))
+                    )
+                },
+            )
+    }
+
+    /// Return the selected model's normalized availability and serving scope.
+    #[must_use]
+    pub fn selected_availability_summary(&self) -> String {
+        let Some(index) = self.list.selected_source_index() else {
+            return "No model selected".to_owned();
+        };
+        let model_id = &self.models[index].model_id;
+        self.availability.get(model_id).map_or_else(
+            || "Unverified · no current evidence".to_owned(),
+            |availability| {
+                format!(
+                    "{} · {}",
+                    availability_label(availability.status),
+                    availability_reason(availability.reason),
+                )
+            },
+        )
+    }
+
+    /// Ask for explicit permission to check the selected model.
+    pub fn request_check(&mut self) {
+        if let Some(model_id) = self.selected_model_id() {
+            self.check_consent_visible = false;
+            self.check_model_id = Some(model_id.clone());
+            self.mode = ModelPickerMode::ConfirmCheck;
+            self.set_status(format!("Check {model_id}? One provider request consumes quota and may cost money. Enter confirms; Esc declines."));
+        }
+    }
+
+    /// Enable confirmation only when the complete spending warning was painted.
+    pub const fn set_check_consent_visible(&mut self, visible: bool) {
+        self.check_consent_visible = visible;
+    }
+
+    /// Confirm only the model captured by the consent prompt.
+    pub fn confirm_check(&mut self) -> Option<String> {
+        if self.mode != ModelPickerMode::ConfirmCheck || !self.check_consent_visible {
+            return None;
+        }
+        let model_id = self.check_model_id.take()?;
+        self.mode = ModelPickerMode::Checking;
+        self.set_status(format!("Checking {model_id}… one request, 20 second limit"));
+        Some(model_id)
+    }
+
+    /// Decline a pending request without invoking the provider.
+    pub fn decline_check(&mut self) {
+        self.check_model_id = None;
+        self.mode = ModelPickerMode::Actions;
+        self.set_status("Check declined; no provider request sent");
+    }
+
+    /// Replace availability after a check without losing filter, sort, or selection.
+    pub fn finish_check(&mut self, models: Option<ModelList>, status: impl Into<String>) {
+        let selected = self.selected_model_id();
+        if let Some(models) = models {
+            self.models = models.models;
+            self.availability = models.catalog.availability;
+            self.refresh_filter();
+            if let Some(model_id) = selected
+                && let Some(row) = self
+                    .list
+                    .indices()
+                    .iter()
+                    .position(|index| self.models[*index].model_id == model_id)
+            {
+                self.select_visible(row);
+            }
+        }
+        self.mode = ModelPickerMode::Actions;
+        self.set_status(status);
+    }
+
+    /// Retain exactly the visible painted item area for mouse activation.
+    pub fn set_rendered_item_area(&mut self, area: Option<bmux_tui::geometry::Rect>) {
+        self.rendered_item_area = area.filter(|area| !area.is_empty());
+    }
+
+    /// Activate only a visible model row inside the retained paint geometry.
+    pub fn select_mouse_row(&mut self, mouse: bmux_tui::event::MouseEvent) -> Option<String> {
+        if !matches!(
+            self.mode,
+            ModelPickerMode::Actions | ModelPickerMode::Filter
+        ) {
+            return None;
+        }
+        let row =
+            super::picker_mouse::command_palette_row_in_area(mouse, self.rendered_item_area?)?;
+        self.select_visible(row)
+            .then(|| self.selected_model_id())
+            .flatten()
     }
 
     /// Return filter input mutably.
@@ -122,7 +263,10 @@ impl ModelPickerApp {
                 .iter()
                 .map(|row| {
                     Line::from_spans(vec![Span::styled(
-                        truncate_column(&row.model_id, usable_list_width(width)),
+                        truncate_column(
+                            &format!("{} · {}", row.state, row.model_id),
+                            usable_list_width(width),
+                        ),
                         theme.text,
                     )])
                 })
@@ -307,7 +451,22 @@ impl ModelPickerApp {
         self.list
             .indices()
             .iter()
-            .map(|index| ModelPickerRow::from_model(&self.models[*index]))
+            .map(|index| {
+                let model = &self.models[*index];
+                let mut row = ModelPickerRow::from_model(model);
+                let status = self
+                    .availability
+                    .get(&model.model_id)
+                    .map_or("Unverified", |availability| {
+                        availability_label(availability.status)
+                    });
+                row.state = if row.state.is_empty() {
+                    status.to_owned()
+                } else {
+                    format!("{status} · {}", row.state)
+                };
+                row
+            })
             .collect()
     }
 
@@ -572,6 +731,29 @@ fn display_width(text: &str) -> usize {
     bmux_tui::text_width::display_width(text)
 }
 
+const fn availability_label(status: ModelAvailabilityStatus) -> &'static str {
+    match status {
+        ModelAvailabilityStatus::Verified => "Verified",
+        ModelAvailabilityStatus::CatalogDeclared => "Catalog-supported",
+        ModelAvailabilityStatus::Unverified => "Unverified",
+        ModelAvailabilityStatus::Unsupported | ModelAvailabilityStatus::AccountDenied => {
+            "Unavailable"
+        }
+    }
+}
+
+const fn availability_reason(reason: ModelAvailabilityReason) -> &'static str {
+    match reason {
+        ModelAvailabilityReason::ObservedSuccess => "completed provider request",
+        ModelAvailabilityReason::ProviderSurfaceUnsupported => {
+            "not supported on this serving surface"
+        }
+        ModelAvailabilityReason::AccountDenied => "current account lacks access",
+        ModelAvailabilityReason::CatalogDeclaration => "catalog declaration, not a live check",
+        ModelAvailabilityReason::NoEvidence => "no current evidence",
+    }
+}
+
 fn model_price_cell(
     model: &ModelInfo,
     price: impl Fn(&ModelPricingInfo) -> Option<ModelTokenPrice>,
@@ -823,6 +1005,122 @@ mod tests {
             }),
             api_surface: None,
             visibility: ModelVisibility::Visible,
+        }
+    }
+
+    #[test]
+    fn availability_does_not_hide_unknown_or_denied_models() {
+        let mut app = ModelPickerApp::new_with_status(
+            vec![
+                model("unknown", None, None, None),
+                model("denied", None, None, None),
+            ],
+            "Select",
+        );
+        app.availability.insert(
+            "denied".to_owned(),
+            ModelAvailability {
+                status: ModelAvailabilityStatus::AccountDenied,
+                target: bcode_model::ModelCatalogSupportHint {
+                    provider: "provider".to_owned(),
+                    auth_mode: "subscription".to_owned(),
+                    api_surface: "responses".to_owned(),
+                    integration: None,
+                },
+                reason: ModelAvailabilityReason::AccountDenied,
+                observed_at_ms: Some(1),
+                expires_at_ms: Some(2),
+            },
+        );
+        assert_eq!(app.visible_rows().len(), 2);
+        let unknown_row = app
+            .list
+            .indices()
+            .iter()
+            .position(|index| app.models[*index].model_id == "unknown")
+            .unwrap();
+        app.select_visible(unknown_row);
+        assert_eq!(app.selected_model_id().as_deref(), Some("unknown"));
+        assert_eq!(
+            app.selected_availability_summary(),
+            "Unverified · no current evidence"
+        );
+        let denied_row = app
+            .list
+            .indices()
+            .iter()
+            .position(|index| app.models[*index].model_id == "denied")
+            .unwrap();
+        app.select_visible(denied_row);
+        assert_eq!(app.selected_model_id().as_deref(), Some("denied"));
+        assert_eq!(
+            app.selected_availability_summary(),
+            "Unavailable · current account lacks access"
+        );
+        assert_eq!(
+            app.selected_scope_summary(),
+            "Scope: provider / subscription / responses"
+        );
+        app.mark_state_ignored("denied");
+        assert_eq!(app.visible_rows().len(), 1);
+        app.toggle_show_ignored();
+        assert_eq!(app.visible_rows().len(), 2);
+    }
+
+    #[test]
+    fn selected_check_requires_visible_explicit_consent_and_captures_one_model() {
+        let mut app = ModelPickerApp::new_with_status(
+            vec![
+                model("one", None, None, None),
+                model("two", None, None, None),
+            ],
+            "Select",
+        );
+        assert!(app.confirm_check().is_none());
+        app.request_check();
+        assert!(app.confirm_check().is_none());
+        app.set_check_consent_visible(true);
+        app.select_next();
+        assert_eq!(app.confirm_check().as_deref(), Some("one"));
+        assert_eq!(app.mode(), ModelPickerMode::Checking);
+        assert!(app.confirm_check().is_none());
+        app.finish_check(None, "Check complete");
+        app.request_check();
+        app.decline_check();
+        assert!(app.confirm_check().is_none());
+        assert_eq!(app.mode(), ModelPickerMode::Actions);
+    }
+
+    #[test]
+    fn mouse_activation_uses_retained_visible_geometry() {
+        use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        let mut app =
+            ModelPickerApp::new_with_status(vec![model("one", None, None, None)], "Select");
+        let mouse = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(2, 8));
+        assert!(app.select_mouse_row(mouse).is_none());
+        app.set_rendered_item_area(Some(Rect::new(1, 8, 10, 1)));
+        assert_eq!(app.select_mouse_row(mouse).as_deref(), Some("one"));
+        let header = MouseEvent {
+            position: Point::new(2, 7),
+            ..mouse
+        };
+        assert!(app.select_mouse_row(header).is_none());
+        app.set_rendered_item_area(None);
+        assert!(app.select_mouse_row(mouse).is_none());
+    }
+
+    #[test]
+    fn compact_unicode_status_rows_stay_bounded() {
+        let app = ModelPickerApp::new_with_status(
+            vec![model("模型👩‍💻e\u{301}", None, None, None)],
+            "Select",
+        );
+        let theme = super::super::render::TuiTheme::for_theme_id("terminal-native");
+        for width in 0..80 {
+            for item in app.list_items(width, theme) {
+                assert!(item.width() <= usable_list_width(width));
+            }
         }
     }
 

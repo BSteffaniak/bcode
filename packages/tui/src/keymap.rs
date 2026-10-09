@@ -492,6 +492,11 @@ fn register_model_actions(
 ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
     use bcode_plugin_sdk::tui::keymap::KeymapAction;
     for (id, description, defaults) in [
+        (
+            "tui.model.check",
+            "Check selected model (may consume quota/cost)",
+            vec!["c"],
+        ),
         ("tui.model.filter", "Filter models", vec!["/"]),
         (
             "tui.model.showIgnored",

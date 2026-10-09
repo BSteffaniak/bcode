@@ -9,7 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub use live::{LIVE_SNAPSHOT_SCHEMA_VERSION, LiveCatalogSnapshot, LiveModel, LiveModelMetadata};
 
+mod evidence;
 mod live;
+pub use evidence::{
+    EVIDENCE_SCHEMA_VERSION, EvidenceCapability, EvidenceDocument, EvidenceOutcome,
+    EvidenceResolution, EvidenceScope, ModelSupportEvidence,
+};
 
 /// Normalized model-catalog diagnostics exposed at the application boundary.
 ///
@@ -264,6 +269,10 @@ pub struct ModelCatalogEntry {
     /// metadata differs by serving target.
     #[serde(default)]
     pub supported_by: BTreeSet<ModelSupportTarget>,
+    /// Explicit serving targets removed by trusted definitive surface evidence.
+    /// This does not change support on other deployments or global model status.
+    #[serde(default)]
+    pub unsupported_by: BTreeSet<ModelSupportTarget>,
     /// Serving deployments with target-specific operational metadata.
     #[serde(default)]
     pub deployments: Vec<ModelDeployment>,

@@ -341,6 +341,7 @@ impl ProviderEventValidator {
             | ProviderTurnEvent::ExactRequestInputTokens { .. }
             | ProviderTurnEvent::ContextCompacted { .. }
             | ProviderTurnEvent::ProviderMetadata { .. }
+            | ProviderTurnEvent::ModelAvailability { .. }
             | ProviderTurnEvent::Warning { .. } => {}
         }
         Ok(())

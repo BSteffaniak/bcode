@@ -1242,6 +1242,170 @@ pub struct ModelCatalogSupportHint {
 pub struct ModelCatalogHints {
     #[serde(default)]
     pub policy: ModelCatalogPolicy,
+    /// Central catalog/evidence availability decisions keyed by exact model id.
+    /// Missing entries are unverified, not unsupported.
+    #[serde(default)]
+    pub availability: BTreeMap<String, ModelAvailability>,
+    /// Provider-resolved discovery identity; actual attempts may use another candidate.
+    #[serde(default)]
+    pub availability_scope: Option<ModelCheckScope>,
+}
+
+/// Normalized scoped availability, independent of optional capability declarations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAvailability {
+    /// Objective support or account-local denial state.
+    pub status: ModelAvailabilityStatus,
+    /// Serving deployment to which this decision applies.
+    pub target: ModelCatalogSupportHint,
+    /// Secret-safe reason, never a provider error string.
+    pub reason: ModelAvailabilityReason,
+    /// Observation time for evidence-derived decisions.
+    #[serde(default)]
+    pub observed_at_ms: Option<u64>,
+    /// Exclusive expiry for evidence-derived decisions.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Availability provenance/status. Absence of declarations means unverified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAvailabilityStatus {
+    /// Actual completed request verified this deployment.
+    Verified,
+    /// Catalog explicitly declares this deployment.
+    CatalogDeclared,
+    /// Neither a declaration nor current evidence establishes support.
+    Unverified,
+    /// Definitive serving-surface rejection.
+    Unsupported,
+    /// Account-local entitlement denial, not a global support claim.
+    AccountDenied,
+}
+
+/// Fixed normalized explanations for availability decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAvailabilityReason {
+    /// Completed text generation on the active scope.
+    ObservedSuccess,
+    /// Definitive provider-surface unsupported response.
+    ProviderSurfaceUnsupported,
+    /// Current account is not entitled.
+    AccountDenied,
+    /// Explicit deployment declaration in catalog.
+    CatalogDeclaration,
+    /// Support has not been verified.
+    NoEvidence,
+}
+
+/// Bounded, explicitly authorized model-check request. Admission validates 1–16 ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCheckRequest {
+    /// Exact provider-native model ids, not prompts.
+    pub model_ids: Vec<String>,
+    /// Must be true before any provider request is sent.
+    pub allow_requests: bool,
+}
+
+/// Secret-safe identity actually exercised, not merely the initially selected profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCheckScope {
+    /// Effective provider deployment.
+    pub target: ModelCatalogSupportHint,
+    /// Selected provider profile reference, never an authentication secret.
+    pub profile: Option<String>,
+    /// Domain-separated digest of serving endpoint/configuration.
+    pub endpoint_fingerprint: String,
+    /// Domain-separated account-isolation digest, not an account id or token.
+    pub account_fingerprint: String,
+}
+
+/// Fixed check outcome; inconclusive failures never become support removals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCheckStatus {
+    /// Completed generation.
+    Working,
+    /// Definitively unsupported serving surface.
+    Unsupported,
+    /// Account entitlement denial.
+    AccountDenied,
+    /// No definitive result.
+    Inconclusive,
+    /// Admission deadline elapsed.
+    Timeout,
+    /// Cancelled without a definitive result.
+    Cancelled,
+}
+
+/// Normalized diagnostic reason without arbitrary provider error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCheckReason {
+    /// Generation succeeded.
+    ObservedSuccess,
+    /// Provider classifier established unsupported surface.
+    ProviderSurfaceUnsupported,
+    /// Provider classifier established account denial.
+    AccountDenied,
+    /// Failure could not be classified definitively.
+    InconclusiveProviderFailure,
+    /// Provider emitted no definitive observation.
+    NoDefinitiveObservation,
+    /// Deadline elapsed.
+    Timeout,
+    /// Operation cancelled.
+    Cancelled,
+    /// Provider spending was not explicitly enabled.
+    RequestsNotAllowed,
+    /// Local check admission rejected the request.
+    InvalidRequest,
+    /// Optional evidence store unavailable; other application domains remain usable.
+    EvidenceStoreUnavailable,
+}
+
+/// One completed normalized check, exposing no prompt, response, or raw error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCheckResult {
+    /// Exact requested model id.
+    pub model_id: String,
+    /// Definitive or inconclusive result.
+    pub status: ModelCheckStatus,
+    /// Fixed diagnostic reason.
+    pub reason: ModelCheckReason,
+    /// True only after atomic evidence publication succeeds.
+    pub evidence_persisted: bool,
+    /// Actual attempted scope, absent when no request was admitted.
+    pub scope: Option<ModelCheckScope>,
+}
+
+/// Provider-owned normalized observation of an actual admitted model attempt.
+/// Inconclusive statuses are diagnostic only and must not become durable support facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAvailabilityObservation {
+    /// Actual provider-native model id.
+    pub model_id: String,
+    /// Normalized definitive or inconclusive outcome.
+    pub status: ModelCheckStatus,
+    /// Fixed diagnostic reason, never a raw provider error.
+    pub reason: ModelCheckReason,
+    /// Actual auth candidate and serving identity.
+    pub scope: ModelCheckScope,
+    /// Request admission timestamp, before provider I/O.
+    pub attempt_started_at_ms: u64,
+    /// Admission ordinal, not completion sequence.
+    pub attempt_ordinal: u64,
+    /// Observation completion time.
+    pub observed_at_ms: u64,
+}
+
+/// Bounded batch report in request order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCheckReport {
+    /// One result per admitted/requested model id.
+    pub results: Vec<ModelCheckResult>,
 }
 
 /// Model listing response.
@@ -3282,6 +3446,11 @@ pub enum ProviderOutputEvent {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderTurnEvent {
+    /// Secret-safe provider classification for an actual model/auth attempt.
+    ModelAvailability {
+        /// Normalized attempted scope and result; no raw provider error payload.
+        observation: ModelAvailabilityObservation,
+    },
     /// Opt-in version-1 adapter timing. Emit only after explicit host acceptance.
     AttemptTiming {
         /// Bounded secret-free terminal attempt snapshot.

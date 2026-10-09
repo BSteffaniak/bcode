@@ -157,6 +157,7 @@ struct RootPluginSurface {
 }
 
 struct RootModelPicker {
+    generation: u64,
     provider_plugin_id: Option<String>,
     picker: super::model_picker::ModelPickerApp,
 }
@@ -249,6 +250,8 @@ pub struct ChatLoopState {
     parent_plugin_surface: Option<RootPluginSurface>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
     model_picker: Option<RootModelPicker>,
+    model_picker_generation: u64,
+    model_check_in_flight: bool,
     auth_pool_picker: Option<super::auth_pool_picker::AuthPoolPickerApp>,
     skill_picker: Option<super::skill_picker::SkillPickerApp>,
     working_directory_dialog: Option<super::working_directory_dialog::WorkingDirectoryDialog>,
@@ -316,6 +319,8 @@ impl ChatLoopState {
             parent_plugin_surface: None,
             provider_picker: None,
             model_picker: None,
+            model_picker_generation: 0,
+            model_check_in_flight: false,
             auth_pool_picker: None,
             skill_picker: None,
             working_directory_dialog: None,
@@ -1268,7 +1273,11 @@ impl ChatLoopState {
             }
         }
         let model = self.model_picker.as_mut()?;
-        if matches!(event, Event::Key(stroke) if keymap.action("model_picker", *stroke) == Some("tui.control.submit") || keymap.action("model_picker_actions", *stroke) == Some("tui.control.submit"))
+        if matches!(
+            model.picker.mode(),
+            super::model_picker::ModelPickerMode::Actions
+                | super::model_picker::ModelPickerMode::Filter
+        ) && matches!(event, Event::Key(stroke) if keymap.action("model_picker", *stroke) == Some("tui.control.submit") || keymap.action("model_picker_actions", *stroke) == Some("tui.control.submit"))
             && let Some(model_id) = model.picker.selected_ignored_model_id()
         {
             model.picker.set_status(format!(
@@ -1278,9 +1287,15 @@ impl ChatLoopState {
         }
         let action = match event {
             Event::Paste(text) => {
-                model.picker.focus_filter();
-                let _ = super::text_input_flow::handle_paste(model.picker.filter_mut(), text);
-                model.picker.refresh_filter();
+                if matches!(
+                    model.picker.mode(),
+                    super::model_picker::ModelPickerMode::Actions
+                        | super::model_picker::ModelPickerMode::Filter
+                ) {
+                    model.picker.focus_filter();
+                    let _ = super::text_input_flow::handle_paste(model.picker.filter_mut(), text);
+                    model.picker.refresh_filter();
+                }
                 super::model_flow::ModelPickerAction::Continue
             }
             Event::Key(stroke) => super::model_flow::handle_model_picker_key(
@@ -1289,9 +1304,9 @@ impl ChatLoopState {
                 model.provider_plugin_id.as_deref(),
                 *stroke,
             ),
-            Event::Mouse(mouse) => super::picker_mouse::picker_row_from_mouse(*mouse)
-                .filter(|row| model.picker.select_visible(*row))
-                .and_then(|_| model.picker.selected_model_id())
+            Event::Mouse(mouse) => model
+                .picker
+                .select_mouse_row(*mouse)
                 .map_or(super::model_flow::ModelPickerAction::Continue, |model_id| {
                     super::model_flow::ModelPickerAction::Select(model_id)
                 }),
@@ -1300,10 +1315,27 @@ impl ChatLoopState {
             }
         };
         let provider = model.provider_plugin_id.clone();
-        if !matches!(action, super::model_flow::ModelPickerAction::Continue) {
+        if matches!(
+            action,
+            super::model_flow::ModelPickerAction::Cancel
+                | super::model_flow::ModelPickerAction::Select(_)
+        ) {
             self.model_picker = None;
         }
         Some((provider, action))
+    }
+
+    pub fn start_selected_model_check(&mut self) -> Option<u64> {
+        let model = self.model_picker.as_mut()?;
+        if self.model_check_in_flight {
+            model.picker.finish_check(
+                None,
+                "A model check is already running; wait for its bounded outcome before retrying",
+            );
+            return None;
+        }
+        self.model_check_in_flight = true;
+        Some(model.generation)
     }
 
     pub const fn has_skill_picker(&self) -> bool {
@@ -3247,6 +3279,59 @@ pub fn apply_effect_result(
                 report_nonfatal_client_error(chat, "Auth pool preference update failed", &error);
             }
         },
+        TuiEffectResult::SelectedModelChecked {
+            session_id,
+            provider_plugin_id,
+            generation,
+            result,
+            models,
+        } => {
+            loop_state.model_check_in_flight = false;
+            if chat.attached_session_id() != session_id {
+                return;
+            }
+            let Some(model) = loop_state.model_picker.as_mut().filter(|model| {
+                model.generation == generation && model.provider_plugin_id == provider_plugin_id
+            }) else {
+                return;
+            };
+            let status = result
+                .as_ref()
+                .ok()
+                .and_then(|report| report.results.first())
+                .map_or_else(
+                    || "Check unavailable; retry when the service is available".to_owned(),
+                    |result| {
+                        use bcode_model::ModelCheckStatus;
+                        let outcome = match result.status {
+                            ModelCheckStatus::Working => "Verified: completed provider request",
+                            ModelCheckStatus::Unsupported => {
+                                "Unavailable: serving surface unsupported"
+                            }
+                            ModelCheckStatus::AccountDenied => {
+                                "Unavailable: current account lacks access"
+                            }
+                            ModelCheckStatus::Inconclusive => "Unverified: check inconclusive",
+                            ModelCheckStatus::Timeout => "Unverified: check timed out",
+                            ModelCheckStatus::Cancelled => "Unverified: check cancelled",
+                        };
+                        format!(
+                            "{outcome}{}{}",
+                            if result.evidence_persisted {
+                                " · saved"
+                            } else {
+                                " · not saved"
+                            },
+                            if models.is_err() {
+                                " · list refresh unavailable"
+                            } else {
+                                ""
+                            }
+                        )
+                    },
+                );
+            model.picker.finish_check(models.ok(), status);
+        }
         TuiEffectResult::ModelPickerLoaded {
             provider_plugin_id,
             result,
@@ -3256,12 +3341,12 @@ pub fn apply_effect_result(
                     || "Select a model".to_owned(),
                     |provider| format!("Select a model from {provider}"),
                 );
+                loop_state.model_picker_generation =
+                    loop_state.model_picker_generation.wrapping_add(1);
                 loop_state.model_picker = Some(RootModelPicker {
+                    generation: loop_state.model_picker_generation,
                     provider_plugin_id,
-                    picker: super::model_picker::ModelPickerApp::new_with_status(
-                        models.models,
-                        status,
-                    ),
+                    picker: super::model_picker::ModelPickerApp::from_model_list(models, status),
                 });
                 chat.app.set_status("select a model".to_owned());
             }

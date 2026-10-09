@@ -14,9 +14,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_client::{BcodeClient, ClientError, DaemonAvailability, SessionWatchEvent};
 use bcode_config::AuthMode;
 use bcode_ipc::{ServerStatus, default_endpoint};
-use bcode_model_provider_runtime::{
-    BlockingModelProviderInvoker, SingleTurnRequest, SingleTurnStatus, run_single_turn_blocking,
-};
+use bcode_model_provider_runtime::BlockingModelProviderInvoker;
 use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse,
@@ -6333,6 +6331,12 @@ enum ModelCommand {
         /// Request timeout in seconds.
         #[arg(long, default_value_t = 20)]
         timeout_seconds: u64,
+        /// Exact model ids to probe, including models absent from discovery.
+        #[arg(long = "model")]
+        model_ids: Vec<String>,
+        /// Authorize bounded provider requests, which consume quota or incur charges.
+        #[arg(long, required_unless_present = "dry_run")]
+        allow_provider_requests: bool,
     },
     /// Verify prompt-cache behavior against the configured provider's live models.
     ///
@@ -8618,10 +8622,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
             provider,
             json,
         } => {
-            let provider = match provider {
-                Some(provider) => provider,
-                None => default_model_provider_id()?,
-            };
+            let provider = provider.map_or_else(default_model_provider_id, Ok)?;
             let path = bcode_config::ignore_model_in_state(&provider, model_id.clone())?;
             if json {
                 print_json(
@@ -8642,10 +8643,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
             provider,
             json,
         } => {
-            let provider = match provider {
-                Some(provider) => provider,
-                None => default_model_provider_id()?,
-            };
+            let provider = provider.map_or_else(default_model_provider_id, Ok)?;
             let path = bcode_config::unignore_model_in_state(&provider, &model_id)?;
             if json {
                 print_json(
@@ -8669,15 +8667,20 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
             dry_run,
             output,
             timeout_seconds,
+            model_ids,
+            allow_provider_requests,
         } => {
-            verify_models(
+            verify_models(VerifyModelsOptions {
                 prompt,
                 max_models,
-                id_pattern.as_ref(),
+                id_pattern,
                 dry_run,
                 output,
                 timeout_seconds,
-            )?;
+                model_ids,
+                allow_provider_requests,
+            })
+            .await?;
         }
         ModelCommand::VerifyCache(args) => verify_model_caches(&args).await?,
         ModelCommand::VerifyImages(args) => verify_model_images(&args).await?,
@@ -12985,88 +12988,81 @@ fn write_model_capabilities(
     Ok(())
 }
 
-fn verify_models(
+#[derive(Debug)]
+struct VerifyModelsOptions {
     prompt: String,
     max_models: Option<usize>,
-    id_pattern: Option<&String>,
+    id_pattern: Option<String>,
     dry_run: bool,
     output: Option<PathBuf>,
     timeout_seconds: u64,
-) -> Result<(), CliError> {
-    let config = bcode_config::load_config()?;
-    let context = configured_provider_context(&config);
-    let selection = config.resolved_model_selection();
-    let provider_plugin_id = selection.provider_plugin_id.clone().ok_or_else(|| {
-        CliError::PluginCli("no model provider is configured; pass --provider".to_string())
-    })?;
-    let mut host = load_cli_plugin_host()?;
-    let list_request = bcode_model::ModelListRequest {
-        provider_context: context,
-        selected_model_id: selection.selected_model_id,
-    };
-    let models: bcode_model::ModelList = host
-        .invoke_service_json(
-            &provider_plugin_id,
-            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
-            bcode_model::OP_MODELS,
-            &list_request,
-        )
-        .map_err(plugin_service_call_error)?;
-    let mut candidates = models
-        .models
-        .into_iter()
-        .map(|model| model.model_id)
-        .filter(|model_id| id_pattern.is_none_or(|pattern| wildcard_match(pattern, model_id)))
-        .collect::<Vec<_>>();
-    if let Some(max_models) = max_models {
-        candidates.truncate(max_models);
+    model_ids: Vec<String>,
+    allow_provider_requests: bool,
+}
+
+async fn verify_models(options: VerifyModelsOptions) -> Result<(), CliError> {
+    if options.prompt != "say ok" {
+        return Err(CliError::InvalidArguments(
+            "model verification uses the fixed low-cost 'say ok' probe; use an ordinary turn for custom prompts".into(),
+        ));
     }
-    let mut results = BTreeMap::new();
-    let mut invoker = CliPluginTurnInvoker { host: &mut host };
-    for model_id in &candidates {
-        let result = if dry_run {
-            CliVerifyModelResult {
-                status: "dry_run".to_string(),
-                latency_ms: None,
-                error_code: None,
-                message: None,
-            }
-        } else {
-            verify_one_model(
-                &mut invoker,
-                &provider_plugin_id,
-                &list_request.provider_context,
-                model_id,
-                &prompt,
-                timeout_seconds,
-            )
-        };
-        println!(
-            "{model_id}\t{}\t{}",
-            result.status,
-            result
-                .latency_ms
-                .map_or_else(|| "-".to_string(), |latency| format!("{latency}ms"))
-        );
-        results.insert(model_id.clone(), result);
+    if !(1..=60).contains(&options.timeout_seconds) {
+        return Err(CliError::InvalidArguments(
+            "--timeout-seconds must be between 1 and 60".into(),
+        ));
     }
-    let report = CliVerifyReport {
-        provider: "configured".to_string(),
-        verified_at: unix_timestamp_string(),
-        prompt,
-        dry_run,
-        total_models: candidates.len(),
-        results,
+    if !options.dry_run && !options.allow_provider_requests {
+        return Err(CliError::InvalidArguments(
+            "verification requires --allow-provider-requests (consumes provider quota)".into(),
+        ));
+    }
+    let client = BcodeClient::default_endpoint().with_request_timeout(Duration::from_secs(
+        options
+            .timeout_seconds
+            .saturating_mul(16)
+            .saturating_add(30),
+    ));
+    let mut candidates = if options.model_ids.is_empty() {
+        client
+            .session_model_list(None)
+            .await?
+            .models
+            .into_iter()
+            .filter(|model| {
+                !matches!(
+                    model.visibility,
+                    bcode_model::ModelVisibility::Ignored { .. }
+                )
+            })
+            .map(|model| model.model_id)
+            .collect::<Vec<_>>()
+    } else {
+        options.model_ids
     };
-    // Provider work is complete; output failures must not skip plugin deactivation.
-    host.deactivate_all()?;
-    require_verification_candidates(report.total_models, dry_run)?;
-    let body = serde_json::to_string_pretty(&report)?;
-    if let Some(output) = output {
+    candidates.retain(|model_id| {
+        options
+            .id_pattern
+            .as_ref()
+            .is_none_or(|pattern| wildcard_match(pattern, model_id))
+    });
+    let mut seen = BTreeSet::new();
+    candidates.retain(|model_id| seen.insert(model_id.clone()));
+    candidates.truncate(options.max_models.unwrap_or(16).min(16));
+    require_verification_candidates(candidates.len(), options.dry_run)?;
+    let report = if options.dry_run {
+        serde_json::json!({"dry_run": true, "model_ids": candidates, "max_requests": candidates.len()})
+    } else {
+        serde_json::to_value(
+            client
+                .check_models(None, None, candidates, options.timeout_seconds, true)
+                .await?,
+        )?
+    };
+    if let Some(output) = options.output {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&output, body)?;
+        fs::write(&output, serde_json::to_string_pretty(&report)?)?;
         println!("wrote {}", display_from_current_dir(&output));
     } else {
         print_json(&report)?;
@@ -13081,107 +13077,6 @@ fn require_verification_candidates(count: usize, dry_run: bool) -> Result<(), Cl
         ));
     }
     Ok(())
-}
-
-fn verify_one_model(
-    invoker: &mut CliPluginTurnInvoker<'_>,
-    provider_plugin_id: &str,
-    context: &bcode_model::ProviderRequestContext,
-    model_id: &str,
-    prompt: &str,
-    timeout_seconds: u64,
-) -> CliVerifyModelResult {
-    let Ok(result) = run_single_turn_blocking(
-        invoker,
-        SingleTurnRequest {
-            provider_plugin_id: Some(provider_plugin_id.to_string()),
-            model_id: model_id.to_string(),
-            provider_context: context.clone(),
-            prompt: prompt.to_string(),
-            system_prompt: Some("You are Bcode's model verification probe. Follow the user's instruction exactly and answer briefly.".to_string()),
-            parameters: bcode_model::ModelParameters::default(),
-            metadata: BTreeMap::from([(
-                "bcode_request_kind".to_string(),
-                "model_verification".to_string(),
-            )]),
-            timeout: std::time::Duration::from_secs(timeout_seconds),
-        },
-    ) else {
-        return auth_diagnostics_verify_result(context);
-    };
-    let status = match result.status {
-        SingleTurnStatus::Finished => "working",
-        SingleTurnStatus::Cancelled | SingleTurnStatus::ProviderError => "provider_error",
-        SingleTurnStatus::Timeout => "timeout",
-    };
-    CliVerifyModelResult {
-        status: result
-            .error
-            .as_ref()
-            .map_or_else(|| status.to_string(), provider_error_status),
-        latency_ms: Some(result.latency_ms),
-        error_code: result.error.as_ref().map(|error| error.code.clone()),
-        message: result.error.map(|error| error.message),
-    }
-}
-
-fn auth_diagnostics_verify_result(
-    context: &bcode_model::ProviderRequestContext,
-) -> CliVerifyModelResult {
-    CliVerifyModelResult {
-        status: "unauthorized".to_string(),
-        latency_ms: None,
-        error_code: Some("missing_openai_auth".to_string()),
-        message: Some(auth_diagnostics_message(context)),
-    }
-}
-
-fn auth_diagnostics_message(context: &bcode_model::ProviderRequestContext) -> String {
-    let mut parts = Vec::new();
-    if let Some(profile) = &context.auth_profile {
-        parts.push(format!("auth_profile={profile}"));
-    }
-    if let Some(auth) = &context.auth {
-        if let Some(backend) = &auth.backend {
-            parts.push(format!("backend={backend}"));
-        }
-        if let Some(scheme) = &auth.scheme {
-            parts.push(format!("scheme={scheme}"));
-        }
-        let mut credential_names = auth.credentials.keys().cloned().collect::<Vec<_>>();
-        credential_names.sort();
-        parts.push(format!("credentials_present={credential_names:?}"));
-        for diagnostic in &auth.diagnostics {
-            parts.push(format!(
-                "diagnostic[{}:{}]={}",
-                diagnostic.severity, diagnostic.code, diagnostic.message
-            ));
-        }
-    }
-    if parts.is_empty() {
-        "auth context did not include credentials or diagnostics".to_string()
-    } else {
-        parts.join("; ")
-    }
-}
-
-fn provider_error_status(error: &bcode_model::ProviderError) -> String {
-    let message = error.message.to_lowercase();
-    if message.contains("model is not supported")
-        || message.contains("model is unsupported")
-        || message.contains("unsupported model")
-    {
-        return "not_supported".to_string();
-    }
-    match error.category {
-        bcode_model::ProviderErrorCategory::Auth => "unauthorized",
-        bcode_model::ProviderErrorCategory::ModelNotFound => "not_found",
-        bcode_model::ProviderErrorCategory::RateLimit => "rate_limited",
-        bcode_model::ProviderErrorCategory::Timeout => "timeout",
-        bcode_model::ProviderErrorCategory::Network => "network_error",
-        _ => "provider_error",
-    }
-    .to_string()
 }
 
 /// Current schema version for the `verify-cache` CLI report envelope.
@@ -13732,27 +13627,6 @@ impl BlockingModelProviderInvoker for CliPluginTurnInvoker<'_> {
             )
             .map_err(|error| error.to_string())
     }
-}
-
-#[derive(Debug, Serialize)]
-struct CliVerifyReport {
-    provider: String,
-    verified_at: String,
-    prompt: String,
-    dry_run: bool,
-    total_models: usize,
-    results: BTreeMap<String, CliVerifyModelResult>,
-}
-
-#[derive(Debug, Serialize)]
-struct CliVerifyModelResult {
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    latency_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {

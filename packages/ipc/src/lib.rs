@@ -992,6 +992,25 @@ pub enum Request {
     SessionModelList {
         provider_plugin_id: Option<String>,
     },
+    /// List models using the effective selection of one attached session.
+    SessionModelListForSession {
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+    },
+    /// Request cancellation; acknowledgment does not establish provider settlement.
+    CancelModelCheck {
+        check_id: String,
+    },
+    /// Probe a bounded set of models through the active provider configuration.
+    /// Explicit consent is required before consuming provider quota.
+    CheckModels {
+        check_id: String,
+        session_id: Option<SessionId>,
+        provider_plugin_id: Option<String>,
+        model_ids: Vec<String>,
+        timeout_seconds: u64,
+        allow_provider_requests: bool,
+    },
     /// Inspect enabled judgement models and owned account availability without evaluating.
     JudgementSetup,
     /// Recheck one exact evaluator and account selection against current daemon state.
@@ -2170,6 +2189,14 @@ pub enum ResponsePayload {
     SessionModelList {
         provider_plugin_id: Option<String>,
         models: bcode_model::ModelList,
+    },
+    /// Cancellation was requested, not necessarily completed.
+    ModelCheckCancellationRequested {
+        cancellation_requested: bool,
+    },
+    /// Codec-safe encoding of the normalized bounded model-check report.
+    CheckModels {
+        result_json: String,
     },
     /// Secret-free, bounded non-conversational evaluator setup catalog.
     JudgementSetup {
@@ -5585,6 +5612,8 @@ mod tests {
                     visibility: bcode_model::ModelVisibility::Visible,
                 }],
                 catalog: bcode_model::ModelCatalogHints {
+                    availability: BTreeMap::new(),
+                    availability_scope: None,
                     policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
                         provider_id: "openai".to_string(),
                         target: bcode_model::ModelCatalogSupportHint {
@@ -5666,6 +5695,8 @@ mod tests {
                     visibility: bcode_model::ModelVisibility::Visible,
                 }],
                 catalog: bcode_model::ModelCatalogHints {
+                    availability: BTreeMap::new(),
+                    availability_scope: None,
                     policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
                         provider_id: "bedrock".to_string(),
                         target: None,

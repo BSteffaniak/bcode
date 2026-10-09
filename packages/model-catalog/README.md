@@ -1,5 +1,63 @@
 # bcode-model-catalog
 
+## Scoped support evidence
+
+`EvidenceStore::new(state_root)` owns the optional
+`model-support-evidence/evidence-v1.json` domain store, not the session database.
+Provider integrations supply normalized observations after complete generation or
+an explicitly classified definitive error. No prompt, response, raw error,
+credential, endpoint URL or account identifier is represented in this contract.
+Endpoint and account fingerprints must be domain-separated SHA-256 digests.
+Admission order `(attempt_started_at_ms, attempt_ordinal)` governs reconciliation,
+not response arrival. Assign ordinals before each actual attempt, including retries.
+Success proves only its explicit exercised capabilities; a text-only request does
+not establish tools, image, structured-output or cache support.
+
+The document is bounded to 1 MiB/4096 retained capability observations. Evidence
+lifetimes are limited to 30 days. Expired latest facts remain as tombstones, so an
+older success cannot reappear after a newer denial expires. Version mismatches,
+corruption and capacity failures preserve state and degrade only this optional
+domain. Writers use a create-new lock and private temporary file, sync data, and
+atomically rename on the same filesystem. A crashed writer lock or temporary file
+requires explicit inspection/maintenance; normal reads never repair state.
+
+`merge_provider_models_with_evidence` is the central discovered/catalog/evidence
+union and emits `ModelCatalogHints.availability` decisions. Missing declarations
+are unverified, not unsupported. Evidence is exact provider/auth/surface/endpoint/
+account scoped; definitive provider-surface rejection can reconcile other accounts
+on the same endpoint, while account denial cannot. Apply local ignore/visibility
+policy after this union.
+
+## Offline trusted support publication
+
+Shared publication is an explicit local operation, with no automatic upload or
+external central service. The catalog maintainer authenticates/reviews evidence
+origins and supplies a JSON `SupportTrustPolicy` containing `trusted_scopes` and
+`removal_account_quorum` (at least two distinct accounts). Merely copying a local
+evidence file does not establish trust. Allowlist only reviewed public serving
+endpoints; private/custom endpoint behavior must never be promoted as another
+public deployment's support. Account-denied observations never remove support.
+
+```sh
+bcode-model-catalog support-patch-prepare \
+  --catalog catalog.json --evidence evidence-v1.json --policy trusted-scopes.json \
+  --now-ms 1791468000000 --output support-patch.json
+bcode-model-catalog support-patch-apply \
+  --catalog catalog.json --patch support-patch.json --policy trusted-scopes.json \
+  --now-ms 1791468000000 --revision reviewed-support-1 --output catalog-reviewed.json
+```
+
+Inputs and outputs are portable JSON documents (catalog input may come from
+`build --format pretty-json`). Output is an atomic new artifact; existing files
+are refused. Application revalidates trust and exact base revision, applies changes
+to a clone, validates the resulting catalog, and only then publishes the result.
+Additions create minimal missing entries without inferred capability/pricing data.
+Removals record exact `unsupported_by` deployment targets; other deployments,
+capabilities, global model status and operational metadata remain independent.
+Later reviewed success restores only its target. The generated catalog artifact
+is usable by the existing catalog overlay/distribution pipeline.
+
+
 Loads hand-authored TOML model catalog definitions and builds static catalog artifacts for Bcode and
  the models site.
 

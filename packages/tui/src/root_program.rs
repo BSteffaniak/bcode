@@ -828,6 +828,17 @@ impl BcodeRuntimeModel {
                     super::model_flow::ModelPickerAction::Cancel => {
                         self.chat.app.set_status("model picker closed".to_owned());
                     }
+                    super::model_flow::ModelPickerAction::Check(model_id) => {
+                        if let Some(generation) = self.loop_state.start_selected_model_check() {
+                            self.chat
+                                .start_effect(super::effects::TuiEffect::CheckSelectedModel {
+                                    session_id: self.chat.attached_session_id(),
+                                    provider_plugin_id,
+                                    model_id,
+                                    generation,
+                                });
+                        }
+                    }
                     super::model_flow::ModelPickerAction::Select(model_id) => {
                         if let Some(session_id) = self.chat.attached_session_id() {
                             self.chat

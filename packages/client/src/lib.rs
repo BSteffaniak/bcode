@@ -4237,6 +4237,116 @@ impl BcodeClient {
         }
     }
 
+    /// Probe exact models with explicit quota consent and persist scoped availability.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bounds, missing consent, unavailable provider setup,
+    /// incompatible reports, or daemon communication failure.
+    pub async fn check_models(
+        &self,
+        session_id: Option<SessionId>,
+        provider_plugin_id: Option<String>,
+        model_ids: Vec<String>,
+        timeout_seconds: u64,
+        allow_provider_requests: bool,
+    ) -> Result<bcode_model::ModelCheckReport, ClientError> {
+        self.check_models_with_id(
+            SessionId::new().to_string(),
+            session_id,
+            provider_plugin_id,
+            model_ids,
+            timeout_seconds,
+            allow_provider_requests,
+        )
+        .await
+    }
+
+    /// Probe models with a caller-retained cancellation identity.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, bounds or consent; reports daemon/protocol failures.
+    pub async fn check_models_with_id(
+        &self,
+        check_id: String,
+        session_id: Option<SessionId>,
+        provider_plugin_id: Option<String>,
+        model_ids: Vec<String>,
+        timeout_seconds: u64,
+        allow_provider_requests: bool,
+    ) -> Result<bcode_model::ModelCheckReport, ClientError> {
+        if check_id.is_empty()
+            || check_id.len() > 128
+            || !check_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        if !allow_provider_requests
+            || model_ids.is_empty()
+            || model_ids.len() > 16
+            || !(1..=60).contains(&timeout_seconds)
+            || model_ids
+                .iter()
+                .any(|id| id.trim().is_empty() || id.len() > 256)
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        match self
+            .send_request(Request::CheckModels {
+                check_id,
+                session_id,
+                provider_plugin_id,
+                model_ids,
+                timeout_seconds,
+                allow_provider_requests,
+            })
+            .await?
+        {
+            ResponsePayload::CheckModels { result_json } => {
+                serde_json::from_str(&result_json).map_err(|_| ClientError::UnexpectedResponse)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request provider cancellation without claiming terminal settlement.
+    ///
+    /// # Errors
+    /// Returns daemon communication, ownership or protocol errors.
+    pub async fn cancel_model_check(&self, check_id: String) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::CancelModelCheck { check_id })
+            .await?
+        {
+            ResponsePayload::ModelCheckCancellationRequested {
+                cancellation_requested,
+            } => Ok(cancellation_requested),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// List models in the same effective session scope used for model checks.
+    ///
+    /// # Errors
+    /// Returns selection, daemon communication or protocol errors.
+    pub async fn session_model_list_for_session(
+        &self,
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+    ) -> Result<bcode_model::ModelList, ClientError> {
+        match self
+            .send_request(Request::SessionModelListForSession {
+                session_id,
+                provider_plugin_id,
+            })
+            .await?
+        {
+            ResponsePayload::SessionModelList { models, .. } => Ok(models),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Read exact turn-correlated transient consumer evidence without canonical replay.
     ///
     /// # Errors

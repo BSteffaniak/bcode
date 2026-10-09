@@ -42,8 +42,17 @@ const EMBEDDED_PROVIDER_CATALOGS: &[(&str, &str)] = &[
 mod usage_pricing;
 pub use usage_pricing::{price_session_usage, price_usage_with_tariff};
 
+pub mod evidence;
 mod remote;
 mod verification;
+pub use bcode_model_catalog_models::{
+    EVIDENCE_SCHEMA_VERSION, EvidenceCapability, EvidenceDocument, EvidenceOutcome,
+    EvidenceResolution, EvidenceScope, ModelSupportEvidence,
+};
+pub use evidence::{EvidenceError, EvidenceStore, resolve_evidence};
+mod evidence_overlay;
+pub mod support_patch;
+pub use evidence_overlay::{EvidenceModelUnion, ModelEvidenceContext};
 
 pub use remote::{
     DEFAULT_REMOTE_CATALOG_URL, RemoteCatalogClient, RemoteCatalogOptions, overlay_remote_catalog,
@@ -982,6 +991,13 @@ fn model_matches_support_target(
     target: &ModelSupportTarget,
     include_unknown: bool,
 ) -> bool {
+    if entry
+        .unsupported_by
+        .iter()
+        .any(|unsupported| unsupported.matches(target))
+    {
+        return false;
+    }
     entry
         .deployments
         .iter()
@@ -1141,6 +1157,15 @@ fn enrich_from_entry_for_target(
         entry.thinking_mode,
     );
     model.reasoning = merge_model_reasoning(model.reasoning.take(), catalog_reasoning);
+    apply_catalog_visibility(&mut model, entry, target);
+    model
+}
+
+fn apply_catalog_visibility(
+    model: &mut ModelInfo,
+    entry: &ModelCatalogEntry,
+    target: &ModelSupportTarget,
+) {
     if entry.status == CatalogModelStatus::Deprecated {
         model.visibility = bcode_model::ModelVisibility::Unsupported {
             reason: "model is deprecated in catalog".to_string(),
@@ -1151,8 +1176,16 @@ fn enrich_from_entry_for_target(
             reason: "model is marked unsupported by Bcode catalog".to_string(),
         };
     }
-    apply_api_surface_visibility(&mut model, entry);
-    model
+    apply_api_surface_visibility(model, entry);
+    if entry
+        .unsupported_by
+        .iter()
+        .any(|unsupported| unsupported.matches(target))
+    {
+        model.visibility = bcode_model::ModelVisibility::Unsupported {
+            reason: "catalog declares this serving deployment unsupported".to_owned(),
+        };
+    }
 }
 
 fn model_info_from_catalog_entry_for_target(
@@ -2236,6 +2269,7 @@ fn live_model_entry(
         api_surface: None,
         thinking_mode: None,
         supported_by: target.cloned().into_iter().collect(),
+        unsupported_by: BTreeSet::new(),
         deployments: target
             .cloned()
             .map(|target| ModelDeployment {
@@ -3147,6 +3181,8 @@ mod tests {
                 bcode_model::ModelList {
                     models: Vec::new(),
                     catalog: bcode_model::ModelCatalogHints {
+                        availability_scope: None,
+                        availability: std::collections::BTreeMap::new(),
                         policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
                             provider_id: "bedrock".to_string(),
                             target: bcode_model::ModelCatalogSupportHint {
@@ -3218,6 +3254,8 @@ mod tests {
                             visibility: ModelVisibility::Visible,
                         }],
                         catalog: bcode_model::ModelCatalogHints {
+                            availability_scope: None,
+                            availability: std::collections::BTreeMap::new(),
                             policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
                                 provider_id: "bedrock".to_string(),
                                 target,
@@ -4561,6 +4599,8 @@ status = "stable"
                 .resolve(bcode_model::ModelList {
                     models: vec![candidate],
                     catalog: bcode_model::ModelCatalogHints {
+                        availability_scope: None,
+                        availability: std::collections::BTreeMap::new(),
                         policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
                             provider_id: "openai".to_string(),
                             target: Some(target.clone()),
@@ -4575,6 +4615,8 @@ status = "stable"
                 .resolve(bcode_model::ModelList {
                     models: Vec::new(),
                     catalog: bcode_model::ModelCatalogHints {
+                        availability_scope: None,
+                        availability: std::collections::BTreeMap::new(),
                         policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
                             provider_id: "openai".to_string(),
                             target,

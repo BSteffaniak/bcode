@@ -1751,6 +1751,9 @@ pub async fn handle_compaction_events(
 ) -> CompactionPollStatus {
     for event in events {
         match event {
+            ProviderTurnEvent::ModelAvailability { observation } => {
+                super::model_evidence::persist(state, &observation);
+            }
             ProviderTurnEvent::Output { event, .. } => match event {
                 bcode_model::ProviderOutputEvent::TextDelta { text } => summary.push_str(&text),
                 bcode_model::ProviderOutputEvent::ToolCallStarted { .. }

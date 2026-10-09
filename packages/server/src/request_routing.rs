@@ -812,6 +812,21 @@ pub enum CoreRuntimeRequest {
     SessionModelList {
         provider_plugin_id: Option<String>,
     },
+    CheckModels {
+        check_id: String,
+        session_id: Option<SessionId>,
+        provider_plugin_id: Option<String>,
+        model_ids: Vec<String>,
+        timeout_seconds: u64,
+        allow_provider_requests: bool,
+    },
+    CancelModelCheck {
+        check_id: String,
+    },
+    SessionModelListForSession {
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+    },
     JudgementSetup,
     JudgementSetupValidate {
         selection_json: String,
@@ -1694,6 +1709,31 @@ impl RoutedRequest {
             Request::DefaultModelStatus => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::DefaultModelStatus))
             }
+            Request::CheckModels {
+                check_id,
+                session_id,
+                provider_plugin_id,
+                model_ids,
+                timeout_seconds,
+                allow_provider_requests,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::CheckModels {
+                check_id,
+                session_id,
+                provider_plugin_id,
+                model_ids,
+                timeout_seconds,
+                allow_provider_requests,
+            })),
+            Request::CancelModelCheck { check_id } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::CancelModelCheck { check_id }))
+            }
+            Request::SessionModelListForSession {
+                session_id,
+                provider_plugin_id,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::SessionModelListForSession {
+                session_id,
+                provider_plugin_id,
+            })),
             Request::SessionModelList { provider_plugin_id } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::SessionModelList {
                     provider_plugin_id,

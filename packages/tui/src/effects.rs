@@ -406,6 +406,13 @@ pub enum TuiEffect {
         pool: String,
         profile: Option<String>,
     },
+    /// Explicitly consented, bounded check for exactly one selected model.
+    CheckSelectedModel {
+        session_id: Option<SessionId>,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+        generation: u64,
+    },
     /// Load models for the selected provider.
     LoadModelPicker {
         /// Selected provider plugin, or the default provider.
@@ -829,6 +836,14 @@ pub enum TuiEffectResult {
         /// Daemon response.
         result: Result<(), ClientError>,
     },
+    /// Completed selected check and post-persistence model-list refresh.
+    SelectedModelChecked {
+        session_id: Option<SessionId>,
+        provider_plugin_id: Option<String>,
+        generation: u64,
+        result: Result<bcode_model::ModelCheckReport, ClientError>,
+        models: Result<bcode_model::ModelList, ClientError>,
+    },
     /// Models for the root picker loaded.
     ModelPickerLoaded {
         /// Provider used for the model query.
@@ -1066,6 +1081,9 @@ impl TuiEffectResult {
             Self::AuthPoolPreferenceSet { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
+            Self::SelectedModelChecked { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
             Self::ModelPickerLoaded { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillPickerLoaded { result } => DaemonObservation::from_client_result(result),
             Self::SkillDescribed { result, .. } => DaemonObservation::from_client_result(result),
@@ -1161,6 +1179,7 @@ enum EffectKey {
     RalphStart,
     PluginSurface,
     ModelProviders,
+    ModelCheck,
     ModelPicker,
     AuthPoolPicker,
     AuthPoolPreference,
@@ -1361,6 +1380,7 @@ impl TuiEffect {
             | Self::LoadModelProviders
             | Self::LoadAuthPoolPicker
             | Self::SetAuthPoolPreference { .. }
+            | Self::CheckSelectedModel { .. }
             | Self::LoadModelPicker { .. }
             | Self::LoadSkillPicker
             | Self::DescribeSkill { .. }
@@ -1432,6 +1452,7 @@ impl TuiEffect {
             | Self::LoadModelProviders
             | Self::LoadAuthPoolPicker
             | Self::SetAuthPoolPreference { .. }
+            | Self::CheckSelectedModel { .. }
             | Self::LoadModelPicker { .. }
             | Self::LoadSkillPicker
             | Self::DescribeSkill { .. }
@@ -1671,6 +1692,7 @@ impl TuiEffect {
             Self::LoadModelProviders => EffectKey::ModelProviders,
             Self::LoadAuthPoolPicker => EffectKey::AuthPoolPicker,
             Self::SetAuthPoolPreference { .. } => EffectKey::AuthPoolPreference,
+            Self::CheckSelectedModel { .. } => EffectKey::ModelCheck,
             Self::LoadModelPicker { .. } => EffectKey::ModelPicker,
             Self::LoadSkillPicker => EffectKey::SkillPicker,
             Self::DescribeSkill { .. } => EffectKey::SkillDescription,
@@ -2177,6 +2199,37 @@ impl TuiEffect {
                     pool: pool.clone(),
                     profile: profile.clone(),
                     result: client.set_auth_pool_preference(pool, profile).await,
+                }
+            }
+            Self::CheckSelectedModel {
+                session_id,
+                provider_plugin_id,
+                model_id,
+                generation,
+            } => {
+                let result = client
+                    .check_models(
+                        session_id,
+                        provider_plugin_id.clone(),
+                        vec![model_id],
+                        20,
+                        true,
+                    )
+                    .await;
+                let models = match session_id {
+                    Some(id) => {
+                        client
+                            .session_model_list_for_session(id, provider_plugin_id.clone())
+                            .await
+                    }
+                    None => client.session_model_list(provider_plugin_id.clone()).await,
+                };
+                TuiEffectResult::SelectedModelChecked {
+                    session_id,
+                    provider_plugin_id,
+                    generation,
+                    result,
+                    models,
                 }
             }
             Self::LoadModelPicker { provider_plugin_id } => TuiEffectResult::ModelPickerLoaded {

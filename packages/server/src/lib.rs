@@ -18,6 +18,8 @@ mod image_input;
 mod interaction_operations;
 mod invariant_guidance;
 mod judgement;
+mod model_check;
+mod model_evidence;
 mod model_ignores;
 mod model_request_target;
 mod plugin_operations;
@@ -458,6 +460,7 @@ pub struct ServerState {
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
+    model_checks: Mutex<BTreeMap<String, model_check::ActiveCheck>>,
     generation_contexts: Mutex<BTreeMap<String, context_generation::CapturedContext>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_model_selection_origins: Mutex<BTreeMap<SessionId, SessionModelSelectionOrigin>>,
@@ -2571,6 +2574,7 @@ impl ServerState {
             runtime_work: RuntimeWorkManager::with_metrics(init.metrics.clone()),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
+            model_checks: Mutex::default(),
             generation_contexts: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_model_selection_origins: Mutex::default(),
@@ -2627,6 +2631,15 @@ impl ServerState {
 
     async fn unregister_client(&self, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
+        for check in self
+            .model_checks
+            .lock()
+            .await
+            .values()
+            .filter(|check| check.owner == client_id)
+        {
+            check.cancellation.cancel();
+        }
         self.client_runtime_contexts.lock().await.remove(&client_id);
         interaction_operations::resolve_exchanges_without_consumers(self).await;
         self.client_session_namespaces
@@ -6555,6 +6568,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::AppendPresentationNote { .. } => "append_presentation_note",
         Request::SessionModelStatus { .. } => "session_model_status",
         Request::DefaultModelStatus => "default_model_status",
+        Request::CheckModels { .. } => "check_models",
+        Request::CancelModelCheck { .. } => "cancel_model_check",
+        Request::SessionModelListForSession { .. } => "session_model_list_for_session",
         Request::SessionModelList { .. } => "session_model_list",
         Request::JudgementSetup => "judgement_setup",
         Request::JudgementSetupValidate { .. } => "judgement_setup_validate",
@@ -6779,10 +6795,7 @@ async fn handle_request_inner(
             .await
         }
         SessionLifecycleRequest::CreateChildSession { request } => {
-            Box::pin(handle_create_child_session(
-                request_id, state, writer, request,
-            ))
-            .await
+            handle_create_child_session_boxed(request_id, state, writer, request).await
         }
         SessionLifecycleRequest::SessionSummary { session_id } => {
             Box::pin(handle_session_summary(
@@ -9173,6 +9186,92 @@ async fn handle_core_runtime_request(
         CoreRuntimeRequest::DefaultModelStatus => {
             handle_default_model_status(request_id, client_id, state, writer).await
         }
+        CoreRuntimeRequest::CheckModels {
+            check_id,
+            session_id,
+            provider_plugin_id,
+            model_ids,
+            timeout_seconds,
+            allow_provider_requests,
+        } => {
+            let report = Box::pin(model_check::run(
+                state,
+                client_id,
+                model_check::CheckInput {
+                    check_id,
+                    session_id,
+                    provider: provider_plugin_id,
+                    model_ids,
+                    timeout_seconds,
+                    consent: allow_provider_requests,
+                },
+            ))
+            .await;
+            let response = match report {
+                Ok(report) => serde_json::to_string(&report).map_or_else(
+                    |_| {
+                        Response::Err(ErrorResponse::new(
+                            "model_check_failed",
+                            "model check report could not be encoded",
+                        ))
+                    },
+                    |result_json| Response::Ok(ResponsePayload::CheckModels { result_json }),
+                ),
+                Err(message) => Response::Err(ErrorResponse::new("model_check_rejected", message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::CancelModelCheck { check_id } => {
+            let cancelled = model_check::cancel(state, client_id, &check_id).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::ModelCheckCancellationRequested {
+                    cancellation_requested: cancelled,
+                }),
+            )
+            .await
+        }
+        CoreRuntimeRequest::SessionModelListForSession {
+            session_id,
+            provider_plugin_id,
+        } => {
+            let selection = session_model_selection_with_runtime_context(
+                state,
+                session_id,
+                state.client_runtime_context(client_id).await,
+            )
+            .await;
+            let provider = provider_plugin_id.or(selection.provider_plugin_id);
+            let models = resolved_provider_models_view(
+                state,
+                provider.clone(),
+                bcode_model::ModelListRequest {
+                    provider_context: selection.provider_context,
+                    selected_model_id: selection.model_id,
+                },
+                bcode_model_catalog::ModelListView::UserVisible,
+            )
+            .await;
+            let response = match models {
+                Ok(mut models) => {
+                    if let Ok(rules) = bcode_config::effective_model_ignore_rules(
+                        provider.as_deref().unwrap_or("bcode.openai-compatible"),
+                    ) {
+                        model_ignores::apply_model_ignores(&mut models.models, &rules);
+                    }
+                    Response::Ok(ResponsePayload::SessionModelList {
+                        provider_plugin_id: provider,
+                        models,
+                    })
+                }
+                Err(_) => Response::Err(ErrorResponse::new(
+                    "model_list_failed",
+                    "provider model list unavailable",
+                )),
+            };
+            send_response(writer, request_id, response).await
+        }
         CoreRuntimeRequest::SessionModelList { provider_plugin_id } => {
             handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
                 .await
@@ -10109,6 +10208,17 @@ async fn handle_session_summary(
         )),
     };
     send_response(writer, request_id, response).await
+}
+
+fn handle_create_child_session_boxed<'a>(
+    request_id: u64,
+    state: &'a ServerState,
+    writer: &'a SharedWriter,
+    request: bcode_session_models::SessionChildCreateRequest,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerError>> + Send + 'a>> {
+    Box::pin(handle_create_child_session(
+        request_id, state, writer, request,
+    ))
 }
 
 async fn handle_create_child_session(
@@ -17650,6 +17760,37 @@ async fn resolved_provider_models_view(
     let selected_model_id = request.selected_model_id.clone();
     let models = provider_models(state, provider_plugin_id, request).await?;
     start_catalog_refresh(state).await;
+    if let Some(scope) = models.catalog.availability_scope.clone() {
+        let evidence_scope = bcode_model_catalog::EvidenceScope {
+            target: bcode_model_catalog_models::ModelSupportTarget {
+                provider: scope.target.provider,
+                auth_mode: scope.target.auth_mode,
+                api_surface: scope.target.api_surface,
+                integration: scope.target.integration,
+            },
+            endpoint_fingerprint: scope.endpoint_fingerprint,
+            account_fingerprint: scope.account_fingerprint,
+        };
+        let now_ms = unix_timestamp().saturating_mul(1000);
+        let document = bcode_model_catalog::EvidenceStore::new(&state.state_root)
+            .snapshot(now_ms)
+            .map_err(|_| "model evidence store unavailable".to_string())?;
+        return state
+            .model_catalog
+            .resolve_view_with_evidence(
+                models,
+                selected_model_id.as_deref(),
+                None,
+                view,
+                bcode_model_catalog::ModelEvidenceContext {
+                    scope: &evidence_scope,
+                    document: &document,
+                    now_ms,
+                },
+            )
+            .await
+            .map_err(|_| "model evidence resolution unavailable".to_string());
+    }
     Ok(state
         .model_catalog
         .resolve_view(models, selected_model_id.as_deref(), None, view)
@@ -22854,6 +22995,7 @@ const fn provider_turn_event_kind(event: &ProviderTurnEvent) -> &'static str {
         ProviderTurnEvent::ToolCallFinished { .. } => "tool_call_finished",
         ProviderTurnEvent::OriginalUsage { .. } => "original_usage",
         ProviderTurnEvent::Usage { .. } => "usage",
+        ProviderTurnEvent::ModelAvailability { .. } => "model_availability",
         ProviderTurnEvent::ExactRequestInputTokens { .. } => "exact_request_input_tokens",
         ProviderTurnEvent::AttemptTiming { .. } => "attempt_timing",
         ProviderTurnEvent::RequestProjection { .. } => "request_projection",
@@ -23818,7 +23960,8 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
         | ProviderTurnEvent::ToolCallStarted { .. }
         | ProviderTurnEvent::ToolCallFinished { .. } => true,
         ProviderTurnEvent::ToolCallDelta { delta, .. } => !delta.is_empty(),
-        ProviderTurnEvent::AttemptTiming { .. }
+        ProviderTurnEvent::ModelAvailability { .. }
+        | ProviderTurnEvent::AttemptTiming { .. }
         | ProviderTurnEvent::RequestProjection { .. }
         | ProviderTurnEvent::ContextCompacted { .. }
         | ProviderTurnEvent::TurnStarted
@@ -23999,6 +24142,12 @@ async fn handle_provider_turn_event(
     stream_progress: &mut ModelStreamProgress,
     command_context: &RuntimeCommandContext<'_>,
 ) {
+    // Availability is domain evidence, not session content; retain it even when cancellation
+    // races delivery, without reopening the terminal session turn.
+    if let ProviderTurnEvent::ModelAvailability { observation } = &event {
+        model_evidence::persist(state, observation);
+        return;
+    }
     if state
         .session_current_turn(session_id)
         .await
@@ -24020,6 +24169,9 @@ async fn handle_provider_turn_event(
         return;
     }
     match event {
+        ProviderTurnEvent::ModelAvailability { observation } => {
+            model_evidence::persist(state, &observation);
+        }
         ProviderTurnEvent::Output { position, event } => match event {
             bcode_model::ProviderOutputEvent::TextDelta { text } => {
                 begin_positioned_assistant_output(

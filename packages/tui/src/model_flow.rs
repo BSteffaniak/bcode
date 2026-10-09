@@ -10,6 +10,7 @@ pub enum ModelPickerAction {
     Continue,
     Cancel,
     Select(String),
+    Check(String),
 }
 
 pub fn handle_model_picker_key(
@@ -19,6 +20,26 @@ pub fn handle_model_picker_key(
     stroke: KeyStroke,
 ) -> ModelPickerAction {
     match picker.mode() {
+        model_picker::ModelPickerMode::ConfirmCheck => {
+            match keymap.action("model_picker_actions", stroke) {
+                Some("tui.control.submit") => picker
+                    .confirm_check()
+                    .map_or(ModelPickerAction::Continue, ModelPickerAction::Check),
+                Some("tui.control.cancel") => {
+                    picker.decline_check();
+                    ModelPickerAction::Continue
+                }
+                _ => ModelPickerAction::Continue,
+            }
+        }
+        model_picker::ModelPickerMode::Checking => {
+            // Closing does not claim that the server-side request was cancelled.
+            if keymap.action("model_picker_actions", stroke) == Some("tui.control.cancel") {
+                ModelPickerAction::Cancel
+            } else {
+                ModelPickerAction::Continue
+            }
+        }
         model_picker::ModelPickerMode::Actions => {
             handle_model_picker_action_key(picker, keymap, provider_plugin_id, stroke)
         }
@@ -36,6 +57,10 @@ fn handle_model_picker_action_key(
 ) -> ModelPickerAction {
     match keymap.action("model_picker_actions", stroke) {
         Some("tui.control.cancel") => ModelPickerAction::Cancel,
+        Some("tui.model.check") => {
+            picker.request_check();
+            ModelPickerAction::Continue
+        }
         Some("tui.model.filter") => {
             picker.focus_filter();
             ModelPickerAction::Continue

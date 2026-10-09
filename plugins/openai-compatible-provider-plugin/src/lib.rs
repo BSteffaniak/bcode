@@ -12,6 +12,8 @@
 mod discovery;
 /// Provider-owned conversion of external conversation history.
 pub mod history;
+mod model_availability;
+mod model_observation;
 mod startup;
 
 use base64::Engine as _;
@@ -4597,6 +4599,7 @@ async fn stream_chat_completion_inner(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
+    let admission = model_observation::admission();
     turn.timing.lock().expect("timing lock").begin(
         request
             .metadata
@@ -4608,6 +4611,7 @@ async fn stream_chat_completion_inner(
         () = turn.cancelled() => Ok(StreamOutcome::Cancelled),
         outcome = stream_chat_completion_attempt(request, turn) => outcome,
     };
+    model_observation::observe(request, turn, admission, &outcome);
     let classification = match &outcome {
         Ok(StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens) => {
             bcode_model::ProviderAttemptOutcome::Completed
@@ -7090,7 +7094,14 @@ impl OpenAiCompatibleProviderPlugin {
             });
         ModelList {
             models: apply_provider_static_metadata(&settings, models),
-            catalog: catalog_hints(&settings),
+            catalog: {
+                let mut hints = catalog_hints(&settings);
+                hints.availability_scope = model_observation::scope(
+                    &settings,
+                    request.provider_context.auth_profile.as_deref(),
+                );
+                hints
+            },
         }
     }
 }
@@ -7124,6 +7135,7 @@ fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
                     authority: ModelListAuthority::Explicit,
                 }
             }),
+            ..ModelCatalogHints::default()
         };
     }
     let Some(provider_id) = provider_id else {
@@ -7140,6 +7152,7 @@ fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
             }),
             authority: ModelListAuthority::Fallback,
         },
+        ..ModelCatalogHints::default()
     }
 }
 
@@ -9432,6 +9445,7 @@ fn error_from_status_and_headers(
         .as_ref()
         .and_then(|error| error.error_type.as_deref());
     let category = category_from_openai_error(status, &code, error_type, &message);
+    let availability = model_availability::classify(status, &code, &message);
     let mut error = provider_error(code.clone(), category, message);
     if matches!(category, ProviderErrorCategory::Auth) {
         error.failure = Some(Box::new(openai_failure_context_for_source(
@@ -9445,10 +9459,13 @@ fn error_from_status_and_headers(
     error.request_id = headers
         .and_then(openai_request_id)
         .map(String::into_boxed_str);
-    error.diagnostic_context = Box::new(BTreeMap::from([(
-        "http_status".to_string(),
-        status.to_string(),
-    )]));
+    error.diagnostic_context = Box::new(BTreeMap::from([
+        ("http_status".to_string(), status.to_string()),
+        (
+            "model_availability".to_string(),
+            availability.diagnostic().to_string(),
+        ),
+    ]));
     if let Some(error_type) = error_type {
         error
             .diagnostic_context

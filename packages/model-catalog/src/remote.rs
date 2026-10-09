@@ -443,10 +443,14 @@ fn overlay_entry(local: &mut ModelCatalogEntry, remote: &ModelCatalogEntry) {
     if let Some(remote_reasoning) = &remote.reasoning {
         local.reasoning = Some(merge_reasoning(local.reasoning.as_ref(), remote_reasoning));
     }
+    local
+        .unsupported_by
+        .extend(remote.unsupported_by.iter().cloned());
     local.supported_by.clone_from(&remote.supported_by);
     local.supported_by.extend(local_supported_by);
     local.deployments = local_deployments;
     for deployment in &remote.deployments {
+        local.unsupported_by.remove(&deployment.target);
         if let Some(existing) = local
             .deployments
             .iter_mut()
