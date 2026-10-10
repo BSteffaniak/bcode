@@ -485,6 +485,50 @@ pub struct SessionCompatibilityInventoryResponse {
     pub next_cursor: Option<SessionCompatibilityCursor>,
 }
 
+/// Normalized result of explicitly requested optional milestone generation.
+/// Failure text is diagnostic presentation, never provider-private data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMilestoneGenerationOutcome {
+    /// Whether the optional generation operation succeeded (including a no-milestone result).
+    pub success: bool,
+    /// Bounded human-readable outcome.
+    pub text: String,
+}
+
+#[cfg(test)]
+mod milestone_wire_tests {
+    use super::*;
+
+    #[test]
+    fn milestone_reads_and_generation_have_distinct_wire_contracts() {
+        let session_id = SessionId::new();
+        for request in [
+            Request::SessionMilestones {
+                session_id,
+                query: bcode_session_models::SessionMilestoneQuery {
+                    after_sequence: Some(42),
+                    limit: 2,
+                },
+            },
+            Request::GenerateSessionMilestone { session_id },
+        ] {
+            let bytes = serde_json::to_vec(&request).unwrap();
+            assert_eq!(serde_json::from_slice::<Request>(&bytes).unwrap(), request);
+        }
+        let response = ResponsePayload::SessionMilestoneGenerated {
+            result: SessionMilestoneGenerationOutcome {
+                success: false,
+                text: "generation disabled".to_owned(),
+            },
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ResponsePayload>(&bytes).unwrap(),
+            response
+        );
+    }
+}
+
 /// Request payload variants for Bcode client/server IPC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1152,6 +1196,15 @@ pub enum Request {
         /// Client working directory used when the imported source has no cwd metadata.
         #[serde(default)]
         working_directory: Option<PathBuf>,
+    },
+    /// Explicitly invoke configured optional generation; no client prompt is accepted.
+    GenerateSessionMilestone {
+        session_id: SessionId,
+    },
+    /// Read one bounded page of canonical milestones without invoking generation.
+    SessionMilestones {
+        session_id: SessionId,
+        query: bcode_session_models::SessionMilestoneQuery,
     },
     /// Capture one bounded source snapshot for generic session derivation.
     SessionDerivationSnapshot {
@@ -2249,6 +2302,12 @@ pub enum ResponsePayload {
     ExternalSessionImported {
         session: SessionSummary,
         warnings: Vec<SessionImportWarning>,
+    },
+    SessionMilestoneGenerated {
+        result: SessionMilestoneGenerationOutcome,
+    },
+    SessionMilestones {
+        page: bcode_session_models::SessionMilestonePage,
     },
     SessionDerivationSnapshot {
         snapshot: SessionDerivationSourceSnapshot,
@@ -5429,6 +5488,8 @@ mod tests {
                 name: None,
                 explicit_name: None,
                 derived_title: None,
+                automatic_title: None,
+                automatic_title_source_sequence: None,
                 title_source: bcode_session_models::SessionTitleSource::EmptyDraft,
                 client_count: 1,
                 created_at_ms: 10,
@@ -5471,6 +5532,8 @@ mod tests {
             name: Some("Canonical title".to_owned()),
             explicit_name: Some("Canonical title".to_owned()),
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: bcode_session_models::SessionTitleSource::Explicit,
             client_count: 1,
             created_at_ms: 10,
@@ -6003,6 +6066,8 @@ mod tests {
             name: Some(name.to_owned()),
             explicit_name: Some(name.to_owned()),
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: bcode_session_models::SessionTitleSource::Explicit,
             client_count: 0,
             created_at_ms: 10,

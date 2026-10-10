@@ -36,6 +36,7 @@ bcode_prompt_profile_plugin             = { workspace = true, optional = true }
 bcode_question_plugin                   = { workspace = true, optional = true }
 bcode_read_plugin                       = { workspace = true, optional = true }
 bcode_session_derivation_plugin         = { workspace = true, optional = true }
+bcode_session_milestones_plugin         = { workspace = true, optional = true }
 bcode_shell_plugin                      = { workspace = true, optional = true }
 bcode_skills_plugin                     = { workspace = true, optional = true }
 bcode_tantivy_session_search_plugin     = { workspace = true, optional = true }
@@ -176,6 +177,7 @@ static-bundled-plugins = [
     "static-bundled-loop-plugin",
     "static-bundled-read-plugin",
     "static-bundled-session-derivation-plugin",
+    "static-bundled-session-milestones-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-skills-plugin",
     "static-bundled-tantivy-session-search-plugin",
@@ -199,6 +201,10 @@ static-bundled-read-plugin = [
 static-bundled-session-derivation-plugin = [
     "dep:bcode_session_derivation_plugin",
     "bcode_session_derivation_plugin/static-bundled",
+]
+static-bundled-session-milestones-plugin = [
+    "dep:bcode_session_milestones_plugin",
+    "bcode_session_milestones_plugin/static-bundled",
 ]
 static-bundled-shell-plugin = [
     "dep:bcode_shell_plugin",

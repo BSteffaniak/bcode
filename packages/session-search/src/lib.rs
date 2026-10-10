@@ -132,6 +132,8 @@ impl std::error::Error for ContractValidationError {}
 #[serde(rename_all = "snake_case")]
 pub enum SearchContentKind {
     SessionTitle,
+    /// Finalized canonical milestone header and description.
+    Milestone,
     UserMessage,
     AssistantMessage,
     AssistantReasoning,
@@ -1201,13 +1203,21 @@ fn filter_discovery_for_policy(
 ) -> ListSessionSearchProvidersResponse {
     let mut providers = Vec::new();
     let mut failures = discovery.failures;
-    for provider in discovery.providers {
+    for mut provider in discovery.providers {
         if matches!(
             policy.execution_class,
             SessionSearchExecutionClass::Ordinary
         ) && matches!(provider.capabilities.execution, SearchExecutionKind::Scan)
         {
-            continue;
+            // Bounded finalized milestone metadata is ordinary search content even when its
+            // optional store scans compressed records. Large output still requires deep intent.
+            provider
+                .capabilities
+                .content_kinds
+                .retain(|kind| matches!(kind, SearchContentKind::Milestone));
+            if provider.capabilities.content_kinds.is_empty() {
+                continue;
+            }
         }
         let exclusion = if matches!(provider.status.state, SearchProviderState::Stale) {
             Some((
@@ -3619,6 +3629,98 @@ mod tests {
         let decoded: RebuildSessionSearchResponse =
             serde_json::from_slice(&encoded).expect("decode response");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn ordinary_scan_planning_retains_only_milestones() {
+        let capabilities = SessionSearchCapabilities {
+            provider_id: "compressed".to_owned(),
+            execution: SearchExecutionKind::Scan,
+            content_kinds: BTreeSet::from([
+                SearchContentKind::Milestone,
+                SearchContentKind::ShellOutput,
+                SearchContentKind::ToolOutput,
+            ]),
+            features: BTreeSet::new(),
+            max_hits: 20,
+            max_batch_records: 20,
+            max_batch_text_bytes: 1024,
+        };
+        let provider = SessionSearchProviderInfo {
+            plugin_id: "compressed".to_owned(),
+            capabilities,
+            status: SessionSearchStatus {
+                provider_id: "compressed".to_owned(),
+                state: SearchProviderState::Ready,
+                record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+                normalization_version: CURRENT_NORMALIZATION_VERSION,
+                policy_version: CURRENT_SEARCH_POLICY_VERSION,
+                index_bytes: 0,
+                quota_bytes: 1024,
+                document_count: 0,
+                pending_sessions: 0,
+                coverage: Vec::new(),
+                degraded_reason: None,
+            },
+        };
+        let discovery = ListSessionSearchProvidersResponse {
+            providers: vec![provider],
+            failures: Vec::new(),
+        };
+        let ordinary =
+            filter_discovery_for_policy(discovery.clone(), &SessionSearchPlanPolicy::default());
+        assert_eq!(ordinary.providers.len(), 1);
+        assert_eq!(
+            ordinary.providers[0].capabilities.content_kinds,
+            BTreeSet::from([SearchContentKind::Milestone])
+        );
+        let deep = filter_discovery_for_policy(
+            discovery,
+            &SessionSearchPlanPolicy {
+                execution_class: SessionSearchExecutionClass::Deep,
+                ..SessionSearchPlanPolicy::default()
+            },
+        );
+        assert!(
+            deep.providers[0]
+                .capabilities
+                .content_kinds
+                .contains(&SearchContentKind::ShellOutput)
+        );
+        assert!(
+            deep.providers[0]
+                .capabilities
+                .content_kinds
+                .contains(&SearchContentKind::ToolOutput)
+        );
+    }
+
+    #[test]
+    fn milestone_category_and_fields_round_trip_and_reject_future_variants() {
+        let filters = SessionSearchFilters {
+            content_kinds: BTreeSet::from([SearchContentKind::Milestone]),
+            ..SessionSearchFilters::default()
+        };
+        let encoded = serde_json::to_value(&filters).expect("encode milestone filters");
+        assert_eq!(encoded["content_kinds"], serde_json::json!(["milestone"]));
+        assert_eq!(
+            serde_json::from_value::<SessionSearchFilters>(encoded).expect("decode filters"),
+            filters
+        );
+        for field in [SearchField::Title, SearchField::Text] {
+            let query = SessionSearchQuery::Text {
+                text: "checkpoint".to_owned(),
+                mode: TextMatchMode::Terms,
+                fields: BTreeSet::from([field]),
+            };
+            let encoded = serde_json::to_value(&query).expect("encode query");
+            assert_eq!(
+                serde_json::from_value::<SessionSearchQuery>(encoded).expect("decode query"),
+                query
+            );
+        }
+        assert!(serde_json::from_str::<SearchContentKind>("\"future_milestone\"").is_err());
+        assert!(serde_json::from_str::<SearchField>("\"future_milestone_field\"").is_err());
     }
 
     #[test]

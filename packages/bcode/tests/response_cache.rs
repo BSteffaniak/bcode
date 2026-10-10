@@ -1256,17 +1256,17 @@ impl ModelResponseCache for GatedLookupCache {
 
 #[tokio::test]
 async fn abandoned_blocking_lookup_releases_late_miss() {
-    check_abandoned_lookup(false, false).await;
+    Box::pin(check_abandoned_lookup(false, false)).await;
 }
 
 #[tokio::test]
 async fn cancelled_blocking_lookup_returns_before_adapter_and_releases_late_miss() {
-    check_abandoned_lookup(true, false).await;
+    Box::pin(check_abandoned_lookup(true, false)).await;
 }
 
 #[tokio::test]
 async fn cancelled_blocking_lookup_discards_late_hit_without_abort() {
-    check_abandoned_lookup(true, true).await;
+    Box::pin(check_abandoned_lookup(true, true)).await;
 }
 
 async fn check_abandoned_lookup(cancel: bool, hit: bool) {
@@ -2295,18 +2295,22 @@ fn assert_replacement_reservation_retained(abort_stale: bool, invalidate_all: bo
 
 #[tokio::test]
 async fn stale_cache_completion_cannot_overwrite_post_invalidation_response() {
-    assert_replacement_completion_retained(true, true).await;
+    Box::pin(assert_replacement_completion_retained(true, true)).await;
 }
 
 #[tokio::test]
 async fn stale_cache_completion_cannot_overwrite_post_exact_invalidation_response() {
-    assert_replacement_completion_retained(false, true).await;
+    Box::pin(assert_replacement_completion_retained(false, true)).await;
 }
 
 #[tokio::test]
 async fn replacement_cache_completion_survives_invalidation_without_stale_write() {
     for invalidate_all in [false, true] {
-        assert_replacement_completion_retained(invalidate_all, false).await;
+        Box::pin(assert_replacement_completion_retained(
+            invalidate_all,
+            false,
+        ))
+        .await;
     }
 }
 

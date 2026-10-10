@@ -375,6 +375,14 @@ pub struct SessionDbState {
     pub last_event_seq: u64,
     /// Current explicit/display title, if any.
     pub title: Option<String>,
+    /// Explicit name, separate from generated titles.
+    pub explicit_name: Option<String>,
+    /// Original first-prompt title.
+    pub derived_title: Option<String>,
+    /// Generated title.
+    pub automatic_title: Option<String>,
+    /// Canonical generated-title sequence.
+    pub automatic_title_source_sequence: Option<u64>,
     /// Current working directory.
     pub working_directory: std::path::PathBuf,
     /// Current agent selection, if any.
@@ -1113,7 +1121,7 @@ pub type SessionMigrationProgressCallback =
 #[derive(Debug, Clone)]
 pub struct SessionDb {
     session_id: SessionId,
-    db: Arc<Box<dyn Database>>,
+    pub(crate) db: Arc<Box<dyn Database>>,
 }
 
 #[cfg(test)]
@@ -1776,6 +1784,10 @@ impl SessionDb {
                 "visibility",
                 "parent_id",
                 "execution_provenance",
+                "explicit_name",
+                "derived_title",
+                "automatic_title",
+                "automatic_title_source_sequence",
             ])
             .where_eq("session_id", self.session_id.to_string())
             .execute_first(&**self.db)
@@ -1812,6 +1824,11 @@ impl SessionDb {
             session_id: row_session_id,
             last_event_seq: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
             title: optional_string(&row, "title"),
+            explicit_name: optional_string(&row, "explicit_name"),
+            derived_title: optional_string(&row, "derived_title"),
+            automatic_title: optional_string(&row, "automatic_title"),
+            automatic_title_source_sequence: optional_i64(&row, "automatic_title_source_sequence")
+                .map(i64_to_u64),
             working_directory: std::path::PathBuf::from(required_string(
                 &row,
                 "working_directory",
@@ -4752,6 +4769,10 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
             "turn_receipts",
             "submissions",
             "session_children",
+            "milestone_evaluations",
+            "milestone_scheduling",
+            "milestone_turns",
+            "session_milestones",
             "session_children_checkpoint",
             "model_context_entries",
             "model_context_projection_state",
@@ -5500,6 +5521,7 @@ async fn project_event(
     if update_state {
         update_session_state(db, event).await?;
     }
+    crate::milestone::project(db, event).await?;
     match &event.kind {
         SessionEventKind::SessionCreated {
             name,
@@ -5508,6 +5530,7 @@ async fn project_event(
             db.upsert("session_state")
                 .value("session_id", event.session_id.to_string())
                 .value("last_event_seq", seq_to_value(event.sequence))
+                .value("explicit_name", name.clone())
                 .value("title", name.clone())
                 .value(
                     "working_directory",
@@ -5566,6 +5589,7 @@ async fn project_event(
         }
         SessionEventKind::SessionRenamed { name } => {
             db.update("session_state")
+                .value("explicit_name", name.clone())
                 .value("title", name.clone())
                 .where_eq("session_id", event.session_id.to_string())
                 .execute(db)
@@ -5643,16 +5667,16 @@ async fn project_event(
                 .await?;
             if db
                 .select("session_state")
-                .columns(&["title"])
+                .columns(&["derived_title"])
                 .where_eq("session_id", event.session_id.to_string())
                 .execute_first(db)
                 .await?
                 .as_ref()
-                .and_then(|row| optional_string(row, "title"))
+                .and_then(|row| optional_string(row, "derived_title"))
                 .is_none()
             {
                 db.update("session_state")
-                    .value("title", crate::title_from_first_prompt(text))
+                    .value("derived_title", crate::title_from_first_prompt(text))
                     .where_eq("session_id", event.session_id.to_string())
                     .execute(db)
                     .await?;
@@ -6438,6 +6462,7 @@ mod tests {
             SessionStorageCompatibility::Current { .. }
         ));
         // Reproduce the released epoch-11 shape, before submissions and parent relationships.
+        remove_milestone_projection_fixture(&db).await;
         remove_parent_relationship_fixture(&db).await;
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
@@ -9426,6 +9451,16 @@ mod tests {
         db.append_event(&event(
             session_id,
             0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append canonical session creation");
+        db.append_event(&event(
+            session_id,
+            1,
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "legacy history through N".to_string(),
@@ -9474,14 +9509,14 @@ mod tests {
                 .model_context_projection_status()
                 .await
                 .expect("model-context status"),
-            ModelContextProjectionStatus::Fresh { checkpoint: 0 }
+            ModelContextProjectionStatus::Fresh { checkpoint: 1 }
         );
         drop(write);
         drop(maintenance);
 
         let rejected = event(
             session_id,
-            1,
+            2,
             SessionEventKind::AssistantMessage {
                 text: "incompatible writer must not commit".to_string(),
             },
@@ -9503,7 +9538,7 @@ mod tests {
                 .last_event_sequence()
                 .await
                 .expect("canonical tail"),
-            Some(0)
+            Some(1)
         );
         for projection in MaterializedProjection::all() {
             assert_eq!(
@@ -9511,7 +9546,7 @@ mod tests {
                     .materialized_projection_checkpoint(*projection)
                     .await
                     .expect("projection checkpoint"),
-                Some(0),
+                Some(1),
                 "projection {} must remain fresh at N",
                 projection.as_str()
             );
@@ -9528,7 +9563,7 @@ mod tests {
         migrated
             .append_event(&event(
                 session_id,
-                1,
+                2,
                 SessionEventKind::AssistantMessage {
                     text: "compatible append".to_string(),
                 },
@@ -9540,7 +9575,7 @@ mod tests {
                 .last_event_sequence()
                 .await
                 .expect("canonical tail"),
-            Some(1)
+            Some(2)
         );
         for projection in MaterializedProjection::all() {
             assert_eq!(
@@ -9548,7 +9583,7 @@ mod tests {
                     .materialized_projection_checkpoint(*projection)
                     .await
                     .expect("projection checkpoint"),
-                Some(1),
+                Some(2),
                 "projection {} must advance atomically to N+1",
                 projection.as_str()
             );
@@ -9558,7 +9593,7 @@ mod tests {
                 .model_context_projection_status()
                 .await
                 .expect("model-context status"),
-            ModelContextProjectionStatus::Fresh { checkpoint: 1 }
+            ModelContextProjectionStatus::Fresh { checkpoint: 2 }
         );
         assert_eq!(
             migrated
@@ -10058,6 +10093,39 @@ mod tests {
         );
     }
 
+    async fn remove_milestone_projection_fixture(db: &SessionDb) {
+        for table in [
+            "milestone_evaluations",
+            "session_milestones",
+            "milestone_scheduling",
+            "milestone_turns",
+        ] {
+            switchy::database::schema::drop_table(table)
+                .if_exists(true)
+                .execute(db.database())
+                .await
+                .unwrap();
+        }
+        for column in [
+            "automatic_title",
+            "automatic_title_source_sequence",
+            "explicit_name",
+            "derived_title",
+        ] {
+            switchy::database::schema::alter_table("session_state")
+                .drop_column(column.into())
+                .execute(db.database())
+                .await
+                .unwrap();
+        }
+        db.database()
+            .delete(SESSION_MIGRATIONS_TABLE)
+            .where_gte("id", "050")
+            .execute(db.database())
+            .await
+            .unwrap();
+    }
+
     async fn remove_parent_relationship_fixture(db: &SessionDb) {
         for table in ["session_children", "session_children_checkpoint"] {
             switchy::database::schema::drop_table(table)
@@ -10143,6 +10211,7 @@ mod tests {
                 .unwrap();
         }
         remove_usage_staging_fixture(&db).await;
+        remove_milestone_projection_fixture(&db).await;
         remove_parent_relationship_fixture(&db).await;
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
@@ -11138,6 +11207,16 @@ mod tests {
         db.append_event(&event(
             session_id,
             0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append canonical session creation");
+        db.append_event(&event(
+            session_id,
+            1,
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "projected".to_string(),
@@ -11166,7 +11245,7 @@ mod tests {
             db.database(),
             &event(
                 session_id,
-                1,
+                2,
                 SessionEventKind::AssistantMessage {
                     text: "canonical tail".to_string(),
                 },
@@ -11177,7 +11256,7 @@ mod tests {
         .expect("append canonical tail without model-context projection");
         let tail_event = event(
             session_id,
-            1,
+            2,
             SessionEventKind::AssistantMessage {
                 text: "canonical tail".to_string(),
             },
@@ -11241,14 +11320,14 @@ mod tests {
                 .model_context_projection_status()
                 .await
                 .expect("projection status"),
-            ModelContextProjectionStatus::Fresh { checkpoint: 1 }
+            ModelContextProjectionStatus::Fresh { checkpoint: 2 }
         );
         let context = migrated
             .model_context_events()
             .await
             .expect("migrated context");
         assert_eq!(context.len(), 2);
-        assert_eq!(context[1].sequence, 1);
+        assert_eq!(context[1].sequence, 2);
         let canonical_after = migrated
             .database()
             .select("events")
@@ -11265,7 +11344,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(payload_hashes_after, payload_hashes_before);
-        validate_all_projection_checkpoints_at_tail(migrated.database(), Some(1))
+        validate_all_projection_checkpoints_at_tail(migrated.database(), Some(2))
             .await
             .expect("all projection checkpoints at canonical tail");
 
@@ -11278,7 +11357,7 @@ mod tests {
                 .model_context_projection_status()
                 .await
                 .expect("projection status after reopen"),
-            ModelContextProjectionStatus::Fresh { checkpoint: 1 }
+            ModelContextProjectionStatus::Fresh { checkpoint: 2 }
         );
     }
 
@@ -11463,6 +11542,16 @@ mod tests {
         db.append_event(&event(
             session_id,
             0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append canonical session creation");
+        db.append_event(&event(
+            session_id,
+            1,
             SessionEventKind::UserMessage {
                 client_id: ClientId::new(),
                 text: "projected".to_string(),
@@ -11491,7 +11580,7 @@ mod tests {
             db.database(),
             &event(
                 session_id,
-                2,
+                3,
                 SessionEventKind::AssistantMessage {
                     text: "gapped tail".to_string(),
                 },
@@ -11518,8 +11607,8 @@ mod tests {
                 .await
                 .expect_err("gapped migration must fail"),
             SessionDbError::InvalidCanonicalSequence {
-                expected: 1,
-                actual: 2
+                expected: 2,
+                actual: 3
             }
         ));
         drop(write);
@@ -11548,7 +11637,7 @@ mod tests {
             .expect("projection query")
             .expect("projection state");
         assert_eq!(required_i64(&state, "schema_version").expect("schema"), 1);
-        assert_eq!(required_i64(&state, "last_event_seq").expect("tail"), 0);
+        assert_eq!(required_i64(&state, "last_event_seq").expect("tail"), 1);
         assert_eq!(
             reopened
                 .all_events_strict()
@@ -11557,7 +11646,7 @@ mod tests {
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![0, 2]
+            vec![0, 1, 3]
         );
         assert!(
             reopened

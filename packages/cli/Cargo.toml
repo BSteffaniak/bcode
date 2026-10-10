@@ -124,6 +124,7 @@ static-bundled-plugins = [
     "static-bundled-question-plugin",
     "static-bundled-read-plugin",
     "static-bundled-session-derivation-plugin",
+    "static-bundled-session-milestones-plugin",
     "static-bundled-shell-plugin",
     "static-bundled-tantivy-session-search-plugin",
     "static-bundled-web-search-plugin",
@@ -137,6 +138,7 @@ static-bundled-question-plugin = [
 ]
 static-bundled-read-plugin = ["_static-bundled"]
 static-bundled-session-derivation-plugin = ["_static-bundled"]
+static-bundled-session-milestones-plugin = ["_static-bundled"]
 static-bundled-shell-plugin = [
     "_static-bundled",
     "bcode_tui/static-bundled-shell-plugin",

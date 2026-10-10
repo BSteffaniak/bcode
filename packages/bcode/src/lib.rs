@@ -799,15 +799,14 @@ impl GenerateTextBuilder {
         P: ModelProviderInvoker,
     {
         let agent = self.agent.build();
-        agent
-            .generate_text_with_provider_with_options(
-                provider,
-                self.prompt,
-                None,
-                self.messages,
-                self.cancellation,
-            )
-            .await
+        Box::pin(agent.generate_text_with_provider_with_options(
+            provider,
+            self.prompt,
+            None,
+            self.messages,
+            self.cancellation,
+        ))
+        .await
     }
 }
 
@@ -1338,15 +1337,14 @@ impl<T> GenerateObjectBuilder<T> {
             .options
             .unwrap_or_else(StructuredOutputOptions::for_type::<T>);
         let agent = self.agent.build();
-        agent
-            .generate_object_with_provider_and_request_options(
-                provider,
-                self.prompt,
-                options,
-                self.messages,
-                self.cancellation,
-            )
-            .await
+        Box::pin(agent.generate_object_with_provider_and_request_options(
+            provider,
+            self.prompt,
+            options,
+            self.messages,
+            self.cancellation,
+        ))
+        .await
     }
     /// Run the request with explicit structured-output options and a caller-supplied provider.
     ///
@@ -1365,15 +1363,14 @@ impl<T> GenerateObjectBuilder<T> {
         P: ModelProviderInvoker,
     {
         let agent = self.agent.build();
-        agent
-            .generate_object_with_provider_and_request_options(
-                provider,
-                self.prompt,
-                options,
-                self.messages,
-                self.cancellation,
-            )
-            .await
+        Box::pin(agent.generate_object_with_provider_and_request_options(
+            provider,
+            self.prompt,
+            options,
+            self.messages,
+            self.cancellation,
+        ))
+        .await
     }
 }
 

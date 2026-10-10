@@ -235,6 +235,7 @@ static-bundled-plugins = [
     "static-bundled-compressed-session-search-plugin",
     "static-bundled-tantivy-session-search-plugin",
     "static-bundled-session-derivation-plugin",
+    "static-bundled-session-milestones-plugin",
     "static-bundled-jev-provider-plugin",
     "bcode_bundled_plugins/static-bundled-plugins",
     "bcode_cli/static-bundled-plugins",
@@ -256,6 +257,9 @@ static-bundled-session-derivation-plugin = [
     "cli",
     "bcode_bundled_plugins/static-bundled-session-derivation-plugin",
     "bcode_cli/static-bundled-session-derivation-plugin",
+]
+static-bundled-session-milestones-plugin = [
+    "bcode_bundled_plugins/static-bundled-session-milestones-plugin",
 ]
 static-bundled-shell-plugin = [
     "bundled-plugins",

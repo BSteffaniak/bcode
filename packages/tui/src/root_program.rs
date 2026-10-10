@@ -4094,6 +4094,170 @@ mod tests {
         drop(model);
     }
 
+    fn milestone_root_key(model: &mut super::BcodeRuntimeModel, key: bmux_keyboard::KeyCode) {
+        let _invalidation = model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
+            bmux_keyboard::KeyStroke::simple(key),
+        ));
+    }
+
+    fn milestone_root_complete(
+        model: &mut super::BcodeRuntimeModel,
+        result: super::super::effects::TuiEffectResult,
+    ) {
+        bmux_tui_runtime::Program::update(
+            model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(result),
+            )),
+        )
+        .expect("milestone root completion");
+    }
+
+    fn milestone_root_open(model: &mut super::BcodeRuntimeModel) {
+        milestone_root_complete(
+            model,
+            super::super::effects::TuiEffectResult::SlashCommandExecuted {
+                message: "/timeline".into(),
+                result: Ok(super::super::slash_commands::SlashCommandOutcome::OpenTimeline),
+            },
+        );
+    }
+
+    fn milestone_root_request(
+        model: &mut super::BcodeRuntimeModel,
+    ) -> Option<super::super::timeline_dialog::MilestonePageRequest> {
+        let (effects, notes) = model.chat.pending_effects.drain_runtime();
+        assert!(notes.is_empty());
+        let mut requests = effects.into_iter().map(|(_, effect)| match effect {
+            super::super::effects::TuiEffect::LoadMilestones { request } => request,
+            _ => panic!("unexpected effect during milestone navigation"),
+        });
+        let request = requests.next();
+        assert!(requests.next().is_none());
+        request
+    }
+
+    fn milestone_root_page(
+        request: super::super::timeline_dialog::MilestonePageRequest,
+        next_after_sequence: Option<u64>,
+    ) -> super::super::effects::TuiEffectResult {
+        super::super::effects::TuiEffectResult::MilestonesLoaded {
+            request,
+            result: Ok(bcode_session_models::SessionMilestonePage {
+                milestones: Vec::new(),
+                next_after_sequence,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn milestone_root_close_reopen_rejects_stale_success_and_failure() {
+        use bmux_keyboard::KeyCode;
+        let mut model = root_test_model_with_history(bcode_session_models::SessionId::new(), &[]);
+        milestone_root_open(&mut model);
+        milestone_root_key(&mut model, KeyCode::Char('m'));
+        let old = milestone_root_request(&mut model).expect("first page request");
+        milestone_root_key(&mut model, KeyCode::Escape);
+        milestone_root_open(&mut model);
+        milestone_root_key(&mut model, KeyCode::Char('m'));
+        let current = milestone_root_request(&mut model).expect("reopened page request");
+        assert_ne!(old, current);
+        let status = model.chat.app.status().to_owned();
+        milestone_root_complete(&mut model, milestone_root_page(old, Some(999)));
+        milestone_root_complete(
+            &mut model,
+            super::super::effects::TuiEffectResult::MilestonesLoaded {
+                request: old,
+                result: Err(bcode_client::ClientError::UnexpectedResponse),
+            },
+        );
+        assert_eq!(model.chat.app.status(), status);
+        // Loading Enter must neither dismiss the dialog nor schedule a source jump.
+        milestone_root_key(&mut model, KeyCode::Enter);
+        assert!(model.pending_timeline_jump.is_none());
+        assert!(milestone_root_request(&mut model).is_none());
+        milestone_root_complete(&mut model, milestone_root_page(current, Some(42)));
+        assert_eq!(model.chat.app.status(), "milestones: more pages available");
+        milestone_root_key(&mut model, KeyCode::Char('n'));
+        let next = milestone_root_request(&mut model).expect("dialog survived loading Enter");
+        drop(model);
+        assert_eq!(next.after_sequence, Some(42));
+    }
+
+    #[tokio::test]
+    async fn milestone_root_rapid_filter_and_page_keys_preserve_current_request() {
+        use bmux_keyboard::KeyCode;
+        let session_id = bcode_session_models::SessionId::new();
+        let mut prompt = root_test_history_event(session_id, 10);
+        prompt.kind = bcode_session_models::SessionEventKind::UserMessage {
+            client_id: bcode_session_models::ClientId::new(),
+            text: "resident prompt".into(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        };
+        let mut model = root_test_model_with_history(session_id, std::slice::from_ref(&prompt));
+        milestone_root_open(&mut model);
+        milestone_root_key(&mut model, KeyCode::Char('m'));
+        let first = milestone_root_request(&mut model).expect("first request");
+        milestone_root_key(&mut model, KeyCode::Char('p'));
+        milestone_root_key(&mut model, KeyCode::Char('n'));
+        assert!(milestone_root_request(&mut model).is_none());
+        milestone_root_key(&mut model, KeyCode::Char('m'));
+        let replacement = milestone_root_request(&mut model).expect("replacement request");
+        milestone_root_key(&mut model, KeyCode::Char('n'));
+        assert!(milestone_root_request(&mut model).is_none());
+        milestone_root_complete(&mut model, milestone_root_page(first, Some(999)));
+        milestone_root_complete(&mut model, milestone_root_page(replacement, Some(7)));
+        milestone_root_key(&mut model, KeyCode::Char('n'));
+        let next = milestone_root_request(&mut model).expect("next request");
+        assert_eq!(next.after_sequence, Some(7));
+        milestone_root_key(&mut model, KeyCode::Char('n'));
+        assert!(milestone_root_request(&mut model).is_none());
+        milestone_root_key(&mut model, KeyCode::Char('m'));
+        let restarted = milestone_root_request(&mut model).expect("restart first page");
+        assert_eq!(restarted.after_sequence, None);
+        milestone_root_complete(&mut model, milestone_root_page(next, Some(999)));
+        milestone_root_complete(&mut model, milestone_root_page(restarted, None));
+        assert_eq!(model.chat.app.status(), "milestones: final page");
+        milestone_root_key(&mut model, KeyCode::Char('n'));
+        assert!(milestone_root_request(&mut model).is_none());
+        milestone_root_key(&mut model, KeyCode::Char('p'));
+        milestone_root_key(&mut model, KeyCode::Enter);
+        // No frame has measured the resident transcript yet, so navigation takes
+        // the bounded history-load route and completes only after acknowledgement.
+        assert_eq!(model.chat.app.status(), "loading timeline message…");
+        let (effects, notes) = model.chat.pending_effects.drain_runtime();
+        assert!(notes.is_empty());
+        assert_eq!(effects.len(), 1);
+        let (_, effect) = effects.into_iter().next().expect("timeline source load");
+        let super::super::effects::TuiEffect::LoadTimelineJump {
+            session_id: requested_session,
+            generation,
+            sequence,
+        } = effect
+        else {
+            panic!("prompt navigation must load its canonical source");
+        };
+        assert_eq!(requested_session, session_id);
+        assert_eq!(sequence, 10);
+        assert_eq!(
+            model.pending_timeline_jump,
+            Some((session_id, generation, sequence))
+        );
+        milestone_root_complete(
+            &mut model,
+            super::super::effects::TuiEffectResult::TimelineJumpLoaded {
+                session_id,
+                generation,
+                sequence,
+                result: Ok((vec![prompt], false, false, Vec::new())),
+            },
+        );
+        assert_eq!(model.chat.app.status(), "jumped to timeline message");
+        assert!(model.pending_timeline_jump.is_none());
+        assert!(milestone_root_request(&mut model).is_none());
+        drop(model);
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn timeline_completion_cannot_replace_a_newer_window_or_session() {
@@ -4597,6 +4761,8 @@ mod tests {
             name: Some("reconnected".to_owned()),
             explicit_name: Some("reconnected".to_owned()),
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: SessionTitleSource::Explicit,
             client_count: 1,
             created_at_ms: 1,
@@ -4738,6 +4904,8 @@ mod tests {
             name: Some("reconnected".to_owned()),
             explicit_name: Some("reconnected".to_owned()),
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: SessionTitleSource::Explicit,
             client_count: 1,
             created_at_ms: 1,

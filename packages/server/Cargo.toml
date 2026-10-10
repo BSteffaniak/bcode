@@ -113,6 +113,9 @@ bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_session_derivation_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
+bcode_session_milestones_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }

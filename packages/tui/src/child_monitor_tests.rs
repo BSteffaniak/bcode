@@ -12,9 +12,11 @@ fn monitor_expands_idle_coordinator_and_preserves_transcript() {
     let mut child = session_summary(SessionId::new());
     child.parent_id = Some(root);
     child.name = Some("协调 👩‍💻 e\u{301}".to_owned());
+    child.explicit_name.clone_from(&child.name);
     let mut grandchild = session_summary(SessionId::new());
     grandchild.parent_id = Some(child.id);
     grandchild.name = Some("running grandchild".to_owned());
+    grandchild.explicit_name.clone_from(&grandchild.name);
     let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
     app.apply_monitor_children(
         root,

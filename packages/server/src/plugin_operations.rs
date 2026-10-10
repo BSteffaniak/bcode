@@ -423,7 +423,7 @@ async fn drive_service_bridge<T>(
                     Ok(bcode_plugin_sdk::ServiceBridgeResponse::Service(result))
                 } else {
                     super::resolve_command_plugin_bridge_request(
-                        &state.sessions,
+                        state,
                         authorized_session_id,
                         bridge_call.request,
                         &bridge_call.cancellation,

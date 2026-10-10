@@ -172,8 +172,12 @@ impl SessionState {
         let (sender, _) = broadcast::channel(512);
         let live_events = SessionLiveEventBroker::new(512);
         let working_directory = normalize_working_directory(&state.working_directory);
-        let title_source = if state.title.is_some() {
+        let title_source = if state.explicit_name.is_some() {
             SessionTitleSource::Explicit
+        } else if state.automatic_title.is_some() {
+            SessionTitleSource::AutomaticMilestone
+        } else if state.derived_title.is_some() {
+            SessionTitleSource::FirstUserMessage
         } else {
             SessionTitleSource::EmptyDraft
         };
@@ -181,8 +185,10 @@ impl SessionState {
             summary: SessionSummary {
                 id: state.session_id,
                 name: state.title.clone(),
-                explicit_name: state.title,
-                derived_title: None,
+                explicit_name: state.explicit_name.clone(),
+                derived_title: state.derived_title.clone(),
+                automatic_title: state.automatic_title.clone(),
+                automatic_title_source_sequence: state.automatic_title_source_sequence,
                 title_source,
                 client_count: 0,
                 created_at_ms,
@@ -254,12 +260,7 @@ impl SessionState {
 
     pub(crate) fn summary(&self) -> SessionSummary {
         let mut summary = self.summary.clone();
-        if summary.name.is_none() {
-            summary.name = summary
-                .explicit_name
-                .clone()
-                .or_else(|| summary.derived_title.clone());
-        }
+        summary.name = summary.title().map(ToOwned::to_owned);
         summary
     }
 
@@ -301,11 +302,20 @@ impl SessionState {
                         visibility: *visibility,
                     }));
             }
+            SessionEventKind::AutomaticTitleUpdated { title, .. } => {
+                self.summary.automatic_title = Some(title.clone());
+                self.summary.automatic_title_source_sequence = Some(event.sequence);
+                if self.summary.explicit_name.is_none() {
+                    self.summary.title_source = SessionTitleSource::AutomaticMilestone;
+                }
+            }
             SessionEventKind::SessionRenamed { name } => {
                 self.summary.name.clone_from(name);
                 self.summary.explicit_name.clone_from(name);
                 if name.is_some() {
                     self.summary.title_source = SessionTitleSource::Explicit;
+                } else if self.summary.automatic_title.is_some() {
+                    self.summary.title_source = SessionTitleSource::AutomaticMilestone;
                 } else if self.summary.derived_title.is_some() {
                     self.summary.title_source = SessionTitleSource::FirstUserMessage;
                 } else {

@@ -1350,6 +1350,8 @@ fn importable_to_summary(
             .unwrap_or_else(|| summary.external_session_id.clone()),
     );
     SessionSummary {
+        automatic_title: None,
+        automatic_title_source_sequence: None,
         parent_id: None,
         id,
         name: name.clone(),
@@ -2711,6 +2713,8 @@ mod tests {
 
     fn summary(id: SessionId, location: Option<SessionLocationSummary>) -> SessionSummary {
         SessionSummary {
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             parent_id: None,
             id,
             name: None,

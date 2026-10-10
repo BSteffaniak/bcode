@@ -53,6 +53,7 @@ struct ProviderConfig {
     session_quota_bytes: u64,
     cache_bytes: usize,
     compression_level: i32,
+    index_milestones: bool,
 }
 
 impl Default for ProviderConfig {
@@ -63,11 +64,20 @@ impl Default for ProviderConfig {
             session_quota_bytes: DEFAULT_SESSION_QUOTA_BYTES,
             cache_bytes: DEFAULT_CACHE_BYTES,
             compression_level: 3,
+            index_milestones: true,
         }
     }
 }
 
 impl ProviderConfig {
+    fn allowed_content(&self) -> BTreeSet<SearchContentKind> {
+        let mut content = large_content_kinds();
+        if self.index_milestones {
+            content.insert(SearchContentKind::Milestone);
+        }
+        content
+    }
+
     fn validate(&self) -> Result<(), ProviderError> {
         if self.quota_bytes == 0 || self.session_quota_bytes == 0 {
             return Err(ProviderError::new(
@@ -102,6 +112,8 @@ struct Manifest {
     policy_version: u16,
     quota_bytes: u64,
     session_quota_bytes: u64,
+    #[serde(default)]
+    content_kinds: BTreeSet<SearchContentKind>,
     next_chunk_id: u64,
     chunks: Vec<ChunkMetadata>,
     sessions: BTreeMap<SessionId, SessionState>,
@@ -109,7 +121,7 @@ struct Manifest {
 }
 
 impl Manifest {
-    const fn empty(config: &ProviderConfig) -> Self {
+    fn empty(config: &ProviderConfig) -> Self {
         Self {
             format_version: FORMAT_VERSION,
             record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
@@ -117,6 +129,7 @@ impl Manifest {
             policy_version: CURRENT_SEARCH_POLICY_VERSION,
             quota_bytes: config.quota_bytes,
             session_quota_bytes: config.session_quota_bytes,
+            content_kinds: config.allowed_content(),
             next_chunk_id: 0,
             chunks: Vec::new(),
             sessions: BTreeMap::new(),
@@ -133,6 +146,12 @@ impl Manifest {
             return Err(ProviderError::new(
                 "incompatible_index",
                 "unsupported retained format",
+            ));
+        }
+        if self.content_kinds != config.allowed_content() {
+            return Err(ProviderError::new(
+                "incompatible_index",
+                "configured content policy differs from retained state; rebuild is required",
             ));
         }
         if self.quota_bytes != config.quota_bytes
@@ -177,20 +196,80 @@ struct ProviderState {
     root: PathBuf,
     manifest: Manifest,
     cache: Arc<Mutex<ChunkCache>>,
+    chunks_by_content: BTreeMap<(SearchContentKind, Option<SessionId>), BTreeSet<usize>>,
 }
 
 #[derive(Clone)]
 struct ScanSnapshot {
     root: PathBuf,
     chunks: Vec<ChunkMetadata>,
+    incomplete: bool,
     cache: Arc<Mutex<ChunkCache>>,
 }
 
 impl ProviderState {
+    fn index_chunks(&mut self, start: usize) {
+        for (index, chunk) in self.manifest.chunks.iter().enumerate().skip(start) {
+            for kind in &chunk.content_kinds {
+                for session in [None, Some(chunk.session_id)] {
+                    self.chunks_by_content
+                        .entry((*kind, session))
+                        .or_default()
+                        .insert(index);
+                }
+            }
+        }
+    }
+
+    fn scan_snapshot_for(&self, request: &SessionSearchRequest) -> ScanSnapshot {
+        let mut candidates = BTreeSet::new();
+        for kind in [
+            SearchContentKind::Milestone,
+            SearchContentKind::ShellOutput,
+            SearchContentKind::ToolOutput,
+        ] {
+            if !request.filters.content_kinds.is_empty()
+                && !request.filters.content_kinds.contains(&kind)
+            {
+                continue;
+            }
+            if request.filters.session_ids.is_empty() {
+                if let Some(indices) = self.chunks_by_content.get(&(kind, None)) {
+                    candidates.extend(indices.iter().take(MAX_SCAN_CHUNKS + 1).copied());
+                }
+            } else {
+                for session_id in &request.filters.session_ids {
+                    if let Some(indices) = self.chunks_by_content.get(&(kind, Some(*session_id))) {
+                        candidates.extend(indices.iter().take(MAX_SCAN_CHUNKS + 1).copied());
+                    }
+                }
+            }
+        }
+        let incomplete = candidates.len() > MAX_SCAN_CHUNKS;
+        ScanSnapshot {
+            root: self.root.clone(),
+            chunks: candidates
+                .into_iter()
+                .take(MAX_SCAN_CHUNKS)
+                .map(|index| self.manifest.chunks[index].clone())
+                .collect(),
+            incomplete,
+            cache: Arc::clone(&self.cache),
+        }
+    }
+
+    #[cfg(test)]
     fn scan_snapshot(&self) -> ScanSnapshot {
         ScanSnapshot {
             root: self.root.clone(),
-            chunks: self.manifest.chunks.clone(),
+            chunks: self
+                .manifest
+                .chunks
+                .iter()
+                .take(MAX_SCAN_CHUNKS)
+                .cloned()
+                .collect(),
+            incomplete: self.manifest.chunks.len() > MAX_SCAN_CHUNKS,
             cache: Arc::clone(&self.cache),
         }
     }
@@ -323,7 +402,7 @@ impl ConcurrentRustPlugin for CompressedSessionSearchPlugin {
             return error_response(&error);
         }
         match context.request.operation.as_str() {
-            OP_CAPABILITIES => json_response(&capabilities()),
+            OP_CAPABILITIES => json_response(&capabilities(&config)),
             OP_STATUS => json_response(&self.status(&config)),
             OP_SEARCH => decode_request(&context, |request| {
                 self.search(&config, &request, &context.cancellation)
@@ -399,7 +478,7 @@ impl CompressedSessionSearchPlugin {
                         fingerprint: session.generation_fingerprint.clone(),
                         last_sequence: session.canonical_tail_sequence,
                     },
-                    content_kinds: large_content_kinds(),
+                    content_kinds: config.allowed_content(),
                     indexed_through_sequence: Some(session.indexed_through_sequence),
                     complete: session.canonical_tail_sequence
                         == Some(session.indexed_through_sequence),
@@ -450,12 +529,11 @@ impl CompressedSessionSearchPlugin {
         if let Err(error) = request.validate() {
             return ServiceResponse::error("invalid_request", error.to_string());
         }
-        if request.records.iter().any(|record| {
-            !matches!(
-                record.content_kind,
-                SearchContentKind::ShellOutput | SearchContentKind::ToolOutput
-            )
-        }) {
+        if request
+            .records
+            .iter()
+            .any(|record| !config.allowed_content().contains(&record.content_kind))
+        {
             return ServiceResponse::error(
                 "unsupported_content",
                 "provider accepts only shell_output and tool_output",
@@ -530,13 +608,27 @@ impl CompressedSessionSearchPlugin {
             .lifecycle
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let snapshot = match self.with_state(config, |state| Ok(state.scan_snapshot())) {
+        let snapshot = match self.with_state(config, |state| Ok(state.scan_snapshot_for(request))) {
             Ok(snapshot) => snapshot,
             Err(error) => return error_response(&error),
         };
         drop(lifecycle);
         match scan(&snapshot, request, &matcher, cancellation) {
-            Ok(response) => json_response(&response),
+            Ok(mut response) => {
+                response.searched_content = if request.filters.content_kinds.is_empty() {
+                    config.allowed_content()
+                } else {
+                    request
+                        .filters
+                        .content_kinds
+                        .intersection(&config.allowed_content())
+                        .copied()
+                        .collect()
+                }
+                .into_iter()
+                .collect();
+                json_response(&response)
+            }
             Err(error) => error_response(&error),
         }
     }
@@ -576,6 +668,8 @@ impl CompressedSessionSearchPlugin {
                 .retain(|chunk| chunk.session_id != request.session_id);
             state.manifest.sessions.remove(&request.session_id);
             publish_manifest(&state.root, &state.manifest)?;
+            state.chunks_by_content.clear();
+            state.index_chunks(0);
             for chunk in removed {
                 let _ = fs::remove_file(state.root.join("chunks").join(chunk.file_name));
             }
@@ -673,11 +767,11 @@ impl CompressedSessionSearchPlugin {
     }
 }
 
-fn capabilities() -> SessionSearchCapabilities {
+fn capabilities(config: &ProviderConfig) -> SessionSearchCapabilities {
     SessionSearchCapabilities {
         provider_id: PLUGIN_ID.to_owned(),
         execution: SearchExecutionKind::Scan,
-        content_kinds: large_content_kinds(),
+        content_kinds: config.allowed_content(),
         features: BTreeSet::from([
             SearchFeature::Terms,
             SearchFeature::Phrase,
@@ -718,11 +812,14 @@ fn open_state(root: &Path, config: &ProviderConfig) -> Result<ProviderState, Pro
         publish_manifest(root, &manifest)?;
         manifest
     };
-    Ok(ProviderState {
+    let mut state = ProviderState {
         root: root.to_path_buf(),
         manifest,
         cache: Arc::new(Mutex::new(ChunkCache::new(config.cache_bytes))),
-    })
+        chunks_by_content: BTreeMap::new(),
+    };
+    state.index_chunks(0);
+    Ok(state)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -889,6 +986,7 @@ fn apply_batch(
         cleanup_chunks(&state.root, &chunks);
         return Err(error);
     }
+    state.index_chunks(original_manifest.chunks.len());
     Ok(ApplySearchRecordsResponse {
         batch_id: request.batch_id.clone(),
         outcome: ApplyBatchOutcome::Applied,
@@ -975,7 +1073,7 @@ fn scan(
     let deadline = request.deadline_ms.map(Duration::from_millis);
     let mut hits = Vec::new();
     let mut scanned = 0;
-    let mut incomplete = false;
+    let mut incomplete = state.incomplete;
     if deadline.is_some_and(|duration| duration.is_zero()) {
         return Ok(search_response(
             hits,
@@ -985,8 +1083,7 @@ fn scan(
             Some("scan deadline reached"),
         ));
     }
-    let chunks = state.chunks.clone();
-    for chunk in chunks {
+    for chunk in &state.chunks {
         if scanned >= MAX_SCAN_CHUNKS {
             incomplete = true;
             break;
@@ -1009,11 +1106,11 @@ fn scan(
                 Some("scan deadline reached"),
             ));
         }
-        if !chunk_selected(&chunk, request) {
+        if !chunk_selected(chunk, request) {
             continue;
         }
         scanned += 1;
-        let records = load_chunk(state, &chunk)?;
+        let records = load_chunk(state, chunk)?;
         for record in records.iter() {
             if cancellation.is_cancelled() {
                 return Ok(search_response(
@@ -1429,6 +1526,155 @@ mod tests {
         SearchCanonicalGeneration, SessionSearchFilters, SessionSearchLocator,
     };
 
+    #[test]
+    fn milestone_policy_is_independent_and_preserves_retained_manifest() {
+        let enabled = ProviderConfig::default();
+        assert!(
+            capabilities(&enabled)
+                .content_kinds
+                .contains(&SearchContentKind::Milestone)
+        );
+        let disabled = ProviderConfig {
+            index_milestones: false,
+            ..enabled.clone()
+        };
+        assert!(
+            !capabilities(&disabled)
+                .content_kinds
+                .contains(&SearchContentKind::Milestone)
+        );
+        assert!(
+            capabilities(&disabled)
+                .content_kinds
+                .contains(&SearchContentKind::ShellOutput)
+        );
+        let manifest = Manifest::empty(&enabled);
+        assert!(manifest.validate(&disabled).is_err());
+        assert!(
+            manifest
+                .content_kinds
+                .contains(&SearchContentKind::Milestone)
+        );
+        let mut future = serde_json::to_value(&manifest).expect("encode manifest");
+        future["content_kinds"] = serde_json::json!(["future_milestone"]);
+        assert!(serde_json::from_value::<Manifest>(future).is_err());
+    }
+
+    #[test]
+    fn compressed_milestone_search_preserves_canonical_locator_and_fields() {
+        let directory = tempfile::tempdir().expect("temporary provider storage");
+        let config = config(directory.path());
+        let session_id = SessionId::new();
+        let mut header = record(session_id, 7, "Durable checkpoint");
+        header.content_kind = SearchContentKind::Milestone;
+        header.field = Some(SearchField::Title);
+        let mut description = header.clone();
+        description.record_id = "milestone-description-7".to_owned();
+        description.locator.record_id = Some(description.record_id.clone());
+        description.field = Some(SearchField::Text);
+        description.text = Some("Durable checkpoint".to_owned());
+        let expected = [header.locator.clone(), description.locator.clone()];
+        let mut state = open_state(directory.path(), &config).expect("open provider");
+        apply_batch(
+            &mut state,
+            &config,
+            &batch(session_id, vec![header, description]),
+            &ServiceCancellation::default(),
+        )
+        .expect("index finalized metadata");
+        let retained =
+            std::fs::read(directory.path().join("manifest.json")).expect("retained manifest");
+        let disabled = ProviderConfig {
+            index_milestones: false,
+            ..config.clone()
+        };
+        assert!(open_state(directory.path(), &disabled).is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join("manifest.json")).expect("preserved manifest"),
+            retained
+        );
+        let reopened = open_state(directory.path(), &config).expect("re-enable metadata indexing");
+        assert_eq!(
+            reopened.manifest.sessions[&session_id].indexed_through_sequence,
+            7
+        );
+        let mut request = query("Durable", TextMatchMode::Terms);
+        request.filters.content_kinds = BTreeSet::from([SearchContentKind::Milestone]);
+        let matcher = CompiledQuery::compile(&request.query).expect("compile metadata query");
+        let response = scan(
+            &state.scan_snapshot(),
+            &request,
+            &matcher,
+            &ServiceCancellation::default(),
+        )
+        .expect("search metadata");
+        assert_eq!(response.hits.len(), 2);
+        for (hit, locator) in response.hits.iter().zip(expected) {
+            assert_eq!(hit.locator, locator);
+            assert_eq!(hit.content_kind, SearchContentKind::Milestone);
+        }
+        assert_eq!(response.hits[0].matched_field, SearchField::Title);
+        assert_eq!(response.hits[1].matched_field, SearchField::Text);
+    }
+
+    #[test]
+    fn milestone_snapshot_is_category_bounded_despite_unrelated_output_corpus() {
+        let directory = tempfile::tempdir().expect("provider storage");
+        let config = config(directory.path());
+        let session_id = SessionId::new();
+        let mut state = open_state(directory.path(), &config).expect("open");
+        let mut milestone = record(session_id, 7, "needle milestone");
+        milestone.content_kind = SearchContentKind::Milestone;
+        milestone.field = Some(SearchField::Title);
+        apply_batch(
+            &mut state,
+            &config,
+            &batch(session_id, vec![milestone]),
+            &ServiceCancellation::default(),
+        )
+        .expect("index milestone");
+        let metadata = state.manifest.chunks[0].clone();
+        let mut output = metadata.clone();
+        output.content_kinds = large_content_kinds();
+        state.manifest.chunks.clear();
+        for id in 1..10_001 {
+            let mut chunk = output.clone();
+            chunk.id = id;
+            state.manifest.chunks.push(chunk);
+        }
+        state.manifest.chunks.push(metadata);
+        state.chunks_by_content.clear();
+        state.index_chunks(0);
+        let mut request = query("needle", TextMatchMode::Terms);
+        request.filters.content_kinds = BTreeSet::from([SearchContentKind::Milestone]);
+        let snapshot = state.scan_snapshot_for(&request);
+        assert_eq!(snapshot.chunks.len(), 1);
+        assert!(!snapshot.incomplete);
+        let matcher = CompiledQuery::compile(&request.query).expect("query");
+        let response = scan(
+            &snapshot,
+            &request,
+            &matcher,
+            &ServiceCancellation::default(),
+        )
+        .expect("metadata search");
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].locator.sequence, 7);
+        request.filters.session_ids = BTreeSet::from([SessionId::new()]);
+        assert!(state.scan_snapshot_for(&request).chunks.is_empty());
+        request.filters.session_ids = BTreeSet::from([session_id]);
+        assert_eq!(state.scan_snapshot_for(&request).chunks.len(), 1);
+        request.filters.session_ids.clear();
+        request.filters.content_kinds = large_content_kinds();
+        let bounded = state.scan_snapshot_for(&request);
+        assert_eq!(bounded.chunks.len(), MAX_SCAN_CHUNKS);
+        assert!(bounded.incomplete);
+        let reopened = open_state(directory.path(), &config)
+            .expect("reopen reconstructs derived category index");
+        request.filters.content_kinds = BTreeSet::from([SearchContentKind::Milestone]);
+        assert_eq!(reopened.scan_snapshot_for(&request).chunks.len(), 1);
+    }
+
     fn config(root: &Path) -> ProviderConfig {
         ProviderConfig {
             storage_root: Some(root.to_path_buf()),
@@ -1665,7 +1911,7 @@ mod tests {
 
     #[test]
     fn capabilities_match_implemented_provider_relevance_sort() {
-        let capabilities = capabilities();
+        let capabilities = capabilities(&ProviderConfig::default());
         assert!(
             capabilities
                 .features

@@ -11,13 +11,16 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 14;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 15;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
 /// These messages remain model context but are omitted from conversational presentation.
 /// Keep this prefix stable so previously retained snapshots have the same presentation.
 pub const TURN_ENVIRONMENT_SNAPSHOT_PREFIX: &str = "Turn environment snapshot (historical observations, not enduring instructions). Later snapshots and tool observations supersede these facts.\n\n";
+
+mod milestone;
+pub use milestone::*;
 
 use bcode_skill_models::{SkillActivationMode, SkillContextResponse, SkillId, SkillSource};
 pub use bcode_tool_models::{
@@ -681,7 +684,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 50;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 51;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -731,6 +734,11 @@ pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
     "session_created",
     "session_derived",
     "session_imported",
+    "milestone_evaluation_requested",
+    "milestone_publication_requested",
+    "milestone_published",
+    "milestone_evaluation_completed",
+    "automatic_title_updated",
     "session_renamed",
     "skill_activated",
     "skill_context_loaded",
@@ -791,6 +799,11 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
         SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
         SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
+        SessionEventKind::MilestoneEvaluationRequested { .. } => "milestone_evaluation_requested",
+        SessionEventKind::MilestonePublicationRequested { .. } => "milestone_publication_requested",
+        SessionEventKind::MilestonePublished { .. } => "milestone_published",
+        SessionEventKind::MilestoneEvaluationCompleted { .. } => "milestone_evaluation_completed",
+        SessionEventKind::AutomaticTitleUpdated { .. } => "automatic_title_updated",
         SessionEventKind::SessionRenamed { .. } => "session_renamed",
         SessionEventKind::TraceEvent { .. } => "trace_event",
         SessionEventKind::SkillInvoked { .. } => "skill_invoked",
@@ -1142,6 +1155,8 @@ pub enum SessionTitleSource {
     Explicit,
     /// Title was derived from the first user prompt.
     FirstUserMessage,
+    /// Title generated from a settled milestone source.
+    AutomaticMilestone,
     /// Title came from an external imported session.
     Imported,
 }
@@ -1249,6 +1264,12 @@ pub struct SessionSummary {
     pub explicit_name: Option<String>,
     #[serde(default)]
     pub derived_title: Option<String>,
+    /// Latest generated display title; never an explicit name.
+    #[serde(default)]
+    pub automatic_title: Option<String>,
+    /// Canonical automatic-title publication sequence.
+    #[serde(default)]
+    pub automatic_title_source_sequence: Option<u64>,
     #[serde(default)]
     pub title_source: SessionTitleSource,
     pub client_count: usize,
@@ -1269,13 +1290,14 @@ impl SessionSummary {
     /// Return the resolved display title for this session, if any.
     ///
     /// This is the canonical source of truth for a session's user-visible name.
-    /// Callers should prefer this over inspecting `name`/`explicit_name`/`derived_title`
-    /// directly. The precedence is: `name` → `explicit_name` → `derived_title`.
+    /// Callers should prefer this over inspecting individual title fields.
+    /// Precedence: explicit name → automatic title → legacy name → first-prompt title.
     #[must_use]
     pub fn title(&self) -> Option<&str> {
-        self.name
+        self.explicit_name
             .as_deref()
-            .or(self.explicit_name.as_deref())
+            .or(self.automatic_title.as_deref())
+            .or(self.name.as_deref())
             .or(self.derived_title.as_deref())
     }
 
@@ -4207,6 +4229,27 @@ pub enum SessionEventKind {
     SessionChildrenReconciled {
         /// Number of verified child relationships at the maintenance boundary.
         verified_children: u64,
+    },
+    /// Durable evaluation admission, without generation input.
+    MilestoneEvaluationRequested {
+        request: SessionMilestoneEvaluationRequest,
+    },
+    /// Exact publication retry envelope, including optional title.
+    MilestonePublicationRequested {
+        request: SessionMilestonePublicationRequest,
+    },
+    /// Durable annotation excluded from model context.
+    MilestonePublished {
+        milestone: SessionMilestone,
+    },
+    /// Successful evaluation checkpoint, including no-result evaluations.
+    MilestoneEvaluationCompleted {
+        completion: SessionMilestoneEvaluationCompletion,
+    },
+    /// Automatic display title, not an explicit rename.
+    AutomaticTitleUpdated {
+        evaluation_id: String,
+        title: String,
     },
 }
 

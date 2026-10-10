@@ -306,6 +306,22 @@ enum PersistedSessionEventKind {
         summary: String,
         compacted_through_sequence: u64,
     },
+    MilestoneEvaluationRequested {
+        request: bcode_session_models::SessionMilestoneEvaluationRequest,
+    },
+    MilestonePublicationRequested {
+        request: bcode_session_models::SessionMilestonePublicationRequest,
+    },
+    MilestonePublished {
+        milestone: bcode_session_models::SessionMilestone,
+    },
+    MilestoneEvaluationCompleted {
+        completion: bcode_session_models::SessionMilestoneEvaluationCompletion,
+    },
+    AutomaticTitleUpdated {
+        evaluation_id: String,
+        title: String,
+    },
     SessionRenamed {
         name: Option<String>,
     },
@@ -548,6 +564,31 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
     #[allow(clippy::too_many_lines)]
     fn from(value: &SessionEventKind) -> Self {
         match value {
+            SessionEventKind::MilestoneEvaluationRequested { request } => {
+                Self::MilestoneEvaluationRequested {
+                    request: request.clone(),
+                }
+            }
+            SessionEventKind::MilestonePublicationRequested { request } => {
+                Self::MilestonePublicationRequested {
+                    request: request.clone(),
+                }
+            }
+            SessionEventKind::MilestonePublished { milestone } => Self::MilestonePublished {
+                milestone: milestone.clone(),
+            },
+            SessionEventKind::MilestoneEvaluationCompleted { completion } => {
+                Self::MilestoneEvaluationCompleted {
+                    completion: completion.clone(),
+                }
+            }
+            SessionEventKind::AutomaticTitleUpdated {
+                evaluation_id,
+                title,
+            } => Self::AutomaticTitleUpdated {
+                evaluation_id: evaluation_id.clone(),
+                title: title.clone(),
+            },
             SessionEventKind::SessionChildrenReconciled { verified_children } => {
                 Self::SessionChildrenReconciled {
                     verified_children: *verified_children,
@@ -1145,6 +1186,25 @@ impl PersistedSessionEventKind {
             } => SessionEventKind::ContextCompacted {
                 summary,
                 compacted_through_sequence,
+            },
+            Self::MilestoneEvaluationRequested { request } => {
+                SessionEventKind::MilestoneEvaluationRequested { request }
+            }
+            Self::MilestonePublicationRequested { request } => {
+                SessionEventKind::MilestonePublicationRequested { request }
+            }
+            Self::MilestonePublished { milestone } => {
+                SessionEventKind::MilestonePublished { milestone }
+            }
+            Self::MilestoneEvaluationCompleted { completion } => {
+                SessionEventKind::MilestoneEvaluationCompleted { completion }
+            }
+            Self::AutomaticTitleUpdated {
+                evaluation_id,
+                title,
+            } => SessionEventKind::AutomaticTitleUpdated {
+                evaluation_id,
+                title,
             },
             Self::SessionRenamed { name } => SessionEventKind::SessionRenamed { name },
             Self::TraceEvent { trace } => SessionEventKind::TraceEvent { trace },

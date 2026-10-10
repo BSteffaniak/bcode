@@ -61,6 +61,8 @@ pub fn session_summary_from_catalog_row(
         name: name.clone(),
         explicit_name: name,
         derived_title: None,
+        automatic_title: None,
+        automatic_title_source_sequence: None,
         title_source: SessionTitleSource::Explicit,
         client_count: 0,
         created_at_ms: required_i64(row, "created_at_ms").map(i64_to_u64)?,

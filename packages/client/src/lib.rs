@@ -7340,6 +7340,43 @@ impl BcodeClient {
         }
     }
 
+    /// Explicitly request optional configured milestone generation. No prompt is supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unavailable generation, rejected admission, or IPC failure.
+    pub async fn generate_session_milestone(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bcode_ipc::SessionMilestoneGenerationOutcome, ClientError> {
+        match self
+            .send_request(Request::GenerateSessionMilestone { session_id })
+            .await?
+        {
+            ResponsePayload::SessionMilestoneGenerated { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one bounded page of canonical milestones. This never invokes a model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid query, unavailable canonical storage, or IPC failure.
+    pub async fn session_milestones(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionMilestoneQuery,
+    ) -> Result<bcode_session_models::SessionMilestonePage, ClientError> {
+        match self
+            .send_request(Request::SessionMilestones { session_id, query })
+            .await?
+        {
+            ResponsePayload::SessionMilestones { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Capture a bounded stable source snapshot for generic derivation.
     ///
     /// # Errors

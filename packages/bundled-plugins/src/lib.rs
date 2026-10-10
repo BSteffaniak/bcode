@@ -267,6 +267,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(read_plugin());
     #[cfg(feature = "static-bundled-session-derivation-plugin")]
     plugins.push(session_derivation_plugin());
+    #[cfg(feature = "static-bundled-session-milestones-plugin")]
+    plugins.push(session_milestones_plugin());
     #[cfg(feature = "static-bundled-shell-plugin")]
     plugins.push(shell_plugin());
     #[cfg(feature = "static-bundled-compressed-session-search-plugin")]
@@ -459,6 +461,14 @@ fn session_derivation_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/session-derivation-plugin/bcode-plugin.toml"),
         bcode_session_derivation_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-session-milestones-plugin")]
+fn session_milestones_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/session-milestones-plugin/bcode-plugin.toml"),
+        bcode_session_milestones_plugin::static_plugin(),
     )
 }
 

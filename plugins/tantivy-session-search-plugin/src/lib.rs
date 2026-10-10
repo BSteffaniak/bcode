@@ -61,6 +61,7 @@ struct ProviderConfig {
     quota_bytes: u64,
     writer_memory_bytes: usize,
     sensitive_content: BTreeSet<SearchContentKind>,
+    index_milestones: bool,
 }
 
 impl Default for ProviderConfig {
@@ -70,6 +71,7 @@ impl Default for ProviderConfig {
             quota_bytes: DEFAULT_QUOTA_BYTES,
             writer_memory_bytes: DEFAULT_WRITER_MEMORY_BYTES,
             sensitive_content: BTreeSet::new(),
+            index_milestones: true,
         }
     }
 }
@@ -110,6 +112,11 @@ impl ProviderConfig {
             SearchContentKind::Compaction,
         ]);
         content.extend(self.sensitive_content.iter().copied());
+        if self.index_milestones {
+            content.insert(SearchContentKind::Milestone);
+        } else {
+            content.remove(&SearchContentKind::Milestone);
+        }
         content
     }
 }
@@ -1209,9 +1216,12 @@ fn build_text_query(
     use bcode_session_search::SessionSearchQuery;
     match query {
         SessionSearchQuery::Text { text, mode, fields } => {
-            if !fields.is_empty() && !fields.contains(&SearchField::Text) {
+            if fields
+                .iter()
+                .any(|field| !matches!(field, SearchField::Title | SearchField::Text))
+            {
                 return Err(ProviderError::configuration(
-                    "this provider searches normalized record text only".to_owned(),
+                    "this provider supports title and text match fields".to_owned(),
                 ));
             }
             let mut parser = QueryParser::for_index(&engine.index, vec![engine.fields.text]);
@@ -1228,7 +1238,21 @@ fn build_text_query(
                 TextMatchMode::Regex => format!("text:/{text}/"),
                 TextMatchMode::Fuzzy => escape_query_text(text),
             };
-            parser.parse_query(&encoded).map_err(ProviderError::index)
+            let text_query = parser.parse_query(&encoded).map_err(ProviderError::index)?;
+            if fields.is_empty() {
+                return Ok(text_query);
+            }
+            Ok(Box::new(BooleanQuery::intersection(vec![
+                text_query,
+                Box::new(TermSetQuery::new(
+                    fields
+                        .iter()
+                        .map(|field| {
+                            Term::from_field_text(engine.fields.matched_field, field_name(*field))
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            ])))
         }
         SessionSearchQuery::And { clauses } => Ok(Box::new(BooleanQuery::intersection(
             clauses
@@ -1603,6 +1627,7 @@ fn escape_query_text(text: &str) -> String {
 const fn content_kind_name(kind: SearchContentKind) -> &'static str {
     match kind {
         SearchContentKind::SessionTitle => "session_title",
+        SearchContentKind::Milestone => "milestone",
         SearchContentKind::UserMessage => "user_message",
         SearchContentKind::AssistantMessage => "assistant_message",
         SearchContentKind::AssistantReasoning => "assistant_reasoning",
@@ -1622,6 +1647,7 @@ const fn content_kind_name(kind: SearchContentKind) -> &'static str {
 
 fn parse_content_kind(value: &str) -> Result<SearchContentKind, ProviderError> {
     [
+        SearchContentKind::Milestone,
         SearchContentKind::SessionTitle,
         SearchContentKind::UserMessage,
         SearchContentKind::AssistantMessage,
@@ -1729,6 +1755,39 @@ mod tests {
     use bcode_session_search::{
         SearchCanonicalGeneration, SessionSearchFilters, SessionSearchQuery, SessionSearchRecord,
     };
+
+    #[test]
+    fn milestone_policy_is_independent_and_retained_state_is_not_purged() {
+        let enabled = ProviderConfig::default();
+        assert!(
+            enabled
+                .allowed_content()
+                .contains(&SearchContentKind::Milestone)
+        );
+        let disabled = ProviderConfig {
+            index_milestones: false,
+            ..enabled.clone()
+        };
+        assert!(
+            !disabled
+                .allowed_content()
+                .contains(&SearchContentKind::Milestone)
+        );
+        assert!(
+            disabled
+                .allowed_content()
+                .contains(&SearchContentKind::UserMessage)
+        );
+        let state = PersistedProviderState::new(&enabled);
+        assert!(state.validate(&disabled).is_err());
+        assert!(state.content_kinds.contains(&SearchContentKind::Milestone));
+        assert_eq!(content_kind_name(SearchContentKind::Milestone), "milestone");
+        assert_eq!(
+            parse_content_kind("milestone").expect("milestone category"),
+            SearchContentKind::Milestone
+        );
+        assert!(parse_content_kind("future_milestone").is_err());
+    }
 
     fn config(root: &Path) -> ProviderConfig {
         ProviderConfig {
@@ -1846,6 +1905,30 @@ mod tests {
         assert!(response.error.is_none());
         assert!(configured_root.exists());
         assert!(!managed_root.exists());
+    }
+
+    #[test]
+    fn milestone_header_and_description_are_searchable_by_stable_fields() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        let engine = SearchEngine::open(root.path().to_path_buf(), &config).expect("engine");
+        let session_id = SessionId::new();
+        let mut header = record(session_id, 7, "Durable checkpoint");
+        header.content_kind = SearchContentKind::Milestone;
+        header.field = Some(SearchField::Title);
+        let mut description = record(session_id, 8, "Durable checkpoint description");
+        description.content_kind = SearchContentKind::Milestone;
+        index_records(&engine, &[header, description]);
+        for field in [SearchField::Title, SearchField::Text] {
+            let mut query = request("Durable");
+            query.filters.content_kinds = BTreeSet::from([SearchContentKind::Milestone]);
+            query.query = SessionSearchQuery::Text {
+                text: "Durable".to_owned(),
+                mode: TextMatchMode::Terms,
+                fields: BTreeSet::from([field]),
+            };
+            assert_eq!(search_count(&engine, &query), 1);
+        }
     }
 
     #[test]

@@ -61,6 +61,8 @@ fn acceptance_session(session_id: SessionId) -> SessionSummary {
         name: Some("HyperChad acceptance fixture".to_owned()),
         explicit_name: Some("HyperChad acceptance fixture".to_owned()),
         derived_title: None,
+        automatic_title: None,
+        automatic_title_source_sequence: None,
         title_source: SessionTitleSource::Explicit,
         client_count: 1,
         created_at_ms: 1,

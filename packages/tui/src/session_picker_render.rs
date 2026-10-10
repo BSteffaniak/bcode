@@ -300,6 +300,8 @@ mod tests {
                 name: Some("Design review".to_owned()),
                 explicit_name: None,
                 derived_title: None,
+                automatic_title: None,
+                automatic_title_source_sequence: None,
                 title_source: SessionTitleSource::Explicit,
                 client_count: 0,
                 created_at_ms: 1,

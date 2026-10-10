@@ -1121,6 +1121,7 @@ impl SessionView {
         replacement.streaming_presentation_policy = self.streaming_presentation_policy;
         replacement.terminal_interactions = self.terminal_interactions.clone();
         replacement.snapshot.session_id = previous.session_id;
+        replacement.snapshot.session_summary = previous.session_summary;
         replacement.snapshot.title = previous.title;
         replacement.snapshot.working_directory = previous.working_directory;
         replacement.snapshot.permissions = previous.permissions;
@@ -1135,7 +1136,6 @@ impl SessionView {
         replacement.unattributed_cost = self.unattributed_cost.clone();
         replacement.usage_cost_revision = self.usage_cost_revision;
         replacement.usage_checkpoint = self.usage_checkpoint;
-        replacement.snapshot.session_summary = previous.session_summary;
         replacement.snapshot.transcript.source_start_sequence =
             previous.transcript.source_start_sequence;
         replacement.snapshot.transcript.source_end_sequence =
@@ -2485,8 +2485,41 @@ impl SessionView {
                     },
                 );
             }
+            SessionEventKind::AutomaticTitleUpdated { title, .. } => {
+                if let Some(summary) = self.snapshot.session_summary.as_mut() {
+                    if summary
+                        .automatic_title_source_sequence
+                        .is_some_and(|sequence| sequence >= event.sequence)
+                    {
+                        return;
+                    }
+                    summary.automatic_title = Some(title.clone());
+                    summary.automatic_title_source_sequence = Some(event.sequence);
+                    if summary.explicit_name.is_none() {
+                        summary.title_source =
+                            bcode_session_models::SessionTitleSource::AutomaticMilestone;
+                        self.snapshot.title = Some(title.clone());
+                    }
+                    self.bump_revision();
+                }
+            }
             SessionEventKind::SessionRenamed { name } => {
-                self.snapshot.title.clone_from(name);
+                if let Some(summary) = self.snapshot.session_summary.as_mut() {
+                    summary.explicit_name.clone_from(name);
+                    summary.name.clone_from(name);
+                    summary.title_source = if summary.explicit_name.is_some() {
+                        bcode_session_models::SessionTitleSource::Explicit
+                    } else if summary.automatic_title.is_some() {
+                        bcode_session_models::SessionTitleSource::AutomaticMilestone
+                    } else if summary.derived_title.is_some() {
+                        bcode_session_models::SessionTitleSource::FirstUserMessage
+                    } else {
+                        bcode_session_models::SessionTitleSource::EmptyDraft
+                    };
+                    self.snapshot.title = summary.title().map(ToOwned::to_owned);
+                } else {
+                    self.snapshot.title.clone_from(name);
+                }
                 self.bump_revision();
             }
             _ => {}

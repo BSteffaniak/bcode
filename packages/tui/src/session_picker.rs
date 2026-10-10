@@ -932,6 +932,8 @@ mod tests {
             name: Some(title.to_owned()),
             explicit_name: None,
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: bcode_session_models::SessionTitleSource::Explicit,
             client_count: 0,
             created_at_ms: 1,

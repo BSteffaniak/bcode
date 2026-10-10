@@ -10,6 +10,7 @@
 //! captured before that request was sent rather than inferred from later session history.
 
 pub(crate) mod artifact_operations;
+mod auxiliary_generation;
 #[cfg(test)]
 mod child_session_ipc_tests;
 mod context_accounting;
@@ -18,6 +19,7 @@ mod image_input;
 mod interaction_operations;
 mod invariant_guidance;
 mod judgement;
+mod milestones;
 mod model_check;
 mod model_evidence;
 mod model_ignores;
@@ -32,6 +34,7 @@ mod session_bulk_migration;
 mod session_compression;
 mod session_operations;
 mod session_search_operations;
+mod settled_turn_observers;
 pub mod storage_maintenance;
 pub mod storage_maintenance_worker;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -6448,6 +6451,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RalphRunStatus(_) => "ralph_run_status",
         Request::RecordRalphLifecycle(_) => "record_ralph_lifecycle",
         Request::ImportExternalSession { .. } => "import_external_session",
+        Request::GenerateSessionMilestone { .. } => "generate_session_milestone",
+        Request::SessionMilestones { .. } => "session_milestones",
         Request::SessionDerivationSnapshot { .. } => "session_derivation_snapshot",
         Request::SessionDerivationPrompts { .. } => "session_derivation_prompts",
         Request::DeriveSession { .. } => "derive_session",
@@ -7053,14 +7058,42 @@ async fn handle_request_inner(
         SessionLifecycleRequest::InvocationInput { session_id, input } => {
             handle_invocation_input(request_id, client_id, state, writer, session_id, input).await
         }
+        SessionLifecycleRequest::SessionMilestones { session_id, query } => {
+            let response = Box::pin(state.sessions.session_milestones(session_id, query))
+                .await
+                .map_or_else(
+                    |_| {
+                        Response::Err(ErrorResponse::new(
+                            "milestones_unavailable",
+                            "Canonical milestones unavailable; inspect session compatibility.",
+                        ))
+                    },
+                    |page| Response::Ok(ResponsePayload::SessionMilestones { page }),
+                );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::GenerateSessionMilestone { session_id } => {
+            let generated = Box::pin(handle_explicit_session_milestone(state, session_id)).await;
+            let response = generated.map_or_else(
+                |_| Response::Err(ErrorResponse::new("milestone_generation_failed", "Milestone generation unavailable; check enabled policy and model selection.")),
+                |result| Response::Ok(ResponsePayload::SessionMilestoneGenerated { result: bcode_ipc::SessionMilestoneGenerationOutcome { success: result.success, text: result.text } }),
+            );
+            send_response(writer, request_id, response).await
+        }
         SessionLifecycleRequest::SessionDerivationSnapshot { session_id } => {
-            handle_session_derivation_snapshot(request_id, state, writer, session_id).await
+            Box::pin(handle_session_derivation_snapshot(
+                request_id, state, writer, session_id,
+            ))
+            .await
         }
         SessionLifecycleRequest::SessionDerivationPrompts { session_id, query } => {
-            handle_session_derivation_prompts(request_id, state, writer, session_id, query).await
+            Box::pin(handle_session_derivation_prompts(
+                request_id, state, writer, session_id, query,
+            ))
+            .await
         }
         SessionLifecycleRequest::DeriveSession { request } => {
-            handle_derive_session(request_id, state, writer, *request).await
+            Box::pin(handle_derive_session(request_id, state, writer, *request)).await
         }
         SessionLifecycleRequest::SessionDerivationStatus { operation_id } => {
             handle_session_derivation_status(request_id, state, writer, operation_id).await
@@ -7069,7 +7102,10 @@ async fn handle_request_inner(
             handle_cancel_session_derivation(request_id, state, writer, operation_id).await
         }
         SessionLifecycleRequest::SessionHistory { session_id } => {
-            handle_session_history(request_id, client_id, state, writer, session_id).await
+            Box::pin(handle_session_history(
+                request_id, client_id, state, writer, session_id,
+            ))
+            .await
         }
         SessionLifecycleRequest::RepriceSession {
             session_id,
@@ -20554,6 +20590,7 @@ async fn run_model_turn_lifecycle(
     if let Err(error) = cancel_pending_turn_submissions(state, session_id, &turn_id).await {
         tracing::warn!(%session_id, %error, "terminal turn pending steering cancellation deferred");
     }
+    let observer_cancel_requested = cancel_state.is_cancelled();
     finish_current_turn(command_context).await;
     if cancel_state
         .settled_tool_observations
@@ -20594,7 +20631,7 @@ async fn run_model_turn_lifecycle(
             ],
         );
     }
-    append_model_turn_finished_event(
+    let terminal_persisted = append_model_turn_finished_event(
         state,
         session_id,
         turn_id,
@@ -20603,7 +20640,19 @@ async fn run_model_turn_lifecycle(
     )
     .await;
     drop(terminal_guard);
-    service_runtime_priority_commands(state, session_id, command_context).await;
+    if let Some(mut facts) =
+        settled_turn_observers::facts(trigger_event, completion.outcome, recovering)
+    {
+        facts.cancellation_requested = observer_cancel_requested;
+        Box::pin(settled_turn_observers::dispatch_after_settlement(
+            state,
+            facts,
+            terminal_persisted,
+            &model_work_id,
+            command_context,
+        ))
+        .await;
+    }
     finish_registered_runtime_work(
         state,
         session_id,
@@ -40168,6 +40217,42 @@ async fn cancel_registered_runtime_work(
     true
 }
 
+async fn handle_explicit_session_milestone(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<bcode_plugin_sdk::milestones::MilestonesHostResponse, String> {
+    let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+    let work_id = WorkId::new(format!("auxiliary:{}", uuid::Uuid::new_v4()));
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+        .await
+        .map_err(|_| "milestone ownership unavailable".to_owned())?;
+    let mut spec = RuntimeWorkSpec::new(
+        work_id.clone(),
+        RuntimeWorkKind::PluginInvocation,
+        "Session milestone evaluation".into(),
+        CancellationHandle::ServiceCall(cancellation.clone()),
+    );
+    spec.ownership = Some(ownership);
+    state.runtime_work.start(session_id, spec).await;
+    let result = Box::pin(milestones::handle(
+        state,
+        bcode_plugin_sdk::milestones::MilestonesHostRequest::Generate { session_id },
+        cancellation.clone(),
+    ))
+    .await;
+    let status = if cancellation.is_cancelled() {
+        RuntimeWorkStatus::Cancelled
+    } else if result.is_ok() {
+        RuntimeWorkStatus::Completed
+    } else {
+        RuntimeWorkStatus::Failed
+    };
+    finish_registered_runtime_work(state, session_id, work_id, status, None).await;
+    result
+}
+
 async fn finish_registered_runtime_work(
     state: &ServerState,
     session_id: SessionId,
@@ -40444,14 +40529,20 @@ async fn append_model_turn_finished_event(
     turn_id: String,
     outcome: ModelTurnOutcome,
     message: Option<String>,
-) {
+) -> bool {
     match state
         .sessions
         .append_model_turn_finished(session_id, turn_id, outcome, message)
         .await
     {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append model turn finish: {error}"),
+        Ok(event) => {
+            publish_session_event(state, &event).await;
+            true
+        }
+        Err(error) => {
+            tracing::warn!("failed to append model turn finish: {error}");
+            false
+        }
     }
 }
 
@@ -40674,16 +40765,80 @@ fn command_invocation_session(
 }
 
 async fn resolve_command_plugin_bridge_request(
-    sessions: &SessionManager,
+    state: &ServerState,
     authorized_session_id: Option<SessionId>,
     request: ServiceBridgeRequest,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<ServiceBridgeResponse, String> {
+    resolve_session_plugin_application_request(
+        state,
+        authorized_session_id,
+        request,
+        cancellation,
+        false,
+    )
+    .await
+}
+
+async fn resolve_session_plugin_application_request(
+    state: &ServerState,
+    authorized_session_id: Option<SessionId>,
+    request: ServiceBridgeRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    settled_observer: bool,
 ) -> Result<ServiceBridgeResponse, String> {
     let ServiceBridgeRequest::InvokeService(request) = request else {
         return Err(
             "command invocation bridge supports nested application services only".to_owned(),
         );
     };
+    if request.interface_id == bcode_plugin_sdk::milestones::MILESTONES_HOST_INTERFACE_ID {
+        let payload =
+            serde_json::from_value::<bcode_plugin_sdk::milestones::MilestonesHostRequest>(
+                request.payload,
+            )
+            .map_err(|_| "invalid milestone request".to_owned())?;
+        if matches!(
+            &payload,
+            bcode_plugin_sdk::milestones::MilestonesHostRequest::EvaluateSettled { .. }
+        ) && !settled_observer
+        {
+            return Err("automatic evaluation requires settled observer authority".into());
+        }
+        let target = match &payload {
+            bcode_plugin_sdk::milestones::MilestonesHostRequest::Read { session_id }
+            | bcode_plugin_sdk::milestones::MilestonesHostRequest::Generate { session_id }
+            | bcode_plugin_sdk::milestones::MilestonesHostRequest::EvaluateSettled { session_id } => {
+                *session_id
+            }
+        };
+        if authorized_session_id != Some(target) {
+            return Err("milestone request requires matching canonical command context".into());
+        }
+        let operation: Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            bcode_plugin_sdk::milestones::MilestonesHostResponse,
+                            String,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(milestones::handle(state, payload, cancellation.clone()));
+        let result = operation.await;
+        return Ok(ServiceBridgeResponse::Service(match result {
+            Ok(result) => bcode_tool::ToolInvocationServiceResolution::Responded {
+                payload: serde_json::to_value(result)
+                    .map_err(|_| "milestone response encoding failed")?,
+            },
+            Err(_) => bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "milestone_unavailable".into(),
+                message: "Milestone operation unavailable.".into(),
+            },
+        }));
+    }
+    let sessions = &state.sessions;
     if request.interface_id != bcode_plugin_sdk::SESSION_DERIVATION_INTERFACE_ID {
         return Ok(ServiceBridgeResponse::Service(
             bcode_tool::ToolInvocationServiceResolution::Unsupported,
@@ -40822,7 +40977,17 @@ async fn derive_with_invocation_cancellation(
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<bcode_session_models::SessionDerivationTerminalOutcome, SessionError> {
     let operation_id = request.operation_id;
-    let derive = sessions.derive_session(request);
+    let derive: Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        bcode_session_models::SessionDerivationTerminalOutcome,
+                        SessionError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > = Box::pin(sessions.derive_session(request));
     tokio::pin!(derive);
     loop {
         tokio::select! {
@@ -40929,6 +41094,11 @@ fn session_event_metric_labels(event: &bcode_session_models::SessionEvent) -> Me
 
 const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
     match kind {
+        SessionEventKind::MilestoneEvaluationRequested { .. } => "milestone_evaluation_requested",
+        SessionEventKind::MilestonePublicationRequested { .. } => "milestone_publication_requested",
+        SessionEventKind::MilestonePublished { .. } => "milestone_published",
+        SessionEventKind::MilestoneEvaluationCompleted { .. } => "milestone_evaluation_completed",
+        SessionEventKind::AutomaticTitleUpdated { .. } => "automatic_title_updated",
         SessionEventKind::SessionCreated { .. } => "session_created",
         SessionEventKind::ClientAttached { .. } => "client_attached",
         SessionEventKind::ClientDetached { .. } => "client_detached",
@@ -42788,6 +42958,8 @@ mod tests {
         );
 
         let missing = SessionSummary {
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             parent_id: None,
             id: SessionId::new(),
             name: Some("missing".to_owned()),
@@ -59928,8 +60100,13 @@ library = "test"
             .expect("prepare")
             .expect("prepared");
         let child = sessions
-            .create_fresh_execution_session(
-                None,
+            .create_child_execution_session(
+                bcode_session_models::SessionChildCreateRequest {
+                    child_id: SessionId::new(),
+                    parent_id: parent.id,
+                    name: None,
+                    working_directory: parent.working_directory.clone(),
+                },
                 ExecutionSessionProvenance {
                     version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
                     owner: "bcode.workflow".to_owned(),
@@ -59942,7 +60119,6 @@ library = "test"
                     workspace_snapshot: Some("snapshot".to_owned()),
                     parent_generation: None,
                 },
-                None,
             )
             .await
             .expect("child");
@@ -62151,12 +62327,32 @@ library = "test"
             Err(ServerError::WorkflowOwnedByLiveDaemon { .. })
         ));
         drop(ownership);
-        state
+        // Guard drop queues an actor release on a separate channel. A command can
+        // win the actor's select before that release, so verify its consumption.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = state
+                    .sessions
+                    .session_ownership_snapshot(parent_id)
+                    .await
+                    .expect("ownership snapshot");
+                if snapshot.guards.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped publication ownership guards must be consumed");
+        let release = state
             .sessions
             .release_session_ownership(parent_id)
             .await
             .expect("release");
-        assert!(!state.sessions.session_is_owned(parent_id).await);
+        assert!(
+            !state.sessions.session_is_owned(parent_id).await,
+            "{release:?}"
+        );
         // No background owner may remain when this fixture simulates daemon exit.
         drop(
             Arc::get_mut(state)
@@ -62328,7 +62524,7 @@ library = "test"
             .expect("exclusive server")
             .daemon_status
             .state_location_id = old_location;
-        assert!(!state.sessions.session_is_owned(parent).await);
+        wait_for_released_fixture_ownership(&state, parent).await;
         shutdown_publication_owner(&state).await;
         drop(state);
         let replacement = workflow_operations::execution_authority(&competing, "edit-run")
@@ -63104,6 +63300,16 @@ library = "test"
             task.abort();
             let _ = task.await;
         }
+    }
+
+    async fn wait_for_released_fixture_ownership(state: &ServerState, session_id: SessionId) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.sessions.session_is_owned(session_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released ownership snapshot propagated");
     }
 
     async fn shutdown_publication_owner(state: &Arc<ServerState>) {
@@ -97819,7 +98025,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            ["workflow.execution_context"]
+            [
+                "workflow.execution_context",
+                "workflow.contributor_evidence"
+            ]
         );
         let invalid = bcode_model::ToolCall {
             id: "invalid".into(),

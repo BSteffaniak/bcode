@@ -26,6 +26,8 @@ pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
 pub mod contexts;
 pub mod edit;
 pub mod judgement;
+pub mod milestones;
+pub use milestones::MilestonesConfig;
 /// Versioned remembered startup choices and optional fallback support.
 pub mod startup;
 pub use judgement::{JudgementConfig, JudgementMode};
@@ -230,6 +232,9 @@ pub struct BcodeConfig {
     /// Global and per-feature optional judgement policy.
     #[serde(default)]
     pub judgement: JudgementConfig,
+    /// Explicit paid session milestone generation policy.
+    #[serde(default)]
+    pub milestones: MilestonesConfig,
     #[serde(default)]
     pub model: ModelConfig,
     /// Per-agent permission and tool configuration.
@@ -295,6 +300,7 @@ impl Default for BcodeConfig {
             plugins: PluginConfig::default(),
             model: ModelConfig::default(),
             judgement: JudgementConfig::default(),
+            milestones: MilestonesConfig::default(),
             agent: BTreeMap::new(),
             auth: AuthConfig::default(),
             onboarding: OnboardingConfig::default(),
@@ -340,6 +346,10 @@ impl ConfigDocSchema for BcodeConfig {
                 "Config composition metadata and profile selection.",
             ),
             schema_section_doc::<PluginConfig>("plugins", "Bundled and external plugin selection."),
+            schema_section_doc::<MilestonesConfig>(
+                "milestones",
+                "Explicit opt-in paid session milestone generation.",
+            ),
             schema_section_doc::<ModelConfig>(
                 "model",
                 "Model provider, profile, alias, metadata, retry, and compaction settings.",

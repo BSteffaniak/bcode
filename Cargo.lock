@@ -1571,6 +1571,7 @@ dependencies = [
  "bcode_question_plugin",
  "bcode_read_plugin",
  "bcode_session_derivation_plugin",
+ "bcode_session_milestones_plugin",
  "bcode_shell_plugin",
  "bcode_skills_plugin",
  "bcode_tantivy_session_search_plugin",
@@ -2636,6 +2637,7 @@ dependencies = [
  "bcode_session_import",
  "bcode_session_migration",
  "bcode_session_migration_target",
+ "bcode_session_milestones_plugin",
  "bcode_session_models",
  "bcode_session_search",
  "bcode_session_view",
@@ -2760,6 +2762,19 @@ dependencies = [
  "bcode_session_models",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bcode_session_milestones_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_command",
+ "bcode_config",
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_tool",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

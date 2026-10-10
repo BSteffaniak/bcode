@@ -432,6 +432,10 @@ pub enum TuiEffect {
         /// Initially focused setting.
         focus: super::thinking_dialog::ThinkingDialogFocus,
     },
+    /// Load one bounded canonical milestone page for timeline navigation.
+    LoadMilestones {
+        request: super::timeline_dialog::MilestonePageRequest,
+    },
     /// Load a bounded history window around a timeline entry.
     LoadTimelineJump {
         /// Active session.
@@ -870,6 +874,13 @@ pub enum TuiEffectResult {
         /// Loaded model status.
         result: Result<bcode_model::SessionModelStatus, ClientError>,
     },
+    /// Canonical milestones loaded without generation.
+    MilestonesLoaded {
+        /// Exact terminal-only request identity.
+        request: super::timeline_dialog::MilestonePageRequest,
+        /// Bounded canonical page.
+        result: Result<bcode_session_models::SessionMilestonePage, ClientError>,
+    },
     /// Bounded timeline jump history loaded.
     TimelineJumpLoaded {
         /// Session for which the jump was requested.
@@ -1071,6 +1082,7 @@ impl TuiEffectResult {
             | Self::SearchIndexingWaited { .. }
             | Self::SlashCommandExecuted { .. }
             | Self::ThinkingDialogLoaded { .. }
+            | Self::MilestonesLoaded { .. }
             | Self::TimelineJumpLoaded { .. }
             | Self::PluginCommandInvoked { .. } => DaemonObservation::None,
             Self::RalphAction { result, .. } => DaemonObservation::from_tui_result(result),
@@ -1385,6 +1397,7 @@ impl TuiEffect {
             | Self::LoadSkillPicker
             | Self::DescribeSkill { .. }
             | Self::LoadThinkingDialog { .. }
+            | Self::LoadMilestones { .. }
             | Self::LoadTimelineJump { .. }
             | Self::InvokePluginCommand { .. } => {
                 unreachable!("daemon start failure for non-foreground effect")
@@ -1457,6 +1470,7 @@ impl TuiEffect {
             | Self::LoadSkillPicker
             | Self::DescribeSkill { .. }
             | Self::LoadThinkingDialog { .. }
+            | Self::LoadMilestones { .. }
             | Self::LoadTimelineJump { .. } => EffectDaemonIntent::Background,
         }
     }
@@ -1697,7 +1711,7 @@ impl TuiEffect {
             Self::LoadSkillPicker => EffectKey::SkillPicker,
             Self::DescribeSkill { .. } => EffectKey::SkillDescription,
             Self::LoadThinkingDialog { .. } => EffectKey::ThinkingDialog,
-            Self::LoadTimelineJump { .. } => EffectKey::TimelineJump,
+            Self::LoadMilestones { .. } | Self::LoadTimelineJump { .. } => EffectKey::TimelineJump,
             Self::InvokePluginCommand {
                 plugin_id,
                 command_id,
@@ -2242,6 +2256,18 @@ impl TuiEffect {
             Self::DescribeSkill { skill_id } => TuiEffectResult::SkillDescribed {
                 skill_id: skill_id.clone(),
                 result: client.describe_skill(skill_id).await,
+            },
+            Self::LoadMilestones { request } => TuiEffectResult::MilestonesLoaded {
+                request,
+                result: client
+                    .session_milestones(
+                        request.session_id,
+                        bcode_session_models::SessionMilestoneQuery {
+                            after_sequence: request.after_sequence,
+                            limit: 200,
+                        },
+                    )
+                    .await,
             },
             Self::LoadThinkingDialog { session_id, focus } => {
                 let result = match session_id {

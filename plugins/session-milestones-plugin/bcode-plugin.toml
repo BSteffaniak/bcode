@@ -1,0 +1,27 @@
+categories = ["session", "commands"]
+id         = "bcode.session-milestones"
+name       = "Bcode Session Milestones Plugin"
+version    = "0.0.1"
+
+[[services]]
+class        = "control"
+description  = "Opt-in milestone threshold, prompt and validation policy"
+interface_id = "bcode.session-milestones/v1"
+name         = "Session Milestones Policy"
+
+[[services]]
+class        = "control"
+description  = "Read or explicitly generate session milestones"
+interface_id = "bcode.command/v1"
+name         = "Session Milestones Commands"
+
+[[services]]
+class        = "control"
+interface_id = "bcode.settled-turn-observer/v1"
+name         = "Settled conversation milestone policy"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_session_milestones_plugin.dylib"
+type         = "native"

@@ -4704,7 +4704,8 @@ impl BmuxApp {
                 old_working_directory,
                 new_working_directory: _,
             } => self.apply_working_directory_changed(event.sequence, old_working_directory),
-            SessionEventKind::SessionRenamed { .. } => self.apply_shared_session_renamed(),
+            SessionEventKind::SessionRenamed { .. }
+            | SessionEventKind::AutomaticTitleUpdated { .. } => self.apply_shared_session_renamed(),
             SessionEventKind::SkillSuggested { skill_id, .. } => {
                 self.status = format!("suggested skill: {skill_id}");
             }
@@ -6248,6 +6249,11 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ModelTurnStarted { .. }
         | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
         | SessionEventKind::ModelTurnCancelRequested { .. }
+        | SessionEventKind::MilestoneEvaluationRequested { .. }
+        | SessionEventKind::MilestonePublicationRequested { .. }
+        | SessionEventKind::MilestonePublished { .. }
+        | SessionEventKind::MilestoneEvaluationCompleted { .. }
+        | SessionEventKind::AutomaticTitleUpdated { .. }
         | SessionEventKind::SessionRenamed { .. }
         | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SessionDerived { .. }

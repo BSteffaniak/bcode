@@ -20,6 +20,32 @@ struct GoalEntryHost {
 }
 
 impl PluginTuiHost for GoalEntryHost {
+    fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+        let registry = bcode_bundled_plugins::tui_registry("bcode.loop")?;
+        let resolved = bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+            registry.keymap_actions().to_vec(),
+            BTreeMap::new(),
+        )
+        .ok()?;
+        resolved.action_for_key(scope, stroke).map(str::to_owned)
+    }
+
+    fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+        let Some(registry) = bcode_bundled_plugins::tui_registry("bcode.loop") else {
+            return Vec::new();
+        };
+        let Ok(resolved) = bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+            registry.keymap_actions().to_vec(),
+            BTreeMap::new(),
+        ) else {
+            return Vec::new();
+        };
+        resolved
+            .keys_for_action(scope, action)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
     fn spawn(&self, task: PluginTask) {
         self.tasks.lock().unwrap().push(task);
     }

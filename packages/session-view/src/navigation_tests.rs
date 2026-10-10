@@ -1,4 +1,5 @@
 use super::*;
+use crate::SessionView;
 use bcode_session_models::{SessionLocationSummary, SessionTitleSource};
 
 fn summary(parent_id: Option<SessionId>) -> SessionSummary {
@@ -8,6 +9,8 @@ fn summary(parent_id: Option<SessionId>) -> SessionSummary {
         name: Some("子 👩‍💻 e\u{301}".to_owned()),
         explicit_name: None,
         derived_title: None,
+        automatic_title: None,
+        automatic_title_source_sequence: None,
         title_source: SessionTitleSource::Explicit,
         client_count: 0,
         created_at_ms: 1,
@@ -16,6 +19,114 @@ fn summary(parent_id: Option<SessionId>) -> SessionSummary {
         import: None,
         execution: None,
         location: None,
+    }
+}
+
+#[test]
+fn automatic_titles_preserve_manual_names() {
+    let mut metadata = summary(None);
+    metadata.name = Some("manual".to_owned());
+    metadata.explicit_name = Some("manual".to_owned());
+    let id = metadata.id;
+    let mut view = SessionView::new();
+    view.set_session_summary(metadata);
+    let update = bcode_session_models::SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        provenance: None,
+        session_id: id,
+        sequence: 9,
+        timestamp_ms: 10,
+        kind: bcode_session_models::SessionEventKind::AutomaticTitleUpdated {
+            evaluation_id: "evaluation".to_owned(),
+            title: "generated 子".to_owned(),
+        },
+    };
+    view.apply_event(&update);
+    assert_eq!(view.snapshot().title.as_deref(), Some("manual"));
+    assert_eq!(
+        view.snapshot()
+            .session_summary
+            .as_ref()
+            .unwrap()
+            .automatic_title
+            .as_deref(),
+        Some("generated 子")
+    );
+    let mut automatic = summary(None);
+    automatic.explicit_name = None;
+    automatic.name = None;
+    view.set_session_summary(automatic);
+    let update = bcode_session_models::SessionEvent {
+        session_id: view.snapshot().session_id.unwrap(),
+        sequence: 11,
+        ..update
+    };
+    view.apply_event(&update);
+    assert_eq!(view.snapshot().title.as_deref(), Some("generated 子"));
+    let stale = bcode_session_models::SessionEvent {
+        sequence: 10,
+        kind: bcode_session_models::SessionEventKind::AutomaticTitleUpdated {
+            evaluation_id: "older".to_owned(),
+            title: "stale".to_owned(),
+        },
+        ..update
+    };
+    view.apply_event(&stale);
+    assert_eq!(view.snapshot().title.as_deref(), Some("generated 子"));
+}
+
+#[test]
+fn rename_title_source_tracks_manual_and_fallback_titles() {
+    for (automatic, derived, expected_source, expected_title) in [
+        (
+            Some("automatic 子"),
+            Some("prompt"),
+            SessionTitleSource::AutomaticMilestone,
+            Some("automatic 子"),
+        ),
+        (
+            None,
+            Some("prompt"),
+            SessionTitleSource::FirstUserMessage,
+            Some("prompt"),
+        ),
+        (None, None, SessionTitleSource::EmptyDraft, None),
+    ] {
+        let mut metadata = summary(None);
+        metadata.explicit_name = None;
+        metadata.name = None;
+        metadata.automatic_title = automatic.map(str::to_owned);
+        metadata.derived_title = derived.map(str::to_owned);
+        let id = metadata.id;
+        let mut view = SessionView::new();
+        view.set_session_summary(metadata);
+        for (sequence, name, source, title) in [
+            (
+                20,
+                Some("manual".to_owned()),
+                SessionTitleSource::Explicit,
+                Some("manual"),
+            ),
+            (21, None, expected_source, expected_title),
+        ] {
+            view.apply_event(&bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                provenance: None,
+                session_id: id,
+                sequence,
+                timestamp_ms: sequence,
+                kind: bcode_session_models::SessionEventKind::SessionRenamed { name },
+            });
+            assert_eq!(view.snapshot().title.as_deref(), title);
+            assert_eq!(
+                view.snapshot()
+                    .session_summary
+                    .as_ref()
+                    .unwrap()
+                    .title_source,
+                source
+            );
+        }
     }
 }
 

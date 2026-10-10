@@ -39,29 +39,23 @@ async fn nonresident_session_is_unknown_without_installing_scheduler() {
 
 #[tokio::test]
 async fn observed_failure_does_not_conceal_nonresident_unknown() {
-    let sessions = bcode_session::SessionManager::default();
-    let summary = sessions
+    let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+    let summary = state
+        .sessions
         .create_session(None, std::env::current_dir().unwrap())
         .await
         .unwrap();
-    let state = crate::tests::test_server_state(sessions);
     state
-        .activity_observations
-        .lock()
+        .sessions
+        .append_runtime_work_finished(
+            summary.id,
+            bcode_session_models::WorkId::new("work"),
+            bcode_session_models::RuntimeWorkStatus::Failed,
+            None,
+            None,
+        )
         .await
-        .observe(&bcode_session_models::SessionEvent {
-            session_id: summary.id,
-            sequence: 1,
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            timestamp_ms: 0,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::RuntimeWorkFinished {
-                work_id: bcode_session_models::WorkId::new("work"),
-                status: bcode_session_models::RuntimeWorkStatus::Failed,
-                finished_at_ms: None,
-                message: None,
-            },
-        });
+        .unwrap();
     let mut issues = Vec::new();
     let observed = observe_activity(&state, &summary, &mut issues).await;
     let no_scheduler = state.session_runtimes.lock().await.is_empty();
@@ -79,27 +73,12 @@ async fn complete_empty_evidence_requires_resident_idle_scheduler() {
     use crate::{SessionRuntimeHandle, SessionRuntimePhase};
     use std::sync::{Arc, atomic::AtomicUsize};
     use tokio::sync::{Mutex, mpsc};
-    let sessions = bcode_session::SessionManager::default();
-    let summary = sessions
+    let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+    let summary = state
+        .sessions
         .create_session(None, std::env::current_dir().unwrap())
         .await
         .unwrap();
-    let state = crate::tests::test_server_state(sessions);
-    state
-        .activity_observations
-        .lock()
-        .await
-        .observe(&bcode_session_models::SessionEvent {
-            session_id: summary.id,
-            sequence: 0,
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            timestamp_ms: 0,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::SessionCreated {
-                name: None,
-                working_directory: summary.working_directory.clone(),
-            },
-        });
     let followup_commands = mpsc::channel(1).0;
     let steering_commands = mpsc::channel(1).0;
     let cancel_commands = mpsc::channel(1).0;

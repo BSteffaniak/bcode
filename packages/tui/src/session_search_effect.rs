@@ -152,7 +152,15 @@ pub fn canonical_navigation_target(
             }
             Ok(SessionSearchNavigationTarget {
                 session_id: event.session_id,
-                sequence: event.sequence,
+                sequence: match &event.kind {
+                    bcode_session_models::SessionEventKind::MilestonePublished { milestone } => {
+                        if !milestone.source.is_valid() {
+                            return Err(SessionSearchNavigationUnavailable::InvalidHydration);
+                        }
+                        milestone.source.anchor_sequence
+                    }
+                    _ => event.sequence,
+                },
             })
         }
         SearchHitHydrationOutcome::StaleLocator => {
@@ -344,6 +352,44 @@ mod tests {
     }
 
     #[test]
+    fn milestone_hydration_navigates_source_anchor_not_publication() {
+        let mut hydrated = hydrated_hit(
+            bcode_session_search::SearchHitHydrationOutcome::Hydrated,
+            true,
+        );
+        hydrated.hit.content_kind = bcode_session_search::SearchContentKind::Milestone;
+        hydrated.event.as_mut().unwrap().kind =
+            bcode_session_models::SessionEventKind::MilestonePublished {
+                milestone: bcode_session_models::SessionMilestone {
+                    evaluation_id: "evaluation".to_owned(),
+                    source: bcode_session_models::SessionMilestoneSource {
+                        start_sequence: 2,
+                        end_sequence: 5,
+                        anchor_sequence: 3,
+                    },
+                    header: "子 👩‍💻".to_owned(),
+                    description: "Canonical annotation".to_owned(),
+                    provenance: bcode_session_models::SessionMilestoneProvenance {
+                        provider_id: "provider".to_owned(),
+                        model_id: "model".to_owned(),
+                        input_truncated: false,
+                    },
+                },
+            };
+        assert_eq!(canonical_navigation_target(&hydrated).unwrap().sequence, 3);
+        assert_eq!(hydrated.hit.locator.sequence, 7);
+        if let bcode_session_models::SessionEventKind::MilestonePublished { milestone } =
+            &mut hydrated.event.as_mut().unwrap().kind
+        {
+            milestone.source.anchor_sequence = 6;
+        }
+        assert_eq!(
+            canonical_navigation_target(&hydrated),
+            Err(SessionSearchNavigationUnavailable::InvalidHydration)
+        );
+    }
+
+    #[test]
     fn deleted_changed_and_degraded_hits_cannot_navigate() {
         use bcode_session_search::SearchHitHydrationOutcome;
 
@@ -431,6 +477,8 @@ mod tests {
             name: Some("Canonical title".to_owned()),
             explicit_name: None,
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: bcode_session_models::SessionTitleSource::Explicit,
             client_count: 0,
             created_at_ms: 1,

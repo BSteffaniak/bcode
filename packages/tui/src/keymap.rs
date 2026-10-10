@@ -485,6 +485,18 @@ fn register_control_actions(
         }
     }
 
+    for (id, description, key) in [
+        ("tui.timeline.milestones", "Read milestones", "m"),
+        ("tui.timeline.prompts", "Show user prompts", "p"),
+        ("tui.timeline.nextMilestonePage", "Next milestone page", "n"),
+    ] {
+        registry.register(KeymapAction {
+            id: id.into(),
+            scope: "timeline".into(),
+            description: description.into(),
+            defaults: vec![key.into()],
+        })?;
+    }
     Ok(())
 }
 fn register_model_actions(

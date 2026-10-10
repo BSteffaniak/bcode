@@ -246,6 +246,7 @@ pub struct ChatLoopState {
     theme_picker: Option<super::theme_picker::ThemePickerState>,
     streaming_configurator: Option<super::streaming_configurator::StreamingConfiguratorState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
+    milestone_requests: super::timeline_dialog::MilestonePageRequests,
     plugin_surface: Option<RootPluginSurface>,
     parent_plugin_surface: Option<RootPluginSurface>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
@@ -315,6 +316,7 @@ impl ChatLoopState {
             theme_picker: None,
             streaming_configurator: None,
             timeline_dialog: None,
+            milestone_requests: super::timeline_dialog::MilestonePageRequests::default(),
             plugin_surface: None,
             parent_plugin_surface: None,
             provider_picker: None,
@@ -386,6 +388,7 @@ impl ChatLoopState {
         self.thinking_dialog = None;
         self.theme_picker = None;
         self.timeline_dialog = None;
+        self.milestone_requests.cancel();
         self.provider_picker = None;
         self.model_picker = None;
         self.auth_pool_picker = None;
@@ -1487,6 +1490,38 @@ impl ChatLoopState {
             return TimelineDialogRootOutcome::Unhandled;
         };
         match dialog.handle_key_with_keymap(stroke, keymap) {
+            super::timeline_dialog::TimelineDialogOutcome::Milestones => {
+                if let Some(session_id) = chat.viewing_session_id() {
+                    if let Some(request) = self.milestone_requests.begin(session_id, None, dialog) {
+                        chat.replace_effect(TuiEffect::LoadMilestones { request });
+                    }
+                    chat.app
+                        .set_status("loading canonical milestones…".to_owned());
+                }
+                TimelineDialogRootOutcome::Handled
+            }
+            super::timeline_dialog::TimelineDialogOutcome::NextMilestonePage => {
+                if !self.milestone_requests.is_pending()
+                    && let (Some(session_id), Some(after_sequence)) =
+                        (chat.viewing_session_id(), dialog.next_after_sequence())
+                {
+                    if let Some(request) =
+                        self.milestone_requests
+                            .begin(session_id, Some(after_sequence), dialog)
+                    {
+                        chat.replace_effect(TuiEffect::LoadMilestones { request });
+                    }
+                    chat.app
+                        .set_status("loading next milestone page…".to_owned());
+                }
+                TimelineDialogRootOutcome::Handled
+            }
+            super::timeline_dialog::TimelineDialogOutcome::Prompts => {
+                self.milestone_requests.cancel();
+                *dialog =
+                    super::timeline_dialog::TimelineDialogState::new(chat.app.timeline_entries());
+                TimelineDialogRootOutcome::Handled
+            }
             super::timeline_dialog::TimelineDialogOutcome::Handled => {
                 chat.app.set_status("timeline".to_owned());
                 TimelineDialogRootOutcome::Handled
@@ -1500,6 +1535,7 @@ impl ChatLoopState {
                 )
             }
             super::timeline_dialog::TimelineDialogOutcome::Cancel => {
+                self.milestone_requests.cancel();
                 self.timeline_dialog = None;
                 chat.app.set_status("timeline closed".to_owned());
                 TimelineDialogRootOutcome::Handled
@@ -3379,6 +3415,35 @@ pub fn apply_effect_result(
             }
             Err(error) => report_nonfatal_client_error(chat, "Skill details unavailable", &error),
         },
+        TuiEffectResult::MilestonesLoaded { request, result } => {
+            if loop_state.milestone_requests.accept(
+                request,
+                chat.viewing_session_id(),
+                loop_state.timeline_dialog.as_mut(),
+            ) {
+                match result {
+                    Ok(page) => {
+                        let truncated = page.next_after_sequence.is_some();
+                        if let Some(dialog) = loop_state.timeline_dialog.as_mut() {
+                            dialog.replace_milestone_page(&page);
+                        }
+                        chat.app.set_status(
+                            if truncated {
+                                "milestones: more pages available"
+                            } else {
+                                "milestones: final page"
+                            }
+                            .to_owned(),
+                        );
+                    }
+                    Err(error) => report_nonfatal_tui_error(
+                        chat,
+                        "milestones unavailable",
+                        &TuiError::from(error),
+                    ),
+                }
+            }
+        }
         TuiEffectResult::ThinkingDialogLoaded { focus, result } => match result {
             Ok(mut status) => {
                 if let Some(pending_effort) = chat.app.pending_reasoning_effort() {
@@ -4140,6 +4205,7 @@ fn apply_root_slash_command_outcome(
                 .set_status(format!("host slash route pending root navigation: {route}")),
         },
         SlashCommandOutcome::OpenTimeline => {
+            loop_state.milestone_requests.cancel();
             let entries = if chat.viewing_session_id().is_some() {
                 chat.app.timeline_entries()
             } else {

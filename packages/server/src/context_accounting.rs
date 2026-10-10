@@ -47,7 +47,7 @@ pub fn projected_model_context_chars(
 }
 
 pub fn estimated_tokens_from_chars(chars: usize) -> u64 {
-    u64::try_from(chars).unwrap_or(u64::MAX).saturating_add(3) / 4
+    bcode_session_models::estimated_normalized_text_tokens_from_chars(chars)
 }
 
 pub fn estimated_model_messages_tokens(messages: &[ModelMessage]) -> u64 {

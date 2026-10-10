@@ -177,6 +177,13 @@ pub enum SessionLifecycleRequest {
         session_id: SessionId,
         input: bcode_tool::ToolInvocationInput,
     },
+    GenerateSessionMilestone {
+        session_id: SessionId,
+    },
+    SessionMilestones {
+        session_id: SessionId,
+        query: bcode_session_models::SessionMilestoneQuery,
+    },
     SessionDerivationSnapshot {
         session_id: SessionId,
     },
@@ -1963,6 +1970,15 @@ impl RoutedRequest {
                 external_session_id,
                 working_directory,
             }),
+            Request::GenerateSessionMilestone { session_id } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::GenerateSessionMilestone { session_id },
+            )),
+            Request::SessionMilestones { session_id, query } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionMilestones {
+                    session_id,
+                    query,
+                }))
+            }
             Request::SessionDerivationSnapshot { session_id } => Self::SessionLifecycle(Box::new(
                 SessionLifecycleRequest::SessionDerivationSnapshot { session_id },
             )),

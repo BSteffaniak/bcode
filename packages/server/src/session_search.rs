@@ -1708,6 +1708,32 @@ fn apply_session_summary_attributes(
     record
 }
 
+fn projected_event_fits_batch(
+    records: &[bcode_session_search::SessionSearchRecord],
+    prior_records: usize,
+    prior_text_bytes: usize,
+    capabilities: &bcode_session_search::SessionSearchCapabilities,
+) -> Result<bool, IngestionError> {
+    let text_bytes = records.iter().fold(0_usize, |total, record| {
+        total.saturating_add(usize::try_from(record.indexed_bytes).unwrap_or(usize::MAX))
+    });
+    if records.len() > capabilities.max_batch_records
+        || text_bytes > capabilities.max_batch_text_bytes
+    {
+        return Err(IngestionError::permanent(format!(
+            "provider '{}' cannot ingest canonical event atomically: requires {} records and {text_bytes} text bytes; configured capacity is {} records and {} text bytes; increase provider batch capacity before retrying (checkpoint preserved)",
+            capabilities.provider_id,
+            records.len(),
+            capabilities.max_batch_records,
+            capabilities.max_batch_text_bytes,
+        )));
+    }
+    Ok(
+        prior_records.saturating_add(records.len()) <= capabilities.max_batch_records
+            && prior_text_bytes.saturating_add(text_bytes) <= capabilities.max_batch_text_bytes,
+    )
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn ingest_provider_page(
     state: &ServerState,
@@ -1783,10 +1809,12 @@ async fn ingest_provider_page(
         let projected_text_bytes = projected.iter().fold(0_usize, |total, record| {
             total.saturating_add(usize::try_from(record.indexed_bytes).unwrap_or(usize::MAX))
         });
-        if records.len().saturating_add(projected.len()) > provider.capabilities.max_batch_records
-            || batch_text_bytes.saturating_add(projected_text_bytes)
-                > provider.capabilities.max_batch_text_bytes
-        {
+        if !projected_event_fits_batch(
+            &projected,
+            records.len(),
+            batch_text_bytes,
+            &provider.capabilities,
+        )? {
             break;
         }
         records.extend(projected);
@@ -3926,6 +3954,8 @@ pub(crate) mod tests {
     fn projected_records_use_canonical_summary_scope_without_source_persistence_details() {
         let session_id = SessionId::new();
         let summary = bcode_session_models::SessionSummary {
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             parent_id: None,
             id: session_id,
             name: None,
@@ -3997,6 +4027,8 @@ pub(crate) mod tests {
     fn canonical_generation_fingerprint_binds_identity_import_and_fork_but_not_mutable_metadata() {
         let session_id = SessionId::new();
         let mut summary = bcode_session_models::SessionSummary {
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             parent_id: None,
             id: session_id,
             name: None,
@@ -4244,6 +4276,8 @@ pub(crate) mod tests {
     #[test]
     fn deadline_continuation_resumes_after_last_complete_session() {
         let first = bcode_session_models::SessionSummary {
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             parent_id: None,
             id: SessionId::new(),
             name: Some("first".to_owned()),
@@ -4259,6 +4293,8 @@ pub(crate) mod tests {
             location: None,
         };
         let second = bcode_session_models::SessionSummary {
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             parent_id: None,
             id: SessionId::new(),
             name: Some("second".to_owned()),
@@ -5149,6 +5185,110 @@ pub(crate) mod tests {
                 "session-local failure is retained"
             );
         }
+    }
+
+    #[test]
+    fn atomic_milestone_capacity_failure_preserves_checkpoint_and_records() {
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id: bcode_session_models::SessionId::new(),
+            sequence: 12,
+            timestamp_ms: 123,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::MilestonePublished {
+                milestone: bcode_session_models::SessionMilestone {
+                    evaluation_id: "capacity-test".to_owned(),
+                    source: bcode_session_models::SessionMilestoneSource {
+                        start_sequence: 2,
+                        end_sequence: 9,
+                        anchor_sequence: 6,
+                    },
+                    header: "Header".to_owned(),
+                    description: "Description".to_owned(),
+                    provenance: bcode_session_models::SessionMilestoneProvenance {
+                        provider_id: "test".to_owned(),
+                        model_id: "test".to_owned(),
+                        input_truncated: false,
+                    },
+                },
+            },
+        };
+        let bcode_session_search::projection::EventProjection::Records(records) =
+            bcode_session_search::projection::project_event(
+                &event,
+                &bcode_session_search::projection::SearchProjectionPolicy::default(),
+            )
+            .expect("project milestone")
+        else {
+            panic!("milestone records");
+        };
+        let mut capabilities = provider_capabilities(FAST_PROVIDER_ID);
+        capabilities.max_batch_records = 1;
+        let error = projected_event_fits_batch(&records, 0, 0, &capabilities)
+            .expect_err("atomic event cannot fit");
+        assert!(!error.retryable_error());
+        assert!(error.message.contains("increase provider batch capacity"));
+        assert!(error.message.contains("checkpoint preserved"));
+        capabilities.max_batch_records = 2;
+        assert!(projected_event_fits_batch(&records, 0, 0, &capabilities).expect("event fits"));
+        assert!(
+            !projected_event_fits_batch(&records, 1, 0, &capabilities).expect("defer whole event")
+        );
+        capabilities.max_batch_text_bytes = 1;
+        assert!(projected_event_fits_batch(&records, 0, 0, &capabilities).is_err());
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.locator.sequence == 12));
+    }
+
+    #[tokio::test]
+    async fn insufficient_event_capacity_never_acknowledges_or_advances_checkpoint() {
+        let state = {
+            let _guard = SEARCH_TEST_LOCK.lock().await;
+            APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+            state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)])
+        };
+        let directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(None, directory.path().to_path_buf())
+            .await
+            .expect("create");
+        state
+            .sessions
+            .append_context_compacted(session.id, "cannot fit one byte".to_owned(), 0)
+            .await
+            .expect("canonical content");
+        let summary = state
+            .sessions
+            .session_summary(session.id)
+            .await
+            .expect("summary");
+        let mut provider = list_providers(&state)
+            .await
+            .providers
+            .into_iter()
+            .find(|provider| provider.plugin_id == FAST_PROVIDER_ID)
+            .expect("fast provider");
+        provider.capabilities.content_kinds =
+            BTreeSet::from([bcode_session_search::SearchContentKind::Compaction]);
+        provider.capabilities.max_batch_text_bytes = 1;
+        let error = ingest_provider_page(
+            &state,
+            session.id,
+            &summary,
+            &provider,
+            "capacity-generation",
+            None,
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("unavailable atomic capacity");
+        drop(state);
+        assert!(!error.retryable_error());
+        assert!(error.message.contains("checkpoint preserved"));
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -1,12 +1,17 @@
 //! Session actor, handle, and snapshot plumbing.
 
+#[cfg(test)]
+#[path = "milestone/actor_tests.rs"]
+mod milestone_actor_tests;
+
+mod milestone;
+
 use super::{
     Arc, ClientId, Instant, PathBuf, ProjectionWindow, ProjectionWindowRequest, SessionAttachment,
     SessionError, SessionEvent, SessionEventKind, SessionEventProvenance, SessionInputHistoryEntry,
     SessionLiveEvent, SessionLiveEventKind, SessionLoadStatusKind, SessionState,
     SessionStoreExecutor, SessionSummary, elapsed_ms, input_history_from_events,
-    model_context_events_from_history, state::LiveTextStreamKey, title_from_first_prompt,
-    usize_to_u64,
+    model_context_events_from_history, state::LiveTextStreamKey, usize_to_u64,
 };
 use crate::db::{MaterializedProjection, SessionDb, SessionDbError};
 use crate::lease::SessionLeaseGuard;
@@ -929,6 +934,38 @@ enum SubmissionMutation {
 }
 
 enum SessionCommand {
+    MilestoneContext {
+        max_bytes: usize,
+        max_turns: usize,
+        reply: oneshot::Sender<Result<bcode_session_models::SessionMilestoneContext, SessionError>>,
+    },
+    MilestoneEvaluationStatus {
+        evaluation_id: String,
+        reply: oneshot::Sender<
+            Result<Option<bcode_session_models::SessionMilestoneEvaluationStatus>, SessionError>,
+        >,
+    },
+    MilestoneEvaluationCheckpoint {
+        reply: oneshot::Sender<
+            Result<Option<bcode_session_models::SessionMilestoneEvaluationStatus>, SessionError>,
+        >,
+    },
+    RequestMilestoneEvaluation {
+        request: bcode_session_models::SessionMilestoneEvaluationRequest,
+        reply: oneshot::Sender<Result<bool, SessionError>>,
+    },
+    PublishMilestone {
+        request: bcode_session_models::SessionMilestonePublicationRequest,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    CompleteMilestoneEvaluation {
+        completion: bcode_session_models::SessionMilestoneEvaluationCompletion,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    Milestones {
+        query: bcode_session_models::SessionMilestoneQuery,
+        reply: oneshot::Sender<Result<bcode_session_models::SessionMilestonePage, SessionError>>,
+    },
     PendingSubmissionsForTurn {
         turn_id: bcode_session_models::TurnId,
         after: Option<u64>,
@@ -1469,6 +1506,34 @@ impl SessionActor {
             }
             SessionCommand::History(reply) => {
                 let _ = reply.send(self.history().await);
+            }
+            SessionCommand::MilestoneContext {
+                max_bytes,
+                max_turns,
+                reply,
+            } => {
+                let _ = reply.send(self.milestone_context(max_bytes, max_turns).await);
+            }
+            SessionCommand::MilestoneEvaluationStatus {
+                evaluation_id,
+                reply,
+            } => {
+                let _ = reply.send(self.milestone_evaluation_status(&evaluation_id).await);
+            }
+            SessionCommand::MilestoneEvaluationCheckpoint { reply } => {
+                let _ = reply.send(self.milestone_evaluation_checkpoint().await);
+            }
+            SessionCommand::RequestMilestoneEvaluation { request, reply } => {
+                let _ = reply.send(self.request_milestone_evaluation(request).await);
+            }
+            SessionCommand::PublishMilestone { request, reply } => {
+                let _ = reply.send(self.publish_milestone(request).await);
+            }
+            SessionCommand::CompleteMilestoneEvaluation { completion, reply } => {
+                let _ = reply.send(self.complete_milestone_evaluation(completion).await);
+            }
+            SessionCommand::Milestones { query, reply } => {
+                let _ = reply.send(self.milestones(query).await);
             }
             SessionCommand::HistoryPage { query, reply } => {
                 let _ = reply.send(self.history_page(query).await);
@@ -2777,17 +2842,6 @@ impl SessionActor {
             }
         }
         let mut events = Vec::new();
-        if self.state.summary.name.is_none() && !self.state.has_user_message {
-            let title = title_from_first_prompt(&text);
-            events.push(
-                self.append_event(
-                    SessionEventKind::SessionRenamed { name: Some(title) },
-                    None,
-                    activity_timestamp_ms,
-                )
-                .await?,
-            );
-        }
         let event = self
             .append_event(
                 SessionEventKind::UserMessage {

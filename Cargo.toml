@@ -33,6 +33,7 @@ members = [
     "plugins/tantivy-session-search-plugin",
     "plugins/skills-plugin",
     "plugins/session-derivation-plugin",
+    "plugins/session-milestones-plugin",
     "plugins/worktree-plugin",
     "packages/agent-policy",
     "packages/agent-policy/models",
@@ -233,6 +234,7 @@ bcode_session_derivation_plugin         = { version = "0.0.1-alpha.0", default-f
 bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }
 bcode_session_migration                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-migration" }
 bcode_session_migration_target          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-migration-target" }
+bcode_session_milestones_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-milestones-plugin" }
 bcode_session_models                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
 bcode_session_search                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-search" }
 bcode_session_view                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-view" }

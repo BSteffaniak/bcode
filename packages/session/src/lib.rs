@@ -46,6 +46,7 @@ pub mod history_compression;
 mod invocation_recovery;
 pub mod lease;
 mod manifest;
+pub(crate) mod milestone;
 mod mutation;
 pub mod ownership;
 pub mod persisted;
@@ -1574,6 +1575,8 @@ impl SessionManager {
             name: name.clone(),
             explicit_name: name.clone(),
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: if name.is_some() {
                 SessionTitleSource::Explicit
             } else {
@@ -2361,6 +2364,146 @@ impl SessionManager {
         }
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         Ok(db.all_events().await?)
+    }
+
+    /// Capture bounded request-only milestone generation input without write admission.
+    /// # Errors
+    /// Rejects invalid budgets, missing storage or incompatible/stale projections.
+    pub async fn session_milestone_context(
+        &self,
+        session_id: SessionId,
+        max_bytes: usize,
+        max_turns: usize,
+    ) -> Result<bcode_session_models::SessionMilestoneContext, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.milestone_context(max_bytes, max_turns).await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        db.validate_read_readiness().await?;
+        Ok(db.milestone_context(max_bytes, max_turns).await?)
+    }
+
+    /// List durable milestones without admitting a writer or loading a generation plugin.
+    /// # Errors
+    /// Returns invalid-query, missing-session, compatibility or storage errors.
+    pub async fn session_milestones(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionMilestoneQuery,
+    ) -> Result<bcode_session_models::SessionMilestonePage, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.milestones(query).await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.milestones(query).await?)
+    }
+
+    /// Inspect an exact durable evaluation job without write admission.
+    /// # Errors
+    /// Returns missing-session, compatibility or storage errors.
+    pub async fn session_milestone_evaluation(
+        &self,
+        session_id: SessionId,
+        evaluation_id: &str,
+    ) -> Result<Option<bcode_session_models::SessionMilestoneEvaluationStatus>, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.milestone_evaluation_status(evaluation_id).await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.milestone_evaluation_status(evaluation_id).await?)
+    }
+
+    /// Inspect the latest durable scheduling checkpoint with bounded indexed work.
+    /// # Errors
+    /// Returns missing-session, compatibility or storage errors.
+    pub async fn session_milestone_evaluation_checkpoint(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<bcode_session_models::SessionMilestoneEvaluationStatus>, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.milestone_evaluation_checkpoint().await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.milestone_evaluation_checkpoint().await?)
+    }
+
+    /// Admit a durable milestone evaluation through the owning session actor.
+    /// # Errors
+    /// Rejects stale admission, invalid boundaries, ownership and storage failures.
+    pub async fn request_session_milestone_evaluation(
+        &self,
+        session_id: SessionId,
+        request: bcode_session_models::SessionMilestoneEvaluationRequest,
+    ) -> Result<bool, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        self.session_handle(session_id)
+            .await?
+            .request_milestone_evaluation(request)
+            .await
+    }
+    /// Publish a durable milestone through the owning actor.
+    /// # Errors
+    /// Rejects stale or conflicting results and ownership/storage failures.
+    pub async fn publish_session_milestone(
+        &self,
+        session_id: SessionId,
+        request: bcode_session_models::SessionMilestonePublicationRequest,
+    ) -> Result<(), SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        self.session_handle(session_id)
+            .await?
+            .publish_milestone(request)
+            .await
+    }
+    /// Complete an evaluation, including successful no-milestone outcomes.
+    /// # Errors
+    /// Rejects stale/unknown jobs and ownership/storage failures.
+    pub async fn complete_session_milestone_evaluation(
+        &self,
+        session_id: SessionId,
+        completion: bcode_session_models::SessionMilestoneEvaluationCompletion,
+    ) -> Result<(), SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        self.session_handle(session_id)
+            .await?
+            .complete_milestone_evaluation(completion)
+            .await
     }
 
     /// Return the current canonical session generation using a bounded one-event tail read.
@@ -3823,6 +3966,8 @@ mod tests {
             name: Some("deleted".to_owned()),
             explicit_name: Some("deleted".to_owned()),
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: SessionTitleSource::Explicit,
             client_count: 0,
             created_at_ms: 10,
@@ -3863,6 +4008,8 @@ mod tests {
             name: Some("deleted".to_owned()),
             explicit_name: Some("deleted".to_owned()),
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: SessionTitleSource::Explicit,
             client_count: 0,
             created_at_ms: 10,
@@ -8535,11 +8682,21 @@ mod tests {
             .await
             .expect("message should append");
 
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0].kind,
-            SessionEventKind::SessionRenamed { name } if name.as_deref() == Some("Fix session selection UX")
+            SessionEventKind::UserMessage { .. }
         ));
+        let handle = manager
+            .session_handle(session.id)
+            .await
+            .expect("session handle");
+        let summary = handle.snapshot().summary;
+        assert!(summary.explicit_name.is_none());
+        assert_eq!(
+            summary.derived_title.as_deref(),
+            Some("Fix session selection UX")
+        );
         let sessions = manager.list_sessions(&test_working_directory()).await;
         assert_eq!(
             sessions[0].name.as_deref(),

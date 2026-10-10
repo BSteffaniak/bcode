@@ -189,7 +189,138 @@ pub fn session_migrations() -> CurrentMigrationSource {
             .columns(vec!["published", "child_id"]),
         drop_index("idx_session_children_pending", "session_children"),
     );
+    add_milestone_migrations(&mut source);
     source
+}
+
+fn add_milestone_migrations(source: &mut CurrentMigrationSource) {
+    for (id, column, data_type) in [
+        (
+            "050_session_automatic_title",
+            "automatic_title",
+            DataType::Text,
+        ),
+        (
+            "051_session_automatic_title_sequence",
+            "automatic_title_source_sequence",
+            DataType::Int,
+        ),
+        ("052_session_explicit_name", "explicit_name", DataType::Text),
+        ("053_session_derived_title", "derived_title", DataType::Text),
+    ] {
+        add_migration(
+            source,
+            id,
+            alter_table("session_state").add_column(column.into(), data_type, true, None),
+            alter_table("session_state").drop_column(column.into()),
+        );
+    }
+    add_migration(
+        source,
+        "054_session_legacy_name_preservation",
+        update("session_state").value(
+            "explicit_name",
+            switchy::database::query::identifier("title"),
+        ),
+        update("session_state").value(
+            "explicit_name",
+            switchy::database::query::identifier("explicit_name"),
+        ),
+    );
+    add_milestone_record_migrations(source);
+}
+
+fn add_milestone_record_migrations(source: &mut CurrentMigrationSource) {
+    add_migration(
+        source,
+        "055_milestone_evaluations",
+        create_table("milestone_evaluations")
+            .if_not_exists(true)
+            .column(schema_column("evaluation_id", DataType::Text, false))
+            .primary_key("evaluation_id")
+            .column(schema_column("admitted_seq", DataType::Int, false))
+            .column(schema_column("completed", DataType::Int, false))
+            .column(schema_column("turns_at_admission", DataType::Int, false))
+            .column(schema_column("tokens_at_admission", DataType::Int, false))
+            .column(schema_column("request_json", DataType::Text, false))
+            .column(schema_column("publication_json", DataType::Text, true)),
+        drop_table("milestone_evaluations").if_exists(true),
+    );
+    add_migration(
+        source,
+        "056_session_milestones",
+        create_table("session_milestones")
+            .if_not_exists(true)
+            .column(schema_column("evaluation_id", DataType::Text, false))
+            .primary_key("evaluation_id")
+            .column(schema_column("published_seq", DataType::Int, false))
+            .column(schema_column("timestamp_ms", DataType::Int, false))
+            .column(schema_column("publication_json", DataType::Text, true))
+            .column(schema_column("milestone_json", DataType::Text, false)),
+        drop_table("session_milestones").if_exists(true),
+    );
+    add_migration(
+        source,
+        "060_milestone_turns",
+        create_table("milestone_turns")
+            .if_not_exists(true)
+            .column(schema_column("turn_id", DataType::Text, false))
+            .primary_key("turn_id")
+            .column(schema_column("start_seq", DataType::Int, false))
+            .column(schema_column("end_seq", DataType::Int, true))
+            .column(schema_column("eligible", DataType::Int, false))
+            .column(schema_column("text_tokens", DataType::Int, false)),
+        drop_table("milestone_turns").if_exists(true),
+    );
+    add_migration(
+        source,
+        "062_milestone_turns_start_index",
+        create_index("idx_milestone_turns_start")
+            .if_not_exists(true)
+            .table("milestone_turns")
+            .columns(vec!["eligible", "start_seq"]),
+        drop_index("idx_milestone_turns_start", "milestone_turns"),
+    );
+    add_migration(
+        source,
+        "061_milestone_turns_end_index",
+        create_index("idx_milestone_turns_end")
+            .if_not_exists(true)
+            .table("milestone_turns")
+            .columns(vec!["eligible", "end_seq"]),
+        drop_index("idx_milestone_turns_end", "milestone_turns"),
+    );
+    add_migration(
+        source,
+        "059_milestone_scheduling",
+        create_table("milestone_scheduling")
+            .if_not_exists(true)
+            .column(schema_column("singleton", DataType::Int, false))
+            .primary_key("singleton")
+            .column(schema_column("record", DataType::Text, false)),
+        drop_table("milestone_scheduling").if_exists(true),
+    );
+    add_migration(
+        source,
+        "058_milestone_evaluations_sequence_index",
+        create_index("idx_milestone_evaluations_sequence")
+            .if_not_exists(true)
+            .table("milestone_evaluations")
+            .columns(vec!["admitted_seq"]),
+        drop_index(
+            "idx_milestone_evaluations_sequence",
+            "milestone_evaluations",
+        ),
+    );
+    add_migration(
+        source,
+        "057_session_milestones_sequence_index",
+        create_index("idx_session_milestones_sequence")
+            .if_not_exists(true)
+            .table("session_milestones")
+            .columns(vec!["published_seq"]),
+        drop_index("idx_session_milestones_sequence", "session_milestones"),
+    );
 }
 
 fn add_session_execution_migrations(source: &mut CurrentMigrationSource) {

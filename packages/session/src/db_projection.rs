@@ -27,12 +27,15 @@ pub enum MaterializedProjection {
     SessionUsage,
     /// Exact canonical turn terminal and response locators.
     TurnEvidence,
+    /// Milestone annotations and durable evaluation jobs.
+    Milestones,
     /// Authoritative current context occupancy.
     RequestContextOccupancy,
 }
 
 impl MaterializedProjection {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
+        Self::Milestones,
         Self::Submissions,
         Self::TurnEvidence,
         Self::SessionState,
@@ -58,7 +61,8 @@ impl MaterializedProjection {
             Self::RequestContextOccupancy => 4,
             Self::Transcript => 3,
             Self::ToolRuns => 2,
-            Self::Submissions
+            Self::Milestones
+            | Self::Submissions
             | Self::SessionState
             | Self::InputHistory
             | Self::ArtifactReferences
@@ -72,6 +76,7 @@ impl MaterializedProjection {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Milestones => "milestones",
             Self::Submissions => "submissions",
             Self::SessionState => "session_state",
             Self::InputHistory => "input_history",
@@ -133,8 +138,9 @@ pub async fn update_projection_checkpoint(
 }
 
 /// Current projections finalized together for each canonical event.
-pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 9] = [
+pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 10] = [
     MaterializedProjection::Submissions,
+    MaterializedProjection::Milestones,
     MaterializedProjection::TurnEvidence,
     MaterializedProjection::SessionState,
     MaterializedProjection::InputHistory,
@@ -158,7 +164,7 @@ mod tests {
 
     #[test]
     fn projection_inventory_is_complete_and_stable() {
-        assert_eq!(MaterializedProjection::all().len(), 10);
+        assert_eq!(MaterializedProjection::all().len(), 11);
         assert_eq!(
             MaterializedProjection::RequestContextOccupancy.schema_version(),
             4

@@ -184,6 +184,8 @@ impl SessionStore {
             name: None,
             explicit_name: None,
             derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             title_source: SessionTitleSource::EmptyDraft,
             client_count: 0,
             created_at_ms: 0,

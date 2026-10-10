@@ -36,6 +36,8 @@ impl ProjectionContentPolicy {
 pub struct SearchProjectionPolicy {
     /// Maximum UTF-8 bytes retained in one projected text record.
     pub max_text_bytes_per_record: usize,
+    /// Copy finalized canonical milestone metadata into derived search state.
+    pub milestones: ProjectionContentPolicy,
     /// Copy finalized assistant reasoning into derived search state.
     pub reasoning: ProjectionContentPolicy,
     /// Copy shell command text into derived search state.
@@ -74,6 +76,7 @@ impl SearchProjectionPolicy {
             }
         };
         Self {
+            milestones: enabled(SearchContentKind::Milestone),
             reasoning: enabled(SearchContentKind::AssistantReasoning),
             shell_commands: enabled(SearchContentKind::ShellCommand),
             shell_output: enabled(SearchContentKind::ShellOutput),
@@ -92,6 +95,7 @@ impl Default for SearchProjectionPolicy {
     fn default() -> Self {
         Self {
             max_text_bytes_per_record: DEFAULT_MAX_TEXT_BYTES_PER_RECORD,
+            milestones: ProjectionContentPolicy::Include,
             reasoning: ProjectionContentPolicy::Exclude,
             shell_commands: ProjectionContentPolicy::Include,
             shell_output: ProjectionContentPolicy::Exclude,
@@ -141,7 +145,8 @@ pub enum PersistedEventClassification {
 #[allow(clippy::unnested_or_patterns)]
 pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEventClassification {
     match kind {
-        SessionEventKind::SessionCreated { name: Some(_), .. }
+        SessionEventKind::AutomaticTitleUpdated { .. }
+        | SessionEventKind::SessionCreated { name: Some(_), .. }
         | SessionEventKind::SubmissionAccepted { .. }
         | SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantMessage { .. }
@@ -152,7 +157,8 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::PositionedAssistantResponseSegment { .. } => {
             PersistedEventClassification::Searchable
         }
-        SessionEventKind::ToolCallRequested { .. }
+        SessionEventKind::MilestonePublished { .. }
+        | SessionEventKind::ToolCallRequested { .. }
         | SessionEventKind::PositionedToolCallRequested { .. }
         | SessionEventKind::PermissionRequested { .. }
         | SessionEventKind::PermissionResolved { .. }
@@ -160,27 +166,13 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::RuntimeWorkFinished { .. }
         | SessionEventKind::RuntimeWorkProgress { .. }
         | SessionEventKind::TraceEvent { .. }
-        | SessionEventKind::ToolInvocationResultRecorded {
-            record:
-                bcode_session_models::ToolInvocationResultRecord {
-                    result:
-                        Some(ToolInvocationResult::Artifact { .. })
-                        | None
-                        | Some(ToolInvocationResult::Text { .. })
-                        | Some(ToolInvocationResult::Json { .. }),
-                    is_error: false,
-                    ..
-                },
-        }
         | SessionEventKind::AssistantReasoningMessage { .. }
         | SessionEventKind::AssistantReasoningActivity { .. }
         | SessionEventKind::PositionedAssistantReasoningActivity { .. } => {
             PersistedEventClassification::PolicyControlled
         }
-        SessionEventKind::ToolInvocationResultRecorded {
-            record: bcode_session_models::ToolInvocationResultRecord { is_error: true, .. },
-        }
-        | SessionEventKind::ToolInvocationLifecycle {
+        SessionEventKind::ToolInvocationResultRecorded { record } => classify_tool_result(record),
+        SessionEventKind::ToolInvocationLifecycle {
             event:
                 bcode_session_models::ToolInvocationLifecycleEvent {
                     stage:
@@ -193,7 +185,10 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::AssistantReasoningDelta { .. } => {
             PersistedEventClassification::NonFinal
         }
-        SessionEventKind::SubmissionActivated { .. }
+        SessionEventKind::MilestoneEvaluationRequested { .. }
+        | SessionEventKind::MilestonePublicationRequested { .. }
+        | SessionEventKind::MilestoneEvaluationCompleted { .. }
+        | SessionEventKind::SubmissionActivated { .. }
         | SessionEventKind::SubmissionContextObserved { .. }
         | SessionEventKind::SubmissionCancelled { .. }
         | SessionEventKind::SessionCreated { name: None, .. }
@@ -235,6 +230,23 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         SessionEventKind::InertHistory { .. }
         | SessionEventKind::ToolContribution { .. }
         | SessionEventKind::ToolContributionPlaced { .. } => PersistedEventClassification::Excluded,
+    }
+}
+
+/// Errors are ordinary searchable diagnostics; successful payloads require content policy.
+const fn classify_tool_result(
+    record: &bcode_session_models::ToolInvocationResultRecord,
+) -> PersistedEventClassification {
+    if record.is_error {
+        return PersistedEventClassification::Searchable;
+    }
+    match &record.result {
+        None
+        | Some(
+            ToolInvocationResult::Artifact { .. }
+            | ToolInvocationResult::Text { .. }
+            | ToolInvocationResult::Json { .. },
+        ) => PersistedEventClassification::PolicyControlled,
     }
 }
 
@@ -392,6 +404,9 @@ pub fn project_event(
     validate_projection_request(event, policy)?;
     let _classification = classify_persisted_event(&event.kind);
 
+    if let SessionEventKind::MilestonePublished { milestone } = &event.kind {
+        return Ok(project_milestone(event, milestone, policy));
+    }
     if let Some(projection) = project_transcript_event(event, policy) {
         return Ok(projection);
     }
@@ -435,7 +450,10 @@ fn project_non_transcript_event(
         SessionEventKind::AssistantReasoningMessage { .. } => {
             EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
         }
-        SessionEventKind::SubmissionActivated { .. }
+        SessionEventKind::MilestoneEvaluationRequested { .. }
+        | SessionEventKind::MilestonePublicationRequested { .. }
+        | SessionEventKind::MilestoneEvaluationCompleted { .. }
+        | SessionEventKind::SubmissionActivated { .. }
         | SessionEventKind::SubmissionContextObserved { .. }
         | SessionEventKind::SubmissionCancelled { .. }
         | SessionEventKind::SessionCreated { name: None, .. }
@@ -496,9 +514,62 @@ fn project_non_transcript_event(
         | SessionEventKind::AssistantReasoningActivity { .. }
         | SessionEventKind::PositionedAssistantReasoningActivity { .. }
         | SessionEventKind::AssistantResponseSegment { .. }
-        | SessionEventKind::PositionedAssistantResponseSegment { .. } => {
+        | SessionEventKind::PositionedAssistantResponseSegment { .. }
+        | SessionEventKind::MilestonePublished { .. }
+        | SessionEventKind::AutomaticTitleUpdated { .. } => {
             unreachable!("searchable event variants must be handled by their focused projector")
         }
+    }
+}
+
+fn project_milestone(
+    event: &SessionEvent,
+    milestone: &bcode_session_models::SessionMilestone,
+    policy: &SearchProjectionPolicy,
+) -> EventProjection {
+    if !policy.milestones.enabled() {
+        return EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy);
+    }
+    let attributes = BTreeMap::from([
+        ("evaluation_id".to_owned(), milestone.evaluation_id.clone()),
+        (
+            "source_start_sequence".to_owned(),
+            milestone.source.start_sequence.to_string(),
+        ),
+        (
+            "source_end_sequence".to_owned(),
+            milestone.source.end_sequence.to_string(),
+        ),
+        (
+            "source_anchor_sequence".to_owned(),
+            milestone.source.anchor_sequence.to_string(),
+        ),
+    ]);
+    let mut records = Vec::new();
+    for (identity, field, text) in [
+        ("milestone-header", SearchField::Title, &milestone.header),
+        (
+            "milestone-description",
+            SearchField::Text,
+            &milestone.description,
+        ),
+    ] {
+        if let EventProjection::Records(mut projected) = project_text(
+            event,
+            identity,
+            SearchContentKind::Milestone,
+            field,
+            text,
+            attributes.clone(),
+            policy.max_text_bytes_per_record,
+        ) {
+            records.append(&mut projected);
+        }
+    }
+    if records.is_empty() {
+        EventProjection::Excluded(ProjectionExclusion::EmptyAfterNormalization)
+    } else {
+        EventProjection::Records(records)
     }
 }
 
@@ -871,6 +942,20 @@ fn project_transcript_event(
     policy: &SearchProjectionPolicy,
 ) -> Option<EventProjection> {
     let (record_kind, content_kind, field, text) = match &event.kind {
+        SessionEventKind::AutomaticTitleUpdated {
+            evaluation_id,
+            title,
+        } => {
+            return Some(project_text(
+                event,
+                "automatic-title",
+                SearchContentKind::SessionTitle,
+                SearchField::Title,
+                title,
+                BTreeMap::from([("evaluation_id".to_owned(), evaluation_id.clone())]),
+                policy.max_text_bytes_per_record,
+            ));
+        }
         SessionEventKind::SessionCreated {
             name: Some(name), ..
         }
@@ -1631,6 +1716,189 @@ mod tests {
                 u8::from_str_radix(pair, 16).expect("fixture hex byte")
             })
             .collect()
+    }
+
+    #[test]
+    fn tool_result_classification_preserves_error_and_policy_semantics() {
+        let mut record = bcode_session_models::ToolInvocationResultRecord {
+            invocation_id: "classification-call".to_owned(),
+            model_output: "finalized output".to_owned(),
+            is_error: false,
+            presentation: None,
+            result: None,
+            content: Vec::new(),
+        };
+        for is_error in [false, true] {
+            record.is_error = is_error;
+            let expected = if is_error {
+                PersistedEventClassification::Searchable
+            } else {
+                PersistedEventClassification::PolicyControlled
+            };
+            assert_eq!(classify_tool_result(&record), expected);
+            assert_eq!(
+                classify_persisted_event(&SessionEventKind::ToolInvocationResultRecorded {
+                    record: record.clone(),
+                }),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_milestones_project_stable_header_description_and_policy() {
+        let publication = event(
+            12,
+            SessionEventKind::MilestonePublished {
+                milestone: bcode_session_models::SessionMilestone {
+                    evaluation_id: "evaluation-1".to_owned(),
+                    source: bcode_session_models::SessionMilestoneSource {
+                        start_sequence: 2,
+                        end_sequence: 9,
+                        anchor_sequence: 6,
+                    },
+                    header: "Durable milestone".to_owned(),
+                    description: "Canonical description".to_owned(),
+                    provenance: bcode_session_models::SessionMilestoneProvenance {
+                        provider_id: "test-provider".to_owned(),
+                        model_id: "test-model".to_owned(),
+                        input_truncated: false,
+                    },
+                },
+            },
+        );
+        let SessionEventKind::MilestonePublished { milestone } = &publication.kind else {
+            unreachable!("publication fixture");
+        };
+        let entry = bcode_session_models::SessionMilestoneEntry {
+            event_sequence: publication.sequence,
+            timestamp_ms: publication.timestamp_ms,
+            milestone: milestone.clone(),
+        };
+        let encoded = serde_json::to_value(&entry).expect("encode canonical metadata");
+        let decoded: bcode_session_models::SessionMilestoneEntry =
+            serde_json::from_value(encoded).expect("decode canonical metadata");
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.milestone.provenance.provider_id, "test-provider");
+        assert_eq!(decoded.milestone.provenance.model_id, "test-model");
+        assert!(!decoded.milestone.provenance.input_truncated);
+        for automatic_title in [None, Some("Unpublished title intent".to_owned())] {
+            let requested = event(
+                11,
+                SessionEventKind::MilestonePublicationRequested {
+                    request: bcode_session_models::SessionMilestonePublicationRequest {
+                        milestone: milestone.clone(),
+                        automatic_title,
+                    },
+                },
+            );
+            assert_eq!(
+                classify_persisted_event(&requested.kind),
+                PersistedEventClassification::MetadataOnly
+            );
+            assert_eq!(
+                project_event(&requested, &SearchProjectionPolicy::default())
+                    .expect("publication intent metadata"),
+                EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+            );
+        }
+        let policy = SearchProjectionPolicy::default();
+        let EventProjection::Records(records) =
+            project_event(&publication, &policy).expect("project publication")
+        else {
+            panic!("publication must be searchable");
+        };
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].field, Some(SearchField::Title));
+        assert_eq!(records[1].field, Some(SearchField::Text));
+        assert_eq!(records[0].text.as_deref(), Some("Durable milestone"));
+        assert_eq!(records[1].text.as_deref(), Some("Canonical description"));
+        assert_ne!(records[0].record_id, records[1].record_id);
+        for record in &records {
+            assert_eq!(record.locator.session_id, publication.session_id);
+            assert_eq!(record.locator.sequence, publication.sequence);
+            assert_eq!(record.timestamp_ms, publication.timestamp_ms);
+            assert_eq!(record.content_kind, SearchContentKind::Milestone);
+            assert_eq!(record.attributes["source_anchor_sequence"], "6");
+            assert_eq!(record.attributes["evaluation_id"], "evaluation-1");
+        }
+        assert_eq!(
+            project_event(&publication, &policy).expect("canonical backfill"),
+            EventProjection::Records(records)
+        );
+        let disabled = SearchProjectionPolicy {
+            milestones: ProjectionContentPolicy::Exclude,
+            ..policy
+        };
+        assert_eq!(
+            project_event(&publication, &disabled).expect("disabled metadata"),
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        );
+        assert_eq!(
+            SearchProjectionPolicy::for_content_kinds(&std::collections::BTreeSet::new())
+                .milestones,
+            ProjectionContentPolicy::Exclude
+        );
+    }
+
+    #[test]
+    fn evaluation_metadata_is_not_searchable_and_title_history_is_preserved() {
+        let requested = event(
+            10,
+            SessionEventKind::MilestoneEvaluationRequested {
+                request: bcode_session_models::SessionMilestoneEvaluationRequest {
+                    evaluation_id: "evaluation-1".to_owned(),
+                    source: bcode_session_models::SessionMilestoneSource {
+                        start_sequence: 2,
+                        end_sequence: 9,
+                        anchor_sequence: 6,
+                    },
+                    expected_generation: 9,
+                    expected_explicit_name: None,
+                    max_requests_per_session: Some(20),
+                },
+            },
+        );
+        let completed = event(
+            11,
+            SessionEventKind::MilestoneEvaluationCompleted {
+                completion: bcode_session_models::SessionMilestoneEvaluationCompletion {
+                    evaluation_id: "evaluation-1".to_owned(),
+                },
+            },
+        );
+        let policy = SearchProjectionPolicy::default();
+        for metadata in [requested, completed] {
+            assert_eq!(
+                classify_persisted_event(&metadata.kind),
+                PersistedEventClassification::MetadataOnly
+            );
+            assert_eq!(
+                project_event(&metadata, &policy).expect("evaluation metadata"),
+                EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+            );
+        }
+        let mut locators = Vec::new();
+        for (sequence, title) in [(12, "First title"), (14, "Later title")] {
+            let title_event = event(
+                sequence,
+                SessionEventKind::AutomaticTitleUpdated {
+                    evaluation_id: format!("evaluation-{sequence}"),
+                    title: title.to_owned(),
+                },
+            );
+            let EventProjection::Records(records) =
+                project_event(&title_event, &policy).expect("project title")
+            else {
+                panic!("title searchable");
+            };
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].field, Some(SearchField::Title));
+            assert_eq!(records[0].content_kind, SearchContentKind::SessionTitle);
+            assert_eq!(records[0].text.as_deref(), Some(title));
+            locators.push(records[0].locator.clone());
+        }
+        assert_ne!(locators[0], locators[1]);
     }
 
     fn event(sequence: u64, kind: SessionEventKind) -> SessionEvent {

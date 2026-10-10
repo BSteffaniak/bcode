@@ -16,6 +16,8 @@ pub enum CancellationHandle {
     SessionTurn(Arc<TurnCancelState>),
     /// Cancel an in-flight plugin invocation.
     PluginInvocation(PluginInvocationCancelHandle),
+    /// Cancel a typed application service operation.
+    ServiceCall(bcode_plugin_sdk::ServiceCancellation),
     /// Cancel a Ralph autonomous runner.
     RalphRun {
         /// Store containing the run record.
@@ -44,6 +46,10 @@ impl CancellationHandle {
         match self {
             Self::SessionTurn(cancel_state) | Self::WorkflowNode(cancel_state) => {
                 cancel_state.cancel().await;
+                Ok(())
+            }
+            Self::ServiceCall(cancellation) => {
+                cancellation.cancel();
                 Ok(())
             }
             Self::PluginInvocation(cancel) => {
@@ -76,6 +82,7 @@ impl CancellationHandle {
     pub const fn is_cancellable(&self) -> bool {
         match self {
             Self::SessionTurn(_)
+            | Self::ServiceCall(_)
             | Self::PluginInvocation(_)
             | Self::RalphRun { .. }
             | Self::WorkflowRun(_)
@@ -171,14 +178,35 @@ impl RuntimeWorkManager {
     /// identity replaces its cancellation handle without creating another durable start event.
     pub async fn start(&self, session_id: SessionId, spec: RuntimeWorkSpec) -> (bool, bool) {
         let cancellable = spec.cancellation.is_cancellable();
-        let replaced = self.active.lock().await.insert(
+        let mut active = self.active.lock().await;
+        let inherited_cancellation = spec.parent_work_id.as_ref().is_some_and(|parent| {
+            active
+                .get(&(session_id, parent.clone()))
+                .is_some_and(|work| work.cancelled)
+        });
+        let prior_cancellation = active
+            .get(&(session_id, spec.work_id.clone()))
+            .is_some_and(|work| work.cancelled);
+        let cancelled = inherited_cancellation || prior_cancellation;
+        let cancellation = spec.cancellation.clone();
+        let replaced = active.insert(
             (session_id, spec.work_id.clone()),
             ActiveRuntimeWork {
                 spec,
-                cancelled: false,
+                cancelled,
                 shared_execution: None,
             },
         );
+        drop(active);
+        if cancelled {
+            if let CancellationHandle::ServiceCall(token) = &cancellation {
+                token.cancel();
+            } else {
+                tokio::spawn(async move {
+                    let _ = cancellation.cancel().await;
+                });
+            }
+        }
         (cancellable, replaced.is_none())
     }
 
@@ -493,6 +521,53 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
+    async fn typed_service_cancellation_remains_routable_until_settlement() {
+        let manager = RuntimeWorkManager::default();
+        let session_id = SessionId::new();
+        let parent = WorkId::new("model-parent");
+        let child = WorkId::new("auxiliary-child");
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        manager
+            .start(
+                session_id,
+                RuntimeWorkSpec::new(
+                    parent.clone(),
+                    RuntimeWorkKind::ModelTurn,
+                    "parent".into(),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                ),
+            )
+            .await;
+        manager
+            .start(
+                session_id,
+                RuntimeWorkSpec::new(
+                    child.clone(),
+                    RuntimeWorkKind::PluginInvocation,
+                    "auxiliary".into(),
+                    CancellationHandle::ServiceCall(cancellation.clone()),
+                )
+                .with_parent_work_id(Some(parent.clone())),
+            )
+            .await;
+        assert!(!cancellation.is_cancelled());
+        let cancelled = manager.cancel_with_children(session_id, &parent).await;
+        assert!(cancelled.contains(&child));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cancellation.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cancellation delivery");
+        assert!(cancellation.is_cancelled());
+        assert_eq!(manager.active_count().await, 2);
+        assert!(manager.finish(session_id, &child).await);
+        assert!(manager.finish(session_id, &parent).await);
+        assert_eq!(manager.active_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn active_ids_are_removed_exactly_once_on_finish() {
         let manager = RuntimeWorkManager::default();
         let session_id = SessionId::new();
@@ -537,6 +612,32 @@ mod tests {
             work_id.to_string(),
             CancellationHandle::Test(count),
         )
+    }
+
+    #[tokio::test]
+    async fn child_registration_inherits_parent_cancellation() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        manager
+            .start(session, test_spec("parent", Arc::clone(&count)))
+            .await;
+        manager
+            .cancel_with_children(session, &WorkId::new("parent"))
+            .await;
+        wait_for_count(&count, 1).await;
+        manager
+            .start(
+                session,
+                test_spec("child", Arc::clone(&count))
+                    .with_parent_work_id(Some(WorkId::new("parent"))),
+            )
+            .await;
+        wait_for_count(&count, 2).await;
+        manager
+            .start(session, test_spec("child", Arc::clone(&count)))
+            .await;
+        wait_for_count(&count, 3).await;
     }
 
     #[tokio::test]

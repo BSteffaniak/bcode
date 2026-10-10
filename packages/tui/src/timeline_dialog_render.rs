@@ -51,6 +51,7 @@ pub fn render_timeline_dialog_with_keymap(
         u16::try_from(body_layout.size.width).unwrap_or(u16::MAX),
         visible_entries,
         theme,
+        keymap,
     );
     body.push(Line::from_spans(vec![Span::styled(
         format!(
@@ -87,15 +88,25 @@ fn rows(
     width: u16,
     visible_entries: usize,
     theme: TuiTheme,
+    keymap: &super::keymap::BmuxKeyMap,
 ) -> Vec<Line> {
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![Span::styled(
-        "User messages",
+        format!(
+            "Timeline · {} milestones · {} prompts · {} next page",
+            keymap.hint("timeline", "tui.timeline.milestones"),
+            keymap.hint("timeline", "tui.timeline.prompts"),
+            keymap.hint("timeline", "tui.timeline.nextMilestonePage")
+        ),
         theme.border.add_modifier(Modifier::BOLD),
     )]));
     if state.entries().is_empty() {
         rows.push(Line::from_spans(vec![Span::styled(
-            "No user messages in this session.",
+            if state.is_loading() {
+                "Loading canonical milestones…"
+            } else {
+                "No entries in this bounded view."
+            },
             theme.muted,
         )]));
     } else {
@@ -142,6 +153,9 @@ fn entry_line(entry: &TimelineEntry, selected: bool, width: u16, theme: TuiTheme
 }
 
 fn format_timestamp(timestamp_ms: u64) -> String {
+    if timestamp_ms == 0 {
+        return "time unavailable".to_owned();
+    }
     let seconds = timestamp_ms / 1_000;
     let (year, month, day, hour, minute, second) = utc_components(seconds);
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
@@ -194,11 +208,93 @@ mod tests {
     use bmux_tui::text_width::display_width;
 
     #[test]
+    fn full_timeline_dialog_resizes_and_clips_unicode_and_loading() {
+        use bmux_tui::{buffer::Buffer, frame::Frame, geometry::Rect, paint::PaintCx};
+        let keymap =
+            super::super::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
+        let theme = super::TuiTheme::for_theme_id("terminal-native");
+        let mut state = super::TimelineDialogState::new(
+            (1..=50)
+                .map(|sequence| {
+                    super::TimelineEntry::new(sequence, 1_000, "子 👩‍💻 e\u{301} **milestone**")
+                })
+                .collect(),
+        );
+        for (width, height) in [
+            (110, 32),
+            (0, 0),
+            (1, 1),
+            (2, 3),
+            (12, 8),
+            (45, 12),
+            (110, 32),
+        ] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            super::render_timeline_dialog_with_keymap(
+                &mut state,
+                &mut PaintCx::new(&mut frame),
+                theme,
+                &keymap,
+            );
+            for hit in frame.hits().regions() {
+                assert!(hit.area.right() <= area.right());
+                assert!(hit.area.bottom() <= area.bottom());
+            }
+            assert_eq!(state.selected_entry().unwrap().sequence(), 50);
+        }
+        let mut requests = super::super::timeline_dialog::MilestonePageRequests::default();
+        requests
+            .begin(bcode_session_models::SessionId::new(), None, &mut state)
+            .unwrap();
+        let area = Rect::new(0, 0, 110, 32);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        super::render_timeline_dialog_with_keymap(
+            &mut state,
+            &mut PaintCx::new(&mut frame),
+            theme,
+            &keymap,
+        );
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = frame.buffer().get(bmux_tui::geometry::Point::new(x, y)) {
+                    text.push_str(&cell.symbol);
+                }
+            }
+        }
+        assert!(text.contains("Loading canonical milestones"));
+        assert!(state.selected_entry().is_none());
+    }
+
+    #[test]
+    fn unicode_entries_remain_bounded_at_tiny_widths() {
+        let entry = super::TimelineEntry::new(42, 0, "子 👩‍💻 e\u{301} milestone");
+        for width in [0, 1, 2, 3, 8, 20] {
+            let line = super::entry_line(
+                &entry,
+                true,
+                width,
+                super::TuiTheme::for_theme_id("terminal-native"),
+            );
+            assert!(line.width() <= usize::from(width));
+            assert_eq!(entry.sequence(), 42);
+        }
+    }
+
+    #[test]
     fn timeline_preview_flattens_markdown_semantically() {
         assert_eq!(
             markdown_preview("# Request\n\n- Use **care**\n- Run `cargo test`", 80),
             "Request Use care Run cargo test"
         );
+    }
+
+    #[test]
+    fn timestamp_for_milestone_is_not_fabricated() {
+        assert_eq!(super::format_timestamp(0), "time unavailable");
     }
 
     #[test]

@@ -129,6 +129,7 @@ fn parse_sort(value: &str) -> Result<SessionSearchSort, String> {
 
 fn parse_content_kind(value: &str) -> Result<SearchContentKind, String> {
     match value {
+        "milestone" => Ok(SearchContentKind::Milestone),
         "title" => Ok(SearchContentKind::SessionTitle),
         "user" => Ok(SearchContentKind::UserMessage),
         "assistant" => Ok(SearchContentKind::AssistantMessage),

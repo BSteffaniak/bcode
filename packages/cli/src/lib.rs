@@ -5463,7 +5463,26 @@ struct TraceRangeArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum SessionMilestonesCommand {
+    /// Read a bounded publication-ordered page without invoking a model.
+    List {
+        session_id: SessionId,
+        #[arg(long)]
+        after_sequence: Option<u64>,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=200))]
+        limit: u32,
+    },
+    /// Explicitly invoke enabled generation using the configured milestone model.
+    Generate { session_id: SessionId },
+}
+
+#[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Read canonical milestones or explicitly request optional generation (JSON).
+    Milestones {
+        #[command(subcommand)]
+        command: SessionMilestonesCommand,
+    },
     /// Read current disposable advisory task/domain labels (not canonical session state).
     Categorization {
         session_id: SessionId,
@@ -6254,6 +6273,7 @@ impl From<SessionSearchFieldArg> for bcode_session_search::SearchField {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SessionSearchContentArg {
+    Milestone,
     SessionTitle,
     UserMessage,
     AssistantMessage,
@@ -6274,6 +6294,7 @@ enum SessionSearchContentArg {
 impl From<SessionSearchContentArg> for bcode_session_search::SearchContentKind {
     fn from(value: SessionSearchContentArg) -> Self {
         match value {
+            SessionSearchContentArg::Milestone => Self::Milestone,
             SessionSearchContentArg::SessionTitle => Self::SessionTitle,
             SessionSearchContentArg::UserMessage => Self::UserMessage,
             SessionSearchContentArg::AssistantMessage => Self::AssistantMessage,
@@ -7347,6 +7368,36 @@ async fn print_derivation_status(operation_id: uuid::Uuid) -> Result<(), CliErro
 
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match command.as_ref() {
+        SessionCommand::Milestones { command } => {
+            match command {
+                SessionMilestonesCommand::List {
+                    session_id,
+                    after_sequence,
+                    limit,
+                } => {
+                    let client = session_read_client(*session_id).await?;
+                    let page = client
+                        .session_milestones(
+                            *session_id,
+                            bcode_session_models::SessionMilestoneQuery {
+                                after_sequence: *after_sequence,
+                                limit: *limit as usize,
+                            },
+                        )
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&page)?);
+                }
+                SessionMilestonesCommand::Generate { session_id } => {
+                    let client = session_owner_client(*session_id).await?;
+                    let result = client.generate_session_milestone(*session_id).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    if !result.success {
+                        return Err(CliError::InvalidArguments(result.text));
+                    }
+                }
+            }
+            Ok(())
+        }
         SessionCommand::AppendPresentationNote {
             session_id,
             source_id,
@@ -7388,6 +7439,73 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             print_derivation_cancellation(*operation_id).await
         }
         _ => Box::pin(dispatch_session_command(command)).await,
+    }
+}
+
+#[cfg(test)]
+mod milestone_cli_tests {
+    use super::*;
+
+    #[test]
+    fn milestone_list_is_bounded_and_generation_accepts_no_prompt() {
+        let id = SessionId::new().to_string();
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "session",
+                "milestones",
+                "list",
+                &id,
+                "--limit",
+                "200"
+            ])
+            .is_ok()
+        );
+        for limit in ["0", "201"] {
+            assert!(
+                Cli::try_parse_from([
+                    "bcode",
+                    "session",
+                    "milestones",
+                    "list",
+                    &id,
+                    "--limit",
+                    limit
+                ])
+                .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["bcode", "session", "milestones", "generate", &id]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "session",
+                "milestones",
+                "generate",
+                &id,
+                "--prompt",
+                "hidden inference"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inline_milestone_control_is_typed_and_removed_from_query() {
+        let (query, content) =
+            parse_session_search_content_controls("content:milestone 子 👩‍💻").unwrap();
+        assert_eq!(query, "子 👩‍💻");
+        assert!(matches!(
+            content.as_slice(),
+            [SessionSearchContentArg::Milestone]
+        ));
+        assert!(parse_session_search_content_controls("content:unknown needle").is_err());
+        assert_eq!(
+            parse_session_search_content_controls("a  phrase")
+                .unwrap()
+                .0,
+            "a  phrase"
+        );
     }
 }
 
@@ -7836,7 +7954,8 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
                 .await?;
             print_json(&usage)?;
         }
-        SessionCommand::AppendPresentationNote { .. }
+        SessionCommand::Milestones { .. }
+        | SessionCommand::AppendPresentationNote { .. }
         | SessionCommand::Derive { .. }
         | SessionCommand::DerivationPrompts { .. }
         | SessionCommand::DerivationSnapshot { .. }
@@ -16234,6 +16353,26 @@ impl SessionSearchCliScope {
     }
 }
 
+fn parse_session_search_content_controls(
+    query: &str,
+) -> Result<(String, Vec<SessionSearchContentArg>), CliError> {
+    let mut content = Vec::new();
+    let mut terms = Vec::new();
+    for term in query.split_whitespace() {
+        if let Some(value) = term.strip_prefix("content:") {
+            let kind = <SessionSearchContentArg as ValueEnum>::from_str(value, false)
+                .map_err(CliError::InvalidArguments)?;
+            content.push(kind);
+        } else {
+            terms.push(term);
+        }
+    }
+    if content.is_empty() {
+        return Ok((query.to_owned(), content));
+    }
+    Ok((terms.join(" "), content))
+}
+
 const fn session_search_request(
     query: String,
     match_mode: bcode_session_search::TextMatchMode,
@@ -16318,6 +16457,14 @@ fn session_search_json(
             serde_json::json!({
                 "session_id": hit.locator.session_id,
                 "event_sequence": hit.locator.sequence,
+                "navigation_sequence": hydrated
+                    .filter(|candidate| candidate.outcome == bcode_session_search::SearchHitHydrationOutcome::Hydrated)
+                    .and_then(|candidate| candidate.event.as_deref())
+                    .filter(|event| event.session_id == hit.locator.session_id && event.sequence == hit.locator.sequence)
+                    .and_then(|event| match &event.kind {
+                        bcode_session_models::SessionEventKind::MilestonePublished { milestone } => milestone.source.is_valid().then_some(milestone.source.anchor_sequence),
+                        _ => Some(event.sequence),
+                    }),
                 "record_id": hit.locator.record_id,
                 "content_kind": hit.content_kind,
                 "matched_field": hit.matched_field,
@@ -16348,11 +16495,14 @@ fn session_search_json(
 async fn session_search(command: SessionSearchCliCommand) -> Result<(), CliError> {
     let policy = command.scope.policy(command.deadline_ms);
     let execution_class = policy.execution_class;
+    let (query, inline_content) = parse_session_search_content_controls(&command.query)?;
+    let mut content = command.content;
+    content.extend(inline_content);
     let request = session_search_request(
-        command.query,
+        query,
         command.match_mode.into(),
         command.fields.into_iter().map(Into::into).collect(),
-        command.scope.filters(command.content),
+        command.scope.filters(content),
         command.limit,
         command.deadline_ms,
     );
@@ -18273,6 +18423,11 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ContextCompacted { .. } => "context_compacted",
         SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
         SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
+        SessionEventKind::MilestoneEvaluationRequested { .. } => "milestone_evaluation_requested",
+        SessionEventKind::MilestonePublicationRequested { .. } => "milestone_publication_requested",
+        SessionEventKind::MilestonePublished { .. } => "milestone_published",
+        SessionEventKind::MilestoneEvaluationCompleted { .. } => "milestone_evaluation_completed",
+        SessionEventKind::AutomaticTitleUpdated { .. } => "automatic_title_updated",
         SessionEventKind::SessionRenamed { .. } => "session_renamed",
         SessionEventKind::TraceEvent { .. } => "trace_event",
         SessionEventKind::SkillInvoked { .. } => "skill_invoked",
@@ -19659,6 +19814,22 @@ fn reasoning_activity_description(
 #[allow(clippy::too_many_lines)]
 fn print_non_trace_session_event(event: &SessionEvent) {
     match &event.kind {
+        SessionEventKind::MilestonePublished { milestone } => println!(
+            "#{} milestone: {}\n{}\nsource {}–{} (navigation {})",
+            event.sequence,
+            milestone.header,
+            milestone.description,
+            milestone.source.start_sequence,
+            milestone.source.end_sequence,
+            milestone.source.anchor_sequence,
+        ),
+        SessionEventKind::AutomaticTitleUpdated {
+            evaluation_id,
+            title,
+        } => println!(
+            "#{} automatic display title ({evaluation_id}): {title}",
+            event.sequence,
+        ),
         SessionEventKind::SubmissionContextObserved {
             submission_id,
             issue,
@@ -20081,6 +20252,9 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             println!("#{} legacy event: {event_type}", event.sequence);
         }
         SessionEventKind::TraceEvent { .. }
+        | SessionEventKind::MilestoneEvaluationRequested { .. }
+        | SessionEventKind::MilestonePublicationRequested { .. }
+        | SessionEventKind::MilestoneEvaluationCompleted { .. }
         | SessionEventKind::SessionChildLinked { .. }
         | SessionEventKind::SessionChildrenReconciled { .. } => {}
     }
