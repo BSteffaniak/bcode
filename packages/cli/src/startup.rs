@@ -601,9 +601,74 @@ fn consent_selection(
     Ok(true)
 }
 
+/// Validate only the explicit headless selection; never enroll, discover, or repair accounts.
+///
+/// # Errors
+/// Returns configuration, selection, provider-readiness, or authentication errors.
+pub fn headless_preflight() -> Result<bcode_config::ResolvedModelSelection, CliError> {
+    let config = bcode_config::load_config()?;
+    let selection = config.resolved_model_selection();
+    validate_headless_selection(&config, &selection)?;
+    let mut host = load_cli_plugin_host()?;
+    let readiness = register_enabled(&host).and_then(|()| {
+        local_readiness_with_policy(&config, &host, true)
+            .map_err(|message| CliError::InvalidArguments(message.to_owned()))
+    });
+    let deactivated = host.deactivate_all().map_err(CliError::from);
+    readiness?;
+    deactivated?;
+    Ok(selection)
+}
+
+fn validate_headless_selection(
+    config: &BcodeConfig,
+    selection: &bcode_config::ResolvedModelSelection,
+) -> Result<(), CliError> {
+    selection
+        .validate_selection()
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    let profile = selection
+        .model_profile
+        .as_ref()
+        .and_then(|name| config.model.profiles.get(name));
+    if profile.is_none_or(|profile| {
+        profile.provider_plugin_id.trim().is_empty()
+            || profile
+                .model_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+    }) {
+        return Err(CliError::InvalidArguments(
+            "run requires a profile with an explicit provider and model".to_owned(),
+        ));
+    }
+    // A pool can rotate accounts after overload/expiry. Reject ambiguous account/none
+    // selection as well: an explicit account must actually participate in preflight.
+    let auth_none = selection.settings.get("auth_mode").map(String::as_str) == Some("none");
+    let account = selection
+        .auth_profile
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty());
+    if selection.auth_pool.is_some()
+        || account == auth_none
+        || selection.auth_profile.is_some() && !account
+    {
+        return Err(CliError::InvalidArguments("run requires exactly one explicit auth_profile (no auth_pool), or auth_mode = none without an account".to_owned()));
+    }
+    Ok(())
+}
+
 fn local_readiness(
     config: &BcodeConfig,
     host: &bcode_plugin::PluginHost,
+) -> Result<(), &'static str> {
+    local_readiness_with_policy(config, host, false)
+}
+
+fn local_readiness_with_policy(
+    config: &BcodeConfig,
+    host: &bcode_plugin::PluginHost,
+    headless: bool,
 ) -> Result<(), &'static str> {
     let selection = config.resolved_model_selection();
     selection
@@ -618,15 +683,30 @@ fn local_readiness(
             "The selected model provider is disabled or unavailable. Enable that provider or choose a connection explicitly.",
         );
     }
-    check_model_readiness(&selection, |request| {
-        host.invoke_service_json::<_, bcode_model::StartupReadinessResponse>(
+    let request = bcode_model::StartupReadinessRequest {
+        model_id: selection
+            .model_id
+            .clone()
+            .ok_or("Choose a model to get started.")?,
+        settings: selection.settings.clone(),
+    };
+    let readiness = host
+        .invoke_service_json::<_, bcode_model::StartupReadinessResponse>(
             plugin_id,
             bcode_model::MODEL_PROVIDER_INTERFACE_ID,
             bcode_model::OP_STARTUP_READINESS,
-            request,
+            &request,
         )
-        .ok()
-    })?;
+        .ok();
+    if headless && readiness.is_none() {
+        return Err(
+            "The selected provider cannot verify startup readiness; no turn was submitted.",
+        );
+    }
+    check_model_readiness(&selection, |_| readiness)?;
+    if headless && selection.settings.get("auth_mode").map(String::as_str) == Some("none") {
+        return Ok(());
+    }
     bcode_provider_auth::inspect_auth_selection(&bcode_provider_auth::ProviderRequestContextResolution {
         config,
         selection: selection.clone(),
@@ -666,7 +746,50 @@ fn local_readiness(
 
 #[cfg(test)]
 mod tests {
-    use super::interactive_startup;
+    #[test]
+    fn headless_auth_source_is_explicit_and_unambiguous() {
+        let mut config = BcodeConfig::default();
+        config.model.profiles.insert(
+            "headless-test".to_owned(),
+            bcode_config::ModelProfileConfig {
+                provider_plugin_id: "test.provider".to_owned(),
+                model_id: Some("test-model".to_owned()),
+                ..Default::default()
+            },
+        );
+        let mut selection = bcode_config::ResolvedModelSelection {
+            provider_plugin_id: Some("test.provider".to_owned()),
+            provider_source: None,
+            model_id: Some("test-model".to_owned()),
+            model_source: None,
+            selected_model_id: Some("test-model".to_owned()),
+            model_profile: Some("headless-test".to_owned()),
+            auth_profile: None,
+            auth_pool: None,
+            settings: std::collections::BTreeMap::new(),
+            request: std::collections::BTreeMap::new(),
+            reasoning: bcode_config::ReasoningConfig::default(),
+        };
+        assert!(super::validate_headless_selection(&config, &selection).is_err());
+        selection.auth_profile = Some("explicit-account".to_owned());
+        assert!(super::validate_headless_selection(&config, &selection).is_ok());
+        selection.auth_pool = Some("rotating-pool".to_owned());
+        assert!(super::validate_headless_selection(&config, &selection).is_err());
+        selection.auth_pool = None;
+        selection
+            .settings
+            .insert("auth_mode".to_owned(), "none".to_owned());
+        assert!(super::validate_headless_selection(&config, &selection).is_err());
+        selection.auth_profile = None;
+        assert!(super::validate_headless_selection(&config, &selection).is_ok());
+        selection.auth_profile = Some(" ".to_owned());
+        assert!(super::validate_headless_selection(&config, &selection).is_err());
+        selection.auth_profile = None;
+        selection.model_profile = Some("missing".to_owned());
+        assert!(super::validate_headless_selection(&config, &selection).is_err());
+    }
+
+    use super::{BcodeConfig, interactive_startup};
 
     fn choices() -> Vec<(
         bcode_config::startup::StartupSelection,

@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [master]
     paths:
-      - ".github/actions/setup-bcode/**"
+
       - ".github/workflows/tui-pty-acceptance.yml"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -25,11 +25,11 @@ on:
       - "xtask/src/architecture.rs"
       - "scripts/smoke-local-daemon.sh"
       - "scripts/smoke-tui-pty.sh"
-      - "scripts/*install-action-release.py"
+
   push:
     branches: [master]
     paths:
-      - ".github/actions/setup-bcode/**"
+
       - ".github/workflows/tui-pty-acceptance.yml"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -50,7 +50,7 @@ on:
       - "xtask/src/architecture.rs"
       - "scripts/smoke-local-daemon.sh"
       - "scripts/smoke-tui-pty.sh"
-      - "scripts/*install-action-release.py"
+
   workflow_dispatch:
 
 jobs:
@@ -67,110 +67,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Verify safe pinned distribution installation
-        run: python3 -B scripts/test-install-action-release.py
-      - name: Prepare setup Action fixture
-        id: setup-fixture
-        shell: bash
-        run: |
-          python3 -B - <<'PY'
-          import hashlib
-          import io
-          import os
-          from pathlib import Path
-          import tarfile
-          import tempfile
-
-          root = Path(tempfile.mkdtemp(prefix="bcode-setup-test-", dir=os.environ["RUNNER_TEMP"]))
-          archive = root / "fixture.tar.gz"
-          with tarfile.open(archive, "w:gz") as bundle:
-              entry = tarfile.TarInfo("bcode")
-              entry.mode = 0o700
-              content = b"setup-test-not-an-executable"
-              entry.size = len(content)
-              bundle.addfile(entry, io.BytesIO(content))
-          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"archive={archive}\nsha256={digest}\n")
-          PY
-      - name: Exercise composite setup Action
-        id: setup-bcode
-        uses: ./.github/actions/setup-bcode
-        with:
-          archive: ${{ steps.setup-fixture.outputs.archive }}
-          sha256: ${{ steps.setup-fixture.outputs.sha256 }}
-      - name: Verify setup Action outputs without executing fixture
-        shell: bash
-        env:
-          SETUP_BINARY: ${{ steps.setup-bcode.outputs.binary }}
-          SETUP_INSTALLATION: ${{ steps.setup-bcode.outputs.installation }}
-        run: |
-          python3 -B - <<'PY'
-          import os
-          from pathlib import Path
-
-          binary = Path(os.environ["SETUP_BINARY"])
-          installation = Path(os.environ["SETUP_INSTALLATION"])
-          assert binary.is_absolute() and installation.is_absolute()
-          assert binary.parent == installation
-          assert binary.read_bytes() == b"setup-test-not-an-executable"
-          assert installation.stat().st_mode & 0o777 == 0o700
-          PY
-      - name: Reject incorrect distribution checksum
-        id: setup-rejected
-        continue-on-error: true
-        uses: ./.github/actions/setup-bcode
-        with:
-          archive: ${{ steps.setup-fixture.outputs.archive }}
-          sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-      - name: Verify rejected setup has no usable outputs
-        shell: bash
-        env:
-          SETUP_OUTCOME: ${{ steps.setup-rejected.outcome }}
-          SETUP_BINARY: ${{ steps.setup-rejected.outputs.binary }}
-          SETUP_INSTALLATION: ${{ steps.setup-rejected.outputs.installation }}
-        run: |
-          python3 -I -B - <<'PY'
-          import os
-
-          assert os.environ["SETUP_OUTCOME"] == "failure"
-          assert not os.environ["SETUP_BINARY"]
-          assert not os.environ["SETUP_INSTALLATION"]
-          PY
-      - name: Prepare checkout-contained archive rejection
-        shell: bash
-        env:
-          SETUP_ARCHIVE: ${{ steps.setup-fixture.outputs.archive }}
-        run: |
-          python3 -I -B - <<'PY'
-          import os
-          from pathlib import Path
-          import shutil
-
-          shutil.copyfile(os.environ["SETUP_ARCHIVE"],
-                          Path(os.environ["GITHUB_WORKSPACE"]) / "setup-rejected.tar.gz")
-          PY
-      - name: Reject checkout-contained distribution
-        id: setup-checkout-rejected
-        continue-on-error: true
-        uses: ./.github/actions/setup-bcode
-        with:
-          archive: ${{ github.workspace }}/setup-rejected.tar.gz
-          sha256: ${{ steps.setup-fixture.outputs.sha256 }}
-      - name: Verify checkout rejection has no usable outputs
-        shell: bash
-        env:
-          SETUP_OUTCOME: ${{ steps.setup-checkout-rejected.outcome }}
-          SETUP_BINARY: ${{ steps.setup-checkout-rejected.outputs.binary }}
-          SETUP_INSTALLATION: ${{ steps.setup-checkout-rejected.outputs.installation }}
-        run: |
-          python3 -I -B - <<'PY'
-          import os
-
-          assert os.environ["SETUP_OUTCOME"] == "failure"
-          assert not os.environ["SETUP_BINARY"]
-          assert not os.environ["SETUP_INSTALLATION"]
-          PY
       - name: Exercise non-interactive CLI process boundaries
         run: cargo test -p bcode --features app --test cli_process
       - name: Exercise targeted cancellation through the real CLI and daemon

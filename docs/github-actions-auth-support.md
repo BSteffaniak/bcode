@@ -23,30 +23,25 @@ subscription-authenticated model gateway. A custom-provider/proxy configuration
 option in Codex is not evidence that a third-party broker may enroll, refresh,
 and multiplex subscription credentials for arbitrary GitHub jobs.
 
-## Consequences for this integration
+## Supported scope and remaining gates
 
-* Use explicitly selected API-key authentication for the service-free automation
-  path. Preserve the user's billing choice; do not silently fall back from a
-  subscription to paid API access.
-* Do not present copying Codex auth caches into GitHub secrets or runners as the
-  Bcode quickstart. Besides the provider's stated scope, that pattern conflicts
-  with this integration's requirement to keep refresh credentials in broker custody.
-* Keep subscription gateway support blocked pending provider clarification or a
-  documented supported contract covering Bcode's actual gateway and repository
-  usage. Do not imply the trusted-private Codex runner guide authorizes it.
-* Do not translate the guide's description of current Codex refresh timing into
-  a refresh quota, token lifetime, or guaranteed unattended session duration.
-* An API-key-backed broker remains a possible explicitly billed path, but still
-  requires implementation and verification of OIDC authorization, bounded leases,
-  budgets, provider-owned request handling, recovery and secret isolation. It is
-  not delivered by this assessment.
+Use explicitly selected API-key authentication for the service-free trusted
+automation path. Preserve billing choice: never silently fall back from a
+subscription to API billing. The generic Action accepts arbitrary prompts; no
+broker, hosted service or GitHub App is required for this initial path.
 
-## Remaining verification
+For subscription credentials, existing Bcode provider code refreshes enrolled
+owned profiles and persists rotation through host custody. A persistent trusted
+single-user installation with unattended custody access is the smallest candidate
+for eliminating per-job credential copying. This implementation behavior is not
+proof of provider support for Bcode unattended use. Confirm that contract before
+enabling subscription automation. Revocation can still require reauthorization.
 
-No credentials were enrolled, OAuth endpoints called, services deployed or
-GitHub jobs dispatched for this assessment. These sources establish provider
-recommendations and a limitation, not successful Bcode setup or execution.
-The reusable Action, isolated execution path, onboarding, supported self-host
-operation and live arbitrary-prompt evidence remain required. The agreed
-subscription/broker scope must not be marked complete by substituting direct
-API-key execution alone.
+Do not copy refresh bundles into GitHub secrets/artifacts or use secret updates
+as transactional rotation storage. Do not infer refresh quotas or perpetual auth.
+Shared subscription gateway operation remains unverified; do not build or promise
+it as a prerequisite for the simpler direct integration.
+
+No credentials were enrolled, services deployed or live workflows dispatched
+for this assessment. See [GitHub Actions](github-actions.md) for setup and trust
+limitations. Live execution and subscription-support verification remain open.

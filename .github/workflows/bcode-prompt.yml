@@ -1,0 +1,84 @@
+name: Bcode prompt
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: Arbitrary task for Bcode (trusted maintainers only)
+        required: true
+        type: string
+      timeout-secs:
+        description: Execution budget in seconds
+        default: '600'
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: bcode-prompt
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download pinned release
+        id: release
+        shell: bash
+        env:
+          RELEASE_URL: ${{ vars.BCODE_ACTION_RELEASE_URL }}
+          RELEASE_SHA256: ${{ vars.BCODE_ACTION_RELEASE_SHA256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$RELEASE_URL" == https://* && "$RELEASE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo 'Configure BCODE_ACTION_RELEASE_URL and BCODE_ACTION_RELEASE_SHA256 first'; exit 1; }
+          directory=$(mktemp -d "$RUNNER_TEMP/bcode-download.XXXXXXXX")
+          curl --fail --location --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 --max-filesize 536870912 "$RELEASE_URL" -o "$directory/release.tar.gz"
+          printf 'archive=%s\n' "$directory/release.tar.gz" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup-bcode
+        id: setup
+        with:
+          archive: ${{ steps.release.outputs.archive }}
+          sha256: ${{ vars.BCODE_ACTION_RELEASE_SHA256 }}
+      - name: Prepare explicit API authentication configuration
+        id: config
+        shell: bash
+        env:
+          MODEL: ${{ vars.BCODE_ACTION_MODEL }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$MODEL" =~ ^[a-zA-Z0-9._/-]+$ ]] || { echo 'Configure BCODE_ACTION_MODEL explicitly'; exit 1; }
+          directory=$(mktemp -d "$RUNNER_TEMP/bcode-config.XXXXXXXX")
+          cat > "$directory/bcode.toml" <<EOF
+          [model.profiles.github]
+          provider_plugin_id = "bcode.openai-compatible"
+          model_id = "$MODEL"
+          auth_profile = "github-api"
+          [model.profiles.github.settings]
+          auth_mode = "api_key"
+          base_url = "https://api.openai.com/v1"
+          dialect = "responses_api"
+          [auth.profiles.github-api]
+          backend = "env"
+          provider_id = "openai"
+          owner_plugin_id = "bcode.openai-compatible"
+          scheme = "api_key"
+          [auth.profiles.github-api.map.api_key]
+          env = "BCODE_ACTION_API_KEY"
+          [tools.shell.env]
+          mode = "inherit"
+          EOF
+          printf 'path=%s\n' "$directory/bcode.toml" >> "$GITHUB_OUTPUT"
+      - name: Execute prompt
+        id: bcode
+        uses: ./.github/actions/run-bcode
+        env:
+          BCODE_ACTION_API_KEY: ${{ secrets.BCODE_ACTION_API_KEY }}
+        with:
+          binary: ${{ steps.setup.outputs.binary }}
+          config: ${{ steps.config.outputs.path }}
+          profile: github
+          prompt: ${{ inputs.prompt }}
+          timeout-secs: ${{ inputs.timeout-secs }}

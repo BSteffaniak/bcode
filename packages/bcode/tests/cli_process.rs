@@ -683,6 +683,165 @@ fn capture_output(mut pipe: impl std::io::Read) -> std::io::Result<(Vec<u8>, boo
 }
 
 #[test]
+fn run_rejects_preexisting_state_before_metrics_or_daemon_initialization() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("existing-state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(state.join("sentinel"), "unchanged").unwrap();
+    std::fs::write(
+        root.path().join("trusted.toml"),
+        "[metrics]\nstartup_reports = true\n",
+    )
+    .unwrap();
+    let output = run_cli_at_root(
+        root.path(),
+        &[
+            "--config-only",
+            "trusted.toml",
+            "--profile",
+            "selected",
+            "--state-root",
+            state.to_str().unwrap(),
+            "--json-errors",
+            "run",
+            "--cwd",
+            ".",
+            "--file",
+            "missing-prompt.txt",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["observation"], "unverified");
+    assert!(result["session_id"].is_null());
+    assert!(result["receipt"].is_null());
+    let entries: Vec<_> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("sentinel")]);
+    assert_eq!(
+        std::fs::read_to_string(state.join("sentinel")).unwrap(),
+        "unchanged"
+    );
+}
+
+#[test]
+fn run_missing_explicit_selection_emits_unknown_without_admission() {
+    let output = run_cli(&["run", "--cwd", ".", "--file", "missing-prompt.txt"]);
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["observation"], "unverified");
+    assert!(value["session_id"].is_null());
+    assert!(value["receipt"].is_null());
+    assert!(value["outcome"].is_null());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--state-root"));
+}
+
+#[test]
+fn run_missing_prompt_fails_before_authentication_or_daemon_start() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("trusted.toml"), "").unwrap();
+    let state = root.path().join("isolated-state");
+    let output = run_cli_at_root(
+        root.path(),
+        &[
+            "--config-only",
+            "trusted.toml",
+            "--profile",
+            "selected",
+            "--state-root",
+            state.to_str().unwrap(),
+            "run",
+            "--cwd",
+            ".",
+            "--file",
+            "missing-prompt.txt",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["observation"], "unverified");
+    assert!(value["receipt"].is_null());
+    assert_eq!(value["cancellation_requested"], false);
+}
+
+#[test]
+fn run_json_errors_do_not_echo_prompt_path_or_payload() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("trusted.toml"), "").unwrap();
+    let state = root.path().join("isolated-state");
+    let output = run_cli_at_root(
+        root.path(),
+        &[
+            "--config-only",
+            "trusted.toml",
+            "--profile",
+            "selected",
+            "--state-root",
+            state.to_str().unwrap(),
+            "--no-credential-discovery",
+            "--json-errors",
+            "run",
+            "--cwd",
+            ".",
+            "--file",
+            "SECRET_FIXTURE_MARKER-missing.txt",
+            "--timeout-secs",
+            "1",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["observation"], "unverified");
+    assert!(result["receipt"].is_null());
+    let diagnostic: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(diagnostic["schema_version"], 1);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET_FIXTURE_MARKER"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET_FIXTURE_MARKER"));
+}
+
+#[test]
+fn run_stdin_budget_exits_without_waiting_for_eof() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("trusted.toml"), "").unwrap();
+    let state = root.path().join("isolated-state");
+    // The harness retains the stdin pipe without writing or closing it until exit.
+    // Its 30-second watchdog allows bootstrap (outside the execution budget) while
+    // still proving that the one-second input budget does not wait forever for EOF.
+    let output = run_cli_at_root(
+        root.path(),
+        &[
+            "--config-only",
+            "trusted.toml",
+            "--profile",
+            "selected",
+            "--state-root",
+            state.to_str().unwrap(),
+            "run",
+            "--cwd",
+            ".",
+            "--stdin",
+            "--timeout-secs",
+            "1",
+        ],
+        Stdio::piped(),
+        Stdio::piped(),
+    );
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["observation"], "unverified");
+    assert!(value["receipt"].is_null());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("budget expired"));
+}
+
+#[test]
 fn send_wait_input_failure_emits_unverified_process_result() {
     let session = "00000000-0000-0000-0000-000000000001";
     let output = run_cli(&["send", session, "--file", "missing-prompt.txt", "--wait"]);

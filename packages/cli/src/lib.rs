@@ -419,23 +419,17 @@ pub async fn run_with_static_bundled(
     let matches = command.get_matches();
     let arguments_ready = Instant::now();
     let _config_override = config_override_from_matches(&matches);
-    let _state_location = state_location_from_matches(&matches)?;
-    let reading_startup_reports = matches.subcommand().is_some_and(|(name, sub)| {
-        name == "server" && sub.subcommand_name() == Some("startup-report")
-    });
-    if !reading_startup_reports
-        && bcode_config::load_config()?.metrics.startup_reports
-        && let Err(error) = bcode_metrics::startup::initialize(
-            &bcode_config::default_state_dir().join("startup-reports"),
-            process_started,
-            bcode_ipc::ArtifactId::current().to_string(),
-        )
-    {
-        let _ = error;
-        eprintln!(
-            "bcode: startup reports unavailable; check diagnostic storage permissions or format"
-        );
+    // Claim the one-shot state location before state resolution, startup reports,
+    // plugin preflight, or any daemon operation can populate it.
+    if matches.subcommand_name() == Some("run") {
+        headless::claim_fresh_state(
+            matches
+                .get_one::<PathBuf>("state_root")
+                .map(PathBuf::as_path),
+        )?;
     }
+    let _state_location = state_location_from_matches(&matches)?;
+    initialize_startup_reports(&matches, process_started)?;
     record_early_startup([
         process_started,
         cli_started,
@@ -488,6 +482,29 @@ pub async fn run_with_static_bundled(
         eprintln!("bcode: startup report flush failed; report may be incomplete");
     }
     result
+}
+
+fn initialize_startup_reports(
+    matches: &clap::ArgMatches,
+    process_started: Instant,
+) -> Result<(), CliError> {
+    let reading_startup_reports = matches.subcommand().is_some_and(|(name, sub)| {
+        name == "server" && sub.subcommand_name() == Some("startup-report")
+    });
+    if !reading_startup_reports
+        && bcode_config::load_config()?.metrics.startup_reports
+        && bcode_metrics::startup::initialize(
+            &bcode_config::default_state_dir().join("startup-reports"),
+            process_started,
+            bcode_ipc::ArtifactId::current().to_string(),
+        )
+        .is_err()
+    {
+        eprintln!(
+            "bcode: startup reports unavailable; check diagnostic storage permissions or format"
+        );
+    }
+    Ok(())
 }
 
 /// Resolve a plugin-supplied surface repository path against the CLI process working directory.
@@ -553,6 +570,9 @@ fn config_override_from_matches(
         )
         .expect("writing to string should not fail");
     }
+    if matches.subcommand_name() == Some("run") {
+        override_toml.push_str("\n[model.retry]\nenabled = false\noverload_enabled = false\nno_progress_timeout_enabled = false\nremote_catalog_rules_enabled = false\n");
+    }
     let mut overrides =
         bcode_config::ConfigLoadOverrides::from_env_with_cli(None, Some(override_toml));
     overrides.exclusive_config_path = config_only.cloned();
@@ -583,7 +603,8 @@ fn validate_cli_execution_mode(
 ) -> Result<(), CliError> {
     if launch_options != bcode_tui::TuiLaunchOptions::default() && !cli.supports_execution_mode() {
         return Err(CliError::InvalidArguments(
-            "execution-mode flags are supported only for TUI launches, --new, and send".to_owned(),
+            "execution-mode flags are supported only for TUI launches, --new, send, and run"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -594,6 +615,9 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     let _ = (&cli.state_root, &cli.state_profile);
     let launch_options = cli.launch_options();
     validate_cli_execution_mode(&cli, launch_options)?;
+    if let Some(Commands::Run(options)) = &cli.command {
+        return Box::pin(headless::run(&cli, options, launch_options)).await;
+    }
     startup::prepare_remembered_source()?;
     if cli.new {
         if cli.command.is_some() {
@@ -3922,7 +3946,8 @@ async fn handle_session_io_command(
             ))
             .await?;
         }
-        Commands::Onboard { .. }
+        Commands::Run(_)
+        | Commands::Onboard { .. }
         | Commands::Settings { .. }
         | Commands::ArtifactId
         | Commands::Server { .. }
@@ -4236,13 +4261,18 @@ impl Cli {
         !self.onboard
             && (self.new
                 || self.command.as_ref().is_none_or(|command| {
-                    matches!(command, Commands::Tui { .. } | Commands::Send { .. })
+                    matches!(
+                        command,
+                        Commands::Tui { .. } | Commands::Send { .. } | Commands::Run(_)
+                    )
                 }))
     }
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Execute one prompt headlessly with explicit trusted configuration and JSON settlement.
+    Run(headless::RunOptions),
     /// Bounded non-conversational advisory judgement operations.
     Judgement {
         #[command(subcommand)]
@@ -4396,10 +4426,10 @@ enum Commands {
         #[arg(long, conflicts_with = "background")]
         steering: bool,
         /// Stable producer namespace for durable turn admission.
-        #[arg(long, default_value = "bcode.cli")]
+        #[arg(long, default_value = "bcode.cli", conflicts_with = "follow_up")]
         producer: String,
         /// Optional producer-owned idempotency key.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "follow_up")]
         idempotency_key: Option<String>,
         /// Admit the turn at background scheduling priority.
         #[arg(long)]
@@ -10805,6 +10835,7 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
 }
 
 mod credential_setup;
+mod headless;
 mod startup;
 
 fn auth_providers() -> Result<(), CliError> {
@@ -19074,6 +19105,15 @@ async fn send_message_with_client(
     session_id: SessionId,
     options: SendOptions,
 ) -> Result<(), CliError> {
+    send_message_observed(client, session_id, options, None).await
+}
+
+async fn send_message_observed(
+    client: &BcodeClient,
+    session_id: SessionId,
+    options: SendOptions,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), CliError> {
     let SendOptions {
         input,
         placement,
@@ -19087,7 +19127,18 @@ async fn send_message_with_client(
     let wait_timeout = observe_options.as_ref().map(|options| options.timeout);
     let text = report_unverified_submission(input.read(), session_id, wait_timeout.is_some())?;
     let mut watcher = if wait_timeout.is_some() {
-        Some(watch_submitted_turn(client, session_id).await?)
+        if deadline.is_some() {
+            Some(report_unverified_submission(
+                headless::request(deadline, async {
+                    Ok(client.watch_session(session_id, 100).await?)
+                })
+                .await,
+                session_id,
+                true,
+            )?)
+        } else {
+            Some(watch_submitted_turn(client, session_id).await?)
+        }
     } else {
         None
     };
@@ -19111,64 +19162,103 @@ async fn send_message_with_client(
         .await?;
         write_submission_receipt(session_id, &receipt, json)?;
     } else {
-        let admission = client
-            .submit_turn(
-                session_id,
-                text,
-                bcode_session_models::TurnAdmissionMetadata {
-                    origin: Some(bcode_session_models::TurnOrigin {
-                        producer,
-                        correlation_id: None,
-                        display_label: Some("Bcode CLI".to_owned()),
-                    }),
-                    priority: if background {
-                        bcode_session_models::TurnPriority::Background
-                    } else {
-                        bcode_session_models::TurnPriority::Interactive
+        let admission = headless::request(deadline, async {
+            client
+                .submit_turn(
+                    session_id,
+                    text,
+                    bcode_session_models::TurnAdmissionMetadata {
+                        origin: Some(bcode_session_models::TurnOrigin {
+                            producer,
+                            correlation_id: None,
+                            display_label: Some("Bcode CLI".to_owned()),
+                        }),
+                        priority: if background {
+                            bcode_session_models::TurnPriority::Background
+                        } else {
+                            bcode_session_models::TurnPriority::Interactive
+                        },
+                        idempotency_key,
+                        activity: None,
+                        execution: launch_options.turn_execution_options(),
                     },
-                    idempotency_key,
-                    activity: None,
-                    execution: launch_options.turn_execution_options(),
-                },
-            )
-            .await
-            .map_err(CliError::from);
+                )
+                .await
+                .map_err(CliError::from)
+        })
+        .await;
         let admission =
             report_unverified_submission(admission, session_id, wait_timeout.is_some())?;
         if let (Some(watcher), Some(timeout)) = (&mut watcher, wait_timeout) {
-            if let Some(error) = turn_admission_failure(&admission) {
-                write_unstarted_turn_result(session_id, &admission)?;
-                return Err(error);
-            }
-            let (bcode_session_models::TurnAdmission::Accepted(receipt)
-            | bcode_session_models::TurnAdmission::Existing(receipt)
-            | bcode_session_models::TurnAdmission::Deferred(receipt)) = &admission
-            else {
-                unreachable!("failed admission was handled")
-            };
-            let observation = watcher
-                .recover_and_wait_for_turn_outcome(&receipt.turn_id.to_string(), timeout)
-                .await;
-            let outcome = match observation {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return report_observation_failure(
-                        client,
-                        session_id,
-                        receipt,
-                        observe_options.as_ref(),
-                        error,
-                        watcher,
-                    )
-                    .await;
-                }
-            };
-            write_terminal_turn_result(session_id, receipt, outcome)?;
+            observe_cli_admission(
+                client,
+                watcher,
+                session_id,
+                &admission,
+                observe_options.as_ref(),
+                timeout,
+                deadline,
+            )
+            .await?;
         } else {
             write_turn_admission(&mut std::io::stdout().lock(), session_id, &admission, json)?;
         }
     }
     Ok(())
+}
+
+async fn observe_cli_admission(
+    client: &BcodeClient,
+    watcher: &mut bcode_client::SessionWatcher,
+    session_id: SessionId,
+    admission: &bcode_session_models::TurnAdmission,
+    options: Option<&TurnObservationOptions>,
+    timeout: Duration,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), CliError> {
+    if let Some(error) = turn_admission_failure(admission) {
+        write_unstarted_turn_result(session_id, admission)?;
+        return Err(error);
+    }
+    let (bcode_session_models::TurnAdmission::Accepted(receipt)
+    | bcode_session_models::TurnAdmission::Existing(receipt)
+    | bcode_session_models::TurnAdmission::Deferred(receipt)) = admission
+    else {
+        unreachable!("failed admission was handled")
+    };
+    let timeout = deadline.map_or(timeout, |deadline| {
+        deadline.saturating_duration_since(tokio::time::Instant::now())
+    });
+    let observation = if deadline.is_some() {
+        headless::observe(client, watcher, session_id, receipt, timeout).await
+    } else {
+        watcher
+            .recover_and_wait_for_turn_outcome(&receipt.turn_id.to_string(), timeout)
+            .await
+    };
+    let outcome = match observation {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if deadline.is_some() {
+                let failure = CliError::InvalidArguments(error.to_string());
+                settle_observation_failure(
+                    client,
+                    session_id,
+                    receipt,
+                    options.and_then(|options| options.cancellation_grace),
+                    error,
+                    watcher,
+                )
+                .await?;
+                return Err(failure);
+            }
+            return report_observation_failure(
+                client, session_id, receipt, options, error, watcher,
+            )
+            .await;
+        }
+    };
+    write_terminal_turn_result(session_id, receipt, outcome)
 }
 
 async fn submit_cli_prompt(
@@ -19217,6 +19307,25 @@ async fn report_observation_failure(
     let cancellation_grace = options
         .and_then(|options| options.cancellation_grace)
         .filter(|_| matches!(error, ClientError::RequestTimeout { .. }));
+    settle_observation_failure(
+        client,
+        session_id,
+        receipt,
+        cancellation_grace,
+        error,
+        watcher,
+    )
+    .await
+}
+
+async fn settle_observation_failure(
+    client: &BcodeClient,
+    session_id: SessionId,
+    receipt: &bcode_session_models::TurnReceipt,
+    cancellation_grace: Option<std::time::Duration>,
+    error: ClientError,
+    watcher: &mut bcode_client::SessionWatcher,
+) -> Result<(), CliError> {
     let requested = cancellation_grace.is_some();
     let deadline = cancellation_grace.map(|grace| tokio::time::Instant::now() + grace);
     let acknowledged = if let Some(deadline) = deadline {
@@ -25393,6 +25502,21 @@ mod send_cli_tests {
             })
         ));
         assert!(Cli::try_parse_from(["bcode", "send", &session, "hello", "--stdin"]).is_err());
+    }
+    #[test]
+    fn follow_up_rejects_explicit_turn_admission_options_but_not_defaults() {
+        let session = "00000000-0000-0000-0000-000000000001";
+        for extra in [
+            vec!["--producer", "test.producer"],
+            vec!["--idempotency-key", "retry-key"],
+            vec!["--background"],
+        ] {
+            let mut arguments = vec!["bcode", "send", session, "hello", "--follow-up"];
+            arguments.extend(extra);
+            let error = Cli::try_parse_from(arguments).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        assert!(Cli::try_parse_from(["bcode", "send", session, "hello", "--follow-up"]).is_ok());
     }
 }
 

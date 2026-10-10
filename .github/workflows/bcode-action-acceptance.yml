@@ -1,0 +1,16 @@
+name: Bcode Action acceptance
+on:
+  pull_request:
+    paths: ['.github/actions/**', 'scripts/test-*-bcode.sh', '.github/workflows/bcode-prompt.yml', '.github/workflows/bcode-action-acceptance.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  adapters:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: bash scripts/test-setup-bcode.sh
+      - run: bash scripts/test-run-bcode.sh

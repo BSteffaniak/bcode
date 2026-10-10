@@ -1,0 +1,38 @@
+name: Run Bcode
+description: Execute one arbitrary prompt using explicit trusted configuration
+inputs:
+  binary:
+    description: Absolute path to a verified Bcode release binary
+    required: true
+  config:
+    description: Absolute trusted config file outside the checkout; contains explicit model/auth profiles
+    required: true
+  profile:
+    description: Explicit model profile to use (no account or billing fallback)
+    required: true
+  prompt:
+    description: Arbitrary UTF-8 prompt, passed as data rather than shell code
+    required: true
+  timeout-secs:
+    description: Execution budget in seconds (1–86400)
+    default: '600'
+outputs:
+  result:
+    description: Private result JSON path; output may contain sensitive model-generated content
+    value: ${{ steps.run.outputs.result }}
+  exit-code:
+    description: Bcode exit status; only observed completion succeeds
+    value: ${{ steps.run.outputs.exit-code }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        BCODE_ACTION_BINARY: ${{ inputs.binary }}
+        BCODE_ACTION_CONFIG: ${{ inputs.config }}
+        BCODE_ACTION_PROFILE: ${{ inputs.profile }}
+        BCODE_ACTION_PROMPT: ${{ inputs.prompt }}
+        BCODE_ACTION_TIMEOUT: ${{ inputs.timeout-secs }}
+        BCODE_ACTION_PATH: ${{ github.action_path }}
+      run: bash "$BCODE_ACTION_PATH/run.sh"

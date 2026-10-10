@@ -26,4 +26,4 @@ runs:
         BCODE_SETUP_ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        python3 -I -B "$BCODE_SETUP_ACTION_PATH/setup.py"
+        bash "$BCODE_SETUP_ACTION_PATH/setup.sh"

@@ -9,6 +9,11 @@ async fn hello_peer(listener: &bcode_ipc::LocalIpcListener) -> bcode_ipc::LocalI
         namespace: bcode_ipc::daemon_namespace(),
         protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
         artifact_id: Some(bcode_ipc::ArtifactId::current()),
+        executable_digest: Some(
+            bcode_daemon_lifecycle::current_executable_identity()
+                .unwrap()
+                .1,
+        ),
         build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.into(),
         storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
         session_event_schema_version: Some(
@@ -146,23 +151,30 @@ async fn cancellation_recovery_deadline_preserves_original_timeout_without_retry
         // Keep the response unanswered without closing the original subscription.
         (listener, watch)
     });
-    let client = BcodeClient::new(endpoint).with_request_timeout(std::time::Duration::from_secs(1));
+    let client =
+        BcodeClient::new(endpoint).with_request_timeout(std::time::Duration::from_secs(30));
     let mut watcher = client.watch_session(session_id, 1).await.unwrap();
     let receipt = bcode_session_models::TurnReceipt::from_accepted_event(session_id, 17);
     let original = std::time::Duration::from_secs(7);
     let options = TurnObservationOptions {
         timeout: original,
-        cancellation_grace: Some(std::time::Duration::from_millis(20)),
+        // Include fresh cancellation-connection executable verification under load.
+        // This remains shorter than the transport timeout, and history stays unanswered.
+        cancellation_grace: Some(std::time::Duration::from_secs(5)),
     };
-    let result = report_observation_failure(
-        &client,
-        session_id,
-        &receipt,
-        Some(&options),
-        ClientError::RequestTimeout { timeout: original },
-        &mut watcher,
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        report_observation_failure(
+            &client,
+            session_id,
+            &receipt,
+            Some(&options),
+            ClientError::RequestTimeout { timeout: original },
+            &mut watcher,
+        ),
     )
-    .await;
+    .await
+    .expect("recovery grace must expire before the 30-second transport timeout");
     assert!(
         matches!(result, Err(CliError::Client(ClientError::RequestTimeout { timeout })) if timeout == original)
     );
@@ -302,6 +314,209 @@ async fn delayed_acknowledgement_does_not_restart_recovery_grace() {
     );
     assert!(
         tokio::time::timeout(bound, bcode_ipc::recv_envelope(&mut watch))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn headless_permission_wait_fails_without_answering_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("permission.sock"));
+    let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+    let session_id = SessionId::new();
+    let server = tokio::spawn(async move {
+        let mut watch = hello_peer(&listener).await;
+        attach_peer(&mut watch, session_id).await;
+        let history = bcode_ipc::recv_envelope(&mut watch).await.unwrap();
+        reply(
+            &mut watch,
+            history.request_id,
+            bcode_ipc::ResponsePayload::SessionHistoryPage {
+                page: bcode_session_models::SessionHistoryPage {
+                    session_id,
+                    events: Vec::new(),
+                    compatibility_issues: Vec::new(),
+                    next_cursor: None,
+                    has_more: false,
+                },
+            },
+        )
+        .await;
+        let mut permissions = hello_peer(&listener).await;
+        let request = bcode_ipc::recv_envelope(&mut permissions).await.unwrap();
+        assert!(matches!(
+            bcode_ipc::decode_request(&request.payload).unwrap(),
+            bcode_ipc::Request::ListPermissions
+        ));
+        let permission = serde_json::from_value(serde_json::json!({
+            "permission_id": "checkpoint", "session_id": session_id,
+            "tool_call_id": "tool", "tool_name": "test", "arguments_json": "{}", "agent_id": "build",
+        })).unwrap();
+        reply(
+            &mut permissions,
+            request.request_id,
+            bcode_ipc::ResponsePayload::PermissionList {
+                permissions: vec![permission],
+            },
+        )
+        .await;
+        (listener, watch)
+    });
+    let client = BcodeClient::new(endpoint);
+    let mut watcher = client.watch_session(session_id, 1).await.unwrap();
+    let receipt = bcode_session_models::TurnReceipt::from_accepted_event(session_id, 17);
+    let result = headless::observe(
+        &client,
+        &mut watcher,
+        session_id,
+        &receipt,
+        std::time::Duration::from_secs(1),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ClientError::Protocol(message)) if message.contains("requires permission"))
+    );
+    let (listener, _watch) = server.await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn headless_observes_authoritative_success_and_failure() {
+    use bcode_session_models::{ModelTurnOutcome, SessionEvent, SessionEventKind, TurnReceipt};
+    for outcome in [ModelTurnOutcome::Completed, ModelTurnOutcome::Cancelled] {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("terminal.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let session_id = SessionId::new();
+        let receipt = TurnReceipt::from_accepted_event(session_id, 17);
+        let expected = receipt.clone();
+        let server = tokio::spawn(async move {
+            let mut watch = hello_peer(&listener).await;
+            attach_peer(&mut watch, session_id).await;
+            let history = bcode_ipc::recv_envelope(&mut watch).await.unwrap();
+            assert!(matches!(
+                bcode_ipc::decode_request(&history.payload).unwrap(),
+                bcode_ipc::Request::SessionHistoryPage { .. }
+            ));
+            reply(
+                &mut watch,
+                history.request_id,
+                bcode_ipc::ResponsePayload::SessionHistoryPage {
+                    page: bcode_session_models::SessionHistoryPage {
+                        session_id,
+                        compatibility_issues: Vec::new(),
+                        next_cursor: None,
+                        has_more: false,
+                        events: vec![SessionEvent {
+                            schema_version: 1,
+                            session_id,
+                            sequence: 18,
+                            timestamp_ms: 0,
+                            provenance: None,
+                            kind: SessionEventKind::ModelTurnFinished {
+                                turn_id: expected.turn_id.to_string(),
+                                outcome,
+                                message: None,
+                            },
+                        }],
+                    },
+                },
+            )
+            .await;
+            // Retain transport until the observer settles the recovered terminal event.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let client = BcodeClient::new(endpoint);
+        let mut watcher = client.watch_session(session_id, 1).await.unwrap();
+        let observed = headless::observe(
+            &client,
+            &mut watcher,
+            session_id,
+            &receipt,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observed, outcome);
+        assert_eq!(
+            write_terminal_turn_result(session_id, &receipt, observed).is_ok(),
+            outcome == ModelTurnOutcome::Completed
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn headless_lost_admission_response_is_unknown_and_never_replayed() {
+    let directory = tempfile::tempdir().unwrap();
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("lost.sock"));
+    let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+    let session_id = SessionId::new();
+    let server = tokio::spawn(async move {
+        let mut watch = hello_peer(&listener).await;
+        attach_peer(&mut watch, session_id).await;
+        let mut admission = hello_peer(&listener).await;
+        let request = bcode_ipc::recv_envelope(&mut admission).await.unwrap();
+        assert!(
+            matches!(bcode_ipc::decode_request(&request.payload).unwrap(),
+            bcode_ipc::Request::SubmitTurn { session_id: id, .. } if id == session_id)
+        );
+        // The peer may have committed admission. Losing the response is not rejection.
+        drop(admission);
+        (listener, watch)
+    });
+    // Compatibility verification hashes the real test executable. Leave setup slack
+    // under the parallel library suite; the lost response, not elapsed time, drives failure.
+    let client = BcodeClient::new(endpoint);
+    let result = send_message_observed(
+        &client,
+        session_id,
+        scripted_send_options(),
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30)),
+    )
+    .await;
+    assert!(result.is_err());
+    let (listener, _watch) = server.await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn headless_subscription_uses_total_budget_not_transport_timeout() {
+    let directory = tempfile::tempdir().unwrap();
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("subscribe.sock"));
+    let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+    let session_id = SessionId::new();
+    let server = tokio::spawn(async move {
+        let mut watch = hello_peer(&listener).await;
+        let _request = bcode_ipc::recv_envelope(&mut watch).await.unwrap();
+        (listener, watch)
+    });
+    let client =
+        BcodeClient::new(endpoint).with_request_timeout(std::time::Duration::from_secs(30));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        send_message_observed(
+            &client,
+            session_id,
+            scripted_send_options(),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100)),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    let (listener, _watch) = server.await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
             .await
             .is_err()
     );
@@ -593,6 +808,11 @@ async fn timeout_cancellation_preserves_exact_target_and_unknown_acknowledgement
                 namespace: bcode_ipc::daemon_namespace(),
                 protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
                 artifact_id: Some(bcode_ipc::ArtifactId::current()),
+                executable_digest: Some(
+                    bcode_daemon_lifecycle::current_executable_identity()
+                        .unwrap()
+                        .1,
+                ),
                 build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.into(),
                 storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
                 session_event_schema_version: Some(

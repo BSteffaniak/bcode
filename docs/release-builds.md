@@ -3,44 +3,26 @@
 Bcode release artifacts are produced by the repository `xtask` release automation and the
 `release.yml` GitHub Actions workflow.
 
-## CI installation prerequisite
+## CI installation
 
-The composite Action at `.github/actions/setup-bcode` exposes this installer with
-required `archive` and `sha256` inputs and `installation` / `binary` outputs.
-Consumers must pin the Action repository to a reviewed full commit SHA, provide
-an absolute archive path in trusted runner storage, and use an ephemeral Unix
-runner with Python 3. The adapter requires `GITHUB_WORKSPACE` to identify an
-existing absolute checkout directory, and rejects archive or installation storage
-inside that directory after resolving symlinks. `GITHUB_OUTPUT` must also be an
-absolute path outside the checkout; relative or checkout-contained output paths
-are rejected before installation. This is a configuration check,
-not an OS sandbox against concurrent same-user processes.
+The composite Action at `.github/actions/setup-bcode` accepts an absolute tar.gz
+archive path and an independently trusted SHA-256 pin. It copies the archive to
+private runner storage, verifies that snapshot, then uses the platform tar utility
+to extract the reviewed release. It never runs archive content or changes PATH.
+Outputs identify the runtime directory and executable.
 
-The supported input format is **tar.gz only**, matching Linux release artifacts.
-Native macOS and Windows releases are ZIP files and cannot currently be installed
-with this Action. The macOS CI fixture tests tar extraction on that host; it does
-not demonstrate installation of a native macOS release.
+This bootstrap supports only trusted, digest-pinned Bcode distributions—not
+arbitrary archives. Release tooling validates distribution structure and plugin
+layout. A checksum downloaded alongside an untrusted archive is not an independent
+trust anchor. Pin the Action to a reviewed commit and obtain the distribution pin
+from trusted workflow policy. Runner paths and the archive must be outside the
+checkout. This is not an OS sandbox or protection from concurrent same-user code.
 
-It does not download a release, execute Bcode, alter PATH,
-accept credentials, or run prompts. Installation files remain in `RUNNER_TEMP`
-for the job; runner disposal is responsible for final cleanup. This setup Action
-is not the still-required prompt-execution Action.
+Requirements: Bash, tar, and sha256sum (or shasum). Linux tar.gz distributions are
+supported; native macOS/Windows ZIP distributions are not. Failed installs are
+removed; ephemeral runner disposal cleans successful installs.
 
-`scripts/install-action-release.py --archive RELEASE.tar.gz --sha256 TRUSTED_DIGEST
---parent PRIVATE_RUNNER_DIRECTORY` verifies a Unix distribution and prints a new
-private installation directory. Supply a reviewed SHA-256 pin from trusted workflow
-configuration; fetching a digest beside an archive is not an independent trust
-anchor. The caller must download into trusted private storage and enforce network
-deadlines; this helper does not download or execute binaries. Both the archive and
-parent directory must be outside untrusted checkout control. Windows ZIP installation
-is not supported by this helper.
-
-The installer hashes a bounded private snapshot before extraction, rejects links,
-devices, traversal and duplicate paths, bounds the entire decompressed tar stream
-(including metadata) before parsing as well as extracted size and entry count,
-preserves bundled runtime layout, and strips archive ownership and privileged modes.
-Failed installations are removed. This is an installation prerequisite, not yet a
-reusable Action, authentication setup, sandbox, or execution supervisor.
+See [GitHub Actions](github-actions.md) for arbitrary-prompt execution.
 
 ## Local commands
 
