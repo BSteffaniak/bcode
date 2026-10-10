@@ -831,6 +831,7 @@ mod tests {
                 let (response, _received) = tokio::sync::oneshot::channel();
                 cancel
                     .send(crate::CancelCommand {
+                        expected_turn_id: None,
                         clear_queue: false,
                         requested_by: Some(client_id),
                         response,

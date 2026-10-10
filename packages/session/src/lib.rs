@@ -109,7 +109,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-pub use store::{SessionStore, SessionStoreError};
+pub use store::{SessionDiscoveryCandidate, SessionStore, SessionStoreError};
 use store_executor::SessionStoreExecutor;
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -2124,6 +2124,38 @@ impl SessionManager {
             .take(limit.min(256))
             .map(|(_, handle)| handle.snapshot().summary)
             .collect()
+    }
+
+    /// Select a bounded recent-activity window from an in-memory session manager.
+    pub async fn loaded_catalog_activity_page(
+        &self,
+        after: Option<bcode_session_models::SessionCatalogPosition>,
+        limit: usize,
+    ) -> Vec<SessionDiscoveryCandidate> {
+        let inner = self.inner.lock().await;
+        let mut selected = BTreeMap::new();
+        for handle in inner.sessions.values() {
+            let summary = handle.snapshot().summary;
+            let position = bcode_session_models::SessionCatalogPosition {
+                updated_at_ms: summary.updated_at_ms,
+                created_at_ms: summary.created_at_ms,
+                id: summary.id,
+            };
+            if after.is_some_and(|after| position.sort_key() <= after.sort_key()) {
+                continue;
+            }
+            selected.insert(
+                position.sort_key(),
+                SessionDiscoveryCandidate {
+                    position,
+                    summary: Some(summary),
+                },
+            );
+            if selected.len() > limit.min(256) {
+                selected.pop_last();
+            }
+        }
+        selected.into_values().collect()
     }
 
     pub async fn all_session_catalog_entries(&self) -> Vec<SessionCatalogEntry> {

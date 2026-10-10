@@ -134,9 +134,11 @@ switch between **This directory** and **All directories**. For scripting,
 in the already-selected and configured readable locations; it conflicts with `--cwd` and is not a
 global startup flag. `--json` emits one session per JSON line, while `--json --with-status` emits
 one bounded catalog page per line, including health and continuation metadata. Existing local
-listing output is unchanged. Global native pages use ascending session-ID order within each
-configured location, not a global recent-first sort. A failed paginated listing may have emitted
-partial output and must
+listing output is unchanged. Global native pages are ordered by descending recent activity,
+then creation time and session ID, merged across configured locations. Pages are live keyset
+windows rather than revision-pinned snapshots: ordinary catalog updates do not reject reads.
+Concurrent activity can move sessions ahead of a continuation; the picker refreshes the first page
+on updates. A failed paginated listing may have emitted partial output and must
 be restarted explicitly; its cursor is not a durable snapshot or authority token.
 
 Discovery never changes a session's canonical cwd or owning state location.

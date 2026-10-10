@@ -29,6 +29,15 @@ pub enum SessionStoreError {
     Lease(#[from] lease::SessionLeaseError),
 }
 
+/// One indexed activity boundary and its trustworthy display metadata, if available.
+#[derive(Debug)]
+pub struct SessionDiscoveryCandidate {
+    /// Advances even when display metadata is damaged or hidden.
+    pub position: bcode_session_models::SessionCatalogPosition,
+    /// None means the candidate requires explicit maintenance.
+    pub summary: Option<SessionSummary>,
+}
+
 /// Filesystem-rooted session store for DB-backed session histories.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -493,6 +502,59 @@ impl SessionStore {
         .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?
     }
 
+    /// Read bounded native candidates in recent-activity order without replay or repair.
+    ///
+    /// # Errors
+    /// Returns unsafe-path, catalog compatibility, query or close failures.
+    pub async fn discovery_activity_page(
+        &self,
+        after: Option<bcode_session_models::SessionCatalogPosition>,
+        include_boundary: bool,
+        limit: usize,
+    ) -> Result<Vec<SessionDiscoveryCandidate>, SessionStoreError> {
+        if !(1..=256).contains(&limit) {
+            return Err(SessionStoreError::CatalogLoad(
+                "invalid catalog page limit".into(),
+            ));
+        }
+        let root = self.root.canonicalize()?;
+        let path = db::global_catalog_db_path(&root);
+        if fs::symlink_metadata(&path)?.file_type().is_symlink()
+            || path.canonicalize()?.parent() != Some(root.as_path())
+        {
+            return Err(SessionStoreError::CatalogLoad("unsafe catalog path".into()));
+        }
+        let catalog = db::GlobalSessionDb::open_existing_turso_in_root(&root)
+            .await
+            .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        let result = catalog
+            .list_sessions_activity_page(after, include_boundary, limit)
+            .await;
+        let close = catalog.close().await;
+        let candidates =
+            result.map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        close.map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .map(|candidate| {
+                    let position = bcode_session_models::SessionCatalogPosition {
+                        updated_at_ms: candidate.updated_at_ms,
+                        created_at_ms: candidate.created_at_ms,
+                        id: candidate.id,
+                    };
+                    SessionDiscoveryCandidate {
+                        position,
+                        summary: store.load_session_manifest(candidate.id).ok().flatten(),
+                    }
+                })
+                .collect()
+        })
+        .await
+        .map_err(SessionStoreError::BlockingTask)
+    }
+
     pub(crate) fn root(&self) -> &Path {
         self.root.as_path()
     }
@@ -636,6 +698,76 @@ mod tests {
         )
         .unwrap();
         assert!(store.discovery_page(None, 1).await.unwrap().2);
+    }
+
+    #[tokio::test]
+    async fn discovery_activity_pages_order_ties_and_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path());
+        let mut expected = Vec::new();
+        for (updated, created) in [(10, 1), (30, 2), (30, 5), (30, 5), (20, 4)] {
+            let id = SessionId::new();
+            std::fs::create_dir(root.path().join(id.to_string())).unwrap();
+            std::fs::write(
+                root.path().join(id.to_string()).join("session.db"),
+                b"no replay",
+            )
+            .unwrap();
+            let mut summary = store.canonical_summary(id);
+            summary.updated_at_ms = updated;
+            summary.created_at_ms = created;
+            store.write_session_manifest(&summary).unwrap();
+            expected.push(summary);
+        }
+        let catalog = crate::db::GlobalSessionDb::open_turso_in_root(root.path())
+            .await
+            .unwrap();
+        catalog
+            .upsert_sessions(root.path(), &expected)
+            .await
+            .unwrap();
+        catalog.close().await.unwrap();
+        expected.sort_by_key(|s| {
+            (
+                std::cmp::Reverse(s.updated_at_ms),
+                std::cmp::Reverse(s.created_at_ms),
+                s.id,
+            )
+        });
+        let mut after = None;
+        let mut found = Vec::new();
+        loop {
+            let page = store
+                .discovery_activity_page(after, false, 2)
+                .await
+                .unwrap();
+            assert!(page.len() <= 2);
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|candidate| candidate.position);
+            found.extend(
+                page.into_iter()
+                    .map(|candidate| candidate.summary.unwrap().id),
+            );
+        }
+        assert_eq!(
+            found,
+            expected
+                .iter()
+                .map(|summary| summary.id)
+                .collect::<Vec<_>>()
+        );
+        let boundary = bcode_session_models::SessionCatalogPosition {
+            updated_at_ms: expected[1].updated_at_ms,
+            created_at_ms: expected[1].created_at_ms,
+            id: expected[1].id,
+        };
+        let page = store
+            .discovery_activity_page(Some(boundary), true, 1)
+            .await
+            .unwrap();
+        assert_eq!(page[0].position, boundary);
     }
 
     #[test]

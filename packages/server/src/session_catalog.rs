@@ -173,11 +173,13 @@ impl SessionCatalog {
     }
 
     /// Read native candidates directly, without starting full catalog discovery.
-    /// Empty filtered windows may carry a continuation; each request examines at most 256 candidates.
+    /// Empty filtered windows may carry a continuation; each location contributes at most
+    /// 256 candidates and only one bounded merged window is returned.
     ///
     /// # Errors
     /// Returns an error for invalid limits, oversized queries, relative directory scopes,
-    /// changed cursor selections or revisions, and unavailable cursor locations.
+    /// changed cursor selections and unavailable cursor locations. Revision updates are
+    /// permitted because pages are live keyset windows rather than coherent snapshots.
     pub async fn page_with_scope(
         &self,
         state: &Arc<ServerState>,
@@ -191,84 +193,83 @@ impl SessionCatalog {
         };
         validate_catalog_selection(&scope, &query, limit)?;
         let revision = *self.revision_rx.borrow();
-        // Local compatibility APIs retain import discovery. This native page endpoint does not
-        // scan unknown import directories or silently claim that external coverage is complete.
+        // Activity keysets are live windows, not revision-pinned snapshots. Unrelated
+        // discovery completion or session updates must not make ordinary browsing fail.
         let local_import_gap = matches!(scope, SessionDiscoveryScope::WorkingDirectory(_));
         if let Some(cursor) = &cursor
-            && (cursor.revision != revision || cursor.scope != scope || cursor.query != query)
+            && (cursor.scope != scope || cursor.query != query)
         {
-            return Err("catalog cursor changed; restart from the first page".into());
+            return Err("catalog cursor selection changed; restart from the first page".into());
         }
         let locations = native_locations(state);
-        let index = cursor.as_ref().map_or(0, |cursor| cursor.location_index);
-        let after = cursor.as_ref().and_then(|cursor| cursor.after);
-        if index >= locations.len().max(1) {
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.location_index >= locations.len().max(1))
+        {
             return Err("catalog cursor location is no longer available; restart".into());
         }
+        let after = cursor.as_ref().and_then(|cursor| cursor.after);
+        let mut candidates = Vec::new();
         let mut sources = Vec::new();
-        let (mut sessions, next, degraded) = if let Some(location) = locations.get(index) {
+        let mut degraded = false;
+        for (index, location) in locations.iter().enumerate() {
+            let include_boundary = cursor
+                .as_ref()
+                .is_some_and(|cursor| index > cursor.location_index);
             let result = bcode_session::SessionStore::new(&location.sessions_root)
-                .discovery_page(after, limit)
+                .discovery_activity_page(after, include_boundary, limit)
                 .await;
-            let (mut sessions, next, degraded) =
-                result.unwrap_or_else(|_| (Vec::new(), None, true));
-            for session in &mut sessions {
-                session.location = Some(location.summary());
-                let claims = exact_location_claims(state, session.id);
-                if let Some(location) = &mut session.location {
-                    location.ambiguous = claims.as_ref().map_or(true, |claims| claims.len() > 1);
-                }
-            }
+            let damaged = result.map_or(true, |page| {
+                let damaged = page.iter().any(|candidate| candidate.summary.is_none());
+                candidates.extend(page.into_iter().map(|candidate| (index, candidate)));
+                damaged
+            });
+            degraded |= damaged;
             sources.push(SessionCatalogSourceStatus {
                 source_id: location.source_id(), display_name: location.display_name(),
-                status: if degraded { SessionCatalogStatus::Degraded("native catalog metadata missing or unsupported; explicit maintenance required".into()) } else { SessionCatalogStatus::Loaded },
                 updated_at_ms: 0,
+                status: if damaged { SessionCatalogStatus::Degraded("native catalog metadata missing or unsupported; explicit maintenance required".into()) } else { SessionCatalogStatus::Loaded },
             });
-            (sessions, next, degraded)
-        } else {
-            let sessions = state.sessions.loaded_catalog_page(after, limit).await;
-            let next = if sessions.len() == limit {
-                sessions.last().map(|session| session.id)
-            } else {
-                None
-            };
-            (sessions, next, false)
-        };
-        let text = query.text.as_ref().map(|text| text.to_lowercase());
-        sessions.retain(|session| {
-            session.is_picker_visible()
-                && match &scope {
-                    SessionDiscoveryScope::AllWorkingDirectories => true,
-                    SessionDiscoveryScope::WorkingDirectory(path) => {
-                        normalize_path(&session.working_directory) == normalize_path(path)
+        }
+        if locations.is_empty() {
+            candidates.extend(
+                state
+                    .sessions
+                    .loaded_catalog_activity_page(after, limit)
+                    .await
+                    .into_iter()
+                    .map(|candidate| (0, candidate)),
+            );
+        }
+        candidates.sort_by_key(|(index, candidate)| (candidate.position.sort_key(), *index));
+        candidates.truncate(limit);
+        let next_cursor =
+            candidates
+                .last()
+                .filter(|_| candidates.len() == limit)
+                .map(|(index, candidate)| SessionCatalogCursor {
+                    scope: scope.clone(),
+                    query: query.clone(),
+                    revision,
+                    location_index: *index,
+                    after: Some(candidate.position),
+                });
+        let mut sessions = Vec::new();
+        for (index, candidate) in candidates {
+            if let Some(mut session) = candidate.summary {
+                if let Some(location) = locations.get(index) {
+                    session.location = Some(location.summary());
+                    let claims = exact_location_claims(state, session.id);
+                    if let Some(location) = &mut session.location {
+                        location.ambiguous =
+                            claims.as_ref().map_or(true, |claims| claims.len() > 1);
                     }
                 }
-                && text.as_ref().is_none_or(|text| {
-                    session.id.to_string().contains(text)
-                        || session
-                            .title()
-                            .is_some_and(|name| name.to_lowercase().contains(text))
-                        || session
-                            .working_directory
-                            .to_string_lossy()
-                            .to_lowercase()
-                            .contains(text)
-                })
-        });
-        let next_cursor = if next.is_some() || index + 1 < locations.len() {
-            Some(SessionCatalogCursor {
-                scope,
-                query,
-                revision,
-                location_index: if next.is_some() { index } else { index + 1 },
-                after: next,
-            })
-        } else {
-            None
-        };
-        if *self.revision_rx.borrow() != revision {
-            return Err("catalog changed during page read; restart".into());
+                sessions.push(session);
+            }
         }
+        let text = query.text.as_ref().map(|text| text.to_lowercase());
+        sessions.retain(|session| catalog_summary_matches(session, &scope, text.as_deref()));
         Ok(SessionCatalogPage {
             sessions,
             catalog_status: if degraded || local_import_gap {
@@ -1422,6 +1423,31 @@ async fn notify_planning_retry(
     }
 }
 
+fn catalog_summary_matches(
+    session: &SessionSummary,
+    scope: &bcode_session_models::SessionDiscoveryScope,
+    text: Option<&str>,
+) -> bool {
+    session.is_picker_visible()
+        && match scope {
+            bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories => true,
+            bcode_session_models::SessionDiscoveryScope::WorkingDirectory(path) => {
+                normalize_path(&session.working_directory) == normalize_path(path)
+            }
+        }
+        && text.is_none_or(|text| {
+            session.id.to_string().contains(text)
+                || session
+                    .title()
+                    .is_some_and(|name| name.to_lowercase().contains(text))
+                || session
+                    .working_directory
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(text)
+        })
+}
+
 fn validate_catalog_selection(
     scope: &bcode_session_models::SessionDiscoveryScope,
     query: &bcode_session_models::SessionCatalogQuery,
@@ -1452,6 +1478,169 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn activity_pages_survive_catalog_revision_updates() {
+        use bcode_session_models::{SessionCatalogQuery, SessionDiscoveryScope};
+        let manager = bcode_session::SessionManager::default();
+        for _ in 0..3 {
+            manager
+                .create_session(None, "/project".into())
+                .await
+                .unwrap();
+        }
+        let state = std::sync::Arc::new(crate::tests::test_server_state(manager));
+        let catalog = &state.session_catalog;
+        let first = catalog
+            .page_with_scope(
+                &state,
+                SessionDiscoveryScope::AllWorkingDirectories,
+                SessionCatalogQuery::default(),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        let updater = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                for _ in 0..8 {
+                    let mut inner = state.session_catalog.inner.lock().await;
+                    state.session_catalog.bump_revision(&mut inner);
+                    drop(inner);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let next = catalog
+            .page_with_scope(
+                &state,
+                SessionDiscoveryScope::AllWorkingDirectories,
+                SessionCatalogQuery::default(),
+                first.next_cursor,
+                1,
+            )
+            .await
+            .unwrap();
+        updater.await.unwrap();
+        assert_ne!(first.sessions[0].id, next.sessions[0].id);
+        assert!(catalog.revision() > first.catalog_revision);
+        let last = catalog
+            .page_with_scope(
+                &state,
+                SessionDiscoveryScope::AllWorkingDirectories,
+                SessionCatalogQuery::default(),
+                next.next_cursor,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_ne!(next.sessions[0].id, last.sessions[0].id);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn global_activity_pages_merge_readable_locations() {
+        use bcode_session_models::{SessionCatalogQuery, SessionDiscoveryScope};
+        let primary = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for (root, activity) in [
+            (primary.path(), 10),
+            (foreign.path(), 40),
+            (primary.path(), 30),
+            (foreign.path(), 20),
+        ] {
+            let manager = bcode_session::SessionManager::persistent(root).unwrap();
+            let mut session = manager
+                .create_session(None, root.to_path_buf())
+                .await
+                .unwrap();
+            drop(manager);
+            session.updated_at_ms = 4_000_000_000_000 + activity;
+            session.created_at_ms = 1;
+            let manifest_path = root.join(session.id.to_string()).join("manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["summary"] = serde_json::to_value(&session).unwrap();
+            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let catalog = bcode_session::db::GlobalSessionDb::open_turso_in_root(root)
+                .await
+                .unwrap();
+            catalog
+                .upsert_sessions(root, std::slice::from_ref(&session))
+                .await
+                .unwrap();
+            catalog.close().await.unwrap();
+            expected.push(session);
+        }
+        expected.sort_by_key(|s| {
+            (
+                std::cmp::Reverse(s.updated_at_ms),
+                std::cmp::Reverse(s.created_at_ms),
+                s.id,
+            )
+        });
+        let config = bcode_config::StateConfig {
+            root: Some(primary.path().to_path_buf()),
+            sessions_root: Some(primary.path().to_path_buf()),
+            profile: std::collections::BTreeMap::from([(
+                "foreign".into(),
+                bcode_config::StateProfileConfig {
+                    root: Some(foreign.path().to_path_buf()),
+                    sessions_root: Some(foreign.path().to_path_buf()),
+                },
+            )]),
+            readable_profiles: vec!["foreign".into()],
+            ..Default::default()
+        };
+        let state = std::sync::Arc::new({
+            let mut raw = crate::tests::test_server_state(
+                bcode_session::SessionManager::persistent_lazy(primary.path()),
+            );
+            raw.locations = Some(
+                bcode_config::resolve_state_location_set(
+                    &config,
+                    &bcode_config::StateLocationSelection::default(),
+                )
+                .unwrap(),
+            );
+            raw.daemon_status.state_location_id = raw
+                .locations
+                .as_ref()
+                .map(|locations| locations.primary().id().as_str().to_owned());
+            raw
+        });
+        let mut cursor = None;
+        let mut found = Vec::new();
+        loop {
+            let page = state
+                .session_catalog
+                .page_with_scope(
+                    &state,
+                    SessionDiscoveryScope::AllWorkingDirectories,
+                    SessionCatalogQuery::default(),
+                    cursor,
+                    2,
+                )
+                .await
+                .unwrap();
+            assert!(page.sessions.len() <= 2);
+            found.extend(page.sessions.into_iter().map(|summary| summary.id));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            found,
+            expected
+                .iter()
+                .map(|summary| summary.id)
+                .collect::<Vec<_>>()
+        );
+        drop(state);
+    }
+
     #[tokio::test]
     async fn native_pages_continue_empty_filters_and_reject_changed_selection() {
         use bcode_session_models::{SessionCatalogQuery, SessionDiscoveryScope};

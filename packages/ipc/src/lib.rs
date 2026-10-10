@@ -129,7 +129,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 50 adds retained workflow activity snapshots and host progress timestamps.
 /// Version 51 adds bounded request-only turn judgement observations to that layout.
 /// Older positional request/response layouts are rejected rather than misinterpreted.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 51;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 52;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =

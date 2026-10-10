@@ -938,6 +938,59 @@ impl GlobalSessionDb {
             .collect()
     }
 
+    /// Read a bounded activity-ordered candidate window using a keyset boundary.
+    /// Equal keys may be included when merging a later readable location.
+    ///
+    /// # Errors
+    /// Returns query or row conversion errors without migrating the catalog.
+    pub async fn list_sessions_activity_page(
+        &self,
+        after: Option<bcode_session_models::SessionCatalogPosition>,
+        include_boundary: bool,
+        limit: usize,
+    ) -> SessionDbResult<Vec<SessionSummary>> {
+        use switchy::database::query::{
+            where_and, where_eq, where_gt, where_gte, where_lt, where_or,
+        };
+        let mut query = self.db.select("sessions").columns(&[
+            "session_id",
+            "title",
+            "working_directory",
+            "created_at_ms",
+            "updated_at_ms",
+        ]);
+        if let Some(after) = after {
+            let identity: Box<dyn switchy::database::query::BooleanExpression> = if include_boundary
+            {
+                Box::new(where_gte("session_id", after.id.to_string()))
+            } else {
+                Box::new(where_gt("session_id", after.id.to_string()))
+            };
+            query = query.filter(Box::new(where_or(vec![
+                Box::new(where_lt("updated_at_ms", seq_to_value(after.updated_at_ms))),
+                Box::new(where_and(vec![
+                    Box::new(where_eq("updated_at_ms", seq_to_value(after.updated_at_ms))),
+                    Box::new(where_lt("created_at_ms", seq_to_value(after.created_at_ms))),
+                ])),
+                Box::new(where_and(vec![
+                    Box::new(where_eq("updated_at_ms", seq_to_value(after.updated_at_ms))),
+                    Box::new(where_eq("created_at_ms", seq_to_value(after.created_at_ms))),
+                    identity,
+                ])),
+            ])));
+        }
+        query
+            .sort("updated_at_ms", SortDirection::Desc)
+            .sort("created_at_ms", SortDirection::Desc)
+            .sort("session_id", SortDirection::Asc)
+            .limit(limit.min(256))
+            .execute(&**self.db)
+            .await?
+            .iter()
+            .map(session_summary_from_catalog_row)
+            .collect()
+    }
+
     /// Read at most 129 indexed direct-child identities; rows remain disposable candidates.
     ///
     /// # Errors

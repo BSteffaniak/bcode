@@ -121,6 +121,29 @@ pub struct SessionCatalogQuery {
     pub text: Option<String>,
 }
 
+/// Stable activity-order boundary for bounded catalog pagination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogPosition {
+    /// Most recent activity timestamp.
+    pub updated_at_ms: u64,
+    /// Creation timestamp, used to break activity ties.
+    pub created_at_ms: u64,
+    /// Final deterministic identity tie-breaker.
+    pub id: SessionId,
+}
+
+impl SessionCatalogPosition {
+    /// Ordering shared by catalog queries and cross-location merges.
+    #[must_use]
+    pub const fn sort_key(self) -> (std::cmp::Reverse<u64>, std::cmp::Reverse<u64>, SessionId) {
+        (
+            std::cmp::Reverse(self.updated_at_ms),
+            std::cmp::Reverse(self.created_at_ms),
+            self.id,
+        )
+    }
+}
+
 /// Restartable catalog continuation, not a durable snapshot or authority token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogCursor {
@@ -128,16 +151,16 @@ pub struct SessionCatalogCursor {
     pub scope: SessionDiscoveryScope,
     /// Filter that produced this cursor.
     pub query: SessionCatalogQuery,
-    /// Catalog revision; changed revisions require restarting.
+    /// Revision observed when reading the page; updates do not invalidate the ordering boundary.
     pub revision: u64,
-    /// Next readable location index.
+    /// Location index breaking ties between identical candidate keys.
     pub location_index: usize,
-    /// Last examined native candidate ID, including filtered candidates.
-    pub after: Option<SessionId>,
+    /// Last examined activity-order boundary, including filtered or damaged candidates.
+    pub after: Option<SessionCatalogPosition>,
 }
 
-/// One bounded catalog candidate window, ordered by configured location then ascending session ID.
-/// Empty results may still have a continuation. This is not recent-activity ordering.
+/// One bounded catalog candidate window, ordered by most recent activity across locations.
+/// Empty results may still have a continuation. Concurrent updates do not form a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogPage {
     /// Visible session summaries; never more than the requested bounded limit.

@@ -26249,7 +26249,11 @@ mod session_configuration_cli_tests {
             query: SessionCatalogQuery::default(),
             revision: 42,
             location_index: 0,
-            after: Some(bcode_session_models::SessionId::new()),
+            after: Some(bcode_session_models::SessionCatalogPosition {
+                updated_at_ms: 0,
+                created_at_ms: 0,
+                id: bcode_session_models::SessionId::new(),
+            }),
         };
         let mut page = SessionCatalogPage {
             sessions: vec![],

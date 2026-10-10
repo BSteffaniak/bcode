@@ -260,6 +260,8 @@ async fn bounded_initial_history_returns_terminal_without_transport_work() {
             parent_id: None,
             name: None,
             explicit_name: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
             derived_title: None,
             title_source: bcode_session_models::SessionTitleSource::Explicit,
             client_count: 0,
