@@ -29,7 +29,7 @@ Maintenance requires exclusive verified ownership, preserves canonical history, 
 
 Confirmed child publication creates a durable parent transcript card with a stable child identity and a verified title snapshot. Its link opens the child through normal session navigation, not an external browser. Publication intent is not presented as successful creation. Child transcripts are not copied into the parent; refresh does not append history.
 
-The TUI offers a compact child activity overview and a selectable monitor. Ctrl-G focuses the monitor; Escape returns focus to the composer. Attention-needed work is distinguished from running, queued, idle, and unknown work. Operation/count evidence and observation age remain explicitly scoped to bounded observations. Child navigation preserves parent presentation anchors.
+The TUI offers a compact child activity overview and a selectable monitor. `/monitor` opens and focuses it; Ctrl-G toggles it. Escape returns focus to the composer. Attention-needed work is distinguished from running, queued, idle, and unknown work. Operation/count evidence and observation age remain explicitly scoped to bounded observations. Child navigation preserves parent presentation anchors.
 
 Hierarchy is explored incrementally, including loaded collapsed coordinators. Continuation cursors and incomplete coverage remain visible; a bounded resident view does not impose a limit on durable tree depth or size.
 

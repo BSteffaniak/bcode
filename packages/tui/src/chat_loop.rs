@@ -4371,6 +4371,21 @@ fn apply_root_slash_command_outcome(
         SlashCommandOutcome::PickSession => {
             loop_state.open_session_picker(chat);
         }
+        SlashCommandOutcome::OpenChildMonitor => {
+            chat.app.open_child_panel();
+            if let Some(session_id) = chat.attached_session_id() {
+                chat.replace_effect(TuiEffect::LoadChildActivity {
+                    session_id,
+                    after: None,
+                    generation: 0,
+                });
+                chat.replace_effect(TuiEffect::LoadSessionChildren {
+                    parent_id: session_id,
+                    after: None,
+                    generation: 0,
+                });
+            }
+        }
         SlashCommandOutcome::SearchSessions => {
             loop_state.open_session_search(chat);
         }

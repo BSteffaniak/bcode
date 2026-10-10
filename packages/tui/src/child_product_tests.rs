@@ -79,6 +79,34 @@ async fn published_parent_card_opens_child_through_root_route_without_parent_his
 }
 
 #[tokio::test]
+async fn monitor_slash_outcome_opens_refocuses_and_refreshes_children() {
+    let session_id = SessionId::new();
+    let mut model = root_test_model_with_history(session_id, &[]);
+    for _ in 0..2 {
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(crate::effects::TuiEffectResult::SlashCommandExecuted {
+                    message: "/monitor".into(),
+                    result: Ok(crate::slash_commands::SlashCommandOutcome::OpenChildMonitor),
+                }),
+            )),
+        )
+        .expect("monitor slash completion");
+        assert!(model.chat.app.child_panel_open());
+        assert!(model.chat.app.child_panel_focused());
+        let (effects, _) = model.chat.pending_effects.drain_runtime();
+        assert!(effects.iter().any(|(_, effect)| matches!(effect,
+            crate::effects::TuiEffect::LoadSessionChildren { parent_id, .. } if *parent_id == session_id
+        )));
+        assert!(effects.iter().any(|(_, effect)| matches!(effect,
+            crate::effects::TuiEffect::LoadChildActivity { session_id: id, .. } if *id == session_id
+        )));
+        model.chat.app.release_child_panel_focus();
+    }
+}
+
+#[tokio::test]
 async fn monitor_explicit_focus_escape_returns_composer_and_typing_is_not_swallowed() {
     let mut model = root_test_model_with_history(SessionId::new(), &[]);
     let ctrl_g = KeyStroke::with_modifiers(

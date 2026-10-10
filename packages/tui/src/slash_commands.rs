@@ -43,6 +43,8 @@ pub enum SlashCommandOutcome {
     PickSession,
     /// Open the session picker focused on transcript search.
     SearchSessions,
+    /// Open and focus the child-session monitor.
+    OpenChildMonitor,
     /// Open model picker.
     PickModel,
     /// Open auth-pool subscription picker.
@@ -823,6 +825,7 @@ async fn execute_builtin(
             format_build_info_markdown(&super::build_info()),
         )),
         BuiltinCommandId::Sessions => Ok(SlashCommandOutcome::PickSession),
+        BuiltinCommandId::Monitor => Ok(SlashCommandOutcome::OpenChildMonitor),
         BuiltinCommandId::Search => Ok(SlashCommandOutcome::SearchSessions),
         BuiltinCommandId::Resync => resync_command(client, parts).await,
         BuiltinCommandId::RescanImports => client.refresh_session_catalog(None).await.map(|list| {

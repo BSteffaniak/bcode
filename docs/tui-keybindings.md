@@ -193,6 +193,7 @@ open `/sessions`, then use the session picker's `Ctrl+F` search route.
 Typing `/` in the composer exposes slash-command completion. Common commands include:
 
 ```text
+/monitor
 /sessions
 /new
 /plan

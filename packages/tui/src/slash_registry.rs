@@ -9,6 +9,7 @@ use bcode_skill_models::SkillId;
 pub enum BuiltinCommandId {
     Version,
     Sessions,
+    Monitor,
     Search,
     Resync,
     RescanImports,
@@ -94,6 +95,11 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         id: BuiltinCommandId::Sessions,
         names: &["sessions"],
         completions: &[completion!("/sessions", "Open session picker")],
+    },
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Monitor,
+        names: &["monitor"],
+        completions: &[completion!("/monitor", "Open child-session monitor")],
     },
     BuiltinCommandSpec {
         id: BuiltinCommandId::Search,
@@ -385,6 +391,16 @@ mod tests {
         assert!(builtin_command("goal").is_none());
         assert!(!is_builtin_command_name("goal"));
         assert!(static_completions().all(|completion| completion.command() != "/goal"));
+    }
+
+    #[test]
+    fn monitor_is_discoverable_and_resolves_to_builtin() {
+        assert_eq!(
+            builtin_command("monitor").unwrap().id(),
+            BuiltinCommandId::Monitor
+        );
+        assert!(static_completions().any(|completion| completion.command() == "/monitor"));
+        assert!(!is_non_conflicting_skill_alias(&SkillId::new("monitor")));
     }
 
     #[test]

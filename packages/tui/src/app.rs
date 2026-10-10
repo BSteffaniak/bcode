@@ -1546,6 +1546,11 @@ impl BmuxApp {
         })
     }
 
+    /// Open the child monitor with keyboard focus, retaining its loaded state.
+    pub const fn open_child_panel(&mut self) {
+        self.child_panel = ChildPanelPresentation::Monitor;
+    }
+
     /// Toggle monitor visibility with explicitly requested keyboard focus.
     pub const fn toggle_child_panel(&mut self) {
         self.child_panel = if self.child_panel_open() {
