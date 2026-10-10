@@ -406,7 +406,9 @@ serde_json = { version = "1.0.149", default-features = false, features = [
 ] }
 # Rust intrinsics provide CPU-detected acceleration without the nonportable sha2-asm build.
 sha2 = { version = "0.11.0", default-features = false }
-shuck-formatter = { version = "0.0.41", default-features = false }
+shuck-ast = { version = "0.2.3", default-features = false }
+shuck-formatter = { version = "0.2.3", default-features = false }
+shuck-parser = { version = "0.2.3", default-features = false }
 smallvec = { version = "1.15.2", default-features = false, features = [
     "union",
 ] }

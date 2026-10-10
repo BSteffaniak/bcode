@@ -4,6 +4,7 @@
 //! that may interpret shell artifact schemas and terminal recording references; generic TUI and
 //! transcript code routes opaque plugin visuals without understanding those values.
 
+mod beautify;
 mod command;
 mod formatter;
 mod partial_json;
@@ -1304,11 +1305,16 @@ fn shell_command_projection(
         },
         |preview| partial_json_string(preview, "cwd"),
     );
-    let format = draft.is_none()
-        && arguments
-            .get("format_commands")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
+    let format = draft
+        .map_or_else(
+            || {
+                arguments
+                    .get("format_commands")
+                    .and_then(serde_json::Value::as_bool)
+            },
+            |preview| partial_json::bool_field(preview, "format_commands"),
+        )
+        .unwrap_or(true);
     command::project(&source, cwd.as_deref(), format, context.width(), context)
 }
 
@@ -3538,8 +3544,8 @@ mod tests {
             copied,
             format_shell_command_for_display(payload["command"].as_str().unwrap())
         );
-        assert!(copied.contains("; then"), "{copied}");
-        assert!(copied.contains("; else"), "{copied}");
+        assert!(copied.contains("then\n  echo"), "{copied}");
+        assert!(copied.contains("\nelse\n  echo"), "{copied}");
         assert!(!copied.contains(";then"), "{copied}");
     }
 

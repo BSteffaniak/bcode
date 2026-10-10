@@ -34,7 +34,9 @@ portable-pty = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+shuck-ast = { workspace = true, optional = true }
 shuck-formatter = { workspace = true, optional = true }
+shuck-parser = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 url = { workspace = true }
@@ -53,4 +55,6 @@ static-bundled = [
     "bmux_terminal_grid",
     "bmux_tui",
     "shuck-formatter",
+    "shuck-parser",
+    "shuck-ast",
 ]

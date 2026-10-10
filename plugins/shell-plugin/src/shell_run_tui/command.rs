@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_drafts_never_format_even_when_json_is_complete() {
+    fn streamed_drafts_beautify_structure_even_before_json_is_complete() {
         let context = context(24);
         let source = "if true;then echo 'a  b';fi";
         let json = serde_json::json!({"command": source, "format_commands": true}).to_string();
@@ -278,7 +278,10 @@ mod tests {
                 .iter()
                 .map(|(_, row)| row.text.as_str())
                 .collect::<String>();
-            assert_eq!(recovered, decoded);
+            assert_eq!(
+                recovered,
+                format_shell_command_for_display(&decoded).replace('\n', "")
+            );
             assert!(projected.rows.iter().all(|line| line.width() <= 24));
         }
         let final_payload = serde_json::json!({"command": source});
@@ -289,6 +292,19 @@ mod tests {
                 .iter()
                 .all(|(_, row)| row.identity.starts_with("shell-command:formatted:"))
         );
+    }
+
+    #[test]
+    fn disabled_formatting_is_respected_before_the_json_object_finishes() {
+        let payload = serde_json::json!({"preview": "{\"format_commands\":false,\"command\":\"echo one; echo two"});
+        let projected = shell_command_projection(&payload, &context(80));
+        let copied = projected
+            .selection
+            .iter()
+            .map(|(_, row)| row.text.as_str())
+            .collect::<String>();
+        assert_eq!(copied, "echo one; echo two");
+        assert_eq!(projected.rows.len(), 1);
     }
 
     #[test]

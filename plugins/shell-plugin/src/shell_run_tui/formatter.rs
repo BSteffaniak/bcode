@@ -1,4 +1,4 @@
-//! Bounded formatter memoization; literal drafts never enter this cache.
+//! Bounded memoization of progressive shell presentation.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
@@ -49,17 +49,33 @@ fn format(command: &str) -> String {
         .with_dialect(ShellDialect::Bash)
         .with_indent_style(IndentStyle::Space)
         .with_indent_width(2);
-    match format_source(command, None, &options) {
+    let command = super::beautify::beautify(command);
+    match format_source(&command, None, &options) {
         Ok(FormattedSource::Formatted(formatted)) => {
             formatted.trim_end_matches(['\r', '\n']).to_owned()
         }
-        Ok(FormattedSource::Unchanged) | Err(_) => command.to_owned(),
+        Ok(FormattedSource::Unchanged) | Err(_) => command,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progressively_formatted_prefixes_never_collapse_to_one_line() {
+        let source = "if true; then echo 'hello; world'; else echo \"tail\"; fi";
+        for end in source.find("then").unwrap() + 4..=source.len() {
+            let rendered = super::display(&source[..end]);
+            assert!(rendered.contains('\n'), "prefix {end}: {rendered}");
+            if end >= source.find("world'").unwrap() + 6 {
+                assert!(rendered.contains("'hello; world'"), "{rendered}");
+            }
+        }
+        let rendered = super::display(source);
+        assert!(rendered.contains("then\n  echo"), "{rendered}");
+        assert!(rendered.contains("\nelse\n  echo"), "{rendered}");
+    }
 
     #[test]
     fn exact_source_and_fallback_survive_cache_churn() {

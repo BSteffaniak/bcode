@@ -27,6 +27,32 @@ pub(super) fn string_field(input: &str, wanted: &str) -> Option<String> {
     }
 }
 
+/// Read a completed top-level boolean without requiring the rest of the object.
+pub(super) fn bool_field(input: &str, wanted: &str) -> Option<bool> {
+    let mut rest = input.trim_start().strip_prefix('{')?;
+    loop {
+        rest = rest.trim_start();
+        let (key, consumed, complete) = string_prefix(rest)?;
+        if !complete {
+            return None;
+        }
+        rest = rest
+            .get(consumed..)?
+            .trim_start()
+            .strip_prefix(':')?
+            .trim_start();
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+        let value = values.next()?.ok()?;
+        if key == wanted {
+            return value.as_bool();
+        }
+        rest = rest
+            .get(values.byte_offset()..)?
+            .trim_start()
+            .strip_prefix(',')?;
+    }
+}
+
 fn string_prefix(input: &str) -> Option<(String, usize, bool)> {
     let encoded = input.strip_prefix('"')?;
     let mut end = 0;
