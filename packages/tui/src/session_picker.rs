@@ -39,6 +39,12 @@ enum CatalogScope {
     AllDirectories,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogSelection {
+    FollowTop,
+    PreserveIdentity,
+}
+
 /// Session picker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPickerApp {
@@ -53,6 +59,8 @@ pub struct SessionPickerApp {
     filter: TextInputState,
     rename: TextInputState,
     list: FilteredListState,
+    // Automatic discovery follows the first row until explicit session navigation.
+    catalog_selection: CatalogSelection,
     list_area: Option<bmux_tui::geometry::Rect>,
     status: String,
     empty_message: String,
@@ -81,6 +89,7 @@ impl SessionPickerApp {
             filter: super::text_input_flow::empty_state(),
             rename: super::text_input_flow::empty_state(),
             list,
+            catalog_selection: CatalogSelection::FollowTop,
             status: "Select a session or press Ctrl-N to create one".to_owned(),
             empty_message: "No matching sessions. Press Ctrl-N to create a new session.".to_owned(),
             last_import: None,
@@ -281,8 +290,13 @@ impl SessionPickerApp {
         self.last_import.as_ref()
     }
 
-    /// Replace session metadata without moving selection to a different session.
+    /// Replace metadata, following the first row until the user navigates or starts an action.
     pub fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        let preserve_selection = self.catalog_selection == CatalogSelection::PreserveIdentity
+            || matches!(
+                self.mode,
+                SessionPickerMode::Rename | SessionPickerMode::DeleteConfirm
+            );
         let selected = self
             .list
             .selected_source_index()
@@ -303,6 +317,10 @@ impl SessionPickerApp {
             return;
         }
         self.refresh_filter();
+        if !preserve_selection {
+            self.list.select_visible(0);
+            return;
+        }
         let selected_row = selected.and_then(|selected| {
             self.list.indices().iter().position(|index| {
                 let session = &self.sessions[*index];
@@ -596,6 +614,9 @@ impl SessionPickerApp {
     /// Select a visible row by zero-based index.
     pub fn select_visible(&mut self, row: usize) -> bool {
         let selected = self.list.select_visible(row);
+        if selected && self.mode != SessionPickerMode::TranscriptSearch {
+            self.catalog_selection = CatalogSelection::PreserveIdentity;
+        }
         if selected && self.mode == SessionPickerMode::TranscriptSearch {
             self.refresh_search_preview();
         }
@@ -683,7 +704,7 @@ impl SessionPickerApp {
                 SessionNavigationKey::from_summary(&self.sessions[*index]) == parent
             })
         {
-            self.list.select_visible(row);
+            self.select_visible(row);
         } else {
             self.set_status("Parent not loaded in this location".to_owned());
         }
@@ -783,6 +804,9 @@ impl SessionPickerApp {
 
     /// Move selection down.
     pub fn select_next(&mut self) {
+        if self.mode != SessionPickerMode::TranscriptSearch && !self.list.indices().is_empty() {
+            self.catalog_selection = CatalogSelection::PreserveIdentity;
+        }
         self.list.select_next();
         if self.mode == SessionPickerMode::TranscriptSearch {
             self.refresh_search_preview();
@@ -791,6 +815,9 @@ impl SessionPickerApp {
 
     /// Move selection up.
     pub fn select_previous(&mut self) {
+        if self.mode != SessionPickerMode::TranscriptSearch && !self.list.indices().is_empty() {
+            self.catalog_selection = CatalogSelection::PreserveIdentity;
+        }
         self.list.select_previous();
         if self.mode == SessionPickerMode::TranscriptSearch {
             self.refresh_search_preview();
@@ -1008,6 +1035,41 @@ mod tests {
         app.restart_catalog();
         assert!(app.catalog_cursor().is_none());
         assert!(!app.has_catalog_continuation());
+    }
+
+    #[test]
+    fn catalog_loading_follows_top_until_manual_navigation() {
+        for scope in [CatalogScope::Directory, CatalogScope::AllDirectories] {
+            let oldest = summary("oldest", "/tmp/workspace");
+            let newer = summary("newer", "/tmp/workspace");
+            let newest = summary("newest", "/tmp/workspace");
+            let mut app = SessionPickerApp::new(Vec::new());
+            app.catalog_scope = scope;
+            app.replace_sessions(vec![oldest.clone()]);
+            app.replace_sessions(vec![newer.clone(), oldest.clone()]);
+            assert_eq!(app.selected_session_id(), Some(newer.id));
+            app.replace_sessions(vec![newest.clone(), newer.clone(), oldest.clone()]);
+            assert_eq!(app.selected_session_id(), Some(newest.id));
+            app.select_next();
+            app.replace_sessions(vec![oldest.clone(), newest.clone(), newer.clone()]);
+            assert_eq!(app.selected_session_id(), Some(newer.id));
+        }
+    }
+
+    #[test]
+    fn catalog_loading_preserves_mouse_and_upward_navigation() {
+        for mouse in [false, true] {
+            let first = summary("first", "/tmp/workspace");
+            let incoming = summary("incoming", "/tmp/workspace");
+            let mut app = SessionPickerApp::new(vec![first.clone()]);
+            if mouse {
+                assert!(app.select_visible(0));
+            } else {
+                app.select_previous();
+            }
+            app.replace_sessions(vec![incoming, first.clone()]);
+            assert_eq!(app.selected_session_id(), Some(first.id));
+        }
     }
 
     #[test]
