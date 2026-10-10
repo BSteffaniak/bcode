@@ -278,7 +278,7 @@ pub fn paint_with_context(
     use bmux_tui::composition::{Surface, TextBlock};
     use bmux_tui::geometry::Rect;
     use bmux_tui::paint::LocalRect;
-    use bmux_tui::prelude::{Border, BorderSet, Component, Constraints, LayoutCx, Line};
+    use bmux_tui::prelude::{Border, Component, Constraints, LayoutCx, Line};
     use bmux_tui_components::selectable_list::{
         SelectableList, SelectableListState, SelectableListStyles,
     };
@@ -287,7 +287,7 @@ pub fn paint_with_context(
     }
     let border = if focused { theme.focused } else { theme.border };
     let shell = Surface::new(TextBlock::new(""))
-        .border(Border::new(BorderSet::ASCII, border.patch(theme.raised)))
+        .border(Border::rounded().style(border.patch(theme.raised)))
         .background(theme.raised)
         .content_style(theme.text);
     let shell_layout = shell.layout(Constraints::tight(area.size()), &mut LayoutCx::new());

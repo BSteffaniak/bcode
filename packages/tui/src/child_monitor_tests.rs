@@ -645,6 +645,7 @@ fn monitor_painted_panel_preserves_status_color_and_visible_chevron_geometry() {
     let (app, child) = monitor_paint_fixture();
     let theme = crate::render::TuiTheme::for_app(&app);
     let styles = monitor_test_styles(theme);
+    assert_eq!(theme.raised, app.presented_theme().surfaces.raised);
     for focused in [true, false] {
         for (width, height) in [
             (80, 15),
@@ -672,6 +673,13 @@ fn monitor_painted_panel_preserves_status_color_and_visible_chevron_geometry() {
                 assert_eq!(hit.rect.intersection(area), hit.rect);
             }
             if width >= 20 && height >= 5 {
+                assert_eq!(
+                    buffer
+                        .get(bmux_tui::geometry::Point::new(0, 0))
+                        .unwrap()
+                        .symbol,
+                    "╭"
+                );
                 let row = hits
                     .iter()
                     .find(|hit| hit.action == MonitorAction::Select(child.id))
@@ -700,7 +708,7 @@ fn monitor_painted_panel_preserves_status_color_and_visible_chevron_geometry() {
                     theme.muted,
                 )
                 .for_state(SessionActivityState::Running);
-                assert_ne!(status.fg, theme.raised.bg);
+                assert_ne!(status.fg, styles.raised.bg);
                 assert!(
                     (row.rect.x..row.rect.right()).any(|x| {
                         buffer
@@ -715,9 +723,9 @@ fn monitor_painted_panel_preserves_status_color_and_visible_chevron_geometry() {
                         .unwrap()
                         .style
                         .bg,
-                    theme.raised.bg
+                    styles.raised.bg
                 );
-                assert_ne!(theme.raised.bg, app.presented_theme().canvas.bg);
+                assert_ne!(styles.raised.bg, app.presented_theme().canvas.bg);
             }
             if area.is_empty() {
                 assert!(hits.is_empty());
@@ -789,7 +797,11 @@ fn monitor_test_styles(
         muted: theme.muted,
         border: theme.border,
         focused: theme.focused,
-        raised: theme.raised,
+        raised: crate::monitor_presentation::raised_surface(
+            theme.raised,
+            bmux_tui::style::Style::new(),
+            theme.text,
+        ),
         selection: theme.selection,
         info: theme.info,
         warning: theme.warning,

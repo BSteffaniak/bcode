@@ -363,18 +363,14 @@ impl TuiTheme {
     }
 
     #[must_use]
-    pub fn for_app(app: &BmuxApp) -> Self {
+    pub const fn for_app(app: &BmuxApp) -> Self {
         let theme = app.presented_theme();
         Self {
             text: theme.text,
             muted: theme.muted,
             border: theme.border,
             focused: theme.focused.patch(Style::new().fg(theme.accent)),
-            raised: super::monitor_presentation::raised_surface(
-                theme.surfaces.raised,
-                theme.canvas,
-                theme.text,
-            ),
+            raised: theme.surfaces.raised,
             overlay: theme.surfaces.overlay,
             scrim: theme.surfaces.scrim,
             selection: theme.selection,
@@ -560,7 +556,11 @@ fn paint_child_monitor(
         muted: theme.muted,
         border: theme.border,
         focused: theme.focused,
-        raised: theme.raised,
+        raised: super::monitor_presentation::raised_surface(
+            theme.raised,
+            app.presented_theme().canvas,
+            theme.text,
+        ),
         selection: theme.selection,
         info: theme.info,
         warning: theme.warning,

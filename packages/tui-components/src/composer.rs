@@ -33,8 +33,9 @@ pub fn composer_panel<'a>(style: ComposerStyle, child: impl Component + 'a) -> C
             .id("bcode.composer")
             .border(Border::single().style(style.border))
             .padding(Insets::new(0, 1, 0, 1))
-            .background(style.surface),
-        title_style: style.border,
+            .background(style.surface)
+            .content_style(style.surface),
+        title_style: style.surface.patch(style.border),
     }
 }
 
@@ -104,6 +105,32 @@ mod tests {
                     "─".repeat(interior - title_len)
                 );
                 assert_eq!(buffer.row_symbols(0).expect("top row"), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn composer_surface_inherits_background_into_editor_and_title() {
+        use bmux_tui::buffer::Buffer;
+        use bmux_tui::frame::Frame;
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui::style::Color;
+        let surface = Style::new().bg(Color::Blue);
+        let editor = TextBlock::new("editor").style(Style::new().fg(Color::White));
+        let panel = composer_panel(
+            ComposerStyle {
+                border: Style::new().fg(Color::Cyan),
+                surface,
+            },
+            editor,
+        );
+        let area = Rect::new(0, 0, 24, 5);
+        let layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(area);
+        panel.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        for y in 0..area.height {
+            for x in 0..area.width {
+                assert_eq!(buffer.get(Point::new(x, y)).unwrap().style.bg, surface.bg);
             }
         }
     }
