@@ -1697,6 +1697,264 @@ async fn attach_recovery_receipt(
 }
 
 #[tokio::test]
+async fn represented_acceptance_recovery_is_exact_idempotent_and_never_redispatches() {
+    let (_root, _sessions, state, _) = typed_provider_fixture().await;
+    let db = open(&crate::workflow_store_path(&state), true).expect("db");
+    let authority = owner::local_authority(&state, "new")
+        .await
+        .expect("owner")
+        .expect("local owner");
+    let dispatch = prepare_acceptance_recovery_fixture(&state, &db, &authority.authority).await;
+    let prepared =
+        representation::attempts::owner_boundary::prepared(&db, "new", &dispatch.dispatch_identity)
+            .await
+            .expect("prepared lookup")
+            .expect("prepared");
+    assert!(
+        recovery::recover_acceptance(&state, &prepared, &authority.authority)
+            .await
+            .expect("missing evidence")
+            .is_none()
+    );
+    assert!(
+        crate::drive_workflow_run(&state, "new").await.is_err(),
+        "receipt-less preparation without acceptance must not be redispatched"
+    );
+    interrupt_after_canonical_acceptance(&state, &dispatch).await;
+    assert!(
+        representation::attempts::owner_boundary::receipt(&db, &dispatch.dispatch_identity)
+            .await
+            .expect("receipt lookup")
+            .is_none()
+    );
+    let session = acceptance_recovery_session(&state, &prepared).await;
+    let before = state
+        .sessions
+        .turn_receipt(session, "bcode.workflow", &dispatch.dispatch_identity)
+        .await
+        .expect("canonical acceptance")
+        .expect("accepted");
+    let mut invalid_authority = authority.authority.clone();
+    invalid_authority.generation += 1;
+    assert!(
+        recovery::recover_acceptance(&state, &prepared, &invalid_authority)
+            .await
+            .is_err()
+    );
+    crate::drive_workflow_run(&state, "new")
+        .await
+        .expect("live same-owner driver reconciles acceptance without a recovery barrier");
+    let recovered = recovery::recover_acceptance(&state, &prepared, &authority.authority)
+        .await
+        .expect("recover acceptance")
+        .expect("recovered receipt");
+    let accepted_event = state
+        .sessions
+        .session_history_around(
+            session,
+            bcode_session_models::SessionHistoryAroundQuery {
+                sequence: before.accepted_event_sequence,
+                before: 0,
+                after: 0,
+            },
+        )
+        .await
+        .expect("acceptance event")
+        .events
+        .pop()
+        .expect("event");
+    assert_eq!(recovered.admitted_at_ms, accepted_event.timestamp_ms);
+    assert_eq!(recovered.receipt["turn_id"], before.turn_id.to_string());
+    assert_eq!(
+        recovered.receipt["accepted_event_sequence"],
+        before.accepted_event_sequence
+    );
+    assert_eq!(
+        recovery::recover_acceptance(&state, &prepared, &authority.authority)
+            .await
+            .expect("duplicate recovery"),
+        Some(recovered)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .turn_receipt(session, "bcode.workflow", &dispatch.dispatch_identity)
+            .await
+            .expect("same acceptance"),
+        Some(before)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .all_session_summaries()
+            .await
+            .iter()
+            .filter(|summary| summary.execution.is_some())
+            .count(),
+        1
+    );
+    stop_fixture_driver(&state).await;
+}
+
+async fn interrupt_after_canonical_acceptance(
+    state: &std::sync::Arc<ServerState>,
+    dispatch: &bcode_workflow_store::PreparedActivationDispatch,
+) {
+    assert!(
+        crate::dispatch_workflow_prompt_turn_after_admission(state, dispatch, || {
+            Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "interrupted after canonical acceptance before workflow receipt".into(),
+            ))
+        })
+        .await
+        .is_err()
+    );
+}
+
+async fn acceptance_recovery_session(
+    state: &ServerState,
+    prepared: &bcode_workflow_store::PreparedAttempt,
+) -> bcode_session_models::SessionId {
+    owner::execution_session_link(
+        state,
+        &prepared.run_id,
+        &prepared.node_id,
+        &prepared.activation_id,
+        prepared.attempt,
+    )
+    .await
+    .expect("link lookup")
+    .expect("exact link")
+    .session_id
+    .parse()
+    .expect("session")
+}
+
+#[tokio::test]
+async fn represented_acceptance_recovery_live_owner_cancel_settles_exact_turn() {
+    let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+    let db = open(&crate::workflow_store_path(&state), true).expect("db");
+    let authority = owner::local_authority(&state, "new")
+        .await
+        .expect("owner")
+        .expect("local");
+    let dispatch = prepare_acceptance_recovery_fixture(&state, &db, &authority.authority).await;
+    interrupt_after_canonical_acceptance(&state, &dispatch).await;
+    let prepared =
+        representation::attempts::owner_boundary::prepared(&db, "new", &dispatch.dispatch_identity)
+            .await
+            .expect("prepared lookup")
+            .expect("prepared");
+    let session = acceptance_recovery_session(&state, &prepared).await;
+    let accepted = state
+        .sessions
+        .turn_receipt(session, "bcode.workflow", &dispatch.dispatch_identity)
+        .await
+        .expect("canonical acceptance")
+        .expect("accepted");
+    crate::drive_workflow_run(&state, "new")
+        .await
+        .expect("same owner recovers receipt");
+    state.start_workflow_driver().await;
+    assert!(
+        crate::workflow_operations::cancel_run(&state, "new")
+            .await
+            .expect("cancel")
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if status(&state, "new")
+                .await
+                .expect("status")
+                .expect("run")
+                .status
+                == bcode_workflow::RunStatus::Cancelled
+            {
+                break;
+            }
+            crate::drive_workflow_run(&state, "new")
+                .await
+                .expect("observe cancellation");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("canonical cancellation settlement");
+    let evidence = state
+        .sessions
+        .session_turn_evidence(session, &accepted.turn_id.to_string())
+        .await
+        .expect("turn evidence");
+    assert!(evidence.iter().any(|event| matches!(
+        event.kind,
+        bcode_session_models::SessionEventKind::ModelTurnFinished {
+            outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+            ..
+        }
+    )));
+    assert_eq!(
+        state
+            .sessions
+            .turn_receipt(session, "bcode.workflow", &dispatch.dispatch_identity)
+            .await
+            .expect("unchanged acceptance"),
+        Some(accepted)
+    );
+    bcode_fake_provider_plugin::release_fake_event_script_gate(
+        &state.selected_provider_context.settings["delegation_fixture_gate"],
+    );
+    stop_fixture_driver(&state).await;
+}
+
+async fn prepare_acceptance_recovery_fixture(
+    state: &std::sync::Arc<ServerState>,
+    db: &dyn Database,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> bcode_workflow_store::PreparedActivationDispatch {
+    use bcode_workflow_store::ActivationDispatchOwner;
+    let (revision, definition) = representation::graph_revision::current(db, "new")
+        .await
+        .expect("graph");
+    let activation = representation::graph::ready(db, "new", revision, None, 1)
+        .await
+        .expect("ready")
+        .pop()
+        .expect("activation");
+    let pending = bcode_workflow_store::PendingActivation {
+        run_id: "new".into(),
+        node_id: activation.node_id.clone(),
+        activation_id: activation.activation_id.clone(),
+        dependency_generation: activation.generation,
+        input: Some(activation.input),
+        node: definition.node(&activation.node_id).expect("node").clone(),
+        created_at_ms: 1,
+    };
+    let plan = crate::WorkflowPromptTurnOwner { state }
+        .plan(&pending)
+        .await
+        .expect("plan")
+        .expect("agent plan");
+    let prepared = bcode_workflow_store::PreparedAttempt {
+        run_id: "new".into(),
+        node_id: pending.node_id.clone(),
+        activation_id: pending.activation_id.clone(),
+        attempt: 1,
+        side_effect: bcode_workflow::DispatchSideEffect::Mutating,
+        intent: plan.intent,
+        prepared_at_ms: 2,
+    };
+    let identity = representation::attempts::prepare(db, authority, &prepared)
+        .await
+        .expect("prepare");
+    bcode_workflow_store::PreparedActivationDispatch {
+        activation: pending,
+        attempt: 1,
+        dispatch_identity: identity,
+        intent: prepared.intent,
+    }
+}
+
+#[tokio::test]
 async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
     state.start_workflow_driver().await;

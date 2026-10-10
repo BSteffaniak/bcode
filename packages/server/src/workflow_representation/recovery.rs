@@ -120,7 +120,135 @@ pub async fn takeover(
     })
 }
 
-/// Reconcile bounded receipt pages; missing receipts remain ambiguous and are never redispatched.
+/// Recover only canonically accepted agent work; absence never authorizes redispatch.
+pub(super) async fn recover_acceptance(
+    state: &ServerState,
+    prepared: &bcode_workflow_store::PreparedAttempt,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<Option<bcode_workflow_store::DispatchReceipt>, ServerError> {
+    if prepared
+        .intent
+        .get("owner")
+        .and_then(serde_json::Value::as_str)
+        != Some(crate::workflow_receipts::AGENT_TURN_OWNER)
+    {
+        return Ok(None);
+    }
+    if !workflow_operations::authority_targets_current_daemon(state, authority) {
+        return Err(unavailable());
+    }
+    let retained = retained_store(state).await?;
+    let db = open(retained.path(), true)?;
+    owner_boundary::verify(&db, &prepared.run_id, authority)
+        .await
+        .map_err(|_| unavailable())?;
+    let identity = prepared.dispatch_identity();
+    if let Some(existing) = owner_boundary::receipt(&db, &identity)
+        .await
+        .map_err(|_| unavailable())?
+    {
+        return Ok(Some(existing));
+    }
+    let Some(link) = owner_boundary::execution_session_link(
+        &db,
+        &prepared.run_id,
+        &prepared.node_id,
+        &prepared.activation_id,
+        prepared.attempt,
+    )
+    .await
+    .map_err(|_| unavailable())?
+    else {
+        return Ok(None);
+    };
+    let session_id = link.session_id.parse().map_err(|_| unavailable())?;
+    let summary = state
+        .sessions
+        .session_summary_non_owning(session_id)
+        .await?;
+    let Some(execution) = summary.execution else {
+        return Ok(None);
+    };
+    let provenance = execution.provenance;
+    if provenance.version != bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION
+        || provenance.owner != "bcode.workflow"
+        || provenance.run_id != prepared.run_id
+        || provenance.node_id != prepared.node_id
+        || provenance.activation_id.as_deref() != Some(prepared.activation_id.as_str())
+        || provenance.attempt != prepared.attempt
+        || provenance.workspace_snapshot.as_deref() != Some(link.workspace_snapshot.as_str())
+    {
+        return Err(unavailable());
+    }
+    let Some(accepted) = state
+        .sessions
+        .turn_receipt(session_id, "bcode.workflow", &identity)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let revision = representation::graph_pages::revision(&db, &prepared.run_id)
+        .await
+        .map_err(|_| unavailable())?;
+    let node =
+        representation::graph_pages::node(&db, &prepared.run_id, revision, &prepared.node_id)
+            .await
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+    if node.kind != bcode_workflow::NodeKind::Agent {
+        return Err(unavailable());
+    }
+    let admitted_at_ms = canonical_acceptance_time(state, session_id, &accepted).await?;
+    let receipt = bcode_workflow_store::DispatchReceipt {
+        run_id: prepared.run_id.clone(),
+        node_id: prepared.node_id.clone(),
+        activation_id: prepared.activation_id.clone(),
+        attempt: prepared.attempt,
+        dispatch_identity: identity,
+        receipt: crate::recovered_workflow_receipt(session_id, &accepted, &node.output.type_name),
+        admitted_at_ms,
+    };
+    crate::workflow_receipts::AgentTurnReceipt::decode(&receipt.receipt)
+        .map_err(|_| unavailable())?;
+    super::owner::persist_receipt(state, &receipt, authority).await?;
+    Ok(Some(receipt))
+}
+
+/// Read only the canonical acceptance event named by the receipt, never recovery wall time.
+async fn canonical_acceptance_time(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    accepted: &bcode_session_models::TurnReceipt,
+) -> Result<u64, ServerError> {
+    let window = state
+        .sessions
+        .session_history_around(
+            session_id,
+            bcode_session_models::SessionHistoryAroundQuery {
+                sequence: accepted.accepted_event_sequence,
+                before: 0,
+                after: 0,
+            },
+        )
+        .await?;
+    let event = window
+        .events
+        .into_iter()
+        .find(|event| {
+            event.sequence == accepted.accepted_event_sequence && event.session_id == session_id
+        })
+        .ok_or_else(unavailable)?;
+    if !matches!(
+        event.kind,
+        bcode_session_models::SessionEventKind::UserMessage { .. }
+            | bcode_session_models::SessionEventKind::SubmissionAccepted { .. }
+    ) {
+        return Err(unavailable());
+    }
+    Ok(event.timestamp_ms)
+}
+
+/// Reconcile bounded receipt pages; missing acceptance evidence never authorizes redispatch.
 pub async fn reconcile(
     state: &ServerState,
     run_id: &str,
@@ -136,8 +264,14 @@ pub async fn reconcile(
                 .await
                 .map_err(|_| unavailable())?;
         for attempt in attempts {
-            let Some(receipt) = attempt.receipt else {
-                continue;
+            let receipt = if let Some(receipt) = attempt.receipt {
+                receipt
+            } else {
+                let Some(receipt) = recover_acceptance(state, &attempt.prepared, authority).await?
+                else {
+                    continue;
+                };
+                receipt
             };
             owner_boundary::verify(&db, run_id, authority)
                 .await

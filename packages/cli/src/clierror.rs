@@ -33,6 +33,9 @@ impl CliDiagnosticError {
             CliError::Client(error)
             | CliError::ChildSessionCreate { source: error, .. }
             | CliError::SessionListingInterrupted { source: error } => Self::from_client(error),
+            CliError::DaemonStart(
+                bcode_daemon_lifecycle::DaemonStartError::NotificationTimeout { .. },
+            ) => Self::notification_timeout(),
             CliError::WorkflowApplication { code, .. } => Self::application(code),
             CliError::Signal(error) | CliError::ThemeIo(error) => Self::io(error.kind()),
             CliError::Json(_) => Self::diagnostic(
@@ -72,6 +75,14 @@ impl CliDiagnosticError {
         }
     }
 
+    const fn notification_timeout() -> Self {
+        Self::diagnostic(
+            "daemon_readiness_notification_timeout",
+            "startup",
+            "Daemon readiness notification deadline elapsed; child readiness and execution lifetime are unknown. Inspect exact-artifact startup evidence before further action.",
+        )
+    }
+
     const fn diagnostic(code: &'static str, phase: &'static str, message: &'static str) -> Self {
         Self {
             schema_version: 1,
@@ -109,6 +120,9 @@ impl CliDiagnosticError {
                 "decode",
                 "IPC response decoding failed; verify exact client/daemon artifact compatibility.",
             ),
+            ClientError::DaemonStart(
+                bcode_daemon_lifecycle::DaemonStartError::NotificationTimeout { .. },
+            ) => Self::notification_timeout(),
             ClientError::DaemonStart(_) => Self::diagnostic(
                 "daemon_start_failed",
                 "startup",
@@ -237,6 +251,43 @@ impl CliDiagnosticError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_timeout_is_distinct_and_secret_safe_for_both_cli_paths() {
+        let timeout = || bcode_daemon_lifecycle::DaemonStartError::NotificationTimeout {
+            log_path: "/private/SECRET_FIXTURE_MARKER".into(),
+            recent_log: "SECRET_FIXTURE_MARKER still starting retry".into(),
+        };
+        for error in [
+            CliError::DaemonStart(timeout()),
+            CliError::Client(bcode_client::ClientError::DaemonStart(timeout())),
+        ] {
+            let diagnostic = CliDiagnosticError::from_error(&error);
+            assert_eq!(diagnostic.code, "daemon_readiness_notification_timeout");
+            assert_eq!(diagnostic.phase, "startup");
+            assert!(
+                diagnostic
+                    .message
+                    .contains("execution lifetime are unknown")
+            );
+            assert!(!diagnostic.message.contains("still starting"));
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("SECRET_FIXTURE_MARKER")
+            );
+        }
+        let probe_timeout = CliError::Client(bcode_client::ClientError::DaemonStart(
+            bcode_daemon_lifecycle::DaemonStartError::StartTimeout {
+                log_path: "SECRET_FIXTURE_MARKER".into(),
+                recent_log: "SECRET_FIXTURE_MARKER".into(),
+            },
+        ));
+        assert_eq!(
+            CliDiagnosticError::from_error(&probe_timeout).code,
+            "daemon_start_failed"
+        );
+    }
 
     #[test]
     fn typed_connection_timeout_has_exact_normalized_contract() {

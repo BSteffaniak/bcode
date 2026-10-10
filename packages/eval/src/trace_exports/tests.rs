@@ -70,6 +70,10 @@ fn all_session_model_inputs_precede_tool_io_under_shared_allowance() {
             vec![event(first, 1, false), event(first, 2, true)],
         ),
         (directory.join("second.jsonl"), vec![event(second, 3, true)]),
+        (
+            directory.join("repeat.jsonl"),
+            vec![event(first, 1, false), event(first, 2, true)],
+        ),
     ];
     let calls = RefCell::new(Vec::new());
     let invoke = |args: &[String], _: &str, _: std::time::Duration| {
@@ -102,6 +106,16 @@ fn all_session_model_inputs_precede_tool_io_under_shared_allowance() {
             .unwrap();
     assert_eq!(receipts["receipts"][0]["status"], "exported");
     assert_eq!(receipts["receipts"][1]["status"], "unavailable");
+    assert_eq!(receipts["receipts"][1]["failure"], "invocation");
+    let repeated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("repeat.captures.json")).unwrap())
+            .unwrap();
+    assert_eq!(receipts, repeated);
+    let name = receipts["receipts"][0]["file"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read(directory.join("repeat.captures").join(name)).unwrap(),
+        b"x"
+    );
     for (path, _) in sessions {
         let root = path.with_extension("captures");
         for file in std::fs::read_dir(&root).unwrap() {
@@ -152,20 +166,25 @@ fn cli_capture_pages_large_byte_arrays_and_rejects_corruption() {
         assert!(serde_json::to_vec_pretty(&value).unwrap().len() < 1024 * 1024);
         Ok(value)
     };
-    assert_eq!(read_cli_capture(&capture, &read).unwrap().bytes, bytes);
+    assert_eq!(
+        read_cli_capture(&capture, "test-observation", &read)
+            .unwrap()
+            .bytes,
+        bytes
+    );
     let corrupt = |args: &[String], label: &str, duration| {
         let mut value = read(args, label, duration)?;
         value["bytes"][0] = json!(0);
         Ok(value)
     };
-    assert!(read_cli_capture(&capture, &corrupt).is_none());
+    assert!(read_cli_capture(&capture, "test-observation", &corrupt).is_err());
     let no_progress = |args: &[String], label: &str, duration| {
         let mut value = read(args, label, duration)?;
         value["bytes"] = json!([]);
         value["eof"] = json!(false);
         Ok(value)
     };
-    assert!(read_cli_capture(&capture, &no_progress).is_none());
+    assert!(read_cli_capture(&capture, "test-observation", &no_progress).is_err());
     let calls = std::cell::Cell::new(0);
     let partial_error = |args: &[String], label: &str, duration| {
         calls.set(calls.get() + 1);
@@ -175,6 +194,40 @@ fn cli_capture_pages_large_byte_arrays_and_rejects_corruption() {
             read(args, label, duration)
         }
     };
-    assert!(read_cli_capture(&capture, &partial_error).is_none());
+    assert_eq!(
+        read_cli_capture(&capture, "partial", &partial_error).unwrap_err(),
+        CaptureFailure::Invocation
+    );
     assert_eq!(calls.get(), 2);
+    for (error, expected) in [
+        (
+            super::super::EvalError::Validation(
+                "post-execution capture allowance exhausted".into(),
+            ),
+            CaptureFailure::Deadline,
+        ),
+        (
+            super::super::EvalError::Client("SECRET /private/storage deadline exhausted".into()),
+            CaptureFailure::Invocation,
+        ),
+        (
+            super::super::EvalError::Json(
+                serde_json::from_str::<serde_json::Value>("SECRET").unwrap_err(),
+            ),
+            CaptureFailure::Decode,
+        ),
+    ] {
+        let failure = CaptureFailure::invocation(&error);
+        assert_eq!(failure, expected);
+        assert!(!serde_json::to_string(&failure).unwrap().contains("SECRET"));
+    }
+    let decode = |_: &[String], _: &str, _: std::time::Duration| Ok(json!({"secret":"SECRET"}));
+    assert_eq!(
+        read_cli_capture(&capture, "decode", &decode).unwrap_err(),
+        CaptureFailure::Decode
+    );
+    assert_eq!(
+        read_cli_capture(&capture, "corrupt", &corrupt).unwrap_err(),
+        CaptureFailure::Integrity
+    );
 }

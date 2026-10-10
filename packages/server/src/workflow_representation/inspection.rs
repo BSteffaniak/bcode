@@ -194,38 +194,9 @@ pub(super) async fn shared_parent_link(
     run_id: &str,
     link: &bcode_workflow_store::WorkflowExecutionSessionLink,
 ) -> Result<bool, ServerError> {
-    let run = representation::runs::summary(db, run_id)
+    super::workflow_activity::verify_shared_parent_link(db, run_id, link)
         .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(unavailable)?;
-    if link.run_id != run_id
-        || run.parent_session_id.as_deref() != Some(link.session_id.as_str())
-        || run.workspace_snapshot != link.workspace_snapshot
-    {
-        return Ok(false);
-    }
-    let canonical = representation::attempts::owner_boundary::execution_session_link(
-        db,
-        run_id,
-        &link.node_id,
-        &link.activation_id,
-        link.attempt,
-    )
-    .await
-    .map_err(|_| unavailable())?;
-    if canonical.as_ref() != Some(link) {
-        return Ok(false);
-    }
-    let node = representation::graph::execution_node(db, run_id, &link.node_id)
-        .await
-        .map_err(|_| unavailable())?;
-    if node.kind != bcode_workflow::NodeKind::Agent {
-        return Ok(false);
-    }
-    let configuration =
-        crate::workflow_prompt_configuration(&node.configuration).map_err(|_| unavailable())?;
-    Ok(configuration.execution_target
-        == bcode_workflow::PromptContextTarget::SharedParentSequential)
+        .map_err(super::workflow_activity::SharedVerificationFailure::into_server_error)
 }
 
 fn definition(

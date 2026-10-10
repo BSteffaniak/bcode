@@ -307,7 +307,9 @@ impl SessionManager {
     ///
     /// The caller retains `child_id`. No parent events, context, control, or lifecycle effects are
     /// copied. Publication is a single canonical directory rename under exclusive child-ID
-    /// maintenance ownership. Retry reconciliation reads only the two-event creation prefix.
+    /// maintenance ownership. A locally owned resident retry validates the bounded canonical
+    /// creation prefix and provenance through that owner before idempotent parent publication.
+    /// Nonresident retries retain exclusive maintenance ownership.
     ///
     /// # Errors
     /// Returns an error for self-parenting, conflicting identity reuse, unavailable parent,
@@ -477,6 +479,43 @@ impl SessionManager {
             .await
     }
 
+    /// Validate an exact retry through its resident owner before publishing the parent receipt.
+    async fn publish_resident_child_retry(
+        &self,
+        handle: &crate::actor::SessionHandle,
+        request: &SessionChildCreateRequest,
+        execution: Option<&crate::ExecutionSessionProvenance>,
+    ) -> Result<SessionSummary, SessionError> {
+        // Do not acquire offline maintenance ownership underneath the verified local owner.
+        let _guard = handle
+            .acquire_ownership(crate::SessionOwnershipKind::RuntimeWork)
+            .await?;
+        handle.validate_write_readiness().await?;
+        let (summary, prefix) = handle.observed_summary().await?;
+        verify_request(&prefix, request)?;
+        verify_summary_prefix(&summary, &prefix, request.child_id)?;
+        if summary.execution.as_ref().map(|value| &value.provenance) != execution {
+            return Err(invalid(
+                "child execution provenance conflicts with original creation",
+            ));
+        }
+        if let Some(provenance) = execution {
+            let events = handle.events_range(2, 2, 1).await?;
+            if !events.iter().any(|event| {
+                event.sequence == 2
+                    && event.session_id == request.child_id
+                    && matches!(&event.kind, SessionEventKind::ExecutionSessionCreated {
+                        provenance: retained, ..
+                    } if retained.as_ref() == provenance)
+            }) {
+                return Err(invalid("child execution creation prefix is inconsistent"));
+            }
+        }
+        self.link_child_session(request.parent_id, request.child_id)
+            .await?;
+        Ok(summary)
+    }
+
     async fn create_persistent_child(
         &self,
         request: SessionChildCreateRequest,
@@ -487,6 +526,19 @@ impl SessionManager {
         validate_session_path(&root, request.child_id)?;
         validate_session_path(&root, request.parent_id)?;
         if db::session_dir_path(&root, request.child_id).exists() {
+            let resident = self
+                .inner
+                .lock()
+                .await
+                .sessions
+                .get(&request.child_id)
+                .filter(|handle| handle.snapshot().owned)
+                .cloned();
+            if let Some(handle) = resident {
+                return self
+                    .publish_resident_child_retry(&handle, &request, execution.as_ref())
+                    .await;
+            }
             let child = self.session_summary_non_owning(request.child_id).await?;
             if child.parent_id != Some(request.parent_id) {
                 return Err(invalid(
@@ -998,6 +1050,146 @@ mod tests {
         assert!(page.children.iter().any(|summary| summary.id == child.id));
         assert!(manager.session_is_owned(parent.id).await);
         drop(guard);
+    }
+
+    fn retry_execution_provenance(
+        parent_session_id: SessionId,
+    ) -> crate::ExecutionSessionProvenance {
+        crate::ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+            owner: "workflow".into(),
+            run_id: "retry-run".into(),
+            node_id: "retry-node".into(),
+            activation_id: Some("retry-activation".into()),
+            attempt: 1,
+            parent_session_id,
+            workspace_snapshot: Some("retry-workspace".into()),
+            context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+            parent_generation: None,
+        }
+    }
+
+    /// Retain canonical creation without the parent publication receipt for retry tests.
+    async fn stage_unpublished_child(
+        manager: &SessionManager,
+        root: &std::path::Path,
+        request: &SessionChildCreateRequest,
+        execution: Option<&crate::ExecutionSessionProvenance>,
+    ) {
+        manager
+            .record_child_link(request.parent_id, request.child_id, false)
+            .await
+            .unwrap();
+        let staging = child_staging_path(root, request).unwrap();
+        let summary = manager
+            .prepare_child_storage(&staging, request, execution)
+            .await
+            .unwrap();
+        fs::rename(
+            db::session_dir_path(&staging, request.child_id),
+            db::session_dir_path(root, request.child_id),
+        )
+        .unwrap();
+        manager.register_child_summary(summary).await;
+    }
+
+    #[tokio::test]
+    async fn live_owned_child_retry_publishes_exact_canonical_creation_once() {
+        for execution_child in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = SessionManager::persistent(root.path()).unwrap();
+            let parent = manager
+                .create_session(None, root.path().to_path_buf())
+                .await
+                .unwrap();
+            let child_request = request(parent.id);
+            let execution = execution_child.then(|| retry_execution_provenance(parent.id));
+            stage_unpublished_child(&manager, root.path(), &child_request, execution.as_ref())
+                .await;
+            let guard = manager
+                .acquire_session_ownership(
+                    child_request.child_id,
+                    crate::SessionOwnershipKind::RuntimeWork,
+                )
+                .await
+                .unwrap();
+            let before = manager
+                .session_history(child_request.child_id)
+                .await
+                .unwrap();
+            let mut conflict = child_request.clone();
+            conflict.name = Some("different child".into());
+            assert!(
+                manager
+                    .create_child_session_inner(conflict, execution.clone())
+                    .await
+                    .is_err()
+            );
+            if let Some(provenance) = &execution {
+                let mut conflict = provenance.clone();
+                conflict.attempt += 1;
+                assert!(
+                    manager
+                        .create_child_session_inner(child_request.clone(), Some(conflict))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    manager
+                        .create_child_session(child_request.clone())
+                        .await
+                        .is_err()
+                );
+            }
+            for _ in 0..2 {
+                let retried = manager
+                    .create_child_session_inner(child_request.clone(), execution.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(retried.id, child_request.child_id);
+                assert!(manager.session_is_owned(child_request.child_id).await);
+            }
+            assert_eq!(
+                manager
+                    .session_history(child_request.child_id)
+                    .await
+                    .unwrap(),
+                before
+            );
+            // A different manager must not reinterpret the resident shortcut as authority.
+            let foreign = SessionManager::persistent(root.path()).unwrap();
+            assert!(
+                foreign
+                    .create_child_session_inner(child_request.clone(), execution.clone())
+                    .await
+                    .is_err()
+            );
+            assert!(manager.session_is_owned(child_request.child_id).await);
+            let parent_events = manager.session_history(parent.id).await.unwrap();
+            assert_eq!(
+                parent_events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        SessionEventKind::SessionChildPublished { child_id, .. }
+                            if child_id == child_request.child_id
+                    ))
+                    .count(),
+                1
+            );
+            let page = manager
+                .query_child_sessions(SessionChildQuery {
+                    parent_id: parent.id,
+                    after: None,
+                    limit: 10,
+                })
+                .await
+                .unwrap();
+            assert!(page.complete);
+            assert_eq!(page.children.len(), 1);
+            assert_eq!(page.children[0].id, child_request.child_id);
+            drop(guard);
+        }
     }
 
     fn request(parent: SessionId) -> SessionChildCreateRequest {

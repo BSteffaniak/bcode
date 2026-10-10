@@ -1,4 +1,89 @@
-//! Behavioral contract/cursor tests; no source-text assertions.
+#[test]
+fn shared_verification_failures_preserve_operation_and_safe_category() {
+    use representation::RepresentationError as Error;
+    for operation in [
+        SharedVerificationOperation::RunSummary,
+        SharedVerificationOperation::SessionLink,
+        SharedVerificationOperation::ExecutionNode,
+    ] {
+        for (injected, category) in [
+            (
+                Error::Database(switchy_database::DatabaseError::Busy),
+                SharedVerificationCategory::Busy,
+            ),
+            (
+                Error::UnsupportedStore,
+                SharedVerificationCategory::Unsupported,
+            ),
+            (
+                Error::MaintenanceRequired,
+                SharedVerificationCategory::MaintenanceRequired,
+            ),
+            (
+                Error::InvalidAdmission,
+                SharedVerificationCategory::InvalidState,
+            ),
+        ] {
+            let failure = SharedVerificationFailure::from_storage(operation, &injected);
+            assert_eq!(
+                failure,
+                SharedVerificationFailure {
+                    operation,
+                    category
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_failure_boundary_preserves_closed_codes_and_operations() {
+    for (category, expected_code) in [
+        (
+            SharedVerificationCategory::Busy,
+            "workflow_activity_shared_busy",
+        ),
+        (
+            SharedVerificationCategory::Unsupported,
+            "workflow_activity_shared_unsupported",
+        ),
+        (
+            SharedVerificationCategory::MaintenanceRequired,
+            "workflow_activity_shared_maintenance_required",
+        ),
+    ] {
+        let error = preserve_live_failure(
+            SharedVerificationFailure {
+                operation: SharedVerificationOperation::SessionLink,
+                category,
+            }
+            .into_server_error(),
+        );
+        let ServerError::WorkflowActivitySharedVerification {
+            operation,
+            code,
+            message,
+        } = error
+        else {
+            panic!("typed causal error was overwritten");
+        };
+        assert_eq!(operation, "session_link");
+        assert_eq!(code, expected_code);
+        assert!(!message.is_empty());
+        let response =
+            bcode_ipc::ErrorResponse::new(code, format!("{message}; operation={operation}"));
+        let encoded = serde_json::to_value(response).expect("portable error response");
+        assert_eq!(encoded["code"], expected_code);
+    }
+    assert!(matches!(
+        preserve_live_failure(super::super::unavailable()),
+        ServerError::WorkflowActivityObservation {
+            phase: "live_adaptation"
+        }
+    ));
+}
+
+// Behavioral contract/cursor tests; no source-text assertions.
 use super::*;
 
 async fn seeded_activity_state(
@@ -80,6 +165,230 @@ async fn seeded_activity_state(
     let mut state = crate::tests::test_server_state(crate::SessionManager::default());
     state.workflow_store = std::sync::Arc::new(std::sync::Mutex::new(store));
     (root, state, run.run_id, dispatch)
+}
+
+async fn activity_dispatch_request(
+    db: &dyn switchy_database::Database,
+    run_id: &str,
+    pending: &WorkflowActivityAttempt,
+    dispatch: &str,
+) -> bcode_workflow_store::PreparedActivationDispatch {
+    let node =
+        bcode_workflow_store::representation::graph::execution_node(db, run_id, &pending.node_id)
+            .await
+            .unwrap();
+    bcode_workflow_store::PreparedActivationDispatch {
+        activation: bcode_workflow_store::PendingActivation {
+            run_id: run_id.into(),
+            node_id: pending.node_id.clone(),
+            activation_id: pending.activation_id.clone(),
+            dependency_generation: 0,
+            input: Some(serde_json::json!(1)),
+            node,
+            created_at_ms: 1,
+        },
+        attempt: 1,
+        dispatch_identity: dispatch.into(),
+        intent: serde_json::json!({}),
+    }
+}
+
+fn shared_test_provenance(
+    run_id: &str,
+    pending: &WorkflowActivityAttempt,
+    parent: bcode_session_models::SessionId,
+) -> bcode_session_models::ExecutionSessionProvenance {
+    bcode_session_models::ExecutionSessionProvenance {
+        version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+        owner: "bcode.workflow".into(),
+        run_id: run_id.into(),
+        node_id: pending.node_id.clone(),
+        activation_id: Some(pending.activation_id.clone()),
+        attempt: 1,
+        parent_session_id: parent,
+        context_mode: bcode_session_models::ExecutionSessionContextMode::SharedSequential,
+        workspace_snapshot: Some("fixture".into()),
+        parent_generation: None,
+    }
+}
+
+#[tokio::test]
+async fn shared_completion_waits_for_durable_settlement_before_releasing_guards() {
+    let (_root, state, run_id, dispatch) =
+        seeded_activity_state(serde_json::json!({"owner":"bcode.server.agent-turn/v1"})).await;
+    let state = std::sync::Arc::new(state);
+    let pending = fresh_attempt_page(&state, &run_id).await;
+    let db = super::super::open(&crate::workflow_store_path(&state), true).unwrap();
+    let authority =
+        bcode_workflow_store::representation::attempts::owner_boundary::execution_authority(
+            &db, &run_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let dispatch_request = activity_dispatch_request(&db, &run_id, &pending, &dispatch).await;
+    let parent = state
+        .sessions
+        .create_session(None, std::env::temp_dir())
+        .await
+        .unwrap();
+    let provenance = shared_test_provenance(&run_id, &pending, parent.id);
+    let mut permit = Some(
+        state
+            .sessions
+            .admit_shared_execution_session(parent.id, &provenance)
+            .await
+            .unwrap(),
+    );
+    let proof = permit.as_ref().unwrap().observation();
+    let link = bcode_workflow_store::WorkflowExecutionSessionLink::new(
+        run_id.clone(),
+        pending.node_id,
+        pending.activation_id,
+        1,
+        parent.id.to_string(),
+        "fixture".into(),
+        11,
+    );
+    crate::register_workflow_node_runtime_work(
+        &state,
+        parent.id,
+        &crate::WorkId::new(format!("workflow:{run_id}")),
+        &dispatch,
+        "shared prompt".into(),
+        crate::CancellationHandle::WorkflowNode(std::sync::Arc::new(
+            crate::TurnCancelState::default(),
+        )),
+    )
+    .await;
+    assert!(
+        state
+            .runtime_work
+            .bind_shared_execution(
+                parent.id,
+                &crate::WorkId::new(dispatch.clone()),
+                permit.as_ref().unwrap()
+            )
+            .await
+    );
+    let finished = state
+        .sessions
+        .append_model_turn_finished(
+            parent.id,
+            "turn".into(),
+            bcode_session_models::ModelTurnOutcome::Completed,
+            None,
+        )
+        .await
+        .unwrap();
+    crate::publish_session_event(&state, &finished).await;
+    let gate = crate::workflow_drive_gate(&state, &run_id);
+    let guard = gate.lock().await;
+    let receipt = serde_json::json!({"owner":"bcode.server.agent-turn/v1","session_id":parent.id,"turn_id":"turn"});
+    let mut completion = Box::pin(crate::complete_workflow_prompt_dispatch(
+        &state,
+        &dispatch_request,
+        &authority,
+        &receipt,
+        parent.id,
+        permit.take(),
+        Ok(bcode_workflow_store::AttemptObservation::Cancelled),
+    ));
+    assert!(futures::poll!(&mut completion).is_pending());
+    assert!(proof.upgrade().unwrap().provenance().is_some());
+    assert!(
+        state
+            .runtime_work
+            .observes_shared_execution(parent.id, &link)
+            .await
+    );
+    assert!(!fresh_attempt_page(&state, &run_id).await.terminal);
+    drop(guard);
+    completion.await;
+    assert!(fresh_attempt_page(&state, &run_id).await.terminal);
+    assert!(
+        !state
+            .runtime_work
+            .observes_shared_execution(parent.id, &link)
+            .await
+    );
+    assert!(proof.upgrade().is_none());
+    drop(state);
+}
+
+#[tokio::test]
+async fn failed_shared_settlement_releases_guards_without_terminalizing_attempt() {
+    let (_root, state, run_id, dispatch) =
+        seeded_activity_state(serde_json::json!({"owner":"bcode.server.agent-turn/v1"})).await;
+    let state = std::sync::Arc::new(state);
+    let pending = fresh_attempt_page(&state, &run_id).await;
+    let db = super::super::open(&crate::workflow_store_path(&state), true).unwrap();
+    let authority =
+        bcode_workflow_store::representation::attempts::owner_boundary::execution_authority(
+            &db, &run_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let dispatch_request = activity_dispatch_request(&db, &run_id, &pending, &dispatch).await;
+    let parent = state
+        .sessions
+        .create_session(None, std::env::temp_dir())
+        .await
+        .unwrap();
+    let provenance = shared_test_provenance(&run_id, &pending, parent.id);
+    let mut permit = Some(
+        state
+            .sessions
+            .admit_shared_execution_session(parent.id, &provenance)
+            .await
+            .unwrap(),
+    );
+    let proof = permit.as_ref().unwrap().observation();
+    let receipt = serde_json::json!({"owner":"bcode.server.agent-turn/v1","session_id":parent.id,"turn_id":"turn"});
+    bcode_workflow_store::representation::attempts::attach_receipt(
+        &db,
+        &authority,
+        &bcode_workflow_store::DispatchReceipt {
+            run_id: run_id.clone(),
+            node_id: pending.node_id,
+            activation_id: pending.activation_id,
+            attempt: 1,
+            dispatch_identity: dispatch.clone(),
+            receipt: receipt.clone(),
+            admitted_at_ms: 11,
+        },
+    )
+    .await
+    .unwrap();
+    let mut stale_authority = authority;
+    stale_authority.fencing_token = "stale".into();
+    drop(db);
+    crate::complete_workflow_prompt_dispatch(
+        &state,
+        &dispatch_request,
+        &stale_authority,
+        &receipt,
+        parent.id,
+        permit.take(),
+        Ok(bcode_workflow_store::AttemptObservation::Cancelled),
+    )
+    .await;
+    drop(permit);
+    assert!(!fresh_attempt_page(&state, &run_id).await.terminal);
+    assert!(proof.upgrade().is_none());
+    // The sequential lock is reusable, rather than leaked by failed durable settlement.
+    let replacement = tokio::time::timeout(
+        Duration::from_secs(1),
+        state
+            .sessions
+            .admit_shared_execution_session(parent.id, &provenance),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(replacement);
+    drop(state);
 }
 
 #[tokio::test]

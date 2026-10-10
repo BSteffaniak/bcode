@@ -69,11 +69,27 @@ fn temporarily_unavailable(error: &bcode_client::ClientError, code: &str) -> boo
     matches!(error, bcode_client::ClientError::Server { code: actual, .. } if actual == code)
 }
 
-fn missing_progress_observation(snapshot: &SessionProgressSnapshot) -> bool {
-    // The portable tagged observation is the public contract, not daemon inspection data.
-    serde_json::to_value(snapshot).ok().is_some_and(|value| {
-        value["version"] == 2 && value["observation"]["reason"] == "not_observed_or_evicted"
-    })
+const fn missing_progress_observation(snapshot: &SessionProgressSnapshot) -> bool {
+    snapshot.version == bcode_workflow_view_models::SESSION_PROGRESS_VERSION
+        && matches!(
+        snapshot.observation,
+        bcode_workflow_view_models::SessionProgressObservation::Unavailable {
+            reason: bcode_workflow_view_models::SessionProgressUnavailableReason::NotObservedOrEvicted
+        }
+    )
+}
+
+const fn progress_unavailable_category(snapshot: &SessionProgressSnapshot) -> &'static str {
+    if snapshot.version != bcode_workflow_view_models::SESSION_PROGRESS_VERSION {
+        return "unsupported_progress_version";
+    }
+    match &snapshot.observation {
+        bcode_workflow_view_models::SessionProgressObservation::Unavailable { reason } => match reason {
+            bcode_workflow_view_models::SessionProgressUnavailableReason::NotObservedOrEvicted => "not_observed_or_evicted",
+            bcode_workflow_view_models::SessionProgressUnavailableReason::CoverageUnavailable => "coverage_unavailable",
+        },
+        bcode_workflow_view_models::SessionProgressObservation::Available { .. } => "invalid_progress_marker",
+    }
 }
 
 fn may_retry_observation(elapsed: std::time::Duration, allowance: std::time::Duration) -> bool {
@@ -230,12 +246,11 @@ pub async fn observe(
                     if snapshot.advanced_since(&snapshot).is_some() {
                         break snapshot;
                     }
-                    let reason = if missing_progress_observation(&snapshot) {
-                        "not_observed_or_evicted"
-                    } else {
-                        "coverage_or_contract_unavailable"
-                    };
-                    let diagnostic = format!("agent progress coverage unavailable: {reason}");
+                    let reason = progress_unavailable_category(&snapshot);
+                    let diagnostic = format!(
+                        "agent progress coverage unavailable: {reason}; session={session}; activity_observed_at_ms={}; progress_version={}",
+                        activity.observed_at_ms, snapshot.version
+                    );
                     *last_coverage_diagnostic
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -356,6 +371,36 @@ pub async fn observe(
 mod tests {
     use super::may_wait_for_initial_coverage;
     use std::time::Duration;
+
+    #[test]
+    fn unavailable_progress_categories_preserve_contract_distinctions() {
+        let snapshot = |version: u32, observation: serde_json::Value| {
+            serde_json::from_value::<bcode_ipc::SessionProgressSnapshot>(serde_json::json!({
+                "version": version, "session_id": "session", "observation": observation
+            }))
+            .unwrap()
+        };
+        for (reason, expected) in [
+            ("coverage_unavailable", "coverage_unavailable"),
+            ("not_observed_or_evicted", "not_observed_or_evicted"),
+        ] {
+            let value = snapshot(
+                2,
+                serde_json::json!({"status":"unavailable","reason":reason}),
+            );
+            assert_eq!(super::progress_unavailable_category(&value), expected);
+            assert_eq!(value.advanced_since(&value), None);
+        }
+        let future = snapshot(
+            99,
+            serde_json::json!({"status":"unavailable","reason":"not_observed_or_evicted"}),
+        );
+        assert_eq!(
+            super::progress_unavailable_category(&future),
+            "unsupported_progress_version"
+        );
+        assert!(!super::missing_progress_observation(&future));
+    }
 
     #[test]
     fn only_exact_normalized_projection_observation_codes_retry() {

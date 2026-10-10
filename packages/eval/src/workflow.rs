@@ -91,11 +91,15 @@ fn progress_mark(
             })
         }
         ProgressObservation::Unavailable { reason } => {
-            // Do not persist untrusted reason text as a public diagnostic.
-            let _ = reason;
-            Err(EvalError::Validation(
-                "session progress coverage unavailable; idle timeout cannot be established".into(),
-            ))
+            // Only normalized public categories may enter retained diagnostics.
+            let category = match reason.as_str() {
+                "not_observed_or_evicted" => "not_observed_or_evicted",
+                "coverage_unavailable" => "coverage_unavailable",
+                _ => "unknown_unavailability_reason",
+            };
+            Err(EvalError::Validation(format!(
+                "session progress coverage unavailable: {category}; session={session}; idle timeout cannot be established"
+            )))
         }
         ProgressObservation::Available { .. } => Err(EvalError::Validation(
             "session progress epoch missing".into(),
@@ -338,6 +342,63 @@ fn scan_workflow_progress(
     scan_workflow_progress_with_ipc(root, clock, now, remaining, invoke, Duration::from_secs(15))
 }
 
+fn initial_session_marker_missing(
+    progress: &bcode_workflow_view_models::SessionProgressSnapshot,
+    clock: &ExecutionClock<String>,
+) -> bool {
+    progress.version == bcode_workflow_view_models::SESSION_PROGRESS_VERSION
+        && !clock.contains(&progress.session_id)
+        && matches!(progress.observation,
+            bcode_workflow_view_models::SessionProgressObservation::Unavailable {
+                reason: bcode_workflow_view_models::SessionProgressUnavailableReason::NotObservedOrEvicted
+            })
+}
+
+/// Only the exact first-marker category may wait; all other prerequisites fail closed.
+fn initial_marker_readiness(
+    page: &bcode_workflow_view_models::WorkflowActivityPage,
+    clock: &ExecutionClock<String>,
+) -> Result<bool, EvalError> {
+    let mut pending = false;
+    for issue in page
+        .issues
+        .iter()
+        .filter(|issue| issue.starts_with("session_progress:"))
+    {
+        let verified_initial = page.attempts.iter().any(|attempt| {
+            if let bcode_workflow_view_models::AttemptObservation::LinkedSession {
+                progress, ..
+            } = &attempt.observation
+            {
+                !attempt.terminal
+                    && attempt.session_id.as_deref() == Some(progress.session_id.as_str())
+                    && initial_session_marker_missing(progress, clock)
+                    && *issue
+                        == format!(
+                            "session_progress:{}:registry:NotObservedOrEvicted",
+                            progress.session_id
+                        )
+            } else {
+                false
+            }
+        });
+        if !verified_initial {
+            return Err(EvalError::Validation("workflow live session progress prerequisites unavailable; inspect retained activity page issues for metadata, provenance, ownership and residency categories".into()));
+        }
+        pending = true;
+    }
+    Ok(pending)
+}
+
+fn pending_readiness_within_deadline(
+    result: &Result<Duration, EvalError>,
+    elapsed: Duration,
+    allowance: Duration,
+) -> bool {
+    matches!(result, Err(EvalError::Validation(reason)) if reason == "workflow_activity_pending_readiness")
+        && elapsed < allowance
+}
+
 fn scan_workflow_progress_with_ipc(
     root: &str,
     clock: &mut ExecutionClock<String>,
@@ -409,20 +470,14 @@ fn scan_workflow_progress_with_ipc(
                             .map(str::to_owned);
                     }
                     let page: WorkflowActivityPage = serde_json::from_value(value)?;
-                    if page
-                        .issues
-                        .iter()
-                        .any(|issue| issue.starts_with("session_progress:"))
-                    {
-                        return Err(EvalError::Validation("workflow live session progress prerequisites unavailable; inspect retained activity page issues for metadata, provenance, ownership and residency categories".into()));
-                    }
+                    let initial_marker_pending = initial_marker_readiness(&page, clock)?;
                     if page.version != WORKFLOW_ACTIVITY_VERSION || page.run_id != run || page.root_run_id != root
                         || guard.id.as_deref() != Some(page.scan_id.as_str()) || page.scan_id.is_empty()
                         || page.section != if section == "attempts" { WorkflowActivitySection::Attempts } else { WorkflowActivitySection::Children } || revision.is_some_and(|value| value != page.revision)
                         || page.scan_lifetime_ms == 0 || page.snapshot_age_ms >= page.scan_lifetime_ms
                         || snapshot_time.is_some_and(|value| value != page.snapshot_started_at_ms)
                         || page.inventory_exhausted != page.next_cursor.is_none()
-                        || page.issues.iter().any(|issue| issue != "Complete page inventory is as-of the retained snapshot; live progress is observed later and current subtree idleness is not certified")
+                        || page.issues.iter().any(|issue| issue != "Complete page inventory is as-of the retained snapshot; live progress is observed later and current subtree idleness is not certified" && !(initial_marker_pending && issue.starts_with("session_progress:")))
                         || (section == "attempts" && !page.children.is_empty())
                         || (section == "children" && !page.attempts.is_empty())
                     {
@@ -507,6 +562,17 @@ fn scan_workflow_progress_with_ipc(
                                 ));
                             }
                             AttemptObservation::LinkedSession { progress, stage } => {
+                                if attempt.session_id.as_deref()
+                                    != Some(progress.session_id.as_str())
+                                {
+                                    return Err(EvalError::Validation(
+                                        "linked session progress identity mismatch".into(),
+                                    ));
+                                }
+                                if initial_session_marker_missing(&progress, clock) {
+                                    readiness_pending = true;
+                                    continue;
+                                }
                                 observe_stage(
                                     &stage,
                                     &attempt.dispatch_identity,
@@ -1324,9 +1390,11 @@ pub fn execute(
                     &invoke,
                     activity_ipc,
                 );
-                if matches!(&result, Err(EvalError::Validation(reason)) if reason == "workflow_activity_pending_readiness")
-                    && readiness_started.elapsed() < readiness_allowance
-                    && wall_limit.is_none_or(|limit| now() < limit)
+                if pending_readiness_within_deadline(
+                    &result,
+                    readiness_started.elapsed(),
+                    readiness_allowance,
+                ) && wall_limit.is_none_or(|limit| now() < limit)
                 {
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
@@ -1917,6 +1985,133 @@ mod observation_tests {
     use super::*;
     use std::cell::Cell;
 
+    fn marker_readiness_page(reason: Option<&str>, issue: Option<&str>) -> serde_json::Value {
+        let session = "00000000-0000-0000-0000-000000000001";
+        let progress = reason.map_or_else(|| serde_json::json!({"version":2,"session_id":session,
+            "observation":{"status":"available","epoch":"marker","counter":1,"last_progress_at_ms":1}}),
+            |reason| serde_json::json!({"version":2,"session_id":session,
+                "observation":{"status":"unavailable","reason":reason}}));
+        serde_json::json!({"version":2,"scan_id":"scan","root_run_id":"root","run_id":"root",
+            "revision":1,"section":"attempts","snapshot_started_at_ms":1,"snapshot_age_ms":0,
+            "scan_lifetime_ms":30000,"current_idle_eligible":false,
+            "attempts":[{"dispatch_identity":"dispatch","node_id":"integrate","activation_id":"activation",
+                "attempt":1,"terminal":false,"session_id":session,
+                "observation":{"kind":"linked_session","progress":progress,
+                    "stage":{"source_id":"dispatch","epoch":"dispatch","sequence":2,"last_progress_at_ms":1}}}],
+            "children":[],"next_cursor":null,"inventory_exhausted":true,"subtree_coverage_complete":false,
+            "issues":issue.map(|category| format!("session_progress:{session}:{category}")).into_iter().collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn first_marker_readiness_does_not_insert_baseline_or_count_polls_as_progress() {
+        let mut clock = ExecutionClock::new(
+            Duration::ZERO,
+            Some(Duration::from_mins(3)),
+            None,
+            std::num::NonZeroUsize::new(10).unwrap(),
+        );
+        let missing = marker_readiness_page(
+            Some("not_observed_or_evicted"),
+            Some("registry:NotObservedOrEvicted"),
+        );
+        let marker_arrived = Cell::new(false);
+        let invoke = |args: &[String], _: &str, _: Duration| {
+            if args[1] == "activity-close" {
+                Ok(serde_json::json!({}))
+            } else {
+                let mut page = if marker_arrived.get() {
+                    marker_readiness_page(None, None)
+                } else {
+                    missing.clone()
+                };
+                if args
+                    .windows(2)
+                    .any(|pair| pair == ["--section", "children"])
+                {
+                    page["section"] = serde_json::json!("children");
+                    page["attempts"] = serde_json::json!([]);
+                    page["issues"] = serde_json::json!([]);
+                    page["subtree_coverage_complete"] = serde_json::json!(true);
+                }
+                Ok(page)
+            }
+        };
+        for elapsed in [0, 10, 29, 30] {
+            let result = scan_workflow_progress(
+                "root",
+                &mut clock,
+                &|| Duration::from_secs(elapsed),
+                &|| Duration::from_secs(30),
+                &invoke,
+            );
+            assert!(
+                matches!(&result, Err(EvalError::Validation(reason)) if reason == "workflow_activity_pending_readiness")
+            );
+            assert_eq!(
+                pending_readiness_within_deadline(
+                    &result,
+                    Duration::from_secs(elapsed),
+                    Duration::from_secs(30)
+                ),
+                elapsed < 30
+            );
+            assert!(!clock.contains("00000000-0000-0000-0000-000000000001"));
+            assert!(!clock.contains("dispatch"));
+        }
+        marker_arrived.set(true);
+        scan_workflow_progress(
+            "root",
+            &mut clock,
+            &|| Duration::from_secs(30),
+            &|| Duration::from_secs(30),
+            &invoke,
+        )
+        .unwrap();
+        assert!(clock.contains("00000000-0000-0000-0000-000000000001"));
+        marker_arrived.set(false);
+        assert!(
+            scan_workflow_progress(
+                "root",
+                &mut clock,
+                &|| Duration::from_secs(31),
+                &|| Duration::from_secs(30),
+                &invoke
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn initial_marker_wait_rejects_other_prerequisites_and_coverage_categories() {
+        let clock = ExecutionClock::new(
+            Duration::ZERO,
+            Some(Duration::from_mins(3)),
+            None,
+            std::num::NonZeroUsize::new(10).unwrap(),
+        );
+        for issue in [
+            "metadata:database_locked",
+            "provenance_unverified",
+            "ownership_released_or_foreign",
+            "runtime_nonresident",
+            "registry:CoverageUnavailable",
+            "registry:UnknownFutureReason",
+        ] {
+            let page = serde_json::from_value(marker_readiness_page(
+                Some("not_observed_or_evicted"),
+                Some(issue),
+            ))
+            .unwrap();
+            assert!(initial_marker_readiness(&page, &clock).is_err());
+        }
+        let page = serde_json::from_value(marker_readiness_page(
+            Some("coverage_unavailable"),
+            Some("registry:NotObservedOrEvicted"),
+        ))
+        .unwrap();
+        assert!(initial_marker_readiness(&page, &clock).is_err());
+    }
+
     #[test]
     fn public_subtree_scan_compares_nested_progress_not_poll_metadata() {
         let root = "00000000-0000-0000-0000-000000000001";
@@ -2077,6 +2272,31 @@ mod observation_tests {
         assert!(!clock.contains(child));
         assert!(clock.contains(grandchild));
         assert_eq!(clock.expired(Duration::from_secs(250), true).unwrap(), None);
+    }
+
+    #[test]
+    fn unavailable_progress_diagnostics_are_normalized_and_secret_safe() {
+        for reason in [
+            "coverage_unavailable",
+            "not_observed_or_evicted",
+            "private-secret",
+        ] {
+            let error = progress_mark(
+                serde_json::json!({"version":2,"session_id":"s",
+                    "observation":{"status":"unavailable","reason":reason}}),
+                "s",
+            )
+            .unwrap_err()
+            .to_string();
+            let category = if reason == "private-secret" {
+                "unknown_unavailability_reason"
+            } else {
+                reason
+            };
+            assert!(error.contains(category));
+            assert!(error.contains("idle timeout cannot be established"));
+            assert!(!error.contains("private-secret"));
+        }
     }
 
     #[test]

@@ -1013,8 +1013,8 @@ fn invoke_candidate(
             ..
         })) => edit_failure(&code),
         _ => ServiceResponse::error(
-            "workflow_publication_failed",
-            "candidate publication outcome unknown",
+            "workflow_bridge_outcome_unknown",
+            "workflow application bridge did not return a classified result; operation outcome unknown",
         ),
     }
 }
@@ -1131,8 +1131,8 @@ fn invoke_prepared_edit(
             ..
         })) => edit_failure(&code),
         _ => ServiceResponse::error(
-            "workflow_staging_failed",
-            "workflow edit was not admitted; verify route, policy, and active execution",
+            "workflow_bridge_outcome_unknown",
+            "workflow application bridge did not return a classified result; operation outcome unknown",
         ),
     }
 }
@@ -1147,9 +1147,49 @@ fn edit_failure(code: &str) -> ServiceResponse {
             code,
             "workflow candidate rejected; verify revision, topology, schemas and active-work reconciliation",
         ),
+        "workflow_storage_busy" => ServiceResponse::error(
+            "workflow_storage_busy",
+            "workflow edit storage is busy; durable work may be unchanged or pending; inspect retained state before further action",
+        ),
+        "workflow_storage_unavailable" => ServiceResponse::error(
+            "workflow_storage_unavailable",
+            "workflow edit storage is unavailable; operation outcome unknown",
+        ),
+        "workflow_operation_outcome_unknown" => ServiceResponse::error(
+            "workflow_operation_outcome_unknown",
+            "workflow edit failed with an unclassified application error; operation outcome unknown",
+        ),
+        "invalid_request" => ServiceResponse::error(
+            "workflow_candidate_resolution_failed",
+            "workflow graph edit candidate resolution failed; inspect retained candidate and active execution",
+        ),
+        "workflow_graph_publication_authority_conflict" => ServiceResponse::error(
+            "workflow_graph_publication_authority_conflict",
+            "workflow graph publication authority conflict",
+        ),
+        "workflow_graph_publication_capacity_unavailable" => ServiceResponse::error(
+            "workflow_graph_publication_capacity_unavailable",
+            "workflow graph publication capacity unavailable",
+        ),
+        "workflow_graph_publication_invalid_admission" => ServiceResponse::error(
+            "workflow_graph_publication_invalid_admission",
+            "workflow graph publication admission invalid",
+        ),
+        "workflow_graph_publication_maintenance_required" => ServiceResponse::error(
+            "workflow_graph_publication_maintenance_required",
+            "workflow graph publication requires maintenance",
+        ),
+        "workflow_graph_publication_unsupported" => ServiceResponse::error(
+            "workflow_graph_publication_unsupported",
+            "workflow graph publication operation unsupported",
+        ),
+        "workflow_graph_publication_storage_unavailable" => ServiceResponse::error(
+            "workflow_graph_publication_storage_unavailable",
+            "workflow graph publication storage unavailable; outcome unknown",
+        ),
         _ => ServiceResponse::error(
             "workflow_staging_failed",
-            "workflow edit was not admitted; verify route, policy, and active execution",
+            "workflow edit outcome unknown; inspect retained state before further action",
         ),
     }
 }
@@ -1339,6 +1379,165 @@ fn staging_response(payload: serde_json::Value) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    extern "C" fn publication_failure_bridge(
+        request_ptr: *const u8,
+        request_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: the SDK supplies a valid request slice for this synchronous callback.
+        let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+        let request: ServiceBridgeRequest = serde_json::from_slice(request).unwrap();
+        let ServiceBridgeRequest::InvokeService(request) = request else {
+            panic!("expected workflow application request");
+        };
+        assert_eq!(request.operation, PUBLISH_OPERATION);
+        // SAFETY: the test keeps the failure code alive throughout the synchronous call.
+        let code = unsafe { &*user_data.cast::<String>() };
+        let resolution = if code == "unsupported-bridge-fixture" {
+            ToolInvocationServiceResolution::Unsupported
+        } else {
+            ToolInvocationServiceResolution::Failed {
+                code: code.clone(),
+                message: "injected-secret-token SQL /private/storage; retry succeeded".into(),
+            }
+        };
+        let response = ServiceBridgeResponse::Service(resolution);
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert!(bytes.len() <= output_capacity);
+        // SAFETY: the SDK provides writable output storage and its length pointer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), output_ptr, bytes.len());
+            *output_len = bytes.len();
+        }
+        bcode_plugin_sdk::SERVICE_BRIDGE_STATUS_OK
+    }
+
+    #[test]
+    fn publication_rejection_categories_survive_application_failures() {
+        let categories = [
+            (
+                "workflow_graph_publication_authority_conflict",
+                "workflow graph publication authority conflict",
+            ),
+            (
+                "workflow_graph_publication_capacity_unavailable",
+                "workflow graph publication capacity unavailable",
+            ),
+            (
+                "workflow_graph_publication_invalid_admission",
+                "workflow graph publication admission invalid",
+            ),
+            (
+                "workflow_graph_publication_maintenance_required",
+                "workflow graph publication requires maintenance",
+            ),
+            (
+                "workflow_graph_publication_unsupported",
+                "workflow graph publication operation unsupported",
+            ),
+            (
+                "invalid_request",
+                "workflow graph edit candidate resolution failed; inspect retained candidate and active execution",
+            ),
+        ];
+        assert_publication_failures(&categories);
+    }
+
+    #[test]
+    fn publication_unknown_outcomes_remain_secret_safe_errors() {
+        let categories = [
+            (
+                "workflow_graph_publication_storage_unavailable",
+                "workflow graph publication storage unavailable; outcome unknown",
+            ),
+            (
+                "workflow_storage_busy",
+                "workflow edit storage is busy; durable work may be unchanged or pending; inspect retained state before further action",
+            ),
+            (
+                "workflow_storage_unavailable",
+                "workflow edit storage is unavailable; operation outcome unknown",
+            ),
+            (
+                "workflow_operation_outcome_unknown",
+                "workflow edit failed with an unclassified application error; operation outcome unknown",
+            ),
+            (
+                "unsupported-bridge-fixture",
+                "workflow application bridge did not return a classified result; operation outcome unknown",
+            ),
+            (
+                "workflow_graph_publication_future_injected-secret-token",
+                "workflow edit outcome unknown; inspect retained state before further action",
+            ),
+        ];
+        assert_publication_failures(&categories);
+    }
+
+    fn assert_publication_failures(categories: &[(&str, &str)]) {
+        let reference = bcode_workflow::WorkflowRunGraphCandidateReference {
+            version: 1,
+            run_id: "run".into(),
+            expected_revision: 1,
+            mutation_id: "publication".into(),
+            checksum_sha256: "a".repeat(64),
+        };
+        let payload = json!({"candidate":reference});
+        for &(category, message) in categories {
+            let mut code = category.to_owned();
+            let context = NativeServiceContext {
+                plugin_id: "bcode.workflow".into(),
+                request: ServiceRequest {
+                    interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.into(),
+                    operation: bcode_tool::OP_INVOKE_TOOL.into(),
+                    payload: Vec::new(),
+                },
+                config: bcode_plugin_sdk::PluginConfigContext::default(),
+                events: ServiceEventEmitter::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                bridge: ServiceBridge::new(
+                    Some(publication_failure_bridge),
+                    std::ptr::from_mut(&mut code).cast(),
+                    bcode_plugin_sdk::ServiceCancellation::default(),
+                ),
+                transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            };
+            let response = invoke_prepared_edit(
+                &context,
+                ToolInvocationRequest {
+                    tool_call_id: "publication-test".into(),
+                    name: PUBLISH_NAME.into(),
+                    arguments: json!({"edit_json":payload.to_string()}),
+                    preparation_descriptor: json!({
+                        "operation":PUBLISH_OPERATION,"edit":payload,"route_id":"application"
+                    }),
+                },
+            );
+            let error = response
+                .error
+                .expect("application failure must remain an error");
+            assert_eq!(error.message, message);
+            assert_eq!(
+                error.code,
+                if category.ends_with("injected-secret-token") {
+                    "workflow_staging_failed"
+                } else if category == "unsupported-bridge-fixture" {
+                    "workflow_bridge_outcome_unknown"
+                } else if category == "invalid_request" {
+                    "workflow_candidate_resolution_failed"
+                } else {
+                    category
+                }
+            );
+            assert!(!error.message.contains("injected-secret-token"));
+            assert!(!error.message.contains("/private/storage"));
+            assert!(!error.message.contains("retry succeeded"));
+        }
+    }
 
     #[test]
     fn staging_receipt_replays_portable_v2_request_without_reconstruction() {

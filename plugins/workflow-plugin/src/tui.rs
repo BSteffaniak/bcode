@@ -8291,9 +8291,38 @@ mod tests {
                 unavailable_reason: None,
             },
         ]);
-        let rendered = render_workspace_text(&mut surface, 200, 32);
-        assert!(rendered.contains("V view definition"));
-        assert!(rendered.contains("F fork definition"));
+        surface.prepare_keymap(&TestHost);
+        let rendered = render_workspace_text(&mut surface, 1200, 32);
+        for (action, label) in [("view", "View definition"), ("fork", "Fork definition")] {
+            let keys = TestHost
+                .keymap_keys(keybindings::RUNS, &format!("workflow.{action}"))
+                .join("/");
+            assert!(!keys.is_empty());
+            assert!(rendered.contains(&format!("{keys} {label}")));
+        }
+        let host = FooterKeymapHost(
+            bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                keybindings::declarations(),
+                std::collections::BTreeMap::from([(
+                    keybindings::RUNS.into(),
+                    std::collections::BTreeMap::from([
+                        ("ctrl+v".into(), "workflow.view".into()),
+                        ("shift+v".into(), String::new()),
+                        ("shift+t".into(), String::new()),
+                    ]),
+                )]),
+            )
+            .unwrap(),
+        );
+        surface.prepare_keymap(&host);
+        let rendered = render_workspace_text(&mut surface, 1200, 32);
+        let keys = host
+            .keymap_keys(keybindings::RUNS, "workflow.view")
+            .join("/");
+        assert!(rendered.contains(&format!("{keys} View definition")));
+        assert!(!rendered.contains("Fork definition"));
+        let narrow = render_workspace_text(&mut surface, 24, 32);
+        assert!(!narrow.contains("View definition"));
     }
 
     #[test]
@@ -8599,8 +8628,21 @@ mod tests {
                 && surface_id == WORKFLOW_AUTHOR_SURFACE_KIND
                 && options["entry"] == "new_workflow"
         ));
-        let rendered = render_workspace_text(&mut surface, 240, 28);
-        assert!(rendered.contains("definitions/templates/new"));
+        surface.prepare_keymap(&TestHost);
+        let rendered = render_workspace_text(&mut surface, 1200, 28);
+        for (action, label) in [
+            ("definitions", "Browse definitions"),
+            ("templates", "Browse templates"),
+            ("new", "Open new authoring"),
+        ] {
+            let keys = TestHost
+                .keymap_keys(keybindings::RUNS, &format!("workflow.{action}"))
+                .join("/");
+            assert!(!keys.is_empty());
+            assert!(rendered.contains(&format!("{keys} {label}")));
+        }
+        let narrow = render_workspace_text(&mut surface, 24, 28);
+        assert!(!narrow.contains("Open new authoring"));
     }
 
     #[test]
@@ -10729,6 +10771,24 @@ mod tests {
             99
         );
         assert!(surface.live_status.contains("Discarded stale"));
+    }
+
+    struct FooterKeymapHost(bcode_plugin_sdk::tui::keymap::KeymapRegistry);
+
+    impl PluginTuiHost for FooterKeymapHost {
+        fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+            self.0
+                .keys_for_action(scope, action)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+
+        fn request_redraw(&self) {}
     }
 
     struct TestHost;

@@ -230,7 +230,7 @@ async fn agent(
         activation: pending,
         attempt: prepared.attempt,
         dispatch_identity: identity.clone(),
-        intent: prepared.intent,
+        intent: prepared.intent.clone(),
     };
     if let Some(receipt) = super::backpressure::queued(&crate::workflow_store_path(state), || {
         owner_boundary::receipt(db, &identity)
@@ -242,6 +242,12 @@ async fn agent(
     }
     // Never replay an ambiguous mutating preparation without a committed receipt.
     if recovered && prepared.side_effect == bcode_workflow::DispatchSideEffect::Mutating {
+        if let Some(receipt) =
+            super::recovery::recover_acceptance(state, &prepared, authority).await?
+        {
+            return observe_existing(state, authority, &dispatch, prepared.side_effect, receipt)
+                .await;
+        }
         return Err(unsupported());
     }
     super::backpressure::queued(&crate::workflow_store_path(state), || {

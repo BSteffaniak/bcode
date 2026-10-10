@@ -222,6 +222,16 @@ pub enum ServerError {
     /// A content-free workflow observation failure at a defined boundary.
     #[error("workflow activity observation failed at {phase}")]
     WorkflowActivityObservation { phase: &'static str },
+    /// Shared-session verification failure normalized from closed internal categories.
+    #[error("workflow shared verification failed at {operation}: {code}")]
+    WorkflowActivitySharedVerification {
+        /// Fixed operation label; never a database message or path.
+        operation: &'static str,
+        /// Fixed public diagnostic code.
+        code: &'static str,
+        /// Secret-safe fixed description.
+        message: &'static str,
+    },
     /// An embedded application callback panicked; its payload is not disclosed.
     #[error("embedded workflow application callback failed")]
     EmbeddedWorkflowCallbackFailed,
@@ -6809,6 +6819,9 @@ async fn handle_request_inner(
             .map_or_else(
                 |error| {
                     let (code, message) = match error {
+                        ServerError::WorkflowActivitySharedVerification { operation, code, message } => {
+                            return Response::Err(ErrorResponse::new(code, format!("{message}; operation={operation}")));
+                        }
                         ServerError::WorkflowActivityObservation { phase: "snapshot_start" } => ("workflow_activity_snapshot_start_failed", "Workflow activity could not establish a retained snapshot; inspect storage compatibility, capacity and ownership."),
                         ServerError::WorkflowActivityObservation { phase: "inventory_read" } => ("workflow_activity_inventory_failed", "Workflow activity inventory read failed; inspect scan lifetime, cursor revision, canonical ledger consistency and database availability."),
                         ServerError::WorkflowActivityObservation { phase: "live_adaptation" } => ("workflow_activity_live_observation_failed", "Workflow live-session observation failed; inspect session provenance, ownership, resident connection and canonical metadata readiness."),
@@ -33148,7 +33161,18 @@ fn workflow_operation_failure(error: &ServerError) -> ToolInvocationServiceResol
             "workflow_candidate_rejected",
             "workflow store rejected the candidate; verify revision, topology, schemas and active-work reconciliation",
         ),
-        _ => return workflow_invocation_failure(),
+        ServerError::WorkflowStorageBusy => (
+            "workflow_storage_busy",
+            "workflow edit storage is busy; durable work may be unchanged or pending; inspect retained state before further action",
+        ),
+        ServerError::WorkflowStorageUnavailable(_) => (
+            "workflow_storage_unavailable",
+            "workflow edit storage is unavailable; operation outcome unknown",
+        ),
+        _ => (
+            "workflow_operation_outcome_unknown",
+            "workflow edit failed with an unclassified application error; operation outcome unknown",
+        ),
     };
     ToolInvocationServiceResolution::Failed {
         code: code.into(),
@@ -38396,6 +38420,7 @@ async fn persist_workflow_prompt_completion(
     unreachable!("the bounded receipt retry loop returns on its final attempt")
 }
 
+#[cfg(test)]
 async fn settle_workflow_prompt_observation(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
@@ -38403,9 +38428,23 @@ async fn settle_workflow_prompt_observation(
     receipt: &serde_json::Value,
     observation: bcode_workflow_store::AttemptObservation,
 ) {
+    match commit_workflow_prompt_observation(state, request, authority, receipt, observation).await
+    {
+        Ok(summary) => continue_settled_workflow_prompt(state, request, summary).await,
+        Err(error) => tracing::warn!(%error, "workflow prompt settlement remains unresolved"),
+    }
+}
+
+async fn commit_workflow_prompt_observation(
+    state: &Arc<ServerState>,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    receipt: &serde_json::Value,
+    observation: bcode_workflow_store::AttemptObservation,
+) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
     let completion_gate = workflow_drive_gate(state, &request.activation.run_id);
     let completion_guard = completion_gate.lock().await;
-    if workflow_representation::owner::persist_receipt(
+    workflow_representation::owner::persist_receipt(
         state,
         &bcode_workflow_store::DispatchReceipt {
             run_id: request.activation.run_id.clone(),
@@ -38418,36 +38457,73 @@ async fn settle_workflow_prompt_observation(
         },
         authority,
     )
-    .await
-    .is_err()
+    .await?;
+    let summary =
+        workflow_representation::owner::settle_observation(state, request, authority, observation)
+            .await?;
+    drop(completion_guard);
+    Ok(summary)
+}
+
+async fn continue_settled_workflow_prompt(
+    state: &Arc<ServerState>,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    summary: bcode_workflow_store::ReceiptReconciliationSummary,
+) {
+    if let Err(error) =
+        propagate_fail_fast_sibling_cancellation(state, summary.sibling_cancellations).await
     {
-        tracing::warn!(
-            run_id = %request.activation.run_id,
-            "workflow prompt settlement could not commit its owned admission receipt"
-        );
-        return;
+        tracing::warn!("failed to propagate fail-fast sibling cancellation: {error}");
     }
-    match workflow_representation::owner::settle_observation(state, request, authority, observation)
-        .await
-    {
-        Ok(summary) => {
-            // Settlement and page driving share the per-run gate. Release it before
-            // scheduling successors so the continuation can acquire the same gate.
-            drop(completion_guard);
-            if let Err(error) =
-                propagate_fail_fast_sibling_cancellation(state, summary.sibling_cancellations).await
-            {
-                tracing::warn!("failed to propagate fail-fast sibling cancellation: {error}");
-            }
-            if let Err(error) =
-                drive_workflow_run_and_parents(state, &request.activation.run_id).await
-            {
-                tracing::warn!("failed to continue workflow hierarchy after completion: {error}");
-            }
+    if let Err(error) = drive_workflow_run_and_parents(state, &request.activation.run_id).await {
+        tracing::warn!("failed to continue workflow hierarchy after completion: {error}");
+    }
+}
+
+async fn complete_workflow_prompt_dispatch(
+    state: &Arc<ServerState>,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    receipt: &serde_json::Value,
+    session_id: SessionId,
+    shared_permit: Option<bcode_session::SharedExecutionSessionPermit>,
+    observation: Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError>,
+) {
+    let result = match observation {
+        Ok(
+            observation @ (bcode_workflow_store::AttemptObservation::Succeeded { .. }
+            | bcode_workflow_store::AttemptObservation::Failed { .. }
+            | bcode_workflow_store::AttemptObservation::Cancelled),
+        ) => {
+            let outcome = runtime_work_outcome_from_attempt_observation(&observation);
+            commit_workflow_prompt_observation(state, request, authority, receipt, observation)
+                .await
+                .map(|summary| (summary, outcome))
         }
+        Ok(_) => Err(WorkflowStoreError::OwnerAccessDeferred),
+        Err(error) => Err(error),
+    };
+    // Keep both verification guards until durable settlement. On failure suspend only
+    // disposable runtime work: the admitted receipt remains unresolved and recoverable.
+    let (status, message) = match &result {
+        Ok((_, outcome)) => outcome.clone(),
         Err(error) => {
-            tracing::warn!("failed to persist completed workflow prompt turn: {error}");
+            tracing::warn!(run_id = %request.activation.run_id, dispatch_identity = %request.dispatch_identity,
+                %error, "workflow prompt settlement unresolved; inspect or reconcile the retained receipt");
+            (RuntimeWorkStatus::Suspended, Some("workflow prompt settlement unresolved; inspect or reconcile the retained receipt".into()))
         }
+    };
+    drop(shared_permit);
+    finish_registered_runtime_work(
+        state,
+        session_id,
+        WorkId::new(request.dispatch_identity.clone()),
+        status,
+        message,
+    )
+    .await;
+    if let Ok((summary, _)) = result {
+        continue_settled_workflow_prompt(state, request, summary).await;
     }
 }
 
@@ -39224,7 +39300,6 @@ async fn dispatch_workflow_prompt_turn_after_admission(
     // receipt write fails, keep observing the admitted turn and retain its shared permit.
     // The caller still receives the persistence failure; observation cannot bypass fencing.
     let execution_session_id = target_session_id;
-    let dispatch_identity = request.dispatch_identity.clone();
     let request_for_completion = request.clone();
     let state_for_completion = Arc::clone(state);
     let receipt_for_completion = owner_receipt.clone();
@@ -39238,42 +39313,19 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                     format!("workflow model turn completion channel closed: {error}"),
                 ),
             };
-            drop(shared_permit);
-            let observation = match workflow_representation::owner::completion_observation(
+            let observation = workflow_representation::owner::completion_observation(
                 &state_for_completion,
                 &request_for_completion,
                 completion,
             )
-            .await
-            {
-                Ok(observation) => observation,
-                Err(error) => {
-                    finish_registered_runtime_work(
-                        &state_for_completion,
-                        execution_session_id,
-                        WorkId::new(dispatch_identity),
-                        RuntimeWorkStatus::Failed,
-                        Some(error.to_string()),
-                    )
-                    .await;
-                    tracing::warn!("failed to complete workflow prompt turn: {error}");
-                    return;
-                }
-            };
-            let (status, message) = runtime_work_outcome_from_attempt_observation(&observation);
-            finish_registered_runtime_work(
-                &state_for_completion,
-                execution_session_id,
-                WorkId::new(dispatch_identity),
-                status,
-                message,
-            )
             .await;
-            settle_workflow_prompt_observation(
+            complete_workflow_prompt_dispatch(
                 &state_for_completion,
                 &request_for_completion,
                 &dispatch_authority,
                 &receipt_for_completion,
+                execution_session_id,
+                shared_permit,
                 observation,
             )
             .await;
@@ -39293,22 +39345,16 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                 timeout_ms,
             )
             .await;
-            drop(shared_permit);
-            match observation {
-                Ok(observation) => {
-                    settle_workflow_prompt_observation(
-                        &state_for_completion,
-                        &request_for_completion,
-                        &dispatch_authority,
-                        &receipt_for_completion,
-                        observation,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    tracing::warn!("failed to reattach existing workflow prompt turn: {error}");
-                }
-            }
+            complete_workflow_prompt_dispatch(
+                &state_for_completion,
+                &request_for_completion,
+                &dispatch_authority,
+                &receipt_for_completion,
+                execution_session_id,
+                shared_permit,
+                observation,
+            )
+            .await;
         });
     }
     receipt_commit?;

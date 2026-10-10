@@ -2586,6 +2586,17 @@ pub enum DaemonStartError {
     /// Daemon process I/O failed.
     #[error("daemon process I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The detached child's readiness notification was not observed before the deadline.
+    /// This records the failed wait, not the child's current readiness or execution lifetime.
+    #[error(
+        "daemon readiness notification deadline elapsed; child readiness and execution lifetime are unknown; log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
+    )]
+    NotificationTimeout {
+        /// Daemon log path.
+        log_path: String,
+        /// Recent daemon log excerpt.
+        recent_log: String,
+    },
     /// Daemon did not become ready before the startup timeout.
     #[error(
         "daemon did not become ready after auto-start; log: {log_path}\ntry `bcode server run` to see startup failures in the foreground\n\n{recent_log}"
@@ -2640,6 +2651,7 @@ impl DaemonStartError {
     pub fn is_existing_daemon_race(&self) -> bool {
         match self {
             Self::Exited { recent_log, .. }
+            | Self::NotificationTimeout { recent_log, .. }
             | Self::StartTimeout { recent_log, .. }
             | Self::HealthCheckFailed { recent_log, .. } => {
                 recent_log.contains("refusing to replace live IPC socket")
@@ -3186,6 +3198,15 @@ async fn wait_for_child_notification(
     child: &mut tokio::process::Child,
     log_path: &Path,
 ) -> Result<(), DaemonStartError> {
+    wait_for_child_notification_with_timeout(endpoint, child, log_path, READINESS_TIMEOUT).await
+}
+
+async fn wait_for_child_notification_with_timeout(
+    endpoint: &IpcEndpoint,
+    child: &mut tokio::process::Child,
+    log_path: &Path,
+    timeout: Duration,
+) -> Result<(), DaemonStartError> {
     use tokio::io::AsyncReadExt as _;
 
     let started = std::time::Instant::now();
@@ -3194,7 +3215,7 @@ async fn wait_for_child_notification(
         .take()
         .ok_or_else(|| std::io::Error::other("daemon startup notification channel missing"))?;
     let mut token = [0_u8; 15];
-    let notification = tokio::time::timeout(READINESS_TIMEOUT, stdout.read_exact(&mut token));
+    let notification = tokio::time::timeout(timeout, stdout.read_exact(&mut token));
     tokio::pin!(notification);
     tokio::select! {
         status = child.wait() => {
@@ -3208,7 +3229,7 @@ async fn wait_for_child_notification(
             match result {
                 Ok(Ok(_)) if &token == b"BCODE_READY_V1\n" => {}
                 Ok(_) => return Err(std::io::Error::other("invalid or closed daemon startup notification channel").into()),
-                Err(_) => return Err(DaemonStartError::StartTimeout {
+                Err(_) => return Err(DaemonStartError::NotificationTimeout {
                     log_path: display_from_current_dir(log_path).to_string(),
                     recent_log: recent_log_excerpt(log_path),
                 }),
@@ -3478,6 +3499,53 @@ mod startup_lock_tests {
         drop(listener);
         fs::remove_file(socket_path).expect("socket cleanup");
         fs::remove_dir_all(root).expect("directory cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notification_timeout_preserves_failure_and_does_not_terminate_child() {
+        let directory = tempfile::tempdir().expect("notification directory");
+        let endpoint = IpcEndpoint::unix_socket(directory.path().join("absent.sock"));
+        let release = directory.path().join("release");
+        let late = directory.path().join("late");
+        let mut child = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                "trap '' PIPE; while [ ! -f \"$1\" ]; do sleep 0.01; done; printf late > \"$2\"; printf 'BCODE_READY_V1\\n' 2>/dev/null || :; exec sleep 30",
+                "notification-test",
+            ])
+            .arg(&release)
+            .arg(&late)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("notification child");
+        let result = wait_for_child_notification_with_timeout(
+            &endpoint,
+            &mut child,
+            &directory.path().join("daemon.log"),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(DaemonStartError::NotificationTimeout { .. })
+        ));
+        assert!(child.try_wait().expect("observe child").is_none());
+        fs::write(&release, b"release").expect("release late notification");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !late.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child continued after deadline");
+        child.kill().await.expect("stop child");
+        // A later notification cannot change the already returned failure into readiness.
+        assert!(matches!(
+            result,
+            Err(DaemonStartError::NotificationTimeout { .. })
+        ));
     }
 
     #[cfg(unix)]

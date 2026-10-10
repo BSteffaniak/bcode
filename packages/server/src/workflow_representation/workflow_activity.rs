@@ -1,5 +1,5 @@
 //! Public authority-neutral workflow inventory and local live progress adaptation.
-use super::{ServerError, ServerState, open, retained_store, unavailable};
+use super::{ServerError, ServerState, open, representation, retained_store, unavailable};
 use bcode_workflow_view_models::{
     SESSION_PROGRESS_VERSION, SessionProgressObservation, SessionProgressSnapshot,
     SessionProgressUnavailableReason, WORKFLOW_ACTIVITY_VERSION, WorkflowActivityAttempt,
@@ -383,6 +383,19 @@ fn advance_coverage(
     Ok(())
 }
 
+fn preserve_live_failure(error: ServerError) -> ServerError {
+    if matches!(
+        error,
+        ServerError::WorkflowActivitySharedVerification { .. }
+    ) {
+        error
+    } else {
+        ServerError::WorkflowActivityObservation {
+            phase: "live_adaptation",
+        }
+    }
+}
+
 /// Observe recursive workflow inventory through one retained snapshot, without ownership mutation.
 /// # Errors
 /// Rejects invalid/expired scans, stale cursors, malformed provenance and storage failures.
@@ -427,9 +440,7 @@ pub async fn page(
         attempts.push(
             observe_attempt(state, &request.run_id, attempt, &mut issues)
                 .await
-                .map_err(|_| ServerError::WorkflowActivityObservation {
-                    phase: "live_adaptation",
-                })?,
+                .map_err(preserve_live_failure)?,
         );
     }
     // Do not publish coverage for a scan evicted or expired during live adaptation.
@@ -581,6 +592,168 @@ fn stage_progress(
     }
 }
 
+/// Secret-safe causal facts; never retain database messages, paths, SQL or payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SharedVerificationOperation {
+    RetainStore,
+    OpenStore,
+    RunSummary,
+    SessionLink,
+    ExecutionNode,
+    Configuration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SharedVerificationCategory {
+    Busy,
+    Unsupported,
+    MaintenanceRequired,
+    InvalidState,
+    Unavailable,
+    DatabaseUnavailable,
+    AuthorityConflict,
+    CapacityUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SharedVerificationFailure {
+    pub operation: SharedVerificationOperation,
+    pub category: SharedVerificationCategory,
+}
+
+impl SharedVerificationFailure {
+    const fn from_storage(
+        operation: SharedVerificationOperation,
+        error: &representation::RepresentationError,
+    ) -> Self {
+        use representation::RepresentationError as Error;
+        let category = match error {
+            Error::Database(switchy_database::DatabaseError::Busy) => {
+                SharedVerificationCategory::Busy
+            }
+            Error::Database(_) => SharedVerificationCategory::DatabaseUnavailable,
+            Error::UnsupportedStore | Error::UnsupportedLifecycle => {
+                SharedVerificationCategory::Unsupported
+            }
+            Error::MaintenanceRequired => SharedVerificationCategory::MaintenanceRequired,
+            Error::InvalidAdmission => SharedVerificationCategory::InvalidState,
+            Error::AuthorityConflict => SharedVerificationCategory::AuthorityConflict,
+            Error::CapacityUnavailable => SharedVerificationCategory::CapacityUnavailable,
+        };
+        Self {
+            operation,
+            category,
+        }
+    }
+
+    pub(super) const fn into_server_error(self) -> ServerError {
+        let operation = match self.operation {
+            SharedVerificationOperation::RetainStore => "retain_store",
+            SharedVerificationOperation::OpenStore => "open_store",
+            SharedVerificationOperation::RunSummary => "run_summary",
+            SharedVerificationOperation::SessionLink => "session_link",
+            SharedVerificationOperation::ExecutionNode => "execution_node",
+            SharedVerificationOperation::Configuration => "configuration",
+        };
+        let (code, message) = match self.category {
+            SharedVerificationCategory::Busy => (
+                "workflow_activity_shared_busy",
+                "Shared-session verification storage is busy",
+            ),
+            SharedVerificationCategory::Unsupported => (
+                "workflow_activity_shared_unsupported",
+                "Shared-session verification storage or lifecycle is unsupported",
+            ),
+            SharedVerificationCategory::MaintenanceRequired => (
+                "workflow_activity_shared_maintenance_required",
+                "Shared-session verification requires explicit maintenance",
+            ),
+            SharedVerificationCategory::InvalidState => (
+                "workflow_activity_shared_invalid_state",
+                "Shared-session verification encountered invalid canonical state",
+            ),
+            SharedVerificationCategory::DatabaseUnavailable => (
+                "workflow_activity_shared_database_unavailable",
+                "Shared-session verification database is unavailable",
+            ),
+            SharedVerificationCategory::Unavailable => (
+                "workflow_activity_shared_unavailable",
+                "Shared-session verification readiness is unavailable",
+            ),
+            SharedVerificationCategory::AuthorityConflict => (
+                "workflow_activity_shared_authority_conflict",
+                "Shared-session verification authority conflicts",
+            ),
+            SharedVerificationCategory::CapacityUnavailable => (
+                "workflow_activity_shared_capacity_unavailable",
+                "Shared-session verification capacity is unavailable",
+            ),
+        };
+        ServerError::WorkflowActivitySharedVerification {
+            operation,
+            code,
+            message,
+        }
+    }
+
+    fn report(self) {
+        tracing::warn!(operation = ?self.operation, category = ?self.category,
+            "workflow shared-parent verification failed");
+    }
+}
+
+/// Verify shared-parent identity while preserving typed failure causality.
+/// No retry, ownership acquisition or compatibility fallback is performed.
+pub(super) async fn verify_shared_parent_link(
+    db: &dyn switchy_database::Database,
+    run_id: &str,
+    link: &bcode_workflow_store::WorkflowExecutionSessionLink,
+) -> Result<bool, SharedVerificationFailure> {
+    use SharedVerificationOperation as Operation;
+    let run = representation::runs::summary(db, run_id)
+        .await
+        .map_err(|error| SharedVerificationFailure::from_storage(Operation::RunSummary, &error))?
+        .ok_or(SharedVerificationFailure {
+            operation: Operation::RunSummary,
+            category: SharedVerificationCategory::InvalidState,
+        })?;
+    if link.run_id != run_id
+        || run.parent_session_id.as_deref() != Some(link.session_id.as_str())
+        || run.workspace_snapshot != link.workspace_snapshot
+    {
+        return Ok(false);
+    }
+    let canonical = representation::attempts::owner_boundary::execution_session_link(
+        db,
+        run_id,
+        &link.node_id,
+        &link.activation_id,
+        link.attempt,
+    )
+    .await
+    .map_err(|error| SharedVerificationFailure::from_storage(Operation::SessionLink, &error))?;
+    if canonical.as_ref() != Some(link) {
+        return Ok(false);
+    }
+    let node = representation::graph::execution_node(db, run_id, &link.node_id)
+        .await
+        .map_err(|error| {
+            SharedVerificationFailure::from_storage(Operation::ExecutionNode, &error)
+        })?;
+    if node.kind != bcode_workflow::NodeKind::Agent {
+        return Ok(false);
+    }
+    let configuration =
+        crate::workflow_prompt_configuration(&node.configuration).map_err(|_| {
+            SharedVerificationFailure {
+                operation: Operation::Configuration,
+                category: SharedVerificationCategory::InvalidState,
+            }
+        })?;
+    Ok(configuration.execution_target
+        == bcode_workflow::PromptContextTarget::SharedParentSequential)
+}
+
 async fn observe_linked_session(
     state: &ServerState,
     run_id: &str,
@@ -612,9 +785,28 @@ async fn observe_linked_session(
             .observes_shared_execution(id, &link)
             .await;
     let shared_verified = if shared_active {
-        let retained = super::retained_store(state).await?;
-        let db = super::open(retained.path(), false)?;
-        super::inspection::shared_parent_link(&db, run_id, &link).await?
+        let retained = super::retained_store(state).await.map_err(|_| {
+            let failure = SharedVerificationFailure {
+                operation: SharedVerificationOperation::RetainStore,
+                category: SharedVerificationCategory::Unavailable,
+            };
+            failure.report();
+            failure.into_server_error()
+        })?;
+        let db = super::open(retained.path(), false).map_err(|_| {
+            let failure = SharedVerificationFailure {
+                operation: SharedVerificationOperation::OpenStore,
+                category: SharedVerificationCategory::DatabaseUnavailable,
+            };
+            failure.report();
+            failure.into_server_error()
+        })?;
+        verify_shared_parent_link(&db, run_id, &link)
+            .await
+            .map_err(|diagnostic| {
+                diagnostic.report();
+                diagnostic.into_server_error()
+            })?
     } else {
         false
     };
@@ -640,10 +832,17 @@ async fn observe_linked_session(
     }
     Ok(
         if (provenance_verified || shared_verified) && owned && resident {
-            state.progress_observations.lock().map_or_else(
+            let snapshot = state.progress_observations.lock().map_or_else(
                 |_| unknown(link.session_id.clone()),
                 |registry| registry.snapshot(id),
-            )
+            );
+            if let SessionProgressObservation::Unavailable { reason } = &snapshot.observation {
+                issues.push(format!(
+                    "session_progress:{}:registry:{reason:?}",
+                    link.session_id
+                ));
+            }
+            snapshot
         } else {
             unknown(link.session_id)
         },

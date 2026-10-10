@@ -1,5 +1,40 @@
 use super::*;
 
+#[test]
+fn workflow_operation_failures_distinguish_busy_and_unknown_without_private_payloads() {
+    for (error, expected_code, expected_message) in [
+        (
+            ServerError::WorkflowStorageBusy,
+            "workflow_storage_busy",
+            "workflow edit storage is busy; durable work may be unchanged or pending; inspect retained state before further action",
+        ),
+        (
+            ServerError::WorkflowStorageUnavailable(
+                "SECRET_FIXTURE_MARKER /private/storage".into(),
+            ),
+            "workflow_storage_unavailable",
+            "workflow edit storage is unavailable; operation outcome unknown",
+        ),
+        (
+            ServerError::WorkflowCapabilityUnavailable(
+                "SECRET_FIXTURE_MARKER workflow_storage_busy".into(),
+            ),
+            "workflow_operation_outcome_unknown",
+            "workflow edit failed with an unclassified application error; operation outcome unknown",
+        ),
+    ] {
+        let bcode_tool::ToolInvocationServiceResolution::Failed { code, message } =
+            crate::workflow_operation_failure(&error)
+        else {
+            panic!("failure must not become success");
+        };
+        assert_eq!(code, expected_code);
+        assert_eq!(message, expected_message);
+        assert!(!message.contains("SECRET_FIXTURE_MARKER"));
+        assert!(!message.contains("/private/storage"));
+    }
+}
+
 #[tokio::test]
 async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_candidate() {
     let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
