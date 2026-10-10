@@ -124,7 +124,9 @@ mod vendored {
 
     fn build_and_link(leptonica_source: &Path, tesseract_source: &Path) {
         let leptonica_install = cmake::Config::new(leptonica_source)
+            .define("leptonica_INSTALL_CMAKE_DIR", "lib/cmake/leptonica")
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
+            .define("CMAKE_INSTALL_LIBDIR", "lib")
             .define("CMAKE_BUILD_TYPE", "Release")
             .define("BUILD_PROG", "OFF")
             .define("BUILD_SHARED_LIBS", "OFF")
@@ -145,6 +147,7 @@ mod vendored {
 
         let tesseract_install = cmake::Config::new(tesseract_source)
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
+            .define("CMAKE_INSTALL_LIBDIR", "lib")
             .define("CMAKE_BUILD_TYPE", "Release")
             .define("BUILD_SHARED_LIBS", "OFF")
             .define("BUILD_TRAINING_TOOLS", "OFF")
@@ -378,8 +381,10 @@ mod bundled {
         );
 
         let leptonica_install = cmake::Config::new(leptonica_source)
+            .define("leptonica_INSTALL_CMAKE_DIR", "lib/cmake/leptonica")
             .out_dir(out_dir().join(format!("leptonica-build-{}", tesseract.leptonica)))
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
+            .define("CMAKE_INSTALL_LIBDIR", "lib")
             .define("CMAKE_BUILD_TYPE", "Release")
             .define("BUILD_PROG", "OFF")
             .define("BUILD_SHARED_LIBS", "ON")
@@ -407,6 +412,7 @@ mod bundled {
         let tesseract_install = cmake::Config::new(tesseract_source)
             .out_dir(out_dir().join(format!("tesseract-build-{}", tesseract.version)))
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
+            .define("CMAKE_INSTALL_LIBDIR", "lib")
             .define("CMAKE_BUILD_TYPE", "Release")
             .define("BUILD_SHARED_LIBS", "ON")
             .define("BUILD_TRAINING_TOOLS", "OFF")
