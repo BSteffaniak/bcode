@@ -3701,6 +3701,11 @@ pub fn apply_config_result(
             }
             chat.app
                 .set_effective_keymap(settings.keymap.registry().clone());
+            if let Err(error) = chat.app.apply_plugin_presentation_config(&config) {
+                chat.app.set_status(format!(
+                    "plugin presentation configuration unavailable: {error}"
+                ));
+            }
             chat.app.apply_tui_config(config.tui.clone());
             if previous_interactions.placement != config.tui.interactions.placement {
                 loop_state.pinned_interaction_viewport = None;

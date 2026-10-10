@@ -35,10 +35,12 @@ serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 shuck-ast = { workspace = true, optional = true }
-shuck-formatter = { workspace = true, optional = true }
 shuck-parser = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
 url = { workspace = true }
 vte = { workspace = true }
 
@@ -48,13 +50,16 @@ bcode_session_models = { workspace = true }
 
 [features]
 default = []
+embedded-javascript = ["dep:tree-sitter", "dep:tree-sitter-javascript"]
+embedded-languages = ["embedded-python", "embedded-javascript"]
+embedded-python = ["dep:tree-sitter", "dep:tree-sitter-python"]
 fail-on-warnings = []
 static-bundled = [
+    "embedded-languages",
     "bcode_tui_components",
     "bmux_keyboard",
     "bmux_terminal_grid",
     "bmux_tui",
-    "shuck-formatter",
     "shuck-parser",
     "shuck-ast",
 ]

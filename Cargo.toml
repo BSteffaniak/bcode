@@ -450,6 +450,11 @@ tantivy = { version = "0.26.1", default-features = false, features = [
 tempfile = { version = "3.27.0", default-features = false }
 test-log = { version = "0.2.20", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
+tree-sitter = { version = "0.27.1", default-features = false, features = [
+    "std",
+] }
+tree-sitter-javascript = { version = "0.25.0", default-features = false }
+tree-sitter-python = { version = "0.25.0", default-features = false }
 # Maintenance must use the same engine artifact as Switchy's canonical session connections.
 # Intentionally pinned to the existing lockfile version rather than introducing a second engine.
 tokio = { version = "1.45.1", default-features = false }

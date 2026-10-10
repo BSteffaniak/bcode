@@ -235,6 +235,9 @@ pub enum ShellRunResult {
         rows: u16,
         #[serde(default = "default_format_commands")]
         format_commands: bool,
+        /// Effective presentation policy forwarded by execution, absent on historical results.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation_policy: Option<bcode_config::ShellOutputPresentationPolicy>,
     },
     Captured {
         exit_code: Option<i32>,
@@ -372,12 +375,26 @@ mod tests {
             columns: 80,
             rows: 24,
             format_commands: true,
+            presentation_policy: Some(bcode_config::ShellOutputPresentationPolicy::default()),
         };
-        let payload = serde_json::to_value(&result).expect("encode shell result");
+        let mut payload = serde_json::to_value(&result).expect("encode shell result");
         assert_eq!(payload["mode"], "terminal");
         assert_eq!(
-            serde_json::from_value::<ShellRunResult>(payload).expect("decode shell result"),
+            serde_json::from_value::<ShellRunResult>(payload.clone()).expect("decode shell result"),
             result
         );
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("presentation_policy");
+        assert!(matches!(
+            serde_json::from_value::<ShellRunResult>(payload.clone()).unwrap(),
+            ShellRunResult::Terminal {
+                presentation_policy: None,
+                ..
+            }
+        ));
+        payload["presentation_policy"] = serde_json::json!({"version": 2});
+        assert!(serde_json::from_value::<ShellRunResult>(payload).is_err());
     }
 }

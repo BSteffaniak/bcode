@@ -374,6 +374,8 @@ pub struct PluginTuiPresentation {
     backend: PresentationPluginBackend,
     visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
     registry_factories: BTreeMap<String, bcode_plugin_sdk::tui::PluginTuiRegistryFactory>,
+    configuration_failures: Mutex<BTreeSet<String>>,
+    configuration: Mutex<bcode_plugin_sdk::tui::PluginTuiPresentationConfiguration>,
     registries: Mutex<BTreeMap<String, Arc<PluginTuiRegistry>>>,
     visual_revisions: Mutex<BTreeMap<String, u64>>,
     artifact_delivery_failures: Mutex<BTreeSet<String>>,
@@ -458,6 +460,10 @@ impl PluginTuiPresentation {
             backend,
             visual_adapter_config,
             registry_factories,
+            configuration_failures: Mutex::new(BTreeSet::new()),
+            configuration: Mutex::new(
+                bcode_plugin_sdk::tui::PluginTuiPresentationConfiguration::default(),
+            ),
             registries: Mutex::new(BTreeMap::new()),
             visual_revisions: Mutex::new(BTreeMap::new()),
             artifact_delivery_failures: Mutex::new(BTreeSet::new()),
@@ -663,14 +669,62 @@ impl PluginTuiPresentation {
         }
     }
 
+    /// Deliver secret-free host configuration without replacing retained registries or replay state.
+    ///
+    /// # Errors
+    /// Rejects invalid envelopes, unavailable local state, or adapter rejection. An adapter error
+    /// invalidates layout and disables only rejected plugin registries until a valid retry.
+    pub fn configure(
+        &self,
+        configuration: bcode_plugin_sdk::tui::PluginTuiPresentationConfiguration,
+    ) -> Result<bool, String> {
+        configuration.validate()?;
+        let mut current = self
+            .configuration
+            .lock()
+            .map_err(|_| "presentation configuration unavailable".to_owned())?;
+        let mut failures = self
+            .configuration_failures
+            .lock()
+            .map_err(|_| "presentation configuration status unavailable".to_owned())?;
+        if *current == configuration && failures.is_empty() {
+            return Ok(false);
+        }
+        let registries = self
+            .registries
+            .lock()
+            .map_err(|_| "presentation registries unavailable".to_owned())?;
+        self.full_generation.fetch_add(1, Ordering::Relaxed);
+        self.visual_generation.fetch_add(1, Ordering::Relaxed);
+        failures.clear();
+        for (plugin_id, registry) in &*registries {
+            if registry.configure(&configuration).is_err() {
+                failures.insert(plugin_id.clone());
+            }
+        }
+        drop(registries);
+        *current = configuration;
+        drop(current);
+        if failures.is_empty() {
+            Ok(true)
+        } else {
+            Err("visual adapter rejected presentation configuration".to_owned())
+        }
+    }
+
     /// Return one retained native TUI registry.
     #[must_use]
     pub fn registry(&self, plugin_id: &str) -> Option<Arc<PluginTuiRegistry>> {
+        let configuration = self.configuration.lock().ok()?;
+        if self.configuration_failures.lock().ok()?.contains(plugin_id) {
+            return None;
+        }
         let mut registries = self.registries.lock().ok()?;
         if let Some(registry) = registries.get(plugin_id).cloned() {
             return Some(registry);
         }
         let registry = Arc::new((self.registry_factories.get(plugin_id)?)());
+        registry.configure(&configuration).ok()?;
         registries.insert(plugin_id.to_owned(), Arc::clone(&registry));
         drop(registries);
         Some(registry)
@@ -2214,6 +2268,143 @@ library = "libdynamic_visual_test.dylib"
             dynamic_test_visual(&presentation, "call-other").expect("unaffected cached visual");
         drop(presentation);
         assert_eq!(routed_text(&unchanged), "dynamic:success:artifact-0");
+    }
+
+    #[test]
+    fn lazy_registry_receives_current_configuration_before_first_use() {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiPresentationConfiguration, PluginTuiVisualAdapter,
+            PluginTuiVisualRenderContext,
+        };
+        struct ConfiguredAdapter(std::sync::atomic::AtomicBool);
+        impl PluginTuiVisualAdapter for ConfiguredAdapter {
+            fn supports(&self, _kind: &str) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+            fn rows(
+                &self,
+                _kind: &str,
+                _payload: &serde_json::Value,
+                _context: &PluginTuiVisualRenderContext,
+            ) -> Vec<Line> {
+                Vec::new()
+            }
+            fn configure(
+                &self,
+                configuration: &PluginTuiPresentationConfiguration,
+            ) -> Result<(), String> {
+                self.0.store(
+                    configuration.config["enabled"].as_bool().unwrap_or(false),
+                    Ordering::Relaxed,
+                );
+                Ok(())
+            }
+        }
+        fn factory() -> PluginTuiRegistry {
+            let mut registry = PluginTuiRegistry::default();
+            registry.register_visual_adapter(
+                ["configured"],
+                Box::new(ConfiguredAdapter(std::sync::atomic::AtomicBool::new(false))),
+            );
+            registry
+        }
+        let mut presentation = test_presentation();
+        presentation
+            .registry_factories
+            .insert("lazy-test".to_owned(), factory);
+        presentation
+            .configure(PluginTuiPresentationConfiguration {
+                version: 1,
+                config: serde_json::json!({"enabled": true}),
+            })
+            .unwrap();
+        let registry = presentation.registry("lazy-test").unwrap();
+        assert!(registry.supports_visual_adapter("configured", "test"));
+        assert!(Arc::ptr_eq(
+            &registry,
+            &presentation.registry("lazy-test").unwrap()
+        ));
+        drop(presentation);
+    }
+
+    #[test]
+    fn presentation_configuration_updates_retained_registry_and_invalidates_once() {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiPresentationConfiguration, PluginTuiVisualAdapter,
+            PluginTuiVisualRenderContext,
+        };
+        struct ConfigAdapter(Arc<Mutex<Vec<serde_json::Value>>>);
+        impl PluginTuiVisualAdapter for ConfigAdapter {
+            fn supports(&self, _kind: &str) -> bool {
+                true
+            }
+            fn rows(
+                &self,
+                _kind: &str,
+                _payload: &serde_json::Value,
+                _context: &PluginTuiVisualRenderContext,
+            ) -> Vec<bmux_tui::prelude::Line> {
+                Vec::new()
+            }
+            fn configure(
+                &self,
+                configuration: &PluginTuiPresentationConfiguration,
+            ) -> Result<(), String> {
+                if configuration.config.get("reject").is_some() {
+                    return Err("private diagnostic".to_owned());
+                }
+                self.0.lock().unwrap().push(configuration.config.clone());
+                Ok(())
+            }
+        }
+        let presentation = test_presentation();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = PluginTuiRegistry::default();
+        registry.register_visual_adapter(["test"], Box::new(ConfigAdapter(Arc::clone(&calls))));
+        presentation.install_registry_for_test("test", registry);
+        presentation.install_registry_for_test("unrelated", PluginTuiRegistry::default());
+        let retained = presentation.registry("test").unwrap();
+        let revision = presentation.revision();
+        let configuration = PluginTuiPresentationConfiguration {
+            version: 1,
+            config: serde_json::json!({"enabled": false}),
+        };
+        assert!(presentation.configure(configuration.clone()).unwrap());
+        assert_eq!(presentation.revision(), revision + 1);
+        assert!(!presentation.configure(configuration).unwrap());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(Arc::ptr_eq(
+            &retained,
+            &presentation.registry("test").unwrap()
+        ));
+        assert!(
+            presentation
+                .configure(PluginTuiPresentationConfiguration {
+                    version: 2,
+                    config: serde_json::json!({})
+                })
+                .is_err()
+        );
+        assert_eq!(presentation.revision(), revision + 1);
+        let error = presentation
+            .configure(PluginTuiPresentationConfiguration {
+                version: 1,
+                config: serde_json::json!({"reject": true}),
+            })
+            .unwrap_err();
+        assert!(!error.contains("private diagnostic"));
+        assert!(presentation.registry("test").is_none());
+        assert!(presentation.registry("unrelated").is_some());
+        assert!(
+            presentation
+                .configure(PluginTuiPresentationConfiguration::default())
+                .unwrap()
+        );
+        assert!(Arc::ptr_eq(
+            &retained,
+            &presentation.registry("test").unwrap()
+        ));
+        drop(presentation);
     }
 
     #[derive(Default)]

@@ -2071,6 +2071,35 @@ impl BmuxApp {
         self.session_view.set_session_summary(summary.clone());
     }
 
+    /// Deliver approved, secret-free plugin presentation fields from the resolved app config.
+    /// This does not mutate configuration or execution policy.
+    ///
+    /// # Errors
+    /// Returns a normalized error if the configuration cannot be encoded or an adapter rejects it.
+    pub fn apply_plugin_presentation_config(
+        &mut self,
+        config: &bcode_config::BcodeConfig,
+    ) -> Result<bool, String> {
+        let output = bcode_config::ShellToolOutputConfig {
+            format_commands: config.tools.shell.output.format_commands,
+            presentation: config.tools.shell.output.presentation.clone(),
+            ..bcode_config::ShellToolOutputConfig::default()
+        };
+        let configuration = bcode_plugin_sdk::tui::PluginTuiPresentationConfiguration {
+            version: 1,
+            config: serde_json::json!({"shell": {"output": output}}),
+        };
+        let Some(presentation) = self.plugin_presentation.as_ref() else {
+            return Ok(false);
+        };
+        let result = presentation.configure(configuration);
+        if !matches!(result, Ok(false)) {
+            self.elapsed_layout_revision = self.elapsed_layout_revision.saturating_add(1);
+            self.transcript_layout = TranscriptLayoutCache::default();
+        }
+        result
+    }
+
     /// Apply terminal UI configuration.
     pub fn apply_tui_config(&mut self, config: TuiConfig) {
         let markdown_changed = self.tui_config.markdown != config.markdown;
@@ -6362,6 +6391,75 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_policy_delivery_is_secret_safe_and_reload_invalidates_once() {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiPresentationConfiguration, PluginTuiRegistry, PluginTuiVisualAdapter,
+            PluginTuiVisualRenderContext,
+        };
+        use std::sync::{Arc, Mutex};
+        struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
+        impl PluginTuiVisualAdapter for Capture {
+            fn supports(&self, _kind: &str) -> bool {
+                true
+            }
+            fn rows(
+                &self,
+                _kind: &str,
+                _payload: &serde_json::Value,
+                _context: &PluginTuiVisualRenderContext,
+            ) -> Vec<bmux_tui::prelude::Line> {
+                Vec::new()
+            }
+            fn configure(
+                &self,
+                configuration: &PluginTuiPresentationConfiguration,
+            ) -> Result<(), String> {
+                self.0.lock().unwrap().push(configuration.config.clone());
+                Ok(())
+            }
+        }
+        let host = bcode_plugin::PluginHost::load_static_plugins(&[]).unwrap();
+        let presentation = Arc::new(crate::plugin_tui::PluginTuiPresentation::new(host));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = PluginTuiRegistry::default();
+        registry.register_visual_adapter(["test"], Box::new(Capture(Arc::clone(&calls))));
+        presentation.install_registry_for_test("test", registry);
+        let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_plugin_presentation(Arc::clone(&presentation));
+        drop(presentation);
+        let mut config = bcode_config::BcodeConfig::default();
+        config
+            .tools
+            .shell
+            .output
+            .prelude_gates
+            .push(bcode_config::ShellToolPreludeGateConfig {
+                marker: "private-marker".to_owned(),
+                ..bcode_config::ShellToolPreludeGateConfig::default()
+            });
+        let before = app.elapsed_layout_revision();
+        assert!(app.apply_plugin_presentation_config(&config).unwrap());
+        assert_eq!(app.elapsed_layout_revision(), before + 1);
+        assert!(!app.apply_plugin_presentation_config(&config).unwrap());
+        let payload = calls.lock().unwrap()[0].clone();
+        assert!(!payload.to_string().contains("private-marker"));
+        assert_eq!(payload.as_object().unwrap().len(), 1);
+        assert!(payload["shell"].get("env").is_none());
+        config.tools.shell.output.presentation.python = false;
+        assert!(app.apply_plugin_presentation_config(&config).unwrap());
+        assert_eq!(app.elapsed_layout_revision(), before + 2);
+        drop(app);
+        let updated = calls.lock().unwrap()[1].clone();
+        let output: bcode_config::ShellToolOutputConfig =
+            serde_json::from_value(updated["shell"]["output"].clone()).unwrap();
+        assert!(!output.presentation.python);
+        assert_eq!(
+            output.format_commands,
+            config.tools.shell.output.format_commands
+        );
+    }
+
     #[test]
     fn older_item_becoming_tail_cannot_supersede_assistant_hold() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);

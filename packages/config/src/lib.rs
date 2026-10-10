@@ -23,6 +23,10 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
 pub const BCODE_CONFIG_ENV: &str = "BCODE_CONFIG";
 /// Environment variable containing raw TOML config overlay data.
 pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
+pub mod shell_presentation;
+pub use shell_presentation::{
+    SHELL_OUTPUT_PRESENTATION_POLICY_VERSION, ShellOutputPresentationPolicy,
+};
 pub mod contexts;
 pub mod edit;
 pub mod judgement;
@@ -3343,6 +3347,10 @@ pub struct ShellToolOutputConfig {
     /// Whether shell commands are formatted for display in the terminal UI.
     #[serde(default = "default_shell_format_commands")]
     pub format_commands: bool,
+    /// Renderer-neutral shell source presentation policy.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub presentation: ShellOutputPresentationPolicy,
     /// Passive output prelude gates that suppress output before a marker appears.
     #[config_doc(skip)]
     #[serde(default)]
@@ -3353,8 +3361,23 @@ impl Default for ShellToolOutputConfig {
     fn default() -> Self {
         Self {
             format_commands: default_shell_format_commands(),
+            presentation: ShellOutputPresentationPolicy::default(),
             prelude_gates: Vec::new(),
         }
+    }
+}
+
+impl ShellToolOutputConfig {
+    /// Resolve presentation once using the existing per-invocation command-format override.
+    /// The explicit presentation master remains an opt-out even when formatting is requested.
+    #[must_use]
+    pub fn resolve_presentation_policy(
+        &self,
+        format_commands: Option<bool>,
+    ) -> ShellOutputPresentationPolicy {
+        let mut policy = self.presentation.clone();
+        policy.enabled &= format_commands.unwrap_or(self.format_commands);
+        policy
     }
 }
 

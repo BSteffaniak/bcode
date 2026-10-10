@@ -2842,6 +2842,70 @@ mod tests {
     }
 
     #[test]
+    fn nested_command_drafts_reflow_without_losing_lifecycle_identity() {
+        let session_id = SessionId::new();
+        let command = "bash -c 'if true;then python -c \"print(123); print(456)\"; node -e \"console.log(789)\";fi'";
+        let arguments = serde_json::json!({"command": command, "cwd": "/tmp/project"}).to_string();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 50)
+            .with_plugin_host(Arc::new(shell_plugin_host()))
+            .run([
+                shell_streamed_draft_step(
+                    session_id,
+                    1,
+                    1,
+                    r#"{"command":"bash -c 'if true;then python -c \"print(123)"#,
+                ),
+                shell_streamed_draft_step(session_id, 1, 2, &arguments),
+                TranscriptFrameStep {
+                    label: "narrow-nested",
+                    input: TranscriptFrameInput::Resize(32, 50),
+                },
+                TranscriptFrameStep {
+                    label: "idle-nested",
+                    input: TranscriptFrameInput::Observe,
+                },
+                TranscriptFrameStep {
+                    label: "final-nested",
+                    input: durable_input(durable(
+                        session_id,
+                        1,
+                        SessionEventKind::ToolCallRequested {
+                            tool_call_id: "call-long-shell".to_owned(),
+                            producer_plugin_id: Some("bcode.shell".to_owned()),
+                            tool_name: "shell.run".to_owned(),
+                            arguments_json: arguments,
+                            working_directory: Some(std::path::PathBuf::from("/tmp/project")),
+                        },
+                    )),
+                },
+                TranscriptFrameStep {
+                    label: "wide-nested",
+                    input: TranscriptFrameInput::Resize(100, 50),
+                },
+            ]);
+        assert_eq!(frames.len(), 6);
+        for frame in &frames {
+            assert_eq!(frame.observation.semantic_items.len(), 1, "{}", frame.text);
+            assert_eq!(frame.observation.terminal_items.len(), 1, "{}", frame.text);
+            assert!(!frame.text.contains("{\"command\""), "{}", frame.text);
+            assert!(!frame.text.contains("Tool · shell.run"), "{}", frame.text);
+        }
+        for index in [1, 2, 3, 4, 5] {
+            assert!(frames[index].text.contains("123"), "{}", frames[index].text);
+            assert!(frames[index].text.contains("789"), "{}", frames[index].text);
+        }
+        assert_eq!(frames[2].text, frames[3].text);
+        assert!(!frames[4].text.contains("assembling"), "{}", frames[4].text);
+        let identity = &frames[0].observation.semantic_items[0].0;
+        assert!(
+            frames
+                .iter()
+                .all(|frame| &frame.observation.semantic_items[0].0 == identity)
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Every user-visible shell lifecycle frame is asserted.
     fn shell_draft_request_live_and_result_keep_one_adapter_owned_identity() {
         let session_id = SessionId::new();

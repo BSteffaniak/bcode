@@ -4,9 +4,7 @@
 //! that may interpret shell artifact schemas and terminal recording references; generic TUI and
 //! transcript code routes opaque plugin visuals without understanding those values.
 
-mod beautify;
 mod command;
-mod formatter;
 mod partial_json;
 
 pub(super) fn register_keymap(registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry) {
@@ -150,6 +148,8 @@ struct LiveArtifactReplay {
 /// Native TUI visual adapter for shell run artifacts.
 #[derive(Default)]
 pub struct ShellRunTuiVisualAdapter {
+    presentation_state: command::PresentationState,
+    output_config: Mutex<bcode_config::ShellToolOutputConfig>,
     live_states: Mutex<BTreeMap<String, TerminalViewerLiveState>>,
     live_replays: Mutex<BTreeMap<String, LiveTerminalReplay>>,
     artifact_replays: Mutex<BTreeMap<String, LiveArtifactReplay>>,
@@ -157,6 +157,32 @@ pub struct ShellRunTuiVisualAdapter {
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
+    fn configure(
+        &self,
+        configuration: &bcode_plugin_sdk::tui::PluginTuiPresentationConfiguration,
+    ) -> Result<(), String> {
+        configuration.validate()?;
+        let config = configuration
+            .config
+            .get("shell")
+            .and_then(|shell| shell.get("output"))
+            .map_or_else(
+                || Ok(bcode_config::ShellToolOutputConfig::default()),
+                |output| {
+                    serde_json::from_value(output.clone())
+                        .map_err(|_| "invalid shell output presentation configuration".to_owned())
+                },
+            )?;
+        let mut current = self
+            .output_config
+            .lock()
+            .map_err(|_| "shell presentation configuration is unavailable".to_owned())?;
+        *current = config;
+        drop(current);
+        self.presentation_state.invalidate();
+        Ok(())
+    }
+
     fn supports(&self, kind: &str) -> bool {
         matches!(kind, SHELL_RUN_SCHEMA | "bcode.tool.request.shell.run")
     }
@@ -540,7 +566,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         if payload.get("preview").is_some() {
             return Vec::new();
         }
-        let row = shell_terminal_prompt_rows(payload, context.width(), context).len();
+        let row = self.command_projection(payload, context).rows.len();
         if let Some(key) = payload
             .get("_bcode_runtime")
             .and_then(|runtime| runtime.get("live_state_key"))
@@ -560,7 +586,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                             key.len(),
                             key,
                             row.saturating_sub(
-                                shell_terminal_prompt_rows(payload, context.width(), context).len()
+                                self.command_projection(payload, context).rows.len()
                             )
                             .saturating_sub(usize::from(
                                 replay.cancelled
@@ -656,7 +682,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
     ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
         ACTIVE_THEME.with(|theme| theme.set(context.theme()));
         let mut projection = bcode_plugin_sdk::tui::PluginTuiVisualProjection::default();
-        let command = shell_command_projection(payload, context);
+        let command = self.command_projection(payload, context);
         projection.rows =
             self.rows_with_active_theme(kind, payload, context, &command.rows, &mut projection);
         let body_start = command.rows.len();
@@ -689,6 +715,34 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
 }
 
 impl ShellRunTuiVisualAdapter {
+    /// Construct the native adapter using the same command presentation defaults as execution.
+    #[must_use]
+    pub fn new(config: bcode_config::ShellToolOutputConfig) -> Self {
+        Self {
+            output_config: Mutex::new(config),
+            ..Self::default()
+        }
+    }
+
+    /// Update renderer-local policy defaults without changing declarative configuration.
+    pub fn configure(&self, config: bcode_config::ShellToolOutputConfig) {
+        if let Ok(mut current) = self.output_config.lock() {
+            *current = config;
+            self.presentation_state.invalidate();
+        }
+    }
+
+    fn command_projection(
+        &self,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+        let Ok(config) = self.output_config.lock() else {
+            return bcode_plugin_sdk::tui::PluginTuiVisualProjection::default();
+        };
+        shell_command_projection_with_state(payload, context, &config, &self.presentation_state)
+    }
+
     fn rows_with_active_theme(
         &self,
         kind: &str,
@@ -1261,6 +1315,7 @@ fn partial_json_string(input: &str, key: &str) -> Option<String> {
     partial_json::string_field(input, key)
 }
 
+#[cfg(test)]
 fn shell_terminal_prompt_rows(
     payload: &serde_json::Value,
     width: u16,
@@ -1279,9 +1334,37 @@ fn shell_terminal_prompt_rows(
     command::project(command, cwd, format_commands, width, context).rows
 }
 
+#[cfg(test)]
 fn shell_command_projection(
     payload: &serde_json::Value,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+    shell_command_projection_with_config(
+        payload,
+        context,
+        &bcode_config::ShellToolOutputConfig::default(),
+    )
+}
+
+#[cfg(test)]
+fn shell_command_projection_with_config(
+    payload: &serde_json::Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    config: &bcode_config::ShellToolOutputConfig,
+) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+    shell_command_projection_with_state(
+        payload,
+        context,
+        config,
+        &command::PresentationState::default(),
+    )
+}
+
+fn shell_command_projection_with_state(
+    payload: &serde_json::Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    config: &bcode_config::ShellToolOutputConfig,
+    state: &command::PresentationState,
 ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
     let draft = payload.get("preview").and_then(serde_json::Value::as_str);
     let arguments = payload.get("arguments").unwrap_or(payload);
@@ -1305,17 +1388,33 @@ fn shell_command_projection(
         },
         |preview| partial_json_string(preview, "cwd"),
     );
-    let format = draft
-        .map_or_else(
-            || {
-                arguments
-                    .get("format_commands")
-                    .and_then(serde_json::Value::as_bool)
-            },
-            |preview| partial_json::bool_field(preview, "format_commands"),
-        )
-        .unwrap_or(true);
-    command::project(&source, cwd.as_deref(), format, context.width(), context)
+    let format = draft.map_or_else(
+        || {
+            arguments
+                .get("format_commands")
+                .and_then(serde_json::Value::as_bool)
+        },
+        |preview| partial_json::bool_field(preview, "format_commands"),
+    );
+    // Unknown persisted policy versions must not silently acquire current defaults.
+    let policy = arguments.get("presentation_policy").map_or_else(
+        || config.resolve_presentation_policy(format),
+        |value| {
+            serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+                let mut policy = config.resolve_presentation_policy(Some(false));
+                policy.enabled = false;
+                policy
+            })
+        },
+    );
+    command::project_with_state(
+        &source,
+        cwd.as_deref(),
+        &policy,
+        context.width(),
+        context,
+        state,
+    )
 }
 
 fn prompt_spans(
@@ -1333,62 +1432,6 @@ fn prompt_spans(
         spans.push(Span::styled("❯ ", prompt_style()));
     }
     spans
-}
-
-fn format_shell_command_for_display(command: &str) -> String {
-    formatter::display(command)
-}
-
-fn shell_command_spans(command: &str) -> Vec<Span> {
-    // Styling partitions source without rewriting any bytes. Quotes and escaped whitespace
-    // remain in their original token, including incomplete quoted streamed arguments.
-    let mut spans = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut whitespace = command.chars().next().is_some_and(char::is_whitespace);
-    let mut first = true;
-    for (offset, character) in command.char_indices() {
-        if !escaped && quote.is_none() && character.is_whitespace() != whitespace {
-            push_shell_span(&mut spans, &command[start..offset], whitespace, &mut first);
-            start = offset;
-            whitespace = character.is_whitespace();
-        }
-        if escaped {
-            escaped = false;
-        } else if character == '\\' && quote != Some('\'') {
-            escaped = true;
-        } else if quote == Some(character) {
-            quote = None;
-        } else if quote.is_none() && matches!(character, '\'' | '"') {
-            quote = Some(character);
-        }
-    }
-    push_shell_span(&mut spans, &command[start..], whitespace, &mut first);
-    spans
-}
-
-fn push_shell_span(spans: &mut Vec<Span>, token: &str, whitespace: bool, first: &mut bool) {
-    if token.is_empty() {
-        return;
-    }
-    let style = if whitespace {
-        argument_style()
-    } else if *first {
-        command_style()
-    } else if token.starts_with('-') {
-        flag_style()
-    } else if token.starts_with(['\'', '"']) {
-        string_style()
-    } else if matches!(token, "|" | "&&" | "||" | ";" | ">" | ">>" | "<") {
-        operator_style()
-    } else {
-        argument_style()
-    };
-    spans.push(Span::styled(token.to_owned(), style));
-    if !whitespace {
-        *first = false;
-    }
 }
 
 fn theme_style(
@@ -3495,7 +3538,7 @@ mod tests {
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
             &ShellRunTuiVisualAdapter::default(),
             "bcode.tool.request.shell.run",
-            &serde_json::json!({"command": "echo --flag 'hello' && pwd", "cwd": "/tmp"}),
+            &serde_json::json!({"command": "if true;then echo 'hello' && pwd;fi", "cwd": "/tmp"}),
             &context,
         );
         let spans = rows.iter().flat_map(|line| &line.spans).collect::<Vec<_>>();
@@ -3508,7 +3551,7 @@ mod tests {
         assert!(
             spans
                 .iter()
-                .any(|span| span.content.contains("--flag") && span.style.fg == Some(Color::Blue))
+                .any(|span| span.content.contains("if") && span.style.fg == Some(Color::Blue))
         );
         assert!(
             spans
@@ -3519,6 +3562,90 @@ mod tests {
             spans
                 .iter()
                 .any(|span| span.content.contains("❯") && span.style.fg == Some(Color::Magenta))
+        );
+    }
+
+    #[test]
+    fn host_configuration_is_validated_before_replacing_adapter_defaults() {
+        use bcode_plugin_sdk::tui::{PluginTuiPresentationConfiguration, PluginTuiVisualAdapter};
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let command = "if true;then echo exact;fi";
+        let payload = serde_json::json!({"command": command});
+        let configuration = PluginTuiPresentationConfiguration {
+            version: 1,
+            config: serde_json::json!({"shell": {"output": {"format_commands": false}}}),
+        };
+        PluginTuiVisualAdapter::configure(&adapter, &configuration).unwrap();
+        assert!(
+            adapter
+                .projection("bcode.tool.request.shell.run", &payload, &context)
+                .rows[0]
+                .plain_text()
+                .contains(command)
+        );
+        for invalid in [
+            PluginTuiPresentationConfiguration {
+                version: 2,
+                config: serde_json::json!({}),
+            },
+            PluginTuiPresentationConfiguration {
+                version: 1,
+                config: serde_json::json!({"shell": {"output": {"presentation": {"version": 99}}}}),
+            },
+        ] {
+            assert!(PluginTuiVisualAdapter::configure(&adapter, &invalid).is_err());
+            assert!(
+                adapter
+                    .projection("bcode.tool.request.shell.run", &payload, &context)
+                    .rows[0]
+                    .plain_text()
+                    .contains(command)
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_config_and_frozen_policy_agree_across_lifecycle() {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
+        let command = "if true;then echo exact;fi";
+        let config = bcode_config::ShellToolOutputConfig {
+            format_commands: false,
+            ..Default::default()
+        };
+        let adapter = ShellRunTuiVisualAdapter::new(config.clone());
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let request = serde_json::json!({"command": command});
+        let draft = serde_json::json!({"preview": request.to_string()});
+        let frozen = serde_json::json!({
+            "command": command, "presentation_policy": config.resolve_presentation_policy(None),
+        });
+        let projections = [
+            adapter.projection("bcode.tool.request.shell.run", &draft, &context),
+            adapter.projection("bcode.tool.request.shell.run", &request, &context),
+            adapter.projection(SHELL_RUN_SCHEMA, &frozen, &context),
+        ];
+        for projection in &projections {
+            assert_eq!(command::declared_copy(projection), command);
+            assert!(projection.rows[0].plain_text().contains(command));
+        }
+        adapter.configure(bcode_config::ShellToolOutputConfig::default());
+        let final_projection = adapter.projection(SHELL_RUN_SCHEMA, &frozen, &context);
+        assert!(final_projection.rows[0].plain_text().contains(command));
+        let future =
+            serde_json::json!({"command": command, "presentation_policy": {"version": 99}});
+        assert!(
+            adapter.projection(SHELL_RUN_SCHEMA, &future, &context).rows[0]
+                .plain_text()
+                .contains(command)
         );
     }
 
@@ -3540,13 +3667,15 @@ mod tests {
         );
         let copied = command::declared_copy(&projection);
         assert!(projection.rows.iter().all(|row| row.width() <= 64));
-        assert_eq!(
-            copied,
-            format_shell_command_for_display(payload["command"].as_str().unwrap())
-        );
-        assert!(copied.contains("then\n  echo"), "{copied}");
-        assert!(copied.contains("\nelse\n  echo"), "{copied}");
-        assert!(!copied.contains(";then"), "{copied}");
+        assert_eq!(copied, payload["command"].as_str().unwrap());
+        let display = projection
+            .rows
+            .iter()
+            .map(Line::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(display.contains("then\n"), "{display}");
+        assert!(display.contains("\nelse"), "{display}");
     }
 
     #[test]

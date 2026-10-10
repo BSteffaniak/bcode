@@ -1664,8 +1664,66 @@ pub struct PluginTuiVisualProjection {
     pub selection: Vec<(usize, PluginTuiSelectionRow)>,
 }
 
+/// Versioned generic presentation configuration delivered by the host.
+///
+/// The host includes only explicitly approved, secret-free presentation fields. Plugins own
+/// interpretation of `config`; this envelope never authorizes execution or changes permission facts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginTuiPresentationConfiguration {
+    /// Independently evolving envelope version. Only v1 is currently supported.
+    pub version: u32,
+    /// Plugin-owned presentation configuration, an object bounded to 64 KiB serialized JSON.
+    pub config: serde_json::Value,
+}
+
+impl Default for PluginTuiPresentationConfiguration {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            config: serde_json::json!({}),
+        }
+    }
+}
+
+impl PluginTuiPresentationConfiguration {
+    /// Validate compatibility and bounded payload size before invoking plugin code.
+    ///
+    /// # Errors
+    /// Rejects unsupported versions, non-object payloads, or payloads exceeding 64 KiB.
+    pub fn validate(&self) -> Result<(), String> {
+        struct BudgetWriter(usize);
+        impl std::io::Write for BudgetWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+                    std::io::Error::other("presentation configuration exceeds budget")
+                })?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        if self.version != 1 || !self.config.is_object() {
+            return Err("unsupported presentation configuration envelope".to_owned());
+        }
+        serde_json::to_writer(BudgetWriter(64 * 1024), &self.config)
+            .map_err(|_| "presentation configuration exceeds budget".to_owned())?;
+        Ok(())
+    }
+}
+
 /// Native Rust plugin artifact/view renderer for inline transcript content.
 pub trait PluginTuiVisualAdapter: Send + Sync {
+    /// Apply host-delivered presentation configuration to retained renderer-local state.
+    /// Older adapters retain their defaults. Execution and permissions are unaffected.
+    ///
+    /// # Errors
+    /// Returns an error when plugin-owned configuration is unsupported or invalid.
+    fn configure(&self, configuration: &PluginTuiPresentationConfiguration) -> Result<(), String> {
+        configuration.validate()
+    }
+
     /// Return whether this adapter can render the artifact/view kind.
     fn supports(&self, kind: &str) -> bool;
 
@@ -2745,6 +2803,24 @@ impl std::fmt::Debug for PluginTuiRegistry {
 }
 
 impl PluginTuiRegistry {
+    /// Deliver bounded generic presentation configuration to every retained visual adapter.
+    ///
+    /// # Errors
+    /// Rejects unsupported envelopes before dispatch, or reports secret-safe adapter rejection.
+    /// Earlier adapters may have accepted a valid envelope before a later adapter rejects it.
+    pub fn configure(
+        &self,
+        configuration: &PluginTuiPresentationConfiguration,
+    ) -> Result<(), String> {
+        configuration.validate()?;
+        for adapter in self.visual_adapters.values() {
+            adapter
+                .configure(configuration)
+                .map_err(|_| "visual adapter rejected presentation configuration".to_owned())?;
+        }
+        Ok(())
+    }
+
     /// Contribute an action definition to the frontend's effective keymap.
     pub fn register_keymap_action(&mut self, action: keymap::KeymapAction) {
         self.keymap_actions.push(action);
@@ -3183,6 +3259,68 @@ impl PluginTuiHost for TokioPluginTuiHost {
         self.text_input
             .as_ref()
             .is_some_and(|resolver| resolver.submits(stroke))
+    }
+}
+
+#[cfg(test)]
+mod presentation_configuration_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Adapter(Arc<AtomicUsize>);
+    impl PluginTuiVisualAdapter for Adapter {
+        fn supports(&self, _kind: &str) -> bool {
+            true
+        }
+        fn rows(
+            &self,
+            _kind: &str,
+            _payload: &serde_json::Value,
+            _context: &PluginTuiVisualRenderContext,
+        ) -> Vec<Line> {
+            Vec::new()
+        }
+        fn configure(
+            &self,
+            _configuration: &PluginTuiPresentationConfiguration,
+        ) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn defaults_and_compatibility_are_validated_before_adapter_dispatch() {
+        let configuration = PluginTuiPresentationConfiguration::default();
+        assert!(configuration.validate().is_ok());
+        assert!(
+            serde_json::from_value::<PluginTuiPresentationConfiguration>(
+                serde_json::json!({"version": 1, "config": {}, "future": true})
+            )
+            .is_err()
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = PluginTuiRegistry::default();
+        registry.register_visual_adapter(["test"], Box::new(Adapter(Arc::clone(&calls))));
+        registry.configure(&configuration).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        for configuration in [
+            PluginTuiPresentationConfiguration {
+                version: 2,
+                config: serde_json::json!({}),
+            },
+            PluginTuiPresentationConfiguration {
+                version: 1,
+                config: serde_json::Value::Null,
+            },
+            PluginTuiPresentationConfiguration {
+                version: 1,
+                config: serde_json::json!({"text": "x".repeat(65536)}),
+            },
+        ] {
+            assert!(registry.configure(&configuration).is_err());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }
 

@@ -1,13 +1,89 @@
-//! One measured command presentation for draft, request, live and result cards.
+//! One measured, source-backed command presentation for every lifecycle state.
 
-use super::{format_shell_command_for_display, prompt_spans, prompt_style, shell_command_spans};
-#[cfg(test)]
-use super::{partial_json_string, shell_command_projection};
+use super::{
+    argument_style, command_style, flag_style, muted_style, operator_style, prompt_spans,
+    prompt_style, string_style,
+};
+use crate::presentation::document::{Document, Provenance, Role, SourceOrigin};
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextBlock;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::text::{Text, TextWrap};
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
+/// One retained semantic document; rendering geometry remains BMUX-owned and width-specific.
+#[derive(Default)]
+pub(super) struct PresentationState {
+    state: Mutex<AcceptedDocument>,
+}
+
+#[derive(Default)]
+struct AcceptedDocument {
+    generation: u64,
+    accepted: Option<(bcode_config::ShellOutputPresentationPolicy, Arc<Document>)>,
+}
+
+impl PresentationState {
+    pub(super) fn invalidate(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.generation = state.generation.saturating_add(1);
+            state.accepted = None;
+        }
+    }
+
+    fn prepare(
+        &self,
+        source: &str,
+        policy: &bcode_config::ShellOutputPresentationPolicy,
+    ) -> Arc<Document> {
+        let generation = if let Ok(mut state) = self.state.lock() {
+            if let Some((accepted_policy, document)) = &state.accepted
+                && accepted_policy == policy
+                && document.execution_text() == source
+            {
+                return Arc::clone(document);
+            }
+            state.generation = state.generation.saturating_add(1);
+            state.generation
+        } else {
+            return Arc::new(crate::presentation::present(source, policy));
+        };
+        let document = Arc::new(crate::presentation::present(source, policy));
+        self.accept(generation, policy, Arc::clone(&document));
+        document
+    }
+
+    fn accept(
+        &self,
+        generation: u64,
+        policy: &bcode_config::ShellOutputPresentationPolicy,
+        document: Arc<Document>,
+    ) -> bool {
+        // Oversized literal fallback is never retained as a semantic parser cache entry.
+        if document.execution_text().len() > policy.max_source_bytes.min(64 * 1024) {
+            return false;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.generation != generation {
+            return false;
+        }
+        state.accepted = Some((policy.clone(), document));
+        true
+    }
+}
+
+#[cfg(test)]
+use super::{partial_json_string, shell_command_projection};
+
+struct Segment {
+    display: Range<usize>,
+    provenance: Provenance,
+}
+
+#[cfg(test)]
 pub(super) fn project(
     command: &str,
     cwd: Option<&str>,
@@ -15,109 +91,269 @@ pub(super) fn project(
     width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+    let policy = bcode_config::ShellToolOutputConfig::default()
+        .resolve_presentation_policy(Some(format_commands));
+    project_with_policy(command, cwd, &policy, width, context)
+}
+
+#[cfg(test)]
+pub(super) fn project_with_policy(
+    command: &str,
+    cwd: Option<&str>,
+    policy: &bcode_config::ShellOutputPresentationPolicy,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+    project_with_state(
+        command,
+        cwd,
+        policy,
+        width,
+        context,
+        &PresentationState::default(),
+    )
+}
+
+pub(super) fn project_with_state(
+    command: &str,
+    cwd: Option<&str>,
+    policy: &bcode_config::ShellOutputPresentationPolicy,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    state: &PresentationState,
+) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
     let mut result = bcode_plugin_sdk::tui::PluginTuiVisualProjection::default();
     if width == 0 || command.is_empty() {
         return result;
     }
-    let display = if format_commands {
-        format_shell_command_for_display(command)
-    } else {
-        command.to_owned()
-    };
-    let prompt = command_prompt(cwd, width, context);
-    let mut logical = Vec::new();
-    let mut source_lines = Vec::new();
-    let mut display_offset = 0;
-    let mut decorated_offset = 0;
-    for (index, source) in display.split('\n').enumerate() {
-        let prefix = if index == 0 {
-            prompt.clone()
-        } else {
-            Line::default()
-        };
-        let prefix_bytes = prefix.plain_text().len();
-        let mut spans = prefix.spans;
-        spans.extend(shell_command_spans(source));
-        source_lines.push((
-            display_offset,
-            decorated_offset + prefix_bytes,
-            source.len(),
-        ));
-        logical.push(Line::from_spans(spans));
-        display_offset += source.len() + 1;
-        decorated_offset += prefix_bytes + source.len() + 1;
-    }
-    // Character wrapping preserves every source whitespace unit; BMUX retains source ranges.
-    // Selection cells use BMUX's standard geometry. Its text projection treats tabs as
-    // zero-width source bytes whereas plain_text_fragments expands tab stops; tab rows retain
-    // source ranges but deliberately omit cells rather than claiming inconsistent hit geometry.
+    let document = state.prepare(command, policy);
+    let (logical, segments) = logical_document(&document, cwd, width, context);
     let block = TextBlock::new(Text { lines: logical }).wrap(TextWrap::Character);
     let layout = block.layout(
         Constraints::for_width(u64::from(width)),
         &mut LayoutCx::new(),
     );
-    let source_revision = |source: &str| {
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        source.hash(&mut hash);
-        hash.finish()
-    };
-    let identity = if display == command {
-        "shell-command:raw".to_owned()
-    } else {
-        // Formatter output has its own source, never invented original-command byte mappings.
-        format!("shell-command:formatted:{:016x}", source_revision(&display))
-    };
+    let revision = source_revision(command);
+    let identity = "shell-command:original";
+    let mut frontier = 0;
+    let mut segment_cursor = 0;
     for measured in block.projection(&layout) {
         let row = result.rows.len();
-        let visible = measured.line.width() <= usize::from(width);
-        let line = measured.line.viewport(0, usize::from(width));
-        let (base, decorated_start, length) = source_lines[measured.source_line];
-        let selection_identity = format!("{identity}:line:{}", measured.source_line);
-        let revision = source_revision(display.get(base..base + length).unwrap_or_default());
-        let start = measured.source_range.start.max(decorated_start);
-        let end = measured.source_range.end.min(decorated_start + length);
-        if visible && start <= end {
-            let source_start = base + start - decorated_start;
-            let source_end = base + end - decorated_start;
-            result
-                .anchors
-                .push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
-                    key: format!("command-byte:{source_start}"),
-                    row,
-                    source: Some(bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
-                        identity: identity.clone(),
-                        start: source_start,
-                        end: source_end,
-                    }),
-                });
-            let text = display[source_start..source_end].to_owned();
-            let prefix_bytes = start.saturating_sub(measured.source_range.start);
-            let rendered = measured.line.plain_text();
-            let column = bmux_tui::text_width::display_width(&rendered[..prefix_bytes]);
-            let column = u16::try_from(column).unwrap_or(width).min(width);
-            let cells = command_selection_cells(
-                &text,
-                &selection_identity,
-                source_start,
-                revision,
-                column,
-                width,
+        while segments
+            .get(segment_cursor)
+            .is_some_and(|segment| segment.display.end <= measured.source_range.start)
+        {
+            segment_cursor += 1;
+        }
+        let relevant = &segments[segment_cursor..];
+        let anchor = measured_anchor(&document, relevant, &measured.source_range);
+        let mut cells = measured_cells(&document, relevant, &measured, width, revision);
+        let end = relevant
+            .iter()
+            .take_while(|segment| segment.display.start < measured.source_range.end)
+            .filter_map(|segment| {
+                let Provenance::Source { id, range } = &segment.provenance else {
+                    return None;
+                };
+                (id.0 == 0).then(|| {
+                    range.start + measured.source_range.end.min(segment.display.end)
+                        - segment.display.start
+                })
+            })
+            .max()
+            .unwrap_or(frontier)
+            .max(frontier)
+            .max(
+                cells
+                    .iter()
+                    .map(|cell| cell.bytes.end)
+                    .max()
+                    .unwrap_or(frontier),
             );
+        // Copy chunks retain omitted original whitespace, not generated indentation or decoded
+        // source. One source identity joins soft and structural rows without fabricated newlines.
+        cells.retain(|cell| cell.bytes.start >= frontier && cell.bytes.end <= end);
+        cells.truncate(4096);
+        if end - frontier <= 256 * 1024 {
             result.selection.push((
                 row,
                 bcode_plugin_sdk::tui::PluginTuiSelectionRow {
-                    identity: selection_identity,
-                    byte_start: source_start,
-                    text,
+                    identity: identity.to_owned(),
+                    byte_start: frontier,
+                    text: command[frontier..end].to_owned(),
                     cells,
                     revision,
                 },
             ));
         }
-        result.rows.push(line);
+        result
+            .anchors
+            .push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                key: format!("shell-command:{row}"),
+                row,
+                source: Some(bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
+                    identity: identity.to_owned(),
+                    start: anchor.unwrap_or(frontier),
+                    end: end.max(anchor.unwrap_or(frontier)),
+                }),
+            });
+        frontier = end;
+        result
+            .rows
+            .push(measured.line.viewport(0, usize::from(width)));
+    }
+    if let Some((_, last)) = result.selection.last_mut()
+        && command.len() - last.byte_start <= 256 * 1024
+    {
+        command[last.byte_start..].clone_into(&mut last.text);
     }
     result
+}
+
+fn measured_anchor(
+    document: &Document,
+    relevant: &[Segment],
+    measured: &Range<usize>,
+) -> Option<usize> {
+    relevant
+        .iter()
+        .take_while(|segment| segment.display.start < measured.end)
+        .find_map(|segment| {
+            let Provenance::Source { id, range } = &segment.provenance else {
+                return None;
+            };
+            let start = measured.start.max(segment.display.start);
+            let end = measured.end.min(segment.display.end);
+            let provenance = Provenance::Source {
+                id: *id,
+                range: range.start + start - segment.display.start
+                    ..range.start + end - segment.display.start,
+            };
+            original_range(document, &provenance).map(|range| range.start)
+        })
+}
+
+fn logical_document(
+    document: &Document,
+    cwd: Option<&str>,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> (Vec<Line>, Vec<Segment>) {
+    let mut logical = Vec::new();
+    let mut segments = Vec::new();
+    let mut offset = 0;
+    for (index, line) in document.lines().into_iter().enumerate() {
+        let mut spans = if index == 0 {
+            command_prompt(cwd, width, context).spans
+        } else {
+            Vec::new()
+        };
+        offset += spans.iter().map(|span| span.content.len()).sum::<usize>();
+        for fragment in line.fragments {
+            let end = offset + fragment.text.len();
+            segments.push(Segment {
+                display: offset..end,
+                provenance: fragment.provenance,
+            });
+            spans.push(Span::styled(fragment.text, role_style(fragment.role)));
+            offset = end;
+        }
+        logical.push(Line::from_spans(spans));
+        offset += 1;
+    }
+    (logical, segments)
+}
+
+fn measured_cells(
+    document: &Document,
+    relevant: &[Segment],
+    measured: &bmux_tui::composition::TextProjectionRow,
+    width: u16,
+    revision: u64,
+) -> Vec<bcode_plugin_sdk::tui::PluginTuiSelectionCell> {
+    let rendered = measured.line.plain_text();
+    // BMUX text projection and selection disagree on tab expansion; do not invent geometry.
+    if measured.line.width() > usize::from(width) || rendered.contains('\t') {
+        return Vec::new();
+    }
+    let mut cells = Vec::new();
+    for fragment in bmux_tui::selection::plain_text_fragments(
+        "shell-command",
+        "shell-command:original",
+        bmux_tui::geometry::Rect::new(0, 0, width, 1),
+        0,
+        &rendered,
+        measured.source_range.start,
+        revision,
+    ) {
+        if fragment.source_range.is_empty() {
+            continue;
+        }
+        if let Some(segment) = relevant
+            .iter()
+            .take_while(|segment| segment.display.start < fragment.source_range.end)
+            .find(|segment| {
+                segment.display.start <= fragment.source_range.start
+                    && segment.display.end >= fragment.source_range.end
+            })
+            && let Provenance::Source { id, range } = &segment.provenance
+        {
+            let decoded = range.start + fragment.source_range.start - segment.display.start
+                ..range.start + fragment.source_range.end - segment.display.start;
+            if let Some(ranges) = document.original_ranges(*id, decoded)
+                && let (Some(first), Some(last)) = (ranges.first(), ranges.last())
+                && ranges.windows(2).all(|pair| pair[0].end == pair[1].start)
+            {
+                cells.push(bcode_plugin_sdk::tui::PluginTuiSelectionCell {
+                    column: fragment.area.x,
+                    width: fragment.area.width,
+                    bytes: first.start..last.end,
+                });
+            }
+        }
+    }
+    cells
+}
+
+fn original_range(document: &Document, provenance: &Provenance) -> Option<Range<usize>> {
+    let Provenance::Source { id, range } = provenance else {
+        return None;
+    };
+    let mut id = *id;
+    let mut range = range.clone();
+    if let Some(ranges) = document.original_ranges(id, range.clone())
+        && let (Some(first), Some(last)) = (ranges.first(), ranges.last())
+    {
+        return Some(first.start..last.end);
+    }
+    for _ in 0..document.sources.len() {
+        match &document.sources.get(id.0)?.origin {
+            SourceOrigin::Original => return Some(range),
+            SourceOrigin::Decoded { parent, encoded } => {
+                id = *parent;
+                range = encoded.clone();
+            }
+        }
+    }
+    None
+}
+
+fn source_revision(source: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hash);
+    hash.finish()
+}
+
+fn role_style(role: Role) -> bmux_tui::prelude::Style {
+    match role {
+        Role::Command => command_style(),
+        Role::Keyword => flag_style(),
+        Role::Operator => operator_style(),
+        Role::String => string_style(),
+        Role::Comment => muted_style(),
+        Role::Literal | Role::Whitespace => argument_style(),
+    }
 }
 
 fn command_prompt(
@@ -126,44 +362,12 @@ fn command_prompt(
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Line {
     let full_prompt = Line::from_spans(prompt_spans(cwd, context));
-    // Prefer source over decorative cwd. At tiny widths even the marker is omitted.
     if full_prompt.width() <= usize::from(width / 2) {
         full_prompt
     } else if width >= 4 {
         Line::from_spans(vec![Span::styled("❯ ", prompt_style())])
     } else {
         Line::default()
-    }
-}
-
-fn command_selection_cells(
-    text: &str,
-    identity: &str,
-    source_start: usize,
-    revision: u64,
-    column: u16,
-    width: u16,
-) -> Vec<bcode_plugin_sdk::tui::PluginTuiSelectionCell> {
-    if text.contains('\t') {
-        Vec::new()
-    } else {
-        bmux_tui::selection::plain_text_fragments(
-            "shell-command",
-            identity,
-            bmux_tui::geometry::Rect::new(column, 0, width - column, 1),
-            0,
-            text,
-            source_start,
-            revision,
-        )
-        .into_iter()
-        .filter(|fragment| !fragment.source_range.is_empty())
-        .map(|fragment| bcode_plugin_sdk::tui::PluginTuiSelectionCell {
-            column: fragment.area.x,
-            width: fragment.area.width,
-            bytes: fragment.source_range,
-        })
-        .collect()
     }
 }
 
@@ -179,16 +383,11 @@ pub(super) fn append_metadata(
 pub(super) fn declared_copy(
     projection: &bcode_plugin_sdk::tui::PluginTuiVisualProjection,
 ) -> String {
-    let mut copied = String::new();
-    let mut previous = None;
-    for (_, row) in &projection.selection {
-        if previous.is_some_and(|identity| identity != row.identity.as_str()) {
-            copied.push('\n');
-        }
-        copied.push_str(&row.text);
-        previous = Some(row.identity.as_str());
-    }
-    copied
+    projection
+        .selection
+        .iter()
+        .map(|(_, row)| row.text.as_str())
+        .collect()
 }
 
 #[cfg(test)]
@@ -204,179 +403,130 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_preserves_source_and_selection_at_every_width() {
-        let source = "python -c 'print(\"a  b\")'\n  界😀e\u{301}\tend\n";
-        for width in [0, 1, 2, 3, 4, 8, 16, 80] {
-            let projected = project(
-                source,
-                Some("/very/long/界/😀/working/directory"),
-                false,
-                width,
-                &context(width),
-            );
-            assert!(
-                projected
-                    .rows
-                    .iter()
-                    .all(|line| line.width() <= usize::from(width))
-            );
-            for (row, selection) in &projected.selection {
-                assert!(selection.is_valid());
-                let end = selection.byte_start + selection.text.len();
-                assert_eq!(selection.text, source[selection.byte_start..end]);
-                assert!(
-                    selection
-                        .cells
-                        .iter()
-                        .all(|cell| cell.column + cell.width <= width)
-                );
-                assert!(projected.anchors.iter().any(|anchor| anchor.row == *row));
-            }
-            if width >= 4 {
-                let recovered = projected
-                    .selection
-                    .iter()
-                    .map(|(_, row)| row.text.as_str())
-                    .collect::<String>();
-                assert_eq!(recovered, source.replace('\n', ""));
-            }
-        }
+    fn accepted_document_reuses_exact_source_and_rejects_stale_completion() {
+        let state = PresentationState::default();
+        let policy = bcode_config::ShellOutputPresentationPolicy::default();
+        let first = state.prepare("echo first", &policy);
+        assert!(Arc::ptr_eq(&first, &state.prepare("echo first", &policy)));
+        let stale_generation = state.state.lock().unwrap().generation;
+        let latest = state.prepare("echo latest", &policy);
+        assert!(!state.accept(stale_generation, &policy, first));
+        assert!(Arc::ptr_eq(&latest, &state.prepare("echo latest", &policy)));
+        state.invalidate();
+        assert!(!state.accept(stale_generation + 1, &policy, Arc::clone(&latest)));
+        assert!(!Arc::ptr_eq(
+            &latest,
+            &state.prepare("echo latest", &policy)
+        ));
+        let mut literal = policy.clone();
+        literal.enabled = false;
+        let changed_policy = state.prepare("echo latest", &literal);
+        assert!(!Arc::ptr_eq(&latest, &changed_policy));
+        let oversized = "x".repeat(64 * 1024 + 1);
+        assert!(!Arc::ptr_eq(
+            &state.prepare(&oversized, &policy),
+            &state.prepare(&oversized, &policy)
+        ));
     }
 
     #[test]
-    fn long_scripts_heredocs_and_invalid_shell_are_wrapped_without_formatting() {
+    fn measured_geometry_and_copy_preserve_original_at_every_width() {
         for source in [
-            "python -c 'import pathlib; print(\"many   quoted spaces preserved\")'",
-            "cat <<'PY'\n    print('hello  world')\nPY",
+            "if true;then echo 'a  b';else echo 界😀e\u{301};fi",
+            "  python - <<'PY'\n\tprint('a  b')\n\nPY\n",
+            "node -e 'console.log(\"界😀\"); console.log(2)'",
+            "bash -c 'if true;then python -c '\"'\"'print(1)'\"'\"';fi'",
             "if unfinished '  quoted",
         ] {
-            let projected = project(source, None, false, 12, &context(12));
-            assert!(projected.rows.len() > 1);
-            assert!(projected.rows.iter().all(|line| line.width() <= 12));
-            assert_eq!(
-                projected
-                    .selection
-                    .iter()
-                    .map(|(_, row)| row.text.as_str())
-                    .collect::<String>(),
-                source.replace('\n', "")
-            );
-        }
-    }
-
-    #[test]
-    fn streamed_drafts_beautify_structure_even_before_json_is_complete() {
-        let context = context(24);
-        let source = "if true;then echo 'a  b';fi";
-        let json = serde_json::json!({"command": source, "format_commands": true}).to_string();
-        for end in (0..=json.len()).filter(|end| json.is_char_boundary(*end)) {
-            let payload = serde_json::json!({"preview": &json[..end]});
-            let projected = shell_command_projection(&payload, &context);
-            let decoded = partial_json_string(&json[..end], "command").unwrap_or_default();
-            let recovered = projected
-                .selection
-                .iter()
-                .map(|(_, row)| row.text.as_str())
-                .collect::<String>();
-            assert_eq!(
-                recovered,
-                format_shell_command_for_display(&decoded).replace('\n', "")
-            );
-            assert!(projected.rows.iter().all(|line| line.width() <= 24));
-        }
-        let final_payload = serde_json::json!({"command": source});
-        let final_projection = shell_command_projection(&final_payload, &context);
-        assert!(
-            final_projection
-                .selection
-                .iter()
-                .all(|(_, row)| row.identity.starts_with("shell-command:formatted:"))
-        );
-    }
-
-    #[test]
-    fn disabled_formatting_is_respected_before_the_json_object_finishes() {
-        let payload = serde_json::json!({"preview": "{\"format_commands\":false,\"command\":\"echo one; echo two"});
-        let projected = shell_command_projection(&payload, &context(80));
-        let copied = projected
-            .selection
-            .iter()
-            .map(|(_, row)| row.text.as_str())
-            .collect::<String>();
-        assert_eq!(copied, "echo one; echo two");
-        assert_eq!(projected.rows.len(), 1);
-    }
-
-    #[test]
-    fn styling_partitions_source_without_normalizing_whitespace() {
-        for source in [
-            "  echo  'a  b'\t--flag",
-            "printf \"quoted  text\"",
-            "echo escaped\\ space",
-            "  界😀e\u{301} ",
-        ] {
-            assert_eq!(
-                Line::from_spans(shell_command_spans(source)).plain_text(),
-                source
-            );
-        }
-    }
-
-    #[test]
-    fn formatted_selection_maps_to_display_not_execution_source() {
-        let source = "if true;then echo hi;fi\ncat <<'PY'\nprint('long  quoted whitespace in a heredoc')\nPY";
-        let display = format_shell_command_for_display(source);
-        assert_ne!(source, display);
-        let projected = project(source, None, true, 10, &context(10));
-        for (_, selection) in &projected.selection {
-            let end = selection.byte_start + selection.text.len();
-            assert_eq!(selection.text, display[selection.byte_start..end]);
-            assert!(selection.identity.starts_with("shell-command:formatted:"));
-        }
-        // Same logical line identity joins soft rows; newline-separated lines differ.
-        let same_line = projected
-            .selection
-            .windows(2)
-            .any(|pair| pair[0].1.identity == pair[1].1.identity);
-        let different_line = projected
-            .selection
-            .windows(2)
-            .any(|pair| pair[0].1.identity != pair[1].1.identity);
-        assert!(same_line && different_line);
-        assert_eq!(declared_copy(&projected), display);
-    }
-
-    #[test]
-    fn literal_copy_keeps_indentation_tabs_blank_lines_and_trailing_newlines() {
-        let source = "  python - <<'PY'\n\tprint('a  b')\n\nPY\n";
-        for width in [4, 12, 80] {
-            let projected = project(source, Some("/tmp/long-cwd"), false, width, &context(width));
-            assert_eq!(declared_copy(&projected), source);
-            for (_, row) in &projected.selection {
-                if row.text.contains('\t') {
-                    // Locked BMUX does not expose tab-expanded measured source geometry.
-                    // Do not publish its incompatible eight-cell selection approximation.
-                    assert!(row.cells.is_empty());
+            for width in [0, 1, 2, 3, 4, 8, 16, 80] {
+                for format in [false, true] {
+                    let projected = project(
+                        source,
+                        Some("/long/界/😀/cwd"),
+                        format,
+                        width,
+                        &context(width),
+                    );
+                    assert!(
+                        projected
+                            .rows
+                            .iter()
+                            .all(|line| line.width() <= usize::from(width))
+                    );
+                    if width == 0 {
+                        assert!(projected.selection.is_empty());
+                        continue;
+                    }
+                    assert_eq!(declared_copy(&projected), source);
+                    for (row, selection) in &projected.selection {
+                        assert!(selection.is_valid());
+                        assert_eq!(
+                            selection.text,
+                            source
+                                [selection.byte_start..selection.byte_start + selection.text.len()]
+                        );
+                        assert!(
+                            selection
+                                .cells
+                                .iter()
+                                .all(|cell| cell.column + cell.width <= width)
+                        );
+                        assert!(projected.anchors.iter().any(|anchor| anchor.row == *row));
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn width_changes_keep_source_identity_and_containment() {
+    fn progressive_drafts_keep_source_copy_authority() {
+        let source = "if true;then echo 'a  b';else echo 界;fi";
+        for (end, _) in source.char_indices().skip(1) {
+            let source = &source[..end];
+            let preview = format!("{{\"command\":{}", serde_json::to_string(source).unwrap());
+            let decoded = partial_json_string(&preview, "command").unwrap();
+            let projected =
+                shell_command_projection(&serde_json::json!({"preview": preview}), &context(20));
+            assert_eq!(declared_copy(&projected), decoded);
+            assert!(projected.rows.iter().all(|line| line.width() <= 20));
+        }
+    }
+
+    #[test]
+    fn selection_cells_use_measured_painted_graphemes_and_original_bytes() {
+        let source = "echo 界😀e\u{301} 'a  b'";
+        for width in [2, 3, 4, 9, 80] {
+            let projected = project(source, None, false, width, &context(width));
+            for (index, selection) in &projected.selection {
+                for cell in &selection.cells {
+                    let painted = projected.rows[*index]
+                        .viewport(usize::from(cell.column), usize::from(cell.width))
+                        .plain_text();
+                    assert_eq!(painted, source[cell.bytes.clone()]);
+                }
+            }
+            assert_eq!(declared_copy(&projected), source);
+        }
+    }
+
+    #[test]
+    fn width_changes_keep_original_identity_and_revision() {
         let source = "echo 'one  two three four five six seven'";
-        let narrow = project(source, None, false, 12, &context(12));
-        let wide = project(source, None, false, 28, &context(28));
-        for anchor in narrow.anchors {
-            let source = anchor.source.unwrap();
+        let narrow = project(source, None, true, 12, &context(12));
+        let wide = project(source, None, true, 28, &context(28));
+        assert_eq!(declared_copy(&narrow), declared_copy(&wide));
+        for (_, row) in &narrow.selection {
             assert!(
-                wide.anchors
+                wide.selection
                     .iter()
-                    .any(|anchor| anchor.source.as_ref().is_some_and(|candidate| {
-                        candidate.identity == source.identity
-                            && (candidate.start..candidate.end).contains(&source.start)
-                    }))
+                    .all(|(_, other)| other.identity == row.identity
+                        && other.revision == row.revision)
             );
         }
+        let changed = project("echo changed", None, true, 12, &context(12));
+        assert_ne!(
+            narrow.selection[0].1.revision,
+            changed.selection[0].1.revision
+        );
     }
 }

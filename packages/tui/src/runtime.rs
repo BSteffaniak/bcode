@@ -256,6 +256,11 @@ fn apply_initial_config(
         );
     };
     settings.apply_tui_config(&config.tui);
+    if let Err(error) = chat.app.apply_plugin_presentation_config(&config) {
+        chat.app.set_status(format!(
+            "plugin presentation configuration unavailable: {error}"
+        ));
+    }
     if let Some(presentation) = chat.app.plugin_presentation() {
         settings.integrate_keymap_contributors(presentation.keymap_actions());
     }

@@ -13,6 +13,8 @@
 //! references.
 
 mod contracts;
+#[cfg(feature = "static-bundled")]
+pub mod presentation;
 pub mod recording;
 #[cfg(feature = "static-bundled")]
 pub mod shell_run_tui;
@@ -1304,18 +1306,23 @@ struct ShellCommandPlan {
     prelude_marker: Option<String>,
 }
 
-fn shell_format_commands(
+fn shell_presentation_options(
     arguments: &ShellRunArguments,
     output_config: &ShellToolOutputConfig,
     arguments_json: &mut serde_json::Value,
-) -> bool {
+) -> Result<(bool, bcode_config::ShellOutputPresentationPolicy), String> {
     let format_commands = arguments
         .format_commands
         .unwrap_or(output_config.format_commands);
+    let policy = output_config.resolve_presentation_policy(Some(format_commands));
     if let Some(arguments) = arguments_json.as_object_mut() {
         arguments.insert("format_commands".to_owned(), json!(format_commands));
+        arguments.insert(
+            "presentation_policy".to_owned(),
+            serde_json::to_value(&policy).map_err(|error| error.to_string())?,
+        );
     }
-    format_commands
+    Ok((format_commands, policy))
 }
 
 fn prelude_marker(tool_call_id: &str) -> String {
@@ -1729,8 +1736,8 @@ fn run_terminal_shell_command_inner(
         || shell_config_with_environment(cwd.as_deref(), environment),
         |config| Ok(config.clone()),
     )?;
-    let format_commands =
-        shell_format_commands(arguments, &shell_config.output, &mut arguments_json);
+    let (format_commands, presentation_policy) =
+        shell_presentation_options(arguments, &shell_config.output, &mut arguments_json)?;
     let env_config = shell_config.env;
     let columns = arguments.terminal_columns(DEFAULT_TERMINAL_COLUMNS);
     let rows = arguments.terminal_rows(DEFAULT_TERMINAL_ROWS);
@@ -1854,6 +1861,7 @@ fn run_terminal_shell_command_inner(
             columns: final_columns,
             rows: final_rows,
             format_commands,
+            presentation_policy,
         },
     )
 }
@@ -1869,6 +1877,7 @@ struct TerminalShellResponseInput<'a> {
     columns: u16,
     rows: u16,
     format_commands: bool,
+    presentation_policy: bcode_config::ShellOutputPresentationPolicy,
 }
 
 fn terminal_shell_response(
@@ -1928,6 +1937,7 @@ fn terminal_shell_response(
                 columns: input.columns,
                 rows: input.rows,
                 format_commands: input.format_commands,
+                presentation_policy: Some(input.presentation_policy),
             },
             input
                 .stream_output
@@ -3954,6 +3964,45 @@ mod tests {
     }
 
     #[test]
+    fn effective_presentation_is_forwarded_without_changing_operation_facts() {
+        let arguments = ShellRunArguments {
+            command: "python -c 'print(1)'".to_owned(),
+            cwd: Some(PathBuf::from("/tmp/workspace")),
+            timeout_ms: Some(1200),
+            columns: Some(80),
+            rows: Some(24),
+            format_commands: Some(true),
+        };
+        let mut payload = serde_json::to_value(&arguments).unwrap();
+        let original = payload.clone();
+        payload["presentation_policy"] = json!({"version": 99});
+        let config = ShellToolOutputConfig {
+            format_commands: false,
+            presentation: bcode_config::ShellOutputPresentationPolicy {
+                python: false,
+                max_regions: 2,
+                ..bcode_config::ShellOutputPresentationPolicy::default()
+            },
+            ..ShellToolOutputConfig::default()
+        };
+        let (format_commands, effective) =
+            shell_presentation_options(&arguments, &config, &mut payload).unwrap();
+        assert!(format_commands && effective.enabled);
+        assert!(!effective.python);
+        assert_eq!(effective.max_regions, 2);
+        assert_eq!(
+            serde_json::from_value::<bcode_config::ShellOutputPresentationPolicy>(
+                payload["presentation_policy"].clone()
+            )
+            .unwrap(),
+            effective
+        );
+        for key in ["command", "cwd", "timeout_ms", "columns", "rows"] {
+            assert_eq!(payload[key], original[key]);
+        }
+    }
+
+    #[test]
     fn shell_request_payload_serializes_for_primary_presentation() {
         let arguments = ShellRunArguments {
             command: "echo test".to_owned(),
@@ -5743,6 +5792,7 @@ mod tests {
                 columns: 80,
                 rows: 24,
                 format_commands: true,
+                presentation_policy: bcode_config::ShellOutputPresentationPolicy::default(),
                 recording_ref: None,
             },
         )
@@ -5824,6 +5874,7 @@ mod tests {
                 columns: 80,
                 rows: 24,
                 format_commands: true,
+                presentation_policy: bcode_config::ShellOutputPresentationPolicy::default(),
                 recording_ref: None,
             },
         )
