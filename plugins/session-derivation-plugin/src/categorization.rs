@@ -132,8 +132,8 @@ fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
     {
         return None;
     }
-    // Lexical cues cannot justify an unobserved label. Keep an explicit
-    // abstention for missing axes and conflicts; these are not resolved intent.
+    // Lexical cues cannot justify an unobserved label. Omit missing axes;
+    // signal-bearing axes retain explicit abstention for ambiguous intent.
     let choice = |instructions: &str, signals: &BTreeSet<String>| Question::Choice {
         instructions: instructions.to_owned(),
         options: signals
@@ -145,28 +145,32 @@ fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
             )])
             .collect(),
     };
+    let mut questions = BTreeMap::new();
+    if !facts.tasks.is_empty() {
+        questions.insert(
+            "task".to_owned(),
+            choice(
+                "Choose the requested advisory task from ordered lexical cues, not every mentioned task. negation marks a negative cue, boundary marks punctuation, contrast and only preserve those cues, and gap means omitted unknown words. These cues do not establish negation scope; use other when ambiguous or only prohibited tasks are supported.",
+                &facts.tasks,
+            ),
+        );
+    }
+    if !facts.domains.is_empty() {
+        questions.insert(
+            "domain".to_owned(),
+            choice(
+                "Choose the domain of the requested task using ordered lexical cues, not a domain mentioned only in a prohibition. gap means omitted unknown words, not adjacency in the source; use other when intent or domain association is ambiguous.",
+                &facts.domains,
+            ),
+        );
+    }
     Some(OptionalRequest {
         feature: Feature::SessionCategorization,
         selection: None,
         request: Request {
             model_id: "auto".to_owned(),
             state: State::Structured(serde_json::to_value(facts).ok()?),
-            questions: BTreeMap::from([
-                (
-                    "task".to_owned(),
-                    choice(
-                        "Choose the requested advisory task from ordered lexical cues, not every mentioned task. negation marks a negative cue, boundary marks punctuation, contrast and only preserve those cues, and gap means omitted unknown words. These cues do not establish negation scope; use other when ambiguous or only prohibited tasks are supported.",
-                        &facts.tasks,
-                    ),
-                ),
-                (
-                    "domain".to_owned(),
-                    choice(
-                        "Choose the domain of the requested task using ordered lexical cues, not a domain mentioned only in a prohibition. gap means omitted unknown words, not adjacency in the source; use other when intent or domain association is ambiguous.",
-                        &facts.domains,
-                    ),
-                ),
-            ]),
+            questions,
         },
     })
 }
@@ -179,7 +183,13 @@ fn labels(
     let response = result.response?;
     // Central access validates model capabilities and numerical values. Correlate the
     // returned envelope with exactly our caller-owned questions, kinds, and options.
-    if query.questions.len() != 2 || response.answers.len() != query.questions.len() {
+    if !(1..=2).contains(&query.questions.len())
+        || response.answers.len() != query.questions.len()
+        || query
+            .questions
+            .keys()
+            .any(|id| !["task", "domain"].contains(&id.as_str()))
+    {
         return None;
     }
     for (id, question) in &query.questions {
@@ -189,23 +199,18 @@ fn labels(
         let Answer::Choice { selected, .. } = response.answers.get(id)? else {
             return None;
         };
-        if !options.contains_key(selected) {
+        if options.len() < 2 || !options.contains_key(selected) {
             return None;
         }
     }
-    let Answer::Choice { selected: task, .. } = response.answers.get("task")? else {
-        return None;
-    };
-    let Answer::Choice {
-        selected: domain, ..
-    } = response.answers.get("domain")?
-    else {
-        return None;
+    let axis = |id: &str| match response.answers.get(id) {
+        Some(Answer::Choice { selected, .. }) => selected.clone(),
+        _ => "other".to_owned(),
     };
     Some(SessionCategorization {
         source_sequence: request.source_sequence,
-        task: task.clone(),
-        domain: domain.clone(),
+        task: axis("task"),
+        domain: axis("domain"),
     })
 }
 
@@ -420,8 +425,8 @@ mod tests {
     #[test]
     fn choices_cannot_invent_missing_or_unobserved_signals() {
         for (source, tasks, domains) in [
-            ("Fix this", vec!["debugging", "other"], vec!["other"]),
-            ("backend", vec!["other"], vec!["backend", "other"]),
+            ("Fix this", vec!["debugging", "other"], vec![]),
+            ("backend", vec![], vec!["backend", "other"]),
             (
                 "Review and test backend security",
                 vec!["other", "review", "testing"],
@@ -432,6 +437,10 @@ mod tests {
                 .unwrap()
                 .request;
             for (id, expected) in [("task", tasks), ("domain", domains)] {
+                if expected.is_empty() {
+                    assert!(!query.questions.contains_key(id));
+                    continue;
+                }
                 let Question::Choice { options, .. } = &query.questions[id] else {
                     panic!("expected choice");
                 };
@@ -449,36 +458,53 @@ mod tests {
         let query = optional_request(&newest_request_facts(&request.newest_request))
             .unwrap()
             .request;
-        for (domain, accepted) in [("backend", false), ("other", true)] {
+        for (task, domain, accepted) in [
+            ("debugging", None, true),
+            ("implementation", None, false),
+            ("debugging", Some("backend"), false),
+            ("debugging", Some("other"), false),
+        ] {
+            let mut answers = BTreeMap::from([(
+                "task".into(),
+                Answer::Choice {
+                    selected: task.into(),
+                    probabilities: None,
+                    confidence: None,
+                },
+            )]);
+            if let Some(domain) = domain {
+                answers.insert(
+                    "domain".into(),
+                    Answer::Choice {
+                        selected: domain.into(),
+                        probabilities: None,
+                        confidence: None,
+                    },
+                );
+            }
             let result = labels(
                 &request,
                 &query,
                 OptionalResponse {
                     observation: None,
                     response: Some(judgement::Response {
-                        answers: BTreeMap::from([
-                            (
-                                "task".into(),
-                                Answer::Choice {
-                                    selected: "debugging".into(),
-                                    probabilities: None,
-                                    confidence: None,
-                                },
-                            ),
-                            (
-                                "domain".into(),
-                                Answer::Choice {
-                                    selected: domain.into(),
-                                    probabilities: None,
-                                    confidence: None,
-                                },
-                            ),
-                        ]),
+                        answers,
                         usage: None,
                     }),
                 },
             );
-            assert_eq!(result.is_some(), accepted);
+            if accepted {
+                assert_eq!(
+                    result,
+                    Some(SessionCategorization {
+                        source_sequence: 12,
+                        task: "debugging".into(),
+                        domain: "other".into(),
+                    })
+                );
+            } else {
+                assert!(result.is_none());
+            }
         }
     }
 
@@ -591,6 +617,120 @@ mod tests {
             .is_none()
         );
     }
+    #[test]
+    fn single_signal_axis_omits_missing_question_and_defaults_its_label() {
+        for (source, id, selected, task, domain) in [
+            ("backend", "domain", "backend", "other", "backend"),
+            ("debug", "task", "debugging", "debugging", "other"),
+        ] {
+            let request = CategorizationRequest {
+                session_id: SessionId::new(),
+                source_sequence: 13,
+                newest_request: source.to_owned(),
+            };
+            let query = optional_request(&newest_request_facts(source))
+                .unwrap()
+                .request;
+            assert_eq!(query.questions.len(), 1);
+            let Question::Choice { options, .. } = &query.questions[id] else {
+                panic!("expected choice");
+            };
+            assert_eq!(options.len(), 2);
+            assert!(options.contains_key(selected));
+            assert!(options.contains_key("other"));
+            let response = OptionalResponse {
+                observation: None,
+                response: Some(judgement::Response {
+                    answers: BTreeMap::from([(
+                        id.to_owned(),
+                        Answer::Choice {
+                            selected: selected.to_owned(),
+                            probabilities: None,
+                            confidence: None,
+                        },
+                    )]),
+                    usage: None,
+                }),
+            };
+            assert_eq!(
+                labels(&request, &query, response),
+                Some(SessionCategorization {
+                    source_sequence: 13,
+                    task: task.to_owned(),
+                    domain: domain.to_owned(),
+                })
+            );
+        }
+        assert!(optional_request(&newest_request_facts("hello world")).is_none());
+    }
+
+    #[test]
+    fn single_axis_rejects_wrong_answer_kind_and_unknown_authored_id() {
+        let request = CategorizationRequest {
+            session_id: SessionId::new(),
+            source_sequence: 14,
+            newest_request: "backend".to_owned(),
+        };
+        let query = optional_request(&newest_request_facts("backend"))
+            .unwrap()
+            .request;
+        let response = |answers| OptionalResponse {
+            observation: None,
+            response: Some(judgement::Response {
+                answers,
+                usage: None,
+            }),
+        };
+        assert!(
+            labels(
+                &request,
+                &query,
+                response(BTreeMap::from([(
+                    "domain".to_owned(),
+                    Answer::YesNo { probability: 0.5 }
+                ),]))
+            )
+            .is_none()
+        );
+        let mut unknown = query.clone();
+        let question = unknown.questions.remove("domain").unwrap();
+        unknown.questions.insert("unexpected".to_owned(), question);
+        assert!(
+            labels(
+                &request,
+                &unknown,
+                response(BTreeMap::from([(
+                    "unexpected".to_owned(),
+                    Answer::Choice {
+                        selected: "backend".to_owned(),
+                        probabilities: None,
+                        confidence: None,
+                    }
+                ),]))
+            )
+            .is_none()
+        );
+        let mut singleton = query;
+        if let Question::Choice { options, .. } = singleton.questions.get_mut("domain").unwrap() {
+            options.retain(|id, _| id == "other");
+        }
+        assert!(
+            labels(
+                &request,
+                &singleton,
+                response(BTreeMap::from([(
+                    "domain".to_owned(),
+                    Answer::Choice {
+                        selected: "other".to_owned(),
+                        probabilities: None,
+                        confidence: None,
+                    }
+                ),]))
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn validated_labels_retain_source_identity_without_request_facts() {
         let request = CategorizationRequest {

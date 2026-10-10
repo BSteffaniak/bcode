@@ -16,6 +16,48 @@ fn stage(name: &str) -> ServerError {
     ServerError::WorkflowStorageUnavailable(format!("workflow inspection unavailable at {name}"))
 }
 
+fn verify_revision(expected: u64, observed: u64) -> Result<(), ServerError> {
+    if expected != observed {
+        return Err(stage("revision_changed"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CollectionCompleteness {
+    admission_observations: Option<bool>,
+    child_sessions: Option<bool>,
+    activations: Option<bool>,
+    child_run_links: Option<bool>,
+}
+
+fn unavailable_collections(complete: CollectionCompleteness) -> Vec<String> {
+    let unsupported = [
+        "events",
+        "waits",
+        "mutation_approvals",
+        "decisions",
+        "grants",
+        "resource_leases",
+        "descendant_runs",
+        "repeat_outcomes",
+    ];
+    unsupported
+        .into_iter()
+        .chain(
+            [
+                ("admission_observations", complete.admission_observations),
+                ("child_sessions", complete.child_sessions),
+                ("activations", complete.activations),
+                ("child_run_links", complete.child_run_links),
+            ]
+            .into_iter()
+            .filter_map(|(name, completeness)| (completeness != Some(true)).then_some(name)),
+        )
+        .map(str::to_owned)
+        .collect()
+}
+
 pub async fn inspect(
     state: &ServerState,
     run_id: &str,
@@ -54,7 +96,7 @@ pub async fn inspect(
     .await
     .map_err(|_| stage("graph"))?;
     let terminal_output = terminal(&db, &run).await.map_err(|_| stage("terminal"))?;
-    let activations = activations(&db, run_id, bound)
+    let (activations, activations_complete) = activations(&db, run_id, revision, bound)
         .await
         .map_err(|_| stage("activations"))?;
     let attempts = super::backpressure::retry(|| {
@@ -66,37 +108,32 @@ pub async fn inspect(
     let child_sessions = sessions(state, &db, run_id, bound)
         .await
         .map_err(|_| stage("sessions"))?;
-    let child_run_links = super::backpressure::retry(|| {
+    let children = super::backpressure::retry(|| {
         representation::hierarchy::children(&db, run_id, None, bound)
     })
     .await
-    .map_err(|_| stage("children"))?
-    .children;
+    .map_err(|_| stage("children"))?;
+    let children_complete = children.next_child_run_id.is_none();
+    let child_run_links = children.children;
     let (admission_observations, admission_observations_complete) =
         admission::inspect(&db, run_id, bound).await;
+    // A graph revision fences topology only, not concurrent attempt/output transitions.
+    // Reject changed topology rather than returning a mixed-revision aggregate.
+    let final_revision =
+        super::backpressure::retry(|| representation::graph_pages::revision(&db, run_id))
+            .await
+            .map_err(|_| stage("final_revision"))?;
+    verify_revision(revision, final_revision)?;
     let sessions_complete = attempts.len() < usize::from(bound);
     Ok(Some(WorkflowRunInspection {
         admission_observations,
         admission_observations_complete,
-        unavailable_collections: vec![
-            "events",
-            "waits",
-            "mutation_approvals",
-            "decisions",
-            "grants",
-            "resource_leases",
-            "descendant_runs",
-            "repeat_outcomes",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .chain(
-            admission_observations_complete
-                .is_none()
-                .then(|| "admission_observations".to_owned()),
-        )
-        .chain((!sessions_complete).then(|| "child_sessions".to_owned()))
-        .collect(),
+        unavailable_collections: unavailable_collections(CollectionCompleteness {
+            admission_observations: admission_observations_complete,
+            child_sessions: Some(sessions_complete),
+            activations: Some(activations_complete),
+            child_run_links: Some(children_complete),
+        }),
         execution_allowance: None,
         continuation: None,
         replacement_readiness: None,
@@ -252,13 +289,15 @@ async fn terminal(
 async fn activations(
     db: &dyn switchy_database::Database,
     run_id: &str,
+    expected_revision: u64,
     bound: u16,
-) -> Result<Vec<WorkflowActivationSummary>, ServerError> {
+) -> Result<(Vec<WorkflowActivationSummary>, bool), ServerError> {
     let scheduling = super::backpressure::retry(|| {
-        representation::scheduling::snapshot(db, run_id, None, None, bound)
+        representation::scheduling::snapshot(db, run_id, Some(expected_revision), None, bound)
     })
     .await
     .map_err(|_| unavailable())?;
+    let complete = scheduling.next_activation_id.is_none();
     let mut activations = Vec::new();
     for activation in scheduling.activations {
         let (generation, created_at_ms, byte_count) = super::backpressure::retry(|| {
@@ -283,7 +322,7 @@ async fn activations(
             created_at_ms,
         });
     }
-    Ok(activations)
+    Ok((activations, complete))
 }
 
 async fn output_summaries(
@@ -308,4 +347,42 @@ async fn output_summaries(
         })
         .collect();
     Ok(outputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CollectionCompleteness, unavailable_collections, verify_revision};
+
+    #[test]
+    fn unknown_and_incomplete_collections_do_not_claim_availability() {
+        for status in [None, Some(false), Some(true)] {
+            let names = unavailable_collections(CollectionCompleteness {
+                admission_observations: status,
+                child_sessions: status,
+                activations: status,
+                child_run_links: status,
+            });
+            for name in [
+                "admission_observations",
+                "child_sessions",
+                "activations",
+                "child_run_links",
+            ] {
+                assert_eq!(
+                    names.iter().any(|value| value == name),
+                    status != Some(true)
+                );
+            }
+            // Supported collection completeness cannot certify legacy event history.
+            assert!(names.iter().any(|name| name == "events"));
+            assert!(names.iter().any(|name| name == "descendant_runs"));
+        }
+    }
+
+    #[test]
+    fn aggregate_topology_requires_the_pinned_revision() {
+        assert!(verify_revision(7, 7).is_ok());
+        assert!(verify_revision(7, 8).is_err());
+        assert!(verify_revision(8, 7).is_err());
+    }
 }

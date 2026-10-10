@@ -60,7 +60,32 @@ independent success measurements and deterministic diagnosis labels are not rewr
 through the real invocation encoding/application path, testing called-disabled zero counts,
 missing telemetry, absent prerequisites, invalid advice and actual advisory application. These
 are offline eval-adapter regressions, not six-feature normal-turn end-to-end coverage or gain
-claims. Normal context and recommendations capture gaps require upstream application evidence.
+claims. Normal recommendations now expose bounded producer-owned tool/skill identities with
+final selection ordinals; changing multi-round selections remain unavailable to the legacy
+single-selection scorer. Actual eval capture uses `EvalRun` in a separate CLI process and
+`NormalEvalAttempt` scope, retaining normalized failure stages and verified partial facts.
+Incomplete workflow inspection or capture still blocks end-to-end conclusions.
+
+### Normal-path study drivers
+
+`scripts/judgement-normal-live.py` captures fresh ordinary turns and independently grades
+written artifacts. It supports explicit single-feature, all-off, all-on and leave-one-out
+configurations, canonical request/result correlation, exact-turn hook checks and no-replay
+reconciliation. `scripts/judgement-navigation-live.py` evaluates a fixed query over three
+actual activated sessions using public advisory labels and a label-only ranking adapter.
+Its relevance subset is authored independently; this measures the harness adapter, not
+native frontend navigation. Missing labels, incomplete pages and unknown calls stay gaps.
+
+`fixtures/evals/judgement/normal_study.py` provides CSV, record-ID, checkout-validation and
+confined-path repair families with bounded independent behavioral oracles. Repetitions and
+cross-feature reuse do not make independent families. Its new study schedule is separate
+from the existing held-out fixtures; generating or freezing it does not establish execution
+or improvement. Generated workflow suites require explicit state/configuration selection;
+shared-daemon suites supply environment pins rather than an isolated-daemon config overlay.
+
+No driver establishes six-feature improvement merely from inference counts, applied advice,
+configuration, task success, or a single paired result. Preserve losses, ties, overhead
+regressions and incomplete attempts in the comparison.
 
 ## Truth and evidence
 

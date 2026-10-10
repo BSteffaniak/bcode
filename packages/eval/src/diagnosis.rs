@@ -215,6 +215,7 @@ pub fn settle_attempt(
         inference_complete: query.is_none(),
         application: Some(ApplicationDisposition::BaselineRetained),
         selection: None,
+        recommendation: None,
     };
     if let Some(query) = query
         && let Some(result) = result

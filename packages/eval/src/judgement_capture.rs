@@ -15,7 +15,67 @@ mod raw;
 pub use raw::{RawCaptureScore, raw_capture_scores};
 mod report;
 pub use report::{compare_captures, compare_captures_quality_only};
+mod normal_eval;
 mod turns;
+/// Run one actual eval attempt in a separately selected CLI process, never a daemon runtime.
+///
+/// # Errors
+/// Rejects incomplete identities, unsafe paths, incompatible suites, and missing attempt evidence.
+pub fn capture_normal_eval_run(job: CaptureJob) -> Result<ConsumerCapture, &'static str> {
+    let ConsumerRequest::EvalRun {
+        suite_path,
+        output_dir,
+        subject_binary,
+        artifact_root,
+    } = job.consumer
+    else {
+        return Err("normal eval consumer required");
+    };
+    if job.schema_version != 1
+        || !job.allow_live
+        || job.request.source != crate::judgement_benchmark::EvidenceSource::LiveConsumer
+        || job.request.feature != Feature::EvalCategorization
+        || job.request.timeout_ms == 0
+        || job.request.timeout_ms > 300_000
+    {
+        return Err("explicit live eval job required");
+    }
+    let mut capture = ConsumerCapture {
+        schema_version: CAPTURE_SCHEMA_VERSION,
+        scope: CaptureScope::NormalEvalAttempt,
+        request: job.request,
+        operation: "eval.run.actual_attempt".into(),
+        status: CaptureStatus::ConsumerUnavailable,
+        output: None,
+        consumer_executed: false,
+        outcome: TerminalOutcome::InfrastructureFailure,
+        operation_latency_ms: None,
+        trial_latency_ms: None,
+        authority_preserved: None,
+        request_only: None,
+        telemetry: CaptureTelemetry::default(),
+    };
+    if normal_eval::execute(
+        &suite_path,
+        &output_dir,
+        &subject_binary,
+        &artifact_root,
+        &mut capture,
+    )
+    .is_err()
+    {
+        // Preserve stage and any verified partial facts; unavailable telemetry remains unknown.
+        capture.status = CaptureStatus::PublicOperationFailed;
+    }
+    if serde_json::to_vec(&capture)
+        .map_err(|_| "invalid eval capture output")?
+        .len()
+        > MAX_CAPTURE_BYTES
+    {
+        return Err("eval capture output exceeds bound");
+    }
+    Ok(capture)
+}
 pub use turns::NormalTurnRequest;
 mod services;
 pub use services::{CategorizationDimension, ServiceConsumer};
@@ -361,6 +421,17 @@ pub enum ConsumerRequest {
         /// Existing deterministic diagnosis, independent of advisory model labels.
         diagnosis: serde_json::Value,
     },
+    /// Actual single-attempt workflow evaluation; dispatched only by an isolated CLI process.
+    EvalRun {
+        /// Authored suite confined to the caller's authorized external artifact root.
+        suite_path: std::path::PathBuf,
+        /// Fresh output directory under that root.
+        output_dir: std::path::PathBuf,
+        /// Explicit pinned subject executable.
+        subject_binary: std::path::PathBuf,
+        /// Explicit authorized artifact root; confinement does not grant access.
+        artifact_root: std::path::PathBuf,
+    },
     /// Reads existing disposable labels; does not claim categorization trigger execution.
     SessionCategorization {
         /// Existing harness-owned session only.
@@ -398,6 +469,8 @@ pub enum CaptureScope {
     ServiceMicrobenchmark,
     /// Automatic consumers observed downstream of a real admitted normal turn.
     NormalTurn,
+    /// Optional diagnosis attached after an actual independently graded workflow eval attempt.
+    NormalEvalAttempt,
 }
 
 /// Raw bounded artifact. Input and error bodies are deliberately not persisted here.
@@ -470,7 +543,9 @@ pub async fn capture_bounded(
         ConsumerRequest::NormalTurn { .. } | ConsumerRequest::Unavailable => request.feature,
         ConsumerRequest::Service { consumer } => consumer.feature(),
         ConsumerRequest::Context { .. } => Feature::ContextReranking,
-        ConsumerRequest::EvalDiagnosis { .. } => Feature::EvalCategorization,
+        ConsumerRequest::EvalDiagnosis { .. } | ConsumerRequest::EvalRun { .. } => {
+            Feature::EvalCategorization
+        }
         ConsumerRequest::SessionCategorization { .. } => Feature::SessionCategorization,
     };
     if expected != request.feature {
@@ -608,6 +683,7 @@ async fn execute_public(
                 capture.outcome = TerminalOutcome::Succeeded;
             }
         }
+        ConsumerRequest::EvalRun { .. } => return Err(()),
         ConsumerRequest::Unavailable => {}
     }
     Ok(())

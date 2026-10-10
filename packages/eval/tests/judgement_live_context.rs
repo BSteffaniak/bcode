@@ -409,6 +409,31 @@ fn live_context_fresh_import_pair() {
 }
 
 #[test]
+#[ignore = "coordinator-only normal consumer pilot; explicit source-pinned subject/job required"]
+fn live_normal_consumer_artifact_pilot() {
+    let job = std::env::var_os("BCODE_LIVE_NORMAL_JOB").expect("explicit normal pilot job path");
+    let python = std::env::var_os("BCODE_LIVE_CONTEXT_PYTHON")
+        .expect("explicit Python 3.11+ executable path");
+    assert!(Path::new(&python).is_absolute());
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/judgement-normal-live.py")
+        .canonicalize()
+        .unwrap();
+    let status = Command::new(python)
+        .args(["-B", "-I"])
+        .arg(script)
+        .arg("--file")
+        .arg(job)
+        .stdin(Stdio::null())
+        .status()
+        .expect("normal public CLI pilot launcher available");
+    assert!(
+        status.success(),
+        "normal pilot evidence gap; inspect external normal-pilot.json"
+    );
+}
+
+#[test]
 fn subprocess_timeout_does_not_claim_cancellation_or_success() {
     let mut child = Command::new("/bin/sleep")
         .arg("1")

@@ -26728,6 +26728,18 @@ async fn prepare_static_model_turn_context(
         },
         skill_catalog_eligible && shortlist.len() >= 2 && !newest_task.is_empty(),
     );
+    let original_skill_ids: Vec<String> = shortlist
+        .iter()
+        .filter_map(|candidate| {
+            let index = candidate.get("id")?.as_str()?.parse::<usize>().ok()?;
+            Some(skill_summaries.get(index)?.id.to_string())
+        })
+        .collect();
+    let mut final_skill_order: Vec<String> = shortlist
+        .iter()
+        .filter_map(|candidate| candidate.get("id")?.as_str().map(str::to_owned))
+        .collect();
+    let mut skill_ranking_applied = false;
     if let Some(purpose) =
         skill_catalog_ranking_purpose(skill_catalog_eligible, pressure, &config.judgement)
         && let Some(order) = optional_selection_order(
@@ -26752,7 +26764,27 @@ async fn prepare_static_model_turn_context(
                 skill_summaries[slot] = original[index].clone();
             }
         }
-        observation.finish(true, selection_observation(&shortlist, &order, &order));
+        final_skill_order.clone_from(&order);
+        skill_ranking_applied = shortlist.iter().zip(&order).any(|(candidate, id)| {
+            candidate.get("id").and_then(serde_json::Value::as_str) != Some(id.as_str())
+        });
+        if pressure {
+            observation.finish(
+                skill_ranking_applied,
+                selection_observation(&shortlist, &order, &order),
+            );
+        }
+    }
+    if !pressure
+        && let Some(selection) =
+            selection_observation(&shortlist, &final_skill_order, &final_skill_order)
+    {
+        observation.finish_recommendation(
+            bcode_model::judgement::RecommendationDomain::Skills,
+            original_skill_ids,
+            selection,
+            skill_ranking_applied,
+        );
     }
     let skill_catalog = if config.system_prompt.sections.skill_catalog {
         format_skill_catalog_for_prompt(
@@ -26974,7 +27006,12 @@ async fn prepare_static_model_turn_context(
         bcode_model::judgement::Feature::Recommendations,
         shortlist.len() >= 2 && !newest_task.is_empty(),
     );
-    if let Some(order) = optional_selection_order(
+    let original_tool_ids: Vec<String> = shortlist
+        .iter()
+        .filter_map(|candidate| candidate.get("id")?.as_str().map(str::to_owned))
+        .collect();
+    let mut final_tool_order = original_tool_ids.clone();
+    let tool_ranking_applied = optional_selection_order(
         state,
         newest_task,
         "recommendations",
@@ -26984,14 +27021,24 @@ async fn prepare_static_model_turn_context(
         &observation,
     )
     .await
-    {
+    .is_some_and(|order| {
         let original = base_tools.clone();
         for (slot, id) in order.iter().enumerate() {
             if let Some(tool) = original.iter().find(|tool| &tool.name == id) {
                 base_tools[slot] = tool.clone();
             }
         }
-        observation.finish(true, selection_observation(&shortlist, &order, &order));
+        final_tool_order.clone_from(&order);
+        order != original_tool_ids
+    });
+    if let Some(selection) = selection_observation(&shortlist, &final_tool_order, &final_tool_order)
+    {
+        observation.finish_recommendation(
+            bcode_model::judgement::RecommendationDomain::Tools,
+            original_tool_ids,
+            selection,
+            tool_ranking_applied,
+        );
     }
     if !execution.allow_user_questions {
         system_messages.push(ModelMessage {
@@ -30044,6 +30091,29 @@ struct ConsumerObservationGuard {
 }
 
 impl ConsumerObservationGuard {
+    fn finish_recommendation(
+        &self,
+        domain: bcode_model::judgement::RecommendationDomain,
+        candidate_ids: Vec<String>,
+        selection: bcode_model::judgement::SelectionObservation,
+        applied: bool,
+    ) {
+        if let Some(operation) = &self.operation {
+            operation.finish_recommendation(
+                if applied {
+                    bcode_model::judgement::ApplicationDisposition::Applied
+                } else {
+                    bcode_model::judgement::ApplicationDisposition::BaselineRetained
+                },
+                bcode_model::judgement::RecommendationSelectionObservation {
+                    domain,
+                    candidate_ids,
+                    selection,
+                },
+            );
+        }
+    }
+
     fn finish(
         &self,
         applied: bool,
@@ -30814,6 +30884,18 @@ async fn observe_settled_tool_triage(
             triage_observation.operation.as_ref(),
         )
         .await;
+        if let Some(response) = &advisory
+            && response.get("trigger").and_then(serde_json::Value::as_str) == Some("not_applicable")
+            && response
+                .get("advisory")
+                .is_none_or(serde_json::Value::is_null)
+            && response
+                .get("observation")
+                .is_none_or(serde_json::Value::is_null)
+            && let Some(operation) = &triage_observation.operation
+        {
+            operation.record_not_applicable();
+        }
         if let Some(advisory) = advisory.and_then(|response| response.get("advisory").cloned()) {
             let accepted = deliver_diagnostic_advisory(invoker, &call.id, advisory).await;
             triage_observation.finish(accepted, None);
@@ -31015,6 +31097,15 @@ async fn observe_settled_session_tool(
     };
     if invoker.cancel_state.is_cancelled() {
         return;
+    }
+    if reply.get("trigger").and_then(serde_json::Value::as_str) == Some("not_applicable")
+        && reply.get("advice").is_none_or(serde_json::Value::is_null)
+        && reply
+            .get("observation")
+            .is_none_or(serde_json::Value::is_null)
+        && let Some(operation) = &observation.operation
+    {
+        operation.record_not_applicable();
     }
     let payload = invoker
         .state

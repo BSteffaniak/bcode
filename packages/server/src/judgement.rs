@@ -142,6 +142,7 @@ impl TurnObservationHandle {
                     inference_complete: trigger != judgement::TriggerDisposition::Triggered,
                     application: None,
                     selection: None,
+                    recommendation: None,
                 });
             Some(index)
         });
@@ -206,6 +207,26 @@ impl TurnObservationHandle {
 }
 
 impl ConsumerOperationHandle {
+    /// Record a producer's explicit no-work prerequisite result, only before central work.
+    pub fn record_not_applicable(&self) {
+        if !self
+            .pending
+            .lock()
+            .is_ok_and(|pending| pending.0 == 0 && !pending.1)
+        {
+            return;
+        }
+        self.update(|op| {
+            if op.trigger == judgement::TriggerDisposition::Triggered
+                && op.inference.is_empty()
+                && op.application.is_none()
+            {
+                op.trigger = judgement::TriggerDisposition::NotApplicable;
+                op.inference_complete = true;
+            }
+        });
+    }
+
     /// Mark central work as pending before dispatch, including cancellation without a reply.
     pub fn inference_started(&self) {
         if let Ok(mut pending) = self.pending.lock() {
@@ -288,6 +309,22 @@ impl ConsumerOperationHandle {
             }
             op.application = Some(application);
             op.selection = selection;
+        });
+    }
+
+    /// Acknowledge an installed advisory catalog permutation with original identities.
+    pub fn finish_recommendation(
+        &self,
+        application: judgement::ApplicationDisposition,
+        recommendation: judgement::RecommendationSelectionObservation,
+    ) {
+        self.update(|op| {
+            if op.application.is_some() {
+                return;
+            }
+            op.selection = Some(recommendation.selection.clone());
+            op.recommendation = Some(recommendation);
+            op.application = Some(application);
         });
     }
 
@@ -833,6 +870,42 @@ mod observation_tests {
         Feature::Recommendations,
         Feature::SessionCategorization,
     ];
+
+    #[test]
+    fn explicit_no_work_prerequisite_closes_without_inventing_inference() {
+        let session = bcode_session_models::SessionId::new();
+        let mut registry = super::TurnObservationStore::default();
+        let turn = registry.begin(session, "prerequisite-test").unwrap();
+        let operation = turn.begin_operation(
+            judgement::Feature::ToolResultTriage,
+            judgement::TriggerDisposition::Triggered,
+        );
+        operation.record_not_applicable();
+        operation.finish(judgement::ApplicationDisposition::BaselineRetained, None);
+        let json = registry
+            .snapshot_json(session, "prerequisite-test")
+            .unwrap();
+        let snapshot: judgement::TurnJudgementObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            snapshot.operations[0].trigger,
+            judgement::TriggerDisposition::NotApplicable
+        );
+        assert!(snapshot.operations[0].inference_complete);
+        assert!(snapshot.operations[0].inference.is_empty());
+        let pending = turn.begin_operation(
+            judgement::Feature::ToolResultTriage,
+            judgement::TriggerDisposition::Triggered,
+        );
+        pending.inference_started();
+        pending.record_not_applicable();
+        let snapshot = turn.0.lock().unwrap();
+        assert_eq!(
+            snapshot.operations[1].trigger,
+            judgement::TriggerDisposition::Triggered
+        );
+        assert!(!snapshot.operations[1].inference_complete);
+        drop(snapshot);
+    }
 
     #[test]
     fn disabled_complete_closure_is_stable_and_turns_are_isolated() {

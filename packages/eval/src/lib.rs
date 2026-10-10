@@ -381,7 +381,19 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
 ///
 /// Returns an error when suite loading, execution, judging, or report writing fails.
 pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
-    let mut suite = load_suite(&options.suite_path)?;
+    run_loaded_suite(options, load_suite(&options.suite_path)?)
+}
+
+/// Execute the caller's already-loaded suite snapshot without rereading its source file.
+/// Relative resources still resolve against the explicit suite locator in `options`.
+///
+/// # Errors
+/// Returns validation, execution, judging, or report-writing errors.
+pub fn run_loaded_suite(
+    options: &EvalRunOptions,
+    mut suite: EvalSuite,
+) -> Result<EvalRunResult, EvalError> {
+    validate_suite(&suite)?;
     let suite_dir = options
         .suite_path
         .parent()

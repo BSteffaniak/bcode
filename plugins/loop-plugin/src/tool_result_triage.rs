@@ -102,6 +102,10 @@ pub struct TriageResponse {
     /// Transient central operation facts; absent for no trigger or legacy replies.
     #[serde(default)]
     pub observation: Option<judgement::OptionalOperationObservation>,
+    /// Plugin-owned prerequisite fact, not proof of inference completion or application.
+    /// Missing legacy facts remain unknown; only `NotApplicable` certifies no central work.
+    #[serde(default)]
+    pub trigger: Option<judgement::TriggerDisposition>,
 }
 
 /// Invoke the diagnostic service. Unsupported envelopes fail closed; optional access failures
@@ -272,8 +276,30 @@ fn judgement_request(input: &TriageRequest) -> Option<OptionalRequest> {
 }
 
 fn classify(bridge: &ServiceBridge, input: &TriageRequest) -> Option<TriageResponse> {
-    let request = judgement_request(input)?;
-    let payload = serde_json::to_value(&request).ok()?;
+    if !valid_input(input) {
+        return None;
+    }
+    let Some(request) = judgement_request(input) else {
+        return Some(TriageResponse {
+            trigger: Some(judgement::TriggerDisposition::NotApplicable),
+            ..TriageResponse::default()
+        });
+    };
+    // Eligibility is known before dispatch. A missing reply cannot certify zero work.
+    Some(
+        query(bridge, input, &request).unwrap_or_else(|| TriageResponse {
+            trigger: Some(judgement::TriggerDisposition::Triggered),
+            ..TriageResponse::default()
+        }),
+    )
+}
+
+fn query(
+    bridge: &ServiceBridge,
+    input: &TriageRequest,
+    request: &OptionalRequest,
+) -> Option<TriageResponse> {
+    let payload = serde_json::to_value(request).ok()?;
     let resolution = bridge
         .request(&ServiceBridgeRequest::InvokeService(
             bcode_tool::ToolInvocationServiceRequest {
@@ -293,7 +319,7 @@ fn classify(bridge: &ServiceBridge, input: &TriageRequest) -> Option<TriageRespo
         return None;
     };
     let response = serde_json::from_value::<OptionalResponse>(payload).ok()?;
-    Some(apply_optional(&request, response))
+    Some(apply_optional(request, response))
 }
 
 fn apply_optional(request: &OptionalRequest, response: OptionalResponse) -> TriageResponse {
@@ -303,6 +329,7 @@ fn apply_optional(request: &OptionalRequest, response: OptionalResponse) -> Tria
             .as_ref()
             .and_then(|response| apply(request, response)),
         observation: response.observation,
+        trigger: Some(judgement::TriggerDisposition::Triggered),
     }
 }
 
@@ -416,6 +443,7 @@ mod tests {
         }))
         .unwrap();
         assert!(legacy.observation.is_none());
+        assert!(legacy.trigger.is_none());
         for outcome in [
             judgement::OptionalOperationOutcome::Disabled,
             judgement::OptionalOperationOutcome::TimedOut,
@@ -492,7 +520,12 @@ mod tests {
                     .is_none_or(|response| response.advisory.is_none())
             );
         }
-        assert!(classify(&ServiceBridge::default(), &input()).is_none());
+        let unavailable = classify(&ServiceBridge::default(), &input()).unwrap();
+        assert!(unavailable.advisory.is_none());
+        assert_eq!(
+            unavailable.trigger,
+            Some(judgement::TriggerDisposition::Triggered)
+        );
     }
 
     fn context(request: &TriageRequest, bridge: ServiceBridge) -> NativeServiceContext {
@@ -528,7 +561,38 @@ mod tests {
         let response = invoke(&context(&input(), ServiceBridge::default()));
         assert!(response.error.is_none());
         let response: TriageResponse = serde_json::from_slice(&response.payload).unwrap();
-        assert_eq!(response, TriageResponse::default());
+        assert_eq!(
+            response,
+            TriageResponse {
+                trigger: Some(judgement::TriggerDisposition::Triggered),
+                ..TriageResponse::default()
+            }
+        );
+
+        let mut successful = input();
+        successful.is_error = false;
+        let response = invoke(&context(&successful, bridge(&fixture)));
+        assert!(response.error.is_none());
+        let response: TriageResponse = serde_json::from_slice(&response.payload).unwrap();
+        assert_eq!(
+            response,
+            TriageResponse {
+                trigger: Some(judgement::TriggerDisposition::NotApplicable),
+                ..TriageResponse::default()
+            }
+        );
+        let mut uncertain_error = input();
+        uncertain_error.output_excerpt = "unrecognized diagnostic".into();
+        let response = invoke(&context(&uncertain_error, bridge(&fixture)));
+        assert!(response.error.is_none());
+        let response: TriageResponse = serde_json::from_slice(&response.payload).unwrap();
+        assert_eq!(
+            response.trigger,
+            Some(judgement::TriggerDisposition::NotApplicable)
+        );
+        assert!(response.advisory.is_none());
+        assert!(response.observation.is_none());
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 
         let cancelled = context(&input(), bridge(&fixture));
         cancelled.cancellation.cancel();
@@ -671,10 +735,19 @@ mod tests {
             response: serde_json::json!({"response": null}),
         };
         let bridge = bridge(&fixture);
+        let assert_not_applicable = |request: &TriageRequest| {
+            let response = classify(&bridge, request).unwrap();
+            assert_eq!(
+                response.trigger,
+                Some(judgement::TriggerDisposition::NotApplicable)
+            );
+            assert!(response.advisory.is_none());
+            assert!(response.observation.is_none());
+        };
         let mut request = input();
         request.is_error = false;
         request.excerpt_truncated = true;
-        assert!(classify(&bridge, &request).is_none());
+        assert_not_applicable(&request);
         request.partial = true;
         assert!(judgement_request(&request).is_some());
         request.output_excerpt = "界".repeat(MAX_EXCERPT_BYTES / 3 + 1);
@@ -682,13 +755,50 @@ mod tests {
         request.output_excerpt.clear();
         request.partial = false;
         request.is_error = true;
-        assert!(classify(&bridge, &request).is_none());
+        assert_not_applicable(&request);
         request = input();
         request.output_excerpt = "arbitrary sensitive content without diagnostic indicators".into();
-        assert!(classify(&bridge, &request).is_none());
+        assert_not_applicable(&request);
         request = input();
         request.version = 2;
         assert!(classify(&bridge, &request).is_none());
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn eligible_missing_or_malformed_central_reply_is_not_zero_work() {
+        for payload in [
+            serde_json::json!({"response": null}),
+            serde_json::json!({"response": "malformed"}),
+        ] {
+            let fixture = Fixture {
+                calls: AtomicUsize::new(0),
+                response: payload,
+            };
+            let response = classify(&bridge(&fixture), &input()).unwrap();
+            assert_eq!(
+                response.trigger,
+                Some(judgement::TriggerDisposition::Triggered)
+            );
+            assert!(response.advisory.is_none());
+            assert!(response.observation.is_none());
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn eligible_transport_unavailable_retains_trigger() {
+        let bridge = ServiceBridge::new(
+            None,
+            std::ptr::null_mut(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let response = classify(&bridge, &input()).unwrap();
+        assert_eq!(
+            response.trigger,
+            Some(judgement::TriggerDisposition::Triggered)
+        );
+        assert!(response.advisory.is_none());
+        assert!(response.observation.is_none());
     }
 }

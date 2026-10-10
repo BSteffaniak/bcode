@@ -129,6 +129,28 @@ impl SelectionObservation {
     }
 }
 
+/// Domain of an advisory catalog selection, never execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationDomain {
+    /// Authorized tool catalog.
+    Tools,
+    /// Eligible skill catalog.
+    Skills,
+}
+
+/// Original bounded public catalog identities paired with final selection ordinals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecommendationSelectionObservation {
+    /// Catalog domain; tool and skill rounds must not be conflated.
+    pub domain: RecommendationDomain,
+    /// Original IDs only, not descriptions, arguments, paths, or provider data.
+    pub candidate_ids: Vec<String>,
+    /// Actual final ordering and admission.
+    pub selection: SelectionObservation,
+}
+
 /// One correlated consumer invocation; no input, prose, credentials or provider wire data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,6 +169,9 @@ pub struct ConsumerOperationObservation {
     pub application: Option<ApplicationDisposition>,
     /// Actual final selection, absent if not exposed by that consumer.
     pub selection: Option<SelectionObservation>,
+    /// Bounded original identities for recommendation rounds; absent in older snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<RecommendationSelectionObservation>,
 }
 
 /// Producer domain whose completeness is certified; eval attempts are not conversational turns.
@@ -227,6 +252,21 @@ impl TurnJudgementObservation {
             }
             if let Some(selection) = &operation.selection {
                 selection.validate()?;
+            }
+            if let Some(recommendation) = &operation.recommendation {
+                let ids = &recommendation.candidate_ids;
+                if operation.feature != Feature::Recommendations
+                    || ids.len() > 32
+                    || ids.len() != recommendation.selection.candidate_count
+                    || ids.iter().any(|id| {
+                        id.is_empty() || id.len() > 256 || id.chars().any(char::is_control)
+                    })
+                    || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+                    || operation.selection.as_ref() != Some(&recommendation.selection)
+                {
+                    return Err("invalid recommendation observation");
+                }
+                recommendation.selection.validate()?;
             }
         }
         let all: &[Feature] = match self.scope {

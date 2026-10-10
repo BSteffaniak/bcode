@@ -103,6 +103,10 @@ pub struct ProgressResponse {
     /// Transient central operation facts; absent for no trigger or legacy replies.
     #[serde(default)]
     pub observation: Option<judgement::OptionalOperationObservation>,
+    /// Plugin-owned prerequisite fact; missing legacy facts remain unknown.
+    /// Only `NotApplicable` certifies that no central work was requested.
+    #[serde(default)]
+    pub trigger: Option<judgement::TriggerDisposition>,
 }
 
 fn bounded_text(text: &str, limit: usize) -> bool {
@@ -231,7 +235,34 @@ fn observe(
     identity: &str,
     input: &ProgressRequest,
 ) -> Option<ProgressResponse> {
-    let payload = serde_json::to_value(prepare(input)?).ok()?;
+    if !valid(input) {
+        return None;
+    }
+    let Some(request) = prepare(input) else {
+        return Some(ProgressResponse {
+            version: 1,
+            advice: None,
+            observation: None,
+            trigger: Some(judgement::TriggerDisposition::NotApplicable),
+        });
+    };
+    Some(
+        query(bridge, identity, input, &request).unwrap_or(ProgressResponse {
+            version: 1,
+            advice: None,
+            observation: None,
+            trigger: Some(judgement::TriggerDisposition::Triggered),
+        }),
+    )
+}
+
+fn query(
+    bridge: &ServiceBridge,
+    identity: &str,
+    input: &ProgressRequest,
+    request: &OptionalRequest,
+) -> Option<ProgressResponse> {
+    let payload = serde_json::to_value(request).ok()?;
     let ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Responded {
         payload,
     }) = bridge
@@ -261,6 +292,7 @@ fn apply_optional(input: &ProgressRequest, response: OptionalResponse) -> Progre
             .as_ref()
             .and_then(|response| apply(input, response)),
         observation: response.observation,
+        trigger: Some(judgement::TriggerDisposition::Triggered),
     }
 }
 
@@ -287,6 +319,7 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
         version: 1,
         advice: None,
         observation: None,
+        trigger: None,
     });
     if context.cancellation.is_cancelled() {
         response.advice = None;
@@ -467,6 +500,7 @@ mod tests {
         }))
         .unwrap();
         assert!(legacy.observation.is_none());
+        assert!(legacy.trigger.is_none());
         let input = input(ProgressScope::Session {
             id: "session".into(),
         });
@@ -484,6 +518,76 @@ mod tests {
         );
         assert!(response.advice.is_none());
         assert_eq!(response.observation, Some(observation));
+        assert_eq!(
+            response.trigger,
+            Some(judgement::TriggerDisposition::Triggered)
+        );
+    }
+
+    #[test]
+    fn valid_no_work_windows_report_not_applicable_without_dispatch() {
+        let mut calls = 0_u32;
+        let bridge = ServiceBridge::new(
+            Some(unavailable_callback),
+            (&raw mut calls).cast(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let mut request = input(ProgressScope::Session {
+            id: "session".into(),
+        });
+        for item in &mut request.observations {
+            item.failure_key = None;
+        }
+        for count in [1, 2, 3] {
+            let mut window = request.clone();
+            window.observations.truncate(count);
+            let response = observe(&bridge, "session", &window).unwrap();
+            assert_eq!(
+                response.trigger,
+                Some(judgement::TriggerDisposition::NotApplicable)
+            );
+            assert!(response.advice.is_none());
+            assert!(response.observation.is_none());
+        }
+        assert_eq!(calls, 0);
+        request.version = 2;
+        assert!(observe(&bridge, "session", &request).is_none());
+    }
+
+    #[test]
+    fn qualified_work_with_unavailable_transport_is_not_zero_work() {
+        let request = input(ProgressScope::Session {
+            id: "session".into(),
+        });
+        assert!(prepare(&request).is_some());
+        let mut calls = 0_u32;
+        let bridge = ServiceBridge::new(
+            Some(unavailable_callback),
+            (&raw mut calls).cast(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let response = observe(&bridge, "session", &request).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            response.trigger,
+            Some(judgement::TriggerDisposition::Triggered)
+        );
+        assert!(response.advice.is_none());
+        assert!(response.observation.is_none());
+    }
+
+    extern "C" fn unavailable_callback(
+        _input_ptr: *const u8,
+        _input_len: usize,
+        _output_ptr: *mut u8,
+        _output_capacity: usize,
+        _output_len: *mut usize,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        unsafe {
+            *user_data.cast::<u32>() += 1;
+        }
+        -1
     }
 
     extern "C" fn progress_callback(
@@ -565,6 +669,10 @@ mod tests {
                 assert!(response.error.is_none());
                 let response: ProgressResponse = serde_json::from_slice(&response.payload).unwrap();
                 assert_eq!(response.version, 1);
+                assert_eq!(
+                    response.trigger,
+                    Some(judgement::TriggerDisposition::Triggered)
+                );
                 assert_eq!(response.advice.is_some(), mode == 1);
                 let observation = response.observation.unwrap();
                 assert_eq!(observation.verification_invocations, 1);
@@ -591,7 +699,13 @@ mod tests {
         let input = input(ProgressScope::Session {
             id: "session".into(),
         });
-        assert!(observe(&ServiceBridge::default(), "request", &input).is_none());
+        let unavailable = observe(&ServiceBridge::default(), "request", &input).unwrap();
+        assert_eq!(
+            unavailable.trigger,
+            Some(judgement::TriggerDisposition::Triggered)
+        );
+        assert!(unavailable.advice.is_none());
+        assert!(unavailable.observation.is_none());
         let mut response = answers(0.1, 0.9, 0.1);
         response.answers.remove("drift");
         assert!(apply(&input, &response).is_none());

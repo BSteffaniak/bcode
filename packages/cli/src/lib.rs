@@ -8711,6 +8711,11 @@ fn list_ignored_models(provider: Option<&str>, json: bool) -> Result<(), CliErro
 
 #[derive(Debug, Subcommand)]
 enum JudgementCommand {
+    /// Read bounded, exact-turn application evidence without dispatching model work.
+    ObserveTurn {
+        session_id: SessionId,
+        turn_id: String,
+    },
     /// Capture one bounded actual-consumer benchmark job on an already-running subject.
     BenchmarkCapture {
         #[arg(long)]
@@ -8748,40 +8753,64 @@ fn read_judgement_benchmark_input(path: &Path, limit: usize) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+async fn capture_judgement_benchmark(file: &std::path::Path) -> Result<(), CliError> {
+    let bytes =
+        read_judgement_benchmark_input(file, bcode_eval::judgement_capture::MAX_CAPTURE_BYTES)?;
+    let job = bcode_eval::judgement_capture::decode_capture_job(&bytes)
+        .map_err(|error| CliError::InvalidArguments(error.into()))?;
+    let (executable, digest) = bcode_daemon_lifecycle::current_executable_identity()
+        .map_err(|_| CliError::InvalidArguments("cannot verify subject executable".into()))?;
+    if job.request.subject.executable != executable
+        || job.request.subject.executable_sha256 != digest
+        || job.request.subject.artifact_id != bcode_ipc::ArtifactId::current().to_string()
+        || job.request.subject.state_id != bcode_ipc::state_location_id()
+    {
+        return Err(CliError::InvalidArguments(
+            "benchmark subject identity mismatch".into(),
+        ));
+    }
+    let client = BcodeClient::default_endpoint()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
+    let result = if matches!(
+        &job.consumer,
+        bcode_eval::judgement_capture::ConsumerRequest::EvalRun { .. }
+    ) {
+        // Dedicated CLI process: synchronous eval environment guards must not run
+        // inside the daemon or overlap other admissions in this process.
+        tokio::task::spawn_blocking(move || {
+            bcode_eval::judgement_capture::capture_normal_eval_run(job)
+        })
+        .await
+        .map_err(|_| CliError::InvalidArguments("eval capture task failed".into()))?
+        .map_err(|error| CliError::InvalidArguments(error.into()))?
+    } else {
+        bcode_eval::judgement_capture::execute_capture_job(&client, job)
+            .await
+            .map_err(|error| CliError::InvalidArguments(error.into()))?
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&result).map_err(|_| {
+            CliError::InvalidArguments("cannot encode benchmark capture".into())
+        })?
+    );
+    Ok(())
+}
+
 async fn handle_judgement_command(command: JudgementCommand) -> Result<(), CliError> {
     match command {
-        JudgementCommand::BenchmarkCapture { file } => {
-            let bytes = read_judgement_benchmark_input(
-                &file,
-                bcode_eval::judgement_capture::MAX_CAPTURE_BYTES,
-            )?;
-            let job = bcode_eval::judgement_capture::decode_capture_job(&bytes)
-                .map_err(|error| CliError::InvalidArguments(error.into()))?;
-            let (executable, digest) = bcode_daemon_lifecycle::current_executable_identity()
-                .map_err(|_| {
-                    CliError::InvalidArguments("cannot verify subject executable".into())
-                })?;
-            if job.request.subject.executable != executable
-                || job.request.subject.executable_sha256 != digest
-                || job.request.subject.artifact_id != bcode_ipc::ArtifactId::current().to_string()
-                || job.request.subject.state_id != bcode_ipc::state_location_id()
-            {
-                return Err(CliError::InvalidArguments(
-                    "benchmark subject identity mismatch".into(),
-                ));
-            }
+        JudgementCommand::ObserveTurn {
+            session_id,
+            turn_id,
+        } => {
             let client = BcodeClient::default_endpoint()
                 .with_daemon_availability(DaemonAvailability::RequireRunning);
-            let result = bcode_eval::judgement_capture::execute_capture_job(&client, job)
-                .await
-                .map_err(|error| CliError::InvalidArguments(error.into()))?;
-            println!(
-                "{}",
-                serde_json::to_string(&result).map_err(|_| {
-                    CliError::InvalidArguments("cannot encode benchmark capture".into())
-                })?
-            );
+            let observation = client
+                .turn_judgement_observation(session_id, &turn_id)
+                .await?;
+            print_json(&observation)?;
         }
+        JudgementCommand::BenchmarkCapture { file } => capture_judgement_benchmark(&file).await?,
         JudgementCommand::BenchmarkCompare { file } => {
             let bytes = read_judgement_benchmark_input(&file, 8 * 1024 * 1024)?;
             let report = bcode_eval::judgement_capture::compare_capture_job(&bytes)

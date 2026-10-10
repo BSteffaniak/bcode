@@ -610,6 +610,66 @@ pub fn activity_scan_allowance(
     Ok(Duration::from_millis(milliseconds))
 }
 
+fn optional_categorization_allowance(
+    metadata: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Duration, EvalError> {
+    let milliseconds = match metadata.get("optional_categorization_allowance_ms") {
+        None => 45_000,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=300_000).contains(value))
+            .ok_or_else(|| {
+                EvalError::Validation(
+                    "optional_categorization_allowance_ms must be an integer in 1..=300000".into(),
+                )
+            })?,
+    };
+    Ok(Duration::from_millis(milliseconds))
+}
+
+// Optional advice has its own bounded allowance, never authority to repair capture gaps.
+fn categorize_attempt(
+    directory: &std::path::Path,
+    allowance: Duration,
+    oracle: &serde_json::Value,
+    diagnosis: &mut serde_json::Value,
+    invoke: &impl Fn(&[String], &str, Duration) -> Result<serde_json::Value, EvalError>,
+) -> Result<bcode_model::judgement::ConsumerOperationObservation, EvalError> {
+    let mut failure = None;
+    let operation = super::diagnosis::invoke_attempt(oracle, diagnosis, |args| {
+        match invoke(args, "optional-eval-categorization", allowance) {
+            Ok(value)
+                if serde_json::from_value::<bcode_model::judgement::OptionalResponse>(
+                    value.clone(),
+                )
+                .is_ok() =>
+            {
+                Some(value)
+            }
+            Ok(_) => {
+                failure = Some("invalid_response");
+                None
+            }
+            Err(_) => {
+                // Do not persist arbitrary subprocess errors or provider-private text.
+                failure = Some("invocation_failed");
+                None
+            }
+        }
+    });
+    if let Some(code) = failure {
+        write_json(
+            directory.join("optional-eval-categorization-error.json"),
+            &serde_json::json!({
+                "schema_version": 1,
+                "code": code,
+                "message": "Optional eval categorization unavailable; inference evidence remains incomplete.",
+            }),
+        )?;
+    }
+    Ok(operation)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CliReadDiagnostic {
@@ -911,6 +971,7 @@ pub fn execute(
     )
     .ok_or_else(|| EvalError::Validation("activity scan session budget must be positive".into()))?;
     let scan_allowance = activity_scan_allowance(&suite.metadata)?;
+    let categorization_allowance = optional_categorization_allowance(&suite.metadata)?;
     let activity_ipc =
         operational_allowance(&suite.metadata, "workflow_activity_ipc_allowance_ms")?;
     let inspection_ipc =
@@ -1734,14 +1795,13 @@ pub fn execute(
     let oracle_value = serde_json::json!({"completion_claimed":completed,"status":status,"capture_complete":capture_complete,"timed_out":timed_out,"artifact_correct":artifact_correct,"artifact_observed":artifact_observed,"false_completion":false_completion,"preservation_passed":preservation,"completion_failure":completion_failure});
     let mut diagnosis =
         super::diagnosis::classify(&oracle_value, &outputs, &final_inspection, &measurements);
-    let operation = super::diagnosis::invoke_attempt(&oracle_value, &mut diagnosis, |args| {
-        invoke(
-            args,
-            "optional-eval-categorization",
-            Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms)),
-        )
-        .ok()
-    });
+    let operation = categorize_attempt(
+        rep_dir,
+        categorization_allowance,
+        &oracle_value,
+        &mut diagnosis,
+        execution_invoke,
+    )?;
     let observation = super::diagnosis::EvalAttemptJudgementObservation::new(
         run_id.to_owned(),
         status,
@@ -2377,6 +2437,183 @@ mod observation_tests {
             assert!(output.artifacts.is_empty());
             assert_eq!(output.diagnostics.len(), 1);
             assert_eq!(serde_json::to_vec(&oracle).unwrap(), oracle_before);
+        }
+    }
+
+    #[test]
+    fn categorization_allowance_is_explicit_and_bounded() {
+        let mut metadata = std::collections::BTreeMap::new();
+        assert_eq!(
+            optional_categorization_allowance(&metadata).unwrap(),
+            Duration::from_secs(45)
+        );
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(300_001),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("45000"),
+        ] {
+            metadata.insert("optional_categorization_allowance_ms".into(), value);
+            assert!(optional_categorization_allowance(&metadata).is_err());
+        }
+        for milliseconds in [1_u64, 300_000] {
+            metadata.insert(
+                "optional_categorization_allowance_ms".into(),
+                serde_json::json!(milliseconds),
+            );
+            assert_eq!(
+                optional_categorization_allowance(&metadata).unwrap(),
+                Duration::from_millis(milliseconds)
+            );
+        }
+    }
+
+    #[test]
+    fn depleted_capture_does_not_prevent_disabled_categorization_or_erase_gap() {
+        use bcode_model::judgement::{
+            OptionalOperationObservation, OptionalOperationOutcome, OptionalResponse,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let oracle = serde_json::json!({"status":"completed", "capture_complete":false,
+            "artifact_correct":true,"artifact_observed":true,"preservation_passed":true});
+        let original = oracle.clone();
+        let mut diagnosis = super::super::diagnosis::classify(
+            &oracle,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(
+            diagnosis["labels"],
+            serde_json::json!(["incomplete_execution_evidence"])
+        );
+        let calls = Cell::new(0);
+        let capture_allowance = Duration::ZERO;
+        let capture_invoke =
+            |_: &[String], _: &str, _: Duration| -> Result<serde_json::Value, EvalError> {
+                assert!(capture_allowance.is_zero());
+                Err(EvalError::Validation(
+                    "post-execution capture allowance exhausted".into(),
+                ))
+            };
+        assert!(capture_invoke(&[], "capture", Duration::from_secs(15)).is_err());
+        let execution_invoke = |args: &[String], label: &str, allowance: Duration| {
+            assert_eq!(
+                &args[..3],
+                &["judgement", "optional-judge", "--request-json"]
+            );
+            let request: bcode_model::judgement::OptionalRequest =
+                serde_json::from_str(&args[3]).unwrap();
+            assert_eq!(
+                request.feature,
+                bcode_model::judgement::Feature::EvalCategorization
+            );
+            let bcode_model::judgement::State::Structured(facts) = request.request.state else {
+                panic!("normalized measured facts required");
+            };
+            assert_eq!(facts["capture_complete"], false);
+            assert_eq!(facts["artifact_correct"], true);
+            assert_eq!(label, "optional-eval-categorization");
+            assert_eq!(allowance, Duration::from_secs(45));
+            calls.set(calls.get() + 1);
+            Ok(serde_json::to_value(OptionalResponse {
+                response: None,
+                observation: Some(OptionalOperationObservation {
+                    outcome: OptionalOperationOutcome::Disabled,
+                    ..OptionalOperationObservation::default()
+                }),
+            })
+            .unwrap())
+        };
+        let operation = categorize_attempt(
+            directory.path(),
+            Duration::from_secs(45),
+            &oracle,
+            &mut diagnosis,
+            &execution_invoke,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(operation.inference_complete);
+        assert_eq!(operation.inference[0].inference_invocations, 0);
+        assert_eq!(
+            operation.application,
+            Some(bcode_model::judgement::ApplicationDisposition::BaselineRetained)
+        );
+        assert_eq!(oracle, original);
+        assert_eq!(oracle["capture_complete"], false);
+        assert!(
+            !directory
+                .path()
+                .join("optional-eval-categorization-error.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn categorization_failure_artifact_is_normalized_and_inference_stays_unknown() {
+        let oracle = serde_json::json!({"capture_complete":false});
+        for malformed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut diagnosis = super::super::diagnosis::classify(
+                &oracle,
+                &serde_json::json!([]),
+                &serde_json::json!({}),
+                &std::collections::BTreeMap::new(),
+            );
+            assert_eq!(
+                diagnosis["labels"],
+                serde_json::json!(["incomplete_execution_evidence"])
+            );
+            let calls = Cell::new(0);
+            let operation = categorize_attempt(
+                directory.path(),
+                Duration::from_secs(45),
+                &oracle,
+                &mut diagnosis,
+                &|args, _, allowance| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(allowance, Duration::from_secs(45));
+                    let request: bcode_model::judgement::OptionalRequest =
+                        serde_json::from_str(&args[3]).unwrap();
+                    let bcode_model::judgement::State::Structured(facts) = request.request.state
+                    else {
+                        panic!("normalized measured facts required");
+                    };
+                    assert_eq!(facts["capture_complete"], false);
+                    if malformed {
+                        Ok(serde_json::json!({"response":"invalid"}))
+                    } else {
+                        Err(EvalError::Client("private-secret-marker".into()))
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(calls.get(), 1);
+            assert!(!operation.inference_complete);
+            assert!(operation.inference.is_empty());
+            let bytes = std::fs::read(
+                directory
+                    .path()
+                    .join("optional-eval-categorization-error.json"),
+            )
+            .unwrap();
+            let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                artifact["code"],
+                if malformed {
+                    "invalid_response"
+                } else {
+                    "invocation_failed"
+                }
+            );
+            assert!(
+                !String::from_utf8(bytes)
+                    .unwrap()
+                    .contains("private-secret-marker")
+            );
+            assert_eq!(oracle["capture_complete"], false);
         }
     }
 
