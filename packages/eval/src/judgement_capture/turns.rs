@@ -56,6 +56,9 @@ fn context_output(
         || observation.turn_id != turn_id
         || observation.terminal != Some(terminal)
         || !observation.complete
+        || !observation
+            .covered_features
+            .contains(&Feature::ContextReranking)
         || observation.omitted != 0
     {
         return Err(());
@@ -431,6 +434,26 @@ mod tests {
         assert_eq!(order, ["history:session:7", "history:session:2"]);
         assert_eq!(admitted, ["history:session:7"]);
         assert!(convert(&snapshot, Arm::Off).is_err());
+    }
+
+    #[test]
+    fn history_selection_requires_feature_coverage_and_unique_canonical_sources() {
+        let mut observation = snapshot();
+        observation
+            .covered_features
+            .retain(|feature| *feature != Feature::ContextReranking);
+        assert!(convert(&observation, Arm::Off).is_err());
+        assert!(
+            context_output(
+                &snapshot(),
+                "session",
+                "turn",
+                TerminalOutcome::Succeeded,
+                Arm::Off,
+                &["history:session:2".into(), "history:session:2".into()]
+            )
+            .is_err()
+        );
     }
 
     #[test]

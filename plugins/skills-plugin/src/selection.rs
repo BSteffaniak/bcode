@@ -149,7 +149,7 @@ pub fn prepare(input: &SelectionRequest) -> PreparedSelection {
     }
 }
 
-/// Apply complete confident advice, or retain deterministic baseline without partial updates.
+/// Apply complete valid advice, promoting confident usefulness while retaining baseline remainder.
 #[must_use]
 pub fn apply(input: &ApplyRequest) -> SelectionResult {
     let baseline = || SelectionResult {
@@ -180,19 +180,21 @@ pub fn apply(input: &ApplyRequest) -> SelectionResult {
         else {
             return baseline();
         };
-        // Uncertain or malformed advice must not create a partially reordered shortlist.
-        if !probability.is_finite()
-            || !(0.0..=1.0).contains(probability)
-            || (0.35..=0.65).contains(probability)
-        {
+        // Malformed advice invalidates the whole batch; uncertainty is valid evidence,
+        // but cannot itself justify promotion or a judgement of irrelevance.
+        if !probability.is_finite() || !(0.0..=1.0).contains(probability) {
             return baseline();
         }
-        // This is the probability of usefulness, not confidence in a pairwise ordering.
-        // Only a confident useful/not-useful separation supports overriding baseline.
+        // Context and recommendations both ask usefulness, not pairwise rank or authority.
+        // Promote only confident usefulness; uncertain and negative answers share the
+        // unchanged baseline remainder rather than being ranked against each other.
         ranked.push((candidate.id.clone(), *probability > 0.65));
     }
-    // Stable partition preserves baseline within each band; small probability differences
-    // between two useful (or two unhelpful) candidates are not calibrated ranking evidence.
+    if !ranked.iter().any(|(_, useful)| *useful) {
+        return baseline();
+    }
+    // Stable partition preserves baseline within the useful band and the remainder;
+    // differences in probability within either group are not calibrated ranking evidence.
     ranked.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
     let mut ranked = ranked.into_iter();
     let ordered_ids: Option<Vec<_>> = input

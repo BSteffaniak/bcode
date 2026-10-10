@@ -2,6 +2,23 @@
 
 Measured on 2026-07-31 from the `bcode/daemon-client-compatibility` worktree with the isolated daemon-startup harness.
 
+## Endpoint and startup-fence scope
+
+Default Unix socket discovery uses `/tmp` with a bounded basename scoped to user,
+artifact identity, and resolved state location. It does not depend on `TMPDIR`:
+clients using different temporary directories must reach the same matching daemon.
+Explicit socket overrides retain their existing selection rules.
+
+The detached daemon retains the inherited startup lock for its lifetime. A
+contending launcher probes the matching endpoint rather than replacing that daemon.
+An endpoint mismatch can therefore surface as a startup coordination timeout;
+removing the lock is not a recovery mechanism. Changing the default endpoint applies
+to newly built artifact identities and does not relocate other artifacts' daemons.
+
+For isolated experiments, pin both `BCODE_STATE_DIR` and
+`BCODE_SESSION_STORE_DIR`, as an inherited session-store override can otherwise
+select a different canonical session root despite an explicit state-root flag.
+
 ## Connection tracing
 
 Set `BCODE_STARTUP_TRACE=1` to enable client connection and daemon startup debug

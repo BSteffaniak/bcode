@@ -191,14 +191,14 @@ def materialize(scenario_id, workspace, source_order):
     if not isinstance(source_order, list) or sorted(source_order) != sorted(ids):
         raise ValueError("source_order must be an exact candidate permutation")
     root = Path(workspace)
-    if root.is_symlink() or not root.is_dir() or any(root.iterdir()):
+    if any(p.is_symlink() for p in (root, *root.parents)) or not root.is_dir() or any(root.iterdir()):
         raise ValueError("fresh existing non-symlink directory required")
     for name, content in item["starter_files"].items():
-        (root / name).write_text(content)
+        (root / name).write_text(content, encoding="utf-8")
     by_id = {candidate["id"]: candidate for candidate in item["candidates"]}
     payload = {key: value for key, value in item.items() if key != "starter_files"}
     payload["candidates"] = [by_id[identity] for identity in source_order]
-    (root / "consumer-input.json").write_text(json.dumps(payload, indent=2) + "\n")
+    (root / "consumer-input.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return payload
 
 

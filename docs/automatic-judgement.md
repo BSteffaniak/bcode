@@ -87,9 +87,13 @@ is not durably cached as a session turn.
 Portable requests/responses are at most 256 KiB, batches at most 64 questions, and choices or
 rubrics at most 128 options; providers may be stricter. Selection accepts at most 32 candidates,
 8192-byte task text, 2048-byte descriptions, and 128-byte IDs. Protected-only, empty, malformed,
-or uninformative shortlists make no judgement request. Uncertain ranking probabilities in
-`[0.35, 0.65]`, incomplete answers, and invalid values retain the entire baseline order;
-equal confident scores retain stable baseline ties. Progress evidence is limited to 64
+or uninformative shortlists make no judgement request. Context and recommendation selection
+promote candidates with usefulness probability above `0.65` in stable baseline order.
+Uncertain probabilities in `[0.35, 0.65]` do not veto confident useful candidates or imply
+irrelevance: uncertain and confidently negative candidates remain together afterward in
+original order. Protected positions stay fixed; no candidate is removed. With no confident
+useful candidate, baseline order is retained. Incomplete answers and invalid values reject
+the entire batch; probabilities within either group do not establish ranking. Progress evidence is limited to 64
 nonempty items and a 16-KiB encoded request. Triage accepts at most a 16-KiB service request
 and an 8192-byte excerpt.
 

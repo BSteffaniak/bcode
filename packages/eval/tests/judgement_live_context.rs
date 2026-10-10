@@ -1,4 +1,6 @@
 //! Opt-in real normal-turn context + independent artifact oracle checkpoint.
+//! The paired pilot additionally creates fresh sessions through public Pi import,
+//! verifies bounded canonical references/compaction, and executes off/on capture.
 //! The matching subject CLI owns verified `BcodeClient` admission; this test never
 //! starts a daemon, edits provider selection, seeds private storage or grants permissions.
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
@@ -210,6 +212,8 @@ fn launch(job: &Experiment) -> Result<bool, &'static str> {
     let mut command = Command::new(&job.subject_binary);
     command
         .env("BCODE_CONFIG", &job.config_file)
+        .env("BCODE_STATE_DIR", &job.state_root)
+        .env("BCODE_SESSION_STORE_DIR", job.state_root.join("sessions"))
         .args(["--state-root"])
         .arg(&job.state_root)
         .args(["--profile", &job.profile]);
@@ -237,6 +241,8 @@ fn cancel_prepared_turn(job: &Experiment, capture: &CaptureJob) -> Result<(), &'
     let mut command = Command::new(&job.subject_binary);
     command
         .env("BCODE_CONFIG", &job.config_file)
+        .env("BCODE_STATE_DIR", &job.state_root)
+        .env("BCODE_SESSION_STORE_DIR", job.state_root.join("sessions"))
         .arg("--state-root")
         .arg(&job.state_root)
         .args(["--profile", &job.profile]);
@@ -375,6 +381,31 @@ fn live_context_artifact_checkpoint() {
         "checkpoint unavailable; consult bounded checkpoint.json"
     );
     // A correctly captured oracle loss is a result, not harness failure or promotion evidence.
+}
+
+#[test]
+#[ignore = "coordinator-only paired live provider pilot; needs explicit subject/config/overlay job"]
+fn live_context_fresh_import_pair() {
+    let job = std::env::var_os("BCODE_LIVE_CONTEXT_PILOT").expect("explicit paired pilot job path");
+    let python = std::env::var_os("BCODE_LIVE_CONTEXT_PYTHON")
+        .expect("explicit Python 3.11+ executable path");
+    assert!(Path::new(&python).is_absolute());
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/judgement-context-live.py")
+        .canonicalize()
+        .unwrap();
+    let status = Command::new(python)
+        .args(["-B", "-I"])
+        .arg(script)
+        .arg("--file")
+        .arg(job)
+        .stdin(Stdio::null())
+        .status()
+        .expect("paired public CLI pilot launcher available");
+    assert!(
+        status.success(),
+        "paired pilot unavailable; inspect external pilot report and reconcile effects"
+    );
 }
 
 #[test]

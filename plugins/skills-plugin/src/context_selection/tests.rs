@@ -94,7 +94,54 @@ fn constrained_budget_admits_relevant_original_evidence_not_distractor() {
 }
 
 #[test]
-fn off_no_key_error_uncertainty_and_malformed_advice_have_identical_baseline() {
+fn mixed_pilot_probabilities_admit_current_evidence_under_pressure() {
+    let mut input = fixture();
+    input.candidates.insert(
+        2,
+        Candidate {
+            id: "observability".into(),
+            source: Source::History,
+            provenance: "session:pilot:sequence:2".into(),
+            snippet: "unrelated observability note".into(),
+            protected: false,
+        },
+    );
+    let original = input.clone();
+    let mut request = advised(input.clone());
+    request.judgement.response.as_mut().unwrap().answers = BTreeMap::from([
+        ("candidate_0".into(), Answer::YesNo { probability: 0.4 }),
+        ("candidate_2".into(), Answer::YesNo { probability: 0.1 }),
+        ("candidate_3".into(), Answer::YesNo { probability: 0.89 }),
+    ]);
+    let result = apply(&request);
+    assert_eq!(
+        result.ordered_ids,
+        [
+            "search-relevant",
+            "explicit",
+            "read-distractor",
+            "observability"
+        ]
+    );
+    assert_eq!(result.included_ids, ["search-relevant", "explicit"]);
+    assert!(result.applied);
+    assert_eq!(request.selection, original);
+
+    // An entirely uncertain/negative batch retains actual baseline admission.
+    request
+        .judgement
+        .response
+        .as_mut()
+        .unwrap()
+        .answers
+        .insert("candidate_3".into(), Answer::YesNo { probability: 0.65 });
+    let baseline = apply(&request);
+    assert_eq!(baseline.included_ids, ["read-distractor", "explicit"]);
+    assert!(!baseline.applied);
+}
+
+#[test]
+fn off_no_key_error_and_malformed_advice_have_identical_baseline() {
     let input = fixture();
     let baseline = apply(&ApplyRequest {
         selection: input.clone(),
@@ -105,7 +152,7 @@ fn off_no_key_error_uncertainty_and_malformed_advice_have_identical_baseline() {
     });
     assert_eq!(baseline.included_ids, ["read-distractor", "explicit"]);
     assert!(!baseline.applied);
-    for probability in [0.5, f64::NAN, 1.1] {
+    for probability in [f64::NAN, 1.1] {
         let mut request = advised(input.clone());
         request
             .judgement

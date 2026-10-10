@@ -59,7 +59,7 @@ def grade(scenario_id, workspace):
     result = {"oracle_id": item["oracle_id"], "status": "fail", "reason": "invalid_artifact",
               "tests": dict.fromkeys(scenarios.test_ids(scenario_id), False)}
     path = Path(workspace) / item["artifact"]
-    if path.is_symlink() or not path.is_file():
+    if any(p.is_symlink() for p in (path, *path.parents)) or not path.is_file():
         return dict(result, reason="missing_or_unsafe_artifact")
     try:
         with path.open("rb") as stream:

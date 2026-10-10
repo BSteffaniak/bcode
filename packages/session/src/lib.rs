@@ -2269,6 +2269,9 @@ impl SessionManager {
 
     /// Import a fully normalized external session as a native Bcode session.
     ///
+    /// Normalized compaction checkpoints summarize the preceding imported prefix;
+    /// their boundaries are rebased to committed canonical event sequences.
+    ///
     /// # Errors
     ///
     /// Returns an error if session creation or event persistence fails.
@@ -2280,19 +2283,33 @@ impl SessionManager {
         events: Vec<(SessionEventKind, Option<SessionEventProvenance>)>,
     ) -> Result<SessionSummary, SessionError> {
         let session = self.create_session(name, working_directory).await?;
-        self.append_event(
-            session.id,
-            SessionEventKind::SessionImported {
-                source_id: import.source_id,
-                source_display_name: import.source_display_name,
-                external_session_id: import.external_session_id,
-                imported_at_ms: import.imported_at_ms,
-            },
-        )
-        .await?;
-        for (event, provenance) in events {
-            self.append_event_with_provenance(session.id, event, provenance)
-                .await?;
+        let imported = self
+            .append_event(
+                session.id,
+                SessionEventKind::SessionImported {
+                    source_id: import.source_id,
+                    source_display_name: import.source_display_name,
+                    external_session_id: import.external_session_id,
+                    imported_at_ms: import.imported_at_ms,
+                },
+            )
+            .await?;
+        let mut previous_sequence = imported.sequence;
+        for (mut event, provenance) in events {
+            if let SessionEventKind::ContextCompacted {
+                compacted_through_sequence,
+                ..
+            } = &mut event
+            {
+                // Normalized import checkpoints summarize the preceding imported prefix.
+                // Source ordinals are not canonical sequences: creation/import events
+                // precede this prefix and must be accounted for by committed receipts.
+                *compacted_through_sequence = previous_sequence;
+            }
+            previous_sequence = self
+                .append_event_with_provenance(session.id, event, provenance)
+                .await?
+                .sequence;
         }
         self.session_summary(session.id).await
     }
@@ -3324,6 +3341,65 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
     use switchy::database::query::FilterableQuery;
+
+    #[tokio::test]
+    async fn imported_compaction_uses_committed_prefix_not_checkpoint_ordinal() {
+        let manager = SessionManager::default();
+        let mut input = Vec::new();
+        for text in ["first contract", "second contract"] {
+            input.push((SessionEventKind::SystemMessage { text: text.into() }, None));
+        }
+        input.push((
+            SessionEventKind::ContextCompacted {
+                summary: "summary".into(),
+                compacted_through_sequence: 1,
+            },
+            None,
+        ));
+        input.push((
+            SessionEventKind::SystemMessage {
+                text: "tail".into(),
+            },
+            None,
+        ));
+        let session = manager
+            .import_session(
+                Some("checkpoint import".into()),
+                test_working_directory(),
+                bcode_session_models::SessionImportSummary {
+                    source_id: "test".into(),
+                    source_display_name: "test".into(),
+                    external_session_id: "checkpoint".into(),
+                    imported_at_ms: 1,
+                },
+                input,
+            )
+            .await
+            .expect("import");
+        let page = manager
+            .session_history_page(
+                session.id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: None,
+                    limit: 20,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                },
+            )
+            .await
+            .expect("bounded canonical history");
+        let index = page
+            .events
+            .iter()
+            .position(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+            .expect("checkpoint");
+        assert!(matches!(&page.events[index].kind,
+            SessionEventKind::ContextCompacted { compacted_through_sequence, .. }
+            if *compacted_through_sequence == page.events[index - 1].sequence
+                && *compacted_through_sequence > 1
+                && *compacted_through_sequence < page.events[index].sequence));
+        assert!(matches!(&page.events.last().expect("tail").kind,
+            SessionEventKind::SystemMessage { text } if text == "tail"));
+    }
 
     #[test]
     fn observation_categories_do_not_expose_nested_payloads() {

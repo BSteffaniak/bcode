@@ -131,6 +131,31 @@ class ContextScenarioTests(unittest.TestCase):
                 path.write_text("def " + signature + ":\n    return 1 / 0\n")
                 self.assertEqual(oracle.grade(identity, root)["status"], "fail")
 
+    def test_symlinked_parent_cannot_supply_artifact_or_workspace(self):
+        with workspace() as root, workspace() as outside:
+            target = Path(outside) / "fresh"
+            target.mkdir()
+            alias = Path(root) / "alias"
+            alias.symlink_to(outside, target_is_directory=True)
+            item = scenarios.scenario("retry-window-v1")
+            order = [c["id"] for c in item["candidates"]]
+            with self.assertRaises(ValueError):
+                scenarios.materialize(item["scenario_id"], alias / "fresh", order)
+            (target / "solution.py").write_text("def retry_delay(attempt):\n    return min(900, 75 * 2 ** attempt)\n")
+            self.assertEqual(oracle.grade(item["scenario_id"], alias / "fresh")["status"], "fail")
+
+    def test_materialized_snippets_are_exact_utf8_and_oracle_not_copied(self):
+        for item in scenarios.corpus(extended=True)["scenarios"]:
+            with workspace() as root:
+                payload = scenarios.materialize(item["scenario_id"], root,
+                                                [c["id"] for c in item["candidates"]])
+                recorded = json.loads((Path(root) / "consumer-input.json").read_text(encoding="utf-8"))
+                self.assertEqual(recorded, payload)
+                self.assertEqual([c["content"].encode("utf-8") for c in recorded["candidates"]],
+                                 [c["content"].encode("utf-8") for c in item["candidates"]])
+                self.assertEqual(set(p.name for p in Path(root).iterdir()),
+                                 {"solution.py", "consumer-input.json"})
+
     def test_live_plan_history_shape_and_counterbalance(self):
         import context_live_plan as plans
         manifest = scenarios.equivalent_pairs({"model": "test"}, {"turns": 1}, 2, extended=True)
@@ -154,7 +179,17 @@ class ContextScenarioTests(unittest.TestCase):
             self.assertEqual(job["repetition"], 0)
             self.assertNotIn("tests", job)
             self.assertNotIn("expected", job)
-        first = bindings[manifest["pairs"][0]["pair_id"]]["off"]
+        import copy
+        duplicate = copy.deepcopy(bindings)
+        first_pair = manifest["pairs"][0]["pair_id"]
+        duplicate[first_pair]["on"]["session_id"] = duplicate[first_pair]["off"]["session_id"].replace("-", "")
+        with self.assertRaises(ValueError):
+            plans.live_development_plan({"model": "test"}, {"turns": 1}, duplicate)
+        altered = copy.deepcopy(bindings)
+        altered[first_pair]["on"]["excerpts"]["contract-current"]["snippet"] += " "
+        with self.assertRaises(ValueError):
+            plans.live_development_plan({"model": "test"}, {"turns": 1}, altered)
+        first = bindings[first_pair]["off"]
         first["excerpts"]["contract-current"]["sequence"] = 20
         with self.assertRaises(ValueError):
             plans.live_development_plan({"model": "test"}, {"turns": 1}, bindings)

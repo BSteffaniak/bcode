@@ -3680,10 +3680,10 @@ fn default_socket_path(endpoint_override_allowed: bool) -> PathBuf {
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
     let namespace = daemon_namespace();
     let digest = socket_scope_digest(&user, &namespace, &state_location_id());
-    socket_path_with_digest(&env::temp_dir(), &digest).unwrap_or_else(|| {
-        socket_path_with_digest(Path::new("/tmp"), &digest)
-            .expect("/tmp can hold a bcode socket path")
-    })
+    // Endpoint discovery must be identical for every client of this artifact/state,
+    // including launchers with different temporary-directory environments.
+    // The scope digest isolates users/artifacts/state; /tmp keeps Unix paths bounded.
+    socket_path_with_digest(Path::new("/tmp"), &digest).expect("/tmp can hold a bcode socket path")
 }
 
 #[cfg(unix)]
@@ -3974,6 +3974,48 @@ mod tests {
             daemon_namespace(),
             daemon_namespace_for(&ArtifactId::current())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_endpoint_environment_probe() {
+        if env::var_os("BCODE_SOCKET_ENDPOINT_PROBE").is_some() {
+            println!("endpoint-probe:{}", default_socket_path(false).display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_endpoint_is_independent_of_temporary_directory() {
+        let executable = env::current_exe().expect("test executable");
+        let mut paths = Vec::new();
+        for directory in [
+            "/tmp",
+            "/var/tmp",
+            "/tmp/a-deliberately-different-temporary-directory",
+        ] {
+            let output = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "tests::socket_endpoint_environment_probe",
+                    "--nocapture",
+                ])
+                .env("BCODE_SOCKET_ENDPOINT_PROBE", "1")
+                .env("TMPDIR", directory)
+                .env("TMP", directory)
+                .env("TEMP", directory)
+                .output()
+                .expect("endpoint probe");
+            assert!(output.status.success());
+            let stdout = String::from_utf8(output.stdout).expect("probe text");
+            let path = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("endpoint-probe:"))
+                .expect("observed endpoint")
+                .to_owned();
+            paths.push(path);
+        }
+        assert!(paths.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     #[cfg(unix)]

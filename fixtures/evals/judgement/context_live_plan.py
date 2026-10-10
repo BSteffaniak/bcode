@@ -47,10 +47,12 @@ def live_development_plan(selection, allowance, history_bindings, repetitions=2)
             actual = binding[arm]
             if set(actual) != {"session_id", "turn_sequence", "excerpts"}:
                 raise ValueError("unsupported history binding fields")
-            uuid.UUID(actual["session_id"])
-            if actual["session_id"] in used_sessions:
+            if not isinstance(actual["session_id"], str):
+                raise ValueError("string session UUID required")
+            canonical_session = str(uuid.UUID(actual["session_id"]))
+            if canonical_session in used_sessions:
                 raise ValueError("fresh session required for every scheduled arm")
-            used_sessions.add(actual["session_id"])
+            used_sessions.add(canonical_session)
             if type(actual["turn_sequence"]) is not int or actual["turn_sequence"] <= 0:
                 raise ValueError("positive turn sequence required")
             if set(actual["excerpts"]) != set(optional):
