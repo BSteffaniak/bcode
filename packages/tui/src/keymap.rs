@@ -539,13 +539,19 @@ fn register_monitor_actions(
 ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
     use bcode_plugin_sdk::tui::keymap::KeymapAction;
     for (scope, id, description, defaults) in [
+        ("chat", "tui.session.search", "Session Search Open", vec![]),
         (
             "auth_pool_picker",
             "tui.auth.clear",
             "Clear promotion",
             vec!["c"],
         ),
-        ("chat", "tui.monitor.toggle", "Toggle child monitor", vec![]),
+        (
+            "chat",
+            "tui.monitor.toggle",
+            "Toggle child monitor",
+            vec!["ctrl+g"],
+        ),
         (
             "monitor",
             "tui.monitor.nextPage",
@@ -1195,7 +1201,6 @@ fn default_chat_bindings() -> Vec<BmuxKeyBinding> {
         bind("ctrl+v", BmuxAction::ClipboardPasteImage),
         bind("ctrl+shift+c", BmuxAction::TranscriptCopySelection),
         bind("ctrl+p", BmuxAction::CommandPaletteOpen),
-        bind("ctrl+g", BmuxAction::SessionSearchOpen),
         bind("tab", BmuxAction::AgentCycle),
         bind("shift+tab", BmuxAction::ThinkingEffortCycle),
         bind("ctrl+tab", BmuxAction::MarkdownFocusNext),
@@ -1380,8 +1385,8 @@ mod tests {
             },
         );
         assert_eq!(
-            keymap.action_for_key(BmuxScope::Chat, default_stroke),
-            Some(BmuxAction::SessionSearchOpen)
+            keymap.action("chat", default_stroke),
+            Some("tui.monitor.toggle")
         );
 
         let mut config = TuiConfig::default();
@@ -1404,8 +1409,8 @@ mod tests {
             Some(BmuxAction::SessionSearchOpen)
         );
         assert_eq!(
-            configured.action_for_key(BmuxScope::Chat, default_stroke),
-            None
+            configured.action("chat", default_stroke),
+            Some("tui.monitor.toggle")
         );
     }
 

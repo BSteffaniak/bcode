@@ -42,8 +42,9 @@ Standalone readers resolve the same configuration before entering terminal mode.
 ASCII uppercase terminal events normalize to explicit `shift+letter` bindings;
 use `shift+a`, not bare `A`, in configuration. Unicode literal input remains unchanged.
 
-The child monitor toggle (`tui.monitor.toggle`) is registered but unbound by default
-so it does not shadow session search. Workflow scheduling-page navigation is also
+The child monitor toggle (`tui.monitor.toggle`) defaults to `Ctrl+G` in chat.
+Global session search (`tui.session.search`) is unbound by default and remains configurable.
+Workflow scheduling-page navigation is also
 unbound where the former Shift-N shortcut was already consumed by new authoring.
 Both actions remain configurable and appear in effective action discovery.
 
@@ -185,8 +186,9 @@ separate operations.
 
 `Ctrl+F` opens the command palette in the normal chat scope. Type to filter and press `Enter` to run a command. Plugins can contribute commands and complete TUI surfaces to the same palette.
 
-`Ctrl+G` opens global session search from the normal chat scope by default and is configurable as
-`tui.session.search`. `Ctrl+F` remains the session-picker compatibility search route.
+`Ctrl+G` toggles the child-session tree/monitor from the normal chat scope, configurable as
+`tui.monitor.toggle`. Global session search (`tui.session.search`) has no default shortcut;
+open `/sessions`, then use the session picker's `Ctrl+F` search route.
 
 Typing `/` in the composer exposes slash-command completion. Common commands include:
 
