@@ -107,6 +107,122 @@ async fn monitor_slash_outcome_opens_refocuses_and_refreshes_children() {
 }
 
 #[tokio::test]
+async fn monitor_mouse_row_selects_and_chevron_expands_without_opening_session() {
+    let root = SessionId::new();
+    let child = SessionId::new();
+    let mut model = root_test_model_with_history(root, &[]);
+    let summary = bcode_session_models::SessionSummary {
+        id: child,
+        parent_id: Some(root),
+        name: Some("子 👩‍💻 e\u{301}".to_owned()),
+        explicit_name: Some("子 👩‍💻 e\u{301}".to_owned()),
+        derived_title: None,
+        automatic_title: None,
+        automatic_title_source_sequence: None,
+        title_source: bcode_session_models::SessionTitleSource::Explicit,
+        client_count: 0,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        working_directory: "/tmp/bcode-tui-test".into(),
+        import: None,
+        execution: None,
+        location: None,
+    };
+    model.chat.app.apply_monitor_children(
+        root,
+        &bcode_session_models::SessionChildPage {
+            children: vec![summary],
+            next_after: None,
+            complete: true,
+            issues: vec![],
+        },
+    );
+    model.chat.app.open_child_panel();
+    let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+    let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+    let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+    crate::render::render(
+        &mut model.chat.app,
+        &mut bmux_tui::paint::PaintCx::new(&mut frame),
+    );
+    let row_key = format!("child-monitor:{child}");
+    let expand_key = format!("child-monitor-expand:{child}");
+    let row = frame
+        .hits()
+        .regions()
+        .iter()
+        .find(|hit| hit.id.as_str() == row_key)
+        .expect("painted row")
+        .area;
+    let chevron = frame
+        .hits()
+        .regions()
+        .iter()
+        .find(|hit| hit.id.as_str() == expand_key)
+        .expect("painted chevron")
+        .area;
+    let point = bmux_tui::geometry::Point::new(row.right() - 1, row.y);
+    assert!(!chevron.contains(point));
+    model.committed_hits = frame.hits().clone();
+    model.chat.app.release_child_panel_focus();
+    model.route_terminal_event(Event::Mouse(bmux_tui::event::MouseEvent::new(
+        bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+        point,
+    )));
+    assert_eq!(model.chat.app.selected_monitor_session(), Some(child));
+    assert!(model.chat.app.child_panel_focused());
+    assert!(model.chat.app.expanded_monitor_sessions().is_empty());
+    assert_eq!(model.chat.opening_session_id(), None);
+    model.route_terminal_event(Event::Mouse(bmux_tui::event::MouseEvent::new(
+        bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+        bmux_tui::geometry::Point::new(chevron.x, chevron.y),
+    )));
+    assert!(model.chat.app.expanded_monitor_sessions().contains(&child));
+    assert_eq!(model.chat.opening_session_id(), None);
+    model.route_terminal_event(Event::Key(KeyStroke::simple(KeyCode::Enter)));
+    assert_eq!(model.chat.opening_session_id(), Some(child));
+    drop(model);
+}
+
+#[tokio::test]
+async fn monitor_toggle_refocuses_from_composer_and_closes_from_monitor() {
+    let mut model = root_test_model_with_history(SessionId::new(), &[]);
+    let toggle = KeyStroke::with_modifiers(
+        KeyCode::Char('g'),
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        },
+    );
+    model.route_terminal_event(Event::Key(toggle));
+    assert!(model.chat.app.child_panel_open());
+    assert!(model.chat.app.child_panel_focused());
+
+    model.route_terminal_event(Event::Key(KeyStroke::simple(KeyCode::Escape)));
+    assert!(model.chat.app.child_panel_open());
+    assert!(!model.chat.app.child_panel_focused());
+    model.route_terminal_event(Event::Key(KeyStroke::simple(KeyCode::Char('子'))));
+    assert_eq!(model.chat.app.composer().text(), "子");
+
+    model.route_terminal_event(Event::Key(toggle));
+    assert!(model.chat.app.child_panel_open());
+    assert!(model.chat.app.child_panel_focused());
+    assert_eq!(model.chat.app.composer().text(), "子");
+    model.route_terminal_event(Event::Key(toggle));
+    assert!(!model.chat.app.child_panel_open());
+    assert!(!model.chat.app.child_panel_focused());
+    model.route_terminal_event(Event::Key(toggle));
+    assert!(model.chat.app.child_panel_open());
+    assert!(model.chat.app.child_panel_focused());
+    assert_eq!(model.chat.app.composer().text(), "子");
+    model.route_terminal_event(Event::Key(toggle));
+    assert!(!model.chat.app.child_panel_open());
+    assert!(!model.chat.app.child_panel_focused());
+    assert_eq!(model.chat.app.composer().text(), "子");
+    drop(model);
+}
+
+#[tokio::test]
 async fn monitor_explicit_focus_escape_returns_composer_and_typing_is_not_swallowed() {
     let mut model = root_test_model_with_history(SessionId::new(), &[]);
     let ctrl_g = KeyStroke::with_modifiers(

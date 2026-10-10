@@ -1553,7 +1553,7 @@ impl BmuxApp {
 
     /// Toggle monitor visibility with explicitly requested keyboard focus.
     pub const fn toggle_child_panel(&mut self) {
-        self.child_panel = if self.child_panel_open() {
+        self.child_panel = if self.child_panel_focused() {
             ChildPanelPresentation::Hidden
         } else {
             ChildPanelPresentation::Monitor
@@ -1706,19 +1706,6 @@ impl BmuxApp {
         page: bcode_session_models::SessionActivityPage,
     ) {
         let selected = self.selected_monitor_session();
-        if page
-            .descendants
-            .iter()
-            .any(bcode_session_view::child_activity::has_active_evidence)
-            && let Some(summary) = self
-                .child_summaries
-                .iter()
-                .find(|summary| summary.id == session_id)
-        {
-            self.child_expanded.insert(
-                bcode_session_view::navigation::SessionNavigationKey::from_summary(summary),
-            );
-        }
         self.child_pages.insert(session_id, page);
         if let Some(selected) = selected {
             self.child_panel_selected = self
@@ -1733,45 +1720,12 @@ impl BmuxApp {
     }
 
     fn monitor_tree(&self) -> bcode_session_view::navigation::SessionTreeProjection {
-        let mut tree = bcode_session_view::navigation::project_session_tree(
+        bcode_session_view::navigation::project_session_tree(
             &self.child_summaries,
             &self.child_expanded,
             None,
             self.child_summaries.len(),
-        );
-        let observations = bcode_session_view::child_attention::newest_observations(
-            self.child_activity.iter().chain(self.child_pages.values()),
-        );
-        // Sort sibling groups, preserving preorder and ancestry. Priority belongs to the shared
-        // semantic evidence policy, never a renderer's interpretation of event logs.
-        let mut ranks: BTreeMap<usize, u8> = BTreeMap::new();
-        for row in &tree.rows {
-            let id = self.child_summaries[row.source_index].id;
-            ranks.insert(
-                row.source_index,
-                observations.get(&id).map_or(3, |(activity, _)| {
-                    bcode_session_view::child_attention::attention_rank(activity)
-                }),
-            );
-        }
-        // Roots may be detached after eviction; stable partition keeps each descendant block
-        // with its ancestor instead of flattening the semantic hierarchy.
-        let mut blocks = Vec::new();
-        for row in tree.rows {
-            if row.depth == 0 || blocks.is_empty() {
-                blocks.push(Vec::new());
-            }
-            blocks.last_mut().expect("root block exists").push(row);
-        }
-        blocks.sort_by_key(|block| {
-            block
-                .iter()
-                .map(|row| ranks[&row.source_index])
-                .min()
-                .unwrap_or(3)
-        });
-        tree.rows = blocks.into_iter().flatten().collect();
-        tree
+        )
     }
 
     /// Selected child identity for ordinary application-boundary opening.
@@ -1838,18 +1792,154 @@ impl BmuxApp {
         self.child_panel_selected.min(4).saturating_add(1)
     }
 
-    pub(crate) fn monitor_row_session(&self, row: usize) -> Option<SessionId> {
-        if row == 0 || row > 8 {
-            return None;
+    /// Select a loaded row by stable identity without opening its session.
+    pub fn select_monitor_session(&mut self, session_id: SessionId) {
+        if let Some(index) = self
+            .monitor_tree()
+            .rows
+            .iter()
+            .position(|row| self.child_summaries[row.source_index].id == session_id)
+        {
+            self.child_panel_selected = index;
+            self.open_child_panel();
         }
+    }
+
+    /// Loaded known-descendant activity for monitor chrome, never complete subtree totals.
+    #[must_use]
+    pub fn monitor_context(&self) -> super::monitor_presentation::MonitorContext {
+        use super::monitor_presentation::{MonitorContext, MonitorDescendantBadge};
+        let observations = bcode_session_view::child_attention::newest_observations(
+            self.child_activity.iter().chain(self.child_pages.values()),
+        );
+        let parents: BTreeMap<_, _> = self
+            .child_summaries
+            .iter()
+            .map(|summary| (summary.id, summary.parent_id))
+            .collect();
+        let mut badges: BTreeMap<SessionId, MonitorDescendantBadge> = BTreeMap::new();
+        for (activity, _) in observations.values() {
+            let mut parent = activity.parent_id;
+            let mut visited = BTreeSet::from([activity.session_id]);
+            // Follow only loaded, verified relationship links; cycles and gaps stop traversal.
+            for _ in 0..self.child_summaries.len() {
+                let Some(id) = parent else {
+                    break;
+                };
+                if !visited.insert(id) {
+                    break;
+                }
+                let Some(next_parent) = parents.get(&id) else {
+                    break;
+                };
+                let badge = badges.entry(id).or_default();
+                badge.active += usize::from(
+                    bcode_session_view::child_activity::has_active_evidence(activity),
+                );
+                badge.attention +=
+                    usize::from(bcode_session_view::child_attention::attention_rank(activity) <= 1);
+                parent = *next_parent;
+            }
+        }
+        MonitorContext {
+            current_session: self.session_id,
+            descendant_badges: badges,
+        }
+    }
+
+    /// Typed bounded terminal presentation, available to acceptance tests.
+    #[must_use]
+    pub fn monitor_presentation(&self) -> super::monitor_presentation::MonitorPresentation {
+        use super::monitor_presentation::{MonitorPresentation, MonitorRow};
         let tree = self.monitor_tree();
-        let index = self
+        let observations = bcode_session_view::child_attention::newest_observations(
+            self.child_activity.iter().chain(self.child_pages.values()),
+        );
+        let now = super::time_format::unix_time_millis(std::time::SystemTime::now());
+        let start = self.child_panel_selected.saturating_sub(4);
+        let rows: Vec<_> = tree
+            .rows
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(8)
+            .map(|(index, row)| {
+                let summary = &self.child_summaries[row.source_index];
+                let observation = observations.get(&summary.id);
+                let continues = |depth| {
+                    tree.rows
+                        .iter()
+                        .skip(index + 1)
+                        .take_while(|next| next.depth >= depth)
+                        .any(|next| next.depth == depth)
+                };
+                MonitorRow {
+                    session_id: summary.id,
+                    title: summary.display_title().to_owned(),
+                    parent_id: summary.parent_id,
+                    detached: row.detached && summary.parent_id != self.session_id,
+                    depth: row.depth,
+                    ancestor_continuations: (0..row.depth.min(4)).map(continues).collect(),
+                    last_sibling: !continues(row.depth),
+                    expanded: self.child_expanded.contains(
+                        &bcode_session_view::navigation::SessionNavigationKey::from_summary(
+                            summary,
+                        ),
+                    ),
+                    states: observation.map_or_else(
+                        || vec![bcode_session_models::SessionActivityState::Unknown],
+                        |(activity, _)| {
+                            if activity.states.is_empty() {
+                                vec![bcode_session_models::SessionActivityState::Unknown]
+                            } else {
+                                activity.states.clone()
+                            }
+                        },
+                    ),
+                    evidence: observation.and_then(|(activity, _)| activity.evidence.clone()),
+                    age: observation.map_or_else(
+                        || "unobserved".to_owned(),
+                        |(_, observed)| {
+                            bcode_session_view::child_attention::observation_age_label(
+                                *observed, now,
+                            )
+                        },
+                    ),
+                }
+            })
+            .collect();
+        let selected = self
             .child_panel_selected
-            .saturating_sub(4)
-            .saturating_add(row - 1);
-        tree.rows
-            .get(index)
-            .map(|row| self.child_summaries[row.source_index].id)
+            .checked_sub(start)
+            .filter(|index| *index < rows.len());
+        MonitorPresentation {
+            parent_title: self.session_title().unwrap_or("Session").to_owned(),
+            overview: self.child_activity.as_ref().map_or_else(
+                || "Attention unknown · descendants unscanned".to_owned(),
+                |root| {
+                    bcode_session_view::child_attention::overview_label(
+                        root,
+                        self.child_activity.iter().chain(self.child_pages.values()),
+                    )
+                },
+            ),
+            freshness: self.child_activity.as_ref().map_or_else(
+                || "unobserved".to_owned(),
+                |page| {
+                    bcode_session_view::child_attention::observation_age_label(
+                        page.observed_at_ms,
+                        now,
+                    )
+                },
+            ),
+            details: selected.and_then(|index| rows.get(index)).cloned(),
+            selected,
+            rows,
+            coverage: self.child_activity.as_ref().map(|page| page.coverage),
+            error: self.child_activity_error.clone(),
+            load_more: self.monitor_next_page().is_some(),
+            footer: self.child_panel_focus_hint(),
+        }
     }
 
     /// Bounded accepted observation rows; selection scrolls the preview rather than imposing a total limit.
@@ -1961,7 +2051,7 @@ impl BmuxApp {
             )
         } else {
             format!(
-                "COMPOSER FOCUS · click a child to open · {} close",
+                "COMPOSER FOCUS · click selects · {} focus",
                 self.shortcut_hint("chat", "tui.monitor.toggle")
             )
         }

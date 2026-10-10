@@ -1353,14 +1353,22 @@ impl BcodeRuntimeModel {
                         bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left)
                     )
                     && let Some(hit) = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse)
-                    && let Some(id) = hit.strip_prefix("child-monitor:")
+                    && let Some(id) = hit
+                        .strip_prefix("child-monitor:")
+                        .or_else(|| hit.strip_prefix("child-monitor-expand:"))
                     && let Ok(session_id) = id.parse()
                 {
-                    super::session_flow::start_switch_session(
-                        &mut self.chat,
-                        session_id,
-                        super::history_flow::initial_transcript_window_request(self.committed_area),
-                    );
+                    self.chat.app.select_monitor_session(session_id);
+                    if hit.starts_with("child-monitor-expand:")
+                        && let Some(parent_id) = self.chat.app.expand_monitor_selected()
+                    {
+                        self.chat
+                            .start_effect(super::effects::TuiEffect::LoadSessionChildren {
+                                parent_id,
+                                after: None,
+                                generation: 0,
+                            });
+                    }
                     return super::invalidation::UiInvalidation::Structural;
                 }
                 if !self.loop_state.modal_foreground()

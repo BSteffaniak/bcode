@@ -187,7 +187,16 @@ separate operations.
 `Ctrl+F` opens the command palette in the normal chat scope. Type to filter and press `Enter` to run a command. Plugins can contribute commands and complete TUI surfaces to the same palette.
 
 `Ctrl+G` toggles the child-session tree/monitor from the normal chat scope, configurable as
-`tui.monitor.toggle`. Global session search (`tui.session.search`) has no default shortcut;
+`tui.monitor.toggle`. `/monitor` opens or refocuses the panel. While it owns focus,
+`Up`/`Down` select a row, `Right` toggles its branch, `Enter` opens the selected session,
+and `Left` opens the attached session's parent when available. `Esc` returns focus to
+the composer without hiding the panel; `Ctrl+G` refocuses it from the composer and
+closes it when the monitor already owns focus.
+Clicking a row selects/refocuses it; the separate chevron toggles expansion rather
+than opening the session. These navigation actions use the `monitor` keymap scope,
+and the panel footer reflects effective bindings.
+
+Global session search (`tui.session.search`) has no default shortcut;
 open `/sessions`, then use the session picker's `Ctrl+F` search route.
 
 Typing `/` in the composer exposes slash-command completion. Common commands include:

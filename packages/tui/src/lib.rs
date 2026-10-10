@@ -43,6 +43,7 @@ pub mod metrics_launcher;
 pub(crate) mod model_flow;
 pub(crate) mod model_picker;
 pub(crate) mod model_picker_render;
+pub mod monitor_presentation;
 pub(crate) mod mouse_flow;
 pub(crate) mod older_history;
 pub mod onboarding;

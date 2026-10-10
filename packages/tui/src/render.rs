@@ -363,14 +363,18 @@ impl TuiTheme {
     }
 
     #[must_use]
-    pub const fn for_app(app: &BmuxApp) -> Self {
+    pub fn for_app(app: &BmuxApp) -> Self {
         let theme = app.presented_theme();
         Self {
             text: theme.text,
             muted: theme.muted,
             border: theme.border,
             focused: theme.focused.patch(Style::new().fg(theme.accent)),
-            raised: theme.surfaces.raised,
+            raised: super::monitor_presentation::raised_surface(
+                theme.surfaces.raised,
+                theme.canvas,
+                theme.text,
+            ),
             overlay: theme.surfaces.overlay,
             scrim: theme.surfaces.scrim,
             selection: theme.selection,
@@ -533,72 +537,53 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut PaintCx<'_, '_>, layout: F
     app.commit_transcript_presentation();
 }
 
-/// Paint the child monitor and its interactions using one BMUX list layout.
+/// Paint child monitor using the public terminal acceptance interface.
 fn paint_child_monitor(
     app: &BmuxApp,
     frame: &mut PaintCx<'_, '_>,
     layout: FrameLayout,
     intersects: impl Fn(Rect) -> bool,
 ) {
-    let theme = TuiTheme::for_app(app);
-    let panel_rows = app.child_panel_rows();
-    let panel_height = layout.body.y.saturating_sub(layout.header.bottom());
-    let panel_area = Rect::new(
+    use super::monitor_presentation::{MonitorAction, MonitorStyles};
+    let area = Rect::new(
         layout.area.x,
         layout.header.bottom(),
         layout.area.width,
-        panel_height,
+        layout.body.y.saturating_sub(layout.header.bottom()),
     );
-    if !panel_area.is_empty() && intersects(panel_area) {
-        let items: Vec<_> = panel_rows
-            .iter()
-            .enumerate()
-            .map(|(row, text)| {
-                bmux_tui_components::selectable_list::SelectableListItem::rich(
-                    app.monitor_row_session(row).map_or_else(
-                        || {
-                            if text.ends_with("load next bounded child page") {
-                                "child-monitor-more".to_owned()
-                            } else {
-                                format!("monitor-chrome:{row}")
-                            }
-                        },
-                        |id| format!("child-monitor:{id}"),
-                    ),
-                    Line::from_spans(vec![Span::styled(
-                        text.clone(),
-                        if row == 0 { theme.info } else { theme.text },
-                    )]),
-                )
-            })
-            .collect();
-        let state = bmux_tui_components::selectable_list::SelectableListState::new(
-            app.child_panel_focused()
-                .then(|| app.monitor_selected_preview_row()),
+    if area.is_empty() || !intersects(area) {
+        return;
+    }
+    let theme = TuiTheme::for_app(app);
+    let styles = MonitorStyles {
+        text: theme.text,
+        muted: theme.muted,
+        border: theme.border,
+        focused: theme.focused,
+        raised: theme.raised,
+        selection: theme.selection,
+        info: theme.info,
+        warning: theme.warning,
+        error: theme.error,
+    };
+    for hit in super::monitor_presentation::paint_with_context(
+        &app.monitor_presentation(),
+        &app.monitor_context(),
+        area,
+        app.child_panel_focused(),
+        styles,
+        frame,
+    ) {
+        let layer = if matches!(hit.action, MonitorAction::ToggleExpansion(_)) {
+            3
+        } else {
+            2
+        };
+        frame.push_hit(
+            HitRegion::new(hit.key(), hit.rect)
+                .role(HitRole::Action)
+                .layer(layer),
         );
-        let list = bmux_tui_components::selectable_list::SelectableList::new(&items).styles(
-            bmux_tui_components::selectable_list::SelectableListStyles {
-                normal: theme.text,
-                focused: theme.selection,
-                selected: theme.selection,
-                hovered: theme.focused,
-                pressed: theme.selection,
-                disabled: theme.muted,
-                background: app.presented_theme().canvas,
-                scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
-            },
-        );
-        list.paint(panel_area, &state, theme.text, frame);
-        // Hit identity comes from the same BMUX list geometry, not a second row layout.
-        for region in list.visible_semantic_regions(panel_area, &state) {
-            if region.key.starts_with("child-monitor:") || region.key == "child-monitor-more" {
-                frame.push_hit(
-                    HitRegion::new(region.key, region.rect)
-                        .role(HitRole::Action)
-                        .layer(2),
-                );
-            }
-        }
     }
 }
 
@@ -739,9 +724,20 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
     let composer = composer_area(area, composer_height);
     let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
-    let panel_height = u16::try_from(app.child_panel_rows().len())
+    let panel_height = if app.child_panel_open() {
+        let presentation = app.monitor_presentation();
+        u16::try_from(
+            presentation
+                .rows
+                .len()
+                .saturating_add(8)
+                .saturating_add(usize::from(presentation.load_more)),
+        )
         .unwrap_or(u16::MAX)
-        .min(body.height.saturating_sub(1));
+        .min(body.height / 2)
+    } else {
+        0
+    };
     let body = Rect::new(
         body.x,
         body.y.saturating_add(panel_height),
