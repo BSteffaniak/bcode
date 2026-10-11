@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Normalized scoped model gateway provider for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "provider", "plugin"]
+license     = { workspace = true }
+name        = "bcode_auth_broker_provider_plugin"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_model                  = { workspace = true }
+bcode_model_provider_runtime = { workspace = true }
+bcode_plugin_sdk             = { workspace = true }
+reqwest                      = { workspace = true, features = ["json"] }
+serde                        = { workspace = true, features = ["derive", "std"] }
+serde_json                   = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

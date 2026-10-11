@@ -7,7 +7,12 @@
 //! These types describe provider registration and normalized interactive authentication flows.
 //! They intentionally contain no vault access, plugin loading, networking, prompting, or UI logic.
 
+pub mod refresh;
 pub mod startup;
+pub use refresh::{
+    AuthRefreshBeginRequest, AuthRefreshBeginResponse, AuthRefreshCommitRequest, OP_BEGIN_REFRESH,
+    OP_COMMIT_REFRESH,
+};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -161,13 +166,19 @@ pub const OP_UPDATE_CREDENTIALS: &str = "update_credentials";
 ///
 /// The caller identity, provider owner, vault path, storage profile, and backend keys are
 /// intentionally absent. The host binds those from the active invocation and selected profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthCredentialUpdateRequest {
     pub schema_version: u16,
     pub provider_id: String,
     pub profile: String,
     /// Credential replacements. `None` removes an optional credential atomically with updates.
     pub credentials: BTreeMap<String, Option<String>>,
+}
+
+impl std::fmt::Debug for AuthCredentialUpdateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthCredentialUpdateRequest { <redacted> }")
+    }
 }
 
 impl AuthCredentialUpdateRequest {

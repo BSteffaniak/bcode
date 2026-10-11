@@ -11,6 +11,8 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_auth_broker_plugin                = { workspace = true, optional = true }
+bcode_auth_broker_provider_plugin       = { workspace = true, optional = true }
 bcode_bedrock_provider_plugin           = { workspace = true, optional = true }
 bcode_blims_plugin                      = { workspace = true, optional = true }
 bcode_code_review_plugin                = { workspace = true, optional = true }
@@ -77,6 +79,14 @@ bundled-ocr-tesseract-v5-5-2 = [
 ]
 default = []
 fail-on-warnings = []
+static-bundled-auth-broker-plugin = [
+    "dep:bcode_auth_broker_plugin",
+    "bcode_auth_broker_plugin/static-bundled",
+]
+static-bundled-auth-broker-provider-plugin = [
+    "dep:bcode_auth_broker_provider_plugin",
+    "bcode_auth_broker_provider_plugin/static-bundled",
+]
 static-bundled-bedrock-provider-plugin = [
     "dep:bcode_bedrock_provider_plugin",
     "bcode_bedrock_provider_plugin/static-bundled",
@@ -177,6 +187,8 @@ static-bundled-plugins = [
     "static-bundled-model-plugin",
     "static-bundled-jev-provider-plugin",
     "static-bundled-openai-compatible-provider-plugin",
+    "static-bundled-auth-broker-plugin",
+    "static-bundled-auth-broker-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
     "static-bundled-question-plugin",

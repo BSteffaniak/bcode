@@ -1,0 +1,40 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Single-owner GitHub OIDC model broker for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "github", "oidc", "plugin"]
+license     = { workspace = true }
+name        = "bcode_auth_broker_plugin"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+axum = { workspace = true, features = ["http1", "json", "tokio"] }
+bcode_model = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
+bcode_tool = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

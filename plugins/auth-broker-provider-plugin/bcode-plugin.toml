@@ -1,0 +1,17 @@
+id      = "bcode.auth-broker-provider"
+name    = "Bcode Auth Broker Provider"
+version = "0.0.1"
+
+[[services]]
+description  = "Normalized text/tool model turns using an opaque broker lease; no subscription credentials"
+interface_id = "bcode.model-provider/v1"
+name         = "Scoped text model gateway"
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_auth_broker_provider_plugin.dylib"
+type         = "native"

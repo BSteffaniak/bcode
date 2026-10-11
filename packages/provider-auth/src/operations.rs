@@ -1,12 +1,16 @@
 //! Host-owned provider-auth application operations.
 
 use crate::{AuthProfileResolutionError, ResolvedAuthProfile, lifecycle::AuthVaultLifecycle};
+#[cfg(unix)]
+mod refresh;
 use bcode_provider_auth_models::{
     AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION, AUTH_SECURITY_INSPECTION_SCHEMA_VERSION,
     AuthCredentialUpdateRequest, AuthCredentialUpdateResponse, AuthDiagnostic,
     AuthDiagnosticSeverity, AuthMethodContribution, AuthSecurityInspectionRequest,
     AuthSecurityInspectionResponse,
 };
+#[cfg(unix)]
+pub use refresh::resolve_refresh_service_request_with_custody;
 
 /// Authorization context bound by the host from an active plugin/provider invocation.
 #[derive(Clone, Copy)]
@@ -23,6 +27,33 @@ pub struct AuthCredentialUpdateContext<'a> {
 /// unrelated values, enforce its device-seal policy, and return secret-safe errors. This is a
 /// trusted host service, never a plugin-supplied authorization hook.
 pub trait AuthCredentialCustody: Send + Sync {
+    /// Admit a remote refresh only after durable fencing and snapshot comparison.
+    ///
+    /// # Errors
+    /// Unsupported custody and unresolved attempts fail closed.
+    fn begin_refresh(
+        &self,
+        _resolved: &ResolvedAuthProfile,
+        _request: bcode_provider_auth_models::AuthRefreshBeginRequest,
+    ) -> Result<
+        bcode_provider_auth_models::AuthRefreshBeginResponse,
+        crate::lifecycle::AuthVaultLifecycleError,
+    > {
+        Err(crate::lifecycle::AuthVaultLifecycleError::RefreshUnsupported)
+    }
+
+    /// Commit the complete record for the matching admitted attempt.
+    ///
+    /// # Errors
+    /// Stale identities, incomplete records, and uncertain publication fail closed.
+    fn commit_refresh(
+        &self,
+        _resolved: &ResolvedAuthProfile,
+        _request: bcode_provider_auth_models::AuthRefreshCommitRequest,
+    ) -> Result<AuthCredentialUpdateResponse, crate::lifecycle::AuthVaultLifecycleError> {
+        Err(crate::lifecycle::AuthVaultLifecycleError::RefreshUnsupported)
+    }
+
     /// Persist validated changes for the host-resolved owner and profile.
     ///
     /// # Errors
@@ -198,6 +229,7 @@ pub struct RetainedAuthRequestCustody {
     passphrase: Option<zeroize::Zeroizing<String>>,
     key_source: Option<std::sync::Arc<dyn AuthCustodyKeySource>>,
     device_source: Option<std::sync::Arc<dyn AuthDeviceFactorSource>>,
+    active_refresh: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(unix)]
@@ -306,6 +338,7 @@ impl RetainedAuthRequestCustody {
             passphrase,
             key_source: None,
             device_source: None,
+            active_refresh: std::sync::Mutex::new(None),
         })
     }
 }
@@ -355,6 +388,25 @@ impl AuthRequestCustody for RetainedAuthRequestCustody {
 
 #[cfg(unix)]
 impl AuthCredentialCustody for RetainedAuthRequestCustody {
+    fn begin_refresh(
+        &self,
+        resolved: &ResolvedAuthProfile,
+        request: bcode_provider_auth_models::AuthRefreshBeginRequest,
+    ) -> Result<
+        bcode_provider_auth_models::AuthRefreshBeginResponse,
+        crate::lifecycle::AuthVaultLifecycleError,
+    > {
+        self.begin_owned_refresh(resolved, &request)
+    }
+
+    fn commit_refresh(
+        &self,
+        resolved: &ResolvedAuthProfile,
+        request: bcode_provider_auth_models::AuthRefreshCommitRequest,
+    ) -> Result<AuthCredentialUpdateResponse, crate::lifecycle::AuthVaultLifecycleError> {
+        self.commit_owned_refresh(resolved, request)
+    }
+
     fn persist(
         &self,
         resolved: &ResolvedAuthProfile,
@@ -532,6 +584,36 @@ pub fn resolve_credential_update_service_request_with_custody<'registry>(
     use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_UPDATE_CREDENTIALS};
     use bcode_tool::ToolInvocationServiceResolution as Resolution;
 
+    #[cfg(unix)]
+    if request.interface_id == AUTH_HOST_INTERFACE_ID
+        && matches!(
+            request.operation.as_str(),
+            bcode_provider_auth_models::OP_BEGIN_REFRESH
+                | bcode_provider_auth_models::OP_COMMIT_REFRESH
+        )
+    {
+        return resolve_refresh_service_request_with_custody(
+            config,
+            runtime,
+            caller_plugin_id,
+            registered_provider,
+            request,
+            custody,
+        );
+    }
+    #[cfg(not(unix))]
+    if request.interface_id == AUTH_HOST_INTERFACE_ID
+        && matches!(
+            request.operation.as_str(),
+            bcode_provider_auth_models::OP_BEGIN_REFRESH
+                | bcode_provider_auth_models::OP_COMMIT_REFRESH
+        )
+    {
+        return Resolution::Failed {
+            code: "auth_refresh_unavailable".into(),
+            message: "durable refresh coordination is unavailable on this host".into(),
+        };
+    }
     if request.interface_id != AUTH_HOST_INTERFACE_ID || request.operation != OP_UPDATE_CREDENTIALS
     {
         return Resolution::Unsupported;

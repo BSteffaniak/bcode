@@ -153,6 +153,14 @@ mermaid-renderer = ["dep:bcode_mermaid_render"]
 metrics = ["dep:bcode_metrics", "dep:tracing-subscriber"]
 openai-compatible-provider = ["dep:bcode_openai_compatible_provider_plugin"]
 opentelemetry = ["dep:tracing-opentelemetry"]
+static-bundled-auth-broker-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-auth-broker-plugin",
+]
+static-bundled-auth-broker-provider-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-auth-broker-provider-plugin",
+]
 static-bundled-bedrock-provider-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-bedrock-provider-plugin",

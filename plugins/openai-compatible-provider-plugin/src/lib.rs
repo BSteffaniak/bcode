@@ -14,6 +14,7 @@ mod discovery;
 pub mod history;
 mod model_availability;
 mod model_observation;
+mod refresh;
 mod startup;
 
 use base64::Engine as _;
@@ -1660,49 +1661,50 @@ impl OpenAiCompatibleProviderPlugin {
         }
         let refresh = match &self.runtime {
             Ok(runtime) => {
-                let mut refresh_settings = settings.clone();
+                let refresh_settings = settings.clone();
                 let cancellation = context.cancellation.clone();
+                let bridge = context.bridge.clone();
+                let provider_context = request.provider_context.clone();
+                let invocation_id = request.turn_id.clone();
                 runtime.block_on(async move {
-                    let refreshed = cancellable_auth_refresh(
+                    refresh::refresh(
+                        refresh_settings,
+                        &provider_context,
+                        &invocation_id,
                         &cancellation,
-                        refresh_chatgpt_auth_if_needed(&mut refresh_settings),
-                    )
-                    .await?;
-                    Ok::<_, ProviderError>((refresh_settings, refreshed))
+                        |request| bridge.request(&request).map_err(|_| provider_error(
+                            "token_refresh_requires_reconnect",
+                            ProviderErrorCategory::Auth,
+                            "credential refresh custody transport failed; reconnect this auth profile",
+                        )),
+                        |mut settings| async move {
+                            let rotated = refresh_chatgpt_auth_if_needed(&mut settings).await?;
+                            Ok((settings, rotated))
+                        },
+                    ).await
                 })
             }
             Err(error) => return ServiceResponse::error("runtime_error", error),
         };
         match refresh {
-            Ok(Ok((refreshed_settings, Some(refreshed)))) => {
+            Ok(Ok((refreshed_settings, Some(credentials)))) => {
                 settings = refreshed_settings;
-                let Some(profile) = request
-                    .provider_context
-                    .auth
-                    .as_ref()
-                    .and_then(|auth| auth.profile.as_deref())
-                else {
-                    return ServiceResponse::error(
-                        "token_refresh_persist_failed",
-                        "refreshed credentials require an owned auth profile",
-                    );
-                };
-                let provider_id = request
-                    .provider_context
-                    .auth
-                    .as_ref()
-                    .and_then(|auth| auth.attributes.get("provider"))
-                    .map_or("openai", String::as_str);
-                if let Err(error) = persist_refreshed_chatgpt_auth(
-                    &context.bridge,
-                    &request.turn_id,
-                    provider_id,
-                    profile,
-                    refreshed,
-                ) {
-                    return ServiceResponse::error(error.code, error.message);
-                }
                 apply_settings_auth_to_context(&settings, &mut request.provider_context);
+                if let Some(auth) = request.provider_context.auth.as_mut() {
+                    for (id, value) in credentials {
+                        if let Some(value) = value {
+                            auth.credentials.insert(
+                                id,
+                                bcode_model::ProviderAuthCredential {
+                                    value,
+                                    source: None,
+                                },
+                            );
+                        } else {
+                            auth.credentials.remove(&id);
+                        }
+                    }
+                }
             }
             Ok(Ok((_, None))) => {}
             Ok(Err(error)) => return ServiceResponse::error(error.code, error.message),
@@ -8742,57 +8744,6 @@ fn refreshed_token_expiry(now: u64, expires_in: Option<u64>) -> Result<u64, Prov
                 "credential refresh returned an invalid expiration",
             )
         })
-}
-
-fn persist_refreshed_chatgpt_auth(
-    bridge: &ServiceBridge,
-    invocation_id: &str,
-    provider_id: &str,
-    profile: &str,
-    refreshed: RefreshedChatGptAuth,
-) -> Result<(), ProviderError> {
-    let request = bcode_provider_auth_models::AuthCredentialUpdateRequest {
-        schema_version: bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
-        provider_id: provider_id.to_owned(),
-        profile: profile.to_owned(),
-        credentials: BTreeMap::from([
-            ("access_token".to_owned(), Some(refreshed.access_token)),
-            ("refresh_token".to_owned(), Some(refreshed.refresh_token)),
-            (
-                "expires_at".to_owned(),
-                Some(refreshed.expires_at.to_string()),
-            ),
-            ("id_token".to_owned(), refreshed.id_token),
-            ("account_id".to_owned(), refreshed.account_id),
-        ]),
-    };
-    let expected_credentials = request.credentials.keys().cloned().collect::<BTreeSet<_>>();
-    let payload = serde_json::to_value(request).map_err(|_| {
-        provider_error(
-            "token_refresh_persist_failed",
-            ProviderErrorCategory::ProviderInternal,
-            "refreshed credential update could not be encoded",
-        )
-    })?;
-    let response = bridge
-        .request(&ServiceBridgeRequest::InvokeService(
-            bcode_tool::ToolInvocationServiceRequest {
-                invocation_id: invocation_id.to_owned(),
-                request_id: format!("{invocation_id}-credential-refresh"),
-                route_id: None,
-                interface_id: bcode_provider_auth_models::AUTH_HOST_INTERFACE_ID.to_owned(),
-                operation: bcode_provider_auth_models::OP_UPDATE_CREDENTIALS.to_owned(),
-                payload,
-            },
-        ))
-        .map_err(|_| {
-            provider_error(
-                "token_refresh_persist_failed",
-                ProviderErrorCategory::Auth,
-                "host credential update transport failed",
-            )
-        })?;
-    credential_update_result(response, &expected_credentials)
 }
 
 fn credential_update_result(

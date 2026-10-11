@@ -15,6 +15,20 @@ fn zeroize_vault_values(vault: &mut sshenv_vault::Vault) {
     }
 }
 
+#[cfg(unix)]
+fn generate_custody_key(
+    source: Option<&dyn crate::operations::AuthCustodyKeySource>,
+) -> Result<sshenv_vault::DataKey, AuthVaultLifecycleError> {
+    source.map_or_else(
+        || Ok(sshenv_vault::crypto::generate_data_key()),
+        |source| {
+            source
+                .generate()
+                .map(|bytes| sshenv_vault::DataKey::new(*bytes))
+        },
+    )
+}
+
 /// Structured non-secret lifecycle diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthVaultDiagnostic {
@@ -34,6 +48,15 @@ pub struct AuthVaultProfileStatus {
 /// Ownership-checked vault operation failure.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthVaultLifecycleError {
+    /// The selected custody cannot coordinate durable remote refresh.
+    #[error("durable refresh coordination unavailable")]
+    RefreshUnsupported,
+    /// An unresolved exchange or uncertain publication requires explicit re-enrollment.
+    #[error("credential refresh outcome unresolved; re-enroll the owned profile")]
+    RefreshBlocked,
+    /// Invocation credentials changed before admission; no remote exchange was admitted.
+    #[error("credential refresh snapshot changed; reload before retrying")]
+    RefreshStale,
     #[error(transparent)]
     Ownership(#[from] AuthProfileResolutionError),
     #[error("auth method '{method_id}' is not registered for provider '{provider_id}'")]
@@ -299,13 +322,16 @@ impl<'a> AuthVaultLifecycle<'a> {
     }
 
     #[cfg(unix)]
-    fn read_from_custody_with_device(
+    pub(crate) fn read_from_custody_with_device(
         &self,
         custody: &dyn crate::custody_storage::AuthCustodyStorage,
         identities: &[&str],
         passphrase: Option<&str>,
         device: Option<&dyn crate::operations::AuthDeviceFactorSource>,
     ) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
+        custody
+            .ensure_no_refresh()
+            .map_err(|_| AuthVaultLifecycleError::RefreshBlocked)?;
         self.read_with(|| {
             let bytes = custody.read().map_err(|_| {
                 AuthVaultLifecycleError::VaultUnavailable("credential custody unavailable".into())
@@ -444,6 +470,9 @@ impl<'a> AuthVaultLifecycle<'a> {
         device: Option<&dyn crate::operations::AuthDeviceFactorSource>,
     ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
         self.validate_custody_changes(&changes)?;
+        custody
+            .ensure_no_refresh()
+            .map_err(|_| AuthVaultLifecycleError::RefreshBlocked)?;
         custody.ensure_no_provisioning().map_err(|_| {
             AuthVaultLifecycleError::WriteFailed(
                 "credential provisioning requires maintenance".into(),
@@ -510,17 +539,7 @@ impl<'a> AuthVaultLifecycle<'a> {
         self.apply_custody_changes(&mut vault, changes)?;
         let result = vault.save_with_effects(
             &key,
-            || {
-                key_source.map_or_else(
-                    || Ok(sshenv_vault::crypto::generate_data_key()),
-                    |source| {
-                        source
-                            .generate()
-                            .map(|bytes| sshenv_vault::DataKey::new(*bytes))
-                            .map_err(Into::into)
-                    },
-                )
-            },
+            || generate_custody_key(key_source).map_err(Into::into),
             |bytes, _| {
                 custody
                     .compare_and_publish(&before, bytes)
@@ -938,7 +957,9 @@ impl<'a> AuthVaultLifecycle<'a> {
             .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))
     }
 
-    fn credential_storage_keys(&self) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
+    pub(crate) fn credential_storage_keys(
+        &self,
+    ) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
         let mut keys = BTreeMap::new();
         match self.method {
             AuthMethodContribution::SecretFields { fields, .. } => {
@@ -1119,6 +1140,254 @@ mod tests {
             },
             source: crate::AuthProfileSource::Declarative,
         }
+    }
+
+    #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
+    struct RefreshFixture {
+        root: tempfile::TempDir,
+        directory: PathBuf,
+        identity: String,
+        profile: ResolvedAuthProfile,
+        registration: AuthMethodContribution,
+        retained: crate::operations::RetainedAuthRequestCustody,
+    }
+
+    #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
+    fn refresh_fixture() -> RefreshFixture {
+        use crate::operations::RetainedAuthRequestCustody;
+        let root = tempfile::tempdir().unwrap();
+        let identity_path = root.path().join("identity");
+        let public = crate::security::ensure_vault_recipient_key(&identity_path).unwrap();
+        let identity =
+            std::fs::read_to_string(crate::security::vault_private_key_path(&identity_path))
+                .unwrap();
+        let (mut vault, key) = sshenv_vault::Vault::create(&public).unwrap();
+        vault.migrate_to_v2(&[public]).unwrap();
+        vault.enable_profile_keys().unwrap();
+        vault.profiles.profiles.insert(
+            "exa".into(),
+            BTreeMap::from([
+                ("TEST_PROVIDER_API_KEY".into(), "old".into()),
+                ("REFRESH_TOKEN".into(), "old-refresh".into()),
+                ("UNRELATED".into(), "preserved".into()),
+            ]),
+        );
+        let mut bytes = Vec::new();
+        vault
+            .save_with_storage(&key, |value, _| {
+                bytes = value.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        let directory = root.path().join("custody");
+        let storage =
+            crate::custody_storage::CredentialCustodyStorage::create(&directory, &bytes).unwrap();
+        let profile = resolved(&root.path().join("unused"));
+        let mut registration = method();
+        if let AuthMethodContribution::SecretFields { fields, .. } = &mut registration {
+            let mut refresh_field = fields[0].clone();
+            refresh_field.credential_id = "refresh_token".into();
+            refresh_field.storage_key = "REFRESH_TOKEN".into();
+            fields.push(refresh_field);
+        }
+        let retained = RetainedAuthRequestCustody::new(
+            storage,
+            profile.clone(),
+            "exa",
+            "bcode.web-search",
+            registration.clone(),
+            vec![Zeroizing::new(identity.clone())],
+            None,
+        )
+        .unwrap();
+        RefreshFixture {
+            root,
+            directory,
+            identity,
+            profile,
+            registration,
+            retained,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
+    fn refresh_serializes_and_commits_complete_records() {
+        use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};
+        use bcode_provider_auth_models::{AuthRefreshBeginRequest, AuthRefreshCommitRequest};
+        let fixture = refresh_fixture();
+        let profile = fixture.profile.clone();
+        let retained = &fixture.retained;
+        let begin = AuthRefreshBeginRequest {
+            schema_version: 1,
+            provider_id: "exa".into(),
+            profile: "exa".into(),
+            credentials: BTreeMap::from([
+                ("api_key".into(), Some("old".into())),
+                ("refresh_token".into(), Some("old-refresh".into())),
+            ]),
+        };
+        let mut foreign_selection = begin.clone();
+        foreign_selection.profile = "other-profile".into();
+        assert!(retained.begin_refresh(&profile, foreign_selection).is_err());
+        let mut foreign_provider = begin.clone();
+        foreign_provider.provider_id = "other-provider".into();
+        assert!(retained.begin_refresh(&profile, foreign_provider).is_err());
+        let mut stale = begin.clone();
+        stale
+            .credentials
+            .insert("api_key".into(), Some("stale".into()));
+        assert!(retained.begin_refresh(&profile, stale).is_err());
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| retained.begin_refresh(&profile, begin.clone()));
+            let right = scope.spawn(|| retained.begin_refresh(&profile, begin.clone()));
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_ne!(left.is_ok(), right.is_ok());
+        let attempt = left.or(right).unwrap();
+        assert!(retained.begin_refresh(&profile, begin).is_err());
+        assert!(
+            retained
+                .persist(
+                    &profile,
+                    BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), Some("bypass".into()))])
+                )
+                .is_err()
+        );
+        let context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("exa".into()),
+            ..Default::default()
+        };
+        assert!(retained.materialize("bcode.web-search", &context).is_err());
+        let commit = AuthRefreshCommitRequest {
+            schema_version: 1,
+            provider_id: "exa".into(),
+            profile: "exa".into(),
+            attempt: attempt.attempt,
+            credentials: BTreeMap::from([
+                ("api_key".into(), Some("rotated".into())),
+                ("refresh_token".into(), Some("rotated-refresh".into())),
+            ]),
+        };
+        let mut incomplete = commit.clone();
+        incomplete.credentials.remove("refresh_token");
+        assert!(retained.commit_refresh(&profile, incomplete).is_err());
+        let mut foreign = commit.clone();
+        foreign.attempt = "f".repeat(64);
+        assert!(retained.commit_refresh(&profile, foreign).is_err());
+        retained.commit_refresh(&profile, commit.clone()).unwrap();
+        assert!(retained.commit_refresh(&profile, commit).is_err());
+        let materialized = retained.materialize("bcode.web-search", &context).unwrap();
+        assert_eq!(materialized.env["TEST_PROVIDER_API_KEY"], "rotated");
+        assert_eq!(materialized.env["REFRESH_TOKEN"], "rotated-refresh");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
+    fn unresolved_refresh_requires_owned_reenrollment() {
+        use crate::operations::{
+            AuthCredentialCustody as _, AuthRequestCustody as _, RetainedAuthRequestCustody,
+        };
+        use bcode_provider_auth_models::{AuthRefreshBeginRequest, AuthRefreshCommitRequest};
+        let RefreshFixture {
+            root: _root,
+            directory,
+            identity,
+            profile,
+            registration,
+            retained,
+        } = refresh_fixture();
+        let context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("exa".into()),
+            ..Default::default()
+        };
+        let next = AuthRefreshBeginRequest {
+            schema_version: 1,
+            provider_id: "exa".into(),
+            profile: "exa".into(),
+            credentials: BTreeMap::from([
+                ("api_key".into(), Some("old".into())),
+                ("refresh_token".into(), Some("old-refresh".into())),
+            ]),
+        };
+        let unresolved = retained.begin_refresh(&profile, next.clone()).unwrap();
+        drop(retained);
+        let storage = crate::custody_storage::CredentialCustodyStorage::open(&directory).unwrap();
+        let reopened = RetainedAuthRequestCustody::new(
+            storage,
+            profile.clone(),
+            "exa",
+            "bcode.web-search",
+            registration,
+            vec![Zeroizing::new(identity.clone())],
+            None,
+        )
+        .unwrap();
+        assert!(reopened.materialize("bcode.web-search", &context).is_err());
+        assert!(reopened.begin_refresh(&profile, next).is_err());
+        assert!(
+            reopened
+                .commit_refresh(
+                    &profile,
+                    AuthRefreshCommitRequest {
+                        schema_version: 1,
+                        provider_id: "exa".into(),
+                        profile: "exa".into(),
+                        attempt: unresolved.attempt,
+                        credentials: BTreeMap::from([
+                            ("api_key".into(), Some("late".into())),
+                            ("refresh_token".into(), Some("late-refresh".into()))
+                        ]),
+                    }
+                )
+                .is_err()
+        );
+        let mut wrong_owner = profile.clone();
+        wrong_owner.owner_plugin_id = "foreign".into();
+        let enrolled = BTreeMap::from([
+            ("api_key".into(), Some("reenrolled".into())),
+            ("refresh_token".into(), Some("reenrolled-refresh".into())),
+        ]);
+        assert!(
+            reopened
+                .reenroll_after_refresh(&wrong_owner, enrolled.clone())
+                .is_err()
+        );
+        reopened.reenroll_after_refresh(&profile, enrolled).unwrap();
+        assert_eq!(
+            reopened
+                .materialize("bcode.web-search", &context)
+                .unwrap()
+                .env["TEST_PROVIDER_API_KEY"],
+            "reenrolled"
+        );
+        drop(reopened);
+        let storage = crate::custody_storage::CredentialCustodyStorage::open(&directory).unwrap();
+        let ciphertext = sshenv_vault::Vault::decode_ciphertext(&storage.read().unwrap()).unwrap();
+        let key = sshenv_vault::recipient::unwrap_data_key_with_strings(
+            &ciphertext.recipients,
+            &[identity.as_str()],
+        )
+        .unwrap();
+        let (mut persisted, key) =
+            sshenv_vault::Vault::unlock_metadata_with_data_key_and_device_factor(
+                ciphertext,
+                key,
+                None,
+                |_| Err(std::io::Error::other("unexpected factor").into()),
+            )
+            .unwrap();
+        persisted
+            .unlock_profile_with_passphrase("exa", &key, None)
+            .unwrap();
+        let values = &persisted.profiles.profiles["exa"];
+        assert_eq!(values["TEST_PROVIDER_API_KEY"], "reenrolled");
+        assert_eq!(values["REFRESH_TOKEN"], "reenrolled-refresh");
+        assert_eq!(values["UNRELATED"], "preserved");
     }
 
     #[test]

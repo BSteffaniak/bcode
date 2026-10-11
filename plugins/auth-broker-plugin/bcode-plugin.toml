@@ -1,0 +1,19 @@
+id      = "bcode.auth-broker"
+name    = "Bcode Auth Broker"
+version = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Serves a single-owner GitHub OIDC normalized model gateway"
+interface_id = "bcode.auth-broker/v1"
+name         = "Auth Broker"
+
+[concurrency]
+max  = 1
+type = "limited"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_auth_broker_plugin.so"
+type         = "native"

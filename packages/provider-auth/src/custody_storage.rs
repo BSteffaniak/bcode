@@ -79,7 +79,72 @@ pub trait AuthCustodyStorage: Send {
     ///
     /// # Errors
     /// Returns storage errors; failed removal must not be treated as acknowledged completion.
+    /// Verify that no remote refresh has an unresolved outcome.
+    ///
+    /// # Errors
+    /// Unsupported storage fails closed rather than admitting a remote exchange.
+    fn ensure_no_refresh(&self) -> Result<(), CustodyStorageError> {
+        Err(CustodyStorageError::MaintenanceRequired)
+    }
+
+    /// Durably admit exactly one profile-bound remote exchange.
+    ///
+    /// # Errors
+    /// Rejects an existing fence, unsupported storage, and uncertain publication.
+    fn begin_refresh(&self, _intent: &AuthRefreshIntent) -> Result<(), CustodyStorageError> {
+        Err(CustodyStorageError::MaintenanceRequired)
+    }
+
+    /// Read the unresolved refresh identity without clearing or replaying it.
+    ///
+    /// # Errors
+    /// Rejects missing, damaged, or unsupported state.
+    fn refresh_intent(&self) -> Result<AuthRefreshIntent, CustodyStorageError> {
+        Err(CustodyStorageError::MaintenanceRequired)
+    }
+
+    /// Clear only the matching fence after durable rotation or owner-verified re-enrollment.
+    ///
+    /// # Errors
+    /// Rejects stale attempts; failed durability must block further use by this owner.
+    fn finish_refresh(&self, _intent: &AuthRefreshIntent) -> Result<(), CustodyStorageError> {
+        Err(CustodyStorageError::MaintenanceRequired)
+    }
+
+    /// Clear the device-provisioning fence after verified completion.
+    ///
+    /// # Errors
+    /// Failed removal or durability remains unresolved.
     fn finish_provisioning(&self) -> Result<(), CustodyStorageError>;
+}
+
+/// Non-secret, owner-protected durable refresh fence. Device provisioning is independent.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthRefreshIntent {
+    /// Independently versioned on-disk record.
+    pub version: u16,
+    /// Opaque random identity; never log it.
+    pub attempt: String,
+    /// Hash of the canonical custody/profile ownership binding.
+    pub profile_binding: String,
+}
+
+impl AuthRefreshIntent {
+    fn validate(&self) -> Result<(), CustodyStorageError> {
+        if self.version != 1
+            || self.attempt.len() != 64
+            || self.profile_binding.len() != 64
+            || !self.attempt.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !self
+                .profile_binding
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        Ok(())
+    }
 }
 
 /// An exclusively owned Unix custody directory containing only encrypted vault data.
@@ -92,6 +157,7 @@ pub trait AuthCustodyStorage: Send {
 pub struct CredentialCustodyStorage {
     directory: std::fs::File,
     _lock: std::fs::File,
+    refresh_poisoned: std::cell::Cell<bool>,
 }
 
 #[cfg(unix)]
@@ -162,6 +228,7 @@ impl CredentialCustodyStorage {
         Ok(Self {
             directory,
             _lock: lock,
+            refresh_poisoned: std::cell::Cell::new(false),
         })
     }
 
@@ -170,6 +237,13 @@ impl CredentialCustodyStorage {
     /// # Errors
     /// Returns storage or maintenance errors for missing/unsupported/damaged data.
     pub fn read(&self) -> Result<Vec<u8>, CustodyStorageError> {
+        if self.refresh_poisoned.get() {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        match crate::store::open_owned_entry(&self.directory, c"pending", libc::O_RDONLY) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(CustodyStorageError::MaintenanceRequired),
+        }
         let file = crate::store::open_owned_entry(&self.directory, c"custody", libc::O_RDONLY)
             .map_err(CustodyStorageError::Io)?;
         let mut bytes = Vec::new();
@@ -330,6 +404,68 @@ impl AuthCustodyStorage for CredentialCustodyStorage {
         Self::provisioning_intent(self)
     }
 
+    fn ensure_no_refresh(&self) -> Result<(), CustodyStorageError> {
+        if self.refresh_poisoned.get() {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        match crate::store::open_owned_entry(&self.directory, c"refresh-v1", libc::O_RDONLY) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(CustodyStorageError::MaintenanceRequired),
+        }
+    }
+
+    fn begin_refresh(&self, intent: &AuthRefreshIntent) -> Result<(), CustodyStorageError> {
+        intent.validate()?;
+        self.ensure_no_refresh()?;
+        self.ensure_no_provisioning()?;
+        let bytes =
+            serde_json::to_vec(intent).map_err(|_| CustodyStorageError::MaintenanceRequired)?;
+        let mut file = crate::store::open_owned_entry(
+            &self.directory,
+            c"refresh-v1",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        )
+        .map_err(CustodyStorageError::Io)?;
+        file.write_all(&bytes).map_err(CustodyStorageError::Io)?;
+        file.sync_all().map_err(CustodyStorageError::Io)?;
+        self.directory.sync_all().map_err(CustodyStorageError::Io)
+    }
+
+    fn refresh_intent(&self) -> Result<AuthRefreshIntent, CustodyStorageError> {
+        if self.refresh_poisoned.get() {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        let file = crate::store::open_owned_entry(&self.directory, c"refresh-v1", libc::O_RDONLY)
+            .map_err(CustodyStorageError::Io)?;
+        let mut bytes = Vec::new();
+        file.take(1025)
+            .read_to_end(&mut bytes)
+            .map_err(CustodyStorageError::Io)?;
+        if bytes.len() > 1024 {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        let intent: AuthRefreshIntent =
+            serde_json::from_slice(&bytes).map_err(|_| CustodyStorageError::MaintenanceRequired)?;
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    fn finish_refresh(&self, intent: &AuthRefreshIntent) -> Result<(), CustodyStorageError> {
+        use std::os::fd::AsRawFd as _;
+        if self.refresh_intent()? != *intent {
+            return Err(CustodyStorageError::Conflict);
+        }
+        // SAFETY: the static relative name and retained directory descriptor are valid.
+        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), c"refresh-v1".as_ptr(), 0) } != 0 {
+            return Err(CustodyStorageError::Io(std::io::Error::last_os_error()));
+        }
+        if let Err(error) = self.directory.sync_all() {
+            self.refresh_poisoned.set(true);
+            return Err(CustodyStorageError::Io(error));
+        }
+        Ok(())
+    }
+
     fn finish_provisioning(&self) -> Result<(), CustodyStorageError> {
         Self::finish_provisioning(self)
     }
@@ -347,6 +483,49 @@ fn validate(ciphertext: &[u8]) -> Result<(), CustodyStorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertain_publication_blocks_reads_without_clearing_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(not(feature = "custody-simulation"))]
+        let public =
+            crate::security::ensure_vault_recipient_key(&temp.path().join("source")).unwrap();
+        #[cfg(feature = "custody-simulation")]
+        let public = "sim-age:uncertain-owner".to_owned();
+        let (vault, key) = sshenv_vault::Vault::create(&public).unwrap();
+        let mut ciphertext = Vec::new();
+        vault
+            .save_with_storage(&key, |bytes, _| {
+                ciphertext = bytes.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        let path = temp.path().join("owned");
+        let mut storage = CredentialCustodyStorage::create(&path, &ciphertext).unwrap();
+        let intent = AuthRefreshIntent {
+            version: 1,
+            attempt: "a".repeat(64),
+            profile_binding: "b".repeat(64),
+        };
+        storage.begin_refresh(&intent).unwrap();
+        // A crash/interrupted writer can leave this ownership-confined publication marker.
+        std::fs::write(path.join("pending"), b"interrupted").unwrap();
+        assert!(
+            storage
+                .compare_and_publish(&ciphertext, &ciphertext)
+                .is_err()
+        );
+        assert!(storage.read().is_err());
+        assert!(storage.ensure_no_refresh().is_err());
+        assert!(storage.refresh_intent().unwrap() == intent);
+        drop(storage);
+        assert!(CredentialCustodyStorage::open(&path).is_err());
+        assert!(path.join("refresh-v1").exists());
+        assert_eq!(
+            std::fs::read(path.join("custody")).unwrap()[MAGIC.len()..],
+            ciphertext
+        );
+    }
 
     #[test]
     fn encrypted_owner_conflicts_release_and_incompatible_envelope() {
@@ -376,6 +555,25 @@ mod tests {
         storage
             .compare_and_publish(&ciphertext, &ciphertext)
             .unwrap();
+        let refresh = AuthRefreshIntent {
+            version: 1,
+            attempt: "a".repeat(64),
+            profile_binding: "b".repeat(64),
+        };
+        storage.begin_refresh(&refresh).unwrap();
+        assert!(storage.ensure_no_refresh().is_err());
+        assert!(storage.begin_refresh(&refresh).is_err());
+        let stale = AuthRefreshIntent {
+            attempt: "c".repeat(64),
+            ..refresh.clone()
+        };
+        assert!(storage.finish_refresh(&stale).is_err());
+        drop(storage);
+        let storage = CredentialCustodyStorage::open(&path).unwrap();
+        assert!(storage.refresh_intent().unwrap() == refresh);
+        assert!(storage.ensure_no_refresh().is_err());
+        storage.finish_refresh(&refresh).unwrap();
+        storage.ensure_no_refresh().unwrap();
         let intent = crate::operations::AuthProvisioningIntent {
             version: 2,
             source: "test".into(),

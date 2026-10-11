@@ -4,12 +4,19 @@ inputs:
   binary:
     description: Absolute path to a verified Bcode release binary
     required: true
+  auth-mode:
+    description: direct (existing explicit API config) or broker-oidc (normalized scoped gateway)
+    default: direct
+  broker-url:
+    description: Trusted HTTPS broker origin; required for broker-oidc
+  broker-audience:
+    description: Exact audience admitted by broker policy; required for broker-oidc
   config:
-    description: Absolute trusted config file outside the checkout; contains explicit model/auth profiles
-    required: true
+    description: Absolute trusted config outside checkout (direct mode only)
+    required: false
   profile:
-    description: Explicit model profile to use (no account or billing fallback)
-    required: true
+    description: Explicit model profile (direct mode only; broker selects github-broker exclusively)
+    required: false
   prompt:
     description: Arbitrary UTF-8 prompt, passed as data rather than shell code
     required: true
@@ -29,6 +36,9 @@ runs:
     - id: run
       shell: bash
       env:
+        BCODE_ACTION_AUTH_MODE: ${{ inputs.auth-mode }}
+        BCODE_ACTION_BROKER_URL: ${{ inputs.broker-url }}
+        BCODE_ACTION_BROKER_AUDIENCE: ${{ inputs.broker-audience }}
         BCODE_ACTION_BINARY: ${{ inputs.binary }}
         BCODE_ACTION_CONFIG: ${{ inputs.config }}
         BCODE_ACTION_PROFILE: ${{ inputs.profile }}

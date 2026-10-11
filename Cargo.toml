@@ -23,6 +23,8 @@ members = [
     "plugins/fake-provider-plugin",
     "plugins/jev-provider-plugin",
     "plugins/openai-compatible-provider-plugin",
+    "plugins/auth-broker-plugin",
+    "plugins/auth-broker-provider-plugin",
     "plugins/opencode-session-import-plugin",
     "plugins/pi-session-import-plugin",
     "plugins/shell-plugin",
@@ -171,6 +173,8 @@ bcode_agent_policy                      = { version = "0.0.1-alpha.0", default-f
 bcode_agent_policy_models               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy/models" }
 bcode_agent_profile                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-profile" }
 bcode_agent_runtime                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-runtime" }
+bcode_auth_broker_plugin                = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/auth-broker-plugin" }
+bcode_auth_broker_provider_plugin       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/auth-broker-provider-plugin" }
 bcode_bedrock_provider_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/bedrock-provider-plugin" }
 bcode_blims_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/blims-plugin" }
 bcode_build_info                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/build-info" }
@@ -374,6 +378,9 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 insta = { version = "1.48.0", default-features = false }
 jsonschema = { version = "0.47.0", default-features = false }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = [
+    "rust_crypto",
+] }
 libc = { version = "0.2.189", default-features = false }
 libloading = { version = "0.9.0", default-features = false }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }

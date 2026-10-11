@@ -61,6 +61,7 @@ mod worktree_creation;
 mod worktree_operations;
 
 use judgement::invoke_judgement_model;
+mod model_host_operations;
 use model_request_target::{ModelRequestTargetInput, resolve_model_request_target};
 use request_routing::{
     AgentSkillPluginRequest, CoreRuntimeRequest, PermissionInteractionRequest, RoutedRequest,
@@ -392,6 +393,7 @@ pub struct ServerState {
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
+    model_host: Arc<model_host_operations::ModelHostOperations>,
     optional_judgement: judgement::OptionalJudgementAccess,
     progress_windows: StdMutex<BTreeMap<SessionId, judgement::ProgressWindow>>,
     workflow_progress_windows: StdMutex<BTreeMap<String, judgement::ProgressWindow>>,
@@ -2513,6 +2515,9 @@ impl ServerState {
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
+            model_host: Arc::new(model_host_operations::ModelHostOperations::from_config(
+                &init.startup_config,
+            )),
             optional_judgement: judgement::OptionalJudgementAccess::new(),
             progress_windows: StdMutex::new(BTreeMap::new()),
             workflow_progress_windows: StdMutex::new(BTreeMap::new()),
@@ -5395,6 +5400,22 @@ async fn run_constructed_server(
         storage_read_admission::register_startup(&state, root).await;
         phase.finish();
     }
+    state.model_host.bind_server(&state);
+    {
+        let weak = Arc::downgrade(&state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                if state.shutdown_requested.load(Ordering::SeqCst) {
+                    break;
+                }
+                state.model_host.reap().await;
+            }
+        });
+    }
     let startup_started_at = state.startup_started_at;
     let background_phase = bcode_metrics::startup::phase("server.background_services");
     let stage_started_at = Instant::now();
@@ -5685,6 +5706,7 @@ async fn shutdown_constructed_server(
     accept_result: Result<(), ServerError>,
 ) -> Result<(), ServerError> {
     state.request_shutdown();
+    trace_shutdown_stage("model_host", state.model_host.shutdown()).await;
     // The blocking worker may finish safely, but cannot publish a store after shutdown.
     state
         .workflow_initialization
@@ -26744,6 +26766,25 @@ async fn invoke_model_provider_start_turn_scoped(
     scope: PluginInvocationScope,
     config: &bcode_config::BcodeConfig,
 ) -> Result<StartTurnResponse, String> {
+    invoke_model_provider_start_turn_with_custody(
+        state,
+        provider_plugin_id,
+        request,
+        scope,
+        config,
+        None,
+    )
+    .await
+}
+
+async fn invoke_model_provider_start_turn_with_custody(
+    state: &ServerState,
+    provider_plugin_id: Option<String>,
+    request: &ModelTurnRequest,
+    scope: PluginInvocationScope,
+    config: &bcode_config::BcodeConfig,
+    custody: Option<Arc<dyn bcode_provider_auth::operations::AuthCredentialCustody>>,
+) -> Result<StartTurnResponse, String> {
     let (provider_plugin_id, interface_id) =
         if let Some(provider_plugin_id) = provider_plugin_id.as_deref() {
             let interface_id = model_provider_interface_for_plugin(state, provider_plugin_id)
@@ -26753,12 +26794,13 @@ async fn invoke_model_provider_start_turn_scoped(
             unique_model_provider_route(state)?
         };
     let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
-    let bridge = server_model_provider_bridge(
+    let bridge = server_model_provider_bridge_with_custody(
         state.plugins.clone(),
         config.clone(),
         state.optional_judgement.invalidation_handle(),
         &request.turn_id,
         &provider_plugin_id,
+        custody,
     );
     let mut labels = MetricLabels::new();
     labels.insert("provider_plugin_id".to_owned(), provider_plugin_id.clone());
@@ -32750,12 +32792,34 @@ fn auth_host_service_resolution(
     caller_plugin_id: &str,
     request: bcode_tool::ToolInvocationServiceRequest,
 ) -> bcode_tool::ToolInvocationServiceResolution {
+    auth_host_service_resolution_with_custody(plugins, config, caller_plugin_id, request, None)
+}
+
+fn auth_host_service_resolution_with_custody(
+    plugins: &bcode_plugin::PluginRuntimeHost,
+    config: &bcode_config::BcodeConfig,
+    caller_plugin_id: &str,
+    request: bcode_tool::ToolInvocationServiceRequest,
+    custody: Option<&dyn bcode_provider_auth::operations::AuthCredentialCustody>,
+) -> bcode_tool::ToolInvocationServiceResolution {
     use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_INSPECT_SECURITY};
 
     if request.interface_id != AUTH_HOST_INTERFACE_ID {
         return bcode_tool::ToolInvocationServiceResolution::Unsupported;
     }
-    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    let runtime = if custody.is_some() {
+        match bcode_config::try_load_runtime_auth_subscriptions() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return bcode_tool::ToolInvocationServiceResolution::Failed {
+                    code: "auth_profile_unavailable".into(),
+                    message: "authentication metadata is unavailable".into(),
+                };
+            }
+        }
+    } else {
+        bcode_config::load_runtime_auth_subscriptions()
+    };
     let registered_provider = |provider_id: &str| {
         plugins.auth_provider(provider_id).map(|registered| {
             bcode_provider_auth::operations::RegisteredAuthProviderOwner {
@@ -32765,12 +32829,13 @@ fn auth_host_service_resolution(
         })
     };
     if request.operation != OP_INSPECT_SECURITY {
-        return bcode_provider_auth::operations::resolve_credential_update_service_request(
+        return bcode_provider_auth::operations::resolve_credential_update_service_request_with_custody(
             config,
             &runtime,
             caller_plugin_id,
             registered_provider,
             request,
+            custody,
         );
     }
     let Ok(inspection) = serde_json::from_value::<
@@ -32841,6 +32906,24 @@ fn server_model_provider_bridge(
     turn_id: &str,
     caller_plugin_id: &str,
 ) -> PluginInvocationBridge {
+    server_model_provider_bridge_with_custody(
+        plugins,
+        config,
+        invalidation,
+        turn_id,
+        caller_plugin_id,
+        None,
+    )
+}
+
+fn server_model_provider_bridge_with_custody(
+    plugins: bcode_plugin::PluginRuntimeHost,
+    config: bcode_config::BcodeConfig,
+    invalidation: judgement::JudgementInvalidationHandle,
+    turn_id: &str,
+    caller_plugin_id: &str,
+    custody: Option<Arc<dyn bcode_provider_auth::operations::AuthCredentialCustody>>,
+) -> PluginInvocationBridge {
     let turn_id = turn_id.to_owned();
     let caller_plugin_id = caller_plugin_id.to_owned();
     PluginInvocationBridge::new(move |request, cancellation| match request {
@@ -32850,7 +32933,13 @@ fn server_model_provider_bridge(
         ServiceBridgeRequest::InvokeService(request) if request.invocation_id == turn_id => {
             invalidation.invalidate();
             Ok(ServiceBridgeResponse::Service(
-                auth_host_service_resolution(&plugins, &config, &caller_plugin_id, request),
+                auth_host_service_resolution_with_custody(
+                    &plugins,
+                    &config,
+                    &caller_plugin_id,
+                    request,
+                    custody.as_deref(),
+                ),
             ))
         }
         ServiceBridgeRequest::InvokeService(_) => Ok(ServiceBridgeResponse::Service(

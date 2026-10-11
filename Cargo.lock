@@ -1510,6 +1510,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_auth_broker_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "axum",
+ "bcode_model",
+ "bcode_plugin_sdk",
+ "bcode_tool",
+ "jsonwebtoken",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_auth_broker_provider_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model",
+ "bcode_model_provider_runtime",
+ "bcode_plugin_sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_bedrock_provider_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1573,6 +1602,8 @@ dependencies = [
 name = "bcode_bundled_plugins"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_auth_broker_plugin",
+ "bcode_auth_broker_provider_plugin",
  "bcode_bedrock_provider_plugin",
  "bcode_blims_plugin",
  "bcode_code_review_plugin",
@@ -5117,6 +5148,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -5327,6 +5359,7 @@ version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
+ "pkcs8",
  "signature",
 ]
 
@@ -5338,8 +5371,10 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "serde",
  "sha2 0.10.9",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -5361,6 +5396,7 @@ dependencies = [
  "generic-array",
  "group",
  "hkdf 0.12.4",
+ "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
@@ -7607,6 +7643,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee0b351864e7ffbc5db9273daf7fa1b4d5177b0946713d667ca571b83c0b4045"
 dependencies = [
  "regex-syntax",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "11.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hmac 0.12.1",
+ "js-sys",
+ "p256",
+ "p384",
+ "rand 0.8.5",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "signature",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 //! Isolated no-crash custody storage. Never use real secrets in simulation.
-use super::{AuthCustodyStorage, CustodyStorageError, MAX_BYTES, validate};
+use super::{AuthCustodyStorage, AuthRefreshIntent, CustodyStorageError, MAX_BYTES, validate};
 use crate::operations::AuthProvisioningIntent;
 use std::{
     io::{Read as _, Write as _},
@@ -27,6 +27,8 @@ struct Snapshot {
     version: u32,
     ciphertext: Vec<u8>,
     intent: Option<AuthProvisioningIntent>,
+    #[serde(default)]
+    refresh: Option<AuthRefreshIntent>,
 }
 
 impl CustodySimulation {
@@ -54,6 +56,7 @@ impl CustodySimulation {
             version: 1,
             ciphertext: ciphertext.to_vec(),
             intent: None,
+            refresh: None,
         })?;
         Ok((simulation, Box::new(storage)))
     }
@@ -140,6 +143,37 @@ fn validate_intent(intent: &AuthProvisioningIntent) -> Result<(), CustodyStorage
 }
 
 impl AuthCustodyStorage for Storage {
+    fn ensure_no_refresh(&self) -> Result<(), CustodyStorageError> {
+        if self.snapshot()?.refresh.is_some() {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        Ok(())
+    }
+    fn begin_refresh(&self, intent: &AuthRefreshIntent) -> Result<(), CustodyStorageError> {
+        intent.validate()?;
+        let mut state = self.snapshot()?;
+        if state.refresh.is_some() || state.intent.is_some() {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        state.refresh = Some(intent.clone());
+        self.publish(&state)
+    }
+    fn refresh_intent(&self) -> Result<AuthRefreshIntent, CustodyStorageError> {
+        let intent = self
+            .snapshot()?
+            .refresh
+            .ok_or(CustodyStorageError::MaintenanceRequired)?;
+        intent.validate()?;
+        Ok(intent)
+    }
+    fn finish_refresh(&self, intent: &AuthRefreshIntent) -> Result<(), CustodyStorageError> {
+        let mut state = self.snapshot()?;
+        if state.refresh.as_ref() != Some(intent) {
+            return Err(CustodyStorageError::Conflict);
+        }
+        state.refresh = None;
+        self.publish(&state)
+    }
     fn read(&self) -> Result<Vec<u8>, CustodyStorageError> {
         Ok(self.snapshot()?.ciphertext)
     }

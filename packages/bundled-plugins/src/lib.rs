@@ -284,6 +284,16 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(model_plugin());
     #[cfg(feature = "static-bundled-jev-provider-plugin")]
     plugins.push(jev_provider_plugin());
+    #[cfg(feature = "static-bundled-auth-broker-plugin")]
+    plugins.push(bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/auth-broker-plugin/bcode-plugin.toml"),
+        bcode_auth_broker_plugin::static_plugin(),
+    ));
+    #[cfg(feature = "static-bundled-auth-broker-provider-plugin")]
+    plugins.push(bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/auth-broker-provider-plugin/bcode-plugin.toml"),
+        bcode_auth_broker_provider_plugin::static_plugin(),
+    ));
     #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
     plugins.push(openai_compatible_provider_plugin());
     #[cfg(feature = "static-bundled-opencode-session-import-plugin")]

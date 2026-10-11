@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub mod history;
+pub mod host_operation;
 pub mod image_upload;
 pub mod judgement;
 /// Content-free lineage for normalized requests and provider conversion observations.

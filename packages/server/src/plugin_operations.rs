@@ -313,6 +313,48 @@ pub async fn invoke_service(
 ) -> Result<PluginServiceOperationResult, PublicPluginError> {
     let plugin_id = plugin_id.to_owned();
     let interface_id = interface_id.to_owned();
+    let mut payload = payload;
+    let model_owner = if interface_id == "bcode.auth-broker/v1"
+        && operation == "serve"
+        && state.model_host.admits(&plugin_id)
+    {
+        let configured = state
+            .startup_config
+            .plugins
+            .config
+            .get(&plugin_id)
+            .and_then(|table| table.get("serve"))
+            .ok_or(PublicPluginError {
+                code: "broker_config_missing",
+                message: "broker serve configuration is missing",
+            })?;
+        let mut value = serde_json::to_value(configured).map_err(|_| PublicPluginError {
+            code: "invalid_request",
+            message: "invalid configured service request",
+        })?;
+        let object = value.as_object_mut().ok_or(PublicPluginError {
+            code: "invalid_request",
+            message: "invalid service request",
+        })?;
+        let invocation_id = uuid::Uuid::new_v4().to_string();
+        object.insert(
+            "invocation_id".into(),
+            serde_json::Value::String(invocation_id.clone()),
+        );
+        payload = serde_json::to_vec(&value).map_err(|_| PublicPluginError {
+            code: "invalid_request",
+            message: "invalid service request",
+        })?;
+        Some((plugin_id.clone(), invocation_id))
+    } else {
+        None
+    };
+    if interface_id == "bcode.auth-broker/v1" && operation == "serve" && model_owner.is_none() {
+        return Err(PublicPluginError {
+            code: "model_host_not_admitted",
+            message: "model host capability is disabled",
+        });
+    }
     let labels = plugin_service_metric_labels(Some(&plugin_id), &interface_id, &operation);
     let authorized_session_id =
         super::command_invocation_session(&interface_id, &operation, &payload);
@@ -323,18 +365,41 @@ pub async fn invoke_service(
         } else {
             None
         };
-    let invocation = state.plugins.invoke_service_with_bridge_scoped(
-        &plugin_id,
-        interface_id,
-        operation,
-        payload,
-        bcode_plugin::PluginInvocationScope::Global,
-        Some(bridge),
-    );
+    let invocation = async {
+        let call = state.plugins.invoke_service_with_bridge_scoped(
+            &plugin_id,
+            interface_id,
+            operation,
+            payload,
+            bcode_plugin::PluginInvocationScope::Global,
+            Some(bridge),
+        );
+        if model_owner.is_some() {
+            tokio::select! {
+                result = call => result,
+                () = async {
+                    while !state.shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                } => Err(bcode_plugin::PluginLoadError::ServiceInvocationTimeout {
+                    plugin_id: plugin_id.clone(), timeout_ms: 0,
+                }),
+            }
+        } else {
+            call.await
+        }
+    };
+    let owner_for_driver = model_owner.clone();
     let result = Box::pin(state.metrics.time_result_async(
         "plugin.service",
         labels,
-        drive_service_bridge(state, authorized_session_id, bridge_requests, invocation),
+        drive_service_bridge_owned(
+            state,
+            authorized_session_id,
+            bridge_requests,
+            invocation,
+            owner_for_driver,
+        ),
     ))
     .await
     .map(project_service_response)
@@ -383,21 +448,78 @@ fn validate_activity_response(
     presentation.validate(producer).map_err(|_| invalid())
 }
 
+struct ModelOwnerGuard {
+    host: std::sync::Arc<super::model_host_operations::ModelHostOperations>,
+    owner: Option<(String, String)>,
+}
+
+impl Drop for ModelOwnerGuard {
+    fn drop(&mut self) {
+        if let Some((caller, id)) = self.owner.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let host = self.host.clone();
+            runtime.spawn(async move {
+                host.cancel_owner(&caller, &id).await;
+            });
+        }
+    }
+}
+
+#[cfg(test)]
 async fn drive_service_bridge<T>(
+    state: &ServerState,
+    authorized_session_id: Option<bcode_session_models::SessionId>,
+    bridge_requests: mpsc::UnboundedReceiver<super::ServerPluginBridgeCall>,
+    invocation: impl std::future::Future<Output = T>,
+) -> T {
+    drive_service_bridge_owned(
+        state,
+        authorized_session_id,
+        bridge_requests,
+        invocation,
+        None,
+    )
+    .await
+}
+
+async fn drive_service_bridge_owned<T>(
     state: &ServerState,
     authorized_session_id: Option<bcode_session_models::SessionId>,
     mut bridge_requests: mpsc::UnboundedReceiver<super::ServerPluginBridgeCall>,
     invocation: impl std::future::Future<Output = T>,
+    model_owner: Option<(String, String)>,
 ) -> T {
+    let _owner_guard = ModelOwnerGuard {
+        host: state.model_host.clone(),
+        owner: model_owner.clone(),
+    };
     tokio::pin!(invocation);
     loop {
         tokio::select! {
-            result = &mut invocation => break result,
+            result = &mut invocation => {
+                if let Some((caller, id)) = &model_owner { state.model_host.cancel_owner(caller, id).await; }
+                break result;
+            },
             bridge_call = bridge_requests.recv() => {
                 let Some(bridge_call) = bridge_call else {
-                    return invocation.await;
+                    let result = invocation.await;
+                    if let Some((caller, id)) = &model_owner { state.model_host.cancel_owner(caller, id).await; }
+                    return result;
                 };
-                let response = if let bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(request) =
+                let response = if let bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(request) = &bridge_call.request
+                    && request.interface_id == bcode_model::host_operation::INTERFACE_ID
+                {
+                    let result = match &model_owner {
+                        Some((caller, id)) if request.invocation_id == *id && !bridge_call.cancellation.is_cancelled() => {
+                            state.model_host.clone().dispatch(caller, request.clone()).await
+                        }
+                        _ => bcode_tool::ToolInvocationServiceResolution::Failed {
+                            code: "model_host_not_admitted".into(), message: "model host invocation ownership is unavailable".into(),
+                        },
+                    };
+                    Ok(bcode_plugin_sdk::ServiceBridgeResponse::Service(result))
+                } else if let bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(request) =
                     &bridge_call.request
                     && request.route_id.as_deref()
                         == Some(bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID)
