@@ -546,6 +546,20 @@ impl bcode_workflow::WorkflowRunApplication for BcodeClient {
     ) -> Result<Vec<bcode_workflow::AttemptSummary>, Self::Error> {
         Self::workflow_attempt_history(self, run_id, cursor, limit).await
     }
+    async fn workflow_lifecycle_history(
+        &self,
+        query: bcode_workflow::WorkflowLifecycleHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowLifecycleHistoryPage, Self::Error> {
+        Self::workflow_lifecycle_history(self, query).await
+    }
+
+    async fn workflow_semantic_history(
+        &self,
+        query: bcode_workflow::WorkflowSemanticHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowSemanticHistoryPage, Self::Error> {
+        Self::workflow_semantic_history(self, query).await
+    }
+
     async fn workflow_observations(
         &self,
         run_id: String,
@@ -6824,6 +6838,60 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowEventHistory { events } => Ok(events),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one exact, pinned lifecycle-history page without execution or provider work.
+    ///
+    /// # Errors
+    /// Rejects invalid queries, transport failures and inconsistent responses.
+    pub async fn workflow_lifecycle_history(
+        &self,
+        query: bcode_workflow::WorkflowLifecycleHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowLifecycleHistoryPage, ClientError> {
+        query
+            .validate()
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+        match self
+            .send_request(Request::WorkflowLifecycleHistory {
+                query: query.clone(),
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowLifecycleHistory { page } => {
+                query
+                    .validate_page(&page)
+                    .map_err(|_| ClientError::UnexpectedResponse)?;
+                Ok(page)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one exact, pinned attempt-history page without execution or provider work.
+    ///
+    /// # Errors
+    /// Rejects invalid queries, transport failures and inconsistent responses.
+    pub async fn workflow_semantic_history(
+        &self,
+        query: bcode_workflow::WorkflowSemanticHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowSemanticHistoryPage, ClientError> {
+        query
+            .validate()
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+        match self
+            .send_request(Request::WorkflowSemanticHistory {
+                query: query.clone(),
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowSemanticHistory { page } => {
+                query
+                    .validate_page(&page)
+                    .map_err(|_| ClientError::UnexpectedResponse)?;
+                Ok(page)
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

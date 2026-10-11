@@ -439,12 +439,21 @@ pub async fn terminalize(
         }
     };
     if let Some(next) = next {
+        let history = super::semantic_history::lifecycle::begin(&*tx, run_id).await?;
+        let recorded_at = timestamp()?;
         tx.update(RUNS)
             .value("status", next.name())
-            .value("updated_at_ms", timestamp()?)
+            .value("updated_at_ms", recorded_at)
             .where_eq("run_id", run_id)
             .execute(&*tx)
             .await?;
+        super::semantic_history::lifecycle::finish(
+            &*tx,
+            history,
+            next.name(),
+            u64::try_from(recorded_at).map_err(|_| Error::MaintenanceRequired)?,
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(next)

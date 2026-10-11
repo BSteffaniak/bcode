@@ -18,6 +18,30 @@ drivers to completion. It uses the fake provider and one process; it is not yet 
 multi-process daemon/IPC acceptance test. Storage subprocess tests separately cover
 retained-handle writes and interruption safety. Neither claim includes old binaries.
 
+## Scoped durable attempt history
+
+The representation's semantic history contract version 1 records only `AttemptsV1`:
+preparation, receipt commitment, and terminal settlement. It does not establish full
+workflow history, authorization-decision history, graph/control history, or complete
+evaluation capture. `workflow semantic-history-run` exposes bounded pages through the
+workflow application boundary; legacy event APIs remain unchanged.
+
+Installation is additive and transactional. Typed database observers retain immutable
+OLD/NEW attempt-transition obligations, including writes by compatible artifacts that
+do not record semantic events. Instrumented Immediate transactions verify exact source
+transitions before atomically appending normalized events and acknowledgements. Indexed,
+run-scoped checkpoints establish coverage without replaying or scanning history. An
+unacknowledged older write permanently prevents complete coverage; subsequent recording
+must not erase that gap. Unmarked independent runs remain executable, without reserving
+the workflow domain or raising its shared execution-contract version.
+
+Admission-origin recording applies only to newly admitted runs after installation.
+Historical runs are not backfilled. Pages pin run, scope, coverage, and event high-water;
+continuations reject changed boundaries and unsupported versions. Page exhaustion is not
+proof that missing historical facts existed or that broader semantic sources are covered.
+Normal reads neither install history structures nor repair damaged state. Public events
+exclude private receipt payloads, failure messages, and execution fencing material.
+
 ## Existing historical-state handling
 
 Known historical storage retains the existing exclusive, backup-verified initialization

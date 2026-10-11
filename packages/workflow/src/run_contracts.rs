@@ -518,7 +518,25 @@ pub trait WorkflowRunApplication: Sync {
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<crate::AttemptSummary>, Self::Error>> + Send;
 
-    /// Read bounded semantic event history after an optional run sequence.
+    /// Read exact bounded run lifecycle history without execution authority.
+    ///
+    /// # Errors
+    /// Rejects unsupported queries, unavailable state and inconsistent pages.
+    fn workflow_lifecycle_history(
+        &self,
+        query: WorkflowLifecycleHistoryQuery,
+    ) -> impl std::future::Future<Output = Result<WorkflowLifecycleHistoryPage, Self::Error>> + Send;
+
+    /// Read bounded pinned attempt history, not full workflow semantics.
+    ///
+    /// # Errors
+    /// Rejects invalid queries, unavailable state and inconsistent pages.
+    fn workflow_semantic_history(
+        &self,
+        query: WorkflowSemanticHistoryQuery,
+    ) -> impl std::future::Future<Output = Result<WorkflowSemanticHistoryPage, Self::Error>> + Send;
+
+    /// Read bounded legacy event history.
     ///
     /// # Errors
     /// Returns an error on unavailable/invalid state or transport failure.
@@ -2010,6 +2028,496 @@ pub struct WorkflowHistoryEvent {
     pub created_at_ms: u64,
 }
 
+/// Durable attempt-history wire boundary. Unknown versions reject.
+pub const WORKFLOW_SEMANTIC_HISTORY_VERSION: u32 = 1;
+
+/// Finite event-source declaration, never full workflow semantic coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSemanticHistoryScope {
+    /// Exactly preparation, receipt commitment and terminal attempt settlement.
+    /// Excludes graph, control, run lifecycle and all other workflow sources.
+    AttemptsV1,
+}
+
+/// Immutable scoped coverage. Exhausting retained rows never erases a gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowSemanticHistoryCoverage {
+    /// Declared obligations guarded from admission through the pinned high-water.
+    CompleteFromAdmission,
+    /// Earlier or intervening obligations were not recorded; no synthesis allowed.
+    HistoricalGap,
+    /// Owning representation cannot provide the declared scope.
+    Unsupported,
+    /// Availability or integrity could not be established.
+    Unavailable,
+}
+
+/// Authoritative terminal attempt outcome, without private owner messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSemanticAttemptOutcome {
+    /// Successful settlement.
+    Succeeded,
+    /// Failed settlement.
+    Failed,
+    /// Cancelled settlement.
+    Cancelled,
+}
+
+/// Only guarded attempt obligations, not a parallel inventory of runtime events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowSemanticHistoryPayload {
+    /// Preparation committed; does not prove dispatch or absence of effects.
+    AttemptPrepared {
+        /// Canonical operation side-effect classification.
+        side_effect: DispatchSideEffect,
+    },
+    /// Dispatch receipt committed; private receipt contents are absent.
+    ReceiptCommitted {},
+    /// Authoritative settlement committed.
+    AttemptTerminal {
+        /// Normalized terminal outcome.
+        outcome: WorkflowSemanticAttemptOutcome,
+    },
+}
+
+/// Run-local durable observation. Unknown payload variants reject, never guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSemanticHistoryEvent {
+    /// Exact owning run.
+    pub run_id: String,
+    /// Run-local sequence starting at one, contiguous when coverage is complete.
+    pub sequence: u64,
+    /// Stable lowercase SHA-256 operation identity, retained on duplicate commitment.
+    pub operation_id: String,
+    /// Recorded Unix timestamp in milliseconds, not reconstruction time.
+    pub recorded_at_ms: u64,
+    /// Exact normalized attempt coordinates; no fencing credentials.
+    pub attempt: WorkflowHistoryAttemptCorrelation,
+    /// Lowercase SHA-256 canonical dispatch identity.
+    pub dispatch_identity: String,
+    /// Typed facts only, never receipt, provider or free-form message JSON.
+    pub payload: WorkflowSemanticHistoryPayload,
+}
+
+/// Exclusive continuation pinned to exact run, scope, high-water and coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSemanticHistoryCursor {
+    /// Wire version, independent of storage schema.
+    pub version: u32,
+    /// Exact owning run.
+    pub run_id: String,
+    /// Finite event-source declaration.
+    pub scope: WorkflowSemanticHistoryScope,
+    /// Immutable scoped coverage, including historical gaps.
+    pub coverage: WorkflowSemanticHistoryCoverage,
+    /// Immutable inclusive high-water; zero denotes no recorded events.
+    pub through_sequence: u64,
+    /// Exclusive last consumed sequence.
+    pub after_sequence: u64,
+}
+
+/// Bounded page, not a durable resume grant or complete workflow-history claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSemanticHistoryPage {
+    /// Pinned observation including the exclusive input position.
+    pub cursor: WorkflowSemanticHistoryCursor,
+    /// At most 100 strictly ordered events through the pinned high-water.
+    pub events: Vec<WorkflowSemanticHistoryEvent>,
+    /// Continuation; absent only when the retained range is exhausted or unavailable.
+    pub next_cursor: Option<WorkflowSemanticHistoryCursor>,
+}
+
+/// Exact bounded read, independent of frontend, storage representation or execution owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSemanticHistoryQuery {
+    /// Wire compatibility version.
+    pub version: u32,
+    /// Exact owning run.
+    pub run_id: String,
+    /// Explicit limited obligation scope.
+    pub scope: WorkflowSemanticHistoryScope,
+    /// Absent initially; subsequent reads retain the exact pinned cursor.
+    pub cursor: Option<WorkflowSemanticHistoryCursor>,
+    /// Positive bound, at most 100 events.
+    pub limit: usize,
+}
+
+impl WorkflowSemanticHistoryQuery {
+    /// Validate before any storage access.
+    ///
+    /// # Errors
+    /// Rejects unsupported versions, invalid bounds or inconsistent cursor identities.
+    pub fn validate(&self) -> Result<(), WorkflowSemanticHistoryError> {
+        if self.version != WORKFLOW_SEMANTIC_HISTORY_VERSION {
+            return Err(WorkflowSemanticHistoryError::UnsupportedVersion);
+        }
+        if !semantic_history_id(&self.run_id) || !(1..=100).contains(&self.limit) {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        if let Some(cursor) = &self.cursor {
+            if cursor.version != self.version {
+                return Err(WorkflowSemanticHistoryError::UnsupportedVersion);
+            }
+            if cursor.run_id != self.run_id
+                || cursor.scope != self.scope
+                || cursor.after_sequence > cursor.through_sequence
+            {
+                return Err(WorkflowSemanticHistoryError::ChangedBoundary);
+            }
+        }
+        Ok(())
+    }
+
+    /// Check the returned page against the exact query, including requested size.
+    ///
+    /// # Errors
+    /// Rejects invalid queries, changed boundaries, versions, scope or oversized replies.
+    pub fn validate_page(
+        &self,
+        page: &WorkflowSemanticHistoryPage,
+    ) -> Result<(), WorkflowSemanticHistoryError> {
+        self.validate()?;
+        if page.events.len() > self.limit || page.cursor.scope != self.scope {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        page.validate(&self.run_id, self.cursor.as_ref())
+    }
+}
+
+/// Content-free validation failures; no private payload is echoed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowSemanticHistoryError {
+    /// Future wire version.
+    UnsupportedVersion,
+    /// Inconsistent identity, bounds, ordering or normalized facts.
+    InvalidPage,
+    /// Changed pinned identity, scope, coverage or high-water.
+    ChangedBoundary,
+}
+
+impl WorkflowSemanticHistoryPage {
+    /// Validate a bounded page against its exact run and optional requested cursor.
+    /// Checks contract consistency, not canonical authority or producer honesty.
+    ///
+    /// # Errors
+    /// Rejects future versions, changed boundaries, malformed identities, oversized
+    /// pages, inconsistent ordering and invalid continuations.
+    pub fn validate(
+        &self,
+        run_id: &str,
+        requested: Option<&WorkflowSemanticHistoryCursor>,
+    ) -> Result<(), WorkflowSemanticHistoryError> {
+        use WorkflowSemanticHistoryError::{ChangedBoundary, InvalidPage, UnsupportedVersion};
+        let cursor = &self.cursor;
+        if cursor.version != WORKFLOW_SEMANTIC_HISTORY_VERSION {
+            return Err(UnsupportedVersion);
+        }
+        if requested.is_some_and(|value| value != cursor) {
+            return Err(ChangedBoundary);
+        }
+        if cursor.run_id != run_id
+            || !semantic_history_id(run_id)
+            || cursor.after_sequence > cursor.through_sequence
+            || self.events.len() > 100
+            || (requested.is_none() && cursor.after_sequence != 0)
+        {
+            return Err(InvalidPage);
+        }
+        if matches!(
+            cursor.coverage,
+            WorkflowSemanticHistoryCoverage::Unsupported
+                | WorkflowSemanticHistoryCoverage::Unavailable
+        ) {
+            return if self.events.is_empty() && self.next_cursor.is_none() {
+                Ok(())
+            } else {
+                Err(InvalidPage)
+            };
+        }
+        let mut last = cursor.after_sequence;
+        let mut operations = std::collections::BTreeSet::new();
+        for event in &self.events {
+            if event.run_id != run_id
+                || event.attempt.run_id != run_id
+                || !semantic_history_id(&event.attempt.node_id)
+                || !semantic_history_id(&event.attempt.activation_id)
+                || event.attempt.attempt == 0
+                || !semantic_history_digest(&event.operation_id)
+                || !semantic_history_digest(&event.dispatch_identity)
+                || !operations.insert(&event.operation_id)
+                || event.sequence <= last
+                || event.sequence > cursor.through_sequence
+                || (cursor.coverage == WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+                    && last.checked_add(1) != Some(event.sequence))
+            {
+                return Err(InvalidPage);
+            }
+            last = event.sequence;
+        }
+        match &self.next_cursor {
+            Some(next) => {
+                let mut expected = cursor.clone();
+                expected.after_sequence = last;
+                if next != &expected {
+                    return Err(ChangedBoundary);
+                }
+                if self.events.is_empty() || last == cursor.through_sequence {
+                    return Err(InvalidPage);
+                }
+            }
+            None if cursor.coverage == WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+                && last != cursor.through_sequence =>
+            {
+                return Err(InvalidPage);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+}
+
+fn semantic_history_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+}
+
+fn semantic_history_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Independent lifecycle-history compatibility boundary; attempts v1 is unchanged.
+pub const WORKFLOW_LIFECYCLE_HISTORY_VERSION: u32 = 1;
+
+/// Only run admission and committed status changes, not full workflow semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLifecycleHistoryScope {
+    /// Admission and status transitions, including terminal transitions exactly once.
+    RunLifecycleV1,
+}
+
+/// Normalized canonical run facts; no messages, receipts or authority tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowLifecycleHistoryPayload {
+    /// Run insertion committed.
+    RunAdmitted {
+        /// Status recorded at admission.
+        status: RunStatus,
+    },
+    /// Status change committed. Terminal status is this same fact, not another event.
+    RunStatusChanged {
+        /// Previous committed status.
+        previous: RunStatus,
+        /// New committed status.
+        status: RunStatus,
+    },
+}
+
+impl WorkflowLifecycleHistoryPayload {
+    fn valid(&self) -> bool {
+        match self {
+            Self::RunAdmitted { .. } => true,
+            Self::RunStatusChanged { previous, status } => previous != status,
+        }
+    }
+}
+
+/// Run-local durable observation. Unknown payload variants reject, never guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLifecycleHistoryEvent {
+    /// Exact owning run.
+    pub run_id: String,
+    /// Run-local sequence starting at one, contiguous when coverage is complete.
+    pub sequence: u64,
+    /// Stable lowercase SHA-256 operation identity, retained on duplicate commitment.
+    pub operation_id: String,
+    /// Recorded Unix timestamp in milliseconds, not reconstruction time.
+    pub recorded_at_ms: u64,
+    /// Typed facts only, never receipt, provider or free-form message JSON.
+    pub payload: WorkflowLifecycleHistoryPayload,
+}
+
+/// Exclusive continuation pinned to exact run, scope, high-water and coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLifecycleHistoryCursor {
+    /// Wire version, independent of storage schema.
+    pub version: u32,
+    /// Exact owning run.
+    pub run_id: String,
+    /// Finite event-source declaration.
+    pub scope: WorkflowLifecycleHistoryScope,
+    /// Immutable scoped coverage, including historical gaps.
+    pub coverage: WorkflowSemanticHistoryCoverage,
+    /// Immutable inclusive high-water; zero denotes no recorded events.
+    pub through_sequence: u64,
+    /// Exclusive last consumed sequence.
+    pub after_sequence: u64,
+}
+
+/// Bounded page, not a durable resume grant or complete workflow-history claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLifecycleHistoryPage {
+    /// Pinned observation including the exclusive input position.
+    pub cursor: WorkflowLifecycleHistoryCursor,
+    /// At most 100 strictly ordered events through the pinned high-water.
+    pub events: Vec<WorkflowLifecycleHistoryEvent>,
+    /// Continuation; absent only when the retained range is exhausted or unavailable.
+    pub next_cursor: Option<WorkflowLifecycleHistoryCursor>,
+}
+
+/// Exact bounded read, independent of frontend, storage representation or execution owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLifecycleHistoryQuery {
+    /// Wire compatibility version.
+    pub version: u32,
+    /// Exact owning run.
+    pub run_id: String,
+    /// Explicit limited obligation scope.
+    pub scope: WorkflowLifecycleHistoryScope,
+    /// Absent initially; subsequent reads retain the exact pinned cursor.
+    pub cursor: Option<WorkflowLifecycleHistoryCursor>,
+    /// Positive bound, at most 100 events.
+    pub limit: usize,
+}
+
+impl WorkflowLifecycleHistoryQuery {
+    /// Validate before any storage access.
+    ///
+    /// # Errors
+    /// Rejects unsupported versions, invalid bounds or inconsistent cursor identities.
+    pub fn validate(&self) -> Result<(), WorkflowSemanticHistoryError> {
+        if self.version != WORKFLOW_LIFECYCLE_HISTORY_VERSION {
+            return Err(WorkflowSemanticHistoryError::UnsupportedVersion);
+        }
+        if !semantic_history_id(&self.run_id) || !(1..=100).contains(&self.limit) {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        if let Some(cursor) = &self.cursor {
+            if cursor.version != self.version {
+                return Err(WorkflowSemanticHistoryError::UnsupportedVersion);
+            }
+            if cursor.run_id != self.run_id
+                || cursor.scope != self.scope
+                || cursor.after_sequence > cursor.through_sequence
+            {
+                return Err(WorkflowSemanticHistoryError::ChangedBoundary);
+            }
+        }
+        Ok(())
+    }
+
+    /// Check the returned page against the exact query, including requested size.
+    ///
+    /// # Errors
+    /// Rejects invalid queries, changed boundaries, versions, scope or oversized replies.
+    pub fn validate_page(
+        &self,
+        page: &WorkflowLifecycleHistoryPage,
+    ) -> Result<(), WorkflowSemanticHistoryError> {
+        self.validate()?;
+        if page.events.len() > self.limit || page.cursor.scope != self.scope {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        page.validate(&self.run_id, self.cursor.as_ref())
+    }
+}
+
+impl WorkflowLifecycleHistoryPage {
+    /// Validate a bounded page against its exact run and optional requested cursor.
+    /// Checks contract consistency, not canonical authority or producer honesty.
+    ///
+    /// # Errors
+    /// Rejects future versions, changed boundaries, malformed identities, oversized
+    /// pages, inconsistent ordering and invalid continuations.
+    pub fn validate(
+        &self,
+        run_id: &str,
+        requested: Option<&WorkflowLifecycleHistoryCursor>,
+    ) -> Result<(), WorkflowSemanticHistoryError> {
+        use WorkflowSemanticHistoryError::{ChangedBoundary, InvalidPage, UnsupportedVersion};
+        let cursor = &self.cursor;
+        if cursor.version != WORKFLOW_LIFECYCLE_HISTORY_VERSION {
+            return Err(UnsupportedVersion);
+        }
+        if requested.is_some_and(|value| value != cursor) {
+            return Err(ChangedBoundary);
+        }
+        if cursor.run_id != run_id
+            || !semantic_history_id(run_id)
+            || cursor.after_sequence > cursor.through_sequence
+            || self.events.len() > 100
+            || (requested.is_none() && cursor.after_sequence != 0)
+        {
+            return Err(InvalidPage);
+        }
+        if matches!(
+            cursor.coverage,
+            WorkflowSemanticHistoryCoverage::Unsupported
+                | WorkflowSemanticHistoryCoverage::Unavailable
+        ) {
+            return if self.events.is_empty() && self.next_cursor.is_none() {
+                Ok(())
+            } else {
+                Err(InvalidPage)
+            };
+        }
+        let mut last = cursor.after_sequence;
+        let mut operations = std::collections::BTreeSet::new();
+        for event in &self.events {
+            if event.run_id != run_id
+                || !event.payload.valid()
+                || !semantic_history_digest(&event.operation_id)
+                || !operations.insert(&event.operation_id)
+                || event.sequence <= last
+                || event.sequence > cursor.through_sequence
+                || (cursor.coverage == WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+                    && last.checked_add(1) != Some(event.sequence))
+            {
+                return Err(InvalidPage);
+            }
+            last = event.sequence;
+        }
+        match &self.next_cursor {
+            Some(next) => {
+                let mut expected = cursor.clone();
+                expected.after_sequence = last;
+                if next != &expected {
+                    return Err(ChangedBoundary);
+                }
+                if self.events.is_empty() || last == cursor.through_sequence {
+                    return Err(InvalidPage);
+                }
+            }
+            None if cursor.coverage == WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+                && last != cursor.through_sequence =>
+            {
+                return Err(InvalidPage);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+}
+
 /// Current canonical execution allowance facts. Counts saturate at their respective caps.
 /// Exhaustion blocks new attempts, not reconciliation of existing work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2146,6 +2654,275 @@ pub struct WorkflowRunInspection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lifecycle_history_roundtrip_pins_boundary_and_rejects_future_or_private_facts() {
+        use super::*;
+        let query = WorkflowLifecycleHistoryQuery {
+            version: WORKFLOW_LIFECYCLE_HISTORY_VERSION,
+            run_id: "run".into(),
+            scope: WorkflowLifecycleHistoryScope::RunLifecycleV1,
+            cursor: None,
+            limit: 1,
+        };
+        let mut page = WorkflowLifecycleHistoryPage {
+            cursor: WorkflowLifecycleHistoryCursor {
+                version: query.version,
+                run_id: query.run_id.clone(),
+                scope: query.scope,
+                coverage: WorkflowSemanticHistoryCoverage::CompleteFromAdmission,
+                through_sequence: 1,
+                after_sequence: 0,
+            },
+            events: vec![WorkflowLifecycleHistoryEvent {
+                run_id: "run".into(),
+                sequence: 1,
+                operation_id: "a".repeat(64),
+                recorded_at_ms: 9,
+                payload: WorkflowLifecycleHistoryPayload::RunAdmitted {
+                    status: RunStatus::Running,
+                },
+            }],
+            next_cursor: None,
+        };
+        for payload in [
+            WorkflowLifecycleHistoryPayload::RunAdmitted {
+                status: RunStatus::Running,
+            },
+            WorkflowLifecycleHistoryPayload::RunStatusChanged {
+                previous: RunStatus::Running,
+                status: RunStatus::Completed,
+            },
+            WorkflowLifecycleHistoryPayload::RunStatusChanged {
+                previous: RunStatus::Running,
+                status: RunStatus::Failed,
+            },
+            WorkflowLifecycleHistoryPayload::RunStatusChanged {
+                previous: RunStatus::Running,
+                status: RunStatus::Cancelled,
+            },
+        ] {
+            page.events[0].payload = payload;
+            let value = serde_json::to_value(&page).unwrap();
+            let decoded: WorkflowLifecycleHistoryPage =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(decoded, page);
+            assert_eq!(query.validate_page(&decoded), Ok(()));
+            let mut private = value;
+            private["events"][0]["payload"]["message"] = serde_json::json!("SECRET");
+            assert!(serde_json::from_value::<WorkflowLifecycleHistoryPage>(private).is_err());
+        }
+        page.cursor.coverage = WorkflowSemanticHistoryCoverage::HistoricalGap;
+        let mut next = page.cursor.clone();
+        next.after_sequence = 1;
+        next.through_sequence = 2;
+        page.cursor.through_sequence = 2;
+        page.next_cursor = Some(next);
+        assert_eq!(query.validate_page(&page), Ok(()));
+        page.next_cursor.as_mut().unwrap().coverage =
+            WorkflowSemanticHistoryCoverage::CompleteFromAdmission;
+        assert_eq!(
+            query.validate_page(&page),
+            Err(WorkflowSemanticHistoryError::ChangedBoundary)
+        );
+        let mut future = serde_json::to_value(&page).unwrap();
+        future["events"][0]["payload"] = serde_json::json!({"kind":"future"});
+        assert!(serde_json::from_value::<WorkflowLifecycleHistoryPage>(future).is_err());
+        let mut future_query = query.clone();
+        future_query.version = 99;
+        assert_eq!(
+            future_query.validate(),
+            Err(WorkflowSemanticHistoryError::UnsupportedVersion)
+        );
+        for limit in [0, 101] {
+            let mut invalid = query.clone();
+            invalid.limit = limit;
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    fn semantic_page() -> super::WorkflowSemanticHistoryPage {
+        use super::*;
+        WorkflowSemanticHistoryPage {
+            cursor: WorkflowSemanticHistoryCursor {
+                version: WORKFLOW_SEMANTIC_HISTORY_VERSION,
+                run_id: "run".into(),
+                scope: WorkflowSemanticHistoryScope::AttemptsV1,
+                coverage: WorkflowSemanticHistoryCoverage::CompleteFromAdmission,
+                through_sequence: 1,
+                after_sequence: 0,
+            },
+            events: vec![WorkflowSemanticHistoryEvent {
+                run_id: "run".into(),
+                sequence: 1,
+                operation_id: "a".repeat(64),
+                recorded_at_ms: 7,
+                attempt: WorkflowHistoryAttemptCorrelation {
+                    run_id: "run".into(),
+                    node_id: "node".into(),
+                    activation_id: "activation".into(),
+                    attempt: 1,
+                },
+                dispatch_identity: "b".repeat(64),
+                payload: WorkflowSemanticHistoryPayload::ReceiptCommitted {},
+            }],
+            next_cursor: None,
+        }
+    }
+
+    #[test]
+    fn semantic_history_contract_roundtrips_typed_obligations_and_rejects_private_payloads() {
+        use super::*;
+        for payload in [
+            WorkflowSemanticHistoryPayload::AttemptPrepared {
+                side_effect: DispatchSideEffect::ReadOnly,
+            },
+            WorkflowSemanticHistoryPayload::ReceiptCommitted {},
+            WorkflowSemanticHistoryPayload::AttemptTerminal {
+                outcome: WorkflowSemanticAttemptOutcome::Succeeded,
+            },
+            WorkflowSemanticHistoryPayload::AttemptTerminal {
+                outcome: WorkflowSemanticAttemptOutcome::Failed,
+            },
+            WorkflowSemanticHistoryPayload::AttemptTerminal {
+                outcome: WorkflowSemanticAttemptOutcome::Cancelled,
+            },
+        ] {
+            let mut page = semantic_page();
+            page.events[0].payload = payload;
+            let value = serde_json::to_value(&page).unwrap();
+            let decoded: WorkflowSemanticHistoryPage =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(decoded, page);
+            assert_eq!(decoded.validate("run", None), Ok(()));
+            let mut private = value;
+            private["events"][0]["payload"]["receipt"] = serde_json::json!({"secret":"TOKEN"});
+            assert!(serde_json::from_value::<WorkflowSemanticHistoryPage>(private).is_err());
+        }
+        let mut future = serde_json::to_value(semantic_page()).unwrap();
+        future["events"][0]["payload"] = serde_json::json!({"kind":"future_event"});
+        assert!(serde_json::from_value::<WorkflowSemanticHistoryPage>(future).is_err());
+        let mut page = semantic_page();
+        page.cursor.version += 1;
+        assert_eq!(
+            page.validate("run", None),
+            Err(WorkflowSemanticHistoryError::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn semantic_history_paging_pins_coverage_highwater_and_preserves_gaps() {
+        use super::*;
+        let mut first = semantic_page();
+        first.cursor.coverage = WorkflowSemanticHistoryCoverage::HistoricalGap;
+        first.cursor.through_sequence = 9;
+        first.events[0].sequence = 5;
+        let mut next = first.cursor.clone();
+        next.after_sequence = 5;
+        first.next_cursor = Some(next.clone());
+        assert_eq!(first.validate("run", None), Ok(()));
+        let mut tail = first.clone();
+        tail.cursor = next.clone();
+        tail.events.clear();
+        tail.next_cursor = None;
+        assert_eq!(tail.validate("run", Some(&next)), Ok(()));
+        assert_eq!(
+            tail.cursor.coverage,
+            WorkflowSemanticHistoryCoverage::HistoricalGap
+        );
+        tail.cursor.coverage = WorkflowSemanticHistoryCoverage::CompleteFromAdmission;
+        assert_eq!(
+            tail.validate("run", Some(&next)),
+            Err(WorkflowSemanticHistoryError::ChangedBoundary)
+        );
+        tail.cursor = next.clone();
+        tail.cursor.through_sequence += 1;
+        assert_eq!(
+            tail.validate("run", Some(&next)),
+            Err(WorkflowSemanticHistoryError::ChangedBoundary)
+        );
+        first.next_cursor.as_mut().unwrap().coverage =
+            WorkflowSemanticHistoryCoverage::CompleteFromAdmission;
+        assert_eq!(
+            first.validate("run", None),
+            Err(WorkflowSemanticHistoryError::ChangedBoundary)
+        );
+    }
+
+    #[test]
+    fn semantic_history_query_rejects_invalid_versions_bounds_and_cursor_binding() {
+        use super::*;
+        let page = semantic_page();
+        let query = WorkflowSemanticHistoryQuery {
+            version: WORKFLOW_SEMANTIC_HISTORY_VERSION,
+            run_id: "run".into(),
+            scope: WorkflowSemanticHistoryScope::AttemptsV1,
+            cursor: None,
+            limit: 1,
+        };
+        assert_eq!(query.validate_page(&page), Ok(()));
+        for limit in [0, 101] {
+            let mut invalid = query.clone();
+            invalid.limit = limit;
+            assert_eq!(
+                invalid.validate(),
+                Err(WorkflowSemanticHistoryError::InvalidPage)
+            );
+        }
+        let mut invalid = query.clone();
+        invalid.version += 1;
+        assert_eq!(
+            invalid.validate(),
+            Err(WorkflowSemanticHistoryError::UnsupportedVersion)
+        );
+        invalid = query.clone();
+        invalid.cursor = Some(page.cursor.clone());
+        invalid.cursor.as_mut().unwrap().run_id = "foreign".into();
+        assert_eq!(
+            invalid.validate(),
+            Err(WorkflowSemanticHistoryError::ChangedBoundary)
+        );
+        let mut oversized = page.clone();
+        oversized.events.push(page.events[0].clone());
+        assert_eq!(
+            query.validate_page(&oversized),
+            Err(WorkflowSemanticHistoryError::InvalidPage)
+        );
+    }
+
+    #[test]
+    fn semantic_history_rejects_false_exhaustion_and_invalid_bounded_pages() {
+        use super::*;
+        let original = semantic_page();
+        for index in 0..6 {
+            let mut page = original.clone();
+            match index {
+                0 => page.events.clear(),
+                1 => page.events[0].attempt.run_id = "foreign".into(),
+                2 => page.events[0].operation_id = "TOKEN".into(),
+                3 => page.events[0].sequence = 0,
+                4 => page.events = vec![page.events[0].clone(); 101],
+                _ => page.events[0].attempt.attempt = 0,
+            }
+            assert_eq!(
+                page.validate("run", None),
+                Err(WorkflowSemanticHistoryError::InvalidPage)
+            );
+        }
+        for coverage in [
+            WorkflowSemanticHistoryCoverage::Unsupported,
+            WorkflowSemanticHistoryCoverage::Unavailable,
+        ] {
+            let mut page = original.clone();
+            page.cursor.coverage = coverage;
+            assert_eq!(
+                page.validate("run", None),
+                Err(WorkflowSemanticHistoryError::InvalidPage)
+            );
+            page.events.clear();
+            assert_eq!(page.validate("run", None), Ok(()));
+        }
+    }
+
     #[test]
     fn allowance_exhaustion_preserves_unknown_and_invalid_facts() {
         use super::WorkflowExecutionAllowanceObservation;

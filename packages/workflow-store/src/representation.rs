@@ -54,6 +54,8 @@ pub mod runs;
 pub mod safety;
 /// Same-snapshot bounded scheduling observations without execution authority.
 pub mod scheduling;
+/// Scoped transactional attempt semantic history and old-writer coverage gaps.
+pub mod semantic_history;
 #[cfg(test)]
 mod tests;
 
@@ -196,6 +198,8 @@ pub async fn install(db: &dyn Database) -> Result<(), RepresentationError> {
     if !existing.is_empty() {
         verified(&*tx).await?;
         admission_observation::install_in(&*tx).await?;
+        semantic_history::install_in(&*tx).await?;
+        semantic_history::lifecycle::install_in(&*tx).await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -254,6 +258,8 @@ pub async fn install(db: &dyn Database) -> Result<(), RepresentationError> {
         .await?;
     journal::install_in(&*tx).await?;
     admission_observation::install_in(&*tx).await?;
+    semantic_history::install_in(&*tx).await?;
+    semantic_history::lifecycle::install_in(&*tx).await?;
     verified(&*tx).await?;
     tx.commit().await?;
     Ok(())
@@ -384,6 +390,7 @@ pub(super) async fn admit_in(
         let text = |value: Option<&str>| {
             value.map_or(DatabaseValue::Null, |s| DatabaseValue::String(s.into()))
         };
+        let history = semantic_history::lifecycle::begin(tx, &run.run_id).await?;
         tx.insert(RUNS)
             .value("run_id", run.run_id.as_str())
             .value(
@@ -428,6 +435,7 @@ pub(super) async fn admit_in(
             .value("definition_json", definition)
             .execute(tx)
             .await?;
+        semantic_history::lifecycle::finish(tx, history, "paused", run.created_at_ms).await?;
         graph::initialize(tx, run, graph_definition).await?;
     }
     Ok(RepresentationAdmission {

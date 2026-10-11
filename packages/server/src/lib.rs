@@ -6567,6 +6567,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowMutationApprovals { .. } => "list_workflow_mutation_approvals",
         Request::ResolveWorkflowMutationApproval { .. } => "resolve_workflow_mutation_approval",
         Request::WorkflowAttemptHistory { .. } => "workflow_attempt_history",
+        Request::WorkflowLifecycleHistory { .. } => "workflow_lifecycle_history",
+        Request::WorkflowSemanticHistory { .. } => "workflow_semantic_history",
         Request::WorkflowObservations { .. } => "workflow_observations",
         Request::WorkflowEventHistory { .. } => "workflow_event_history",
         Request::WorkflowLiveEventCatchUp { .. } => "workflow_live_event_catch_up",
@@ -9084,6 +9086,34 @@ async fn handle_workflow_run_request(
             .await;
             let response = match result {
                 Ok(attempts) => Response::Ok(ResponsePayload::WorkflowAttemptHistory { attempts }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        RuntimeAndModelRequest::WorkflowLifecycleHistory { query } => {
+            let result = Box::pin(
+                bcode_workflow::WorkflowRunApplication::workflow_lifecycle_history(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    query,
+                ),
+            )
+            .await;
+            let response = match result {
+                Ok(page) => Response::Ok(ResponsePayload::WorkflowLifecycleHistory { page }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        RuntimeAndModelRequest::WorkflowSemanticHistory { query } => {
+            let result = Box::pin(
+                bcode_workflow::WorkflowRunApplication::workflow_semantic_history(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    query,
+                ),
+            )
+            .await;
+            let response = match result {
+                Ok(page) => Response::Ok(ResponsePayload::WorkflowSemanticHistory { page }),
                 Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
             };
             send_response(writer, request_id, response).await

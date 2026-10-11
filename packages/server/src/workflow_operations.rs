@@ -385,6 +385,48 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         .await
         .map_err(run_operation_failure)
     }
+    async fn workflow_lifecycle_history(
+        &self,
+        query: bcode_workflow::WorkflowLifecycleHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowLifecycleHistoryPage, Self::Error> {
+        query
+            .validate()
+            .map_err(|error| bcode_workflow::WorkflowRunOperationFailure {
+                code: match error {
+                    bcode_workflow::WorkflowSemanticHistoryError::UnsupportedVersion => {
+                        "workflow_lifecycle_history_unsupported_version"
+                    }
+                    _ => "workflow_lifecycle_history_invalid_query",
+                }
+                .into(),
+                message: "lifecycle history query is unsupported or inconsistent".into(),
+            })?;
+        crate::workflow_representation::discovery::lifecycle_history(self.state, &query)
+            .await
+            .map_err(run_operation_failure)
+    }
+
+    async fn workflow_semantic_history(
+        &self,
+        query: bcode_workflow::WorkflowSemanticHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowSemanticHistoryPage, Self::Error> {
+        query
+            .validate()
+            .map_err(|error| bcode_workflow::WorkflowRunOperationFailure {
+                code: match error {
+                    bcode_workflow::WorkflowSemanticHistoryError::UnsupportedVersion => {
+                        "workflow_semantic_history_unsupported_version"
+                    }
+                    _ => "workflow_semantic_history_invalid_query",
+                }
+                .into(),
+                message: "semantic history query is unsupported or inconsistent".into(),
+            })?;
+        crate::workflow_representation::discovery::semantic_history(self.state, &query)
+            .await
+            .map_err(run_operation_failure)
+    }
+
     async fn workflow_observations(
         &self,
         run_id: String,

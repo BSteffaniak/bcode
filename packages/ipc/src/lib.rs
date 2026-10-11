@@ -1007,6 +1007,14 @@ pub enum Request {
         after_sequence: Option<u64>,
         limit: usize,
     },
+    /// Bounded versioned attempt semantic history, not legacy opaque events.
+    WorkflowLifecycleHistory {
+        query: bcode_workflow::WorkflowLifecycleHistoryQuery,
+    },
+    /// Read finite, pinned attempt history, not legacy opaque events.
+    WorkflowSemanticHistory {
+        query: bcode_workflow::WorkflowSemanticHistoryQuery,
+    },
     /// Return finite transactional observations with explicit coverage, not guessed history.
     WorkflowObservations {
         run_id: String,
@@ -2599,6 +2607,12 @@ pub enum ResponsePayload {
     WorkflowEventHistory {
         events: Vec<bcode_workflow::WorkflowHistoryEvent>,
     },
+    WorkflowLifecycleHistory {
+        page: bcode_workflow::WorkflowLifecycleHistoryPage,
+    },
+    WorkflowSemanticHistory {
+        page: bcode_workflow::WorkflowSemanticHistoryPage,
+    },
     WorkflowObservations {
         page: bcode_workflow::WorkflowObservationPage,
     },
@@ -3711,6 +3725,86 @@ mod child_wire_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lifecycle_history_query_and_page_roundtrip_without_legacy_conversion() {
+        use bcode_workflow::*;
+        let query = WorkflowLifecycleHistoryQuery {
+            version: WORKFLOW_LIFECYCLE_HISTORY_VERSION,
+            run_id: "run".into(),
+            scope: WorkflowLifecycleHistoryScope::RunLifecycleV1,
+            cursor: None,
+            limit: 7,
+        };
+        let request = super::Request::WorkflowLifecycleHistory {
+            query: query.clone(),
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded: super::Request = serde_json::from_slice(&encoded).unwrap();
+        let super::Request::WorkflowLifecycleHistory { query: actual } = decoded else {
+            panic!("typed request");
+        };
+        assert_eq!(actual, query);
+        let page = WorkflowLifecycleHistoryPage {
+            cursor: WorkflowLifecycleHistoryCursor {
+                version: query.version,
+                run_id: query.run_id.clone(),
+                scope: query.scope,
+                coverage: WorkflowSemanticHistoryCoverage::HistoricalGap,
+                through_sequence: 0,
+                after_sequence: 0,
+            },
+            events: Vec::new(),
+            next_cursor: None,
+        };
+        let response = super::ResponsePayload::WorkflowLifecycleHistory { page: page.clone() };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: super::ResponsePayload = serde_json::from_slice(&encoded).unwrap();
+        let super::ResponsePayload::WorkflowLifecycleHistory { page: actual } = decoded else {
+            panic!("typed page");
+        };
+        assert_eq!(actual, page);
+        assert_eq!(query.validate_page(&actual), Ok(()));
+    }
+    #[test]
+    fn semantic_history_query_and_page_roundtrip_without_legacy_conversion() {
+        use bcode_workflow::*;
+        let query = WorkflowSemanticHistoryQuery {
+            version: WORKFLOW_SEMANTIC_HISTORY_VERSION,
+            run_id: "run".into(),
+            scope: WorkflowSemanticHistoryScope::AttemptsV1,
+            cursor: None,
+            limit: 7,
+        };
+        let request = super::Request::WorkflowSemanticHistory {
+            query: query.clone(),
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded: super::Request = serde_json::from_slice(&encoded).unwrap();
+        let super::Request::WorkflowSemanticHistory { query: actual } = decoded else {
+            panic!("typed request");
+        };
+        assert_eq!(actual, query);
+        let page = WorkflowSemanticHistoryPage {
+            cursor: WorkflowSemanticHistoryCursor {
+                version: query.version,
+                run_id: query.run_id.clone(),
+                scope: query.scope,
+                coverage: WorkflowSemanticHistoryCoverage::HistoricalGap,
+                through_sequence: 0,
+                after_sequence: 0,
+            },
+            events: Vec::new(),
+            next_cursor: None,
+        };
+        let response = super::ResponsePayload::WorkflowSemanticHistory { page: page.clone() };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: super::ResponsePayload = serde_json::from_slice(&encoded).unwrap();
+        let super::ResponsePayload::WorkflowSemanticHistory { page: actual } = decoded else {
+            panic!("typed page");
+        };
+        assert_eq!(actual, page);
+        assert_eq!(query.validate_page(&actual), Ok(()));
+    }
     use super::*;
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ModelTurnOutcome, RuntimeWorkKind, RuntimeWorkStatus,

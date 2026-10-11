@@ -226,6 +226,7 @@ pub async fn prepare(
     .await?;
     super::safety::reserve(&*tx, &prepared.run_id, &id, &node.resources).await?;
     super::hierarchy::consume_attempt(&*tx, &prepared.run_id).await?;
+    let history = super::semantic_history::begin(&*tx, &id, &prepared.run_id).await?;
     tx.insert(TABLE)
         .value("dispatch_identity", id.as_str())
         .value("run_id", prepared.run_id.as_str())
@@ -238,6 +239,7 @@ pub async fn prepare(
         .value("terminal_at_ms", DatabaseValue::Null)
         .execute(&*tx)
         .await?;
+    super::semantic_history::prepared(&*tx, history, prepared).await?;
     super::graph::terminal_scan::invalidate(&*tx, &prepared.run_id).await?;
     tx.update(RUNS)
         .value(
@@ -365,11 +367,22 @@ pub async fn attach_receipt(
     {
         return Err(Error::InvalidAdmission);
     }
+    let history =
+        super::semantic_history::begin(&*tx, &receipt.dispatch_identity, &receipt.run_id).await?;
+    let expected = super::semantic_history::source_row(&prepared, Some(json.clone()), None, None)?;
     tx.update(TABLE)
         .value("receipt_json", json)
         .where_eq("dispatch_identity", receipt.dispatch_identity.as_str())
         .execute(&*tx)
         .await?;
+    super::semantic_history::finish(
+        &*tx,
+        history,
+        expected,
+        bcode_workflow::WorkflowSemanticHistoryPayload::ReceiptCommitted {},
+        receipt.admitted_at_ms,
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -444,12 +457,34 @@ pub async fn settle_in(
         .checked_sub(1)
         .filter(|n| *n >= 0)
         .ok_or(Error::MaintenanceRequired)?;
+    let history = super::semantic_history::begin(tx, identity, run_id).await?;
+    let expected = super::semantic_history::source_row(
+        &prepared,
+        Some(text(&row, "receipt_json")?),
+        Some(json.clone()),
+        Some(timestamp),
+    )?;
+    let semantic_outcome = match outcome {
+        TerminalOutcome::Succeeded => bcode_workflow::WorkflowSemanticAttemptOutcome::Succeeded,
+        TerminalOutcome::Failed => bcode_workflow::WorkflowSemanticAttemptOutcome::Failed,
+        TerminalOutcome::Cancelled => bcode_workflow::WorkflowSemanticAttemptOutcome::Cancelled,
+    };
     tx.update(TABLE)
         .value("outcome_json", json)
         .value("terminal_at_ms", timestamp)
         .where_eq("dispatch_identity", identity)
         .execute(tx)
         .await?;
+    super::semantic_history::finish(
+        tx,
+        history,
+        expected,
+        bcode_workflow::WorkflowSemanticHistoryPayload::AttemptTerminal {
+            outcome: semantic_outcome,
+        },
+        terminal_at_ms,
+    )
+    .await?;
     super::graph::terminal_scan::invalidate(tx, run_id).await?;
     super::graph::fanout::release(tx, run_id, &prepared.node_id, &prepared.activation_id).await?;
     super::safety::release(tx, run_id, identity).await?;

@@ -1244,6 +1244,50 @@ async fn dispatch_offline_recovery(command: &WorkflowCommand) -> Result<(), CliE
     }
 }
 
+fn lifecycle_history_query(
+    run_id: String,
+    cursor_json: Option<&str>,
+    limit: usize,
+) -> Result<bcode_workflow::WorkflowLifecycleHistoryQuery, CliError> {
+    let cursor = cursor_json
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| CliError::InvalidArguments("invalid lifecycle history cursor".into()))?;
+    let query = bcode_workflow::WorkflowLifecycleHistoryQuery {
+        version: bcode_workflow::WORKFLOW_LIFECYCLE_HISTORY_VERSION,
+        run_id,
+        scope: bcode_workflow::WorkflowLifecycleHistoryScope::RunLifecycleV1,
+        cursor,
+        limit,
+    };
+    query
+        .validate()
+        .map_err(|_| CliError::InvalidArguments("invalid lifecycle history query".into()))?;
+    Ok(query)
+}
+
+fn semantic_history_query(
+    run_id: String,
+    cursor_json: Option<&str>,
+    limit: usize,
+) -> Result<bcode_workflow::WorkflowSemanticHistoryQuery, CliError> {
+    let cursor = cursor_json
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| CliError::InvalidArguments("invalid semantic history cursor".into()))?;
+    let query = bcode_workflow::WorkflowSemanticHistoryQuery {
+        version: bcode_workflow::WORKFLOW_SEMANTIC_HISTORY_VERSION,
+        run_id,
+        scope: bcode_workflow::WorkflowSemanticHistoryScope::AttemptsV1,
+        cursor,
+        limit,
+    };
+    query
+        .validate()
+        .map_err(|_| CliError::InvalidArguments("invalid semantic history query".into()))?;
+    Ok(query)
+}
+
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
     if matches!(command.as_ref(), WorkflowCommand::RecoverOffline { .. }) {
         return dispatch_offline_recovery(command.as_ref()).await;
@@ -1397,6 +1441,36 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
         WorkflowCommand::Package { command } => {
             Box::pin(handle_workflow_package_command(&client, command)).await?;
         }
+        WorkflowCommand::LifecycleHistoryRun {
+            run_id,
+            cursor_json,
+            limit,
+        } => {
+            let query = lifecycle_history_query(run_id, cursor_json.as_deref(), limit)?;
+            print_json(
+                &Box::pin(
+                    bcode_workflow::WorkflowRunApplication::workflow_lifecycle_history(
+                        &client, query,
+                    ),
+                )
+                .await?,
+            )?;
+        }
+        WorkflowCommand::SemanticHistoryRun {
+            run_id,
+            cursor_json,
+            limit,
+        } => {
+            let query = semantic_history_query(run_id, cursor_json.as_deref(), limit)?;
+            print_json(
+                &Box::pin(
+                    bcode_workflow::WorkflowRunApplication::workflow_semantic_history(
+                        &client, query,
+                    ),
+                )
+                .await?,
+            )?;
+        }
         WorkflowCommand::Observations {
             run_id,
             after_sequence,
@@ -1404,12 +1478,14 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             limit,
         } => {
             print_json(
-                &bcode_workflow::WorkflowRunApplication::workflow_observations(
-                    &client,
-                    run_id,
-                    after_sequence,
-                    through_sequence,
-                    limit,
+                &Box::pin(
+                    bcode_workflow::WorkflowRunApplication::workflow_observations(
+                        &client,
+                        run_id,
+                        after_sequence,
+                        through_sequence,
+                        limit,
+                    ),
                 )
                 .await?,
             )?;
@@ -4636,6 +4712,24 @@ enum WorkflowCommand {
         configuration: Option<PathBuf>,
         #[arg(long, value_name = "JSON_FILE")]
         input: Option<PathBuf>,
+    },
+    /// Return one pinned `RunLifecycleV1` lifecycle history page; not full workflow history.
+    LifecycleHistoryRun {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        cursor_json: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Return one pinned `AttemptsV1` semantic history page; not full workflow history.
+    SemanticHistoryRun {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        cursor_json: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
     /// Return finite committed row transitions and exact coverage as JSON.
     Observations {
@@ -28944,6 +29038,90 @@ mod latency_diagnosis_tests {
 
 #[cfg(test)]
 mod client_timeout_cli_tests {
+    #[test]
+    fn lifecycle_history_cli_maps_exact_run_cursor_and_rejects_invalid_bounds() {
+        let cli = <super::Cli as clap::Parser>::try_parse_from([
+            "bcode",
+            "workflow",
+            "lifecycle-history-run",
+            "--run-id",
+            "run",
+            "--limit",
+            "7",
+        ])
+        .unwrap();
+        let Some(super::Commands::Workflow { command }) = cli.command else {
+            panic!("workflow command");
+        };
+        let super::WorkflowCommand::LifecycleHistoryRun {
+            run_id,
+            cursor_json,
+            limit,
+        } = command
+        else {
+            panic!("lifecycle command");
+        };
+        let query = super::lifecycle_history_query(run_id, cursor_json.as_deref(), limit).unwrap();
+        assert_eq!(query.run_id, "run");
+        assert_eq!(query.limit, 7);
+        assert_eq!(
+            query.scope,
+            bcode_workflow::WorkflowLifecycleHistoryScope::RunLifecycleV1
+        );
+        for bound in [0, 101] {
+            assert!(super::lifecycle_history_query("run".into(), None, bound).is_err());
+        }
+        assert!(
+            super::lifecycle_history_query("run".into(), Some("PRIVATE invalid JSON"), 1).is_err()
+        );
+        let attempt_cursor = bcode_workflow::WorkflowSemanticHistoryCursor {
+            version: 1,
+            run_id: "run".into(),
+            scope: bcode_workflow::WorkflowSemanticHistoryScope::AttemptsV1,
+            coverage: bcode_workflow::WorkflowSemanticHistoryCoverage::HistoricalGap,
+            through_sequence: 3,
+            after_sequence: 1,
+        };
+        let encoded = serde_json::to_string(&attempt_cursor).unwrap();
+        assert!(super::lifecycle_history_query("run".into(), Some(&encoded), 1).is_err());
+    }
+    #[test]
+    fn semantic_history_cli_maps_exact_run_cursor_and_rejects_invalid_bounds() {
+        let cli = <super::Cli as clap::Parser>::try_parse_from([
+            "bcode",
+            "workflow",
+            "semantic-history-run",
+            "--run-id",
+            "run",
+            "--limit",
+            "7",
+        ])
+        .unwrap();
+        let Some(super::Commands::Workflow { command }) = cli.command else {
+            panic!("workflow command");
+        };
+        let super::WorkflowCommand::SemanticHistoryRun {
+            run_id,
+            cursor_json,
+            limit,
+        } = command
+        else {
+            panic!("semantic command");
+        };
+        let query = super::semantic_history_query(run_id, cursor_json.as_deref(), limit).unwrap();
+        assert_eq!(query.run_id, "run");
+        assert_eq!(query.limit, 7);
+        assert_eq!(
+            query.scope,
+            bcode_workflow::WorkflowSemanticHistoryScope::AttemptsV1
+        );
+        for bound in [0, 101] {
+            assert!(super::semantic_history_query("run".into(), None, bound).is_err());
+        }
+        assert!(
+            super::semantic_history_query("run".into(), Some("PRIVATE invalid JSON"), 1).is_err()
+        );
+    }
     use super::{Cli, config_override_from_matches, execution_mode_launch_options};
     use clap::{CommandFactory as _, Parser as _};
     use std::sync::Mutex;

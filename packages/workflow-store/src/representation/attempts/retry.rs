@@ -65,11 +65,27 @@ pub async fn schedule_retry(
         .value("consumed", 0_i64)
         .execute(&*tx)
         .await?;
+    let history = super::super::semantic_history::lifecycle::begin(&*tx, run_id).await?;
+    let recorded_at = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::InvalidAdmission)?
+            .as_millis(),
+    )
+    .map_err(|_| Error::InvalidAdmission)?;
     tx.update(RUNS)
         .value("status", "paused")
+        .value("updated_at_ms", recorded_at)
         .where_eq("run_id", run_id)
         .execute(&*tx)
         .await?;
+    super::super::semantic_history::lifecycle::finish(
+        &*tx,
+        history,
+        "paused",
+        u64::try_from(recorded_at).map_err(|_| Error::InvalidAdmission)?,
+    )
+    .await?;
     super::super::graph::terminal_scan::invalidate(&*tx, run_id).await?;
     tx.commit().await?;
     Ok(result)
