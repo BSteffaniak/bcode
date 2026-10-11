@@ -597,6 +597,8 @@ fn stage_progress(
 pub(super) enum SharedVerificationOperation {
     RetainStore,
     OpenStore,
+    BeginTransaction,
+    CommitTransaction,
     RunSummary,
     SessionLink,
     ExecutionNode,
@@ -650,6 +652,8 @@ impl SharedVerificationFailure {
         let operation = match self.operation {
             SharedVerificationOperation::RetainStore => "retain_store",
             SharedVerificationOperation::OpenStore => "open_store",
+            SharedVerificationOperation::BeginTransaction => "begin_transaction",
+            SharedVerificationOperation::CommitTransaction => "commit_transaction",
             SharedVerificationOperation::RunSummary => "run_summary",
             SharedVerificationOperation::SessionLink => "session_link",
             SharedVerificationOperation::ExecutionNode => "execution_node",
@@ -710,7 +714,30 @@ pub(super) async fn verify_shared_parent_link(
     link: &bcode_workflow_store::WorkflowExecutionSessionLink,
 ) -> Result<bool, SharedVerificationFailure> {
     use SharedVerificationOperation as Operation;
-    let run = representation::runs::summary(db, run_id)
+    let tx = db.begin_transaction().await.map_err(|error| {
+        SharedVerificationFailure::from_storage(
+            Operation::BeginTransaction,
+            &representation::RepresentationError::Database(error),
+        )
+    })?;
+    let result = verify_shared_parent_link_in(&*tx, run_id, link).await?;
+    tx.commit().await.map_err(|error| {
+        SharedVerificationFailure::from_storage(
+            Operation::CommitTransaction,
+            &representation::RepresentationError::Database(error),
+        )
+    })?;
+    Ok(result)
+}
+
+/// Verify shared-parent identity within the caller's consistent read transaction.
+pub(super) async fn verify_shared_parent_link_in(
+    db: &dyn DatabaseTransaction,
+    run_id: &str,
+    link: &bcode_workflow_store::WorkflowExecutionSessionLink,
+) -> Result<bool, SharedVerificationFailure> {
+    use SharedVerificationOperation as Operation;
+    let run = representation::runs::summary_in(db, run_id)
         .await
         .map_err(|error| SharedVerificationFailure::from_storage(Operation::RunSummary, &error))?
         .ok_or(SharedVerificationFailure {
@@ -723,7 +750,7 @@ pub(super) async fn verify_shared_parent_link(
     {
         return Ok(false);
     }
-    let canonical = representation::attempts::owner_boundary::execution_session_link(
+    let canonical = representation::attempts::owner_boundary::execution_session_link_in(
         db,
         run_id,
         &link.node_id,

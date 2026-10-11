@@ -32,6 +32,7 @@ pub use run_contracts::{
     WorkflowAdmissionCategory, WorkflowAdmissionObservation, WorkflowAdmissionPhase,
     WorkflowApprovalContinuation, WorkflowAttemptAdmissionObservation,
     WorkflowAttemptPreparationObservation, WorkflowAuthorityTransferObservation,
+    WorkflowCanonicalCollectionCoverage, WorkflowCanonicalEvalCoverage,
     WorkflowContinuationLineage, WorkflowContinuationRequest, WorkflowContinuationSource,
     WorkflowCoordinatorStatus, WorkflowDecision, WorkflowDecisionInspection,
     WorkflowDecisionValueDisclosure, WorkflowDefinitionRepresentation, WorkflowDefinitionSnapshot,

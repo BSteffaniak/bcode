@@ -100,7 +100,25 @@ pub async fn children(
         return Err(Error::InvalidAdmission);
     }
     let tx = db.begin_transaction().await?;
-    super::super::verified(&*tx).await?;
+    let result = children_in(&*tx, parent, after, limit).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// Observe direct child links within the caller's verified snapshot.
+///
+/// # Errors
+/// Rejects invalid bounds, malformed lineage, unsupported storage and database errors.
+pub async fn children_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    parent: &str,
+    after: Option<&str>,
+    limit: u16,
+) -> Result<ChildPage, Error> {
+    if !(1..=100).contains(&limit) {
+        return Err(Error::InvalidAdmission);
+    }
+    super::super::verified(tx).await?;
     let mut query = tx
         .select(LINEAGE)
         .columns(&["run_id", "link_json"])
@@ -110,7 +128,7 @@ pub async fn children(
     if let Some(after) = after {
         query = query.where_gt("run_id", after);
     }
-    let mut rows = query.execute(&*tx).await?;
+    let mut rows = query.execute(tx).await?;
     let more = rows.len() > usize::from(limit);
     rows.truncate(usize::from(limit));
     let mut children = Vec::with_capacity(rows.len());
@@ -133,7 +151,6 @@ pub async fn children(
     } else {
         None
     };
-    tx.commit().await?;
     Ok(ChildPage {
         children,
         next_child_run_id,

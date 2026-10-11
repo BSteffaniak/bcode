@@ -75,9 +75,26 @@ fn attempt_observable(
     let operation = &observation.operation;
     match arm {
         crate::judgement_benchmark::Arm::Off => {
-            if operation.trigger != TriggerDisposition::Disabled
+            let closed_disabled =
+                operation.trigger == TriggerDisposition::Disabled && operation.inference.is_empty();
+            let disabled_call = operation.trigger == TriggerDisposition::Triggered
+                && operation.inference.len() == 1
+                && operation.inference.iter().all(|fact| {
+                    fact.outcome == bcode_model::judgement::OptionalOperationOutcome::Disabled
+                        && fact.discovery_invocations == 0
+                        && fact.model_listing_invocations == 0
+                        && fact.verification_invocations == 0
+                        && fact.inference_invocations == 0
+                        && fact.effective_provider.is_none()
+                        && fact.effective_model.is_none()
+                        && fact.inference_usage.is_none()
+                        && fact.verification_usage.is_none()
+                        && fact.verification_cost_usd.is_none()
+                        && !fact.verification_cache_hit
+                        && fact.transport_attempts.is_none_or(|count| count == 0)
+                });
+            if !(closed_disabled || disabled_call)
                 || operation.application != Some(ApplicationDisposition::BaselineRetained)
-                || !operation.inference.is_empty()
             {
                 return Err(());
             }
@@ -316,6 +333,53 @@ mod tests {
         observation.terminal = Some(ObservationTerminal::Failed);
         observation.schema_version += 1;
         assert!(attempt_observable(&observation, Arm::Off).is_err());
+    }
+
+    #[test]
+    fn triggered_disabled_optional_response_proves_off_only_without_dispatch() {
+        use bcode_model::judgement::{
+            ConsumerOperationObservation, OptionalOperationObservation, OptionalOperationOutcome,
+        };
+        let fact = OptionalOperationObservation {
+            outcome: OptionalOperationOutcome::Disabled,
+            discovery_invocations: 0,
+            model_listing_invocations: 0,
+            verification_invocations: 0,
+            inference_invocations: 0,
+            elapsed_ms: 0,
+            verification_cache_hit: false,
+            effective_provider: None,
+            effective_model: None,
+            inference_usage: None,
+            verification_usage: None,
+            verification_cost_usd: None,
+            transport_attempts: None,
+            decision: None,
+        };
+        let mut observation = EvalAttemptJudgementObservation::new(
+            "off-run".into(),
+            "failed",
+            ConsumerOperationObservation {
+                operation_id: 0,
+                feature: Feature::EvalCategorization,
+                trigger: TriggerDisposition::Triggered,
+                inference: vec![fact],
+                inference_complete: true,
+                application: Some(ApplicationDisposition::BaselineRetained),
+                selection: None,
+                recommendation: None,
+            },
+        );
+        assert!(attempt_observable(&observation, crate::judgement_benchmark::Arm::Off).is_ok());
+        observation.operation.inference[0].inference_invocations = 1;
+        assert!(attempt_observable(&observation, crate::judgement_benchmark::Arm::Off).is_err());
+        observation.operation.inference[0].inference_invocations = 0;
+        observation.operation.inference[0].outcome = OptionalOperationOutcome::Unavailable;
+        assert!(attempt_observable(&observation, crate::judgement_benchmark::Arm::Off).is_err());
+        observation.operation.inference[0].outcome = OptionalOperationOutcome::Disabled;
+        observation.operation.inference_complete = false;
+        observation.complete = false;
+        assert!(attempt_observable(&observation, crate::judgement_benchmark::Arm::Off).is_err());
     }
 
     #[test]

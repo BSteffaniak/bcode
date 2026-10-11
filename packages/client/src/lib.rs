@@ -4587,6 +4587,34 @@ impl BcodeClient {
         }
     }
 
+    /// Rank a bounded caller-eligible page using plugin-owned advisory category semantics.
+    ///
+    /// # Errors
+    /// Returns transport, unavailable-plugin, invalid-input or incompatible-response errors.
+    pub async fn rank_session_categories(
+        &self,
+        request: &bcode_session_models::SessionCategoryRankRequest,
+    ) -> Result<bcode_session_models::SessionCategoryRankResponse, ClientError> {
+        let payload = serde_json::to_vec(request).map_err(|_| ClientError::UnexpectedResponse)?;
+        let response = self
+            .call_plugin_service(
+                bcode_session_models::CATEGORIZATION_INTERFACE_ID.to_owned(),
+                bcode_session_models::OP_RANK_CATEGORIZATION.to_owned(),
+                payload,
+            )
+            .await?;
+        if response.error.is_some() {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        let ranking: bcode_session_models::SessionCategoryRankResponse =
+            serde_json::from_slice(&response.payload)
+                .map_err(|_| ClientError::UnexpectedResponse)?;
+        ranking
+            .validate_for(request)
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+        Ok(ranking)
+    }
+
     /// Request an advisory judgement; absence retains baseline behavior.
     ///
     /// # Errors

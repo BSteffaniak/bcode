@@ -122,13 +122,20 @@ def settled_writes(events, start, end):
     return receipts
 
 
-def validate_capture(capture, feature, arm, enabled=None, primary_observation=None):
+def validate_capture(capture, feature, arm, enabled=None, primary_observation=None, control='positive'):
     cli.require(capture['scope'] == 'normal_turn' and capture['request']['feature'] == feature
-                and capture['request']['arm'] == arm and capture['consumer_executed']
-                and capture.get('output') is not None, 'normal consumer application unavailable')
+                and capture['request']['arm'] == arm, 'exact normal consumer identity required')
     telemetry = capture['telemetry']
     cli.require(telemetry['optional_operations_complete'], 'optional operation coverage incomplete')
     cli.require(telemetry['decisions']['omitted_stages'] == 0, 'decision evidence truncated')
+    cli.require(control in ('positive', 'negative', 'outage'), 'known control required')
+    if control == 'negative':
+        cli.require(all(telemetry.get(key) == 0 for key in
+                        ('discovery_calls', 'verification_calls', 'inference_calls')),
+                    'negative control optional calls not verified zero')
+        return
+    cli.require(capture['consumer_executed'] and capture.get('output') is not None,
+                'normal consumer application unavailable')
     if enabled is not None and primary_observation is not None:
         hook_summary(primary_observation, primary_observation['session_id'], primary_observation['turn_id'], {})
         ops = [op for op in primary_observation['operations'] if op['feature'] == feature]
@@ -277,6 +284,9 @@ def run(job):
     session_id = None
     try:
         identity = cli.verify_subject(job, job['arm'], workspace)
+        if job.get('resolve_state_identity') is True:
+            cli.require('state_id' not in template['request']['subject'], 'unresolved state cannot carry stale identity')
+            template['request']['subject']['state_id'] = identity['state_id']
         cli.require(all(template['request']['subject'].get(k) == v for k, v in identity.items())
                     and template['request']['subject']['executable'] == job['subject_binary'],
                     'declared subject identity mismatch')
@@ -309,9 +319,14 @@ def run(job):
             report['hook_evidence'] = hook_summary(primary_observation, session_id, turn_id,
                                                   job.get('required_hooks', {}))
         validate_capture(report['capture'], feature, template['request']['arm'],
-                         enabled if primary_observation is not None else None, primary_observation)
-        report['filesystem_write_receipts'] = settled_writes(events, start, end)
-        report['settled_write_receipt_verified'] = True
+                         enabled if primary_observation is not None else None, primary_observation,
+                         job.get('control', 'positive'))
+        if job.get('control', 'positive') != 'negative':
+            report['filesystem_write_receipts'] = settled_writes(events, start, end)
+            report['settled_write_receipt_verified'] = True
+        else:
+            report['filesystem_write_receipts'] = []
+            report['settled_write_receipt_verified'] = False  # no mutation required by negative control
         path = workspace / artifact
         cli.require(not path.is_symlink(), 'unsafe artifact')
         report['artifact_sha256'] = cli.digest(path) if path.is_file() else None

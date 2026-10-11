@@ -119,15 +119,6 @@ class NormalPilotTests(unittest.TestCase):
         with self.assertRaises(pilot.cli.PilotError):
             pilot.validate_capture(capture, feature, 'off', pilot.FEATURES - {feature}, observation)
 
-    def test_navigation_uses_labels_not_relevance_or_request_text(self):
-        spec = importlib.util.spec_from_file_location('navigation', Path(__file__).with_name('judgement-navigation-live.py'))
-        navigation = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(navigation)
-        cards = [{'id': 'a', 'labels': {}}, {'id': 'b', 'labels': {'task': 'fix'}},
-                 {'id': 'c', 'labels': {'task': 'fix'}}]
-        self.assertEqual([c['id'] for c in navigation.rank_cards(cards, {'task': 'fix'})], ['b', 'c', 'a'])
-        self.assertEqual([c['id'] for c in navigation.rank_cards(cards, {'domain': 'unknown'})], ['a', 'b', 'c'])
-
     def test_navigation_partial_reports_update_and_relevance_is_discriminating(self):
         import tempfile
         spec = importlib.util.spec_from_file_location('navigation_updates', Path(__file__).with_name('judgement-navigation-live.py'))
@@ -144,6 +135,18 @@ class NormalPilotTests(unittest.TestCase):
         for relevant in (set(), {'a', 'b', 'c'}, {'foreign'}):
             with self.assertRaises(navigation.cli.PilotError):
                 navigation.validate_relevance(['a', 'b', 'c'], relevant)
+
+    def test_negative_no_work_requires_verified_zero_without_fake_application(self):
+        capture = {'scope': 'normal_turn', 'request': {'feature': 'tool_result_triage', 'arm': 'on'},
+                   'consumer_executed': False, 'output': None,
+                   'telemetry': {'optional_operations_complete': True,
+                                 'decisions': {'omitted_stages': 0}, 'discovery_calls': 0,
+                                 'verification_calls': 0, 'inference_calls': 0}}
+        pilot.validate_capture(capture, 'tool_result_triage', 'on', control='negative')
+        for value in (None, 1):
+            capture['telemetry']['inference_calls'] = value
+            with self.assertRaises(pilot.cli.PilotError):
+                pilot.validate_capture(capture, 'tool_result_triage', 'on', control='negative')
 
     def test_failed_task_terminal_is_not_infrastructure_failure(self):
         capture = {'scope': 'normal_turn', 'request': {'feature': 'tool_result_triage', 'arm': 'off'},

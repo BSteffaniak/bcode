@@ -234,6 +234,95 @@ fn apply_optional(
     }
 }
 
+#[cfg(test)]
+use bcode_session_models::SessionCategoryRankCandidate as RankCandidate;
+use bcode_session_models::{
+    SessionCategoryRankRequest as RankRequest, SessionCategoryRankResponse as RankResponse,
+};
+
+/// Rank already eligible cards without IO, inference, persistence or title inspection.
+///
+/// # Errors
+/// Rejects future versions, invalid axis vocabulary, oversized pages, duplicate
+/// identities and invalid label vocabulary. Stale/missing labels retain baseline.
+pub fn rank(request: &RankRequest) -> Result<RankResponse, &'static str> {
+    if request.version != 1 || request.candidates.len() > 100 {
+        return Err("invalid ranking version or bound");
+    }
+    if request
+        .task
+        .as_ref()
+        .is_some_and(|v| !TASKS.contains(&v.as_str()))
+        || request
+            .domain
+            .as_ref()
+            .is_some_and(|v| !DOMAINS.contains(&v.as_str()))
+    {
+        return Err("invalid ranking query axis");
+    }
+    let mut seen = BTreeSet::new();
+    let mut matched = Vec::new();
+    let mut remaining = Vec::new();
+    let has_query = request.task.is_some() || request.domain.is_some();
+    for candidate in &request.candidates {
+        if !seen.insert(candidate.session_id) {
+            return Err("duplicate ranking identity");
+        }
+        if candidate.categorization.as_ref().is_some_and(|label| {
+            !TASKS.contains(&label.task.as_str()) || !DOMAINS.contains(&label.domain.as_str())
+        }) {
+            return Err("invalid ranking label axis");
+        }
+        let eligible = candidate.categorization.as_ref().is_some_and(|label| {
+            has_query
+                && candidate.source_sequence != 0
+                && label.source_sequence == candidate.source_sequence
+                && request
+                    .task
+                    .as_ref()
+                    .is_none_or(|task| task != "other" && task == &label.task)
+                && request
+                    .domain
+                    .as_ref()
+                    .is_none_or(|domain| domain != "other" && domain == &label.domain)
+        });
+        if eligible {
+            matched.push(candidate.session_id);
+        } else {
+            remaining.push(candidate.session_id);
+        }
+    }
+    let ordered: Vec<_> = matched.iter().chain(&remaining).copied().collect();
+    let applied = ordered
+        .iter()
+        .copied()
+        .ne(request.candidates.iter().map(|c| c.session_id));
+    Ok(RankResponse {
+        version: 1,
+        ordered_session_ids: ordered,
+        matched_session_ids: matched,
+        applied,
+    })
+}
+
+/// Decode bounded native service data and return the portable advisory ranking.
+pub(crate) fn invoke_rank(context: &NativeServiceContext) -> ServiceResponse {
+    if context.request.payload.len() > 65_536 {
+        return ServiceResponse::error("invalid_request", "ranking input exceeds bound");
+    }
+    let Ok(request) = context.request.payload_json::<RankRequest>() else {
+        return ServiceResponse::error("invalid_request", "invalid ranking input");
+    };
+    rank(&request).map_or_else(
+        |_| ServiceResponse::error("invalid_request", "invalid ranking input"),
+        |response| {
+            ServiceResponse::json(&response).unwrap_or_else(|_| {
+                ServiceResponse::error("serialization_failed", "ranking unavailable")
+            })
+        },
+    )
+}
+
 pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     // Reject oversized or unknown fields without echoing untrusted payloads.
     let result = (|| {
@@ -293,6 +382,134 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
 mod tests {
     use super::*;
     use bcode_session_models::SessionId;
+    fn card(task: Option<&str>, domain: &str) -> RankCandidate {
+        RankCandidate {
+            session_id: SessionId::new(),
+            source_sequence: 9,
+            categorization: task.map(|task| SessionCategorization {
+                source_sequence: 9,
+                task: task.into(),
+                domain: domain.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn native_ranking_is_stable_axis_specific_and_title_free() {
+        let cards = vec![
+            card(None, "other"),
+            card(Some("documentation"), "backend"),
+            card(Some("documentation"), "tooling"),
+            card(Some("documentation"), "tooling"),
+        ];
+        let request = RankRequest {
+            version: 1,
+            task: Some("documentation".into()),
+            domain: Some("tooling".into()),
+            candidates: cards.clone(),
+        };
+        let response = rank(&request).unwrap();
+        assert_eq!(
+            response.ordered_session_ids,
+            vec![
+                cards[2].session_id,
+                cards[3].session_id,
+                cards[0].session_id,
+                cards[1].session_id
+            ]
+        );
+        assert_eq!(
+            response.matched_session_ids,
+            vec![cards[2].session_id, cards[3].session_id]
+        );
+        assert!(response.applied);
+        let mut task_only = request.clone();
+        task_only.domain = None;
+        assert_eq!(
+            rank(&task_only).unwrap().matched_session_ids,
+            cards[1..].iter().map(|c| c.session_id).collect::<Vec<_>>()
+        );
+        let mut wrong_axis = request;
+        wrong_axis.task = Some("tooling".into());
+        assert!(rank(&wrong_axis).is_err());
+        assert!(
+            serde_json::from_value::<RankRequest>(serde_json::json!({
+                "version":1,"task":null,"domain":null,"candidates":[],"title":"answer leak"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_rank_routes_without_optional_bridge_and_decodes_portable_response() {
+        use bcode_plugin_sdk::RustPlugin;
+        let request = RankRequest {
+            version: 1,
+            task: Some("documentation".into()),
+            domain: Some("tooling".into()),
+            candidates: vec![card(None, "other"), card(Some("documentation"), "tooling")],
+        };
+        let expected = rank(&request).unwrap();
+        let context = NativeServiceContext {
+            plugin_id: "bcode.session-derivation".into(),
+            request: bcode_plugin_sdk::ServiceRequest {
+                interface_id: bcode_session_models::CATEGORIZATION_INTERFACE_ID.into(),
+                operation: bcode_session_models::OP_RANK_CATEGORIZATION.into(),
+                payload: serde_json::to_vec(&request).unwrap(),
+            },
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: bcode_plugin_sdk::ServiceEventEmitter::default(),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            bridge: bcode_plugin_sdk::ServiceBridge::new(
+                None,
+                std::ptr::null_mut(),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+        };
+        let mut plugin = crate::SessionDerivationPlugin;
+        let reply = plugin.invoke_service(context);
+        assert!(reply.error.is_none());
+        let portable: bcode_session_models::SessionCategoryRankResponse =
+            serde_json::from_slice(&reply.payload).unwrap();
+        assert_eq!(portable, expected);
+    }
+
+    #[test]
+    fn missing_stale_other_and_absent_query_preserve_baseline() {
+        let mut cards = vec![card(None, "other"), card(Some("documentation"), "tooling")];
+        cards[1].categorization.as_mut().unwrap().source_sequence = 8;
+        let mut request = RankRequest {
+            version: 1,
+            task: Some("documentation".into()),
+            domain: None,
+            candidates: cards,
+        };
+        let baseline: Vec<_> = request.candidates.iter().map(|c| c.session_id).collect();
+        for task in [Some("documentation".into()), Some("other".into()), None] {
+            request.task = task;
+            let response = rank(&request).unwrap();
+            assert_eq!(response.ordered_session_ids, baseline);
+            assert!(response.matched_session_ids.is_empty());
+            assert!(!response.applied);
+        }
+        request.candidates[1]
+            .categorization
+            .as_mut()
+            .unwrap()
+            .source_sequence = 9;
+        request.task = Some("other".into());
+        assert!(rank(&request).unwrap().matched_session_ids.is_empty());
+        request.candidates.push(request.candidates[0].clone());
+        assert!(rank(&request).is_err());
+        request.candidates.pop();
+        request.version = 2;
+        assert!(rank(&request).is_err());
+        request.version = 1;
+        request.candidates = (0..101).map(|_| card(None, "other")).collect();
+        assert!(rank(&request).is_err());
+    }
+
     extern "C" fn optional_callback(
         input_ptr: *const u8,
         input_len: usize,

@@ -309,13 +309,27 @@ pub async fn prepared(
     crate::validate_id("dispatch_identity", dispatch_identity)
         .map_err(|_| Error::InvalidAdmission)?;
     let tx = db.begin_transaction().await?;
-    super::super::verified(&*tx).await?;
-    let result = attempt(&*tx, dispatch_identity)
-        .await?
-        .map(|row| checked_prepared(&row, run_id, dispatch_identity))
-        .transpose()?;
+    let result = prepared_in(&*tx, run_id, dispatch_identity).await?;
     tx.commit().await?;
     Ok(result)
+}
+
+/// Read one exact prepared attempt in the caller's snapshot.
+/// # Errors
+/// Rejects invalid identities, unsupported state and inconsistent persisted identity.
+pub async fn prepared_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run_id: &str,
+    dispatch_identity: &str,
+) -> Result<Option<PreparedAttempt>, Error> {
+    crate::validate_id("run_id", run_id).map_err(|_| Error::InvalidAdmission)?;
+    crate::validate_id("dispatch_identity", dispatch_identity)
+        .map_err(|_| Error::InvalidAdmission)?;
+    super::super::verified(tx).await?;
+    attempt(tx, dispatch_identity)
+        .await?
+        .map(|row| checked_prepared(&row, run_id, dispatch_identity))
+        .transpose()
 }
 fn checked_prepared(
     row: &switchy_database::Row,
@@ -521,15 +535,25 @@ pub async fn dispatch_intent(
 /// Rejects malformed receipt or database failure.
 pub async fn receipt(db: &dyn Database, id: &str) -> Result<Option<DispatchReceipt>, Error> {
     let tx = db.begin_transaction().await?;
-    super::super::verified(&*tx).await?;
-    let result = match attempt(&*tx, id).await? {
-        Some(row) if row.get("receipt_json") != Some(DatabaseValue::Null) => {
-            Some(decode(&row, "receipt_json")?)
-        }
-        _ => None,
-    };
+    let result = receipt_in(&*tx, id).await?;
     tx.commit().await?;
     Ok(result)
+}
+
+/// Read an immutable dispatch receipt within the caller's snapshot.
+/// # Errors
+/// Rejects unsupported storage, malformed receipts and query failures.
+pub async fn receipt_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    id: &str,
+) -> Result<Option<DispatchReceipt>, Error> {
+    super::super::verified(tx).await?;
+    match attempt(tx, id).await? {
+        Some(row) if row.get("receipt_json") != Some(DatabaseValue::Null) => {
+            Ok(Some(decode(&row, "receipt_json")?))
+        }
+        _ => Ok(None),
+    }
 }
 /// Recheck exact persisted intent, owner, activation and cancellation before external admission.
 /// Existing receipts are returned for deduplication, never as permission to repeat an effect.
@@ -600,19 +624,35 @@ pub async fn execution_session_link(
     crate::validate_execution_session_link_identity(run_id, node, activation, number)
         .map_err(|_| Error::InvalidAdmission)?;
     let tx = db.begin_transaction().await?;
-    super::super::verified(&*tx).await?;
+    let result = execution_session_link_in(&*tx, run_id, node, activation, number).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// Read an exact execution-session link inside the caller's read snapshot.
+/// # Errors
+/// Rejects invalid identity, unsupported representation, malformed storage or query failures.
+pub async fn execution_session_link_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run_id: &str,
+    node: &str,
+    activation: &str,
+    number: u32,
+) -> Result<Option<WorkflowExecutionSessionLink>, Error> {
+    crate::validate_execution_session_link_identity(run_id, node, activation, number)
+        .map_err(|_| Error::InvalidAdmission)?;
+    super::super::verified(tx).await?;
     let id = crate::dispatch_identity(run_id, node, activation, number);
     let rows = tx
         .select(LINKS)
         .where_eq("dispatch_identity", id)
         .limit(1)
-        .execute(&*tx)
+        .execute(tx)
         .await?;
     let result = rows
         .first()
         .map(|row| decode(row, "link_json"))
         .transpose()?;
-    tx.commit().await?;
     Ok(result)
 }
 /// Persist an exact execution-session link under current authority in one transaction.

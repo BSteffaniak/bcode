@@ -2,7 +2,7 @@
 use super::{Database, DatabaseValue, RUNS, RepresentationError as Error, column};
 use crate::NewWorkflowRun;
 mod discovery;
-pub use discovery::{ChildPage, ParentContext, children, parent_context};
+pub use discovery::{ChildPage, ParentContext, children, children_in, parent_context};
 use switchy_database::{
     DatabaseTransaction, Row,
     query::FilterableQuery,

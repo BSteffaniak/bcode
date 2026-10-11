@@ -121,6 +121,24 @@ pub async fn page(
     if !(1..=100).contains(&limit) {
         return Err(Error::InvalidAdmission);
     }
+    let tx = db.begin_transaction().await?;
+    let result = page_in(&*tx, run, after, limit).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// Read one bounded attempt page within the caller's canonical snapshot.
+/// # Errors
+/// Rejects invalid limits, unsupported state and inconsistent ledger rows.
+pub async fn page_in(
+    db: &dyn switchy_database::DatabaseTransaction,
+    run: &str,
+    after: Option<&str>,
+    limit: u16,
+) -> Result<Vec<bcode_workflow::AttemptSummary>, Error> {
+    if !(1..=100).contains(&limit) {
+        return Err(Error::InvalidAdmission);
+    }
     super::verified(db).await?;
     let mut query = db
         .select("workflow_attempts_v2")
@@ -137,12 +155,12 @@ pub async fn page(
             _ => Err(Error::MaintenanceRequired),
         };
         let identity = text("dispatch_identity")?;
-        let prepared = super::attempts::owner_boundary::prepared(db, run, &identity)
+        let prepared = super::attempts::owner_boundary::prepared_in(db, run, &identity)
             .await?
             .ok_or(Error::MaintenanceRequired)?;
         let terminal =
-            super::attempts::owner_boundary::terminal_outcome(db, run, &identity).await?;
-        let receipt = super::attempts::owner_boundary::receipt(db, &identity).await?;
+            super::attempts::owner_boundary::terminal_outcome_in(db, run, &identity).await?;
+        let receipt = super::attempts::owner_boundary::receipt_in(db, &identity).await?;
         results.push(bcode_workflow::AttemptSummary {
             run_id: prepared.run_id,
             node_id: prepared.node_id,

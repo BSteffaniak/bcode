@@ -683,6 +683,60 @@ pub fn activity_scan_allowance(
     Ok(Duration::from_millis(milliseconds))
 }
 
+/// Evidence boundary used for eval failure categorization, not authoritative success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EvalReadinessScope {
+    FullWorkflowHistory,
+    TerminalCanonicalAttempt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+struct EvalReadiness {
+    version: u32,
+    scope: EvalReadinessScope,
+    complete: bool,
+}
+
+const fn eval_readiness(
+    canonical_contract_present: bool,
+    canonical_complete: bool,
+    full_history_complete: bool,
+) -> EvalReadiness {
+    EvalReadiness {
+        version: 1,
+        scope: if canonical_contract_present {
+            EvalReadinessScope::TerminalCanonicalAttempt
+        } else {
+            EvalReadinessScope::FullWorkflowHistory
+        },
+        complete: if canonical_contract_present {
+            canonical_complete
+        } else {
+            full_history_complete
+        },
+    }
+}
+
+// Only this projection interprets capture completeness within the explicit selected scope.
+// Persisted full-history evidence remains separate and unchanged.
+fn readiness_oracle(oracle: &serde_json::Value, readiness: EvalReadiness) -> serde_json::Value {
+    let mut facts = oracle.clone();
+    facts["capture_complete"] = serde_json::json!(readiness.complete);
+    facts["readiness"] = serde_json::json!(readiness);
+    facts
+}
+
+fn receipt_exports_complete(
+    events: &[bcode_session_models::SessionEvent],
+    receipts: &serde_json::Value,
+) -> bool {
+    receipts["receipts"].as_array().is_some_and(|items| {
+        items.len() == super::introspection::referenced_blobs(events).len()
+            && items.iter().all(|receipt| receipt["status"] == "exported")
+    })
+}
+
 fn optional_categorization_allowance(
     metadata: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Duration, EvalError> {
@@ -1661,6 +1715,20 @@ pub fn execute(
             .flatten()
             .filter_map(|value| value["id"].as_str().map(str::to_owned)),
     );
+    let mut seen_sessions = std::collections::BTreeSet::new();
+    event_sessions.retain(|identity| seen_sessions.insert(identity.clone()));
+    let scoped_workflow_complete =
+        capabilities
+            .canonical_eval_coverage
+            .as_ref()
+            .is_some_and(|coverage| {
+                capabilities.graph.as_ref().is_some_and(|graph| {
+                    coverage.complete_for(run_id, graph.revision, capabilities.run.status)
+                })
+            });
+    let mut canonical_attempt_complete = !capture_failed
+        && scoped_workflow_complete
+        && outputs.as_array().is_some_and(|values| values.len() < 100);
     let mut capture_complete = !capture_failed
         && final_inspection["unavailable_collections"]
             .as_array()
@@ -1759,6 +1827,7 @@ pub fn execute(
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_else(|| serde_json::json!([]));
+        canonical_attempt_complete &= receipt_exports_complete(&events, &receipts);
         let capture_summary = super::introspection::summary_with_exports(&events, &receipts);
         model_coverage.observe(&events, &capture_summary, index != 0, history_complete);
         write_session_events_jsonl(&rep_dir.join(format!("transcript-{index}.jsonl")), &events)?;
@@ -1773,6 +1842,19 @@ pub fn execute(
     )?;
     let manifest_path = rep_dir.join("capture-completeness.json");
     let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    canonical_attempt_complete &= session_history_complete
+        && model_coverage.complete()
+        && !rep_dir.join("trace-export-error.json").exists();
+    measurements.insert(
+        "workflow.canonical_attempt_capture_complete".into(),
+        f64::from(canonical_attempt_complete),
+    );
+    manifest["boundaries"]["canonical_attempt"] = serde_json::json!({
+        "scope": "terminal canonical graph, attempts, outputs, admissions, session bindings and exported model evidence; not semantic workflow history",
+        "complete": canonical_attempt_complete,
+        "producer_coverage": capabilities.canonical_eval_coverage,
+        "unsupported_full_history_collections": capabilities.unavailable_collections,
+    });
     let observation_pages = std::fs::read_dir(rep_dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -1905,13 +1987,26 @@ pub fn execute(
     ] {
         measurements.insert(format!("workflow.{key}"), f64::from(value));
     }
+    let readiness = eval_readiness(
+        capabilities.canonical_eval_coverage.is_some(),
+        canonical_attempt_complete,
+        capture_complete,
+    );
+    write_json(rep_dir.join("eval-readiness.json"), &readiness)?;
     write_json(
         rep_dir.join("oracle.json"),
-        &serde_json::json!({"schema_version":1,"passed":oracle_passed,"artifact_correct":artifact_correct,"artifact_observed":artifact_observed,"preservation_passed":preservation,"completion_claimed":completed,"false_completion":false_completion,"completion_failure":completion_failure,"status":status,"timed_out":timed_out,"capture_complete":capture_complete}),
+        &serde_json::json!({"schema_version":1,"passed":oracle_passed,"artifact_correct":artifact_correct,"artifact_observed":artifact_observed,"preservation_passed":preservation,"completion_claimed":completed,"false_completion":false_completion,"completion_failure":completion_failure,"status":status,"timed_out":timed_out,"capture_complete":capture_complete,"readiness":readiness}),
     )?;
-    let oracle_value = serde_json::json!({"completion_claimed":completed,"status":status,"capture_complete":capture_complete,"timed_out":timed_out,"artifact_correct":artifact_correct,"artifact_observed":artifact_observed,"false_completion":false_completion,"preservation_passed":preservation,"completion_failure":completion_failure});
+    let historical_oracle = serde_json::json!({"completion_claimed":completed,"status":status,"capture_complete":capture_complete,"timed_out":timed_out,"artifact_correct":artifact_correct,"artifact_observed":artifact_observed,"false_completion":false_completion,"preservation_passed":preservation,"completion_failure":completion_failure});
+    let oracle_value = readiness_oracle(&historical_oracle, readiness);
     let mut diagnosis =
         super::diagnosis::classify(&oracle_value, &outputs, &final_inspection, &measurements);
+    diagnosis["readiness"] = serde_json::json!(readiness);
+    diagnosis["full_history_coverage"] = serde_json::json!({
+        "complete": capture_complete,
+        "unsupported_collections": capabilities.unavailable_collections,
+        "root_cause_history_verified": false,
+    });
     let operation = categorize_attempt(
         rep_dir,
         categorization_allowance,
@@ -2707,6 +2802,56 @@ mod observation_tests {
             assert_eq!(output.diagnostics.len(), 1);
             assert_eq!(serde_json::to_vec(&oracle).unwrap(), oracle_before);
         }
+    }
+
+    #[test]
+    fn scoped_readiness_drives_diagnosis_without_claiming_full_history() {
+        let historical = serde_json::json!({"capture_complete":false,"status":"completed",
+            "artifact_correct":true,"artifact_observed":true,"preservation_passed":true,
+            "completion_claimed":true,"false_completion":false,"completion_failure":false});
+        for (canonical_complete, expected_gap) in [(true, false), (false, true)] {
+            let readiness = eval_readiness(true, canonical_complete, false);
+            assert_eq!(
+                readiness.scope,
+                EvalReadinessScope::TerminalCanonicalAttempt
+            );
+            let facts = readiness_oracle(&historical, readiness);
+            let diagnosis = super::super::diagnosis::classify(
+                &facts,
+                &serde_json::json!([]),
+                &serde_json::json!({"unavailable_collections":["events","grants"]}),
+                &std::collections::BTreeMap::new(),
+            );
+            assert_eq!(
+                diagnosis["labels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|label| label == "incomplete_execution_evidence"),
+                expected_gap
+            );
+            assert_eq!(
+                super::super::diagnosis::optional_request(&facts, &diagnosis).is_some(),
+                expected_gap
+            );
+            assert_eq!(historical["capture_complete"], false);
+        }
+        assert!(!receipt_exports_complete(&[], &serde_json::json!({})));
+        assert!(!receipt_exports_complete(
+            &[],
+            &serde_json::json!({"receipts":[{"status":"unavailable"}]})
+        ));
+        let missing_receipt_readiness = eval_readiness(
+            true,
+            receipt_exports_complete(&[], &serde_json::json!({})),
+            false,
+        );
+        assert!(!missing_receipt_readiness.complete);
+        assert_eq!(
+            eval_readiness(false, true, false).scope,
+            EvalReadinessScope::FullWorkflowHistory
+        );
+        assert!(!eval_readiness(false, true, false).complete);
     }
 
     #[test]

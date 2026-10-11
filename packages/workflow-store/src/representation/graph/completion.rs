@@ -201,7 +201,10 @@ pub async fn terminal(db: &dyn Database, run: &str) -> Result<Option<ValidatedOu
     tx.commit().await?;
     Ok(result)
 }
-pub(in crate::representation) async fn terminal_in(
+/// Read the validated terminal output in the caller's read snapshot.
+/// # Errors
+/// Rejects unsupported representation, inconsistent output or query failures.
+pub async fn terminal_in(
     tx: &dyn switchy_database::DatabaseTransaction,
     run: &str,
 ) -> Result<Option<ValidatedOutput>, Error> {
@@ -305,7 +308,24 @@ pub async fn outputs(
         return Err(Error::InvalidAdmission);
     }
     let tx = db.begin_transaction().await?;
-    super::super::verified(&*tx).await?;
+    let results = outputs_in(&*tx, run, after, limit).await?;
+    tx.commit().await?;
+    Ok(results)
+}
+
+/// Read bounded validated outputs inside the caller's read snapshot.
+/// # Errors
+/// Rejects invalid bounds, unsupported representation, inconsistent outputs or query failures.
+pub async fn outputs_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run: &str,
+    after: Option<&str>,
+    limit: u16,
+) -> Result<Vec<ValidatedOutput>, Error> {
+    if limit == 0 || limit > 100 {
+        return Err(Error::InvalidAdmission);
+    }
+    super::super::verified(tx).await?;
     let mut query = tx
         .select(OUTPUTS)
         .where_eq("run_id", run)
@@ -315,7 +335,7 @@ pub async fn outputs(
         query = query.where_gt("output_id", after);
     }
     let mut results = Vec::new();
-    for row in query.execute(&*tx).await? {
+    for row in query.execute(tx).await? {
         let value: ValidatedOutput = decode(&row, "output_json")?;
         if row.get("output_id") != Some(DatabaseValue::String(value.output_id.clone()))
             || value.run_id != run
@@ -325,7 +345,6 @@ pub async fn outputs(
         crate::validate_output(&value).map_err(|_| Error::MaintenanceRequired)?;
         results.push(value);
     }
-    tx.commit().await?;
     Ok(results)
 }
 

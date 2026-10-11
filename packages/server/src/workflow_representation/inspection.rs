@@ -9,6 +9,7 @@ use bcode_workflow::{
     WorkflowTerminalOutputInspection,
 };
 use sha2::Digest;
+use switchy_database::Database as _;
 
 mod admission;
 
@@ -21,6 +22,17 @@ fn verify_revision(expected: u64, observed: u64) -> Result<(), ServerError> {
         return Err(stage("revision_changed"));
     }
     Ok(())
+}
+
+fn attempts_settled(attempts: &[bcode_workflow::AttemptSummary], bound: u16) -> bool {
+    attempts.len() < usize::from(bound)
+        && attempts.iter().all(|attempt| {
+            attempt.terminal_at_ms.is_some()
+                && matches!(
+                    attempt.status.as_str(),
+                    "succeeded" | "failed" | "cancelled"
+                )
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -74,58 +86,88 @@ pub async fn inspect(
         .ok()
         .filter(|limit| (1..=100).contains(limit))
         .ok_or_else(unavailable)?;
+    inspect_canonical(state, run_id, limit, bound, &retained)
+        .await
+        .map(Some)
+}
+
+async fn inspect_canonical(
+    state: &ServerState,
+    run_id: &str,
+    limit: usize,
+    bound: u16,
+    retained: &bcode_workflow_store::WorkflowStore,
+) -> Result<WorkflowRunInspection, ServerError> {
     let db = open(retained.path(), false)?;
-    let run = super::status(state, run_id)
-        .await?
+    // One SQLite read snapshot fences execution transitions as well as topology.
+    let tx = db
+        .begin_transaction()
+        .await
+        .map_err(|_| stage("snapshot"))?;
+    let run = representation::runs::summary_in(&*tx, run_id)
+        .await
+        .map_err(|_| stage("run"))?
         .ok_or_else(unavailable)?;
-    let definition = definition(&retained, &run).map_err(|_| stage("definition"))?;
+    let definition = definition(retained, &run).map_err(|_| stage("definition"))?;
     let revision =
-        super::backpressure::retry(|| representation::graph_pages::revision(&db, run_id))
+        super::backpressure::retry(|| representation::graph_pages::revision(&*tx, run_id))
             .await
             .map_err(|_| stage("revision"))?;
-    let graph = super::inspection_graph::page(
-        state,
-        &bcode_workflow::WorkflowRunGraphPageRequest {
-            run_id: run_id.into(),
-            expected_revision: revision,
-            after_node_id: None,
-            after_edge_id: None,
-            limit,
-        },
-    )
-    .await
-    .map_err(|_| stage("graph"))?;
-    let terminal_output = terminal(&db, &run).await.map_err(|_| stage("terminal"))?;
-    let (activations, activations_complete) = activations(&db, run_id, revision, bound)
+    let graph = canonical_graph(&*tx, run_id, revision, limit, bound).await?;
+    let terminal_output = terminal(&*tx, &run).await.map_err(|_| stage("terminal"))?;
+    let (activations, activations_complete) = activations(&*tx, run_id, revision, bound)
         .await
         .map_err(|_| stage("activations"))?;
     let attempts = super::backpressure::retry(|| {
-        representation::inspection_attempts::page(&db, run_id, None, bound)
+        representation::inspection_attempts::page_in(&*tx, run_id, None, bound)
     })
     .await
     .map_err(|_| stage("attempts"))?;
-    let outputs = output_summaries(state, run_id, limit).await?;
-    let child_sessions = sessions(state, &db, run_id, bound)
+    let outputs = output_summaries(&*tx, run_id, bound).await?;
+    let child_sessions = sessions(state, &*tx, run_id, bound)
         .await
         .map_err(|_| stage("sessions"))?;
     let children = super::backpressure::retry(|| {
-        representation::hierarchy::children(&db, run_id, None, bound)
+        representation::hierarchy::children_in(&*tx, run_id, None, bound)
     })
     .await
     .map_err(|_| stage("children"))?;
     let children_complete = children.next_child_run_id.is_none();
     let child_run_links = children.children;
     let (admission_observations, admission_observations_complete) =
-        admission::inspect(&db, run_id, bound).await;
+        admission::inspect(&*tx, run_id, bound).await;
     // A graph revision fences topology only, not concurrent attempt/output transitions.
     // Reject changed topology rather than returning a mixed-revision aggregate.
     let final_revision =
-        super::backpressure::retry(|| representation::graph_pages::revision(&db, run_id))
+        super::backpressure::retry(|| representation::graph_pages::revision(&*tx, run_id))
             .await
             .map_err(|_| stage("final_revision"))?;
     verify_revision(revision, final_revision)?;
-    let sessions_complete = attempts.len() < usize::from(bound);
-    Ok(Some(WorkflowRunInspection {
+    let sessions_complete =
+        attempts.len() < usize::from(bound) && child_sessions.len() < usize::from(bound);
+    let exhausted = bcode_workflow::WorkflowCanonicalCollectionCoverage::from_verified;
+    let canonical_eval_coverage = Some(bcode_workflow::WorkflowCanonicalEvalCoverage {
+        version: 1,
+        run_id: run_id.into(),
+        graph_revision: revision,
+        terminal_status: run.status,
+        graph_complete: exhausted(
+            graph.nodes_complete
+                && graph.edges_complete
+                && graph.revision == revision
+                && (run.status != bcode_workflow::RunStatus::Completed
+                    || terminal_output.is_some()),
+        ),
+        activations_complete: exhausted(activations_complete),
+        attempts_complete: exhausted(attempts_settled(&attempts, bound)),
+        outputs_complete: exhausted(outputs.len() < usize::from(bound)),
+        admission_complete: exhausted(admission_observations_complete == Some(true)),
+        sessions_complete: exhausted(sessions_complete),
+        no_child_runs: exhausted(children_complete && child_run_links.is_empty()),
+    });
+    tx.commit().await.map_err(|_| stage("snapshot_commit"))?;
+    Ok(WorkflowRunInspection {
+        canonical_eval_coverage,
         admission_observations,
         admission_observations_complete,
         unavailable_collections: unavailable_collections(CollectionCompleteness {
@@ -155,12 +197,34 @@ pub async fn inspect(
         repeat_outcomes: vec![],
         child_sessions,
         coordinator: None,
-    }))
+    })
+}
+
+async fn canonical_graph(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run_id: &str,
+    revision: u64,
+    limit: usize,
+    bound: u16,
+) -> Result<bcode_workflow::WorkflowRunGraphInspection, ServerError> {
+    super::inspection_graph::read_in(
+        tx,
+        &bcode_workflow::WorkflowRunGraphPageRequest {
+            run_id: run_id.into(),
+            expected_revision: revision,
+            after_node_id: None,
+            after_edge_id: None,
+            limit,
+        },
+        bound,
+    )
+    .await
+    .map_err(|_| stage("graph"))
 }
 
 async fn sessions(
     state: &ServerState,
-    db: &dyn switchy_database::Database,
+    db: &dyn switchy_database::DatabaseTransaction,
     run_id: &str,
     bound: u16,
 ) -> Result<Vec<bcode_session_models::SessionSummary>, ServerError> {
@@ -180,23 +244,16 @@ async fn sessions(
                     == Some(link.activation_id.as_str())
                 && execution.provenance.attempt == link.attempt
         });
-        if !child_verified && !shared_parent_link(db, run_id, &link).await? {
+        if !child_verified
+            && !super::workflow_activity::verify_shared_parent_link_in(db, run_id, &link)
+                .await
+                .map_err(super::workflow_activity::SharedVerificationFailure::into_server_error)?
+        {
             return Err(unavailable());
         }
         summaries.push(summary);
     }
     Ok(summaries)
-}
-
-/// Verify the explicit canonical shared-parent target without rewriting session provenance.
-pub(super) async fn shared_parent_link(
-    db: &dyn switchy_database::Database,
-    run_id: &str,
-    link: &bcode_workflow_store::WorkflowExecutionSessionLink,
-) -> Result<bool, ServerError> {
-    super::workflow_activity::verify_shared_parent_link(db, run_id, link)
-        .await
-        .map_err(super::workflow_activity::SharedVerificationFailure::into_server_error)
 }
 
 fn definition(
@@ -222,14 +279,14 @@ fn definition(
 }
 
 async fn terminal(
-    db: &dyn switchy_database::Database,
+    db: &dyn switchy_database::DatabaseTransaction,
     run: &bcode_workflow::WorkflowRunSummary,
 ) -> Result<Option<WorkflowTerminalOutputInspection>, ServerError> {
     if run.status != bcode_workflow::RunStatus::Completed {
         return Ok(None);
     }
     let run_id = &run.run_id;
-    let terminal_output = representation::graph::completion::terminal(db, run_id)
+    let terminal_output = representation::graph::completion::terminal_in(db, run_id)
         .await
         .map_err(|_| unavailable())?
         .map(|output| {
@@ -258,13 +315,13 @@ async fn terminal(
 }
 
 async fn activations(
-    db: &dyn switchy_database::Database,
+    db: &dyn switchy_database::DatabaseTransaction,
     run_id: &str,
     expected_revision: u64,
     bound: u16,
 ) -> Result<(Vec<WorkflowActivationSummary>, bool), ServerError> {
     let scheduling = super::backpressure::retry(|| {
-        representation::scheduling::snapshot(db, run_id, Some(expected_revision), None, bound)
+        representation::scheduling::snapshot_in(db, run_id, Some(expected_revision), None, bound)
     })
     .await
     .map_err(|_| unavailable())?;
@@ -297,26 +354,30 @@ async fn activations(
 }
 
 async fn output_summaries(
-    state: &ServerState,
+    db: &dyn switchy_database::DatabaseTransaction,
     run_id: &str,
-    limit: usize,
+    bound: u16,
 ) -> Result<Vec<WorkflowOutputSummary>, ServerError> {
-    let outputs = super::outputs::run_outputs(state, run_id, limit)
+    let outputs = representation::graph::completion::outputs_in(db, run_id, None, bound)
         .await
         .map_err(|_| stage("outputs"))?
         .into_iter()
-        .map(|output| WorkflowOutputSummary {
-            output_id: output.output_id,
-            run_id: output.run_id,
-            node_id: output.node_id,
-            activation_id: output.activation_id,
-            schema_id: output.schema_id,
-            schema_version: output.schema_version,
-            checksum_sha256: output.checksum_sha256,
-            artifact_reference: output.artifact_reference,
-            created_at_ms: output.created_at_ms,
+        .map(|output| {
+            let checksum_sha256 = bcode_workflow::workflow_canonical_value_sha256(&output.value)
+                .map_err(|_| stage("output_checksum"))?;
+            Ok(WorkflowOutputSummary {
+                output_id: output.output_id,
+                run_id: output.run_id,
+                node_id: output.node_id,
+                activation_id: output.activation_id,
+                schema_id: output.schema_id,
+                schema_version: output.schema_version,
+                checksum_sha256,
+                artifact_reference: output.artifact_reference,
+                created_at_ms: output.created_at_ms,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ServerError>>()?;
     Ok(outputs)
 }
 
@@ -348,6 +409,27 @@ mod tests {
             assert!(names.iter().any(|name| name == "events"));
             assert!(names.iter().any(|name| name == "descendant_runs"));
         }
+    }
+
+    #[test]
+    fn attempt_settlement_requires_terminal_facts_not_just_topology() {
+        let mut attempt: bcode_workflow::AttemptSummary =
+            serde_json::from_value(serde_json::json!({
+                "run_id":"run", "node_id":"worker", "activation_id":"activation", "attempt":1,
+                "dispatch_identity":"dispatch", "side_effect":"read_only", "status":"admitted",
+                "has_receipt":true, "prepared_at_ms":1, "admitted_at_ms":2, "terminal_at_ms":null
+            }))
+            .unwrap();
+        assert!(!super::attempts_settled(&[attempt.clone()], 2));
+        attempt.terminal_at_ms = Some(3);
+        assert!(!super::attempts_settled(&[attempt.clone()], 2));
+        for status in ["succeeded", "failed", "cancelled"] {
+            attempt.status = status.into();
+            assert!(super::attempts_settled(&[attempt.clone()], 2));
+            assert!(!super::attempts_settled(&[attempt.clone()], 1));
+        }
+        attempt.status = "future_terminal".into();
+        assert!(!super::attempts_settled(&[attempt], 2));
     }
 
     #[test]

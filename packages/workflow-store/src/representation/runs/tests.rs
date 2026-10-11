@@ -32,6 +32,182 @@ async fn admitted() -> (Box<dyn Database>, WorkflowExecutionAuthority, String) {
     (db, owner, definition.entries[0].clone())
 }
 #[tokio::test]
+async fn canonical_summary_and_outputs_share_one_sqlite_snapshot() {
+    for cancelled in [false, true] {
+        let (db, owner, node) = admitted().await;
+        let tx = db.begin_transaction().await.unwrap();
+        assert_eq!(
+            summary_in(&*tx, "run").await.unwrap().unwrap().status,
+            bcode_workflow::RunStatus::Paused
+        );
+        let revision = super::super::graph_pages::revision(&*tx, "run")
+            .await
+            .unwrap();
+        let nodes = super::super::graph_pages::nodes(&*tx, "run", revision, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, node);
+        assert!(
+            super::super::graph_edges::page(&*tx, "run", revision, None, None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let snapshot =
+            super::super::scheduling::snapshot_in(&*tx, "run", Some(revision), None, 100)
+                .await
+                .unwrap();
+        assert_eq!(snapshot.activations.len(), 1);
+        assert!(
+            super::super::inspection_attempts::page_in(&*tx, "run", None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            super::super::inspection_sessions::links(&*tx, "run", None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            super::super::admission_observation::inspect(&*tx, "run", None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let activation = graph::activation_id(&*tx, "run", &node)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            attempts::owner_boundary::execution_session_link_in(&*tx, "run", &node, &activation, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(summary_in(&*tx, "missing").await.unwrap().is_none());
+        assert!(
+            super::super::inspection_attempts::page_in(&*tx, "run", None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            super::super::hierarchy::children_in(&*tx, "run", None, 10)
+                .await
+                .unwrap()
+                .children
+                .is_empty()
+        );
+        assert!(
+            graph::completion::outputs_in(&*tx, "run", None, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        tx.commit().await.unwrap();
+
+        settle_snapshot_case(&*db, &owner, &node, cancelled).await;
+        let expected = summary(&*db, "run").await.unwrap().unwrap();
+        let tx = db.begin_transaction().await.unwrap();
+        let observed = summary_in(&*tx, "run").await.unwrap().unwrap();
+        assert_snapshot_summary(&observed, &expected);
+        let outputs = graph::completion::outputs_in(&*tx, "run", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(outputs.len(), usize::from(!cancelled));
+        if !cancelled {
+            let terminal = graph::completion::terminal_in(&*tx, "run")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.value, serde_json::json!(1));
+            assert_eq!(Some(terminal.output_id), observed.terminal_output_id);
+        }
+        // The readers neither commit nor release the caller's snapshot.
+        assert!(summary_in(&*tx, "run").await.unwrap().is_some());
+        tx.commit().await.unwrap();
+    }
+}
+
+async fn settle_snapshot_case(
+    db: &dyn Database,
+    owner: &WorkflowExecutionAuthority,
+    node: &str,
+    cancelled: bool,
+) {
+    let id = prepared(db, owner, node).await;
+    if cancelled {
+        safety::request_cancellation(db, "run", owner, 2)
+            .await
+            .unwrap();
+        settled(db, owner, node, &id, attempts::TerminalOutcome::Succeeded).await;
+    } else {
+        complete_canonical_output(db, owner, node, &id).await;
+    }
+    terminalize(db, owner, "run").await.unwrap();
+}
+
+fn assert_snapshot_summary(
+    observed: &bcode_workflow::WorkflowRunSummary,
+    expected: &bcode_workflow::WorkflowRunSummary,
+) {
+    assert_eq!(observed.status, expected.status);
+    assert_eq!(observed.terminal_output_id, expected.terminal_output_id);
+}
+
+async fn complete_canonical_output(
+    db: &dyn Database,
+    owner: &WorkflowExecutionAuthority,
+    node: &str,
+    dispatch: &str,
+) {
+    let activation = graph::activation_id(db, "run", node)
+        .await
+        .unwrap()
+        .unwrap();
+    attempts::attach_receipt(
+        db,
+        owner,
+        &crate::DispatchReceipt {
+            run_id: "run".into(),
+            node_id: node.into(),
+            activation_id: activation.clone(),
+            attempt: 1,
+            dispatch_identity: dispatch.into(),
+            receipt: serde_json::json!({}),
+            admitted_at_ms: 2,
+        },
+    )
+    .await
+    .unwrap();
+    let definition = bcode_workflow::WorkflowBuilder::new(
+        "run",
+        bcode_workflow::Step::task("work", |v: u32, _| async move { Ok(v) }),
+    )
+    .build()
+    .unwrap()
+    .definition()
+    .clone();
+    let output = crate::ValidatedOutput {
+        output_id: "canonical-output".into(),
+        run_id: "run".into(),
+        node_id: node.into(),
+        activation_id: activation,
+        schema_id: definition.nodes[node].output.type_name.clone(),
+        schema_version: 1,
+        value: serde_json::json!(1),
+        artifact_reference: None,
+        created_at_ms: 3,
+    };
+    graph::completion::complete(db, owner, 1, dispatch, &output)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn detachment_changes_only_association_and_needs_no_owner() {
     let (db, _, _) = admitted().await;
     let before = db.select(RUNS).execute(&*db).await.unwrap()[0].clone();

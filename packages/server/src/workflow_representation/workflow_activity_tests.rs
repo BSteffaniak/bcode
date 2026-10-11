@@ -2,6 +2,8 @@
 fn shared_verification_failures_preserve_operation_and_safe_category() {
     use representation::RepresentationError as Error;
     for operation in [
+        SharedVerificationOperation::BeginTransaction,
+        SharedVerificationOperation::CommitTransaction,
         SharedVerificationOperation::RunSummary,
         SharedVerificationOperation::SessionLink,
         SharedVerificationOperation::ExecutionNode,
@@ -74,6 +76,31 @@ fn shared_failure_boundary_preserves_closed_codes_and_operations() {
             bcode_ipc::ErrorResponse::new(code, format!("{message}; operation={operation}"));
         let encoded = serde_json::to_value(response).expect("portable error response");
         assert_eq!(encoded["code"], expected_code);
+    }
+    for (operation, expected_operation) in [
+        (
+            SharedVerificationOperation::BeginTransaction,
+            "begin_transaction",
+        ),
+        (
+            SharedVerificationOperation::CommitTransaction,
+            "commit_transaction",
+        ),
+    ] {
+        let ServerError::WorkflowActivitySharedVerification {
+            operation, code, ..
+        } = preserve_live_failure(
+            SharedVerificationFailure {
+                operation,
+                category: SharedVerificationCategory::Busy,
+            }
+            .into_server_error(),
+        )
+        else {
+            panic!("typed transaction error was overwritten");
+        };
+        assert_eq!(operation, expected_operation);
+        assert_eq!(code, "workflow_activity_shared_busy");
     }
     assert!(matches!(
         preserve_live_failure(super::super::unavailable()),

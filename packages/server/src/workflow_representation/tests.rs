@@ -642,7 +642,7 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
     assert_eq!(links.len(), 1);
     assert_eq!(links[0].session_id, parent);
     assert!(
-        inspection::shared_parent_link(&db, "new", &links[0])
+        workflow_activity::verify_shared_parent_link(&db, "new", &links[0])
             .await
             .unwrap()
     );
@@ -659,14 +659,14 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
     let mut spoofed = links[0].clone();
     spoofed.session_id = bcode_session_models::SessionId::new().to_string();
     assert!(
-        !inspection::shared_parent_link(&db, "new", &spoofed)
+        !workflow_activity::verify_shared_parent_link(&db, "new", &spoofed)
             .await
             .unwrap()
     );
     spoofed = links[0].clone();
     spoofed.workspace_snapshot = "wrong-workspace".into();
     assert!(
-        !inspection::shared_parent_link(&db, "new", &spoofed)
+        !workflow_activity::verify_shared_parent_link(&db, "new", &spoofed)
             .await
             .unwrap()
     );

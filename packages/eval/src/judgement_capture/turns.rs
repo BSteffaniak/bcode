@@ -316,6 +316,11 @@ pub(super) async fn execute(
                             // arbitrary strings supplied by an untrusted contribution producer.
                             label = payload["category"]
                                 .as_str()
+                                .or_else(|| {
+                                    payload
+                                        .pointer("/advisory/category")
+                                        .and_then(serde_json::Value::as_str)
+                                })
                                 .filter(|value| {
                                     matches!(
                                         *value,

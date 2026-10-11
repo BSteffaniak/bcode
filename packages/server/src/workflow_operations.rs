@@ -11917,6 +11917,7 @@ pub async fn inspect_run(
         )
     };
     Ok(bcode_workflow::WorkflowRunInspection {
+        canonical_eval_coverage: None,
         unavailable_collections: vec![],
         admission_observations: vec![],
         admission_observations_complete: None,

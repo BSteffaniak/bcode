@@ -139,39 +139,44 @@ fn valid(input: &ProgressRequest) -> bool {
         && serde_json::to_vec(input).is_ok_and(|bytes| bytes.len() <= MAX_INPUT_BYTES)
 }
 
-fn repeated_failure(input: &ProgressRequest) -> bool {
+const REPETITION_THRESHOLD: usize = 3;
+
+fn failure_streak(input: &ProgressRequest) -> usize {
     let Some(last) = input.observations.last() else {
-        return false;
+        return 0;
     };
-    let Some(key) = &last.failure_key else {
-        return false;
-    };
-    // Only a consecutive matching failure streak supports advice about repeating an approach.
-    // Success, a different failure, or new evidence resets it; A -> B -> A is not repetition.
-    for previous in input.observations.iter().rev() {
-        if previous.evidence_key.is_some() || previous.failure_key.as_ref() != Some(key) {
-            return false;
-        }
-        if previous.sequence != last.sequence {
-            return true;
-        }
-    }
-    false
+    input
+        .observations
+        .iter()
+        .rev()
+        .take_while(|observation| {
+            last.failure_key.is_some()
+                && observation.failure_key == last.failure_key
+                && observation.evidence_key.is_none()
+        })
+        .count()
+}
+
+fn repeated_failure(input: &ProgressRequest) -> bool {
+    // Three matching failures qualify; success, changed failure or new evidence resets.
+    failure_streak(input) >= REPETITION_THRESHOLD
 }
 
 fn prepare(input: &ProgressRequest) -> Option<OptionalRequest> {
     if !valid(input) || input.observations.len() < 2 {
         return None;
     }
-    // Without changed observations or repeated failures there is no useful new trigger.
-    if !repeated_failure(input)
-        && !input.observations.windows(2).any(|pair| {
-            pair[0].action != pair[1].action
-                || pair[0].summary != pair[1].summary
-                || pair[0].failure_key != pair[1].failure_key
-                || pair[0].evidence_key != pair[1].evidence_key
-        })
-    {
+    // Judge repetition at its first three-observation onset, not every later
+    // identical settled action. New failure/evidence changes qualify independently.
+    let latest = input.observations.last()?;
+    let previous = input.observations.get(input.observations.len() - 2)?;
+    let changed = latest.failure_key != previous.failure_key
+        || latest.evidence_key != previous.evidence_key
+        || (latest.failure_key.is_none()
+            && previous.failure_key.is_none()
+            && (latest.action != previous.action || latest.summary != previous.summary));
+    let repetition_onset = failure_streak(input) == REPETITION_THRESHOLD;
+    if !changed && !repetition_onset {
         return None;
     }
     let questions = [
@@ -411,15 +416,67 @@ mod tests {
             input.observations[1].failure_key = middle_failure;
             assert!(!repeated_failure(&input));
             assert!(apply(&input, &answers(0.1, 0.95, 0.1)).is_none());
-            // A second matching failure after the reset is a fresh streak.
+            // Two matching failures after reset still abstain; the third qualifies.
             let mut next = input.observations[2].clone();
             next.sequence = 4;
+            input.observations.push(next.clone());
+            assert!(!repeated_failure(&input));
+            assert!(prepare(&input).is_none());
+            assert!(apply(&input, &answers(0.1, 0.95, 0.1)).is_none());
+            next.sequence = 5;
             input.observations.push(next);
             assert!(repeated_failure(&input));
+            assert!(prepare(&input).is_some());
             let advice = apply(&input, &answers(0.1, 0.95, 0.1)).unwrap();
-            assert_eq!(advice.through_sequence, 4);
+            assert_eq!(advice.through_sequence, 5);
             assert_eq!(advice.kind, ProgressAdviceKind::RepeatedFailure);
         }
+    }
+
+    #[test]
+    fn repetition_onset_is_selective_and_old_changes_do_not_retrigger() {
+        let mut request = input(ProgressScope::Session {
+            id: "session".into(),
+        });
+        request.observations.truncate(2);
+        assert!(prepare(&request).is_none());
+        let mut next = request.observations[1].clone();
+        next.sequence = 3;
+        request.observations.push(next.clone());
+        assert!(prepare(&request).is_some());
+        for sequence in 4..=8 {
+            next.sequence = sequence;
+            request.observations.push(next.clone());
+            assert!(prepare(&request).is_none());
+        }
+        request.observations.remove(0);
+        next.sequence = 9;
+        request.observations.push(next.clone());
+        assert!(prepare(&request).is_none());
+        request.observations[7].failure_key = Some("new-defect".into());
+        assert!(prepare(&request).is_some());
+        request.observations.remove(0);
+        next.sequence = 10;
+        next.failure_key = Some("new-defect".into());
+        request.observations.push(next);
+        assert!(prepare(&request).is_none());
+        request.observations[7].evidence_key = Some("fresh-reproduction".into());
+        assert!(prepare(&request).is_some());
+    }
+
+    #[test]
+    fn settled_successes_without_changed_evidence_do_not_dispatch() {
+        let mut request = input(ProgressScope::Session {
+            id: "session".into(),
+        });
+        for observation in &mut request.observations {
+            observation.failure_key = None;
+        }
+        assert!(prepare(&request).is_none());
+        request.observations[0].summary = "old different summary".into();
+        assert!(prepare(&request).is_none());
+        request.observations[2].evidence_key = Some("new verified evidence".into());
+        assert!(prepare(&request).is_some());
     }
 
     #[test]

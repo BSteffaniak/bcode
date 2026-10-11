@@ -43,7 +43,18 @@ async fn read(
     })
     .await
     .map_err(normalize)?;
-    let revision = retry(|| representation::graph_pages::revision(&*tx, &request.run_id))
+    let result = read_in(&*tx, request, limit).await?;
+    tx.commit().await.map_err(|_| unavailable())?;
+    Ok(result)
+}
+
+/// Read graph facts inside the caller's canonical read transaction.
+pub(super) async fn read_in(
+    tx: &dyn Database,
+    request: &WorkflowRunGraphPageRequest,
+    limit: u16,
+) -> Result<WorkflowRunGraphInspection, ServerError> {
+    let revision = retry(|| representation::graph_pages::revision(tx, &request.run_id))
         .await
         .map_err(normalize)?;
     if revision != request.expected_revision {
@@ -52,12 +63,12 @@ async fn read(
         )
         .into());
     }
-    let boundary = retry(|| representation::graph_edges::boundary(&*tx, &request.run_id, revision))
+    let boundary = retry(|| representation::graph_edges::boundary(tx, &request.run_id, revision))
         .await
         .map_err(normalize)?;
     let nodes = retry(|| {
         representation::graph_pages::nodes(
-            &*tx,
+            tx,
             &request.run_id,
             revision,
             request.after_node_id.as_deref(),
@@ -68,7 +79,7 @@ async fn read(
     .map_err(normalize)?;
     let edges = retry(|| {
         representation::graph_edges::page(
-            &*tx,
+            tx,
             &request.run_id,
             revision,
             None,
@@ -80,7 +91,7 @@ async fn read(
     .map_err(normalize)?;
     let nodes_complete = match nodes.last() {
         Some(node) => retry(|| {
-            representation::graph_pages::nodes(&*tx, &request.run_id, revision, Some(&node.id), 1)
+            representation::graph_pages::nodes(tx, &request.run_id, revision, Some(&node.id), 1)
         })
         .await
         .map_err(normalize)?
@@ -90,7 +101,7 @@ async fn read(
     let edges_complete = match edges.last() {
         Some(edge) => retry(|| {
             representation::graph_edges::page(
-                &*tx,
+                tx,
                 &request.run_id,
                 revision,
                 None,
@@ -103,7 +114,7 @@ async fn read(
         .is_empty(),
         None => true,
     };
-    let next_edge_id = retry(|| representation::graph_edges::next_edge_id(&*tx, &request.run_id))
+    let next_edge_id = retry(|| representation::graph_edges::next_edge_id(tx, &request.run_id))
         .await
         .map_err(normalize)?;
     let result = graph_view(
@@ -115,7 +126,6 @@ async fn read(
         edges,
         &boundary,
     );
-    tx.commit().await.map_err(|_| unavailable())?;
     Ok(result)
 }
 

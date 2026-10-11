@@ -72,9 +72,27 @@ Incomplete workflow inspection or capture still blocks end-to-end conclusions.
 written artifacts. It supports explicit single-feature, all-off, all-on and leave-one-out
 configurations, canonical request/result correlation, exact-turn hook checks and no-replay
 reconciliation. `scripts/judgement-navigation-live.py` evaluates a fixed query over three
-actual activated sessions using public advisory labels and a label-only ranking adapter.
-Its relevance subset is authored independently; this measures the harness adapter, not
-native frontend navigation. Missing labels, incomplete pages and unknown calls stay gaps.
+actual activated sessions through the product `session rank-categories --file` operation.
+The session-derivation plugin owns ranking; portable session contracts and the client validate
+version, exact identity permutation and advisory application. Ranking accepts only bounded
+caller-eligible IDs, activation sequences and current advisory labels, never session titles or
+relevance truth. Missing/stale labels preserve baseline order. The independently authored
+relevance subset grades the returned order; this tests the public product operation, not a
+frontend layout or a separate harness ranking policy. Unknown calls and incomplete evidence stay gaps.
+
+`scripts/judgement-study-live.py` materializes pinned schedules, admits finite serialized batches,
+reconciles retained reports without replay, and reduces intent-to-treat and enhancement-qualified
+comparisons separately. Treatment/contrast identities prevent combined-system arms from overwriting
+single-feature comparisons. Explicit `rebind-resume` verifies existing receipt/job/terminal-report
+correlations before creating a new source-pinned schedule; unresolved admissions remain blocked.
+Adapter bindings must preserve the authored task and independent oracle. An unsupported binding is
+not permission to substitute a different pilot task or report an unexecuted arm as a loss.
+
+Workflow inspection exposes versioned, transaction-scoped canonical-attempt coverage separately
+from unsupported semantic/full-history collections. Scoped closure additionally requires complete
+canonical session histories and verified model/tool receipt exports. Unsupported or missing exports
+remain incomplete even when graph, attempts and terminal output are known. This is neither a
+full execution-history certificate nor a durable-resume guarantee.
 
 `fixtures/evals/judgement/normal_study.py` provides CSV, record-ID, checkout-validation and
 confined-path repair families with bounded independent behavioral oracles. Repetitions and

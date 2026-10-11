@@ -49,6 +49,11 @@ impl RustPlugin for SessionDerivationPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id == bcode_session_models::CATEGORIZATION_INTERFACE_ID
+            && context.request.operation == bcode_session_models::OP_RANK_CATEGORIZATION
+        {
+            return categorization::invoke_rank(&context);
+        }
+        if context.request.interface_id == bcode_session_models::CATEGORIZATION_INTERFACE_ID
             && context.request.operation == bcode_session_models::OP_CATEGORIZE
         {
             return categorization::invoke(&context);

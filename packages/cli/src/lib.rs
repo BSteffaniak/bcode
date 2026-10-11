@@ -52,6 +52,9 @@ const SESSION_CLI_PAGE_LIMIT: usize = 500;
 /// Errors returned by the CLI.
 #[derive(Debug, Error)]
 pub enum CliError {
+    /// A bounded category ranking request could not be read.
+    #[error("category ranking request unavailable: {0}")]
+    CategoryRankingInput(#[source] std::io::Error),
     /// Startup diagnostic storage could not be read safely.
     #[error(
         "startup reports unavailable: check permissions; corrupt, oversized, and unsupported reports are preserved"
@@ -235,7 +238,7 @@ impl CliError {
             | Self::SessionSearchBackfillCancelled
             | Self::AuthFlowCancelled => 4,
             Self::SessionSearchBackfillIncomplete => 1,
-            Self::StartupReportUnavailable => 1,
+            Self::StartupReportUnavailable | Self::CategoryRankingInput(_) => 1,
             Self::Signal(_) => 1,
             Self::Client(_)
             | Self::ChildSessionCreate { .. }
@@ -5584,6 +5587,12 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Rank a bounded title-free page through the categorization plugin.
+    RankCategories {
+        /// JSON `SessionCategoryRankRequest` containing the caller-eligible page.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Compact legacy global reader evidence while retaining a durable maintenance blocker.
     CompactLegacyAdmission {
         /// Maximum entries inspected in this batch; repeat to drain large registries.
@@ -8001,9 +8010,40 @@ async fn print_session_categorization(session_id: SessionId, json: bool) -> Resu
     Ok(())
 }
 
+async fn print_ranked_categories(file: PathBuf) -> Result<(), CliError> {
+    let file = std::fs::File::open(file).map_err(CliError::CategoryRankingInput)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, 65_537), &mut bytes)
+        .map_err(CliError::CategoryRankingInput)?;
+    if bytes.len() > 65_536 {
+        return Err(CliError::CategoryRankingInput(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "category ranking request exceeds 64 KiB",
+        )));
+    }
+    let request: bcode_session_models::SessionCategoryRankRequest = serde_json::from_slice(&bytes)?;
+    ensure_server_running().await?;
+    let response = BcodeClient::default_endpoint()
+        .rank_session_categories(&request)
+        .await?;
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
+    if let SessionCommand::RankCategories { file } = *command {
+        return Box::pin(print_ranked_categories(file)).await;
+    }
+    Box::pin(dispatch_non_ranking_session_command(command)).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn dispatch_non_ranking_session_command(
+    command: Box<SessionCommand>,
+) -> Result<(), CliError> {
     match *command {
+        SessionCommand::RankCategories { .. } => unreachable!("ranking is dispatched above"),
         SessionCommand::Categorization { session_id, json } => {
             Box::pin(print_session_categorization(session_id, json)).await?;
         }

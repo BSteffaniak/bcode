@@ -49,7 +49,8 @@ mod categorization;
 pub use categorization::{
     CATEGORIZATION_INTERFACE_ID, CategorizationRequest, CategorizationResponse,
     MAX_CATEGORIZATION_REQUEST_BYTES, MAX_CATEGORIZATION_SOURCE_BYTES, OP_CATEGORIZE,
-    SessionCategorization,
+    OP_RANK_CATEGORIZATION, SessionCategorization, SessionCategoryRankCandidate,
+    SessionCategoryRankRequest, SessionCategoryRankResponse,
 };
 
 mod submission;

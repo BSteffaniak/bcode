@@ -2597,9 +2597,91 @@ pub struct WorkflowAdmissionObservation {
     pub observed_at_ms: u64,
 }
 
+/// Availability of one bounded canonical collection at a transactional snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCanonicalCollectionCoverage {
+    /// All applicable rows were verified and the bounded inventory exhausted.
+    Exhausted,
+    /// Truncated, unsettled, unsupported or otherwise unverified inventory.
+    Incomplete,
+}
+
+impl WorkflowCanonicalCollectionCoverage {
+    /// Convert the producer's verified exhaustion predicate into its portable fact.
+    #[must_use]
+    pub const fn from_verified(exhausted: bool) -> Self {
+        if exhausted {
+            Self::Exhausted
+        } else {
+            Self::Incomplete
+        }
+    }
+}
+
+/// Version-one bounded terminal canonical observation, not full semantic history.
+/// Missing coverage or unsupported versions must remain unknown to consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCanonicalEvalCoverage {
+    /// Independently evolving compatibility boundary; currently one.
+    pub version: u32,
+    /// Exact canonical run identity.
+    pub run_id: String,
+    /// Topology shared by the graph and transactional execution snapshot.
+    pub graph_revision: u64,
+    /// Terminal state read with attempts, outputs and bindings in one read transaction.
+    pub terminal_status: crate::RunStatus,
+    /// Each collection was exhausted within the requested bound, not merely returned empty.
+    pub graph_complete: WorkflowCanonicalCollectionCoverage,
+    /// Exhausted canonical activation inventory.
+    pub activations_complete: WorkflowCanonicalCollectionCoverage,
+    /// Exhausted canonical attempt inventory, all attempts terminal.
+    pub attempts_complete: WorkflowCanonicalCollectionCoverage,
+    /// Exhausted checksum-verified canonical outputs.
+    pub outputs_complete: WorkflowCanonicalCollectionCoverage,
+    /// Exhausted canonical admission observations.
+    pub admission_complete: WorkflowCanonicalCollectionCoverage,
+    /// Exhausted verified execution-session provenance bindings.
+    pub sessions_complete: WorkflowCanonicalCollectionCoverage,
+    /// Direct child links exhausted and empty. Descendant settlement is not yet supported.
+    pub no_child_runs: WorkflowCanonicalCollectionCoverage,
+}
+
+impl WorkflowCanonicalEvalCoverage {
+    /// Whether this exact terminal snapshot closes only its declared canonical scope.
+    #[must_use]
+    pub fn complete_for(&self, run_id: &str, revision: u64, status: crate::RunStatus) -> bool {
+        self.version == 1
+            && self.run_id == run_id
+            && self.graph_revision == revision
+            && self.terminal_status == status
+            && matches!(
+                status,
+                crate::RunStatus::Completed
+                    | crate::RunStatus::Failed
+                    | crate::RunStatus::Cancelled
+            )
+            && [
+                self.graph_complete,
+                self.activations_complete,
+                self.attempts_complete,
+                self.outputs_complete,
+                self.admission_complete,
+                self.sessions_complete,
+                self.no_child_runs,
+            ]
+            .iter()
+            .all(|coverage| *coverage == WorkflowCanonicalCollectionCoverage::Exhausted)
+    }
+}
+
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
+    /// Scoped transactional terminal coverage; absence is unknown, never full-history closure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_eval_coverage: Option<WorkflowCanonicalEvalCoverage>,
     /// Normalized admission diagnostics; absent older senders do not prove absence.
     #[serde(default)]
     pub admission_observations: Vec<WorkflowAdmissionObservation>,
@@ -2920,6 +3002,60 @@ mod tests {
             );
             page.events.clear();
             assert_eq!(page.validate("run", None), Ok(()));
+        }
+    }
+
+    #[test]
+    fn scoped_terminal_coverage_rejects_unknown_partial_and_foreign_snapshots() {
+        use super::{
+            RunStatus, WorkflowCanonicalCollectionCoverage, WorkflowCanonicalEvalCoverage,
+        };
+        use WorkflowCanonicalCollectionCoverage::{Exhausted, Incomplete};
+        let coverage = WorkflowCanonicalEvalCoverage {
+            version: 1,
+            run_id: "run".into(),
+            graph_revision: 3,
+            terminal_status: RunStatus::Completed,
+            graph_complete: Exhausted,
+            activations_complete: Exhausted,
+            attempts_complete: Exhausted,
+            outputs_complete: Exhausted,
+            admission_complete: Exhausted,
+            sessions_complete: Exhausted,
+            no_child_runs: Exhausted,
+        };
+        assert!(coverage.complete_for("run", 3, RunStatus::Completed));
+        assert!(!coverage.complete_for("foreign", 3, RunStatus::Completed));
+        assert!(!coverage.complete_for("run", 4, RunStatus::Completed));
+        assert!(!coverage.complete_for("run", 3, RunStatus::Failed));
+        for status in [
+            RunStatus::Running,
+            RunStatus::Paused,
+            RunStatus::RepairRequired,
+        ] {
+            let mut unsettled = coverage.clone();
+            unsettled.terminal_status = status;
+            assert!(!unsettled.complete_for("run", 3, status));
+        }
+        assert!(
+            serde_json::from_value::<WorkflowCanonicalCollectionCoverage>(serde_json::json!(
+                "future"
+            ))
+            .is_err()
+        );
+        for index in 0..8 {
+            let mut partial = coverage.clone();
+            match index {
+                0 => partial.version = 2,
+                1 => partial.graph_complete = Incomplete,
+                2 => partial.activations_complete = Incomplete,
+                3 => partial.attempts_complete = Incomplete,
+                4 => partial.outputs_complete = Incomplete,
+                5 => partial.admission_complete = Incomplete,
+                6 => partial.sessions_complete = Incomplete,
+                _ => partial.no_child_runs = Incomplete,
+            }
+            assert!(!partial.complete_for("run", 3, RunStatus::Completed));
         }
     }
 

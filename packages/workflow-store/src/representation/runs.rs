@@ -508,8 +508,22 @@ pub async fn summary(
     run_id: &str,
 ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, Error> {
     let tx = db.begin_transaction().await?;
-    super::verified(&*tx).await?;
-    match super::identity_in(&*tx, run_id).await? {
+    let result = summary_in(&*tx, run_id).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// Read a bounded canonical summary inside the caller's verified read snapshot.
+///
+/// Does not begin or commit a transaction.
+/// # Errors
+/// Rejects unsupported representation, inconsistent storage or query failures.
+pub async fn summary_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run_id: &str,
+) -> Result<Option<bcode_workflow::WorkflowRunSummary>, Error> {
+    super::verified(tx).await?;
+    match super::identity_in(tx, run_id).await? {
         None => return Ok(None),
         Some(RunRepresentation::Legacy) => return Err(Error::UnsupportedStore),
         Some(RunRepresentation::Version2) => {}
@@ -518,7 +532,7 @@ pub async fn summary(
         .select(RUNS)
         .where_eq("run_id", run_id)
         .limit(1)
-        .execute(&*tx)
+        .execute(tx)
         .await?;
     let row = rows.first().ok_or(Error::MaintenanceRequired)?;
     let observed = observation(row)?;
@@ -535,7 +549,7 @@ pub async fn summary(
         .columns(&["requested_at_ms"])
         .where_eq("run_id", run_id)
         .limit(1)
-        .execute(&*tx)
+        .execute(tx)
         .await?;
     let cancellation_requested_at_ms = match cancellation
         .first()
@@ -548,7 +562,7 @@ pub async fn summary(
         _ => return Err(Error::MaintenanceRequired),
     };
     let terminal = if observed.state == RunState::Completed {
-        super::graph::completion::terminal_in(&*tx, run_id).await?
+        super::graph::completion::terminal_in(tx, run_id).await?
     } else {
         None
     };
@@ -590,7 +604,6 @@ pub async fn summary(
             _ => return Err(Error::MaintenanceRequired),
         },
     };
-    tx.commit().await?;
     Ok(Some(result))
 }
 
