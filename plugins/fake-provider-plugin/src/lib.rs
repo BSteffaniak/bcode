@@ -2933,6 +2933,58 @@ mod tests {
         StructuredOutputMode, TurnOutputPosition,
     };
 
+    #[test]
+    fn configuration_validation_accepts_normalized_requests_on_supported_interfaces() {
+        let plugin = FakeProviderPlugin::default();
+        let request = ValidateConfigRequest {
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([("fixture".to_owned(), "advanced-chat".to_owned())]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for interface in [
+            MODEL_PROVIDER_INTERFACE_ID,
+            MODEL_PROVIDER_INTERFACE_ID_V2,
+            MODEL_PROVIDER_INTERFACE_ID_V3,
+        ] {
+            let context: NativeServiceContext = serde_json::from_value(serde_json::json!({
+                "plugin_id": "bcode.fake-provider",
+                "request": {
+                    "interface_id": interface,
+                    "operation": OP_VALIDATE_CONFIG,
+                    "payload": serde_json::to_vec(&request).unwrap(),
+                },
+            }))
+            .unwrap();
+            let response = plugin.invoke_provider_service(&context);
+            assert!(response.error.is_none(), "{response:?}");
+            let validation: ValidateConfigResponse =
+                serde_json::from_slice(&response.payload).unwrap();
+            assert!(validation.valid);
+            assert!(validation.failures.is_empty());
+            assert_eq!(validation.metadata, request.provider_context.settings);
+        }
+    }
+
+    #[test]
+    fn configuration_validation_rejects_empty_or_malformed_request_payloads() {
+        let plugin = FakeProviderPlugin::default();
+        for payload in [Vec::new(), b"not json".to_vec()] {
+            let context: NativeServiceContext = serde_json::from_value(serde_json::json!({
+                "plugin_id": "bcode.fake-provider",
+                "request": {
+                    "interface_id": MODEL_PROVIDER_INTERFACE_ID,
+                    "operation": OP_VALIDATE_CONFIG,
+                    "payload": payload,
+                },
+            }))
+            .unwrap();
+            let response = plugin.invoke_provider_service(&context);
+            assert_eq!(response.error.unwrap().code, "invalid_request");
+        }
+    }
+
     /// The host wraps structured input in delimiters whenever it also sends instructions, so payload
     /// extraction must unwrap them. Missing this left the payload unparseable and surfaced as
     /// `invalid_fake_structured_output`.

@@ -37,11 +37,15 @@ enum CliError {
 }
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: true,
+        requires_daemon,
         command: ReviewCli::command,
         invoke,
     }
 }
+fn requires_daemon(matches: &clap::ArgMatches) -> bool {
+    matches.subcommand_name() == Some("publish-github")
+}
+
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = ReviewCli::from_arg_matches(&matches).map_err(|e| e.to_string())?;
@@ -398,6 +402,37 @@ fn parse_pull_request_from_branch(branch: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_review_commands_defer_daemon_startup() {
+        let registration = registration();
+        for args in [
+            vec!["review"],
+            vec!["review", "unstaged"],
+            vec!["review", "staged", "--repo", "/tmp/review"],
+            vec!["review", "all"],
+            vec!["review", "last-commit"],
+            vec!["review", "range", "main", "HEAD"],
+            vec!["review", "range", "main", "HEAD", "--two-dot"],
+            vec!["review", "repo"],
+        ] {
+            let matches = (registration.command)().try_get_matches_from(args).unwrap();
+            assert!(!(registration.requires_daemon)(&matches));
+        }
+    }
+
+    #[test]
+    fn github_preview_and_submit_require_daemon_before_invocation() {
+        let registration = registration();
+        for args in [
+            vec!["review", "publish-github"],
+            vec!["review", "publish-github", "--submit"],
+            vec!["review", "publish-github", "--target", "staged"],
+        ] {
+            let matches = (registration.command)().try_get_matches_from(args).unwrap();
+            assert!((registration.requires_daemon)(&matches));
+        }
+    }
 
     #[test]
     fn repo_argument_resolves_relative_default_to_absolute_path() {

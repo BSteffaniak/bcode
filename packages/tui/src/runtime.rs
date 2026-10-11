@@ -74,6 +74,27 @@ pub async fn run_standalone_plugin_surface<W: Write>(
     plugin_id: impl Into<String>,
     surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
 ) -> Result<Option<serde_json::Value>, TuiError> {
+    let presentation = prepare_presentation(&super::static_bundled_plugins()).await?;
+    Box::pin(run_prepared_plugin_surface(
+        terminal,
+        plugin_id,
+        surface,
+        presentation,
+    ))
+    .await
+}
+
+/// Mount a plugin surface using resources loaded while the outer shell showed progress.
+///
+/// # Errors
+/// Returns plugin/root runtime errors.
+#[allow(clippy::future_not_send)]
+pub async fn run_prepared_plugin_surface<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    plugin_id: impl Into<String>,
+    surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    presentation: PreparedPresentation,
+) -> Result<Option<serde_json::Value>, TuiError> {
     let plugin_id = plugin_id.into();
     let (runtime, handle) = {
         let InitializedTui {
@@ -81,11 +102,12 @@ pub async fn run_standalone_plugin_surface<W: Write>(
             settings,
             chat,
             ..
-        } = initialize_tui(
+        } = initialize_tui_with_presentation(
             terminal.area(),
             None,
             &super::static_bundled_plugins(),
             super::TuiLaunchOptions::default(),
+            presentation,
         );
         let passive_client = client
             .clone()
@@ -116,6 +138,26 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     launch_options: super::TuiLaunchOptions,
 ) -> Result<(), TuiError> {
+    let connection = prepare_connection(session_id).await?;
+    Box::pin(run_prepared_chat(
+        terminal,
+        connection,
+        startup_action,
+        static_plugins,
+        launch_options,
+    ))
+    .await
+}
+
+pub struct PreparedConnection {
+    session_id: Option<SessionId>,
+    publisher: Option<super::resurrection::Publisher>,
+    warning: Option<String>,
+}
+
+pub async fn prepare_connection(
+    session_id: Option<SessionId>,
+) -> Result<PreparedConnection, TuiError> {
     let config = bcode_config::load_config();
     let (session_id, publisher, warning) = if let Ok(config) = &config {
         super::resurrection::connect(&config.tui.session_resurrection, session_id).await?
@@ -123,12 +165,110 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
         // Preserve the existing in-TUI configuration error reporting path.
         (session_id, None, None)
     };
+    Ok(PreparedConnection {
+        session_id,
+        publisher,
+        warning,
+    })
+}
+
+#[allow(clippy::future_not_send)]
+pub async fn run_prepared_chat<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    connection: PreparedConnection,
+    startup_action: StartupTuiAction,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    launch_options: super::TuiLaunchOptions,
+) -> Result<(), TuiError> {
+    let PreparedConnection {
+        session_id,
+        publisher,
+        warning,
+    } = connection;
     let mut initialized =
         initialize_tui(terminal.area(), session_id, static_plugins, launch_options);
     if let Some(warning) = warning {
         initialized.chat.app.set_status(warning);
     }
     Box::pin(run_root(terminal, initialized, startup_action, publisher)).await
+}
+
+/// Configuration and plugin resources prepared without constructing terminal or session state.
+pub struct PreparedPresentation {
+    config: Result<bcode_config::BcodeConfig, bcode_config::ConfigError>,
+    streaming_override: Result<
+        Option<bcode_session_view_models::StreamingPresentationPolicy>,
+        bcode_config::ConfigError,
+    >,
+    presentation: Result<super::plugin_tui::PluginTuiPresentation, bcode_plugin::PluginLoadError>,
+}
+
+/// Prepare synchronous native-plugin/configuration loading on a blocking worker.
+///
+/// # Errors
+/// Returns worker failure; configuration/plugin failures retain the existing in-root reporting.
+pub async fn prepare_presentation(
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<PreparedPresentation, TuiError> {
+    let plugins = static_plugins.to_vec();
+    Ok(tokio::task::spawn_blocking(move || load_presentation(&plugins)).await?)
+}
+
+fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> PreparedPresentation {
+    let config = bcode_config::load_config();
+    let streaming_override = bcode_config::load_tui_streaming_presentation_override();
+    let presentation_config = config.as_ref().ok();
+    let selection =
+        presentation_config.map_or_else(bcode_plugin::PluginSelection::all_enabled, |config| {
+            let ids =
+                bcode_plugin::static_bundled_default_plugin_ids(static_plugins).unwrap_or_default();
+            bcode_config::plugin_selection_with_default_plugin_ids(config, &ids)
+        });
+    let visual = presentation_config
+        .map(|config| config.tui.visual_adapters.clone())
+        .unwrap_or_default();
+    let presentation = super::plugin_tui::load_default_presentation_with_static_bundled(
+        &selection,
+        visual,
+        static_plugins,
+        &super::bundled_tui_extensions(),
+    );
+    PreparedPresentation {
+        config,
+        streaming_override,
+        presentation,
+    }
+}
+
+/// Mount prepared resources, keeping all application/terminal construction on the foreground.
+///
+/// # Errors
+/// Returns root runtime errors.
+#[allow(clippy::future_not_send)]
+pub async fn run_prepared_chat_with_presentation<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    connection: PreparedConnection,
+    presentation: PreparedPresentation,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    launch_options: super::TuiLaunchOptions,
+) -> Result<(), TuiError> {
+    let mut initialized = initialize_tui_with_presentation(
+        terminal.area(),
+        connection.session_id,
+        static_plugins,
+        launch_options,
+        presentation,
+    );
+    if let Some(warning) = connection.warning {
+        initialized.chat.app.set_status(warning);
+    }
+    Box::pin(run_root(
+        terminal,
+        initialized,
+        StartupTuiAction::None,
+        connection.publisher,
+    ))
+    .await
 }
 
 struct InitializedTui {
@@ -145,8 +285,27 @@ fn initialize_tui(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     launch_options: super::TuiLaunchOptions,
 ) -> InitializedTui {
-    let config = bcode_config::load_config();
-    let streaming_presentation_override = bcode_config::load_tui_streaming_presentation_override();
+    initialize_tui_with_presentation(
+        terminal_area,
+        session_id,
+        static_plugins,
+        launch_options,
+        load_presentation(static_plugins),
+    )
+}
+
+fn initialize_tui_with_presentation(
+    terminal_area: Rect,
+    session_id: Option<SessionId>,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    launch_options: super::TuiLaunchOptions,
+    presentation: PreparedPresentation,
+) -> InitializedTui {
+    let PreparedPresentation {
+        config,
+        streaming_override: streaming_presentation_override,
+        presentation,
+    } = presentation;
     let client = config
         .as_ref()
         .map_or_else(
@@ -170,22 +329,7 @@ fn initialize_tui(
             _ => None,
         },
     );
-    let presentation_config = config.as_ref().ok();
-    let plugin_selection =
-        presentation_config.map_or_else(bcode_plugin::PluginSelection::all_enabled, |config| {
-            let default_plugin_ids =
-                bcode_plugin::static_bundled_default_plugin_ids(static_plugins).unwrap_or_default();
-            bcode_config::plugin_selection_with_default_plugin_ids(config, &default_plugin_ids)
-        });
-    let visual_adapter_config = presentation_config
-        .map(|config| config.tui.visual_adapters.clone())
-        .unwrap_or_default();
-    match super::plugin_tui::load_default_presentation_with_static_bundled(
-        &plugin_selection,
-        visual_adapter_config,
-        static_plugins,
-        &super::bundled_tui_extensions(),
-    ) {
+    match presentation {
         Ok(presentation) => app.set_plugin_presentation(Arc::new(presentation)),
         Err(error) => app.set_status(format!("plugin presentation unavailable: {error}")),
     }

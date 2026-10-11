@@ -492,7 +492,7 @@ pub async fn run_with_static_bundled(
                 "execution-mode flags are not supported by plugin CLI commands".to_owned(),
             ));
         }
-        if plugin.requires_daemon {
+        if plugin.requires_daemon(subcommand_matches) {
             ensure_server_running().await?;
         }
         let outcome = plugin
@@ -506,8 +506,14 @@ pub async fn run_with_static_bundled(
                 options,
             }) => {
                 let repo_path = resolve_surface_repo_path(repo_path)?;
-                ensure_server_running().await?;
-                bcode_tui::run_plugin_surface(surface_kind, repo_path, options).await?;
+                let surface: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<(), CliError>> + Send>,
+                > = Box::pin(run_plugin_surface_in_shell(
+                    surface_kind,
+                    repo_path,
+                    options,
+                ));
+                surface.await?;
             }
             Some(bcode_plugin_sdk::StaticCliHostAction::AttachSession { session_id }) => {
                 ensure_server_running().await?;
@@ -526,6 +532,103 @@ pub async fn run_with_static_bundled(
         eprintln!("bcode: startup report flush failed; report may be incomplete");
     }
     result
+}
+
+const fn startup_error_summary(error: &CliError) -> &'static str {
+    use bcode_daemon_lifecycle::DaemonStartError;
+    match error {
+        CliError::Client(
+            ClientError::DaemonStart(DaemonStartError::StartTimeout { .. })
+            | ClientError::DaemonStartupTimeout { .. },
+        ) => "The local server did not become ready before the startup deadline.",
+        CliError::Client(ClientError::DaemonStart(DaemonStartError::Exited { .. })) => {
+            "The local server exited before becoming ready."
+        }
+        CliError::Client(ClientError::DaemonStart(DaemonStartError::HealthCheckFailed {
+            ..
+        })) => "The local server failed its readiness health check.",
+        CliError::Client(ClientError::DaemonStart(DaemonStartError::EndpointOccupied {
+            ..
+        })) => "The local server endpoint is occupied; no competing server was started.",
+        CliError::Client(ClientError::DaemonStart(
+            DaemonStartError::StartupCoordinationTimeout { .. },
+        )) => "The local server startup coordination timed out.",
+        CliError::Client(ClientError::IncompatibleDaemon { .. }) => {
+            "The local server identity or compatibility could not be verified."
+        }
+        CliError::Client(
+            ClientError::ConnectTimeout { .. } | ClientError::Transport(_) | ClientError::Codec(_),
+        ) => "The local server connection could not be established.",
+        _ => "The local server could not be started.",
+    }
+}
+
+fn startup_tui_error(error: &CliError) -> bcode_tui::TuiError {
+    use bcode_daemon_lifecycle::DaemonStartError;
+    let code = match error {
+        CliError::Client(
+            ClientError::DaemonStart(DaemonStartError::StartTimeout { .. })
+            | ClientError::DaemonStartupTimeout { .. },
+        ) => "daemon_start_timeout",
+        CliError::Client(ClientError::DaemonStart(DaemonStartError::Exited { .. })) => {
+            "daemon_start_exited"
+        }
+        CliError::Client(ClientError::DaemonStart(DaemonStartError::HealthCheckFailed {
+            ..
+        })) => "daemon_start_health_check",
+        CliError::Client(ClientError::DaemonStart(DaemonStartError::EndpointOccupied {
+            ..
+        })) => "daemon_start_endpoint_occupied",
+        CliError::Client(ClientError::DaemonStart(
+            DaemonStartError::StartupCoordinationTimeout { .. },
+        )) => "daemon_start_coordination_timeout",
+        CliError::Client(ClientError::IncompatibleDaemon { .. }) => "daemon_start_incompatible",
+        CliError::Client(
+            ClientError::ConnectTimeout { .. } | ClientError::Transport(_) | ClientError::Codec(_),
+        ) => "daemon_start_connection",
+        _ => "daemon_start_failed",
+    };
+    bcode_tui::TuiError::PluginService {
+        code: code.to_owned(),
+        message: startup_error_summary(error).to_owned(),
+    }
+}
+
+async fn run_plugin_surface_in_shell(
+    surface_kind: String,
+    repo_path: Option<PathBuf>,
+    options: BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    let mut shell = bcode_tui::TerminalShell::enter()?;
+    let mut failure_summary = "The interface could not be opened.";
+    let result = async {
+        let ready = shell
+            .wait(
+                "Starting the local server…",
+                Box::pin(async {
+                    ensure_server_running().await.map_err(|error| {
+                        failure_summary = startup_error_summary(&error);
+                        bcode_tui::TuiError::Io(std::io::Error::other(failure_summary))
+                    })
+                }),
+            )
+            .await?;
+        if ready.is_some() && !shell.stop_requested() {
+            shell
+                .run_plugin_surface(surface_kind, repo_path, options)
+                .await?;
+        }
+        Ok::<(), bcode_tui::TuiError>(())
+    }
+    .await;
+    if result.is_err() {
+        shell
+            .show_error_without_retry(&format!(
+                "{failure_summary} Initialization may have completed; inspect its status before starting again. Back or Close leaves this journey without retrying.",
+            ))
+            .await?;
+    }
+    Ok(())
 }
 
 fn initialize_startup_reports(
@@ -3761,7 +3864,7 @@ async fn handle_onboard_flags(
     secure_import_env: Option<String>,
     no_credential_discovery: bool,
 ) -> Result<(), CliError> {
-    handle_onboard_command(&OnboardOptions {
+    Box::pin(handle_onboard_command(&OnboardOptions {
         reset,
         output_mode,
         provider,
@@ -3769,7 +3872,7 @@ async fn handle_onboard_flags(
         experience_mode,
         secure_import_env,
         no_credential_discovery,
-    })
+    }))
     .await
 }
 
@@ -3887,6 +3990,20 @@ fn print_onboarding_preview(
 }
 
 async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
+    Box::pin(handle_onboard_command_impl(options, None)).await
+}
+
+async fn handle_onboard_command_in_shell(
+    terminal_shell: &mut bcode_tui::TerminalShell,
+    options: &OnboardOptions,
+) -> Result<(), CliError> {
+    Box::pin(handle_onboard_command_impl(options, Some(terminal_shell))).await
+}
+
+async fn handle_onboard_command_impl(
+    options: &OnboardOptions,
+    terminal_shell: Option<&mut bcode_tui::TerminalShell>,
+) -> Result<(), CliError> {
     let store = bcode_settings::SettingsStore::default();
     let config = bcode_config::load_config()?;
     let discovery_enabled = config.onboarding.credential_discovery_enabled(
@@ -3973,22 +4090,111 @@ async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError
     let readiness_report =
         bcode_settings::setup_readiness_report(shell.sections(), &recommendations);
     store.save_readiness_report(&readiness_report, now_ms)?;
-    let launch = Box::pin(credential_setup::run_setup(discovery_enabled)).await?;
-    if launch && options.launch_mode == OnboardLaunchMode::LaunchWhenReady {
-        Box::pin(start_validated_onboarding_session(&store, now_ms)).await?;
+    Box::pin(finish_onboard_screen(
+        terminal_shell,
+        discovery_enabled,
+        options,
+        &store,
+        now_ms,
+    ))
+    .await
+}
+
+async fn finish_onboard_screen(
+    terminal_shell: Option<&mut bcode_tui::TerminalShell>,
+    discovery_enabled: bool,
+    options: &OnboardOptions,
+    store: &bcode_settings::SettingsStore,
+    now_ms: u64,
+) -> Result<(), CliError> {
+    if let Some(terminal_shell) = terminal_shell {
+        Box::pin(handle_onboard_launch_in_shell(
+            terminal_shell,
+            discovery_enabled,
+            options,
+            store,
+            now_ms,
+        ))
+        .await?;
+    } else {
+        let mut terminal_shell = bcode_tui::TerminalShell::enter()?;
+        let result = Box::pin(handle_onboard_launch_in_shell(
+            &mut terminal_shell,
+            discovery_enabled,
+            options,
+            store,
+            now_ms,
+        ))
+        .await;
+        if result.is_err() {
+            terminal_shell.show_error_without_retry("Setup or launch could not complete. Inspect session status before starting another session. Existing configuration was preserved.").await?;
+        }
+        terminal_shell.finish()?;
     }
     Ok(())
 }
 
-async fn start_validated_onboarding_session(
+async fn handle_onboard_launch_in_shell(
+    shell: &mut bcode_tui::TerminalShell,
+    discovery_enabled: bool,
+    options: &OnboardOptions,
+    store: &bcode_settings::SettingsStore,
+    now_ms: u64,
+) -> Result<(), CliError> {
+    let launch = shell.run_setup(discovery_enabled).await?;
+    if launch == bcode_settings::SetupContinuation::Launch
+        && options.launch_mode == OnboardLaunchMode::LaunchWhenReady
+    {
+        Box::pin(start_validated_onboarding_session_in_shell(
+            shell, store, now_ms,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+async fn start_validated_onboarding_session_in_shell(
+    shell: &mut bcode_tui::TerminalShell,
     store: &bcode_settings::SettingsStore,
     now_ms: u64,
 ) -> Result<(), CliError> {
     credential_setup::validate_launch_selection()?;
-    ensure_server_running().await?;
-    Box::pin(model_validate_config(false)).await?;
+    // Model validation is local configuration validation, not a paid request.
+    let validated = shell
+        .wait(
+            "Preparing your connection",
+            Box::pin(async {
+                ensure_server_running()
+                    .await
+                    .map_err(|error| startup_tui_error(&error))?;
+                let config = bcode_config::load_config().map_err(|_| {
+                    bcode_tui::TuiError::Io(std::io::Error::other(
+                        "Configuration could not be loaded",
+                    ))
+                })?;
+                let validation = BcodeClient::default_endpoint()
+                    .validate_model_config(config.resolved_model_selection().provider_plugin_id)
+                    .await
+                    .map_err(|_| {
+                        bcode_tui::TuiError::Io(std::io::Error::other(
+                            "The selected model configuration could not be validated",
+                        ))
+                    })?;
+                if !validation.valid {
+                    return Err(bcode_tui::TuiError::Io(std::io::Error::other(
+                        "The selected model configuration requires attention",
+                    )));
+                }
+                Ok(())
+            }),
+        )
+        .await?;
+    if validated.is_none() || shell.stop_requested() {
+        return Ok(());
+    }
     store.complete_onboarding(now_ms)?;
-    Box::pin(run_new_session_tui(
+    Box::pin(run_new_session_tui_in_shell(
+        shell,
         None,
         bcode_tui::TuiLaunchOptions::default(),
     ))
@@ -15704,6 +15910,37 @@ async fn run_new_session_tui(
         launch_options,
     )
     .await?;
+    Ok(())
+}
+
+async fn run_new_session_tui_in_shell(
+    shell: &mut bcode_tui::TerminalShell,
+    worktree: Option<String>,
+    launch_options: bcode_tui::TuiLaunchOptions,
+) -> Result<(), CliError> {
+    let session = Box::pin(shell.wait("Starting your session", async {
+        ensure_server_running().await.map_err(|error| startup_tui_error(&error))?;
+        let client = BcodeClient::default_endpoint();
+        if let Some(name) = worktree {
+            client.create_worktree(WorktreeCreateRequest {
+                name, cwd: None, path: None, branch: None, new_branch: None,
+                base_ref: None, detach: false, force: false, attach_session_id: None,
+                new_session: true, no_setup: false,
+            }).await.map_err(|_| bcode_tui::TuiError::Io(std::io::Error::other("Worktree initialization did not complete; inspect its status before retrying")))?
+                .session.ok_or_else(|| bcode_tui::TuiError::Io(std::io::Error::other("Worktree initialization returned no session")))
+        } else {
+            client.create_session(None).await.map_err(|_| bcode_tui::TuiError::Io(std::io::Error::other("Session initialization did not complete; inspect session status before retrying")))
+        }
+    })).await?;
+    if shell.stop_requested() {
+        // The operation settled before cancellation; a created session remains discoverable.
+        return Ok(());
+    }
+    if let Some(session) = session {
+        shell
+            .run_chat(Some(session.id), &static_bundled_plugins(), launch_options)
+            .await?;
+    }
     Ok(())
 }
 

@@ -1335,7 +1335,10 @@ mod tests {
             .expect("read plugin contributes a CLI command");
 
         assert_eq!((registration.command)().get_name(), "read");
-        assert!(!registration.requires_daemon);
+        let matches = (registration.command)()
+            .try_get_matches_from(["read"])
+            .expect("read defaults parse");
+        assert!(!(registration.requires_daemon)(&matches));
     }
 
     #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]

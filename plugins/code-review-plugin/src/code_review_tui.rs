@@ -1943,6 +1943,13 @@ async fn drain_pending_ai_exchange_deletes(
     }
 }
 
+fn record_unverified_ai_exchange_save(app: &mut ReviewApp, exchange_id: &str) {
+    app.mark_ai_exchange_failed(exchange_id, "Saving the review exchange did not produce a verified result; inspect its current state before submitting again.");
+    // Failure presentation must not itself schedule a second mutation of the ambiguous record.
+    app.pending_ai_exchange_saves.remove(exchange_id);
+    app.pending_agent_session = None;
+}
+
 async fn drain_pending_ai_exchange_saves(
     client: &BcodeClient,
     repo_path: &Path,
@@ -1963,9 +1970,9 @@ async fn drain_pending_ai_exchange_saves(
         {
             Ok(persisted) => app.mark_ai_exchange_persisted(&persisted),
             Err(error) => {
-                app.requeue_ai_exchange_save(&exchange_id);
+                record_unverified_ai_exchange_save(app, &exchange_id);
                 app.status_message = Some(format!(
-                    "failed to save review AI exchange; will retry: {error}"
+                    "failed to save review AI exchange; not retried: {error}"
                 ));
                 return true;
             }
@@ -13847,6 +13854,18 @@ pub(crate) mod tests {
         assert_eq!(state.phase, ReviewAgentThreadPhase::Failed);
         assert_eq!(state.error.as_deref(), Some("daemon unavailable"));
         assert_eq!(app.ai_exchanges[&anchor].len(), 2);
+    }
+
+    #[test]
+    fn unverified_exchange_save_never_requeues_or_creates_session() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        let id = app.create_ai_exchange(anchor, "question".to_owned(), None);
+        let _ = app.take_pending_ai_exchange_save().expect("initial save");
+        record_unverified_ai_exchange_save(&mut app, &id);
+        assert!(app.take_pending_ai_exchange_save().is_none());
+        assert!(app.take_pending_agent_session().is_none());
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub enum CompositionError {
 pub struct Contribution {
     plugin_id: String,
     command_name: String,
-    pub requires_daemon: bool,
+    requires_daemon: fn(&clap::ArgMatches) -> bool,
     invoke: fn(clap::ArgMatches) -> StaticCliFuture,
     command: Command,
 }
@@ -91,6 +91,11 @@ pub fn matched<'a>(
 }
 
 impl Contribution {
+    /// Classify the plugin command before dispatch without owning plugin policy.
+    pub fn requires_daemon(&self, matches: &clap::ArgMatches) -> bool {
+        (self.requires_daemon)(matches)
+    }
+
     pub fn invoke(&self, matches: clap::ArgMatches) -> StaticCliFuture {
         (self.invoke)(matches)
     }
@@ -108,7 +113,7 @@ mod tests {
         Contribution {
             plugin_id: plugin_id.to_owned(),
             command_name: command.get_name().to_owned(),
-            requires_daemon: false,
+            requires_daemon: |_| false,
             invoke: unused_invoke,
             command,
         }
@@ -135,6 +140,26 @@ mod tests {
             !web.get_arguments()
                 .any(|argument| argument.get_id() == "bind")
         );
+    }
+
+    #[test]
+    fn daemon_requirement_uses_plugin_subcommand_matches() {
+        let mut contribution = contribution(
+            "bcode.example",
+            Command::new("example")
+                .subcommand(Command::new("view"))
+                .subcommand(Command::new("publish")),
+        );
+        contribution.requires_daemon = |matches| matches.subcommand_name() == Some("publish");
+        for (subcommand, expected) in [("view", false), ("publish", true)] {
+            let root = compose(Command::new("bcode"), std::slice::from_ref(&contribution));
+            let matches = root
+                .try_get_matches_from(["bcode", "example", subcommand])
+                .unwrap();
+            let selected = matched(&matches, std::slice::from_ref(&contribution)).unwrap();
+            let (_, plugin_matches) = matches.subcommand().unwrap();
+            assert_eq!(selected.requires_daemon(plugin_matches), expected);
+        }
     }
 
     #[test]

@@ -11,10 +11,27 @@ const fn interactive_startup(terminal: bool, ci: bool, opted_out: bool) -> bool 
 }
 
 pub async fn advanced(no_discovery: bool) -> Result<(), CliError> {
-    Box::pin(super::handle_onboard_command(&super::OnboardOptions {
-        no_credential_discovery: no_discovery,
-        ..super::OnboardOptions::default()
-    }))
+    let mut shell = bcode_tui::TerminalShell::enter()?;
+    let result = advanced_in_shell(&mut shell, no_discovery).await;
+    if let Err(error) = result {
+        let message = launch_recovery_message(Some(&error));
+        let _ = shell.show_error_without_retry(&message).await?;
+    }
+    shell.finish()?;
+    Ok(())
+}
+
+async fn advanced_in_shell(
+    shell: &mut bcode_tui::TerminalShell,
+    no_discovery: bool,
+) -> Result<(), CliError> {
+    Box::pin(super::handle_onboard_command_in_shell(
+        shell,
+        &super::OnboardOptions {
+            no_credential_discovery: no_discovery,
+            ..super::OnboardOptions::default()
+        },
+    ))
     .await
 }
 
@@ -51,31 +68,130 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
     };
     host.deactivate_all()?;
     let input = quick_input(remembered.is_ok(), readiness, &candidates, &choices);
-    match Box::pin(bcode_tui::run_quick_onboarding(input)).await? {
-        bcode_tui::QuickOnboardingOutcome::Advanced => advanced(no_discovery).await?,
-        bcode_tui::QuickOnboardingOutcome::Close => {}
+    let mut shell = bcode_tui::TerminalShell::enter()?;
+    let result = run_startup_journey(
+        &mut shell,
+        input,
+        remembered.is_ok(),
+        route,
+        &choices,
+        explicit_selection,
+        no_discovery,
+    )
+    .await;
+    shell.finish()?;
+    result?;
+    Ok(true)
+}
+
+async fn run_startup_journey(
+    shell: &mut bcode_tui::TerminalShell,
+    mut input: bcode_tui::QuickOnboardingInput,
+    state_valid: bool,
+    route: StartupRoute,
+    choices: &[(
+        bcode_config::startup::StartupSelection,
+        StartupAuthCandidate,
+    )],
+    explicit_selection: bool,
+    no_discovery: bool,
+) -> Result<(), CliError> {
+    let Ok(outcome) = Box::pin(bcode_tui::run_quick_onboarding_in_shell(
+        shell,
+        input.clone(),
+    ))
+    .await
+    else {
+        // Enrollment may have committed before presentation failed.
+        return recover_startup_journey(shell, &mut input, None).await;
+    };
+    let result = match outcome {
+        bcode_tui::QuickOnboardingOutcome::Advanced => advanced_in_shell(shell, no_discovery).await,
+        bcode_tui::QuickOnboardingOutcome::Close => return Ok(()),
         bcode_tui::QuickOnboardingOutcome::Selected(index) => {
-            Box::pin(launch_selected(index, remembered.is_ok(), route, &choices)).await?;
+            Box::pin(launch_selected(shell, index, state_valid, route, choices)).await
         }
         bcode_tui::QuickOnboardingOutcome::Connected {
             provider_id,
             profile,
         } => {
             Box::pin(launch_connected(
-                &config,
+                shell,
                 provider_id,
                 profile,
                 explicit_selection,
-                remembered.is_ok(),
+                state_valid,
                 no_discovery,
             ))
-            .await?;
+            .await
         }
+    };
+    if let Err(error) = result {
+        return recover_startup_journey(shell, &mut input, Some(&error)).await;
     }
-    Ok(true)
+    Ok(())
+}
+
+async fn recover_startup_journey(
+    shell: &mut bcode_tui::TerminalShell,
+    input: &mut bcode_tui::QuickOnboardingInput,
+    error: Option<&CliError>,
+) -> Result<(), CliError> {
+    // Do not expose potentially secret-bearing provider errors or retry a mutation.
+    recover_launch_input(input);
+    let message = launch_recovery_message(error);
+    let _ = shell.show_error_without_retry(&message).await?;
+    // Back leaves this journey too: Advanced can create sessions, so reopening the
+    // picker here would offer an indirect retry before ambiguous effects are inspected.
+    Ok(())
+}
+
+fn launch_recovery_message(error: Option<&CliError>) -> String {
+    let label = match error {
+        Some(CliError::Tui(bcode_tui::TuiError::PluginService { code, .. })) => match code.as_str()
+        {
+            "daemon_start_timeout" => {
+                Some("Local server startup timed out (daemon_start_timeout).")
+            }
+            "daemon_start_exited" => {
+                Some("Local server exited before becoming ready (daemon_start_exited).")
+            }
+            "daemon_start_health_check" => {
+                Some("Local server readiness health check failed (daemon_start_health_check).")
+            }
+            "daemon_start_endpoint_occupied" => {
+                Some("Local server endpoint is occupied (daemon_start_endpoint_occupied).")
+            }
+            "daemon_start_coordination_timeout" => Some(
+                "Local server startup coordination timed out (daemon_start_coordination_timeout).",
+            ),
+            "daemon_start_incompatible" => Some(
+                "Local server identity or compatibility check failed (daemon_start_incompatible).",
+            ),
+            "daemon_start_connection" => {
+                Some("Local server connection could not be established (daemon_start_connection).")
+            }
+            "daemon_start_failed" => {
+                Some("Local server could not be started (daemon_start_failed).")
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let guidance = "Setup or launch could not complete. If session creation was interrupted, a session may already exist; inspect Sessions before starting another. Back or Close leaves onboarding without retrying. Existing configuration was not replaced.";
+    label.map_or_else(
+        || guidance.to_owned(),
+        |label| format!("{label}\n\n{guidance}"),
+    )
+}
+
+fn recover_launch_input(input: &mut bcode_tui::QuickOnboardingInput) {
+    input.choices.clear();
+    input.recovery = Some(launch_recovery_message(None));
 }
 
 async fn launch_selected(
+    shell: &mut bcode_tui::TerminalShell,
     index: usize,
     state_valid: bool,
     route: StartupRoute,
@@ -122,7 +238,8 @@ async fn launch_selected(
         },
     )
     .map_err(|message| CliError::InvalidArguments(message.to_owned()))?;
-    Box::pin(super::run_new_session_tui(
+    Box::pin(super::run_new_session_tui_in_shell(
+        shell,
         None,
         bcode_tui::TuiLaunchOptions::default(),
     ))
@@ -131,9 +248,9 @@ async fn launch_selected(
 }
 
 async fn launch_connected(
-    config: &BcodeConfig,
-    provider_id: String,
-    profile: String,
+    shell: &mut bcode_tui::TerminalShell,
+    mut provider_id: String,
+    mut profile: String,
     explicit_selection: bool,
     state_valid: bool,
     no_discovery: bool,
@@ -141,92 +258,94 @@ async fn launch_connected(
     if !state_valid {
         return Err(CliError::InvalidArguments("Connection enrolled, but remembered startup state requires explicit maintenance before selecting it".to_owned()));
     }
-    let mut host = load_cli_plugin_host()?;
-    register_enabled(&host)?;
-    if explicit_selection {
-        let repaired = bcode_config::load_config()?;
-        local_readiness(&repaired, &host).map_err(|_| CliError::InvalidArguments("Connection enrolled, but the explicit model/account selection still needs repair. Use Advanced settings; it was not replaced.".to_owned()))?;
+    loop {
+        let config = bcode_config::load_config()?;
+        let mut host = load_cli_plugin_host()?;
+        register_enabled(&host)?;
+        if explicit_selection {
+            let repaired = bcode_config::load_config()?;
+            local_readiness(&repaired, &host).map_err(|_| CliError::InvalidArguments("Connection enrolled, but the explicit model/account selection still needs repair. Use Advanced settings; it was not replaced.".to_owned()))?;
+            host.deactivate_all()?;
+            Box::pin(super::run_new_session_tui_in_shell(
+                shell,
+                None,
+                bcode_tui::TuiLaunchOptions::default(),
+            ))
+            .await?;
+            return Ok(());
+        }
+        let provider = super::registered_auth_provider(&host, &provider_id)?;
+        let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
+        let resolved = bcode_provider_auth::resolve_auth_provider_profile(
+            &config,
+            &provider_id,
+            &provider.plugin_id,
+            Some(&profile),
+            &runtime,
+        )
+        .map_err(|_| {
+            CliError::InvalidArguments("Enrolled account metadata could not be resolved".to_owned())
+        })?;
+        let method = super::resolved_auth_method(&provider, &resolved)?;
+        let selections = model_choices(
+            &host,
+            &config,
+            &provider_id,
+            method.method_id(),
+            Some(profile.clone()),
+            None,
+        );
+        if selections.is_empty() {
+            host.deactivate_all()?;
+            Box::pin(super::handle_onboard_command_in_shell(
+                shell,
+                &super::OnboardOptions {
+                    provider: Some(provider_id),
+                    no_credential_discovery: no_discovery,
+                    experience_mode: super::OnboardExperienceMode::ControlCenter,
+                    ..super::OnboardOptions::default()
+                },
+            ))
+            .await?;
+            return Ok(());
+        }
         host.deactivate_all()?;
-        Box::pin(super::run_new_session_tui(
+        let outcome = Box::pin(bcode_tui::run_quick_onboarding_in_shell(
+            shell,
+            enrolled_input(&provider.contribution.display_name, &selections),
+        ))
+        .await?;
+        match outcome {
+            bcode_tui::QuickOnboardingOutcome::Advanced => {
+                return Box::pin(advanced_in_shell(shell, no_discovery)).await;
+            }
+            bcode_tui::QuickOnboardingOutcome::Connected {
+                provider_id: next_provider,
+                profile: next_profile,
+            } => {
+                provider_id = next_provider;
+                profile = next_profile;
+                continue;
+            }
+            _ => {}
+        }
+        if !consent_enrolled_selection(&outcome, &selections, |selection| {
+            bcode_config::startup::save(selection)
+                .map(|_| ())
+                .map_err(|_| "Startup selection could not be saved; existing state was preserved")
+        })
+        .map_err(|message| CliError::InvalidArguments(message.to_owned()))?
+        {
+            return Ok(());
+        }
+        Box::pin(super::run_new_session_tui_in_shell(
+            shell,
             None,
             bcode_tui::TuiLaunchOptions::default(),
         ))
         .await?;
         return Ok(());
     }
-    let provider = super::registered_auth_provider(&host, &provider_id)?;
-    let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
-    let resolved = bcode_provider_auth::resolve_auth_provider_profile(
-        config,
-        &provider_id,
-        &provider.plugin_id,
-        Some(&profile),
-        &runtime,
-    )
-    .map_err(|_| {
-        CliError::InvalidArguments("Enrolled account metadata could not be resolved".to_owned())
-    })?;
-    let method = super::resolved_auth_method(&provider, &resolved)?;
-    let selections = model_choices(
-        &host,
-        config,
-        &provider_id,
-        method.method_id(),
-        Some(profile),
-        None,
-    );
-    if selections.is_empty() {
-        host.deactivate_all()?;
-        Box::pin(super::handle_onboard_command(&super::OnboardOptions {
-            provider: Some(provider_id),
-            no_credential_discovery: no_discovery,
-            experience_mode: super::OnboardExperienceMode::ControlCenter,
-            ..super::OnboardOptions::default()
-        }))
-        .await?;
-        return Ok(());
-    }
-    host.deactivate_all()?;
-    let outcome = Box::pin(bcode_tui::run_quick_onboarding(enrolled_input(
-        &provider.contribution.display_name,
-        &selections,
-    )))
-    .await?;
-    match outcome {
-        bcode_tui::QuickOnboardingOutcome::Advanced => {
-            return Box::pin(advanced(no_discovery)).await;
-        }
-        bcode_tui::QuickOnboardingOutcome::Connected {
-            provider_id,
-            profile,
-        } => {
-            return Box::pin(launch_connected(
-                config,
-                provider_id,
-                profile,
-                false,
-                state_valid,
-                no_discovery,
-            ))
-            .await;
-        }
-        _ => {}
-    }
-    if !consent_enrolled_selection(&outcome, &selections, |selection| {
-        bcode_config::startup::save(selection)
-            .map(|_| ())
-            .map_err(|_| "Startup selection could not be saved; existing state was preserved")
-    })
-    .map_err(|message| CliError::InvalidArguments(message.to_owned()))?
-    {
-        return Ok(());
-    }
-    Box::pin(super::run_new_session_tui(
-        None,
-        bcode_tui::TuiLaunchOptions::default(),
-    ))
-    .await?;
-    Ok(())
 }
 
 fn enrolled_input(
@@ -790,6 +909,85 @@ mod tests {
     }
 
     use super::{BcodeConfig, interactive_startup};
+
+    #[test]
+    fn daemon_recovery_labels_only_whitelisted_codes_and_never_messages() {
+        for (code, label) in [
+            ("daemon_start_timeout", "startup timed out"),
+            ("daemon_start_exited", "exited before becoming ready"),
+            ("daemon_start_health_check", "health check failed"),
+            ("daemon_start_endpoint_occupied", "endpoint is occupied"),
+            (
+                "daemon_start_coordination_timeout",
+                "coordination timed out",
+            ),
+            ("daemon_start_incompatible", "compatibility check failed"),
+            (
+                "daemon_start_connection",
+                "connection could not be established",
+            ),
+            ("daemon_start_failed", "could not be started"),
+        ] {
+            let error = super::CliError::Tui(bcode_tui::TuiError::PluginService {
+                code: code.to_owned(),
+                message: "secret-bearing-arbitrary-provider-message".to_owned(),
+            });
+            let message = super::launch_recovery_message(Some(&error));
+            assert!(message.contains(label));
+            assert!(message.contains(code));
+            assert!(!message.contains("secret-bearing"));
+            assert!(message.contains("without retrying"));
+        }
+        let generic = super::launch_recovery_message(None);
+        for error in [
+            super::CliError::Tui(bcode_tui::TuiError::PluginService {
+                code: "daemon_start_future_secret-code".to_owned(),
+                message: "daemon_start_timeout secret-bearing-message".to_owned(),
+            }),
+            super::CliError::InvalidArguments(
+                "daemon_start_timeout secret-bearing-message".to_owned(),
+            ),
+        ] {
+            assert_eq!(super::launch_recovery_message(Some(&error)), generic);
+        }
+    }
+
+    #[test]
+    fn failed_launch_recovery_removes_stale_choices_and_warns_about_side_effects() {
+        let mut input = bcode_tui::QuickOnboardingInput {
+            choices: vec![bcode_tui::QuickConnectionChoice {
+                label: "Previously offered account".to_owned(),
+                detail: "Local readiness only".to_owned(),
+            }],
+            recovery: None,
+        };
+        super::recover_launch_input(&mut input);
+        assert!(input.choices.is_empty());
+        let recovery = input.recovery.unwrap();
+        assert!(recovery.contains("a session may already exist"));
+        assert!(recovery.contains("inspect Sessions"));
+    }
+
+    #[test]
+    fn enrolled_navigation_never_saves_a_model_without_confirmation() {
+        for outcome in [
+            bcode_tui::QuickOnboardingOutcome::Close,
+            bcode_tui::QuickOnboardingOutcome::Advanced,
+            bcode_tui::QuickOnboardingOutcome::Connected {
+                provider_id: "test-provider".to_owned(),
+                profile: "new-account".to_owned(),
+            },
+        ] {
+            let mut saves = 0;
+            let confirmed = super::consent_enrolled_selection(&outcome, &[], |_| {
+                saves += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert!(!confirmed);
+            assert_eq!(saves, 0);
+        }
+    }
 
     fn choices() -> Vec<(
         bcode_config::startup::StartupSelection,

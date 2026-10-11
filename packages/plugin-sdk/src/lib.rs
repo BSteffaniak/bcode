@@ -2512,12 +2512,20 @@ pub type StaticCliFuture =
 /// Rust-native CLI contribution from a statically linked plugin.
 ///
 /// This API deliberately uses Clap directly. It is not part of the dynamic-library ABI.
+/// Hosts and static plugins compile against the same SDK contract; changes to these
+/// Rust function signatures require rebuilding both, not a dynamic ABI version change.
 #[derive(Clone, Copy)]
 pub struct StaticCliRegistration {
     /// Build the plugin-owned top-level command.
     pub command: fn() -> clap::Command,
-    /// Whether the host must ensure its daemon is available before invocation.
-    pub requires_daemon: bool,
+    /// Classify whether the host must ensure its daemon before this invocation.
+    ///
+    /// Receives the plugin's top-level command matches, not the composed root matches.
+    /// This must be a side-effect-free classification of parsed arguments: it must not
+    /// connect to a daemon, read credentials, or execute the command. Returning false
+    /// defers daemon startup; it does not grant execution authority or promise that a
+    /// returned host action will never need a daemon later.
+    pub requires_daemon: fn(&clap::ArgMatches) -> bool,
     /// Invoke the plugin command using matches from the composed root parser.
     pub invoke: fn(clap::ArgMatches) -> StaticCliFuture,
 }

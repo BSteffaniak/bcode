@@ -4,6 +4,9 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod terminal_shell;
+pub use terminal_shell::{TerminalRecoveryAction, TerminalShell};
+
 pub(crate) mod activity;
 pub(crate) mod app;
 pub(crate) mod artifact_stream;
@@ -50,6 +53,7 @@ pub mod onboarding;
 mod quick_onboarding;
 pub use quick_onboarding::{
     QuickConnectionChoice, QuickOnboardingInput, QuickOnboardingOutcome, run_quick_onboarding,
+    run_quick_onboarding_in_shell,
 };
 pub(crate) mod composer_interaction;
 pub(crate) mod composer_interaction_render;
@@ -266,6 +270,16 @@ pub async fn run_onboarding_with_discovery_policy(allow_discovery: bool) -> Resu
 pub async fn run_setup_screen(
     allow_discovery: bool,
 ) -> Result<bcode_settings::SetupContinuation, TuiError> {
+    let mut shell = TerminalShell::enter()?;
+    let result = shell.run_setup(allow_discovery).await;
+    shell.finish()?;
+    result
+}
+
+async fn run_setup_in_shell(
+    terminal_shell: &mut TerminalShell,
+    allow_discovery: bool,
+) -> Result<bcode_settings::SetupContinuation, TuiError> {
     let store = bcode_settings::SettingsStore::default();
     let config = bcode_config::load_config()?;
     let discovery_enabled = config
@@ -301,25 +315,13 @@ pub async fn run_setup_screen(
     };
     let readiness = bcode_settings::setup_readiness_report(shell.sections(), &recommendations);
     store.save_readiness_report(&readiness, current_time_ms())?;
-    let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
-    let result = {
-        let mut terminal = Terminal::new(
-            guard.writer_mut().ok_or_else(|| {
-                std::io::Error::other("terminal guard writer unavailable after entering terminal")
-            })?,
-            terminal_area()?,
-        );
-        Box::pin(run_onboarding_runtime(
-            &mut terminal,
-            store,
-            shell,
-            &config.tui,
-        ))
-        .await
-    };
-    let _writer = guard.leave()?;
-    result
+    Box::pin(run_onboarding_runtime(
+        &mut terminal_shell.terminal()?,
+        store,
+        shell,
+        &config.tui,
+    ))
+    .await
 }
 
 async fn run_onboarding_runtime<W: io::Write>(
@@ -337,12 +339,12 @@ async fn run_onboarding_runtime<W: io::Write>(
         presenter,
         bmux_tui_runtime::RuntimeConfig::default(),
     );
-    let input = bmux_tui_runtime::TerminalInput::start::<onboarding_program::OnboardingProgram>(
+    let mut input = bmux_tui_runtime::TerminalInput::start::<onboarding_program::OnboardingProgram>(
         handle,
         onboarding_program::OnboardingMessage::InputFailed,
     );
     let result = Box::pin(runtime.run()).await;
-    input.request_shutdown();
+    input.shutdown().await;
     match result {
         Ok(output) => Ok(output.program.continuation()),
         Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => Err(error),
@@ -469,7 +471,7 @@ pub async fn run_plugin_surface(
         if let Some(target) = options.get("target") {
             return run_code_review(repo, serde_json::from_str(target)?).await;
         }
-        return run_code_review_home(repo).await;
+        return Box::pin(run_code_review_home(repo)).await;
     }
     if surface_kind == "eval-run-picker" {
         return run_eval_viewer_picker(repo).await;
@@ -669,32 +671,9 @@ pub async fn run_with_static_bundled_and_options(
 /// Returns I/O, client, or plugin service errors.
 #[allow(clippy::future_not_send)]
 pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
-    let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
-    let result = {
-        let mut terminal = Terminal::new(
-            guard.writer_mut().ok_or_else(|| {
-                std::io::Error::other("terminal guard writer unavailable after entering terminal")
-            })?,
-            terminal_area()?,
-        );
-        Box::pin(code_review_launcher::run_home(&mut terminal, repo_path)).await
-    };
-
-    match result {
-        Ok(code_review_launcher::ReviewHomeOutcome::OpenWorkspace {
-            workspace,
-            build_mode,
-        }) => {
-            let _writer = guard.leave()?;
-            Box::pin(run_code_review_workspace(workspace, build_mode)).await
-        }
-        Ok(code_review_launcher::ReviewHomeOutcome::Exit) => {
-            let _writer = guard.leave()?;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    let mut shell = TerminalShell::enter()?;
+    Box::pin(shell.run_review_home(repo_path)).await?;
+    shell.finish()
 }
 
 /// Run the full-screen local code review interface for an existing workspace.
@@ -707,34 +686,9 @@ pub async fn run_code_review_workspace(
     workspace: bcode_code_review_models::ReviewWorkspace,
     build_mode: bool,
 ) -> Result<(), TuiError> {
-    let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
-    let result = {
-        let mut terminal = Terminal::new(
-            guard.writer_mut().ok_or_else(|| {
-                std::io::Error::other("terminal guard writer unavailable after entering terminal")
-            })?,
-            terminal_area()?,
-        );
-        Box::pin(code_review_launcher::run_workspace(
-            &mut terminal,
-            workspace,
-            build_mode,
-        ))
-        .await
-    };
-
-    match result {
-        Ok(session_id) => {
-            let _writer = guard.leave()?;
-            if let Some(session_id) = session_id {
-                Box::pin(run(Some(session_id), build_info())).await
-            } else {
-                Ok(())
-            }
-        }
-        Err(error) => Err(error),
-    }
+    let mut shell = TerminalShell::enter()?;
+    Box::pin(shell.run_review_workspace(workspace, build_mode)).await?;
+    shell.finish()
 }
 
 /// Run the full-screen local code review interface.
@@ -747,29 +701,9 @@ pub async fn run_code_review(
     repo_path: std::path::PathBuf,
     target: bcode_code_review_models::ReviewTarget,
 ) -> Result<(), TuiError> {
-    let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
-    let result = {
-        let mut terminal = Terminal::new(
-            guard.writer_mut().ok_or_else(|| {
-                std::io::Error::other("terminal guard writer unavailable after entering terminal")
-            })?,
-            terminal_area()?,
-        );
-        Box::pin(code_review_launcher::run(&mut terminal, repo_path, target)).await
-    };
-
-    match result {
-        Ok(session_id) => {
-            let _writer = guard.leave()?;
-            if let Some(session_id) = session_id {
-                Box::pin(run(Some(session_id), build_info())).await
-            } else {
-                Ok(())
-            }
-        }
-        Err(error) => Err(error),
-    }
+    let mut shell = TerminalShell::enter()?;
+    shell.run_review(repo_path, target).await?;
+    shell.finish()
 }
 
 /// Run the eval run picker TUI.

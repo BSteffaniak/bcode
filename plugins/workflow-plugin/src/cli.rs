@@ -156,7 +156,7 @@ fn load_workflow_source(
 
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: true,
+        requires_daemon: |_| true,
         command: WorkflowCli::command,
         invoke,
     }

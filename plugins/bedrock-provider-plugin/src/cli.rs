@@ -40,7 +40,7 @@ enum ConfigureCommand {
 
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: false,
+        requires_daemon: |_| false,
         command: ProviderCli::command,
         invoke,
     }

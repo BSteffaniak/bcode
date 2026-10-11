@@ -156,10 +156,19 @@ composition, navigation, and all other product semantics. BMUX runtime types do 
 frontend or plugin contracts.
 
 Chat, pickers, dialogs, palettes, Ralph flows, and plugin surfaces are serialized by that root
-program. Standalone onboarding is a separate product entry point, but it uses the same BMUX managed
-input/runtime/presenter boundary rather than a handwritten input or draw loop. Terminal drawing is
-confined to the chat and onboarding presenters. Plugin-owned surfaces retain generic structured
-fallbacks when rich adapters are unavailable or disabled.
+program. `TerminalShell` retains one terminal guard across onboarding, local initialization,
+review surfaces, and chat transitions; standalone wrappers enter their own shell only at an
+independent product entry point. Plugin CLI contributions classify daemon requirements from
+parsed command arguments, so a surface-only command can defer initialization until the shell
+owns the terminal. Local preparation displays progress while terminal/app construction remains
+foreground. An exit requested during an already admitted initialization waits for settlement;
+ambiguous failures offer navigation/close, never automatic mutation replay.
+
+Mounted plugin surfaces drain async effects through the generic host, with exclusive access to
+surface state until completion. Completion restores foreground polling and navigation; borrowed
+chat returns to its retained surface only on explicit navigation or attach failure, not merely on
+successful attachment. Plugin-owned surfaces retain generic structured fallbacks when rich
+adapters are unavailable or disabled.
 
 Reliable session and terminal updates use bounded admission. Request-draft paint handoff, hit maps,
 cursor state, and image-scene ordering remain Bcode-owned and are acknowledged only after successful

@@ -7699,19 +7699,31 @@ impl BcodeClient {
         &self,
         provider_plugin_id: Option<String>,
     ) -> Result<bcode_model::ValidateConfigResponse, ClientError> {
+        // Configuration/auth resolution already owns this context. Do not reload config,
+        // reconstruct provider settings, or substitute daemon credentials here.
+        let request = bcode_model::ValidateConfigRequest {
+            provider_context: self
+                .runtime_context
+                .as_ref()
+                .map_or_else(Default::default, |context| context.provider_context.clone()),
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&request).map_err(|_| {
+            ClientError::Protocol("Provider validation request could not be encoded.".to_owned())
+        })?;
         let response = if let Some(provider) = provider_plugin_id {
             self.invoke_plugin_service(
                 provider,
                 bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_owned(),
                 bcode_model::OP_VALIDATE_CONFIG.to_owned(),
-                Vec::new(),
+                payload,
             )
             .await?
         } else {
             self.call_plugin_service(
                 bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_owned(),
                 bcode_model::OP_VALIDATE_CONFIG.to_owned(),
-                Vec::new(),
+                payload,
             )
             .await?
         };
@@ -9406,6 +9418,104 @@ mod client_timeout_tests {
             ),
             state_location_id: Some(bcode_ipc::state_location_id()),
             ..bcode_ipc::DaemonStatus::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_validation_transmits_normalized_payload_on_both_dispatch_paths() {
+        use super::{
+            ClientRuntimeContext, PluginServiceResponse, Request, Response, ResponsePayload,
+        };
+        use std::collections::BTreeMap;
+
+        let context = ClientRuntimeContext {
+            selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            provider_context: bcode_model::ProviderRequestContext {
+                auth_profile: Some("fixture-account".to_owned()),
+                settings: BTreeMap::from([("fixture".to_owned(), "advanced-chat".to_owned())]),
+                env: BTreeMap::from([(
+                    "FIXTURE_TOKEN".to_owned(),
+                    "synthetic-test-token".to_owned(),
+                )]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for provider in [Some("bcode.fake-provider".to_owned()), None] {
+            let directory =
+                std::path::PathBuf::from(format!("/tmp/bcv-{}", SessionOpenOperationId::new()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("validation.sock"));
+            let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+            let expected_provider = provider.clone();
+            let expected_context = context.provider_context.clone();
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let response = Response::Ok(ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion(
+                        bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                    ),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: matching_daemon_status(),
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                let envelope = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let (interface_id, operation, payload) =
+                    match bcode_ipc::decode_request(&envelope.payload).unwrap() {
+                        Request::InvokePluginService {
+                            plugin_id,
+                            interface_id,
+                            operation,
+                            payload,
+                        } => {
+                            assert_eq!(Some(plugin_id), expected_provider);
+                            (interface_id, operation, payload)
+                        }
+                        Request::CallPluginService {
+                            interface_id,
+                            operation,
+                            payload,
+                        } => {
+                            assert!(expected_provider.is_none());
+                            (interface_id, operation, payload)
+                        }
+                        other => panic!("unexpected request: {other:?}"),
+                    };
+                assert_eq!(interface_id, bcode_model::MODEL_PROVIDER_INTERFACE_ID);
+                assert_eq!(operation, bcode_model::OP_VALIDATE_CONFIG);
+                let request: bcode_model::ValidateConfigRequest =
+                    serde_json::from_slice(&payload).unwrap();
+                assert_eq!(request.provider_context, expected_context);
+                assert!(request.config.is_empty());
+                assert!(request.profile.is_none());
+                let response = Response::Ok(ResponsePayload::PluginServiceResult {
+                    response: PluginServiceResponse {
+                        payload: br#"{"valid":true}"#.to_vec(),
+                        error: None,
+                    },
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(envelope.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+            });
+            let validation = BcodeClient::new(endpoint)
+                .with_runtime_context(Some(context.clone()))
+                .validate_model_config(provider)
+                .await
+                .unwrap();
+            assert!(validation.valid);
+            server.await.unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 

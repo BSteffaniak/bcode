@@ -38,7 +38,7 @@ struct MetricsCli {
 
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: true,
+        requires_daemon: |_| true,
         command: MetricsCli::command,
         invoke,
     }

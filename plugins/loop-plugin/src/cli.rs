@@ -82,7 +82,7 @@ impl GoalCli {
 
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: true,
+        requires_daemon: |_| true,
         command: GoalCli::command,
         invoke,
     }

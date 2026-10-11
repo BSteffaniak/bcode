@@ -447,39 +447,42 @@ impl<W: Write> Presenter<QuickProgram> for QuickPresenter<'_, '_, W> {
 pub async fn run_quick_onboarding(
     input: QuickOnboardingInput,
 ) -> Result<QuickOnboardingOutcome, TuiError> {
+    let mut shell = crate::TerminalShell::enter()?;
+    let result = run_quick_onboarding_in_shell(&mut shell, input).await;
+    shell.finish()?;
+    result
+}
+
+/// Present startup choices while retaining the caller's terminal ownership.
+/// The input reader is fully stopped before another screen can borrow the shell.
+///
+/// # Errors
+/// Returns configuration, program, or terminal errors without closing the shell.
+pub async fn run_quick_onboarding_in_shell(
+    shell: &mut crate::TerminalShell,
+    input: QuickOnboardingInput,
+) -> Result<QuickOnboardingOutcome, TuiError> {
     let config = bcode_config::load_config()?;
     let theme = crate::theme::resolve_configured_theme(&config.tui, std::path::Path::new("."));
     let mut program = QuickProgram::new(input, &theme);
     program.keymap = crate::keymap::BmuxKeyMap::from_config(&config.tui);
-    let mut guard = crate::CrosstermTerminalGuard::enter(io::stdout())?;
-    let result = {
-        let mut terminal = Terminal::new(
-            guard
-                .writer_mut()
-                .ok_or_else(|| io::Error::other("terminal writer unavailable"))?,
-            crate::terminal_area()?,
-        );
-        let (runtime, handle) = bmux_tui_runtime::Runtime::new(
-            program,
-            QuickPresenter {
-                terminal: &mut terminal,
-            },
-            bmux_tui_runtime::RuntimeConfig::default(),
-        );
-        let input = bmux_tui_runtime::TerminalInput::start::<QuickProgram>(
-            handle,
-            QuickMessage::InputFailed,
-        );
-        let result = Box::pin(runtime.run()).await;
-        input.request_shutdown();
-        match result {
-            Ok(output) => Ok(output.program.outcome),
-            Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => Err(error),
-            Err(bmux_tui_runtime::RuntimeError::Presenter { error, .. }) => Err(error.into()),
-        }
-    };
-    let _writer = guard.leave()?;
-    result
+    let mut terminal = shell.terminal()?;
+    let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+        program,
+        QuickPresenter {
+            terminal: &mut terminal,
+        },
+        bmux_tui_runtime::RuntimeConfig::default(),
+    );
+    let mut input =
+        bmux_tui_runtime::TerminalInput::start::<QuickProgram>(handle, QuickMessage::InputFailed);
+    let result = Box::pin(runtime.run()).await;
+    input.shutdown().await;
+    match result {
+        Ok(output) => Ok(output.program.outcome),
+        Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => Err(error),
+        Err(bmux_tui_runtime::RuntimeError::Presenter { error, .. }) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]

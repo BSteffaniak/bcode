@@ -37,29 +37,145 @@ pub async fn run_home<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
 ) -> Result<ReviewHomeOutcome, TuiError> {
-    let runtime = load_code_review_tui_runtime()?;
-    let surface = crate::plugin_tui::open_plugin_tui_surface(
-        &runtime,
-        CODE_REVIEW_PLUGIN_ID,
-        "code-review-home",
-        bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
-            instance_id: "code-review-home".to_string(),
-            repo_path: Some(repo_path),
-            session_id: None,
-            target: None,
-            options: serde_json::Value::Null,
-        },
+    let prepared = prepare_home(repo_path).await?;
+    Box::pin(run_prepared_home(terminal, prepared)).await
+}
+
+/// An opened plugin surface and the runtime that must outlive its interactive execution.
+/// Preparation owns no terminal or input reader and must be drained if exit is requested.
+pub struct PreparedReviewSurface {
+    runtime: bcode_plugin::PluginRuntimeHost,
+    surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    presentation: crate::runtime::PreparedPresentation,
+}
+
+/// Load and open review home without taking terminal/input ownership.
+///
+/// # Errors
+/// Returns plugin load, worker, or surface-open errors.
+pub async fn prepare_home(repo_path: PathBuf) -> Result<PreparedReviewSurface, TuiError> {
+    prepare_surface("code-review-home", repo_path, serde_json::Value::Null).await
+}
+
+/// Load and open a review workspace without taking terminal/input ownership.
+///
+/// # Errors
+/// Returns plugin load, worker, or surface-open errors.
+pub async fn prepare_workspace(
+    workspace: ReviewWorkspace,
+    build_mode: bool,
+) -> Result<PreparedReviewSurface, TuiError> {
+    let target = target_from_workspace(&workspace);
+    prepare_surface(
+        "code-review",
+        workspace.repo_root.clone(),
+        serde_json::json!({
+            "build_mode": build_mode, "workspace": workspace, "target": target,
+        }),
     )
     .await
-    .map_err(|error| map_surface_open_error(&error))?;
-    let outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
+}
+
+/// Load and open a review target without taking terminal/input ownership.
+///
+/// # Errors
+/// Returns plugin load, worker, or surface-open errors.
+pub async fn prepare_review(
+    repo_path: PathBuf,
+    target: ReviewTarget,
+) -> Result<PreparedReviewSurface, TuiError> {
+    prepare_surface(
+        "code-review",
+        repo_path,
+        serde_json::json!({
+            "build_mode": false, "workspace": null, "target": target,
+        }),
+    )
+    .await
+}
+
+async fn prepare_surface(
+    kind: &'static str,
+    repo_path: PathBuf,
+    options: serde_json::Value,
+) -> Result<PreparedReviewSurface, TuiError> {
+    let handle = tokio::runtime::Handle::current();
+    let (runtime, surface) = tokio::task::spawn_blocking(move || {
+        let runtime = load_code_review_tui_runtime()?;
+        // Plugin factories may perform synchronous native initialization before yielding.
+        // Keep that preparation off the terminal scheduler; retain and drain its result.
+        let surface = handle
+            .block_on(crate::plugin_tui::open_plugin_tui_surface(
+                &runtime,
+                CODE_REVIEW_PLUGIN_ID,
+                kind,
+                bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
+                    instance_id: kind.to_owned(),
+                    repo_path: Some(repo_path),
+                    session_id: None,
+                    target: None,
+                    options,
+                },
+            ))
+            .map_err(|error| map_surface_open_error(&error))?;
+        Ok::<_, TuiError>((runtime, surface))
+    })
+    .await??;
+    let presentation =
+        crate::runtime::prepare_presentation(&crate::static_bundled_plugins()).await?;
+    Ok(PreparedReviewSurface {
+        runtime,
+        surface,
+        presentation,
+    })
+}
+
+/// Run an already-opened review home after preparation input is fully stopped.
+///
+/// # Errors
+/// Returns interactive runtime errors.
+#[allow(clippy::future_not_send)]
+pub async fn run_prepared_home<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    prepared: PreparedReviewSurface,
+) -> Result<ReviewHomeOutcome, TuiError> {
+    Ok(parse_review_home_outcome(
+        run_prepared_surface(terminal, prepared).await?,
+    ))
+}
+
+/// Run an already-opened review workspace/target after preparation input is fully stopped.
+///
+/// # Errors
+/// Returns interactive runtime errors.
+#[allow(clippy::future_not_send)]
+pub async fn run_prepared_review<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    prepared: PreparedReviewSurface,
+) -> Result<Option<SessionId>, TuiError> {
+    run_prepared_surface(terminal, prepared).await?;
+    Ok(None)
+}
+
+#[allow(clippy::future_not_send)]
+async fn run_prepared_surface<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    prepared: PreparedReviewSurface,
+) -> Result<Option<serde_json::Value>, TuiError> {
+    let PreparedReviewSurface {
+        runtime,
+        surface,
+        presentation,
+    } = prepared;
+    let result = Box::pin(crate::runtime::run_prepared_plugin_surface(
         terminal,
         CODE_REVIEW_PLUGIN_ID,
         surface,
+        presentation,
     ))
     .await;
     drop(runtime);
-    Ok(parse_review_home_outcome(outcome?))
+    result
 }
 
 /// Run a full-screen local Git review from a durable workspace.
@@ -73,68 +189,22 @@ pub async fn run_workspace<W: Write>(
     workspace: ReviewWorkspace,
     build_mode: bool,
 ) -> Result<Option<SessionId>, TuiError> {
-    let target = target_from_workspace(&workspace);
-    Box::pin(run_with_workspace(
-        terminal,
-        workspace.repo_root.clone(),
-        target,
-        Some(workspace),
-        build_mode,
-    ))
-    .await
+    let prepared = prepare_workspace(workspace, build_mode).await?;
+    Box::pin(run_prepared_review(terminal, prepared)).await
 }
 
-/// Run a full-screen local Git review.
+/// Run a full-screen local Git review from a target.
 ///
 /// # Errors
-///
-/// Returns an error when the code review plugin cannot be loaded/opened or terminal I/O fails.
+/// Returns plugin preparation or interactive runtime errors.
 #[allow(clippy::future_not_send)]
 pub async fn run<W: Write>(
     terminal: &mut Terminal<&mut W>,
     repo_path: PathBuf,
     target: ReviewTarget,
 ) -> Result<Option<SessionId>, TuiError> {
-    Box::pin(run_with_workspace(terminal, repo_path, target, None, false)).await
-}
-
-#[allow(clippy::future_not_send)]
-async fn run_with_workspace<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    repo_path: PathBuf,
-    target: ReviewTarget,
-    workspace: Option<ReviewWorkspace>,
-    build_mode: bool,
-) -> Result<Option<SessionId>, TuiError> {
-    let options = serde_json::json!({
-        "build_mode": build_mode,
-        "workspace": workspace,
-        "target": target,
-    });
-    let runtime = load_code_review_tui_runtime()?;
-    let surface = crate::plugin_tui::open_plugin_tui_surface(
-        &runtime,
-        CODE_REVIEW_PLUGIN_ID,
-        "code-review",
-        bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
-            instance_id: "code-review".to_string(),
-            repo_path: Some(repo_path),
-            session_id: None,
-            target: None,
-            options,
-        },
-    )
-    .await
-    .map_err(|error| map_surface_open_error(&error))?;
-    let outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
-        terminal,
-        CODE_REVIEW_PLUGIN_ID,
-        surface,
-    ))
-    .await;
-    drop(runtime);
-    outcome?;
-    Ok(None)
+    let prepared = prepare_review(repo_path, target).await?;
+    Box::pin(run_prepared_review(terminal, prepared)).await
 }
 
 fn load_code_review_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {

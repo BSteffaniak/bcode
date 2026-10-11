@@ -71,7 +71,7 @@ fn parse_model(value: &str) -> Result<UsageModel, String> {
 
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: true,
+        requires_daemon: |_| true,
         command: UsageCli::command,
         invoke,
     }

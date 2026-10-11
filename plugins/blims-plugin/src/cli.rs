@@ -54,7 +54,7 @@ enum CliError {
 
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: true,
+        requires_daemon: |_| true,
         command: BlimsCli::command,
         invoke,
     }
@@ -62,11 +62,15 @@ pub fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = BlimsCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+        let native_ui = matches!(cli.command, BlimsCommand::Enter);
         match handle_blims_command(cli.command).await {
             Ok(outcome) => Ok(outcome),
             Err(CliError::AttachSession(session_id)) => Ok(StaticCliOutcome {
                 host_action: Some(StaticCliHostAction::AttachSession { session_id }),
             }),
+            Err(_) if native_ui => Err(
+                "Blims could not continue. Check the terminal and service connection; inspect pending work before restarting.".into(),
+            ),
             Err(error) => Err(error.to_string()),
         }
     })
@@ -1016,7 +1020,33 @@ async fn enter_blims_office() -> Result<(), CliError> {
     Box::pin(run_blims_tui()).await
 }
 
+// Bind connection policy to the native journey, not to shared domain actions
+// or process-global state. Spawned native jobs explicitly retain this client;
+// standalone CLI adapters continue to use their normal startup policy.
+tokio::task_local! {
+    static BLIMS_NATIVE_CLIENT: BcodeClient;
+}
+
+fn blims_client() -> BcodeClient {
+    BLIMS_NATIVE_CLIENT
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| BcodeClient::default_endpoint())
+}
+
+fn native_blims_client(client: BcodeClient) -> BcodeClient {
+    client.with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning)
+}
+
 async fn run_blims_tui() -> Result<(), CliError> {
+    BLIMS_NATIVE_CLIENT
+        .scope(
+            native_blims_client(BcodeClient::default_endpoint()),
+            run_blims_tui_inner(),
+        )
+        .await
+}
+
+async fn run_blims_tui_inner() -> Result<(), CliError> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(CliError::Blims(
             "`bcode blims enter` needs an interactive terminal; stdout/stdin is not a TTY"
@@ -1185,7 +1215,109 @@ fn blims_poll_event(timeout: Duration) -> Result<Option<Event>, CliError> {
     Ok(event_from_crossterm(crossterm::event::read()?))
 }
 
+#[derive(Debug, Default)]
+struct BlimsServiceRecovery {
+    mutations_paused: bool,
+}
+
+impl BlimsServiceRecovery {
+    fn blocks(&self, action: Option<&str>) -> bool {
+        self.mutations_paused && blims_action_may_mutate(action)
+    }
+
+    fn finish_action(
+        &mut self,
+        mode: &mut BlimsTuiMode,
+        status: &mut String,
+        may_mutate: bool,
+        result: Result<bool, CliError>,
+    ) -> Result<bool, CliError> {
+        match result {
+            Ok(quit) => {
+                if self.mutations_paused && !quit {
+                    self.show_notice(mode, status);
+                }
+                Ok(quit)
+            }
+            Err(error @ (CliError::Io(_) | CliError::AttachSession(_))) => Err(error),
+            Err(_) => {
+                self.fail(mode, status, may_mutate);
+                Ok(false)
+            }
+        }
+    }
+
+    fn fail(&mut self, mode: &mut BlimsTuiMode, status: &mut String, may_mutate: bool) {
+        self.mutations_paused |= may_mutate;
+        self.show_notice(mode, status);
+    }
+
+    fn show_notice(&self, mode: &mut BlimsTuiMode, status: &mut String) {
+        // Never display service/provider error payloads. A failed mutation may
+        // already have committed, so inspection cannot silently authorize retry.
+        let message = if self.mutations_paused {
+            "Outcome unknown; changes paused. Use Back to inspect pending work before restarting."
+        } else {
+            "Service unavailable. Check connection; use Refresh to retry or Back to return."
+        };
+        message.clone_into(status);
+        match mode {
+            BlimsTuiMode::Conversation(conversation) => {
+                message.clone_into(&mut conversation.status)
+            }
+            BlimsTuiMode::Dashboard(dashboard) => message.clone_into(&mut dashboard.status),
+            BlimsTuiMode::Office => {}
+        }
+    }
+}
+
+fn blims_action_may_mutate(action: Option<&str>) -> bool {
+    matches!(
+        action,
+        Some(
+            "blims.office.act"
+                | "blims.office.refresh"
+                | "blims.office.talk"
+                | "blims.office.room-previous"
+                | "blims.office.room-next"
+                | "blims.picker.select"
+                | "blims.conversation.send"
+                | "blims.dashboard.approve"
+                | "blims.dashboard.reject"
+                | "blims.dashboard.defer"
+        )
+    )
+}
+
 async fn handle_blims_tui_event(app: &mut BlimsTuiApp, event: Event) -> Result<bool, CliError> {
+    let action = if let Event::Key(stroke) = &event {
+        let scope = match app.mode {
+            BlimsTuiMode::Conversation(_) => "blims.conversation",
+            BlimsTuiMode::Dashboard(_) => "blims.dashboard",
+            BlimsTuiMode::Office if app.show_world_picker => "blims.picker",
+            BlimsTuiMode::Office => "blims.office",
+        };
+        app.keymap.action_for_key(scope, *stroke).map(str::to_owned)
+    } else {
+        None
+    };
+    if app.recovery.blocks(action.as_deref()) {
+        app.recovery.show_notice(&mut app.mode, &mut app.status);
+        return Ok(false);
+    }
+    let result = handle_blims_tui_event_inner(app, event).await;
+    app.recovery.finish_action(
+        &mut app.mode,
+        &mut app.status,
+        blims_action_may_mutate(action.as_deref()),
+        result,
+    )
+}
+
+async fn handle_blims_tui_event_inner(
+    app: &mut BlimsTuiApp,
+    event: Event,
+) -> Result<bool, CliError> {
     match event {
         Event::Resize(_) | Event::Mouse(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {}
         Event::Paste(text) => {
@@ -1267,7 +1399,7 @@ async fn handle_blims_tui_conversation_key(
             if text.is_empty() {
                 conversation.status = "Type a message first.".to_string();
             } else {
-                BcodeClient::default_endpoint()
+                blims_client()
                     .send_user_message(
                         conversation.handle.session,
                         text.clone(),
@@ -1310,14 +1442,17 @@ async fn handle_blims_tui_dashboard_key(
     match action {
         Some("blims.dashboard.close") => {
             app.mode = BlimsTuiMode::Office;
-            app.jobs.dashboard_load = None;
+            // Keep observing an already submitted refresh even after returning
+            // to the office; losing its receiver would hide an ambiguous result.
             app.status = "Returned to office.".to_string();
         }
         Some("blims.dashboard.refresh") => {
             dashboard.status = "Refreshing CEO dashboard…".to_string();
             if app.jobs.dashboard_load.is_none() {
+                let refresh = !app.recovery.mutations_paused;
                 app.jobs.dashboard_load = Some(BlimsBackgroundJob::DashboardLoad(
-                    spawn_blims_background(|| Box::pin(load_ceo_dashboard())),
+                    spawn_blims_background(move || Box::pin(load_ceo_dashboard(refresh))),
+                    refresh,
                 ));
             }
         }
@@ -1427,7 +1562,7 @@ enum BlimsBackgroundJob {
     WorldTick(Receiver<Result<BlimsWorldTickResult, CliError>>),
     PlayerRoomSync(Receiver<Result<BlimsWorldSnapshot, CliError>>),
     WorldTemplateSelect(Receiver<Result<BlimsWorldSelection, CliError>>),
-    DashboardLoad(Receiver<Result<BlimsCeoDashboardState, CliError>>),
+    DashboardLoad(Receiver<Result<BlimsCeoDashboardState, CliError>>, bool),
 }
 
 #[derive(Debug)]
@@ -1471,6 +1606,7 @@ struct BlimsTuiApp {
     last_animation: Instant,
     tick_count: u64,
     jobs: BlimsBackgroundJobs,
+    recovery: BlimsServiceRecovery,
     mode: BlimsTuiMode,
     show_world_picker: bool,
     show_help: bool,
@@ -1511,6 +1647,7 @@ impl BlimsTuiApp {
             last_animation: Instant::now(),
             tick_count: 0,
             jobs: BlimsBackgroundJobs::new(),
+            recovery: BlimsServiceRecovery::default(),
             mode: BlimsTuiMode::Office,
             show_world_picker: false,
             show_help: false,
@@ -1650,8 +1787,10 @@ impl BlimsTuiApp {
         ));
         self.status = "Loading CEO dashboard…".to_string();
         if self.jobs.dashboard_load.is_none() {
+            let refresh = !self.recovery.mutations_paused;
             self.jobs.dashboard_load = Some(BlimsBackgroundJob::DashboardLoad(
-                spawn_blims_background(|| Box::pin(load_ceo_dashboard())),
+                spawn_blims_background(move || Box::pin(load_ceo_dashboard(refresh))),
+                refresh,
             ));
         }
     }
@@ -1727,6 +1866,12 @@ impl BlimsTuiApp {
     }
 
     fn schedule_background_jobs(&mut self) {
+        if self.recovery.mutations_paused {
+            // Do not replay a queued mutation after an ambiguous service failure.
+            self.pending_player_room_sync = None;
+            self.pending_world_template_name = None;
+            return;
+        }
         if self.should_world_tick()
             && self.jobs.world_tick.is_none()
             && self.jobs.dashboard_load.is_none()
@@ -1739,13 +1884,17 @@ impl BlimsTuiApp {
                 move || Box::pin(tick_blims_world_blocking(tick_count)),
             )));
         }
-        if let Some(room_id) = self.pending_player_room_sync.take() {
+        if self.jobs.player_room_sync.is_none()
+            && let Some(room_id) = self.pending_player_room_sync.take()
+        {
             self.jobs.player_room_sync =
                 Some(BlimsBackgroundJob::PlayerRoomSync(spawn_blims_background(
                     move || Box::pin(async move { move_blims_player_blocking(&room_id).await }),
                 )));
         }
-        if let Some(template_id) = self.pending_world_template_name.take() {
+        if self.jobs.world_template_select.is_none()
+            && let Some(template_id) = self.pending_world_template_name.take()
+        {
             self.jobs.world_template_select = Some(BlimsBackgroundJob::WorldTemplateSelect(
                 spawn_blims_background(move || {
                     Box::pin(async move {
@@ -1763,6 +1912,9 @@ impl BlimsTuiApp {
         dirty |= self.poll_player_room_sync_job();
         dirty |= self.poll_world_template_select_job();
         dirty |= self.poll_dashboard_load_job();
+        if self.recovery.mutations_paused && dirty {
+            self.recovery.show_notice(&mut self.mode, &mut self.status);
+        }
         dirty
     }
 
@@ -1789,13 +1941,13 @@ impl BlimsTuiApp {
                     self.jobs.world_tick = None;
                     dirty = true;
                 }
-                Ok(Err(error)) => {
-                    self.status = format!("world tick failed: {error}");
+                Ok(Err(_)) => {
+                    self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.world_tick = None;
                     dirty = true;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.status = "world tick worker disconnected".to_string();
+                    self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.world_tick = None;
                     dirty = true;
                 }
@@ -1814,13 +1966,13 @@ impl BlimsTuiApp {
                     self.jobs.player_room_sync = None;
                     dirty = true;
                 }
-                Ok(Err(error)) => {
-                    self.status = format!("room sync failed: {error}");
+                Ok(Err(_)) => {
+                    self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.player_room_sync = None;
                     dirty = true;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.status = "room sync worker disconnected".to_string();
+                    self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.player_room_sync = None;
                     dirty = true;
                 }
@@ -1849,13 +2001,13 @@ impl BlimsTuiApp {
                     self.last_world_tick = Instant::now();
                     dirty = true;
                 }
-                Ok(Err(error)) => {
-                    self.status = format!("world select failed: {error}");
+                Ok(Err(_)) => {
+                    self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.world_template_select = None;
                     dirty = true;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.status = "world select worker disconnected".to_string();
+                    self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.world_template_select = None;
                     dirty = true;
                 }
@@ -1867,11 +2019,10 @@ impl BlimsTuiApp {
 
     fn poll_dashboard_load_job(&mut self) -> bool {
         let mut dirty = false;
-        if let Some(BlimsBackgroundJob::DashboardLoad(receiver)) = &self.jobs.dashboard_load {
-            if !matches!(self.mode, BlimsTuiMode::Dashboard(_)) {
-                self.jobs.dashboard_load = None;
-                return true;
-            }
+        if let Some(BlimsBackgroundJob::DashboardLoad(receiver, may_mutate)) =
+            &self.jobs.dashboard_load
+        {
+            let may_mutate = *may_mutate;
             match receiver.try_recv() {
                 Ok(Ok(dashboard)) => {
                     if matches!(self.mode, BlimsTuiMode::Dashboard(_)) {
@@ -1881,19 +2032,15 @@ impl BlimsTuiApp {
                     self.jobs.dashboard_load = None;
                     dirty = true;
                 }
-                Ok(Err(error)) => {
-                    if let BlimsTuiMode::Dashboard(dashboard) = &mut self.mode {
-                        dashboard.status = format!("dashboard load failed: {error}");
-                        self.status = format!("dashboard load failed: {error}");
-                    }
+                Ok(Err(_)) => {
+                    self.recovery
+                        .fail(&mut self.mode, &mut self.status, may_mutate);
                     self.jobs.dashboard_load = None;
                     dirty = true;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    if let BlimsTuiMode::Dashboard(dashboard) = &mut self.mode {
-                        dashboard.status = "dashboard loader disconnected".to_string();
-                        self.status = "dashboard loader disconnected".to_string();
-                    }
+                    self.recovery
+                        .fail(&mut self.mode, &mut self.status, may_mutate);
                     self.jobs.dashboard_load = None;
                     dirty = true;
                 }
@@ -2062,8 +2209,8 @@ impl BlimsTuiApp {
             Direction::Vertical,
             &[
                 Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(4),
             ],
         );
         if rows.len() < 3 {
@@ -2097,9 +2244,14 @@ impl BlimsTuiApp {
     }
 }
 
-async fn load_ceo_dashboard() -> Result<BlimsCeoDashboardState, CliError> {
-    let operation =
-        submit_blims_command(&serde_json::json!({ "type": "refresh_dashboard" })).await?;
+async fn load_ceo_dashboard(refresh: bool) -> Result<BlimsCeoDashboardState, CliError> {
+    let status = if refresh {
+        let operation =
+            submit_blims_command(&serde_json::json!({ "type": "refresh_dashboard" })).await?;
+        format!("CEO dashboard loaded via {}.", operation.operation_id)
+    } else {
+        "CEO dashboard snapshot loaded; changes remain paused.".into()
+    };
     let projection = load_ceo_dashboard_projection().await?;
     Ok(BlimsCeoDashboardState {
         initiatives: projection.initiatives,
@@ -2109,7 +2261,7 @@ async fn load_ceo_dashboard() -> Result<BlimsCeoDashboardState, CliError> {
         guidance: projection.guidance,
         selected_section: 0,
         selected_item: 0,
-        status: format!("CEO dashboard loaded via {}.", operation.operation_id),
+        status,
     })
 }
 
@@ -2275,8 +2427,13 @@ where
     T: Send + 'static,
 {
     let (sender, receiver) = mpsc::channel();
+    let client = BLIMS_NATIVE_CLIENT.try_with(Clone::clone).ok();
     tokio::spawn(async move {
-        let result = operation().await;
+        let result = if let Some(client) = client {
+            BLIMS_NATIVE_CLIENT.scope(client, operation()).await
+        } else {
+            operation().await
+        };
         let _ = sender.send(result);
     });
     receiver
@@ -2285,7 +2442,7 @@ where
 async fn refresh_conversation_transcript(
     conversation: &mut BlimsConversationState,
 ) -> Result<(), CliError> {
-    let events = BcodeClient::default_endpoint()
+    let events = blims_client()
         .session_history(conversation.handle.session)
         .await?;
     conversation.transcript = events
@@ -2337,7 +2494,7 @@ fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_
     let background = Color::Rgb(19, 16, 30);
     let pane = Pane::new()
         .border(true)
-        .padding(Insets::new(1, 2, 0, 2))
+        .padding(Insets::new(0, 2, 0, 2))
         .styles(blims_pane_styles(Color::BrightMagenta, background));
     let state = PaneState::new(area);
     let retained = std::cell::Cell::new(state);
@@ -2357,7 +2514,7 @@ fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  [{}]", app.world.template_id),
+            format!("  [{}]  {}", app.world.template_id, app.current_room_name()),
             Style::new().fg(Color::BrightBlack),
         ),
     ]);
@@ -2372,13 +2529,25 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_
     let background = Color::Rgb(10, 14, 24);
     let pane = Pane::new()
         .border(true)
-        .padding(Insets::new(1, 2, 0, 2))
+        .padding(Insets::new(0, 2, 0, 2))
         .styles(blims_pane_styles(Color::BrightBlue, background));
     let state = PaneState::new(area);
     let retained = std::cell::Cell::new(state);
     let shell = PaneComponent::new("blims.pane", pane.clone(), &retained, TextBlock::new(""));
     paint_blims_component(&shell, area, frame);
-    let status = app.status.clone();
+    let rows = split(
+        pane.inner_area(&state),
+        Direction::Vertical,
+        &[Constraint::Length(1), Constraint::Min(0)],
+    );
+    if rows.len() != 2 {
+        return;
+    }
+    frame.write_line_with_fallback_style(
+        LocalRect::terminal(rows[0]),
+        &Line::raw(app.status.clone()),
+        Style::new().bg(background).fg(Color::BrightWhite),
+    );
     let shortcut_keys = [
         blims_keys(
             &app.keymap,
@@ -2396,7 +2565,7 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_
         blims_keys(&app.keymap, "blims.office", &["worlds"]),
         blims_keys(&app.keymap, "blims.office", &["refresh", "help", "close"]),
     ];
-    let mut hints = shortcut_keys
+    let hints = shortcut_keys
         .iter()
         .zip([
             "walk",
@@ -2410,10 +2579,9 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_
         .filter(|(keys, _)| !keys.is_empty())
         .map(|(keys, label)| KeyHint::new(keys.as_str(), label))
         .collect::<Vec<_>>();
-    hints.push(KeyHint::new("", &status));
     let component =
         KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
-    paint_blims_component(&component, pane.inner_area(&state), frame);
+    paint_blims_component(&component, rows[1], frame);
 }
 
 fn render_blims_map(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
@@ -3777,10 +3945,10 @@ async fn create_blims_agent_conversation(
 async fn create_agent_talk_session(
     prompt: &BlimsAgentTalkPrompt,
 ) -> Result<bcode_session_models::SessionSummary, CliError> {
-    let session = BcodeClient::default_endpoint()
+    let session = blims_client()
         .create_session(Some(format!("Blims talk: {}", prompt.agent_id)))
         .await?;
-    BcodeClient::default_endpoint()
+    blims_client()
         .send_user_message(
             session.id,
             prompt.prompt.clone(),
@@ -4074,6 +4242,18 @@ async fn print_world_templates(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+fn validate_world_selection_response(
+    response: &bcode_ipc::PluginServiceResponse,
+) -> Result<(), CliError> {
+    if response.error.is_some() {
+        return Err(CliError::Blims(
+            "World selection could not be confirmed.".into(),
+        ));
+    }
+    let _: BlimsCommandSubmitResponse = serde_json::from_slice(&response.payload)?;
+    Ok(())
+}
+
 async fn select_world_template_state(
     template_id: String,
 ) -> Result<(BlimsWorldSelection, bcode_ipc::PluginServiceResponse), CliError> {
@@ -4085,6 +4265,7 @@ async fn select_world_template_state(
         }))?)?,
     )
     .await?;
+    validate_world_selection_response(&response)?;
     let world = load_blims_world().await?;
     let interactions = load_blims_interactions().await?;
     let report = load_blims_report().await?;
@@ -4289,10 +4470,10 @@ async fn create_blims_prepared_ai_work_session(
     CliError,
 > {
     let work = load_blims_prepared_ai_work(work_id).await?;
-    let session = BcodeClient::default_endpoint()
+    let session = blims_client()
         .create_session(Some(format!("Blims AI work: {}", work.id)))
         .await?;
-    BcodeClient::default_endpoint()
+    blims_client()
         .send_user_message(
             session.id,
             work.prompt.clone(),
@@ -5047,7 +5228,7 @@ async fn call_blims_service(
     operation: &str,
     payload: Vec<u8>,
 ) -> Result<bcode_ipc::PluginServiceResponse, CliError> {
-    BcodeClient::default_endpoint()
+    blims_client()
         .call_plugin_service("bcode.blims/v1".to_string(), operation.to_string(), payload)
         .await
         .map_err(CliError::from)
@@ -5085,6 +5266,383 @@ fn paint_blims_component(component: &impl Component, area: Rect, cx: &mut PaintC
 #[cfg(test)]
 mod keymap_tests {
     use super::*;
+
+    fn recovery_app() -> BlimsTuiApp {
+        let world = BlimsWorldSnapshot {
+            theme: String::new(),
+            template_id: String::new(),
+            width: 10,
+            height: 10,
+            player_name: "CEO".into(),
+            rooms: Vec::new(),
+            agents: Vec::new(),
+        };
+        BlimsTuiApp {
+            keymap: bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                blims_keymap_definitions(),
+                BTreeMap::new(),
+            )
+            .unwrap(),
+            geometry: BlimsWorldGeometry::from_world(&world),
+            world,
+            report: BlimsMorningReport {
+                title: String::new(),
+                bullets: Vec::new(),
+            },
+            interactions: BlimsAvailableInteractions {
+                room_id: String::new(),
+                interactions: Vec::new(),
+            },
+            templates: Vec::new(),
+            agent_sprites: BTreeMap::new(),
+            live_log: Vec::new(),
+            activity: Vec::new(),
+            inbox: Vec::new(),
+            selected_inbox_item: 0,
+            selected_template: 0,
+            player_tile: BlimsTilePosition { x: 1, y: 1 },
+            selected_interaction: 0,
+            pending_player_room_sync: None,
+            pending_world_template_name: None,
+            last_world_tick: Instant::now(),
+            last_animation: Instant::now(),
+            tick_count: 0,
+            jobs: BlimsBackgroundJobs::new(),
+            recovery: BlimsServiceRecovery::default(),
+            mode: BlimsTuiMode::Office,
+            show_world_picker: false,
+            show_help: false,
+            status: String::new(),
+        }
+    }
+
+    fn rendered_rows(terminal: &Terminal<Vec<u8>>) -> Vec<String> {
+        let buffer = terminal.retained_buffer().unwrap();
+        (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .filter_map(|x| buffer.get(bmux_tui::geometry::Point::new(x, y)))
+                    .map(|cell| cell.symbol.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn native_header_failure_and_hints_remain_visible_after_resize() {
+        let mut app = recovery_app();
+        app.world.theme = "Office界🙂e\u{301}".into();
+        app.world.template_id = "studio".into();
+        app.recovery
+            .finish_action(
+                &mut app.mode,
+                &mut app.status,
+                true,
+                Err(CliError::Blims("secret-provider-token".into())),
+            )
+            .unwrap();
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 120, 80));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(rows[1].contains("BLIMS"));
+        assert!(rows[1].contains("Office界🙂e\u{301}"));
+        assert!(rows[1].contains("the hallway"));
+        assert!(rows[77].contains("Outcome unknown"));
+        assert!(rows[77].contains("changes paused"));
+        assert!(rows[78].contains("walk"));
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("secret-provider-token"))
+        );
+        terminal.resize(Rect::new(0, 0, 32, 12));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(rows[1].contains("BLIMS"));
+        assert!(rows[9].contains("Outcome unknown"));
+        // Zero/tiny geometry is delegated to BMUX bounded layout/painting.
+        for (width, height) in [(0, 0), (1, 1), (2, 3), (8, 7)] {
+            terminal.resize(Rect::new(0, 0, width, height));
+            terminal.draw(|frame| app.render(frame)).unwrap();
+        }
+        terminal.resize(Rect::new(0, 0, 120, 80));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(rendered_rows(&terminal)[77].contains("Outcome unknown"));
+    }
+
+    #[test]
+    fn report_refresh_cannot_write_after_an_unknown_mutation() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut app = recovery_app();
+                assert!(blims_action_may_mutate(Some("blims.office.refresh")));
+                app.recovery.fail(&mut app.mode, &mut app.status, true);
+                let original_report = app.report.clone();
+                assert!(
+                    !handle_blims_tui_event(
+                        &mut app,
+                        Event::Key(bmux_keyboard::parse_key_stroke("r").unwrap(),)
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(app.report, original_report);
+                assert!(app.status.contains("Outcome unknown"));
+            });
+    }
+
+    #[test]
+    fn native_client_scope_and_background_work_require_running_daemon() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let endpoint = bcode_ipc::IpcEndpoint::unix_socket(
+                    std::env::temp_dir().join(format!("blims-missing-{}.sock", SessionId::new())),
+                );
+                let client = native_blims_client(
+                    BcodeClient::new(endpoint)
+                        .with_daemon_availability(bcode_client::DaemonAvailability::AutoStart)
+                        .with_request_timeout(Duration::from_millis(37)),
+                );
+                BLIMS_NATIVE_CLIENT
+                    .scope(client, async {
+                        assert_eq!(blims_client().request_timeout(), Duration::from_millis(37));
+                        // RequireRunning acquisition is a no-op, even for an absent
+                        // endpoint. No daemon/process/storage is created by this test.
+                        blims_client().ensure_daemon_available().await.unwrap();
+                        assert!(blims_client().server_status().await.is_err());
+                        let receiver = spawn_blims_background(|| {
+                            Box::pin(async {
+                                blims_client().ensure_daemon_available().await?;
+                                Ok(blims_client().request_timeout())
+                            })
+                        });
+                        let observed = loop {
+                            match receiver.try_recv() {
+                                Ok(result) => break result.unwrap(),
+                                Err(TryRecvError::Empty) => tokio::task::yield_now().await,
+                                Err(TryRecvError::Disconnected) => panic!("worker lost"),
+                            }
+                        };
+                        assert_eq!(observed, Duration::from_millis(37));
+                    })
+                    .await;
+                assert!(BLIMS_NATIVE_CLIENT.try_with(Clone::clone).is_err());
+            });
+    }
+
+    #[test]
+    fn rejected_world_selection_is_not_reported_as_success() {
+        let response = bcode_ipc::PluginServiceResponse {
+            payload: serde_json::to_vec(&serde_json::json!({"operation_id": "operation"})).unwrap(),
+            error: Some(bcode_ipc::PluginServiceError {
+                code: "secret-code".into(),
+                message: "secret-provider-payload".into(),
+            }),
+        };
+        let error = validate_world_selection_response(&response).unwrap_err();
+        assert!(!error.to_string().contains("secret"));
+        let mut app = recovery_app();
+        assert!(
+            !app.recovery
+                .finish_action(&mut app.mode, &mut app.status, true, Err(error))
+                .unwrap()
+        );
+        assert!(app.recovery.mutations_paused);
+        let valid = bcode_ipc::PluginServiceResponse {
+            error: None,
+            ..response
+        };
+        validate_world_selection_response(&valid).unwrap();
+        assert!(
+            validate_world_selection_response(&bcode_ipc::PluginServiceResponse {
+                payload: b"{}".to_vec(),
+                error: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn queued_mutations_do_not_replace_unobserved_job_receivers() {
+        let mut app = recovery_app();
+        let (room_sender, room_receiver) = mpsc::channel();
+        let (world_sender, world_receiver) = mpsc::channel();
+        app.jobs.player_room_sync = Some(BlimsBackgroundJob::PlayerRoomSync(room_receiver));
+        app.jobs.world_template_select =
+            Some(BlimsBackgroundJob::WorldTemplateSelect(world_receiver));
+        app.pending_player_room_sync = Some("next-room".into());
+        app.pending_world_template_name = Some("next-template".into());
+        app.schedule_background_jobs();
+        assert_eq!(app.pending_player_room_sync.as_deref(), Some("next-room"));
+        assert_eq!(
+            app.pending_world_template_name.as_deref(),
+            Some("next-template")
+        );
+        room_sender
+            .send(Err(CliError::Blims("room failure".into())))
+            .unwrap();
+        assert!(app.poll_player_room_sync_job());
+        assert!(app.recovery.mutations_paused);
+        app.schedule_background_jobs();
+        assert!(app.pending_player_room_sync.is_none());
+        assert!(app.pending_world_template_name.is_none());
+        // The other already-dispatched work remains observed after pause.
+        world_sender
+            .send(Err(CliError::Blims("world failure".into())))
+            .unwrap();
+        assert!(app.poll_world_template_select_job());
+        assert!(app.jobs.world_template_select.is_none());
+        app.schedule_background_jobs();
+        assert!(app.jobs.player_room_sync.is_none());
+        assert!(app.jobs.world_tick.is_none());
+    }
+
+    #[test]
+    fn service_failure_retains_native_surface_without_exposing_payload() {
+        let mut app = recovery_app();
+        app.mode = BlimsTuiMode::Dashboard(BlimsCeoDashboardState::loading(String::new()));
+        let original_mode = app.mode.clone();
+        let result = app
+            .recovery
+            .finish_action(
+                &mut app.mode,
+                &mut app.status,
+                false,
+                Err(CliError::Blims("secret-provider-token".into())),
+            )
+            .unwrap();
+        assert!(!result);
+        let BlimsTuiMode::Dashboard(dashboard) = &app.mode else {
+            panic!("dashboard closed")
+        };
+        assert_eq!(dashboard.status, app.status);
+        assert!(app.status.contains("Refresh"));
+        assert!(!app.status.contains("secret-provider-token"));
+        assert!(!app.recovery.mutations_paused);
+        let BlimsTuiMode::Dashboard(before) = original_mode else {
+            unreachable!()
+        };
+        assert_eq!(before.proposals, dashboard.proposals);
+    }
+
+    #[test]
+    fn ambiguous_send_blocks_replay_but_allows_back_and_quit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut app = recovery_app();
+            app.mode = BlimsTuiMode::Conversation(BlimsConversationState {
+                handle: BlimsConversationHandle {
+                    agent_id: "agent".into(),
+                    conversation_ref: "conversation".into(),
+                    session: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                },
+                agent_name: "Agent".into(),
+                input: "retained draft".into(),
+                transcript: Vec::new(),
+                status: String::new(),
+            });
+            assert!(
+                !app.recovery
+                    .finish_action(
+                        &mut app.mode,
+                        &mut app.status,
+                        true,
+                        Err(CliError::Blims("secret".into())),
+                    )
+                    .unwrap()
+            );
+            let key = |key| Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap());
+            // A real send with this handle would contact a daemon. The blocked
+            // native dispatch must return locally and preserve the draft.
+            assert!(
+                !handle_blims_tui_event(&mut app, key("enter"))
+                    .await
+                    .unwrap()
+            );
+            let BlimsTuiMode::Conversation(conversation) = &app.mode else {
+                panic!("conversation closed")
+            };
+            assert_eq!(conversation.input, "retained draft");
+            assert!(conversation.status.contains("Outcome unknown"));
+            assert!(!handle_blims_tui_event(&mut app, key("esc")).await.unwrap());
+            assert!(matches!(app.mode, BlimsTuiMode::Office));
+            app.pending_player_room_sync = Some("room".into());
+            app.pending_world_template_name = Some("template".into());
+            app.schedule_background_jobs();
+            assert!(app.jobs.world_tick.is_none());
+            assert!(app.jobs.player_room_sync.is_none());
+            assert!(app.jobs.world_template_select.is_none());
+            assert!(app.pending_player_room_sync.is_none());
+            assert!(app.pending_world_template_name.is_none());
+            assert!(handle_blims_tui_event(&mut app, key("q")).await.unwrap());
+        });
+    }
+
+    #[test]
+    fn background_failure_is_observed_after_dashboard_back_and_not_retried() {
+        let mut app = recovery_app();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Err(CliError::Blims("secret background payload".into())))
+            .unwrap();
+        app.jobs.dashboard_load = Some(BlimsBackgroundJob::DashboardLoad(receiver, true));
+        assert!(app.poll_background_jobs());
+        assert!(matches!(app.mode, BlimsTuiMode::Office));
+        assert!(app.recovery.mutations_paused);
+        assert!(app.jobs.dashboard_load.is_none());
+        assert!(!app.status.contains("secret"));
+        assert!(!app.poll_background_jobs());
+        assert!(!app.recovery.blocks(Some("blims.dashboard.refresh")));
+        assert!(app.recovery.blocks(Some("blims.dashboard.approve")));
+    }
+
+    #[test]
+    fn disconnected_client_and_invalid_service_response_stay_native() {
+        let mut recovery = BlimsServiceRecovery::default();
+        let mut mode = BlimsTuiMode::Office;
+        let mut status = String::new();
+        let invalid_response = serde_json::from_str::<BlimsWorldSnapshot>("not json").unwrap_err();
+        for error in [
+            CliError::Client(bcode_client::ClientError::UnexpectedResponse),
+            CliError::Json(invalid_response),
+        ] {
+            assert!(
+                !recovery
+                    .finish_action(&mut mode, &mut status, false, Err(error))
+                    .unwrap()
+            );
+            assert!(matches!(mode, BlimsTuiMode::Office));
+            assert!(status.starts_with("Service unavailable"));
+            assert!(!recovery.mutations_paused);
+        }
+    }
+
+    #[test]
+    fn terminal_failure_remains_fatal_and_successful_quit_is_preserved() {
+        let mut recovery = BlimsServiceRecovery::default();
+        let mut mode = BlimsTuiMode::Office;
+        let mut status = String::new();
+        assert!(matches!(
+            recovery.finish_action(
+                &mut mode,
+                &mut status,
+                false,
+                Err(CliError::Io(std::io::Error::other("terminal failed"))),
+            ),
+            Err(CliError::Io(_))
+        ));
+        assert!(
+            recovery
+                .finish_action(&mut mode, &mut status, false, Ok(true))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn remapping_and_unbinding_are_scoped_and_update_hints() {

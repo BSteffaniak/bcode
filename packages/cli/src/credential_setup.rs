@@ -6,16 +6,6 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 
-pub async fn run_setup(discovery_enabled: bool) -> Result<bool, CliError> {
-    match Box::pin(bcode_tui::run_setup_screen(discovery_enabled)).await? {
-        bcode_settings::SetupContinuation::Launch => Ok(true),
-        bcode_settings::SetupContinuation::Close => Ok(false),
-        _ => Err(CliError::InvalidArguments(
-            "Setup editors must remain inside the terminal runtime".to_owned(),
-        )),
-    }
-}
-
 pub fn validate_launch_selection() -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let selection = config.resolved_model_selection();

@@ -147,13 +147,114 @@ pub enum TimelineDialogRootOutcome {
     Jump(super::timeline_dialog::TimelineEntry),
 }
 
+type PluginSurfaceOutcome = (String, bcode_plugin_sdk::tui::PluginTuiAction);
+
+type PluginEffectCompletion = (
+    bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    bcode_plugin_sdk::tui::PluginTuiAction,
+);
+
+/// Whether dispatched plugin effects still have a verifiable completion path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PluginEffectIntegrity {
+    Verifiable,
+    UnknownEffects,
+}
+
 struct RootPluginSurface {
     plugin_id: String,
-    surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    surface: Option<bcode_plugin_sdk::tui::BoxedPluginTuiSurface>,
+    drain: Option<tokio::sync::oneshot::Receiver<PluginEffectCompletion>>,
+    drain_task: Option<tokio::task::JoinHandle<()>>,
+    navigation_callback: Option<(bcode_session_models::SessionId, Result<(), String>)>,
+    effect_integrity: PluginEffectIntegrity,
+    close_after_drain: bool,
+    close_outcome: Option<serde_json::Value>,
+    effects_pending: bool,
+    session_navigation_attached: bool,
+    deferred_input: std::collections::VecDeque<Event>,
     invalidation: bmux_tui_runtime::InvalidationSignal,
     active_tasks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pending_session_navigation: Option<bcode_session_models::SessionId>,
     workflow_view_requests: Option<tokio::sync::mpsc::Sender<WorkflowViewRequest>>,
+}
+
+impl RootPluginSurface {
+    fn observe_finished_drain_task(
+        &mut self,
+    ) -> Result<(), bcode_plugin_sdk::tui::PluginTuiAction> {
+        // A task may have sent its result just before finishing its wakeup. Observe its
+        // terminal result before allowing another exclusive operation to replace it.
+        if self
+            .drain_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            let mut task = self.drain_task.take().expect("finished task exists");
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            match std::future::Future::poll(std::pin::Pin::new(&mut task), &mut context) {
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Ready(Err(_)) => {
+                    self.drain = None;
+                    self.effect_integrity = PluginEffectIntegrity::UnknownEffects;
+                    return Err(bcode_plugin_sdk::tui::PluginTuiAction::None);
+                }
+                std::task::Poll::Pending => self.drain_task = Some(task),
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_drain_completion(
+        &mut self,
+        active: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+        action: bcode_plugin_sdk::tui::PluginTuiAction,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        self.surface = Some(active);
+        self.drain = None;
+        if let Some((session_id, result)) = self.navigation_callback.take() {
+            self.surface
+                .as_mut()
+                .expect("settled surface available")
+                .session_navigation_finished(session_id, result);
+        }
+        // Returning exclusive ownership must trigger one foreground poll so newly
+        // linked subscriptions/navigation are admitted without another keypress.
+        self.invalidation.request();
+        if self.close_after_drain {
+            if let bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome } = action {
+                self.close_outcome = outcome.or_else(|| self.close_outcome.take());
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::Close {
+                outcome: self.close_outcome.take(),
+            }
+        } else if self.pending_session_navigation.is_some() {
+            // Settlement retains the surface without changing the borrowed chat route.
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        } else if matches!(
+            action,
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+                | bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+        ) {
+            // Foreground reconciliation is part of settlement, not a later user
+            // event. In particular, effects can introduce observation subscriptions
+            // whose first snapshot must be admitted before the next frame.
+            let next = self
+                .surface
+                .as_mut()
+                .expect("settled surface available")
+                .poll(host);
+            self.effects_pending |= matches!(next, bcode_plugin_sdk::tui::PluginTuiAction::Redraw);
+            if matches!(next, bcode_plugin_sdk::tui::PluginTuiAction::None) {
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            } else {
+                next
+            }
+        } else {
+            action
+        }
+    }
 }
 
 struct RootModelPicker {
@@ -249,7 +350,7 @@ pub struct ChatLoopState {
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     milestone_requests: super::timeline_dialog::MilestonePageRequests,
     plugin_surface: Option<RootPluginSurface>,
-    parent_plugin_surface: Option<RootPluginSurface>,
+    parent_plugin_surfaces: Vec<RootPluginSurface>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
     model_picker: Option<RootModelPicker>,
     model_picker_generation: u64,
@@ -320,7 +421,7 @@ impl ChatLoopState {
             timeline_dialog: None,
             milestone_requests: super::timeline_dialog::MilestonePageRequests::default(),
             plugin_surface: None,
-            parent_plugin_surface: None,
+            parent_plugin_surfaces: Vec::new(),
             provider_picker: None,
             model_picker: None,
             model_picker_generation: 0,
@@ -366,7 +467,9 @@ impl ChatLoopState {
                 launch.clone(),
                 std::sync::Arc::clone(&surface.active_tasks),
             );
-            surface.surface.prepare_keymap(&host);
+            if let Some(surface) = surface.surface.as_mut() {
+                surface.prepare_keymap(&host);
+            }
         }
         self.render_launch = Some(launch);
     }
@@ -1022,14 +1125,23 @@ impl ChatLoopState {
         surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
     ) {
         if let Some(active) = self.plugin_surface.take() {
-            self.parent_plugin_surface = Some(active);
+            self.parent_plugin_surfaces.push(active);
         }
         let invalidation = bmux_tui_runtime::InvalidationSignal::new();
         let active_tasks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         invalidation.request();
         self.plugin_surface = Some(RootPluginSurface {
             plugin_id: plugin_id.into(),
-            surface,
+            surface: Some(surface),
+            drain: None,
+            drain_task: None,
+            navigation_callback: None,
+            effect_integrity: PluginEffectIntegrity::Verifiable,
+            close_after_drain: false,
+            close_outcome: None,
+            effects_pending: true,
+            session_navigation_attached: false,
+            deferred_input: std::collections::VecDeque::new(),
             invalidation,
             active_tasks,
             pending_session_navigation: None,
@@ -1037,7 +1149,7 @@ impl ChatLoopState {
         });
     }
 
-    pub const fn suspend_root_plugin_surface_for_session(
+    pub fn suspend_root_plugin_surface_for_session(
         &mut self,
         session_id: bcode_session_models::SessionId,
     ) -> bool {
@@ -1045,7 +1157,30 @@ impl ChatLoopState {
             return false;
         };
         surface.pending_session_navigation = Some(session_id);
+        surface.session_navigation_attached = false;
+        // Input belongs to the surface visit that accepted it, never a later visit.
+        surface.deferred_input.clear();
         true
+    }
+
+    pub fn mark_root_plugin_session_attached(
+        &mut self,
+        session_id: bcode_session_models::SessionId,
+    ) -> bool {
+        let Some(surface) = self.plugin_surface.as_mut() else {
+            return false;
+        };
+        if surface.pending_session_navigation != Some(session_id) {
+            return false;
+        }
+        surface.session_navigation_attached = true;
+        true
+    }
+
+    pub fn root_plugin_session_is_attached(&self) -> bool {
+        self.plugin_surface
+            .as_ref()
+            .is_some_and(|surface| surface.session_navigation_attached)
     }
 
     pub fn complete_root_plugin_session_navigation(
@@ -1060,9 +1195,12 @@ impl ChatLoopState {
             return false;
         }
         surface.pending_session_navigation = None;
-        surface
-            .surface
-            .session_navigation_finished(session_id, result);
+        surface.session_navigation_attached = false;
+        if let Some(active) = surface.surface.as_mut() {
+            active.session_navigation_finished(session_id, result);
+        } else {
+            surface.navigation_callback = Some((session_id, result));
+        }
         surface.invalidation.request();
         true
     }
@@ -1086,7 +1224,7 @@ impl ChatLoopState {
     pub fn active_root_plugin_surface_id(&self) -> Option<&'static str> {
         self.plugin_surface
             .as_ref()
-            .map(|surface| surface.surface.id())
+            .and_then(|surface| surface.surface.as_ref().map(|surface| surface.id()))
     }
 
     pub fn handle_root_plugin_surface_event(
@@ -1096,13 +1234,39 @@ impl ChatLoopState {
         launch: super::plugin_surface_host::FreshSessionSettings,
     ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
         let surface = self.plugin_surface.as_mut()?;
+        if surface.pending_session_navigation.is_some() {
+            return Some(bcode_plugin_sdk::tui::PluginTuiAction::None);
+        }
         let host = super::plugin_surface_host::root_host(
             surface.invalidation.clone(),
             client.clone(),
             launch,
             std::sync::Arc::clone(&surface.active_tasks),
         );
-        Some(surface.surface.handle_event(event, &host))
+        let Some(active) = surface.surface.as_mut() else {
+            if let Event::Key(key) = event
+                && (key.key == bmux_keyboard::KeyCode::Escape
+                    || (key.key == bmux_keyboard::KeyCode::Char('c') && key.modifiers.ctrl))
+            {
+                surface.close_after_drain = true;
+                surface.deferred_input.clear();
+                surface.invalidation.request();
+            } else if !surface.close_after_drain && matches!(event, Event::Key(_) | Event::Paste(_))
+            {
+                if surface.deferred_input.len() < 32 {
+                    surface.deferred_input.push_back(event.clone());
+                } else {
+                    // Fail closed instead of silently losing a reliable input or replaying it.
+                    surface.close_after_drain = true;
+                    surface.deferred_input.clear();
+                    surface.invalidation.request();
+                }
+            }
+            return Some(bcode_plugin_sdk::tui::PluginTuiAction::Redraw);
+        };
+        surface.effects_pending = true;
+        surface.invalidation.request();
+        Some(active.handle_event(event, &host))
     }
 
     pub fn root_plugin_surface_invalidation(&self) -> Option<bmux_tui_runtime::InvalidationSignal> {
@@ -1117,6 +1281,20 @@ impl ChatLoopState {
         launch: super::plugin_surface_host::FreshSessionSettings,
     ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
         let surface = self.plugin_surface.as_mut()?;
+        if surface.effect_integrity == PluginEffectIntegrity::UnknownEffects {
+            return Some(bcode_plugin_sdk::tui::PluginTuiAction::None);
+        }
+        if let Err(action) = surface.observe_finished_drain_task() {
+            return Some(action);
+        }
+        if surface.drain_task.is_some() && surface.drain.is_none() {
+            surface.invalidation.request();
+        }
+        if surface.close_after_drain && surface.drain.is_none() && surface.drain_task.is_none() {
+            return Some(bcode_plugin_sdk::tui::PluginTuiAction::Close {
+                outcome: surface.close_outcome.take(),
+            });
+        }
         let host = super::plugin_surface_host::root_host(
             surface.invalidation.clone(),
             client.clone(),
@@ -1124,12 +1302,121 @@ impl ChatLoopState {
             std::sync::Arc::clone(&surface.active_tasks),
         );
         let invalidated = surface.invalidation.take();
-        let action = surface.surface.poll(&host);
+        let action = if let Some(receiver) = surface.drain.as_mut() {
+            match receiver.try_recv() {
+                Ok((active, action)) => surface.accept_drain_completion(active, action, &host),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    surface.drain = None;
+                    surface.effect_integrity = PluginEffectIntegrity::UnknownEffects;
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                }
+            }
+        } else if surface.pending_session_navigation.is_some() {
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        } else if let Some(active) = surface.surface.as_mut() {
+            let action = if let Some(event) = surface.deferred_input.pop_front() {
+                surface.effects_pending = true;
+                let action = active.handle_event(&event, &host);
+                if !surface.deferred_input.is_empty() {
+                    surface.invalidation.request();
+                }
+                action
+            } else {
+                active.poll(&host)
+            };
+            surface.effects_pending |=
+                matches!(action, bcode_plugin_sdk::tui::PluginTuiAction::Redraw);
+            if surface.effects_pending
+                && surface.drain_task.is_none()
+                && matches!(
+                    action,
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                        | bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                )
+            {
+                surface.effects_pending = false;
+                let mut active = surface.surface.take().expect("exclusive surface available");
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let invalidation = surface.invalidation.clone();
+                surface.drain_task = Some(tokio::spawn(async move {
+                    let action = active.drain_effects(&host).await;
+                    let _ = sender.send((active, action));
+                    invalidation.request();
+                }));
+                surface.drain = Some(receiver);
+            }
+            action
+        } else {
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        };
         if invalidated && matches!(action, bcode_plugin_sdk::tui::PluginTuiAction::None) {
             Some(bcode_plugin_sdk::tui::PluginTuiAction::Redraw)
         } else {
             Some(action)
         }
+    }
+
+    /// Verify that no retained surface has an unresolved operation failure.
+    ///
+    /// # Errors
+    /// Returns a normalized error for failed tasks or missing completion results.
+    pub fn verify_plugin_operations(&self) -> Result<(), TuiError> {
+        if self
+            .plugin_surface
+            .iter()
+            .chain(self.parent_plugin_surfaces.iter())
+            .any(|surface| surface.effect_integrity == PluginEffectIntegrity::UnknownEffects)
+        {
+            return Err(std::io::Error::other("plugin operation ended without a verified result; effects may have occurred; inspect state before retrying").into());
+        }
+        Ok(())
+    }
+
+    /// Observe all already-dispatched plugin operations before runtime resources are released.
+    /// This never replays input or starts a new effect, including after fatal terminal I/O.
+    ///
+    /// # Errors
+    /// Returns an error if a dispatched task fails or ends without a verified completion.
+    pub async fn settle_root_plugin_effects(
+        &mut self,
+    ) -> Result<Vec<PluginSurfaceOutcome>, TuiError> {
+        let mut actions = Vec::new();
+        let mut failed = false;
+        for surface in self
+            .plugin_surface
+            .iter_mut()
+            .chain(self.parent_plugin_surfaces.iter_mut())
+        {
+            failed |= surface.effect_integrity == PluginEffectIntegrity::UnknownEffects;
+            surface.deferred_input.clear();
+            if let Some(task) = surface.drain_task.as_mut() {
+                failed |= task.await.is_err();
+            }
+            surface.drain_task = None;
+            if let Some(receiver) = surface.drain.as_mut() {
+                match receiver.await {
+                    Ok((mut active, action)) => {
+                        if let Some((session_id, result)) = surface.navigation_callback.take() {
+                            active.session_navigation_finished(session_id, result);
+                        }
+                        surface.surface = Some(active);
+                        actions.push((surface.plugin_id.clone(), action));
+                    }
+                    Err(_) => failed = true,
+                }
+                surface.drain = None;
+            }
+        }
+        if failed {
+            return Err(std::io::Error::other(
+                "plugin operation ended without a verified result; effects may have occurred",
+            )
+            .into());
+        }
+        Ok(actions)
     }
 
     pub fn attach_root_plugin_surface_updates(
@@ -1138,7 +1425,9 @@ impl ChatLoopState {
         workflow_view_requests: tokio::sync::mpsc::Sender<WorkflowViewRequest>,
     ) {
         if let Some(surface) = self.plugin_surface.as_mut() {
-            surface.surface.attach_updates(updates);
+            if let Some(surface) = surface.surface.as_mut() {
+                surface.attach_updates(updates);
+            }
             surface.workflow_view_requests = Some(workflow_view_requests);
         }
     }
@@ -1187,18 +1476,37 @@ impl ChatLoopState {
         &mut self,
         outcome: Option<serde_json::Value>,
     ) -> Option<(String, Option<serde_json::Value>)> {
+        if let Some(surface) = self.plugin_surface.as_mut()
+            && (surface.effect_integrity == PluginEffectIntegrity::UnknownEffects
+                || surface.drain.is_some()
+                || surface.drain_task.is_some())
+        {
+            surface.close_after_drain = true;
+            surface.close_outcome = outcome;
+            surface.invalidation.request();
+            return None;
+        }
         let surface = self.plugin_surface.take()?;
         self.restore_suspended_root_plugin_surface();
         Some((surface.plugin_id, outcome))
     }
 
     pub fn close_root_plugin_surface(&mut self) {
+        if let Some(surface) = self.plugin_surface.as_mut()
+            && (surface.effect_integrity == PluginEffectIntegrity::UnknownEffects
+                || surface.drain.is_some()
+                || surface.drain_task.is_some())
+        {
+            surface.close_after_drain = true;
+            surface.invalidation.request();
+            return;
+        }
         self.plugin_surface = None;
         self.restore_suspended_root_plugin_surface();
     }
 
     fn restore_suspended_root_plugin_surface(&mut self) {
-        self.plugin_surface = self.parent_plugin_surface.take();
+        self.plugin_surface = self.parent_plugin_surfaces.pop();
         if let Some(surface) = self.plugin_surface.as_ref() {
             surface.invalidation.request();
         }
@@ -5553,20 +5861,29 @@ fn paint_plugin_foreground(
     {
         let area = Rect::new(0, 0, frame.area().width, frame.area().height);
         let plugin_theme = render::plugin_theme_for_app(&chat.app);
-        if let Some(launch) = loop_state.render_launch.clone() {
-            let host = super::plugin_surface_host::root_host(
-                surface.invalidation.clone(),
-                loop_state.foreground_client.clone(),
-                launch,
-                std::sync::Arc::clone(&surface.active_tasks),
-            );
-            surface
-                .surface
-                .render_with_host(area, frame, Some(&plugin_theme), &host);
+        if let Some(active) = surface.surface.as_mut() {
+            if let Some(launch) = loop_state.render_launch.clone() {
+                let host = super::plugin_surface_host::root_host(
+                    surface.invalidation.clone(),
+                    loop_state.foreground_client.clone(),
+                    launch,
+                    std::sync::Arc::clone(&surface.active_tasks),
+                );
+                active.render_with_host(area, frame, Some(&plugin_theme), &host);
+            } else {
+                active.render_with_theme(area, frame, Some(&plugin_theme));
+            }
         } else {
-            surface
-                .surface
-                .render_with_theme(area, frame, Some(&plugin_theme));
+            let message = if surface.close_after_drain {
+                "Finishing operation safely before closing…"
+            } else {
+                "Finishing plugin operation… Esc / Ctrl-C requests exit after settlement"
+            };
+            frame.write_line_with_fallback_style(
+                bmux_tui::paint::LocalRect::new(0, 0, frame.area().width, 1),
+                &bmux_tui::prelude::Line::from(message),
+                bmux_tui::prelude::Style::new(),
+            );
         }
     }
 }
@@ -6548,6 +6865,446 @@ mod scheduler_tests {
             .expect("progress")
             .validate()
             .expect("portable progress");
+    }
+
+    struct DelayedEffectSurface {
+        commits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        callbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for DelayedEffectSurface {
+        fn id(&self) -> &'static str {
+            "delayed-effect"
+        }
+        fn title(&self) -> &'static str {
+            "Delayed effect"
+        }
+        fn render(&mut self, _area: Rect, _frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {}
+        fn handle_event(
+            &mut self,
+            event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+            if matches!(event, Event::Key(key) if key.key == bmux_keyboard::KeyCode::Char('o')) {
+                return bcode_plugin_sdk::tui::PluginTuiAction::OpenSession {
+                    session_id: bcode_session_models::SessionId::new(),
+                };
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+        }
+        fn session_navigation_finished(
+            &mut self,
+            _session_id: bcode_session_models::SessionId,
+            _result: Result<(), String>,
+        ) {
+            self.callbacks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn poll(
+            &mut self,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        }
+        fn drain_effects<'a>(
+            &'a mut self,
+            _host: &'a dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = bcode_plugin_sdk::tui::PluginTuiAction>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                if let Some(release) = self.release.take() {
+                    release.await.expect("release delayed operation");
+                    self.commits
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn surface_completion_wakes_poll_and_preserves_navigation_during_drain() {
+        use bcode_plugin_sdk::tui::PluginTuiAction;
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state.queue_root_plugin_surface(
+            "test",
+            Box::new(DelayedEffectSurface {
+                commits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                release: Some(receiver),
+                polls: std::sync::Arc::clone(&polls),
+                callbacks: std::sync::Arc::default(),
+            }),
+        );
+        let _ = state.poll_root_plugin_surface(&client, launch.clone());
+        let open = Event::Key(bmux_keyboard::KeyStroke::simple(
+            bmux_keyboard::KeyCode::Char('o'),
+        ));
+        let _ = state.handle_root_plugin_surface_event(&open, &client, launch.clone());
+        release.send(()).expect("operation alive");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.plugin_surface.as_ref().unwrap().surface.is_none() {
+                let _ = state.poll_root_plugin_surface(&client, launch.clone());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation settled");
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "settlement reconciles the surface before exposing completion"
+        );
+        assert!(state.root_plugin_surface_invalidation().unwrap().take());
+        assert!(matches!(
+            state.poll_root_plugin_surface(&client, launch),
+            Some(PluginTuiAction::OpenSession { .. })
+        ));
+        state.close_root_plugin_surface();
+    }
+
+    #[tokio::test]
+    async fn nested_mounts_retain_every_unresolved_parent_drain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let commits = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut releases = Vec::new();
+        for _ in 0..3 {
+            let (release, receiver) = tokio::sync::oneshot::channel();
+            releases.push(release);
+            state.queue_root_plugin_surface(
+                "test",
+                Box::new(DelayedEffectSurface {
+                    commits: commits.clone(),
+                    release: Some(receiver),
+                    polls: std::sync::Arc::default(),
+                    callbacks: std::sync::Arc::default(),
+                }),
+            );
+            let _action = state.poll_root_plugin_surface(&client, launch.clone());
+        }
+        assert_eq!(state.parent_plugin_surfaces.len(), 2);
+        for release in releases {
+            release.send(()).expect("parent drain still owned");
+        }
+        assert_eq!(
+            state
+                .settle_root_plugin_effects()
+                .await
+                .expect("all settled")
+                .len(),
+            3
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 3);
+        state.close_root_plugin_surface();
+        assert_eq!(state.parent_plugin_surfaces.len(), 1);
+        state.close_root_plugin_surface();
+        assert_eq!(state.parent_plugin_surfaces.len(), 0);
+        state.close_root_plugin_surface();
+        assert!(!state.has_root_plugin_surface());
+    }
+
+    #[tokio::test]
+    async fn failed_drain_never_becomes_a_successful_surface_close() {
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let (_release, receiver) = tokio::sync::oneshot::channel();
+        state.queue_root_plugin_surface(
+            "test",
+            Box::new(DelayedEffectSurface {
+                commits: std::sync::Arc::default(),
+                release: Some(receiver),
+                polls: std::sync::Arc::default(),
+                callbacks: std::sync::Arc::default(),
+            }),
+        );
+        let _action = state.poll_root_plugin_surface(&client, launch.clone());
+        state
+            .plugin_surface
+            .as_ref()
+            .expect("surface")
+            .drain_task
+            .as_ref()
+            .expect("tracked task")
+            .abort();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let action = state.poll_root_plugin_surface(&client, launch.clone());
+                assert!(!matches!(
+                    action,
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::Close { .. })
+                ));
+                if state.verify_plugin_operations().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed task observed");
+        let error = state
+            .verify_plugin_operations()
+            .expect_err("normalized failure");
+        assert!(error.to_string().contains("effects may have occurred"));
+        assert!(state.settle_root_plugin_effects().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_observes_drain_completion_and_deferred_navigation_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let commits = std::sync::Arc::new(AtomicUsize::new(0));
+        let callbacks = std::sync::Arc::new(AtomicUsize::new(0));
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        state.queue_root_plugin_surface(
+            "test",
+            Box::new(DelayedEffectSurface {
+                commits: commits.clone(),
+                release: Some(receiver),
+                polls: std::sync::Arc::default(),
+                callbacks: callbacks.clone(),
+            }),
+        );
+        let _action = state.poll_root_plugin_surface(&client, launch);
+        let session_id = bcode_session_models::SessionId::new();
+        assert!(state.suspend_root_plugin_surface_for_session(session_id));
+        assert!(state.complete_root_plugin_session_navigation(session_id, Ok(())));
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        // No terminal events/presentation are required to observe settlement.
+        let settlement = state.settle_root_plugin_effects();
+        tokio::pin!(settlement);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut settlement)
+                .await
+                .is_err()
+        );
+        release.send(()).expect("accepted operation remains owned");
+        let actions = settlement.await.expect("verified shutdown settlement");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn navigation_callback_waits_for_foreground_drain_settlement() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let callbacks = std::sync::Arc::new(AtomicUsize::new(0));
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        state.queue_root_plugin_surface(
+            "test",
+            Box::new(DelayedEffectSurface {
+                commits: std::sync::Arc::default(),
+                release: Some(receiver),
+                polls: std::sync::Arc::default(),
+                callbacks: callbacks.clone(),
+            }),
+        );
+        let _action = state.poll_root_plugin_surface(&client, launch.clone());
+        let session_id = bcode_session_models::SessionId::new();
+        assert!(state.suspend_root_plugin_surface_for_session(session_id));
+        assert!(
+            state.complete_root_plugin_session_navigation(session_id, Err("attach failed".into()))
+        );
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        release.send(()).expect("accepted operation still owned");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while callbacks.load(Ordering::SeqCst) == 0 {
+                let _action = state.poll_root_plugin_surface(&client, launch.clone());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("callback delivered on settlement");
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        let _actions = state
+            .settle_root_plugin_effects()
+            .await
+            .expect("task relinquished");
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn suspended_surface_does_not_replay_queued_input_after_drain() {
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        state.queue_root_plugin_surface(
+            "test",
+            Box::new(DelayedEffectSurface {
+                commits: std::sync::Arc::default(),
+                release: Some(receiver),
+                polls: std::sync::Arc::default(),
+                callbacks: std::sync::Arc::default(),
+            }),
+        );
+        let _action = state.poll_root_plugin_surface(&client, launch.clone());
+        let open = Event::Key(bmux_keyboard::KeyStroke::simple(
+            bmux_keyboard::KeyCode::Char('o'),
+        ));
+        let _action = state.handle_root_plugin_surface_event(&open, &client, launch.clone());
+        assert_eq!(
+            state
+                .plugin_surface
+                .as_ref()
+                .expect("surface")
+                .deferred_input
+                .len(),
+            1
+        );
+        assert!(
+            state.suspend_root_plugin_surface_for_session(bcode_session_models::SessionId::new())
+        );
+        release.send(()).expect("accepted operation remains owned");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state
+                .plugin_surface
+                .as_ref()
+                .expect("surface")
+                .surface
+                .is_none()
+            {
+                let action = state.poll_root_plugin_surface(&client, launch.clone());
+                assert!(!matches!(
+                    action,
+                    Some(bcode_plugin_sdk::tui::PluginTuiAction::OpenSession { .. })
+                ));
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("suspended operation settled");
+        assert!(
+            state
+                .plugin_surface
+                .as_ref()
+                .expect("surface")
+                .deferred_input
+                .is_empty()
+        );
+        assert!(matches!(
+            state.poll_root_plugin_surface(&client, launch.clone()),
+            Some(
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+                    | bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn mounted_surface_effect_runs_without_input_and_is_not_replayed_after_close() {
+        use bcode_plugin_sdk::tui::PluginTuiAction;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let commits = std::sync::Arc::new(AtomicUsize::new(0));
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        state.queue_root_plugin_surface(
+            "test",
+            Box::new(DelayedEffectSurface {
+                commits: commits.clone(),
+                release: Some(receiver),
+                polls: std::sync::Arc::default(),
+                callbacks: std::sync::Arc::default(),
+            }),
+        );
+        // Mount invalidation alone dispatches; no terminal event is admitted.
+        let _ = state.poll_root_plugin_surface(&client, launch.clone());
+        assert!(state.plugin_surface.as_ref().unwrap().drain.is_some());
+        release
+            .send(())
+            .expect("operation dispatched without keyboard input");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let action = state.poll_root_plugin_surface(&client, launch.clone());
+                if state.plugin_surface.as_ref().unwrap().surface.is_some() {
+                    assert!(matches!(action, Some(PluginTuiAction::Redraw)));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion observed without keyboard input");
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        state.close_root_plugin_surface();
+        assert!(state.poll_root_plugin_surface(&client, launch).is_none());
+        tokio::task::yield_now().await;
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn root_surface_drains_exclusively_once_and_defers_close_until_settled() {
+        use bcode_plugin_sdk::tui::PluginTuiAction;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let commits = std::sync::Arc::new(AtomicUsize::new(0));
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        state.queue_root_plugin_surface(
+            "test",
+            Box::new(DelayedEffectSurface {
+                commits: commits.clone(),
+                release: Some(receiver),
+                polls: std::sync::Arc::default(),
+                callbacks: std::sync::Arc::default(),
+            }),
+        );
+        let submit = Event::Key(bmux_keyboard::KeyStroke::simple(
+            bmux_keyboard::KeyCode::Enter,
+        ));
+        let _ = state.handle_root_plugin_surface_event(&submit, &client, launch.clone());
+        let _ = state.poll_root_plugin_surface(&client, launch.clone());
+        assert!(state.plugin_surface.as_ref().unwrap().surface.is_none());
+        let exit = Event::Key(bmux_keyboard::KeyStroke::simple(
+            bmux_keyboard::KeyCode::Escape,
+        ));
+        let _ = state.handle_root_plugin_surface_event(&exit, &client, launch.clone());
+        assert!(!matches!(
+            state.poll_root_plugin_surface(&client, launch.clone()),
+            Some(PluginTuiAction::Close { .. })
+        ));
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        // Programmatic close obeys the same settlement fence as terminal cancellation.
+        state.close_root_plugin_surface();
+        assert!(state.has_root_plugin_surface());
+        release.send(()).expect("drain still owns operation");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    state.poll_root_plugin_surface(&client, launch.clone()),
+                    Some(PluginTuiAction::Close { .. })
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settled close");
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        state.close_root_plugin_surface();
     }
 
     struct PassiveSurface;

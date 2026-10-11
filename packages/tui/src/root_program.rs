@@ -615,6 +615,24 @@ impl BcodeRuntimeModel {
         self.screen = BcodeRuntimeScreen::Chat;
     }
 
+    fn finish_plugin_session_attach(
+        &mut self,
+        session_id: bcode_session_models::SessionId,
+        result: Result<(), String>,
+    ) {
+        if result.is_ok() {
+            // Attach success begins the linked chat visit; it is not a return.
+            let _attached = self
+                .loop_state
+                .mark_root_plugin_session_attached(session_id);
+        } else {
+            let _completed = self
+                .loop_state
+                .complete_root_plugin_session_navigation(session_id, result);
+            self.resume_screen_after_session_navigation();
+        }
+    }
+
     fn resume_screen_after_session_navigation(&mut self) {
         let expected = self.suspended_screen.take();
         let active = self.active_screen();
@@ -820,9 +838,33 @@ impl BcodeRuntimeModel {
         self.finish_terminal_route_update(damage)
     }
 
+    fn return_from_borrowed_chat(&mut self, event: &Event) -> bool {
+        if self.loop_state.root_plugin_session_is_attached()
+            && let Event::Key(stroke) = event
+            && self
+                .settings
+                .keymap()
+                .action_for_key(super::keymap::BmuxScope::Chat, *stroke)
+                == Some(super::keymap::BmuxAction::AppExit)
+            && let Some(session_id) = self
+                .loop_state
+                .root_plugin_surface_pending_session_navigation()
+        {
+            let _completed = self
+                .loop_state
+                .complete_root_plugin_session_navigation(session_id, Ok(()));
+            self.resume_screen_after_session_navigation();
+            return true;
+        }
+        false
+    }
+
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
         self.synchronize_selection_lifecycle();
+        if self.return_from_borrowed_chat(&event) {
+            return super::invalidation::UiInvalidation::Structural;
+        }
         if self.loop_state.has_root_plugin_surface()
             && !self.loop_state.root_plugin_surface_is_suspended()
         {
@@ -2633,7 +2675,16 @@ impl BcodeRuntimeModel {
         (invalidation, Vec::new())
     }
 
-    #[allow(dead_code)]
+    async fn settle_plugin_operations(&mut self) -> Result<(), TuiError> {
+        for (plugin_id, action) in Box::pin(self.loop_state.settle_root_plugin_effects()).await? {
+            // Shutdown observes completions, but must not dispatch new navigation/commands.
+            if let bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome } = action {
+                self.plugin_surface_result = Some((plugin_id, outcome));
+            }
+        }
+        Ok(())
+    }
+
     pub fn shutdown_owned_work(&mut self) {
         self.loop_state.abort_all_effects();
         if let Some(event_task) = self.chat.event_task.take() {
@@ -3483,6 +3534,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             }
             bmux_tui_runtime::RuntimeEvent::Terminal(event)
             | bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Terminal(event)) => {
+                if self.return_from_borrowed_chat(&event) {
+                    return Ok(bmux_tui_runtime::Update::redraw());
+                }
                 if self.loop_state.has_interactive_surface() && !self.loop_state.modal_foreground()
                 {
                     if let Event::Key(stroke) = event
@@ -3673,11 +3727,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 let action = self
                     .loop_state
                     .poll_root_plugin_surface(&client, self.fresh_session_settings());
-                if self.loop_state.has_root_plugin_surface()
-                    && let Some(invalidation) = self.loop_state.root_plugin_surface_invalidation()
-                {
-                    invalidation.request();
-                }
+                // Surface/host invalidations and drain completion each request their own wakeup.
+                self.loop_state.verify_plugin_operations()?;
+                // Do not self-invalidate on every poll: that would spin while an effect is pending.
                 match action {
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome }) => {
                         if let Some((plugin_id, outcome)) = self
@@ -3864,10 +3916,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     self.handle_session_changed();
                 }
                 if let Some((session_id, navigation_result)) = navigation_result {
-                    let _completed = self
-                        .loop_state
-                        .complete_root_plugin_session_navigation(session_id, navigation_result);
-                    self.resume_screen_after_session_navigation();
+                    self.finish_plugin_session_attach(session_id, navigation_result);
                 } else {
                     let _invalidation = self.synchronize_screen();
                 }
@@ -3931,6 +3980,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             }
         };
         self.synchronize_composer_interaction();
+        self.loop_state.verify_plugin_operations()?;
         self.invalidation = self.invalidation.merge(damage);
         let route_invalidation = self.synchronize_screen();
         self.invalidation = self.invalidation.merge(route_invalidation);
@@ -3996,23 +4046,40 @@ pub async fn run<W: std::io::Write>(
     runtime: bmux_tui_runtime::Runtime<BcodeRuntimeModel, BcodeRuntimePresenter<'_, '_, W>>,
     handle: bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
 ) -> Result<BcodeRuntimeModel, TuiError> {
-    let input = bmux_tui_runtime::TerminalInput::start::<BcodeRuntimeModel>(
+    let mut input = bmux_tui_runtime::TerminalInput::start::<BcodeRuntimeModel>(
         handle,
         BcodeRuntimeMessage::TerminalInputFailed,
     );
-    let result = match Box::pin(runtime.run()).await {
-        Ok(output) => Ok(finish_runtime(output)),
+    let outcome = Box::pin(runtime.run()).await;
+    input.shutdown().await;
+    Box::pin(finish_runtime_result(outcome)).await
+}
+
+type RootRuntimeResult<P> = Result<
+    bmux_tui_runtime::RuntimeOutput<BcodeRuntimeModel, P>,
+    bmux_tui_runtime::RuntimeError<TuiError, TuiError, BcodeRuntimeModel, P>,
+>;
+
+async fn finish_runtime_result<P>(
+    outcome: RootRuntimeResult<P>,
+) -> Result<BcodeRuntimeModel, TuiError> {
+    match outcome {
+        Ok(mut output) => {
+            let settlement = Box::pin(output.program.settle_plugin_operations()).await;
+            let model = finish_runtime(output);
+            settlement.map(|()| model)
+        }
         Err(
             bmux_tui_runtime::RuntimeError::Program { error, mut output }
             | bmux_tui_runtime::RuntimeError::Presenter { error, mut output },
         ) => {
             record_runtime_stats(&mut output.program, &output.stats);
+            let settlement = Box::pin(output.program.settle_plugin_operations()).await;
             output.program.shutdown_owned_work();
-            Err(error)
+            // Preserve terminal failure unless settlement itself could not be verified.
+            settlement.and(Err(error))
         }
-    };
-    input.request_shutdown();
-    result
+    }
 }
 
 /// Construct the root runtime and its bounded admission handle.
@@ -5627,7 +5694,7 @@ mod tests {
         };
         use bcode_session_models::{ClientId, SessionHistoryDirection, SessionHistoryQuery};
 
-        let directory = tempfile::tempdir().expect("isolated state");
+        let directory = std::sync::Arc::new(tempfile::tempdir().expect("isolated state"));
         let state_root = directory.path().join("state");
         std::fs::create_dir(&state_root).expect("state directory");
         let locations = bcode_config::resolve_state_location_set_with_environment(
@@ -5642,33 +5709,96 @@ mod tests {
             ),
         )
         .expect("resolve isolated state");
-        let sessions =
-            bcode_session::SessionManager::persistent(locations.primary().sessions_root())
-                .expect("persistent sessions");
-        let session = sessions
-            .create_session(None, directory.path().to_path_buf())
-            .await
-            .expect("session");
-        let client_id = ClientId::new();
-        for index in 0..1_100 {
-            sessions
-                .append_user_message(session.id, client_id, format!("archived {index}"))
-                .await
-                .expect("persist user message");
-        }
-        let recent = sessions
-            .session_history_page(
-                session.id,
-                SessionHistoryQuery {
-                    cursor: None,
-                    limit: 12,
-                    direction: SessionHistoryDirection::Backward,
-                },
+        let sessions_root = locations.primary().sessions_root().to_path_buf();
+        let working_directory = directory.path().to_path_buf();
+        let handle = tokio::runtime::Handle::current();
+        let fixture_owner = std::sync::Arc::clone(&directory);
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let mut fixture = tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                // The worker retains the directory even if its caller times out or panics.
+                // Cancellation is observed between settled domain writes, never mid-append.
+                let sessions = bcode_session::SessionManager::persistent(sessions_root)
+                    .expect("persistent sessions");
+                let session = sessions
+                    .create_session(None, working_directory)
+                    .await
+                    .expect("session");
+                let ownership = sessions
+                    .acquire_session_ownership(
+                        session.id,
+                        bcode_session::SessionOwnershipKind::RuntimeWork,
+                    )
+                    .await
+                    .expect("fixture write ownership");
+                // Retaining canonical ownership avoids reopening/validating the database for
+                // each of the 1100 writes. All events still use the normal typed append API.
+                let client_id = ClientId::new();
+                for index in 0..1_100 {
+                    if worker_cancellation.load(std::sync::atomic::Ordering::Acquire) {
+                        drop(ownership);
+                        sessions
+                            .release_idle_session_resources(session.id)
+                            .await
+                            .expect("release cancelled fixture ownership");
+                        drop(sessions);
+                        drop(fixture_owner);
+                        return None;
+                    }
+                    sessions
+                        .append_user_message(session.id, client_id, format!("archived {index}"))
+                        .await
+                        .expect("persist user message");
+                }
+                let recent = sessions
+                    .session_history_page(
+                        session.id,
+                        SessionHistoryQuery {
+                            cursor: None,
+                            limit: 12,
+                            direction: SessionHistoryDirection::Backward,
+                        },
+                    )
+                    .await
+                    .expect("recent bounded history")
+                    .events;
+                drop(ownership);
+                sessions
+                    .release_idle_session_resources(session.id)
+                    .await
+                    .expect("release completed fixture ownership");
+                drop(sessions);
+                drop(fixture_owner);
+                Some((session, recent))
+            })
+        });
+        let (session, recent) = if let Ok(result) =
+            // Fixture writes measured up to 139s under shared validation load. This is a
+            // setup deadline, not a traversal or product latency contract.
+            tokio::time::timeout(
+                std::time::Duration::from_mins(5),
+                &mut fixture,
             )
             .await
-            .expect("recent bounded history")
-            .events;
-        drop(sessions);
+        {
+            result
+                .expect("fixture worker completed")
+                .expect("fixture not cancelled")
+        } else {
+            cancellation.store(true, std::sync::atomic::Ordering::Release);
+            // Drain the current append and ownership release before reporting timeout.
+            // If settlement stalls, the detached worker still owns the temporary root.
+            let settled =
+                tokio::time::timeout(std::time::Duration::from_secs(10), &mut fixture).await;
+            assert!(
+                settled.is_ok(),
+                "fixture cancellation did not settle; worker retains its isolated root"
+            );
+            panic!(
+                "bounded 1100-event history fixture initialization exceeded 300 seconds after retaining write ownership"
+            );
+        };
         let mut model = root_test_model_with_history(session.id, &recent);
         model
             .chat
@@ -12287,15 +12417,153 @@ mod tests {
                 .suspend_root_plugin_surface_for_session(session_id)
         );
         assert_eq!(model.screen, super::BcodeRuntimeScreen::Chat);
-        assert!(
-            model
-                .loop_state
-                .complete_root_plugin_session_navigation(session_id, Ok(()))
-        );
-        model.resume_screen_after_session_navigation();
+        model.finish_plugin_session_attach(session_id, Ok(()));
+        let _damage = model.synchronize_screen();
+        assert_eq!(model.screen, super::BcodeRuntimeScreen::Chat);
+        assert!(model.loop_state.root_plugin_surface_is_suspended());
+        assert!(model.loop_state.root_plugin_session_is_attached());
+        assert!(!model.chat.app.should_exit());
+        let _update = bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Char('d'),
+                    modifiers: bmux_keyboard::Modifiers {
+                        ctrl: true,
+                        ..bmux_keyboard::Modifiers::NONE
+                    },
+                },
+            )),
+        )
+        .expect("borrowed chat return is admitted without setting exit");
 
         assert_eq!(model.screen, super::BcodeRuntimeScreen::PluginSurface);
+        assert!(!model.loop_state.root_plugin_surface_is_suspended());
+        assert!(!model.loop_state.root_plugin_session_is_attached());
+        assert!(!model.chat.app.should_exit());
         drop(model);
+    }
+
+    struct ShutdownSurface {
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        commits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for ShutdownSurface {
+        fn id(&self) -> &'static str {
+            "shutdown-test"
+        }
+        fn title(&self) -> &'static str {
+            "Shutdown"
+        }
+        fn render(
+            &mut self,
+            _area: bmux_tui::geometry::Rect,
+            _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+        ) {
+        }
+        fn handle_event(
+            &mut self,
+            _event: &bmux_tui::event::Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        }
+        fn drain_effects<'a>(
+            &'a mut self,
+            _host: &'a dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = bcode_plugin_sdk::tui::PluginTuiAction>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.release
+                    .take()
+                    .expect("accepted operation")
+                    .await
+                    .expect("release");
+                self.commits
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                bcode_plugin_sdk::tui::PluginTuiAction::Close {
+                    outcome: Some(serde_json::json!({"settled": true})),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn root_shutdown_waits_for_plugin_results_on_normal_and_fatal_exit() {
+        for exit in ["normal", "program", "presenter"] {
+            let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, receiver) = tokio::sync::oneshot::channel();
+            let mut outcome = Some({
+                let mut retained_model = Some(root_test_model());
+                {
+                    let model = retained_model.as_mut().expect("fixture model available");
+                    model.queue_plugin_surface(
+                        "test",
+                        Box::new(ShutdownSurface {
+                            release: Some(receiver),
+                            commits: commits.clone(),
+                        }),
+                    );
+                    let client = bcode_client::BcodeClient::default_endpoint();
+                    let launch = model.fresh_session_settings();
+                    let _action = model.loop_state.poll_root_plugin_surface(&client, launch);
+                }
+                let output = bmux_tui_runtime::RuntimeOutput {
+                    program: retained_model
+                        .take()
+                        .expect("fixture model transfers to runtime"),
+                    presenter: (),
+                    stats: bmux_tui_runtime::RuntimeStats::default(),
+                };
+                drop(retained_model);
+                match exit {
+                    "program" => Err(bmux_tui_runtime::RuntimeError::Program {
+                        error: std::io::Error::other("terminal input failed").into(),
+                        output,
+                    }),
+                    "presenter" => Err(bmux_tui_runtime::RuntimeError::Presenter {
+                        error: std::io::Error::other("terminal writer failed").into(),
+                        output,
+                    }),
+                    _ => Ok(output),
+                }
+            });
+            let finish = super::finish_runtime_result(
+                outcome
+                    .take()
+                    .expect("runtime outcome transfers to settlement"),
+            );
+            drop(outcome);
+            tokio::pin!(finish);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut finish)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(commits.load(std::sync::atomic::Ordering::SeqCst), 0);
+            release.send(()).expect("accepted operation still owned");
+            let result = finish.await;
+            assert_eq!(commits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            if exit == "normal" {
+                let mut model = result.expect("normal shutdown observes outcome");
+                assert_eq!(
+                    model.take_plugin_surface_result(),
+                    Some((
+                        "test".to_string(),
+                        Some(serde_json::json!({"settled": true}))
+                    ))
+                );
+                drop(model);
+            } else {
+                assert!(result.is_err());
+                drop(result);
+            }
+        }
     }
 
     #[tokio::test]

@@ -82,7 +82,7 @@ enum WorktreeCliBaseRef {
 
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: true,
+        requires_daemon: |_| true,
         command: WorktreeCli::command,
         invoke,
     }

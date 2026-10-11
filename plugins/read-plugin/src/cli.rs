@@ -37,7 +37,7 @@ enum ReadSource {
 
 pub(crate) fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: false,
+        requires_daemon: |_| false,
         command: ReadCli::command,
         invoke,
     }
