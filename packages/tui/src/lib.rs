@@ -51,6 +51,8 @@ mod quick_onboarding;
 pub use quick_onboarding::{
     QuickConnectionChoice, QuickOnboardingInput, QuickOnboardingOutcome, run_quick_onboarding,
 };
+pub(crate) mod composer_interaction;
+pub(crate) mod composer_interaction_render;
 mod onboarding_program;
 pub(crate) mod onboarding_render;
 pub(crate) mod palette_flow;

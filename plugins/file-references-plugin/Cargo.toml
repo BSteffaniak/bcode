@@ -1,0 +1,26 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Plugin-owned file path references for the Bcode composer"
+edition     = { workspace = true }
+keywords    = ["bcode", "plugin", "completion", "paths"]
+license     = { workspace = true }
+name        = "bcode_file_references_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_filesystem_plugin = { workspace = true }
+bcode_plugin_sdk        = { workspace = true }
+bcode_tool              = { workspace = true }
+serde                   = { workspace = true, features = ["derive", "std"] }
+serde_json              = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = ["bcode_plugin_sdk/tui"]

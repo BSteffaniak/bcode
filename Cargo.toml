@@ -4,6 +4,7 @@ members = [
     "examples/hello-plugin",
     "examples/question-dynamic-plugin",
     "plugins/filesystem-plugin",
+    "plugins/file-references-plugin",
     "plugins/git-plugin",
     "plugins/code-review-plugin",
     "plugins/eval-plugin",
@@ -186,6 +187,7 @@ bcode_eval                              = { version = "0.0.1-alpha.0", default-f
 bcode_eval_models                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/eval/models" }
 bcode_eval_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/eval-plugin" }
 bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
+bcode_file_references_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/file-references-plugin" }
 bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin" }
 bcode_git_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/git-plugin" }
 bcode_github_review_publisher_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/github-review-publisher-plugin" }

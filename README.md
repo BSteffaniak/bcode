@@ -102,6 +102,7 @@ Start with the [plugin guide](docs/plugins.md) and the [dynamic plugin example](
 
 * [Rust SDK](docs/sdk.md)
 * [Plugins](docs/plugins.md)
+* [Composer file references](docs/composer-file-references.md)
 * [Model provider contract](docs/model-provider-contract.md)
 * [Frontend contracts](docs/frontend-contracts.md)
 

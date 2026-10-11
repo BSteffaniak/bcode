@@ -621,6 +621,9 @@ pub struct PluginManifest {
     pub services: Vec<PluginService>,
     #[serde(default)]
     pub tui_surfaces: Vec<PluginTuiSurfaceDeclaration>,
+    /// Generic composer routes. Missing collections preserve legacy manifests.
+    #[serde(default)]
+    pub composer_contributions: Vec<bcode_plugin_models::composer::ComposerContribution>,
     #[serde(default)]
     pub visual_adapters: Vec<PluginVisualAdapterDeclaration>,
     #[serde(default)]
@@ -843,7 +846,14 @@ pub struct PluginService {
     /// Concise workflow authoring actions contributed by this service.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_authoring_actions: Vec<bcode_workflow::WorkflowAuthoringActionDescriptor>,
-    /// Operations this service explicitly exposes to active tool invocations.
+    /// Exact operations this service declares eligible for invocation-bound routing,
+    /// including contextual nested service requests. Missing/empty lists expose none.
+    ///
+    /// This is routing metadata, not resource authorization or a read-only promise.
+    /// Hosts validate declarations and apply the active scope's capability ceiling;
+    /// workspace access still requires a separate host-authorized discovery grant.
+    /// Declaring an operation does not grant writes, execution or arbitrary nesting.
+    /// Scheduling `class` metadata must not be used to infer authorization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invocation_operations: Vec<String>,
 }
@@ -1091,6 +1101,54 @@ pub fn plugin_command_contributions(
                 })
                 .collect::<Vec<_>>()
         })
+        .collect()
+}
+
+/// Return supported manifest composer contributions for registered (enabled) plugins.
+/// Invalid, unsupported and duplicate contribution IDs are omitted, failing closed.
+#[must_use]
+pub fn plugin_composer_contributions(
+    plugins: &[RegisteredPlugin],
+) -> Vec<bcode_plugin_models::composer::PluginOwnedComposerContribution> {
+    let mut contributions = Vec::new();
+    for plugin in plugins {
+        contributions.extend(owned_composer_contributions(&plugin.manifest));
+    }
+    contributions.sort_by(|left, right| {
+        left.contribution
+            .priority
+            .cmp(&right.contribution.priority)
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+            .then_with(|| left.contribution.id.cmp(&right.contribution.id))
+    });
+    contributions
+}
+
+fn owned_composer_contributions(
+    manifest: &PluginManifest,
+) -> Vec<bcode_plugin_models::composer::PluginOwnedComposerContribution> {
+    manifest
+        .composer_contributions
+        .iter()
+        .filter(|contribution| {
+            contribution.is_supported()
+                && manifest
+                    .services
+                    .iter()
+                    .any(|service| service.interface_id == contribution.service_interface_id)
+                && manifest
+                    .composer_contributions
+                    .iter()
+                    .filter(|other| other.id == contribution.id)
+                    .count()
+                    == 1
+        })
+        .map(
+            |contribution| bcode_plugin_models::composer::PluginOwnedComposerContribution {
+                plugin_id: manifest.id.clone(),
+                contribution: contribution.clone(),
+            },
+        )
         .collect()
 }
 
@@ -3584,6 +3642,26 @@ impl PluginRegistry {
                     .map(move |template| (plugin_id.as_str(), template))
             })
             .collect()
+    }
+
+    /// Supported composer routes for enabled plugins in deterministic precedence order.
+    #[must_use]
+    pub fn composer_contributions(
+        &self,
+    ) -> Vec<bcode_plugin_models::composer::PluginOwnedComposerContribution> {
+        let mut contributions: Vec<_> = self
+            .manifests
+            .values()
+            .flat_map(owned_composer_contributions)
+            .collect();
+        contributions.sort_by(|left, right| {
+            left.contribution
+                .priority
+                .cmp(&right.contribution.priority)
+                .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+                .then_with(|| left.contribution.id.cmp(&right.contribution.id))
+        });
+        contributions
     }
 
     /// Return declared TUI surfaces for one plugin.
@@ -6880,6 +6958,7 @@ library = "libauth_test.dylib"
             name: "Example".to_string(),
             version: Version::new(0, 1, 0),
             services: Vec::new(),
+            composer_contributions: Vec::new(),
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
@@ -6929,6 +7008,7 @@ library = "libauth_test.dylib"
             name: "Invalid".to_string(),
             version: Version::new(0, 1, 0),
             services: Vec::new(),
+            composer_contributions: Vec::new(),
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
@@ -11407,6 +11487,7 @@ library = "libexample_plugin.dylib"
                     invocation_operations: Vec::new(),
                 }],
                 tui_surfaces: Vec::new(),
+                composer_contributions: Vec::new(),
                 visual_adapters: Vec::new(),
                 tool_presentations: Vec::new(),
                 keymap_actions: Vec::new(),
@@ -12365,6 +12446,47 @@ library = "libexample_plugin.dylib"
         assert_eq!(registry.keymap_actions_page(None, 0).actions.len(), 1);
     }
 
+    #[test]
+    fn composer_discovery_is_compatible_and_fails_closed() {
+        use bcode_plugin_models::composer::{COMPOSER_INTERFACE_ID, ComposerContribution};
+        let mut manifest = test_manifest("example.topics");
+        let legacy_json = serde_json::to_value(&manifest).unwrap();
+        let mut legacy_json = legacy_json;
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("composer_contributions");
+        let legacy: PluginManifest = serde_json::from_value(legacy_json).unwrap();
+        assert!(legacy.composer_contributions.is_empty());
+        manifest.services[0].interface_id = COMPOSER_INTERFACE_ID.into();
+        manifest.composer_contributions.push(ComposerContribution {
+            id: "topics".into(),
+            activation_kind: "example.topic".into(),
+            service_interface_id: COMPOSER_INTERFACE_ID.into(),
+            priority: 3,
+        });
+        let owned = owned_composer_contributions(&manifest);
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].plugin_id, "example.topics");
+        let roundtrip: PluginManifest =
+            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.composer_contributions,
+            manifest.composer_contributions
+        );
+        manifest
+            .composer_contributions
+            .push(manifest.composer_contributions[0].clone());
+        assert!(owned_composer_contributions(&manifest).is_empty());
+        manifest.composer_contributions.pop();
+        manifest.composer_contributions[0].service_interface_id = "bcode.composer/v2".into();
+        assert!(owned_composer_contributions(&manifest).is_empty());
+        manifest.composer_contributions[0].service_interface_id = COMPOSER_INTERFACE_ID.into();
+        manifest.services.clear();
+        assert!(owned_composer_contributions(&manifest).is_empty());
+        assert!(plugin_composer_contributions(&[]).is_empty());
+    }
+
     fn test_manifest(id: &str) -> PluginManifest {
         PluginManifest {
             config: None,
@@ -12382,6 +12504,7 @@ library = "libexample_plugin.dylib"
                 invocation_operations: Vec::new(),
             }],
             tui_surfaces: Vec::new(),
+            composer_contributions: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
             keymap_actions: Vec::new(),

@@ -1,0 +1,25 @@
+id      = "bcode.file-references"
+name    = "Bcode File References Plugin"
+version = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Bounded path-only composer completion via authorized daemon filesystem discovery"
+interface_id = "bcode.composer/v1"
+name         = "File References"
+
+[[composer_contributions]]
+activation_kind      = "bcode.file-references.path"
+id                   = "paths"
+priority             = 100
+service_interface_id = "bcode.composer/v1"
+
+[config]
+categories = ["composer"]
+section    = "file_references"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_file_references_plugin.dylib"
+type         = "native"

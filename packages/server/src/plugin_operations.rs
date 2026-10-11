@@ -132,6 +132,7 @@ pub fn list_contributions(state: &ServerState) -> bcode_plugin_sdk::PluginContri
         command_contributions,
         commands: state.plugins.command_contributions(),
         config_extensions: state.plugins.config_extensions(),
+        composer_contributions: state.plugins.registry().composer_contributions(),
     }
 }
 

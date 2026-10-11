@@ -190,6 +190,10 @@ static-bundled-fake-provider-plugin = [
     "dep:bcode_fake_provider_plugin",
     "bcode_bundled_plugins/static-bundled-fake-provider-plugin",
 ]
+static-bundled-file-references-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-file-references-plugin",
+]
 static-bundled-filesystem-plugin = [
     "bundled-plugins",
     "cli",

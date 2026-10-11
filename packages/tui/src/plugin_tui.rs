@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+static NEXT_PRESENTATION_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
 const MAX_DYNAMIC_VISUAL_CACHE_ENTRIES: usize = 512;
 const DYNAMIC_VISUAL_QUEUE_CAPACITY: usize = 64;
 const DYNAMIC_VISUAL_COMPLETION_CAPACITY: usize =
@@ -63,6 +65,25 @@ impl PresentationPluginBackend {
         match self {
             Self::Synchronous(host) => host.tool_presentation(tool_name),
             Self::Runtime(runtime) => runtime.tool_presentation(tool_name),
+        }
+    }
+
+    fn composer_contributions(
+        &self,
+    ) -> Vec<bcode_plugin_sdk::composer::PluginOwnedComposerContribution> {
+        match self {
+            Self::Synchronous(host) => {
+                let plugins = host
+                    .loaded_plugins()
+                    .iter()
+                    .map(|plugin| bcode_plugin::RegisteredPlugin {
+                        manifest_path: std::path::PathBuf::new(),
+                        manifest: plugin.manifest().clone(),
+                    })
+                    .collect::<Vec<_>>();
+                bcode_plugin::plugin_composer_contributions(&plugins)
+            }
+            Self::Runtime(runtime) => runtime.registry().composer_contributions(),
         }
     }
 
@@ -371,6 +392,7 @@ pub struct PluginVisualDiagnostic {
 /// later render passes consume.
 #[derive(Debug)]
 pub struct PluginTuiPresentation {
+    composer_identity: u64,
     backend: PresentationPluginBackend,
     visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
     registry_factories: BTreeMap<String, bcode_plugin_sdk::tui::PluginTuiRegistryFactory>,
@@ -457,6 +479,7 @@ impl PluginTuiPresentation {
             .collect();
         let dynamic_visuals = Mutex::new(DynamicVisualCoordinator::new(backend.clone()));
         Self {
+            composer_identity: NEXT_PRESENTATION_IDENTITY.fetch_add(1, Ordering::Relaxed),
             backend,
             visual_adapter_config,
             registry_factories,
@@ -597,6 +620,12 @@ impl PluginTuiPresentation {
         self.backend.tool_presentation(tool_name)
     }
 
+    /// Lifetime identity independent of allocation-address reuse.
+    #[must_use]
+    pub(crate) const fn composer_identity(&self) -> u64 {
+        self.composer_identity
+    }
+
     /// Return the full presentation generation for registry/adapter replacement.
     #[must_use]
     pub fn revision(&self) -> u64 {
@@ -710,6 +739,43 @@ impl PluginTuiPresentation {
         } else {
             Err("visual adapter rejected presentation configuration".to_owned())
         }
+    }
+
+    /// Activate the first compatible enabled composer contributor in manifest priority order.
+    /// Local adapters perform no IO; missing native adapters leave ordinary input available.
+    pub(crate) fn activate_composer(
+        &self,
+        document: &bcode_plugin_sdk::composer::ComposerDocument,
+    ) -> Option<(
+        bcode_plugin_sdk::composer::PluginOwnedComposerContribution,
+        bcode_plugin_sdk::composer::ComposerActivation,
+    )> {
+        self.backend
+            .composer_contributions()
+            .into_iter()
+            .find_map(|route| {
+                let registry = self.registry(&route.plugin_id)?;
+                let activation = registry
+                    .composer_registry()
+                    .activate(&route.contribution.activation_kind, document)
+                    .ok()??;
+                Some((route, activation))
+            })
+    }
+
+    /// Re-run only the contributor that requested continuation, if it is still enabled.
+    pub(crate) fn reactivate_composer(
+        &self,
+        route: &bcode_plugin_sdk::composer::PluginOwnedComposerContribution,
+        document: &bcode_plugin_sdk::composer::ComposerDocument,
+    ) -> Option<bcode_plugin_sdk::composer::ComposerActivation> {
+        if !self.backend.composer_contributions().contains(route) {
+            return None;
+        }
+        self.registry(&route.plugin_id)?
+            .composer_registry()
+            .activate(&route.contribution.activation_kind, document)
+            .ok()?
     }
 
     /// Return one retained native TUI registry.
@@ -2514,6 +2580,51 @@ library = "libdynamic_visual_test.dylib"
             .expect("recovered visual");
         drop(presentation);
         assert!(!routed_text(&recovered).contains("Artifact replay failed"));
+    }
+
+    #[test]
+    fn unadvertised_composer_adapter_cannot_activate_and_registry_lifetimes_are_distinct() {
+        struct Topics;
+        impl bcode_plugin_sdk::composer::PluginComposerContributor for Topics {
+            fn kind(&self) -> &'static str {
+                "example.topic"
+            }
+            fn activate(
+                &self,
+                document: &bcode_plugin_sdk::composer::ComposerDocument,
+            ) -> Option<bcode_plugin_sdk::composer::ComposerActivation> {
+                Some(bcode_plugin_sdk::composer::ComposerActivation {
+                    range: bcode_plugin_sdk::composer::ComposerTextRange {
+                        start: 0,
+                        end: document.text.len(),
+                    },
+                    query: document.text.clone(),
+                })
+            }
+        }
+        let presentation = test_presentation();
+        let mut registry = PluginTuiRegistry::default();
+        registry
+            .register_composer_contributor(Box::new(Topics))
+            .unwrap();
+        presentation.install_registry_for_test("bcode.shell", registry);
+        let document = bcode_plugin_sdk::composer::ComposerDocument {
+            document_id: "fake-document".into(),
+            revision: 0,
+            text: "#topic".into(),
+            cursor: 6,
+            selection: None,
+        };
+        // A native adapter alone is not an enabled manifest contribution.
+        assert!(presentation.activate_composer(&document).is_none());
+        let replacement = test_presentation();
+        assert_ne!(
+            presentation.composer_identity(),
+            replacement.composer_identity()
+        );
+        drop(presentation);
+        assert!(replacement.activate_composer(&document).is_none());
+        drop(replacement);
     }
 
     fn test_presentation() -> PluginTuiPresentation {

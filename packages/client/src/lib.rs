@@ -8,6 +8,7 @@ mod generation;
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
+mod contextual;
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
     LocalIpcStream, PluginServiceResponse, PluginServiceSummary, Request, Response,
@@ -1679,6 +1680,7 @@ pub struct BcodeClient {
     connect_timeout: Duration,
     startup_timeout: Duration,
     startup_gate: Arc<tokio::sync::Mutex<()>>,
+    contextual_invocations: contextual::Controls,
     request_timeout: Duration,
 }
 
@@ -2070,6 +2072,7 @@ impl BcodeClient {
             connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
             startup_timeout: DEFAULT_CLIENT_DAEMON_START_TIMEOUT,
             startup_gate: Arc::new(tokio::sync::Mutex::new(())),
+            contextual_invocations: contextual::Controls::default(),
             request_timeout: configured_request_timeout(),
         }
     }
@@ -2086,6 +2089,7 @@ impl BcodeClient {
             connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
             startup_timeout: DEFAULT_CLIENT_DAEMON_START_TIMEOUT,
             startup_gate: Arc::new(tokio::sync::Mutex::new(())),
+            contextual_invocations: contextual::Controls::default(),
             request_timeout: DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT,
         }
     }
@@ -7597,11 +7601,36 @@ impl BcodeClient {
         }
     }
 
-    /// Invoke a loaded daemon plugin service by explicit plugin ID.
+    /// Invoke a plugin through a workspace-authorized, cancellable daemon scope.
     ///
     /// # Errors
+    /// Returns transport, context, authorization or invocation errors.
+    pub async fn invoke_plugin_service_contextual(
+        &self,
+        context: bcode_ipc::PluginServiceContext,
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    ) -> Result<PluginServiceResponse, ClientError> {
+        contextual::invoke(self, context, plugin_id, interface_id, operation, payload).await
+    }
+
+    /// Cancel this client's contextual invocation; stale or foreign IDs return false.
     ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
+    /// # Errors
+    /// Returns transport errors or an unexpected daemon response.
+    pub async fn cancel_plugin_service_invocation(
+        &self,
+        invocation_id: String,
+    ) -> Result<bool, ClientError> {
+        contextual::cancel(self, &invocation_id).await
+    }
+
+    /// Invoke a loaded daemon plugin service without workspace capabilities.
+    ///
+    /// # Errors
+    /// Returns transport errors or a daemon rejection.
     pub async fn invoke_plugin_service(
         &self,
         plugin_id: String,

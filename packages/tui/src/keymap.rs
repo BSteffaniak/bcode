@@ -363,6 +363,18 @@ fn register_host_actions(
     Ok(())
 }
 fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option<Vec<&'a str>> {
+    if scope == "composer_interaction"
+        && !matches!(
+            id,
+            "tui.control.cancel"
+                | "tui.control.submit"
+                | "tui.control.up"
+                | "tui.control.down"
+                | "tui.control.focus_next"
+        )
+    {
+        return None;
+    }
     if id == "tui.control.toggle"
         && matches!(
             scope,
@@ -426,6 +438,7 @@ fn register_control_actions(
     use bcode_plugin_sdk::tui::keymap::KeymapAction;
 
     for scope in [
+        "composer_interaction",
         "provider_picker",
         "model_picker_actions",
         "model_picker",

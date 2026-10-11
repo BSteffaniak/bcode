@@ -14,6 +14,7 @@ mod batch_request;
 mod confined;
 #[cfg(unix)]
 mod coordination;
+pub mod path_search;
 mod replacement;
 mod write_receipt;
 
@@ -328,6 +329,7 @@ fn invoke_filesystem_service(context: &NativeServiceContext) -> ServiceResponse 
         None
     };
     match request.operation.as_str() {
+        path_search::OP_SEARCH_PATHS => path_search::invoke(context),
         "read" => read_file(request),
         "write" => write_file(request),
         "edit" => edit_file(request),

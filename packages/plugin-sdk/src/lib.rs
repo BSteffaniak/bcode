@@ -6,6 +6,7 @@
 //! Plugin author SDK for Bcode native plugins.
 
 pub mod auxiliary_generation;
+pub mod composer;
 pub mod generation;
 pub mod interaction;
 pub mod milestones;
@@ -18,6 +19,8 @@ pub mod static_lifecycle;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod tui_visual;
+pub mod workspace_access;
+pub use workspace_access::WorkspaceContext;
 
 pub use bcode_agent_profile::{ToolPolicyIdentity, ToolPolicyOperation, ToolPolicyPreparation};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -43,6 +46,9 @@ pub struct PluginContributions {
     pub command_contributions: Vec<bcode_command::CommandContribution>,
     #[serde(default)]
     pub config_extensions: Vec<bcode_plugin_models::PluginConfigExtension>,
+    /// Enabled plugins' renderer-neutral composer declarations.
+    #[serde(default)]
+    pub composer_contributions: Vec<bcode_plugin_models::composer::PluginOwnedComposerContribution>,
 }
 
 /// Versioned application service for generic session derivation operations.
@@ -2949,6 +2955,11 @@ pub mod prelude {
         PluginSessionViewUpdate, PluginTuiAction, PluginTuiHost, PluginTuiHostError,
         PluginTuiRegistry, PluginTuiSurface, PluginTuiSurfaceFactory, PluginTuiSurfaceOpenRequest,
         TokioPluginTuiHost,
+    };
+    pub use crate::workspace_access::{
+        OP_WORKSPACE_ACCESS_AUTHORIZE, OP_WORKSPACE_RESOURCE_AUTHORIZE,
+        WORKSPACE_ACCESS_INTERFACE_ID, WorkspaceAccessGrant, WorkspaceAccessRequest,
+        WorkspaceContext, WorkspaceResourceGrant, WorkspaceResourceRequest,
     };
     pub use crate::{
         AuthRegistrar, CURRENT_PLUGIN_ABI_VERSION, CommandRegistrar, ConcurrentRustPlugin,

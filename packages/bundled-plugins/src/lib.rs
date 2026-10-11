@@ -25,6 +25,11 @@ pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExte
         "bcode.eval",
         bcode_eval_plugin::tui::tui_registry,
     ));
+    #[cfg(feature = "static-bundled-file-references-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.file-references",
+        bcode_file_references_plugin::file_references_tui_registry,
+    ));
     #[cfg(feature = "static-bundled-filesystem-plugin")]
     extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
         "bcode.filesystem",
@@ -80,6 +85,27 @@ pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExte
         "bcode.shell",
         bcode_shell_plugin::shell_tui_registry,
     ));
+    #[cfg(any(
+        feature = "static-bundled-skills-plugin",
+        feature = "static-bundled-vim-edit-plugin",
+        feature = "static-bundled-web-search-plugin",
+        feature = "static-bundled-workflow-plugin",
+        feature = "static-bundled-worktree-plugin"
+    ))]
+    append_workspace_tui_extensions(&mut extensions);
+    extensions
+}
+
+#[cfg(any(
+    feature = "static-bundled-skills-plugin",
+    feature = "static-bundled-vim-edit-plugin",
+    feature = "static-bundled-web-search-plugin",
+    feature = "static-bundled-workflow-plugin",
+    feature = "static-bundled-worktree-plugin"
+))]
+fn append_workspace_tui_extensions(
+    extensions: &mut Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension>,
+) {
     #[cfg(feature = "static-bundled-skills-plugin")]
     extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
         "bcode.skills",
@@ -105,7 +131,6 @@ pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExte
         "bcode.worktree",
         bcode_worktree_plugin::worktree_tui_registry,
     ));
-    extensions
 }
 
 /// Return a native TUI registry for one enabled statically bundled plugin.
@@ -119,6 +144,10 @@ pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiR
         "bcode.document" => Some(bcode_document_plugin::document_tui_registry()),
         #[cfg(feature = "static-bundled-eval-plugin")]
         "bcode.eval" => Some(bcode_eval_plugin::tui::tui_registry()),
+        #[cfg(feature = "static-bundled-file-references-plugin")]
+        "bcode.file-references" => {
+            Some(bcode_file_references_plugin::file_references_tui_registry())
+        }
         #[cfg(feature = "static-bundled-filesystem-plugin")]
         "bcode.filesystem" => Some(bcode_filesystem_plugin::filesystem_tui_registry()),
         #[cfg(feature = "static-bundled-git-plugin")]
@@ -243,6 +272,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(ocr_plugin());
     #[cfg(feature = "static-bundled-fake-provider-plugin")]
     plugins.push(fake_provider_plugin());
+    #[cfg(feature = "static-bundled-file-references-plugin")]
+    plugins.push(file_references_plugin());
     #[cfg(feature = "static-bundled-filesystem-plugin")]
     plugins.push(filesystem_plugin());
     #[cfg(feature = "static-bundled-git-plugin")]
@@ -364,6 +395,14 @@ fn fake_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
         bcode_fake_provider_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-file-references-plugin")]
+fn file_references_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/file-references-plugin/bcode-plugin.toml"),
+        bcode_file_references_plugin::static_plugin(),
     )
 }
 
@@ -1186,6 +1225,75 @@ mod tests {
             selected
                 .iter()
                 .all(|(manifest, _)| manifest.id != "bcode.vim-edit")
+        );
+    }
+
+    #[cfg(feature = "static-bundled-file-references-plugin")]
+    #[test]
+    fn file_references_default_activation_and_explicit_disable() {
+        let plugins = super::static_bundled_plugins();
+        let defaults = bcode_plugin::static_bundled_default_plugin_ids(&plugins)
+            .expect("bundled manifests parse");
+        assert!(defaults.iter().any(|id| id == "bcode.file-references"));
+        let config = bcode_config::BcodeConfig::default();
+        let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
+        let selected = bcode_plugin::filter_selected_static_plugins(&plugins, &selection)
+            .expect("selected bundled plugins");
+        let host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+            .expect("default plugin activation");
+        assert!(
+            bcode_plugin::plugin_composer_contributions(
+                &host
+                    .loaded_plugins()
+                    .iter()
+                    .map(|plugin| bcode_plugin::RegisteredPlugin {
+                        manifest_path: std::path::PathBuf::new(),
+                        manifest: plugin.manifest().clone()
+                    })
+                    .collect::<Vec<_>>()
+            )
+            .iter()
+            .any(|route| route.plugin_id == "bcode.file-references")
+        );
+        let registry =
+            super::tui_registry("bcode.file-references").expect("bundled activation adapter");
+        let document = bcode_plugin_sdk::composer::ComposerDocument {
+            document_id: "bundle-test".into(),
+            revision: 0,
+            text: "@src".into(),
+            cursor: 4,
+            selection: None,
+        };
+        assert!(
+            registry
+                .composer_registry()
+                .activate(bcode_file_references_plugin::ACTIVATION_KIND, &document,)
+                .expect("valid bundled activation")
+                .is_some()
+        );
+        let mut config = config;
+        config
+            .plugins
+            .disabled
+            .insert("bcode.file-references".into());
+        let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
+        let selected = bcode_plugin::filter_selected_static_plugins(&plugins, &selection)
+            .expect("disabled bundled plugins");
+        let host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+            .expect("disabled plugin selection");
+        assert!(
+            bcode_plugin::plugin_composer_contributions(
+                &host
+                    .loaded_plugins()
+                    .iter()
+                    .map(|plugin| bcode_plugin::RegisteredPlugin {
+                        manifest_path: std::path::PathBuf::new(),
+                        manifest: plugin.manifest().clone()
+                    })
+                    .collect::<Vec<_>>()
+            )
+            .iter()
+            .all(|route| route.plugin_id != "bcode.file-references")
         );
     }
 

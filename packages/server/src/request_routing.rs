@@ -930,6 +930,16 @@ pub enum AgentSkillPluginRequest {
     },
     ListPluginServices,
     ListPluginContributions,
+    InvokePluginServiceContextual {
+        context: bcode_ipc::PluginServiceContext,
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    },
+    CancelPluginServiceInvocation {
+        invocation_id: String,
+    },
     InvokePluginService {
         plugin_id: String,
         interface_id: String,
@@ -1886,6 +1896,24 @@ impl RoutedRequest {
             }
             Request::ListPluginContributions => {
                 Self::AgentSkillPlugin(AgentSkillPluginRequest::ListPluginContributions)
+            }
+            Request::InvokePluginServiceContextual {
+                context,
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+            } => Self::AgentSkillPlugin(AgentSkillPluginRequest::InvokePluginServiceContextual {
+                context,
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+            }),
+            Request::CancelPluginServiceInvocation { invocation_id } => {
+                Self::AgentSkillPlugin(AgentSkillPluginRequest::CancelPluginServiceInvocation {
+                    invocation_id,
+                })
             }
             Request::InvokePluginService {
                 plugin_id,

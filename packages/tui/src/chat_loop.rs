@@ -232,6 +232,7 @@ pub enum InteractiveSurfaceOpenCompletion {
 pub struct ChatLoopState {
     render_launch: Option<super::plugin_surface_host::FreshSessionSettings>,
     palette: Option<BmuxCommandPalette>,
+    pub(crate) composer_interaction: super::composer_interaction::ComposerInteraction,
     slash_palette: Option<slash_palette::SlashPalette>,
     slash_completion: slash_palette::SlashCompletionState,
     foreground_client: BcodeClient,
@@ -304,6 +305,7 @@ impl ChatLoopState {
             render_launch: None,
             palette: None,
             slash_palette: None,
+            composer_interaction: super::composer_interaction::ComposerInteraction::default(),
             slash_completion: slash_palette::SlashCompletionState::default(),
             foreground_client: foreground_client.clone(),
             passive_client: passive_client.clone(),
@@ -5584,6 +5586,17 @@ fn paint_foreground(
         frame.set_focus_scope(Some(bmux_tui::hit::HitId::new("bcode.foreground")));
     }
     let theme = render::TuiTheme::for_app(&chat.app);
+    if foreground.is_none() {
+        super::composer_interaction_render::paint(
+            &mut loop_state.composer_interaction,
+            chat.app.composer_panel_area(),
+            frame,
+            theme,
+        );
+    } else {
+        loop_state.composer_interaction.painted_list = None;
+        loop_state.composer_interaction.painted_layout = None;
+    }
     if let Some(slash_palette) = &loop_state.slash_palette
         && foreground == Some(super::foreground::Foreground::Slash)
     {

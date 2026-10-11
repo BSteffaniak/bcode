@@ -95,6 +95,9 @@ bcode_default_agents_plugin = { workspace = true, features = [
 ] }
 bcode_eval = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_file_references_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_hyperchad = { workspace = true, features = [
     "renderer-html-actix",

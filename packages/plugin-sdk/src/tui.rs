@@ -2784,6 +2784,7 @@ impl StaticPluginTuiExtension {
 /// Registry of native TUI surfaces contributed by one plugin.
 #[derive(Default)]
 pub struct PluginTuiRegistry {
+    composer_registry: crate::composer::PluginComposerRegistry,
     keymap_actions: Vec<keymap::KeymapAction>,
     factories: BTreeMap<String, Box<dyn PluginTuiSurfaceFactory>>,
     visual_adapters: BTreeMap<String, std::sync::Arc<dyn PluginTuiVisualAdapter>>,
@@ -2792,6 +2793,7 @@ pub struct PluginTuiRegistry {
 impl std::fmt::Debug for PluginTuiRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginTuiRegistry")
+            .field("composer_registry", &self.composer_registry)
             .field("keymap_actions", &self.keymap_actions)
             .field("surface_kinds", &self.factories.keys().collect::<Vec<_>>())
             .field(
@@ -2819,6 +2821,23 @@ impl PluginTuiRegistry {
                 .map_err(|_| "visual adapter rejected presentation configuration".to_owned())?;
         }
         Ok(())
+    }
+
+    /// Register plugin-owned lightweight local composer activation.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or conflicting activation kinds.
+    pub fn register_composer_contributor(
+        &mut self,
+        contributor: Box<dyn crate::composer::PluginComposerContributor>,
+    ) -> Result<(), crate::composer::PluginComposerRegistryError> {
+        self.composer_registry.register(contributor)
+    }
+
+    /// Local adapters owned by this enabled plugin's registry lifetime.
+    #[must_use]
+    pub const fn composer_registry(&self) -> &crate::composer::PluginComposerRegistry {
+        &self.composer_registry
     }
 
     /// Contribute an action definition to the frontend's effective keymap.

@@ -1,0 +1,609 @@
+//! Generic, revision-fenced composer interaction plumbing. Contributors own activation and order.
+
+use std::path::PathBuf;
+
+use bcode_plugin_sdk::composer::{
+    ComposerActivation, ComposerContinuation, ComposerDocument, ComposerEdit,
+    ComposerSearchRequest, ComposerSnapshot, ComposerSnapshotState, ComposerTextRange,
+    MAX_COMPOSER_CANDIDATES, PluginOwnedComposerContribution,
+};
+use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
+use bmux_tui::event::Event;
+use bmux_tui::geometry::Rect;
+use bmux_tui_components::selectable_list::{
+    SelectableListItem, SelectableListOutcome, SelectableListState,
+};
+
+/// Process-local scope. A registry replacement, workspace switch or session switch invalidates work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerScope {
+    pub session: Option<bcode_session_models::SessionId>,
+    pub agent_id: String,
+    pub workspace: PathBuf,
+    pub registry_identity: u64,
+    pub registry_revision: u64,
+}
+
+#[derive(Debug)]
+pub struct ComposerCompletion {
+    pub request_id: String,
+    pub snapshot: Option<ComposerSnapshot>,
+}
+
+#[derive(Default)]
+enum SearchStatus {
+    #[default]
+    Idle,
+    Loading,
+    Empty,
+    Error,
+    Ready,
+    Incomplete,
+}
+
+pub struct ComposerInteraction {
+    scope: Option<ComposerScope>,
+    document: Option<ComposerDocument>,
+    selection: Option<ComposerTextRange>,
+    request: Option<ComposerSearchRequest>,
+    route: Option<PluginOwnedComposerContribution>,
+    reactivate_route: Option<PluginOwnedComposerContribution>,
+    snapshot: Option<ComposerSnapshot>,
+    task: Option<tokio::task::AbortHandle>,
+    client: Option<bcode_client::BcodeClient>,
+    dismissed: bool,
+    status: SearchStatus,
+    pub list: SelectableListState,
+    pub items: Vec<SelectableListItem>,
+    /// Geometry from the latest paint, never a separately guessed hit rectangle.
+    pub painted_list: Option<Rect>,
+    pub painted_layout: Option<bmux_tui::component::LayoutNode>,
+}
+
+impl Default for ComposerInteraction {
+    fn default() -> Self {
+        Self {
+            scope: None,
+            document: None,
+            selection: None,
+            request: None,
+            route: None,
+            reactivate_route: None,
+            snapshot: None,
+            task: None,
+            client: None,
+            dismissed: false,
+            status: SearchStatus::default(),
+            list: SelectableListState::new(None),
+            items: Vec::new(),
+            painted_list: None,
+            painted_layout: None,
+        }
+    }
+}
+
+impl Drop for ComposerInteraction {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+impl ComposerInteraction {
+    /// Observe text, cursor AND selection before routing input or admitting a reply.
+    /// Returning true requests fresh activation; equal observations never repeat searches.
+    pub fn observe(&mut self, scope: ComposerScope, buffer: &TextEditBuffer) -> bool {
+        let selection = buffer.selection().map(|range| ComposerTextRange {
+            start: range.start,
+            end: range.end,
+        });
+        let new_scope = self.scope.as_ref() != Some(&scope);
+        let changed = new_scope
+            || self.selection != selection
+            || self.document.as_ref().is_none_or(|document| {
+                document.text != buffer.text() || document.cursor != buffer.cursor_byte_index()
+            });
+        if !changed {
+            return false;
+        }
+        let reactivate_route = if new_scope {
+            None
+        } else {
+            self.reactivate_route.take()
+        };
+        self.cancel();
+        self.reactivate_route = reactivate_route;
+        let (document_id, revision) = if new_scope {
+            (uuid::Uuid::new_v4().to_string(), 0)
+        } else if let Some(document) = &self.document {
+            document.revision.checked_add(1).map_or_else(
+                || (uuid::Uuid::new_v4().to_string(), 0),
+                |revision| (document.document_id.clone(), revision),
+            )
+        } else {
+            (uuid::Uuid::new_v4().to_string(), 0)
+        };
+        self.document = Some(ComposerDocument {
+            document_id,
+            revision,
+            text: buffer.text().to_owned(),
+            cursor: buffer.cursor_byte_index(),
+            selection,
+        });
+        self.selection = selection;
+        self.scope = Some(scope);
+        self.dismissed = false;
+        true
+    }
+
+    pub fn document(&self) -> Option<&ComposerDocument> {
+        self.document
+            .as_ref()
+            .filter(|document| document.validate().is_ok())
+    }
+
+    pub fn start(
+        &mut self,
+        route: PluginOwnedComposerContribution,
+        activation: ComposerActivation,
+    ) -> Option<ComposerSearchRequest> {
+        if self.dismissed || route.contribution.id.trim().is_empty() {
+            return None;
+        }
+        let request = ComposerSearchRequest {
+            contribution_id: route.contribution.id.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            document: self.document()?.clone(),
+            activation,
+            max_results: MAX_COMPOSER_CANDIDATES,
+        };
+        request.validate().ok()?;
+        self.cancel();
+        self.route = Some(route);
+        self.request = Some(request.clone());
+        self.status = SearchStatus::Loading;
+        Some(request)
+    }
+
+    pub fn retain_task(
+        &mut self,
+        task: tokio::task::AbortHandle,
+        client: bcode_client::BcodeClient,
+    ) {
+        self.task = Some(task);
+        self.client = Some(client);
+    }
+
+    /// Cancellation is best effort; request identity is the authoritative late-reply fence.
+    pub fn cancel(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            if let (Some(client), Some(request)) = (self.client.take(), self.request.as_ref()) {
+                let invocation_id = request.request_id.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let _ = client.cancel_plugin_service_invocation(invocation_id).await;
+                    });
+                }
+            }
+        }
+        self.client = None;
+        self.request = None;
+        self.route = None;
+        self.reactivate_route = None;
+        self.snapshot = None;
+        self.status = SearchStatus::Idle;
+        self.items.clear();
+        self.painted_list = None;
+        self.painted_layout = None;
+        self.list = SelectableListState::new(None);
+    }
+
+    pub fn dismiss(&mut self) {
+        self.cancel();
+        self.dismissed = true;
+    }
+
+    pub fn complete(&mut self, completion: ComposerCompletion) -> bool {
+        let Some(request) = &self.request else {
+            return false;
+        };
+        if completion.request_id != request.request_id
+            || self.document.as_ref() != Some(&request.document)
+            || self.dismissed
+        {
+            return false;
+        }
+        self.task = None;
+        self.client = None;
+        let Some(snapshot) = completion
+            .snapshot
+            .filter(|snapshot| snapshot.validate_for(request).is_ok())
+        else {
+            self.status = SearchStatus::Error;
+            return true;
+        };
+        self.status = match snapshot.effective_state() {
+            ComposerSnapshotState::Loading => SearchStatus::Loading,
+            ComposerSnapshotState::Error { .. } => SearchStatus::Error,
+            ComposerSnapshotState::Truncated => SearchStatus::Incomplete,
+            ComposerSnapshotState::Ready if snapshot.candidates.is_empty() => SearchStatus::Empty,
+            ComposerSnapshotState::Ready => SearchStatus::Ready,
+        };
+        self.items = snapshot
+            .candidates
+            .iter()
+            .map(|candidate| {
+                // Presentation only: no path parsing, trigger syntax, matching or ranking here.
+                let label = candidate.detail.as_ref().map_or_else(
+                    || candidate.label.clone(),
+                    |detail| format!("{}  {detail}", candidate.label),
+                );
+                SelectableListItem::new(&candidate.id, label)
+            })
+            .collect();
+        // Candidate focus is not a committed value: BMUX emits Selected only when
+        // selection changes. Keep selection empty so clicking the initially focused
+        // first candidate produces an acceptance outcome, including after redraw.
+        self.list = SelectableListState::new(None);
+        if !self.items.is_empty() {
+            self.list.set_focused(Some(0));
+        }
+        self.snapshot = Some(snapshot);
+        true
+    }
+
+    #[must_use]
+    pub const fn visible(&self) -> bool {
+        !matches!(self.status, SearchStatus::Idle)
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> &'static str {
+        match self.status {
+            SearchStatus::Idle | SearchStatus::Ready => " Suggestions ",
+            SearchStatus::Loading => " Loading suggestions… ",
+            SearchStatus::Empty => " No suggestions ",
+            SearchStatus::Error => " Suggestions unavailable ",
+            SearchStatus::Incomplete => " Suggestions · more results omitted ",
+        }
+    }
+
+    pub fn selected_edit(&self) -> Option<ComposerEdit> {
+        let index = self.list.focused().or_else(|| self.list.selected())?;
+        self.snapshot
+            .as_ref()?
+            .candidates
+            .get(index)
+            .map(|candidate| candidate.edit.clone())
+    }
+
+    /// Validate everything before touching the live editor; all editing uses BMUX mechanics.
+    pub fn apply(&mut self, buffer: &mut TextEditBuffer) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        let selection = buffer.selection().map(|range| ComposerTextRange {
+            start: range.start,
+            end: range.end,
+        });
+        if buffer.text() != document.text
+            || buffer.cursor_byte_index() != document.cursor
+            || selection != self.selection
+        {
+            self.cancel();
+            return false;
+        }
+        let Some(edit) = self.selected_edit() else {
+            return false;
+        };
+        let Ok(result) = edit.apply(document) else {
+            return false;
+        };
+        let continuation = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .candidates
+                    .get(self.list.focused().or_else(|| self.list.selected())?)
+            })
+            .map_or(ComposerContinuation::Finish, |candidate| {
+                candidate.continuation
+            });
+        // Probe BMUX byte motions on a clone before publication. Never let any
+        // editor boundary adjustment change the accepted range or resulting cursor.
+        let mut staged = buffer.clone();
+        staged.move_cursor(TextMotion::Absolute(edit.range.start));
+        if staged.cursor_byte_index() != edit.range.start {
+            return false;
+        }
+        staged.move_cursor_with_selection(
+            TextMotion::Absolute(edit.range.end),
+            SelectionMode::Extend,
+        );
+        if staged.cursor_byte_index() != edit.range.end {
+            return false;
+        }
+        staged.insert_str(&edit.replacement);
+        staged.move_cursor(TextMotion::Absolute(result.cursor));
+        if staged.text() != result.text || staged.cursor_byte_index() != result.cursor {
+            return false;
+        }
+        *buffer = staged;
+        let route = self.route.clone();
+        self.cancel();
+        if continuation == ComposerContinuation::Finish {
+            self.document = Some(result);
+            self.selection = None;
+            self.dismissed = true;
+        } else {
+            self.reactivate_route = route;
+        }
+        true
+    }
+
+    pub const fn take_reactivation(&mut self) -> Option<PluginOwnedComposerContribution> {
+        self.reactivate_route.take()
+    }
+
+    #[must_use]
+    pub const fn needs_activation(&self) -> bool {
+        !self.dismissed && self.request.is_none()
+    }
+
+    pub fn list_event(&mut self, event: &Event) -> SelectableListOutcome {
+        let Some(area) = self.painted_list.filter(|area| !area.is_empty()) else {
+            return SelectableListOutcome::Ignored;
+        };
+        let Some(layout) = &self.painted_layout else {
+            return SelectableListOutcome::Ignored;
+        };
+        let list_state = std::cell::Cell::new(self.list);
+        let component = bmux_tui_components::selectable_list::SelectableListComponent::new(
+            "composer.list",
+            &self.items,
+            &list_state,
+        );
+        let mut cx = bmux_tui::component::EventCx::with_clip(layout, area);
+        let outcome = cx.with_transform(0, 0, i32::from(area.x), i64::from(area.y), area, |cx| {
+            component.handle_event(event, layout, cx)
+        });
+        self.list = list_state.get();
+        outcome
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use bcode_plugin_sdk::composer::{
+        COMPOSER_INTERFACE_ID, ComposerCandidate, ComposerContribution,
+    };
+
+    fn scope() -> ComposerScope {
+        ComposerScope {
+            session: None,
+            agent_id: "build".into(),
+            workspace: PathBuf::from("/workspace"),
+            registry_identity: 1,
+            registry_revision: 0,
+        }
+    }
+
+    struct Topics;
+    impl bcode_plugin_sdk::composer::PluginComposerContributor for Topics {
+        fn kind(&self) -> &'static str {
+            "example.topic"
+        }
+        fn activate(&self, document: &ComposerDocument) -> Option<ComposerActivation> {
+            document.allows_activation().then(|| ComposerActivation {
+                range: ComposerTextRange {
+                    start: 0,
+                    end: document.text.len(),
+                },
+                query: document.text.clone(),
+            })
+        }
+    }
+
+    pub fn begin(
+        state: &mut ComposerInteraction,
+        buffer: &TextEditBuffer,
+    ) -> ComposerSearchRequest {
+        state.observe(scope(), buffer);
+        state.dismissed = false; // Fixture explicitly starts a new admitted search.
+        let mut registry = bcode_plugin_sdk::composer::PluginComposerRegistry::default();
+        registry.register(Box::new(Topics)).unwrap();
+        let activation = registry
+            .activate("example.topic", state.document().unwrap())
+            .unwrap()
+            .unwrap();
+        state
+            .start(
+                PluginOwnedComposerContribution {
+                    plugin_id: "example.topics".into(),
+                    contribution: ComposerContribution {
+                        id: "topics".into(),
+                        activation_kind: "example.topic".into(),
+                        service_interface_id: COMPOSER_INTERFACE_ID.into(),
+                        priority: 0,
+                    },
+                },
+                activation,
+            )
+            .unwrap()
+    }
+
+    pub fn completion(request: &ComposerSearchRequest) -> ComposerCompletion {
+        ComposerCompletion {
+            request_id: request.request_id.clone(),
+            snapshot: Some(ComposerSnapshot {
+                request_id: request.request_id.clone(),
+                document_id: request.document.document_id.clone(),
+                revision: request.document.revision,
+                state: ComposerSnapshotState::Ready,
+                candidates: vec![ComposerCandidate {
+                    id: "topic".into(),
+                    label: "主题 👩‍💻".into(),
+                    detail: None,
+                    continuation: ComposerContinuation::Finish,
+                    edit: ComposerEdit {
+                        document_id: request.document.document_id.clone(),
+                        revision: request.document.revision,
+                        range: request.activation.range,
+                        expected_text: request.document.text.clone(),
+                        replacement: "主题 👩‍💻".into(),
+                        cursor: "主题 👩‍💻".len(),
+                    },
+                }],
+                incomplete: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn generic_edit_preserves_atomic_stale_safety() {
+        let mut state = ComposerInteraction::default();
+        let mut buffer = TextEditBuffer::from_text("#topic");
+        let request = begin(&mut state, &buffer);
+        assert!(state.complete(completion(&request)));
+        assert!(state.apply(&mut buffer));
+        assert_eq!(buffer.text(), "主题 👩‍💻");
+        assert_eq!(buffer.cursor_byte_index(), buffer.text().len());
+        buffer.insert_str("x");
+        let request = begin(&mut state, &buffer);
+        state.complete(completion(&request));
+        buffer.insert_str("!");
+        let before = buffer.clone();
+        assert!(!state.apply(&mut buffer));
+        assert_eq!(buffer.text(), before.text());
+    }
+
+    #[test]
+    fn continuation_is_explicit_and_keeps_the_original_route() {
+        let mut state = ComposerInteraction::default();
+        let mut buffer = TextEditBuffer::from_text("#topic");
+        let request = begin(&mut state, &buffer);
+        assert_eq!(request.contribution_id, "topics");
+        let mut reply = completion(&request);
+        reply.snapshot.as_mut().unwrap().candidates[0].continuation =
+            ComposerContinuation::Reactivate;
+        state.complete(reply);
+        assert!(state.apply(&mut buffer));
+        state.observe(scope(), &buffer);
+        let route = state.take_reactivation().unwrap();
+        assert_eq!(route.plugin_id, "example.topics");
+        assert_eq!(route.contribution.id, "topics");
+        let document = state.document().unwrap();
+        let activation =
+            bcode_plugin_sdk::composer::PluginComposerContributor::activate(&Topics, document)
+                .unwrap();
+        let next = state.start(route, activation).unwrap();
+        assert_eq!(next.contribution_id, request.contribution_id);
+        assert_eq!(next.contribution_id, "topics");
+        assert_ne!(next.request_id, request.request_id);
+        state.complete(completion(&next));
+        assert!(state.apply(&mut buffer));
+        assert!(!state.observe(scope(), &buffer));
+        assert!(!state.needs_activation());
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected_and_bmux_byte_cursor_is_preserved() {
+        let mut state = ComposerInteraction::default();
+        let mut buffer = TextEditBuffer::from_text("#topic");
+        let request = begin(&mut state, &buffer);
+        let mut reply = completion(&request);
+        reply.snapshot.as_mut().unwrap().candidates[0].edit.cursor = 1;
+        assert!(state.complete(reply));
+        assert!(!state.apply(&mut buffer));
+        assert_eq!(buffer.text(), "#topic");
+        let request = begin(&mut state, &buffer);
+        let mut reply = completion(&request);
+        let edit = &mut reply.snapshot.as_mut().unwrap().candidates[0].edit;
+        edit.replacement = "a\u{301}".into();
+        edit.cursor = 1;
+        // Locked BMUX Absolute accepts a UTF-8 boundary inside a combining grapheme.
+        // Prove that behavior directly rather than assuming grapheme snapping.
+        let mut probe = TextEditBuffer::from_text("a\u{301}");
+        probe.move_cursor(TextMotion::Absolute(1));
+        assert_eq!(probe.cursor_byte_index(), 1);
+        assert!(state.complete(reply));
+        assert!(state.apply(&mut buffer));
+        assert_eq!(buffer.text(), "a\u{301}");
+        assert_eq!(buffer.cursor_byte_index(), 1);
+    }
+
+    #[test]
+    fn distinct_bounded_search_states_do_not_offer_invalid_edits() {
+        let mut state = ComposerInteraction::default();
+        let buffer = TextEditBuffer::from_text("#topic");
+        let request = begin(&mut state, &buffer);
+        assert!(state.status().contains("Loading"));
+        let mut reply = completion(&request);
+        reply.snapshot.as_mut().unwrap().candidates.clear();
+        state.complete(reply);
+        assert!(state.status().contains("No suggestions"));
+        let request = begin(&mut state, &buffer);
+        let mut reply = completion(&request);
+        reply.snapshot.as_mut().unwrap().state = ComposerSnapshotState::Truncated;
+        state.complete(reply);
+        assert!(state.status().contains("omitted"));
+        let request = begin(&mut state, &buffer);
+        state.complete(ComposerCompletion {
+            request_id: request.request_id,
+            snapshot: None,
+        });
+        assert!(state.status().contains("unavailable"));
+        assert!(state.selected_edit().is_none());
+    }
+
+    #[test]
+    fn dismissal_selection_session_workspace_and_unload_fence_replies() {
+        let mut state = ComposerInteraction::default();
+        let mut buffer = TextEditBuffer::from_text("#topic");
+        let request = begin(&mut state, &buffer);
+        state.dismiss();
+        assert!(!state.complete(completion(&request)));
+        assert!(!state.observe(scope(), &buffer));
+        assert!(
+            state
+                .start(
+                    PluginOwnedComposerContribution {
+                        plugin_id: "disabled".into(),
+                        contribution: ComposerContribution {
+                            id: "x".into(),
+                            activation_kind: "x".into(),
+                            service_interface_id: COMPOSER_INTERFACE_ID.into(),
+                            priority: 0
+                        }
+                    },
+                    request.activation
+                )
+                .is_none()
+        );
+        buffer.select_all();
+        assert!(state.observe(scope(), &buffer));
+        buffer.clear_selection();
+        let request = begin(&mut state, &buffer);
+        let mut changed = scope();
+        changed.registry_revision += 1;
+        state.observe(changed, &buffer);
+        assert!(!state.complete(completion(&request)));
+        let request = begin(&mut state, &buffer);
+        let mut changed = scope();
+        changed.workspace = PathBuf::from("/other");
+        state.observe(changed, &buffer);
+        assert!(!state.complete(completion(&request)));
+        let request = begin(&mut state, &buffer);
+        let mut changed = scope();
+        changed.agent_id = "review".into();
+        state.observe(changed, &buffer);
+        assert!(!state.complete(completion(&request)));
+        let request = begin(&mut state, &buffer);
+        let mut changed = scope();
+        changed.session = Some(bcode_session_models::SessionId(uuid::Uuid::new_v4()));
+        state.observe(changed, &buffer);
+        assert!(!state.complete(completion(&request)));
+    }
+}

@@ -33,6 +33,8 @@ pub enum BcodeRuntimeMessage {
     Terminal(Event),
     /// Ordered canonical/session-view stream update.
     SessionStream(Box<history_flow::SessionStreamUpdate>),
+    /// Completed revision-bound plugin composer search.
+    ComposerSearchCompleted(super::composer_interaction::ComposerCompletion),
     /// Completed artifact fetch for the active presentation generation.
     ArtifactFetchCompleted(Box<ActiveArtifactFetchCompletion>),
     /// Latest Markdown projection completion.
@@ -80,6 +82,7 @@ impl BcodeRuntimeMessage {
             | Self::Terminal(_)
             | Self::SessionStream(_)
             | Self::ArtifactFetchCompleted(_)
+            | Self::ComposerSearchCompleted(_)
             | Self::PluginSurfaceInvalidated
             | Self::EffectCompleted(_)
             | Self::InteractiveSurfaceOpened(_)
@@ -288,6 +291,211 @@ impl RootTimer {
 }
 
 impl BcodeRuntimeModel {
+    /// Arbitrate only the visible generic composer interaction, before ordinary chat bindings.
+    fn handle_composer_interaction_key(&mut self, stroke: bmux_keyboard::KeyStroke) -> bool {
+        use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
+        if self.loop_state.foreground().is_some()
+            || !self.loop_state.composer_interaction.visible()
+            || self
+                .loop_state
+                .composer_interaction
+                .painted_list
+                .is_none_or(bmux_tui::geometry::Rect::is_empty)
+        {
+            return false;
+        }
+        let input = ControlInput::from_registry(
+            self.settings.keymap().registry(),
+            "composer_interaction",
+            stroke,
+            &[
+                ControlAction::Cancel,
+                ControlAction::Submit,
+                ControlAction::FocusNext,
+                ControlAction::Up,
+                ControlAction::Down,
+            ],
+            false,
+        );
+        match input {
+            ControlInput::Action(ControlAction::Cancel) => {
+                self.loop_state.composer_interaction.dismiss();
+            }
+            ControlInput::Action(ControlAction::Submit | ControlAction::FocusNext) => {
+                self.accept_composer_candidate();
+            }
+            ControlInput::Action(ControlAction::Up | ControlAction::Down) => {
+                if let Some(stroke) = input.native_stroke() {
+                    self.loop_state
+                        .composer_interaction
+                        .list_event(&Event::Key(stroke));
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// An acceptance intent is consumed even when its validated edit cannot be committed.
+    fn accept_composer_candidate(&mut self) {
+        if self
+            .loop_state
+            .composer_interaction
+            .apply(self.chat.app.composer_mut())
+        {
+            self.chat.app.reset_input_history_navigation();
+            self.chat.app.wake_cursor();
+            self.draft_autosave.observe(&self.chat, Instant::now());
+        } else {
+            self.loop_state.composer_interaction.dismiss();
+            self.chat
+                .app
+                .set_status("Suggestion could not be applied; draft unchanged".to_owned());
+        }
+    }
+
+    /// Reconcile the complete composer observation before replies/input and after every root update.
+    fn synchronize_composer_interaction(&mut self) {
+        if self.chat.app.plugin_presentation().is_none()
+            || !matches!(self.screen, BcodeRuntimeScreen::Chat)
+            || self.loop_state.foreground().is_some()
+            || self
+                .loop_state
+                .routes_non_mouse_event_to_interactive_surface(
+                    self.chat.app.tui_config().interactions,
+                )
+            || self.runtime_handle.is_none()
+        {
+            // Tool-owned input does not observe the composer or upgrade its damage.
+            // Cancellation still invalidates pending replies even without a text change.
+            if self.loop_state.composer_interaction.visible() {
+                self.invalidation = self
+                    .invalidation
+                    .merge(super::invalidation::UiInvalidation::Structural);
+            }
+            self.loop_state.composer_interaction.cancel();
+            return;
+        }
+        let scope = {
+            let presentation = self.chat.app.plugin_presentation();
+            super::composer_interaction::ComposerScope {
+                session: self.chat.attached_session_id(),
+                agent_id: self
+                    .chat
+                    .app
+                    .pending_agent_id()
+                    .unwrap_or_else(|| self.chat.app.current_agent_id())
+                    .to_owned(),
+                workspace: self
+                    .chat
+                    .app
+                    .working_directory()
+                    .unwrap_or_else(|| self.settings.launch_working_directory())
+                    .to_path_buf(),
+                registry_identity: presentation.map_or(
+                    0,
+                    super::plugin_tui::PluginTuiPresentation::composer_identity,
+                ),
+                registry_revision: presentation
+                    .map_or(0, super::plugin_tui::PluginTuiPresentation::revision),
+            }
+        };
+        let changed = self
+            .loop_state
+            .composer_interaction
+            .observe(scope.clone(), self.chat.app.composer());
+        if changed {
+            self.invalidation = self
+                .invalidation
+                .merge(super::invalidation::UiInvalidation::Structural);
+        }
+        if !changed && !self.loop_state.composer_interaction.needs_activation() {
+            return;
+        }
+        let reactivation = self.loop_state.composer_interaction.take_reactivation();
+        let activation = {
+            let Some(presentation) = self.chat.app.plugin_presentation() else {
+                return;
+            };
+            let Some(document) = self.loop_state.composer_interaction.document() else {
+                return;
+            };
+            reactivation.map_or_else(
+                || presentation.activate_composer(document),
+                |route| {
+                    presentation
+                        .reactivate_composer(&route, document)
+                        .map(|activation| (route, activation))
+                },
+            )
+        };
+        let Some((route, activation)) = activation else {
+            self.loop_state.composer_interaction.dismiss();
+            return;
+        };
+        let Some(request) = self
+            .loop_state
+            .composer_interaction
+            .start(route.clone(), activation)
+        else {
+            return;
+        };
+        self.dispatch_composer_search(scope, route, request);
+    }
+
+    /// Dispatch one bounded search, retaining the original client identity for cancellation.
+    fn dispatch_composer_search(
+        &mut self,
+        scope: super::composer_interaction::ComposerScope,
+        route: bcode_plugin_sdk::composer::PluginOwnedComposerContribution,
+        request: bcode_plugin_sdk::composer::ComposerSearchRequest,
+    ) {
+        let Some(handle) = self.runtime_handle.clone() else {
+            return;
+        };
+        let client = self.loop_state.foreground_client();
+        let task_client = client.clone();
+        let context = bcode_ipc::PluginServiceContext {
+            invocation_id: request.request_id.clone(),
+            workspace: bcode_plugin_sdk::WorkspaceContext {
+                session_id: scope.session.map(|session| session.to_string()),
+                launch_root: Some(scope.workspace),
+            },
+            agent_id: Some(scope.agent_id),
+            deadline_ms: 2_000,
+        };
+        let task = tokio::spawn(async move {
+            let snapshot = match serde_json::to_vec(&request) {
+                Ok(payload) => task_client
+                    .invoke_plugin_service_contextual(
+                        context,
+                        route.plugin_id,
+                        route.contribution.service_interface_id,
+                        bcode_plugin_sdk::composer::OP_COMPOSER_SEARCH.to_owned(),
+                        payload,
+                    )
+                    .await
+                    .ok()
+                    .filter(|response| {
+                        response.error.is_none() && response.payload.len() <= 2 * 1024 * 1024
+                    })
+                    .and_then(|response| serde_json::from_slice(&response.payload).ok()),
+                Err(_) => None,
+            };
+            let _ = handle
+                .send(BcodeRuntimeMessage::ComposerSearchCompleted(
+                    super::composer_interaction::ComposerCompletion {
+                        request_id: request.request_id,
+                        snapshot,
+                    },
+                ))
+                .await;
+        });
+        self.loop_state
+            .composer_interaction
+            .retain_task(task.abort_handle(), client);
+    }
+
     fn fresh_session_settings(&self) -> super::plugin_surface_host::FreshSessionSettings {
         super::plugin_surface_host::FreshSessionSettings {
             keymap: self.settings.keymap().registry().clone(),
@@ -1037,7 +1245,15 @@ impl BcodeRuntimeModel {
             return super::invalidation::UiInvalidation::Structural;
         }
         let damage = match event {
-            Event::Resize(_) => super::invalidation::UiInvalidation::Full,
+            Event::Resize(_) => {
+                self.loop_state.composer_interaction.painted_list = None;
+                self.loop_state.composer_interaction.painted_layout = None;
+                super::invalidation::UiInvalidation::Full
+            }
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) => {
+                self.loop_state.composer_interaction.dismiss();
+                super::invalidation::UiInvalidation::Structural
+            }
             Event::Focus(_) | Event::Tick => super::invalidation::UiInvalidation::Paint,
             Event::Paste(text) => {
                 if self.loop_state.modal_foreground() {
@@ -1238,6 +1454,9 @@ impl BcodeRuntimeModel {
                     }
                     return super::invalidation::UiInvalidation::Structural;
                 }
+                if self.handle_composer_interaction_key(stroke) {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if self.loop_state.has_slash_palette() {
                     match self.loop_state.handle_slash_palette_key(
                         &mut self.chat,
@@ -1328,6 +1547,25 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
+                if self.loop_state.foreground().is_none() {
+                    let outcome = self
+                        .loop_state
+                        .composer_interaction
+                        .list_event(&Event::Mouse(mouse));
+                    if matches!(
+                        outcome,
+                        bmux_tui_components::selectable_list::SelectableListOutcome::Selected(_)
+                    ) {
+                        self.accept_composer_candidate();
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                    if !matches!(
+                        outcome,
+                        bmux_tui_components::selectable_list::SelectableListOutcome::Ignored
+                    ) {
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                }
                 if !self.loop_state.modal_foreground()
                     && self.chat.app.child_panel_open()
                     && matches!(
@@ -3154,8 +3392,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
     ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
         self.synchronize_selection_lifecycle();
+        self.synchronize_composer_interaction();
         let mut temporal_damage = Vec::new();
         let damage = match event {
+            bmux_tui_runtime::RuntimeEvent::Message(
+                BcodeRuntimeMessage::ComposerSearchCompleted(completion),
+            ) => {
+                if self.loop_state.composer_interaction.complete(completion) {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
+            }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Bootstrap { handle }) => {
                 self.runtime_handle = Some(handle.clone());
                 let (_replacement_sender, replacement_receiver) = tokio::sync::mpsc::channel(1);
@@ -3681,6 +3929,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 damage
             }
         };
+        self.synchronize_composer_interaction();
         self.invalidation = self.invalidation.merge(damage);
         let route_invalidation = self.synchronize_screen();
         self.invalidation = self.invalidation.merge(route_invalidation);
@@ -7729,6 +7978,235 @@ mod tests {
             text: note_id.to_owned(),
             format: CommandTextFormat::PlainText,
         }
+    }
+
+    fn composer_root_fixture(config: &bcode_config::TuiConfig) -> super::BcodeRuntimeModel {
+        let mut model = root_test_model_with_tui_config(config);
+        model.chat.app.replace_composer_with("#topic");
+        let request = super::super::composer_interaction::tests::begin(
+            &mut model.loop_state.composer_interaction,
+            model.chat.app.composer(),
+        );
+        let mut reply = super::super::composer_interaction::tests::completion(&request);
+        let candidates = &mut reply.snapshot.as_mut().unwrap().candidates;
+        let mut second = candidates[0].clone();
+        second.id = "second".into();
+        second.label = "Second topic".into();
+        candidates.push(second);
+        model.loop_state.composer_interaction.complete(reply);
+        paint_composer_root_fixture(&mut model, 90, 18);
+        model
+    }
+
+    fn paint_composer_root_fixture(model: &mut super::BcodeRuntimeModel, width: u16, height: u16) {
+        let area = bmux_tui::geometry::Rect::new(0, 0, width, height);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        super::super::composer_interaction_render::paint(
+            &mut model.loop_state.composer_interaction,
+            bmux_tui::geometry::Rect::new(0, height.saturating_sub(2), width, 2),
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            super::super::render::TuiTheme::for_theme_id("terminal-native"),
+        );
+    }
+
+    fn composer_root_key(model: &mut super::BcodeRuntimeModel, key: &str) {
+        model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
+            bmux_keyboard::parse_key_stroke(key).unwrap(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn composer_root_default_keys_accept_navigate_dismiss_without_chat_fallthrough() {
+        for key in ["enter", "tab"] {
+            let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+            composer_root_key(&mut model, key);
+            assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
+            assert!(model.chat.app.take_pending_submission().is_empty());
+            assert!(!model.loop_state.composer_interaction.visible());
+            drop(model);
+        }
+        let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+        composer_root_key(&mut model, "down");
+        assert_eq!(
+            model.loop_state.composer_interaction.list.focused(),
+            Some(1)
+        );
+        composer_root_key(&mut model, "up");
+        assert_eq!(
+            model.loop_state.composer_interaction.list.focused(),
+            Some(0)
+        );
+        assert_eq!(model.chat.app.composer().text(), "#topic");
+        assert!(!model.chat.app.input_history_navigation_active());
+        composer_root_key(&mut model, "escape");
+        assert!(!model.loop_state.composer_interaction.visible());
+        assert_eq!(model.chat.app.composer().text(), "#topic");
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn composer_root_remapped_actions_and_literal_typing_use_effective_registry() {
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "composer_interaction".into(),
+            std::collections::BTreeMap::from([
+                ("ctrl+n".into(), "tui.control.down".into()),
+                ("ctrl+y".into(), "tui.control.submit".into()),
+                ("ctrl+x".into(), "tui.control.cancel".into()),
+            ]),
+        );
+        let mut model = composer_root_fixture(&config);
+        composer_root_key(&mut model, "ctrl+n");
+        assert_eq!(
+            model.loop_state.composer_interaction.list.focused(),
+            Some(1)
+        );
+        composer_root_key(&mut model, "ctrl+y");
+        assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        drop(model);
+        let mut model = composer_root_fixture(&config);
+        composer_root_key(&mut model, "ctrl+x");
+        assert!(!model.loop_state.composer_interaction.visible());
+        drop(model);
+        let mut model = composer_root_fixture(&config);
+        composer_root_key(&mut model, "x");
+        assert_eq!(model.chat.app.composer().text(), "#topicx");
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn composer_root_rejected_acceptance_consumes_enter_and_tab() {
+        for key in ["enter", "tab"] {
+            let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+            model.chat.app.composer_mut().insert_str("!");
+            composer_root_key(&mut model, key);
+            assert_eq!(model.chat.app.composer().text(), "#topic!");
+            assert!(model.chat.app.take_pending_submission().is_empty());
+            assert!(model.chat.app.status().contains("draft unchanged"));
+            assert!(!model.loop_state.composer_interaction.visible());
+            drop(model);
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_root_clipped_clicks_and_empty_resize_cannot_accept() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::Point;
+        let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+        let list = model.loop_state.composer_interaction.painted_list.unwrap();
+        // Border/outside list click never accepts an invisible row.
+        for point in [
+            Point::new(list.x.saturating_sub(1), list.y),
+            Point::new(list.x, list.bottom()),
+        ] {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
+            }
+            assert_eq!(model.chat.app.composer().text(), "#topic");
+        }
+        paint_composer_root_fixture(&mut model, 0, 0);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+                kind,
+                Point::new(list.x, list.y),
+            )));
+        }
+        assert_eq!(model.chat.app.composer().text(), "#topic");
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn composer_root_visible_row_click_accepts_only_measured_item() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+        let list = model.loop_state.composer_interaction.painted_list.unwrap();
+        assert_eq!(model.loop_state.composer_interaction.list.selected(), None);
+        assert_eq!(
+            model.loop_state.composer_interaction.list.focused(),
+            Some(0)
+        );
+        let point = bmux_tui::geometry::Point::new(list.x, list.y);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
+        }
+        assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn composer_root_mouse_click_accepts_a_navigated_candidate_after_redraw() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+        composer_root_key(&mut model, "down");
+        assert_eq!(
+            model.loop_state.composer_interaction.list.focused(),
+            Some(1)
+        );
+        assert_eq!(model.loop_state.composer_interaction.list.selected(), None);
+        paint_composer_root_fixture(&mut model, 90, 18);
+        let list = model.loop_state.composer_interaction.painted_list.unwrap();
+        let point = bmux_tui::geometry::Point::new(list.x, list.y.saturating_add(1));
+        model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            point,
+        )));
+        // Production redraw between press and release must retain pointer state.
+        paint_composer_root_fixture(&mut model, 90, 18);
+        model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            point,
+        )));
+        assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn composer_root_pending_reply_is_fenced_when_plugin_backend_is_disabled() {
+        let mut model = root_test_model();
+        model.chat.app.replace_composer_with("#topic");
+        let request = super::super::composer_interaction::tests::begin(
+            &mut model.loop_state.composer_interaction,
+            model.chat.app.composer(),
+        );
+        // No enabled plugin presentation exists after disable/unload. Root reconciliation
+        // must cancel the retained pending request even when the text has not changed.
+        assert!(model.chat.app.plugin_presentation().is_none());
+        model.synchronize_composer_interaction();
+        assert!(!model.loop_state.composer_interaction.complete(
+            super::super::composer_interaction::tests::completion(&request)
+        ));
+        assert_eq!(model.chat.app.composer().text(), "#topic");
+        assert!(!model.loop_state.composer_interaction.visible());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn composer_root_modal_foreground_has_priority_over_acceptance() {
+        let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+        model.loop_state.open_command_palette(&mut model.chat);
+        assert!(
+            !model
+                .handle_composer_interaction_key(bmux_keyboard::parse_key_stroke("enter").unwrap())
+        );
+        assert_eq!(model.chat.app.composer().text(), "#topic");
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        drop(model);
     }
 
     fn root_test_model() -> super::BcodeRuntimeModel {

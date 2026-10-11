@@ -12,6 +12,19 @@ use std::path::{Component, Path};
 /// This pins the opened object, not the directory's continuing namespace location.
 /// Callers must still bind and recheck authorized identities before publication.
 pub fn open_target(path: &Path) -> io::Result<(File, File)> {
+    open_absolute(path, false)
+}
+
+/// Open a canonical directory with no-follow traversal, including the final component.
+/// Does not open regular files. Like `open_target`, pins the object, not its namespace.
+pub fn open_directory(path: &Path) -> io::Result<File> {
+    if path == Path::new("/") {
+        return File::open("/");
+    }
+    open_absolute(path, true).map(|(_, directory)| directory)
+}
+
+fn open_absolute(path: &Path, directory: bool) -> io::Result<(File, File)> {
     let mut components = path.components().peekable();
     if components.next() != Some(Component::RootDir) || components.peek().is_none() {
         return Err(io::Error::new(
@@ -32,7 +45,7 @@ pub fn open_target(path: &Path) -> io::Result<(File, File)> {
             | libc::O_CLOEXEC
             | libc::O_NOFOLLOW
             | libc::O_NONBLOCK
-            | if components.peek().is_some() {
+            | if directory || components.peek().is_some() {
                 libc::O_DIRECTORY
             } else {
                 0

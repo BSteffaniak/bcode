@@ -3,9 +3,10 @@ name    = "Bcode Filesystem Plugin"
 version = "0.0.1"
 
 [[services]]
-description  = "Filesystem read/write utility service"
-interface_id = "bcode.filesystem/v1"
-name         = "Filesystem"
+description           = "Filesystem read/write utility service"
+interface_id          = "bcode.filesystem/v1"
+invocation_operations = ["search_paths"]
+name                  = "Filesystem"
 
 [[services]]
 class        = "tool_execution"

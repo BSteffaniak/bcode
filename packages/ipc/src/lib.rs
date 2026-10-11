@@ -128,8 +128,11 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 49 adds content-free session progress snapshots; version 48 peers are rejected.
 /// Version 50 adds retained workflow activity snapshots and host progress timestamps.
 /// Version 51 adds bounded request-only turn judgement observations to that layout.
+/// Version 52 adds bounded cross-location session discovery.
+/// Version 53 adds contextual plugin invocation, cancellation, composer discovery and agent hints.
+/// Version 54 combines those contextual additions with the updated upstream positional layout.
 /// Older positional request/response layouts are rejected rather than misinterpreted.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 52;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 54;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1149,6 +1152,18 @@ pub enum Request {
     },
     ListPluginServices,
     ListPluginContributions,
+    /// Invoke a plugin with daemon-validated workspace context and bounded lifetime.
+    InvokePluginServiceContextual {
+        context: PluginServiceContext,
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    },
+    /// Cancel a contextual invocation owned by this connected client.
+    CancelPluginServiceInvocation {
+        invocation_id: String,
+    },
     InvokePluginService {
         plugin_id: String,
         interface_id: String,
@@ -1775,6 +1790,36 @@ pub use bcode_session_models::SessionRuntimeSelection;
 /// Compatibility export of the model-owned application status contract.
 pub use bcode_model::SessionModelStatus;
 
+#[cfg(test)]
+mod contextual_agent_contract_tests {
+    #[test]
+    fn optional_selected_agent_round_trips_and_legacy_defaults_explicitly() {
+        let legacy =
+            serde_json::json!({"invocation_id":"search", "workspace":{}, "deadline_ms":1000});
+        let mut context: super::PluginServiceContext = serde_json::from_value(legacy).unwrap();
+        assert_eq!(context.agent_id, None);
+        context.agent_id = Some("plan".into());
+        let decoded: super::PluginServiceContext =
+            serde_json::from_value(serde_json::to_value(&context).unwrap()).unwrap();
+        assert_eq!(decoded.agent_id.as_deref(), Some("plan"));
+    }
+}
+
+/// Context hints and lifetime for one client-owned plugin invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceContext {
+    /// Selected enabled agent hint. Missing legacy hints use the explicit default policy.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Unique identity within the connected client; reuse is rejected.
+    pub invocation_id: String,
+    /// Workspace hints validated by the daemon, never authorization grants.
+    pub workspace: bcode_plugin_sdk::WorkspaceContext,
+    /// Total admission and execution deadline, between 1 and 30,000 milliseconds.
+    pub deadline_ms: u64,
+}
+
 /// Compatibility export of the plugin SDK's discovery contract.
 pub use bcode_plugin_sdk::PluginContributions;
 
@@ -2234,6 +2279,10 @@ pub enum ResponsePayload {
     },
     PluginServices {
         services: Vec<PluginServiceSummary>,
+    },
+    /// Result of cancellation against the connected client's active invocation.
+    PluginServiceInvocationCancelled {
+        accepted: bool,
     },
     PluginServiceResult {
         response: PluginServiceResponse,
@@ -3911,6 +3960,7 @@ mod tests {
                 "category":"tools", "surface":"slash"
             }}],
             "command_contributions": [],
+            "composer_contributions": [],
             "config_extensions": [{"plugin_id":"example", "section":"example",
                 "aliases":[{"section":"legacy", "reason":"compatibility"}],
                 "categories":["tools"], "schema_version":1, "schema_file":"schema.json"
@@ -3922,11 +3972,20 @@ mod tests {
             domain.config_extensions[0].sections(),
             ["example", "legacy"]
         );
+        assert!(domain.composer_contributions.is_empty());
+        let mut legacy = json.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("composer_contributions");
+        let legacy: PluginContributions = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy, domain);
         assert_eq!(serde_json::to_value(domain).unwrap(), json);
         let empty: PluginContributions = serde_json::from_str("{}").unwrap();
         assert!(empty.commands.is_empty());
         assert!(empty.command_contributions.is_empty());
         assert!(empty.config_extensions.is_empty());
+        assert!(empty.composer_contributions.is_empty());
     }
 
     #[test]

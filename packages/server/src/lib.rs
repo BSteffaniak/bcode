@@ -25,6 +25,7 @@ mod model_check;
 mod model_evidence;
 mod model_ignores;
 mod model_request_target;
+mod plugin_context;
 mod plugin_operations;
 mod request_routing;
 mod runtime_work;
@@ -398,6 +399,7 @@ pub struct ServerState {
     >,
     advisory_categorizations:
         StdMutex<BTreeMap<SessionId, bcode_session_models::SessionCategorization>>,
+    contextual_plugin_invocations: StdMutex<plugin_context::InvocationRegistry>,
     tool_catalog: tool_catalog::ToolCatalogCache,
     startup_plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
@@ -2535,6 +2537,7 @@ impl ServerState {
             selected_provider_context: init.selected_provider_context,
             startup_config: init.startup_config,
             history_auth_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            contextual_plugin_invocations: StdMutex::default(),
             session_configs: Mutex::default(),
             session_skills: Mutex::default(),
             session_repository_roots: Mutex::default(),
@@ -2841,6 +2844,7 @@ impl ServerState {
     }
 
     async fn close_client(&self, client_id: ClientId) -> Result<(), ServerError> {
+        plugin_context::disconnect(self, client_id);
         self.abort_client_forwarders(client_id).await;
         let detach_result = self.detach_client_session(client_id).await;
         self.unregister_client(client_id).await;
@@ -6119,9 +6123,57 @@ async fn read_client_envelopes(
     incoming: tokio::sync::mpsc::Sender<Result<bcode_ipc::Envelope, CodecError>>,
     disconnected: Arc<Notify>,
     request_end: tokio::sync::watch::Sender<bool>,
+    state: Arc<ServerState>,
+    client_id: ClientId,
+    writer: SharedWriter,
 ) {
     loop {
         let envelope = recv_envelope(&mut reader).await;
+        if let Ok(envelope) = &envelope
+            && envelope.kind == EnvelopeKind::Request
+            && let Ok(Request::InvokePluginServiceContextual { context, .. }) =
+                decode_request(&envelope.payload)
+            && !plugin_context::reserve(&state, client_id, &context)
+        {
+            if send_response(
+                &writer,
+                envelope.request_id,
+                Response::Err(ErrorResponse::new(
+                    "plugin_context_denied",
+                    "invalid or replayed contextual invocation",
+                )),
+            )
+            .await
+            .is_err()
+            {
+                request_end.send_replace(true);
+                disconnected.notify_one();
+                break;
+            }
+            continue;
+        }
+        // Cancellation control must not queue behind the invocation it cancels.
+        // Only this bounded, client-owned control request bypasses serial dispatch.
+        if let Ok(envelope) = &envelope
+            && envelope.kind == EnvelopeKind::Request
+            && let Ok(Request::CancelPluginServiceInvocation { invocation_id }) =
+                decode_request(&envelope.payload)
+        {
+            let accepted = plugin_context::cancel(&state, client_id, &invocation_id);
+            if send_response(
+                &writer,
+                envelope.request_id,
+                Response::Ok(ResponsePayload::PluginServiceInvocationCancelled { accepted }),
+            )
+            .await
+            .is_err()
+            {
+                request_end.send_replace(true);
+                disconnected.notify_one();
+                break;
+            }
+            continue;
+        }
         let failed = envelope.is_err();
         if failed {
             request_end.send_replace(true);
@@ -6153,6 +6205,7 @@ async fn run_client_operation(
             | Request::SelectOptionalContext { .. }
             | Request::JudgementVerify { .. }
             | Request::JudgementSetup
+            | Request::InvokePluginServiceContextual { .. }
     );
     let operation = Box::pin(handle_request(
         request,
@@ -6194,6 +6247,28 @@ async fn cancel_judgement_on_disconnect<T>(
     }
 }
 
+async fn decode_client_operation(
+    writer: &SharedWriter,
+    envelope: &bcode_ipc::Envelope,
+) -> Result<Option<Request>, ServerError> {
+    match decode_request(&envelope.payload) {
+        Ok(request) => Ok(Some(request)),
+        Err(error) => {
+            tracing::warn!(request_id = envelope.request_id, %error, "client request payload could not be decoded");
+            send_response(
+                writer,
+                envelope.request_id,
+                Response::Err(ErrorResponse::new(
+                    "invalid_request_payload",
+                    "request payload could not be decoded",
+                )),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
 async fn handle_registered_client(
     stream: LocalIpcStream,
     state: &Arc<ServerState>,
@@ -6213,18 +6288,21 @@ async fn handle_registered_client(
         let _ = stop.recv().await;
         stopped.send_replace(true);
     });
-    readers.spawn(read_client_envelopes(
-        reader,
-        incoming_tx,
-        Arc::clone(&disconnected),
-        request_end.clone(),
-    ));
     let writer = Arc::new(ResponseWriter {
         writer: Mutex::new(writer),
         metrics: state.metrics.clone(),
         disconnect: Notify::new(),
-        request_end,
+        request_end: request_end.clone(),
     });
+    readers.spawn(read_client_envelopes(
+        reader,
+        incoming_tx,
+        Arc::clone(&disconnected),
+        request_end,
+        Arc::clone(state),
+        client_id,
+        Arc::clone(&writer),
+    ));
     let mut attached_session: Option<SessionId> = None;
 
     loop {
@@ -6249,25 +6327,8 @@ async fn handle_registered_client(
             continue;
         }
 
-        let request = match decode_request(&envelope.payload) {
-            Ok(request) => request,
-            Err(error) => {
-                tracing::warn!(
-                    request_id = envelope.request_id,
-                    %error,
-                    "client request payload could not be decoded"
-                );
-                send_response(
-                    &writer,
-                    envelope.request_id,
-                    Response::Err(ErrorResponse::new(
-                        "invalid_request_payload",
-                        "request payload could not be decoded",
-                    )),
-                )
-                .await?;
-                continue;
-            }
+        let Some(request) = decode_client_operation(&writer, &envelope).await? else {
+            continue;
         };
         let Some(result) = run_client_operation(
             request,
@@ -6465,6 +6526,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::AddPermissionRule { .. } => "add_permission_rule",
         Request::ListPluginServices => "list_plugin_services",
         Request::ListPluginContributions => "list_plugin_contributions",
+        Request::InvokePluginServiceContextual { .. } => "invoke_plugin_service_contextual",
+        Request::CancelPluginServiceInvocation { .. } => "cancel_plugin_service_invocation",
         Request::InvokePluginService { .. } => "invoke_plugin_service",
         Request::CallPluginService { .. } => "call_plugin_service",
         Request::PublishPluginEvent { .. } => "publish_plugin_event",
@@ -9621,6 +9684,44 @@ async fn handle_core_runtime_request(
 }
 
 /// Dispatch requests owned by the agent, skill, and plugin domain.
+async fn handle_contextual_plugin_request(
+    request: AgentSkillPluginRequest,
+    request_id: u64,
+    client_id: ClientId,
+    state: &ServerState,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let response = match request {
+        AgentSkillPluginRequest::InvokePluginServiceContextual {
+            context,
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+        } => plugin_service_response(
+            Box::pin(plugin_context::invoke(
+                state,
+                client_id,
+                context,
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+            ))
+            .await,
+        ),
+        AgentSkillPluginRequest::CancelPluginServiceInvocation { invocation_id } => {
+            let accepted = plugin_context::cancel(state, client_id, &invocation_id);
+            Response::Ok(ResponsePayload::PluginServiceInvocationCancelled { accepted })
+        }
+        _ => Response::Err(ErrorResponse::new(
+            "invalid_contextual_request",
+            "request is not a contextual plugin operation",
+        )),
+    };
+    send_response(writer, request_id, response).await
+}
+
 async fn handle_agent_permission_plugin_request(
     request: AgentSkillPluginRequest,
     request_id: u64,
@@ -9687,6 +9788,10 @@ async fn handle_agent_permission_plugin_request(
                 Response::Ok(ResponsePayload::PluginContributions { contributions }),
             )
             .await
+        }
+        request @ (AgentSkillPluginRequest::InvokePluginServiceContextual { .. }
+        | AgentSkillPluginRequest::CancelPluginServiceInvocation { .. }) => {
+            handle_contextual_plugin_request(request, request_id, client_id, state, writer).await
         }
         AgentSkillPluginRequest::InvokePluginService {
             plugin_id,
@@ -42458,6 +42563,9 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::SessionCatalogRefreshed { .. } => "session_catalog_refreshed",
             ResponsePayload::PermissionList { .. } => "permission_list",
             ResponsePayload::ServerStatus { .. } => "server_status",
+            ResponsePayload::PluginServiceInvocationCancelled { .. } => {
+                "plugin_service_invocation_cancelled"
+            }
             ResponsePayload::PluginServiceResult { .. } => "plugin_service_result",
             ResponsePayload::RuntimeWorkList { .. } => "runtime_work_list",
             ResponsePayload::SkillList { .. } => "skill_list",
