@@ -233,6 +233,19 @@ pub fn record_path(state_dir: &Path, namespace: &str) -> PathBuf {
     registry_dir(state_dir).join(format!("{namespace}.json"))
 }
 
+/// Return a registry path isolated by artifact and runtime scope.
+#[must_use]
+pub fn scoped_record_path(state_dir: &Path, record: &DaemonRecord) -> PathBuf {
+    record.state_location_id.as_ref().map_or_else(
+        || record_path(state_dir, &record.namespace),
+        |scope| record_path(state_dir, &format!("{}-{scope}", record.namespace)),
+    )
+}
+
+fn startup_lock_path(state_dir: &Path, namespace: &str, scope: &str) -> PathBuf {
+    registry_dir(state_dir).join(format!("{namespace}-{scope}.lock"))
+}
+
 /// Write a daemon registry record atomically.
 ///
 /// # Errors
@@ -247,7 +260,7 @@ pub fn write_record(
         path: dir.clone(),
         source,
     })?;
-    let path = record_path(state_dir, &record.namespace);
+    let path = scoped_record_path(state_dir, record);
     let temp_path = path.with_extension(format!("json.tmp-{}", record.instance_id));
     let contents = serde_json::to_vec_pretty(record)?;
     fs::write(&temp_path, contents).map_err(|source| DaemonLifecycleError::Io {
@@ -353,8 +366,9 @@ pub fn read_records_strict(
         if record.schema_version != DAEMON_RECORD_SCHEMA_VERSION
             || record.namespace.is_empty()
             || record.instance_id.is_empty()
-            || path.file_stem().and_then(|value| value.to_str()) != Some(record.namespace.as_str())
-            || !namespaces.insert(record.namespace.clone())
+            || (path != scoped_record_path(state_dir, &record)
+                && path != record_path(state_dir, &record.namespace))
+            || !namespaces.insert((record.namespace.clone(), record.state_location_id.clone()))
             || !instances.insert(record.instance_id.clone())
         {
             return Err(invalid());
@@ -1675,6 +1689,26 @@ mod tests {
         assert!(read_records_strict(root.path(), 2).is_err());
         fs::write(directory.join("unexpected"), b"").unwrap();
         assert!(read_records_strict(root.path(), 16).is_err());
+    }
+
+    #[test]
+    fn registry_preserves_distinct_config_scopes_in_one_state_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut first = record_with_writer_epoch(Some(10));
+        first.state_location_id = Some("scope-a".into());
+        first.instance_id = "instance-a".into();
+        let mut second = first.clone();
+        second.state_location_id = Some("scope-b".into());
+        second.instance_id = "instance-b".into();
+        let first_path = write_record(directory.path(), &first).unwrap();
+        let second_path = write_record(directory.path(), &second).unwrap();
+        assert_ne!(first_path, second_path);
+        assert_eq!(read_records_strict(directory.path(), 16).unwrap().len(), 2);
+        remove_record_path(&first_path).unwrap();
+        assert_eq!(
+            read_records_strict(directory.path(), 16).unwrap(),
+            vec![second]
+        );
     }
 
     #[test]
@@ -3014,9 +3048,11 @@ impl StartupLock {
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
     async fn acquire(endpoint: &IpcEndpoint) -> Result<Option<Self>, DaemonStartError> {
-        let path = bcode_config::default_state_dir()
-            .join("daemons")
-            .join(format!("{}.lock", daemon_namespace()));
+        let path = startup_lock_path(
+            &bcode_config::default_state_dir(),
+            &daemon_namespace(),
+            &bcode_ipc::state_location_id(),
+        );
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -3487,6 +3523,27 @@ mod startup_lock_tests {
         .await;
         child.kill().await.expect("stop child");
         assert!(matches!(result, Err(DaemonStartError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn startup_locks_isolate_scopes_and_fence_same_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = super::startup_lock_path(directory.path(), "artifact", "scope-a");
+        std::fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        let first = StartupLock::acquire_at(first_path.clone(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let second = StartupLock::acquire_at(
+            super::startup_lock_path(directory.path(), "artifact", "scope-b"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            StartupLock::acquire_at(first_path, Duration::from_millis(50)).await,
+            Err(DaemonStartError::StartupCoordinationTimeout { .. })
+        ));
+        drop((first, second));
     }
 
     #[cfg(unix)]

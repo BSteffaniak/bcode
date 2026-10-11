@@ -3410,7 +3410,7 @@ fn windows_smoke_state(
             "Windows smoke daemon executable digest does not match extracted binary",
         ));
     }
-    let registry_path = bcode_daemon_lifecycle::record_path(&state_dir, &record.namespace);
+    let registry_path = bcode_daemon_lifecycle::scoped_record_path(&state_dir, &record);
     ensure_file(&registry_path)?;
     Ok(WindowsSmokeState {
         registry_path: registry_path.display().to_string(),

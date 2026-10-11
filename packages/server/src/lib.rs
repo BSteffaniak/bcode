@@ -5286,7 +5286,7 @@ async fn run_with_services(
             skills,
             daemon_status,
             daemon_record_path: daemon_record.as_ref().map(|daemon_record| {
-                bcode_daemon_lifecycle::record_path(&state_root, &daemon_record.namespace)
+                bcode_daemon_lifecycle::scoped_record_path(&state_root, daemon_record)
             }),
             startup_started_at: Some(startup_started_at),
             metrics,

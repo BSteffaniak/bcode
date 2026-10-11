@@ -5,9 +5,15 @@ Measured on 2026-07-31 from the `bcode/daemon-client-compatibility` worktree wit
 ## Endpoint and startup-fence scope
 
 Default Unix socket discovery uses `/tmp` with a bounded basename scoped to user,
-artifact identity, and resolved state location. It does not depend on `TMPDIR`:
+artifact identity, and resolved runtime scope (state root plus config directory).
+It does not depend on `TMPDIR`:
 clients using different temporary directories must reach the same matching daemon.
 Explicit socket overrides retain their existing selection rules.
+
+Startup lock and registry filenames include both artifact namespace and runtime
+scope, so different config directories sharing a state root can coexist without
+contending for a lock or overwriting each other's records. Historical unscoped
+registry filenames remain readable; new records use scoped filenames.
 
 The detached daemon retains the inherited startup lock for its lifetime. A
 contending launcher probes the matching endpoint rather than replacing that daemon.
