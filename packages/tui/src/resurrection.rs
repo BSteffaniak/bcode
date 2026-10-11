@@ -38,6 +38,78 @@ struct Welcome {
     restore: Option<Descriptor>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rejected {
+    protocol: String,
+    error: HostRejection,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostRejection {
+    code: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HandshakeResponse {
+    Welcome(Welcome),
+    Rejected(Rejected),
+}
+
+fn read_welcome(reader: &mut impl std::io::BufRead) -> std::io::Result<Welcome> {
+    let response: HandshakeResponse = read_frame(reader)?;
+    let protocol = match &response {
+        HandshakeResponse::Welcome(value) => &value.protocol,
+        HandshakeResponse::Rejected(value) => &value.protocol,
+    };
+    if protocol != PROTOCOL {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported resurrection host protocol",
+        ));
+    }
+    match response {
+        HandshakeResponse::Welcome(welcome) => Ok(welcome),
+        HandshakeResponse::Rejected(rejected) => {
+            // Host data is untrusted: render known reasons, never arbitrary host text.
+            let (kind, reason) = match rejected.error.code.as_str() {
+                "ownership_verification_unavailable" => (
+                    std::io::ErrorKind::Other,
+                    "the host could not verify foreground process ownership",
+                ),
+                "ownership_rejected" => (
+                    std::io::ErrorKind::PermissionDenied,
+                    "the connecting process does not own the current execution",
+                ),
+                "invalid_handshake" => (
+                    std::io::ErrorKind::InvalidData,
+                    "the host rejected the handshake or peer identity",
+                ),
+                "launch_unavailable" => (
+                    std::io::ErrorKind::ConnectionAborted,
+                    "the launch is no longer available for restoration",
+                ),
+                _ => (
+                    std::io::ErrorKind::InvalidData,
+                    "the host rejected the connection with an unknown error code",
+                ),
+            };
+            Err(std::io::Error::new(kind, reason))
+        }
+    }
+}
+
+fn handshake_error(error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "Session restoration failed during the host handshake: {error}. To launch without restoration, set BCODE_NO_SESSION_RESURRECTION=1."
+        ),
+    )
+}
+
 #[derive(Serialize)]
 struct Hello {
     protocol: &'static str,
@@ -180,12 +252,7 @@ async fn connect_endpoint(
                     accept_restore: explicit_session.is_none(),
                 },
             )?;
-            let welcome: Welcome = read_frame(&mut stream)?;
-            if welcome.protocol != PROTOCOL {
-                return Err(std::io::Error::other(
-                    "unsupported resurrection host protocol",
-                ));
-            }
+            let welcome = read_welcome(&mut stream)?;
             let restored = if explicit_session.is_none() {
                 welcome
                     .restore
@@ -206,7 +273,9 @@ async fn connect_endpoint(
             Ok((stream, restored, authority))
         })
         .await
-        .map_err(std::io::Error::other)??;
+        .map_err(std::io::Error::other)
+        .and_then(std::convert::identity)
+        .map_err(|error| handshake_error(&error))?;
         Ok((
             explicit_session.or(restored),
             Some(start_publisher(stream, authority)),
@@ -290,7 +359,7 @@ fn start_publisher(
 
 fn write_frame(writer: &mut impl std::io::Write, value: &impl Serialize) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.len() >= MAX_FRAME {
+    if bytes.len() + 1 >= MAX_FRAME {
         return Err(std::io::Error::other("resurrection frame exceeds limit"));
     }
     writer.write_all(&bytes)?;
@@ -304,9 +373,22 @@ fn read_frame<T: serde::de::DeserializeOwned>(
     use std::io::BufRead;
     let mut bytes = Vec::new();
     std::io::Read::take(reader, MAX_FRAME as u64).read_until(b'\n', &mut bytes)?;
-    if bytes.last() != Some(&b'\n') || bytes.len() >= MAX_FRAME {
-        return Err(std::io::Error::other(
-            "incomplete or oversized resurrection frame",
+    if bytes.len() >= MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resurrection response exceeds protocol limit",
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "resurrection host closed the connection before replying",
+        ));
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated resurrection response",
         ));
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -350,6 +432,111 @@ mod tests {
         );
         let ack: Acknowledgement = read_frame(&mut &b"{\"revision\":2}\n"[..]).unwrap();
         assert_eq!(ack.revision, 2);
+    }
+
+    #[test]
+    fn frames_distinguish_closed_truncated_oversized_and_malformed_responses() {
+        for (bytes, kind, message) in [
+            (
+                Vec::new(),
+                std::io::ErrorKind::UnexpectedEof,
+                "closed the connection",
+            ),
+            (
+                b"{\"revision\":1}".to_vec(),
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated",
+            ),
+            (
+                vec![b'x'; MAX_FRAME],
+                std::io::ErrorKind::InvalidData,
+                "exceeds protocol limit",
+            ),
+        ] {
+            let error = read_frame::<Acknowledgement>(&mut bytes.as_slice())
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), kind);
+            assert!(error.to_string().contains(message));
+        }
+        assert!(read_frame::<Acknowledgement>(&mut &b"invalid json\n"[..]).is_err());
+        let mut fragmented = std::io::BufReader::with_capacity(2, &b"{\"revision\":3}\n"[..]);
+        assert_eq!(
+            read_frame::<Acknowledgement>(&mut fragmented)
+                .unwrap()
+                .revision,
+            3
+        );
+        let mut valid = b"{\"revision\":4}".to_vec();
+        valid.resize(MAX_FRAME - 2, b' ');
+        valid.push(b'\n');
+        assert_eq!(
+            read_frame::<Acknowledgement>(&mut valid.as_slice())
+                .unwrap()
+                .revision,
+            4
+        );
+        valid.insert(0, b' ');
+        assert!(read_frame::<Acknowledgement>(&mut valid.as_slice()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_and_closed_handshakes_fail_with_explicit_recovery_guidance() {
+        for mode in [
+            SessionResurrectionMode::Auto,
+            SessionResurrectionMode::Enabled,
+        ] {
+            for (response, expected) in [
+                (None, "closed the connection before replying"),
+                (
+                    Some(
+                        serde_json::json!({"protocol": PROTOCOL, "error": {"code": "ownership_verification_unavailable"}}),
+                    ),
+                    "could not verify foreground process ownership",
+                ),
+                (
+                    Some(
+                        serde_json::json!({"protocol": PROTOCOL, "error": {"code": "ownership_rejected"}}),
+                    ),
+                    "does not own the current execution",
+                ),
+                (
+                    Some(
+                        serde_json::json!({"protocol": PROTOCOL, "error": {"code": "unknown\u{001b}[31m"}}),
+                    ),
+                    "unknown error code",
+                ),
+                (
+                    Some(
+                        serde_json::json!({"protocol": "future", "error": {"code": "ownership_rejected"}}),
+                    ),
+                    "unsupported resurrection host protocol",
+                ),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let socket = directory.path().join("host");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let host = std::thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = std::io::BufReader::new(stream);
+                    let _: serde_json::Value = read_frame(&mut reader).unwrap();
+                    if let Some(response) = response {
+                        write_frame(reader.get_mut(), &response).unwrap();
+                    }
+                });
+                let error = connect_endpoint(socket, None, directory.path().to_owned(), mode)
+                    .await
+                    .err()
+                    .unwrap();
+                let message = error.to_string();
+                assert!(message.contains("during the host handshake"));
+                assert!(message.contains(expected), "{message}");
+                assert!(message.contains("BCODE_NO_SESSION_RESURRECTION=1"));
+                assert!(!message.contains('\u{001b}'));
+                host.join().unwrap();
+            }
+        }
     }
 
     #[tokio::test]
