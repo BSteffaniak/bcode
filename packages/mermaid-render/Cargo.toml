@@ -11,24 +11,13 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-libc                = { workspace = true }
-mermaid-rs-renderer = { workspace = true }
-sha2                = { workspace = true }
-tempfile            = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
+bmux_mermaid_render = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [[bin]]
-name = "bcode-mermaid-worker"
+name = "bmux-mermaid-worker"
 path = "src/bin/worker.rs"
 
 [features]

@@ -16,7 +16,7 @@ path              = "src/main.rs"
 required-features = ["app"]
 
 [[bin]]
-name              = "bcode-mermaid-worker"
+name              = "bmux-mermaid-worker"
 path              = "../mermaid-render/src/bin/worker.rs"
 required-features = ["mermaid-renderer"]
 

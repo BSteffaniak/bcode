@@ -11,9 +11,10 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_syntax_render = { workspace = true }
+
+[dev-dependencies]
 bmux_tui = { workspace = true }
-syntect  = { workspace = true }
-two-face = { workspace = true }
 
 [features]
 default          = []

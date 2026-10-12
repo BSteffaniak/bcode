@@ -16,7 +16,7 @@ const RESPONSE_MAGIC: &[u8; 4] = b"BCMR";
 const VERSION: u16 = 1;
 
 fn worker() -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_bcode-mermaid-worker"))
+    Command::new(env!("CARGO_BIN_EXE_bmux-mermaid-worker"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -54,7 +54,7 @@ fn response(mut child: std::process::Child, request: &[u8]) -> (bool, Vec<u8>, b
     assert!(
         response.len() >= 11,
         "worker {:?} exited {status} with {} response bytes",
-        env!("CARGO_BIN_EXE_bcode-mermaid-worker"),
+        env!("CARGO_BIN_EXE_bmux-mermaid-worker"),
         response.len()
     );
     assert_eq!(&response[..4], RESPONSE_MAGIC);
@@ -188,7 +188,7 @@ fn public_worker_adapter_maps_worker_crash_to_typed_protocol_failure() {
 
 #[test]
 fn public_worker_adapter_round_trips_and_maps_failures() {
-    let worker = std::path::Path::new(env!("CARGO_BIN_EXE_bcode-mermaid-worker"));
+    let worker = std::path::Path::new(env!("CARGO_BIN_EXE_bmux-mermaid-worker"));
     let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
     let rendered =
         render_mermaid_with_worker(worker, &request, &MermaidCancellationToken::default()).unwrap();
@@ -214,7 +214,7 @@ fn public_worker_adapter_honors_pre_cancelled_request() {
     cancellation.cancel();
     assert_eq!(
         render_mermaid_with_worker(
-            std::path::Path::new(env!("CARGO_BIN_EXE_bcode-mermaid-worker")),
+            std::path::Path::new(env!("CARGO_BIN_EXE_bmux-mermaid-worker")),
             &MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600),
             &cancellation,
         ),

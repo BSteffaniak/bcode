@@ -11,21 +11,14 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_mermaid_render         = { workspace = true }
-bcode_syntax_render          = { workspace = true }
-bmux_tui                     = { workspace = true }
-hyperchad_color              = { workspace = true }
-hyperchad_markdown           = { workspace = true, features = ["syntax-highlighting"] }
-hyperchad_transformer        = { workspace = true }
-hyperchad_transformer_models = { workspace = true }
-pulldown-cmark               = { workspace = true }
-smallvec                     = { workspace = true }
-unicode-segmentation         = { workspace = true }
-url                          = { workspace = true }
+bmux_markdown = { workspace = true }
 
 [dev-dependencies]
-insta         = { workspace = true }
-unicode-width = { workspace = true }
+bcode_syntax_render = { workspace = true }
+bmux_tui            = { workspace = true }
+insta               = { workspace = true }
+unicode-width       = { workspace = true }
+url                 = { workspace = true }
 
 [features]
 default          = []

@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 const PACKAGE_NAME: &str = "bcode";
 const BINARY_NAME: &str = "bcode";
-const MERMAID_WORKER_BINARY_NAME: &str = "bcode-mermaid-worker";
+const MERMAID_WORKER_BINARY_NAME: &str = "bmux-mermaid-worker";
 const DIST_DIR: &str = "target/dist";
 const DEFAULT_DEV_CODESIGN_IDENTITY: &str = "Bcode Dev";
 const DEV_CODESIGN_KEYCHAIN_RELATIVE_DIR: &str = "Library/Application Support/bcode/dev-signing";
@@ -3761,7 +3761,7 @@ const fn binary_file_name(target_kind: TargetKind) -> &'static str {
 const fn mermaid_worker_file_name(target_kind: TargetKind) -> &'static str {
     match target_kind {
         TargetKind::Macos | TargetKind::Linux => MERMAID_WORKER_BINARY_NAME,
-        TargetKind::Windows => "bcode-mermaid-worker.exe",
+        TargetKind::Windows => "bmux-mermaid-worker.exe",
     }
 }
 
@@ -4233,7 +4233,7 @@ mod tests {
         assert_eq!(binary_file_name(TargetKind::Windows), "bcode.exe");
         assert_eq!(
             mermaid_worker_file_name(TargetKind::Windows),
-            "bcode-mermaid-worker.exe"
+            "bmux-mermaid-worker.exe"
         );
         assert_eq!(archive_extension(TargetKind::Windows), "zip");
         assert_eq!(archive_extension(TargetKind::Macos), "zip");
@@ -4293,7 +4293,7 @@ mod tests {
         fs::create_dir_all(runtime.join("lib")).expect("runtime lib dir");
         fs::create_dir_all(runtime.join("tessdata")).expect("tessdata dir");
         fs::write(staging.join("bcode.exe"), b"bcode").expect("bcode");
-        fs::write(staging.join("bcode-mermaid-worker.exe"), b"mermaid worker").expect("worker");
+        fs::write(staging.join("bmux-mermaid-worker.exe"), b"mermaid worker").expect("worker");
         fs::write(
             staging.join("bcode-runtimes/tesseract/manifest.json"),
             b"{}",
@@ -4307,7 +4307,7 @@ mod tests {
         verify_archive_contents(&archive, TargetKind::Windows, true, true)
             .expect("complete archive");
 
-        fs::remove_file(staging.join("bcode-mermaid-worker.exe")).expect("remove worker");
+        fs::remove_file(staging.join("bmux-mermaid-worker.exe")).expect("remove worker");
         let incomplete = temp.path().join("incomplete.zip");
         create_zip_archive(&incomplete, &staging).expect("create incomplete archive");
         assert!(verify_archive_contents(&incomplete, TargetKind::Windows, true, true).is_err());
@@ -4332,7 +4332,7 @@ mod tests {
     fn windows_archive_requires_canonical_leptonica_dll() {
         let entries = std::collections::BTreeSet::from([
             "bcode.exe".to_owned(),
-            "bcode-mermaid-worker.exe".to_owned(),
+            "bmux-mermaid-worker.exe".to_owned(),
             "bcode-runtimes/tesseract/manifest.json".to_owned(),
             "bcode-runtimes/tesseract/5.5.2/lib/tesseract.dll".to_owned(),
             "bcode-runtimes/tesseract/5.5.2/tessdata/eng.traineddata".to_owned(),
