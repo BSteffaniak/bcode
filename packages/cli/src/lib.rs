@@ -4498,7 +4498,8 @@ enum Commands {
         /// Queue a conversational follow-up instead of the default independent turn.
         #[arg(long, conflicts_with_all = ["steering", "background"])]
         follow_up: bool,
-        /// Steer a compatible active turn at its next safe provider boundary.
+        /// Steer a compatible active turn at its next safe provider boundary,
+        /// or fail without queueing when no compatible active turn exists.
         #[arg(long, conflicts_with = "background")]
         steering: bool,
         /// Stable producer namespace for durable turn admission.
@@ -5882,6 +5883,17 @@ enum SessionCommand {
         #[arg(long, default_value_t = SESSION_CLI_PAGE_LIMIT)]
         limit: usize,
         /// Emit one JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a bounded point-in-time pending queue, not a snapshot or event stream.
+    Pending {
+        session_id: SessionId,
+        /// Exclusive accepted-event sequence cursor.
+        #[arg(long)]
+        after: Option<u64>,
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=128))]
+        limit: u32,
         #[arg(long)]
         json: bool,
     },
@@ -7870,6 +7882,19 @@ async fn run_session_compression(
     dry_run: bool,
     json: bool,
 ) -> Result<(), CliError> {
+    Box::pin(run_session_compression_inner(
+        session_id, older_than, tier, dry_run, json,
+    ))
+    .await
+}
+
+async fn run_session_compression_inner(
+    session_id: Option<SessionId>,
+    older_than: Option<u64>,
+    tier: &str,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), CliError> {
     use bcode_session_models::{
         StorageCompressionDisposition as Disposition, StorageCompressionRequest,
         StorageCompressionTier,
@@ -8259,6 +8284,12 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
             limit,
             json,
         } => Box::pin(watch_session(session_id, limit, json)).await?,
+        SessionCommand::Pending {
+            session_id,
+            after,
+            limit,
+            json,
+        } => Box::pin(session_pending(session_id, after, limit, json)).await?,
         SessionCommand::History {
             session_id,
             after,
@@ -16165,6 +16196,81 @@ struct PagedSessionHistory {
     compatibility_issues: Vec<SessionEventCompatibilityIssue>,
 }
 
+async fn session_pending(
+    session_id: SessionId,
+    after: Option<u64>,
+    limit: u32,
+    json: bool,
+) -> Result<(), CliError> {
+    let page = session_read_client(session_id)
+        .await?
+        .pending_submissions(session_id, after, limit)
+        .await?;
+    if json {
+        print_json(&page)?;
+    } else {
+        write_pending_submissions(&mut std::io::stdout().lock(), &page)?;
+    }
+    Ok(())
+}
+
+fn write_pending_submissions(
+    output: &mut impl std::io::Write,
+    page: &bcode_session_models::PendingSubmissionsPage,
+) -> std::io::Result<()> {
+    use bcode_session_models::{SubmissionStatus, SubmissionTarget};
+
+    if page.records.is_empty() {
+        writeln!(output, "No pending submissions in this page")?;
+    }
+    for record in &page.records {
+        let (kind, turn_id) = match &record.submission.target {
+            SubmissionTarget::Steering { turn_id } => ("steering turn", turn_id),
+            SubmissionTarget::OwnTurn { turn_id } => ("independently queued turn", turn_id),
+        };
+        write!(
+            output,
+            "#{} submission {} -> {kind} {turn_id}: ",
+            record.receipt.accepted_event_sequence, record.receipt.submission_id.0
+        )?;
+        match &record.status {
+            SubmissionStatus::Pending => write!(output, "pending")?,
+            SubmissionStatus::Activated {
+                turn_id,
+                conversation_sequence,
+            } => write!(
+                output,
+                "activated turn {turn_id} at #{conversation_sequence}"
+            )?,
+            SubmissionStatus::Cancelled { event_sequence } => {
+                write!(output, "cancelled at #{event_sequence}")?;
+            }
+        }
+        if let Some(observation) = &record.context_observation {
+            write!(
+                output,
+                "; execution context {:?} at #{}",
+                observation.issue, observation.event_sequence
+            )?;
+        }
+        writeln!(output)?;
+    }
+    if page.has_more {
+        if let Some(after) = page.next_after {
+            writeln!(
+                output,
+                "More pending submissions; continue with --after {after}"
+            )?;
+        } else {
+            writeln!(
+                output,
+                "More pending submissions; continuation cursor unavailable"
+            )?;
+        }
+    }
+    Ok(())
+}
+
 async fn session_history(
     session_id: SessionId,
     after: Option<u64>,
@@ -19383,10 +19489,46 @@ async fn send_message_with_client(
     session_id: SessionId,
     options: SendOptions,
 ) -> Result<(), CliError> {
-    send_message_observed(client, session_id, options, None).await
+    Box::pin(send_message_observed(client, session_id, options, None)).await
 }
 
 async fn send_message_observed(
+    client: &BcodeClient,
+    session_id: SessionId,
+    options: SendOptions,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), CliError> {
+    Box::pin(send_message_observed_inner(
+        client, session_id, options, deadline,
+    ))
+    .await
+}
+
+async fn prepare_submission_watcher(
+    client: &BcodeClient,
+    session_id: SessionId,
+    observe: bool,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Option<bcode_client::SessionWatcher>, CliError> {
+    if !observe {
+        return Ok(None);
+    }
+    let watcher = if deadline.is_some() {
+        report_unverified_submission(
+            headless::request(deadline, async {
+                Ok(client.watch_session(session_id, 100).await?)
+            })
+            .await,
+            session_id,
+            true,
+        )?
+    } else {
+        watch_submitted_turn(client, session_id).await?
+    };
+    Ok(Some(watcher))
+}
+
+async fn send_message_observed_inner(
     client: &BcodeClient,
     session_id: SessionId,
     options: SendOptions,
@@ -19404,22 +19546,8 @@ async fn send_message_observed(
     } = options;
     let wait_timeout = observe_options.as_ref().map(|options| options.timeout);
     let text = report_unverified_submission(input.read(), session_id, wait_timeout.is_some())?;
-    let mut watcher = if wait_timeout.is_some() {
-        if deadline.is_some() {
-            Some(report_unverified_submission(
-                headless::request(deadline, async {
-                    Ok(client.watch_session(session_id, 100).await?)
-                })
-                .await,
-                session_id,
-                true,
-            )?)
-        } else {
-            Some(watch_submitted_turn(client, session_id).await?)
-        }
-    } else {
-        None
-    };
+    let mut watcher =
+        prepare_submission_watcher(client, session_id, wait_timeout.is_some(), deadline).await?;
     if let Some(placement) = placement {
         let receipt = submit_cli_prompt(
             client,
@@ -19438,7 +19566,28 @@ async fn send_message_observed(
             },
         )
         .await?;
-        write_submission_receipt(session_id, &receipt, json)?;
+        // Acceptance is already durable. A failed inspection must not report the
+        // submission as failed or invite resubmission under a new identity.
+        let record = if json {
+            None
+        } else {
+            match client
+                .get_submission(session_id, receipt.submission_id.clone())
+                .await
+            {
+                Ok(record) => record,
+                Err(error) => {
+                    eprintln!("Submission accepted, but target inspection failed: {error}");
+                    None
+                }
+            }
+        };
+        write_submission_receipt(
+            session_id,
+            &receipt,
+            record.as_ref().map(|record| &record.submission.target),
+            json,
+        )?;
     } else {
         let admission = headless::request(deadline, async {
             client
@@ -19552,26 +19701,52 @@ async fn submit_cli_prompt(
             .clone()
             .unwrap_or_else(|| SessionId::new().to_string()),
     );
-    Ok(client
-        .submit_prompt(session_id, submission_id, text, placement, metadata)
-        .await?)
+    Ok(match placement {
+        bcode_session_models::SubmissionPlacement::Steer => {
+            client
+                .steer_prompt(session_id, submission_id, text, metadata)
+                .await?
+        }
+        bcode_session_models::SubmissionPlacement::FollowUp => {
+            client
+                .submit_prompt(session_id, submission_id, text, placement, metadata)
+                .await?
+        }
+    })
 }
 
 fn write_submission_receipt(
     session_id: SessionId,
     receipt: &bcode_session_models::SubmissionReceipt,
+    target: Option<&bcode_session_models::SubmissionTarget>,
     json: bool,
 ) -> Result<(), CliError> {
     if json {
         print_json(&serde_json::json!({ "session_id": session_id, "submission": receipt }))?;
     } else {
-        writeln!(
-            std::io::stdout().lock(),
-            "Accepted submission {} (activation pending)",
-            receipt.submission_id.0
-        )?;
+        write_plain_submission_receipt(&mut std::io::stdout().lock(), receipt, target)?;
     }
     Ok(())
+}
+
+fn write_plain_submission_receipt(
+    output: &mut impl std::io::Write,
+    receipt: &bcode_session_models::SubmissionReceipt,
+    target: Option<&bcode_session_models::SubmissionTarget>,
+) -> std::io::Result<()> {
+    use bcode_session_models::SubmissionTarget;
+
+    write!(output, "Accepted submission {}", receipt.submission_id.0)?;
+    match target {
+        Some(SubmissionTarget::Steering { turn_id }) => {
+            write!(output, " targeting steering turn {turn_id}")?;
+        }
+        Some(SubmissionTarget::OwnTurn { turn_id }) => {
+            write!(output, " targeting independently queued turn {turn_id}")?;
+        }
+        None => write!(output, " (target unavailable)")?,
+    }
+    writeln!(output, " (activation not confirmed)")
 }
 
 async fn report_observation_failure(
@@ -25607,7 +25782,7 @@ mod cancellation_cli_tests {
 
 #[cfg(test)]
 mod send_cli_tests {
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, SessionCommand, SessionId};
     use clap::Parser as _;
 
     #[test]
@@ -25702,6 +25877,262 @@ mod send_cli_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn pending_command_enforces_bounded_page_controls() {
+        let session = SessionId::new().to_string();
+        let parsed = Cli::try_parse_from(["bcode", "session", "pending", &session]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::Pending {
+                    after: None,
+                    limit: 32,
+                    json: false,
+                    ..
+                }
+            })
+        ));
+        let parsed = Cli::try_parse_from([
+            "bcode", "session", "pending", &session, "--after", "42", "--limit", "128", "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::Pending {
+                    after: Some(42),
+                    limit: 128,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+        for limit in ["0", "129"] {
+            assert!(
+                Cli::try_parse_from(["bcode", "session", "pending", &session, "--limit", limit,])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pending_output_preserves_targets_lifecycle_context_and_cursor() {
+        use bcode_session_models::{
+            ClientId, PendingSubmissionsPage, PromptSubmission, SubmissionContextIssue,
+            SubmissionContextObservation, SubmissionId, SubmissionPlacement, SubmissionReceipt,
+            SubmissionRecord, SubmissionStatus, SubmissionTarget, TurnId,
+        };
+        let mut records = Vec::new();
+        for (sequence, target, status, context_observation) in [
+            (
+                41,
+                SubmissionTarget::Steering {
+                    turn_id: TurnId("active".into()),
+                },
+                SubmissionStatus::Pending,
+                Some(SubmissionContextObservation {
+                    issue: SubmissionContextIssue::Unavailable,
+                    event_sequence: 43,
+                }),
+            ),
+            (
+                42,
+                SubmissionTarget::OwnTurn {
+                    turn_id: TurnId("queued".into()),
+                },
+                SubmissionStatus::Pending,
+                None,
+            ),
+        ] {
+            let id = SubmissionId(format!("request-{sequence}"));
+            records.push(SubmissionRecord {
+                receipt: SubmissionReceipt {
+                    submission_id: id.clone(),
+                    accepted_event_sequence: sequence,
+                },
+                submission: PromptSubmission {
+                    id,
+                    client_id: ClientId::new(),
+                    text: "hello".into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    requested_placement: SubmissionPlacement::FollowUp,
+                    target,
+                    execution_descriptor: None,
+                },
+                status,
+                context_observation,
+            });
+        }
+        let page = PendingSubmissionsPage {
+            records,
+            next_after: Some(42),
+            has_more: true,
+        };
+        let mut output = Vec::new();
+        super::write_pending_submissions(&mut output, &page).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "#41 submission request-41 -> steering turn active: pending; execution context Unavailable at #43\n",
+                "#42 submission request-42 -> independently queued turn queued: pending\n",
+                "More pending submissions; continue with --after 42\n",
+            )
+        );
+        let empty = PendingSubmissionsPage {
+            records: Vec::new(),
+            next_after: None,
+            has_more: false,
+        };
+        let mut output = Vec::new();
+        super::write_pending_submissions(&mut output, &empty).unwrap();
+        assert_eq!(output, b"No pending submissions in this page\n");
+    }
+
+    #[test]
+    fn submission_receipt_plain_output_uses_resolved_target() {
+        use bcode_session_models::{SubmissionId, SubmissionReceipt, SubmissionTarget, TurnId};
+
+        let receipt = SubmissionReceipt {
+            submission_id: SubmissionId("request-1".into()),
+            accepted_event_sequence: 42,
+        };
+        for (target, expected) in [
+            (
+                Some(SubmissionTarget::Steering {
+                    turn_id: TurnId("active-1".into()),
+                }),
+                "Accepted submission request-1 targeting steering turn active-1 (activation not confirmed)\n",
+            ),
+            (
+                Some(SubmissionTarget::OwnTurn {
+                    turn_id: TurnId("queued-2".into()),
+                }),
+                "Accepted submission request-1 targeting independently queued turn queued-2 (activation not confirmed)\n",
+            ),
+            (
+                None,
+                "Accepted submission request-1 (target unavailable) (activation not confirmed)\n",
+            ),
+        ] {
+            let mut output = Vec::new();
+            super::write_plain_submission_receipt(&mut output, &receipt, target.as_ref()).unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn steering_help_describes_strict_active_turn_requirement() {
+        let error = Cli::try_parse_from(["bcode", "send", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("--steering"));
+        assert!(help.contains("fail without queueing"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_prompt_dispatch_requires_active_turn_only_for_steering() {
+        use bcode_session_models::{SubmissionId, SubmissionPlacement, SubmissionReceipt};
+
+        for (placement, reject) in [
+            (SubmissionPlacement::FollowUp, false),
+            (SubmissionPlacement::Steer, false),
+            (SubmissionPlacement::Steer, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("s.sock"));
+            let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+            let session_id = bcode_session_models::SessionId::new();
+            let receipt = SubmissionReceipt {
+                submission_id: SubmissionId("retry-1".into()),
+                accepted_event_sequence: 42,
+            };
+            let expected = receipt.clone();
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::Envelope::new(
+                        hello.request_id,
+                        bcode_ipc::EnvelopeKind::Response,
+                        bcode_ipc::encode_response(&bcode_ipc::Response::Ok(
+                            bcode_ipc::ResponsePayload::Hello {
+                                protocol_version: bcode_ipc::ProtocolVersion(
+                                    bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                                ),
+                                client_id: bcode_session_models::ClientId::new(),
+                                daemon:
+                                    super::json_stream_output_tests::artifact_test_daemon_status(),
+                            },
+                        ))
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+                let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                assert!(matches!(
+                    bcode_ipc::decode_request(&request.payload).unwrap(),
+                    bcode_ipc::Request::SubmitPrompt {
+                        session_id: actual_session,
+                        submission_id,
+                        text,
+                        placement: actual_placement,
+                        require_active_turn,
+                        ..
+                    } if actual_session == session_id
+                        && submission_id == expected.submission_id
+                        && text == "hello"
+                        && actual_placement == placement
+                        && require_active_turn == (placement == SubmissionPlacement::Steer)
+                ));
+                let response = if reject {
+                    bcode_ipc::Response::Err(bcode_ipc::ErrorResponse {
+                        code: "steering_unavailable".into(),
+                        message: "no compatible active turn".into(),
+                    })
+                } else {
+                    bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SubmissionAccepted {
+                        receipt: expected,
+                    })
+                };
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::Envelope::new(
+                        request.request_id,
+                        bcode_ipc::EnvelopeKind::Response,
+                        bcode_ipc::encode_response(&response).unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+            });
+            let result = super::submit_cli_prompt(
+                &super::BcodeClient::new(endpoint),
+                session_id,
+                "hello".into(),
+                placement,
+                bcode_session_models::TurnAdmissionMetadata {
+                    idempotency_key: Some("retry-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            if reject {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("no compatible active turn")
+                );
+            } else {
+                assert_eq!(result.unwrap(), receipt);
+            }
+            server.await.unwrap();
+        }
     }
 
     #[test]
@@ -27203,7 +27634,7 @@ mod json_stream_output_tests {
     }
 
     #[cfg(unix)]
-    fn artifact_test_daemon_status() -> bcode_ipc::DaemonStatus {
+    pub fn artifact_test_daemon_status() -> bcode_ipc::DaemonStatus {
         bcode_ipc::DaemonStatus {
             namespace: bcode_ipc::daemon_namespace(),
             protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),

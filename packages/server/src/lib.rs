@@ -219,6 +219,9 @@ pub const SESSION_EVENT_PLUGIN_TOPIC: &str = "bcode.session.event";
 /// Errors returned by the local server.
 #[derive(Debug, Error)]
 pub enum ServerError {
+    /// Strict steering cannot attach to a compatible active turn.
+    #[error("compatible active turn unavailable for steering")]
+    SteeringUnavailable,
     /// A content-free workflow observation failure at a defined boundary.
     #[error("workflow activity observation failed at {phase}")]
     WorkflowActivityObservation { phase: &'static str },
@@ -1017,11 +1020,32 @@ struct RuntimeCurrentTurn {
 }
 
 impl RuntimeCurrentTurn {
-    fn accepts_steering(&self, execution: &TurnExecutionOptions) -> bool {
+    fn accepts_steering(
+        &self,
+        execution: &TurnExecutionOptions,
+        selection: &SessionModelSelection,
+    ) -> bool {
         self.kind == RuntimeOperationKind::ModelTurn
             && !self.cancel_state.is_cancelled()
+            && self.selection.as_ref().is_some_and(|active_selection| {
+                // Requested spelling is provenance; the selected model and provider context
+                // remain authoritative, including all reasoning and authentication settings.
+                let mut normalized_selection = selection.clone();
+                normalized_selection
+                    .requested_model_id
+                    .clone_from(&active_selection.requested_model_id);
+                active_selection == &normalized_selection
+            })
             && self.execution.as_ref().is_some_and(|active| {
-                active == execution
+                // Selection has already gone through the ordinary turn-selection path.
+                // Normalize only its syntactic overrides, never the active turn policy.
+                let mut normalized = execution.clone();
+                normalized
+                    .provider_plugin_id
+                    .clone_from(&active.provider_plugin_id);
+                normalized.model_id.clone_from(&active.model_id);
+                normalized.reasoning.clone_from(&active.reasoning);
+                active == &normalized
                     && active.correlation.is_none()
                     && active.request_context_id.is_none()
                     && active.structured_output.is_none()
@@ -6337,6 +6361,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SubmitTurn { session_id, .. }
         | Request::SubmitPrompt { session_id, .. }
         | Request::GetSubmission { session_id, .. }
+        | Request::PendingSubmissions { session_id, .. }
         | Request::InvokeSkill { session_id, .. }
         | Request::InvokeSkillWithExecution { session_id, .. }
         | Request::CancelSessionTurn { session_id, .. }
@@ -6430,6 +6455,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SubmitTurn { .. } => "submit_turn",
         Request::SubmitPrompt { .. } => "submit_prompt",
         Request::GetSubmission { .. } => "get_submission",
+        Request::PendingSubmissions { .. } => "pending_submissions",
         Request::InvokeSkill { .. } => "invoke_skill",
         Request::InvokeSkillWithExecution { .. } => "invoke_skill_with_execution",
         Request::CancelSessionTurn { .. } => "cancel_session_turn",
@@ -7505,6 +7531,7 @@ async fn handle_turn_workflow_model_request(
             submission_id,
             text,
             placement,
+            require_active_turn,
             admission,
         } => {
             if let Some(active_namespace) = state
@@ -7525,12 +7552,46 @@ async fn handle_turn_workflow_model_request(
                 submission_id,
                 text,
                 placement,
+                require_active_turn,
                 admission,
             )
             .await
             {
                 Ok(receipt) => Response::Ok(ResponsePayload::SubmissionAccepted { receipt }),
+                Err(ServerError::SteeringUnavailable) => Response::Err(ErrorResponse::new(
+                    "steering_unavailable",
+                    "compatible active turn unavailable for steering",
+                )),
                 Err(error) => Response::Err(server_session_error_response(&error)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        SessionTurnRequest::PendingSubmissions {
+            session_id,
+            after,
+            limit,
+        } => {
+            if let Some(active_namespace) = state
+                .active_session_namespace_mismatch(session_id, client_id)
+                .await
+            {
+                return send_incompatible_active_session_response(
+                    writer,
+                    request_id,
+                    &active_namespace,
+                )
+                .await;
+            }
+            let response = if (1..=128).contains(&limit) {
+                match pending_submissions_page(state, session_id, after, limit).await {
+                    Ok(page) => Response::Ok(ResponsePayload::PendingSubmissions { page }),
+                    Err(error) => Response::Err(session_error_response(&error)),
+                }
+            } else {
+                Response::Err(ErrorResponse::new(
+                    "invalid_request",
+                    "pending submissions limit must be between 1 and 128",
+                ))
             };
             send_response(writer, request_id, response).await
         }
@@ -8756,10 +8817,12 @@ async fn handle_workflow_run_request(
             send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ControlWorkflowRun { run_id, action } => {
-            let result = bcode_workflow::WorkflowRunApplication::control_workflow_run(
-                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
-                run_id,
-                action,
+            let result = Box::pin(
+                bcode_workflow::WorkflowRunApplication::control_workflow_run(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    run_id,
+                    action,
+                ),
             )
             .await;
             let response = match result {
@@ -15383,6 +15446,33 @@ async fn live_submission_runtime(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn pending_submissions_page(
+    state: &ServerState,
+    session_id: SessionId,
+    after: Option<u64>,
+    limit: u32,
+) -> Result<bcode_session_models::PendingSubmissionsPage, bcode_session::SessionError> {
+    let mut records = state
+        .sessions
+        .pending_submissions(session_id, after, limit as usize + 1)
+        .await?;
+    let has_more = records.len() > limit as usize;
+    records.truncate(limit as usize);
+    let next_after = if has_more {
+        records
+            .last()
+            .map(|record| record.receipt.accepted_event_sequence)
+    } else {
+        None
+    };
+    Ok(bcode_session_models::PendingSubmissionsPage {
+        records,
+        next_after,
+        has_more,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_prompt_submission(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -15390,6 +15480,48 @@ async fn enqueue_prompt_submission(
     submission_id: bcode_session_models::SubmissionId,
     text: String,
     placement: bcode_session_models::SubmissionPlacement,
+    require_active_turn: bool,
+    admission: bcode_session_models::TurnAdmissionMetadata,
+) -> Result<bcode_session_models::SubmissionReceipt, ServerError> {
+    Box::pin(enqueue_prompt_submission_inner(
+        state,
+        session_id,
+        client_id,
+        submission_id,
+        text,
+        placement,
+        require_active_turn,
+        admission,
+    ))
+    .await
+}
+
+fn strict_steering_target_available(
+    placement: bcode_session_models::SubmissionPlacement,
+    previous: Option<&bcode_session_models::SubmissionRecord>,
+    steering_turn: Option<&bcode_session_models::TurnId>,
+) -> bool {
+    placement == bcode_session_models::SubmissionPlacement::Steer
+        && previous.map_or_else(
+            || steering_turn.is_some(),
+            |record| {
+                matches!(
+                    record.submission.target,
+                    bcode_session_models::SubmissionTarget::Steering { .. }
+                )
+            },
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_prompt_submission_inner(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    client_id: ClientId,
+    submission_id: bcode_session_models::SubmissionId,
+    text: String,
+    placement: bcode_session_models::SubmissionPlacement,
+    require_active_turn: bool,
     mut admission: bcode_session_models::TurnAdmissionMetadata,
 ) -> Result<bcode_session_models::SubmissionReceipt, ServerError> {
     admission.activity = None;
@@ -15433,10 +15565,14 @@ async fn enqueue_prompt_submission(
         .filter(|turn| {
             placement == bcode_session_models::SubmissionPlacement::Steer
                 && phase != SessionRuntimePhase::FinishingTurn
-                && turn.accepts_steering(&admission.execution)
-                && turn.selection.as_ref() == Some(&requested_selection)
+                && turn.accepts_steering(&admission.execution, &requested_selection)
         })
         .map(|turn| bcode_session_models::TurnId(turn.turn_id.clone()));
+    if require_active_turn
+        && !strict_steering_target_available(placement, previous.as_ref(), steering_turn.as_ref())
+    {
+        return Err(ServerError::SteeringUnavailable);
+    }
     let target = previous.as_ref().map_or_else(
         || {
             steering_turn.map_or_else(
@@ -15670,6 +15806,7 @@ async fn enqueue_user_message_command_inner(
         } else {
             bcode_session_models::SubmissionPlacement::FollowUp
         },
+        false,
         bcode_session_models::TurnAdmissionMetadata {
             execution,
             ..Default::default()
@@ -42697,6 +42834,7 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    include!("session_operations/submission_tests.rs");
     mod collaboration_execution;
     mod goal_entry;
     mod judgement_quality;
@@ -68521,9 +68659,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model: None,
             agent_profile: None,
             execution: Some(execution.clone()),
-            selection: None,
+            selection: Some(SessionModelSelection::default()),
         };
-        assert!(turn.accepts_steering(&execution));
+        let selection = SessionModelSelection::default();
+        assert!(turn.accepts_steering(&execution, &selection));
         let variants = [
             TurnExecutionOptions {
                 permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
@@ -68562,22 +68701,24 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         ];
         for changed in variants {
-            assert!(!turn.accepts_steering(&changed));
+            let mut changed_selection = selection.clone();
+            apply_turn_model_selection(&mut changed_selection, &changed);
+            assert!(!turn.accepts_steering(&changed, &changed_selection));
         }
         turn.kind = RuntimeOperationKind::ManualCompaction;
-        assert!(!turn.accepts_steering(&execution));
+        assert!(!turn.accepts_steering(&execution, &selection));
         turn.kind = RuntimeOperationKind::ModelTurn;
         turn.execution = None;
-        assert!(!turn.accepts_steering(&execution));
+        assert!(!turn.accepts_steering(&execution, &selection));
         let captured = TurnExecutionOptions {
             request_context_id: Some("request-only".into()),
             ..execution.clone()
         };
         turn.execution = Some(captured.clone());
-        assert!(!turn.accepts_steering(&captured));
+        assert!(!turn.accepts_steering(&captured, &selection));
         turn.execution = Some(execution.clone());
         turn.cancel_state.close();
-        assert!(!turn.accepts_steering(&execution));
+        assert!(!turn.accepts_steering(&execution, &selection));
     }
 
     #[tokio::test]
@@ -68637,6 +68778,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             steer_id.clone(),
             "steering".into(),
             bcode_session_models::SubmissionPlacement::Steer,
+            false,
             admission.clone(),
         )
         .await
@@ -68683,6 +68825,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::SubmissionId("late".into()),
             "late".into(),
             bcode_session_models::SubmissionPlacement::Steer,
+            false,
             admission,
         )
         .await
@@ -68807,6 +68950,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             id.clone(),
             "pending".into(),
             bcode_session_models::SubmissionPlacement::FollowUp,
+            false,
             bcode_session_models::TurnAdmissionMetadata::default(),
         )
         .await
@@ -68826,6 +68970,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             id.clone(),
             "pending".into(),
             bcode_session_models::SubmissionPlacement::FollowUp,
+            false,
             bcode_session_models::TurnAdmissionMetadata::default(),
         )
         .await
@@ -69110,6 +69255,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::SubmissionId("stream-first".into()),
             "first".into(),
             bcode_session_models::SubmissionPlacement::FollowUp,
+            false,
             bcode_session_models::TurnAdmissionMetadata::default(),
         )
         .await
@@ -69122,6 +69268,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::SubmissionId("stream-steer".into()),
             "second".into(),
             bcode_session_models::SubmissionPlacement::Steer,
+            false,
             bcode_session_models::TurnAdmissionMetadata::default(),
         )
         .await
@@ -69381,6 +69528,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::SubmissionId("cancel-pending".into()),
             "not conversation".into(),
             bcode_session_models::SubmissionPlacement::FollowUp,
+            false,
             bcode_session_models::TurnAdmissionMetadata::default(),
         )
         .await

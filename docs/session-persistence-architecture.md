@@ -74,6 +74,30 @@ Each capture adds history and consequently some cached-input cost until ordinary
 removes it from active context. Recovery recapture and long-lived growth require dedicated
 verification; successful cache measurements alone do not establish those lifecycle properties.
 
+## Steering and queue inspection
+
+CLI `send --steering` requires a compatible active turn. If none is available, the
+server returns `steering_unavailable` before accepting input; it does not queue a
+new task. Use ordinary `send` for independent work or `--follow-up` for an explicit
+queued continuation. Composer and legacy `submit_prompt` callers retain their
+existing fallback semantics; SDK callers can use `steer_prompt` for strict steering.
+Compatibility compares effective model/provider/reasoning selections while keeping
+permission, tool, interaction-route, captured-context, and execution policy immutable.
+Retries preserve the originally accepted target, including after that turn ends.
+
+`session pending SESSION_ID --after SEQUENCE --limit 32 --json` reads an indexed,
+acceptance-ordered page of pending submissions. The page includes actual targets,
+lifecycle records and execution-context blockers. `after` is exclusive; limits are
+1 through 128. Follow `next_after` while `has_more` is true. This observes a mutable
+queue, not a snapshot or durable event stream: restart without `after` to observe
+earlier items. Reading does not activate input, repair projections, or resume work.
+Plain CLI acceptance output resolves the actual target through canonical lookup;
+JSON receipts keep their existing identity/sequence contract.
+
+Worker progress is evidence, not task admission. Orchestration skills can use
+bounded worker history reads without sending each status report as a steering or
+follow-up prompt. No inter-session report protocol or automatic wakeup is required.
+
 ## Canonical storage and authority
 
 A Bcode session id maps to exactly one canonical database within the state location that owns it:

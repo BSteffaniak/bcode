@@ -95,6 +95,20 @@ pub struct SubmissionRecord {
     pub context_observation: Option<SubmissionContextObservation>,
 }
 
+/// One acceptance-ordered page of currently pending input.
+///
+/// This is a bounded observation of a mutable queue, not a snapshot or resumable
+/// event stream. Rescan from the beginning to observe earlier pending items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSubmissionsPage {
+    /// Canonical submission records, including actual target and recovery blockers.
+    pub records: Vec<SubmissionRecord>,
+    /// Exclusive acceptance-sequence cursor when another page was observed.
+    pub next_after: Option<u64>,
+    /// Whether the bounded read observed another pending record.
+    pub has_more: bool,
+}
+
 /// Secret-free recovery identity. Only version 1 is writable; runtime resolves and compares it.
 /// Profile fields are names, never credentials, paths, environment or provider-native payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

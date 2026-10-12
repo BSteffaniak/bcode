@@ -393,11 +393,18 @@ pub enum SessionTurnRequest {
         text: String,
         placement: bcode_session_models::SubmissionPlacement,
         admission: bcode_session_models::TurnAdmissionMetadata,
+        require_active_turn: bool,
     },
     /// Read one durable submission by identity.
     GetSubmission {
         session_id: SessionId,
         submission_id: bcode_session_models::SubmissionId,
+    },
+    /// Read one bounded page of pending input without recovery or replay.
+    PendingSubmissions {
+        session_id: SessionId,
+        after: Option<u64>,
+        limit: u32,
     },
     /// Submit an ordinary turn through generic admission metadata.
     SubmitTurn {
@@ -1170,12 +1177,23 @@ impl RoutedRequest {
                 text,
                 placement,
                 admission,
+                require_active_turn,
             } => Self::SessionTurn(SessionTurnRequest::SubmitPrompt {
                 session_id,
                 submission_id,
                 text,
                 placement,
                 admission,
+                require_active_turn,
+            }),
+            Request::PendingSubmissions {
+                session_id,
+                after,
+                limit,
+            } => Self::SessionTurn(SessionTurnRequest::PendingSubmissions {
+                session_id,
+                after,
+                limit,
             }),
             Request::GetSubmission {
                 session_id,

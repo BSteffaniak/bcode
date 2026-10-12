@@ -4050,9 +4050,36 @@ impl BcodeClient {
         }
     }
 
+    /// Read a bounded acceptance-ordered page of currently pending input.
+    ///
+    /// `after` is an exclusive acceptance-sequence cursor over a mutable queue,
+    /// not a snapshot or event stream. Rescan from the beginning for earlier items.
+    /// # Errors
+    /// Returns invalid-limit (outside 1..=128), storage, transport, or response errors.
+    pub async fn pending_submissions(
+        &self,
+        session_id: SessionId,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<bcode_session_models::PendingSubmissionsPage, ClientError> {
+        match self
+            .send_request(Request::PendingSubmissions {
+                session_id,
+                after,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::PendingSubmissions { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Accept a conversational prompt using a caller-retained identity for retries.
     ///
     /// Acceptance does not imply activation or independent turn execution.
+    /// Steering through this compatibility API may fall back to an independent
+    /// queued turn; use [`Self::steer_prompt`] to forbid that fallback.
     /// # Errors
     /// Returns transport, conflicting-duplicate, admission, or unexpected-response errors.
     pub async fn submit_prompt(
@@ -4070,6 +4097,37 @@ impl BcodeClient {
                 text,
                 placement,
                 admission,
+                require_active_turn: false,
+            })
+            .await?
+        {
+            ResponsePayload::SubmissionAccepted { receipt } => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Steer a compatible active turn without admitting an independent queued task.
+    ///
+    /// Retain the identity for exact retries. An accepted steering submission keeps
+    /// its original target, even after that turn has ended.
+    /// # Errors
+    /// Returns `steering_unavailable` when no compatible active target exists, or
+    /// transport, conflicting-duplicate, admission, or unexpected-response errors.
+    pub async fn steer_prompt(
+        &self,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    ) -> Result<bcode_session_models::SubmissionReceipt, ClientError> {
+        match self
+            .send_request(Request::SubmitPrompt {
+                session_id,
+                submission_id,
+                text,
+                placement: bcode_session_models::SubmissionPlacement::Steer,
+                admission,
+                require_active_turn: true,
             })
             .await?
         {

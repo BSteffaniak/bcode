@@ -629,11 +629,22 @@ pub enum Request {
         text: String,
         placement: bcode_session_models::SubmissionPlacement,
         admission: bcode_session_models::TurnAdmissionMetadata,
+        /// Reject before acceptance unless steering can target a compatible active turn.
+        #[serde(default)]
+        require_active_turn: bool,
     },
     /// Read one durable submission through a bounded indexed lookup.
     GetSubmission {
         session_id: SessionId,
         submission_id: bcode_session_models::SubmissionId,
+    },
+    /// Read one bounded acceptance-ordered page of pending input without recovery or replay.
+    PendingSubmissions {
+        session_id: SessionId,
+        /// Exclusive accepted-event sequence. Rescan without this cursor for earlier items.
+        after: Option<u64>,
+        /// Page size from 1 through 128.
+        limit: u32,
     },
     /// Submit an ordinary turn through generic admission metadata.
     SubmitTurn {
@@ -2242,6 +2253,10 @@ pub enum ResponsePayload {
     /// Exact durable receipt for conversational acceptance, including an idempotent retry.
     SubmissionAccepted {
         receipt: bcode_session_models::SubmissionReceipt,
+    },
+    /// Bounded pending-queue observation; not a snapshot or event stream.
+    PendingSubmissions {
+        page: bcode_session_models::PendingSubmissionsPage,
     },
     /// Bounded authoritative lookup; absence is not an inferred cancellation.
     Submission {
@@ -5458,6 +5473,35 @@ mod tests {
                 } if actual == version
             ));
         }
+    }
+
+    #[test]
+    fn strict_prompt_admission_round_trips_and_legacy_defaults_to_fallback() {
+        let request = Request::SubmitPrompt {
+            session_id: SessionId::new(),
+            submission_id: bcode_session_models::SubmissionId("strict-retry".to_owned()),
+            text: "correction".to_owned(),
+            placement: bcode_session_models::SubmissionPlacement::Steer,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            require_active_turn: true,
+        };
+        let encoded = encode_request(&request).expect("encode strict steering");
+        assert_eq!(
+            decode_request(&encoded).expect("decode strict steering"),
+            request
+        );
+        let mut legacy = serde_json::to_value(&request).expect("request value");
+        legacy["submit_prompt"]
+            .as_object_mut()
+            .expect("prompt payload")
+            .remove("require_active_turn");
+        assert!(matches!(
+            serde_json::from_value::<Request>(legacy).expect("legacy prompt"),
+            Request::SubmitPrompt {
+                require_active_turn: false,
+                ..
+            }
+        ));
     }
 
     #[test]
