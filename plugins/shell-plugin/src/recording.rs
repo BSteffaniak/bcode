@@ -324,6 +324,7 @@ enum AsyncRecordingCommand {
         timed_out: bool,
         cancelled: bool,
         response: mpsc::Sender<io::Result<ShellRecordingSummary>>,
+        budget: Option<super::ShellExecutionBudget>,
     },
 }
 
@@ -377,6 +378,7 @@ impl AsyncShellRecordingResizeSender {
 
 /// Non-blocking producer for a shell recording writer thread.
 pub struct AsyncShellRecordingWriter {
+    budget: Option<super::ShellExecutionBudget>,
     sender: mpsc::SyncSender<AsyncRecordingCommand>,
     worker: Option<thread::JoinHandle<()>>,
     sequence: Arc<Mutex<Instant>>,
@@ -411,11 +413,16 @@ impl AsyncShellRecordingWriter {
             .name("bcode-shell-recording".to_owned())
             .spawn(move || run_async_recording_writer(writer, &receiver, observer.as_ref()))?;
         Ok(Self {
+            budget: None,
             sender,
             worker: Some(worker),
             sequence: Arc::new(Mutex::new(Instant::now())),
             failed: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub(crate) fn set_budget(&mut self, budget: super::ShellExecutionBudget) {
+        self.budget = Some(budget);
     }
 
     /// Return a cloneable non-blocking resize producer.
@@ -464,6 +471,57 @@ impl AsyncShellRecordingWriter {
         queued();
         drop(sequence);
         Ok(())
+    }
+
+    /// Queue an exact frame with deadline-bounded backpressure.
+    ///
+    /// # Errors
+    ///
+    /// Deadline, ordering, or queue failure invalidates the recording rather than
+    /// publishing a lossy complete replay.
+    pub(crate) fn write_output_until(
+        &self,
+        _offset_micros: u64,
+        bytes: &[u8],
+        replay_bytes: Option<&[u8]>,
+        budget: &super::ShellExecutionBudget,
+    ) -> io::Result<()> {
+        loop {
+            if budget.stopped() {
+                self.failed.store(true, Ordering::SeqCst);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "shell recording backpressure deadline exceeded",
+                ));
+            }
+            if self.failed.load(Ordering::SeqCst) {
+                return Err(io::Error::other("shell recording writer previously failed"));
+            }
+            match self.sequence.try_lock() {
+                Ok(sequence) => {
+                    let command = AsyncRecordingCommand::Output {
+                        offset_micros: u64::try_from(sequence.elapsed().as_micros())
+                            .unwrap_or(u64::MAX),
+                        bytes: bytes.to_vec(),
+                        replay_bytes: replay_bytes.map(<[u8]>::to_vec),
+                    };
+                    match self.sender.try_send(command) {
+                        Ok(()) => return Ok(()),
+                        Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            self.failed.store(true, Ordering::SeqCst);
+                            return Err(io::Error::other("shell recording writer disconnected"));
+                        }
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.failed.store(true, Ordering::SeqCst);
+                    return Err(io::Error::other("shell recording ordering poisoned"));
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Queue exact PTY bytes without waiting for filesystem I/O.
@@ -554,6 +612,7 @@ impl AsyncShellRecordingWriter {
                 timed_out,
                 cancelled,
                 response,
+                budget: self.budget.clone(),
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "recording writer stopped"))?;
         drop(sequence);
@@ -574,8 +633,20 @@ impl AsyncShellRecordingWriter {
 impl Drop for AsyncShellRecordingWriter {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
-            let _ = self.sender.send(AsyncRecordingCommand::Shutdown);
-            let _ = worker.join();
+            if self.failed.load(Ordering::SeqCst)
+                || self
+                    .budget
+                    .as_ref()
+                    .is_some_and(super::ShellExecutionBudget::stopped)
+            {
+                // Failed capture must not wait on an observer or filesystem during teardown.
+                // Disconnect the queue; the worker owns partial-file cleanup.
+                let _ = self.sender.try_send(AsyncRecordingCommand::Shutdown);
+                drop(worker);
+            } else {
+                let _ = self.sender.send(AsyncRecordingCommand::Shutdown);
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -677,9 +748,7 @@ fn run_async_recording_writer(
                 if failure.is_none() {
                     let write_result = (|| {
                         writer.write_output(offset_micros, &bytes)?;
-                        if let Some(replay_bytes) = replay_bytes
-                            && !replay_bytes.is_empty()
-                        {
+                        if let Some(replay_bytes) = replay_bytes.filter(|bytes| !bytes.is_empty()) {
                             writer.write_replay_output(offset_micros, &replay_bytes)?;
                         }
                         Ok(())
@@ -708,16 +777,18 @@ fn run_async_recording_writer(
                 timed_out,
                 cancelled,
                 response,
+                budget,
             } => {
                 let result = failure.map_or_else(
                     || {
                         let final_path = writer.final_path.clone();
-                        let summary = writer.finish(
+                        let summary = writer.finish_with_budget(
                             offset_micros,
                             exit_code,
                             signal.as_deref(),
                             timed_out,
                             cancelled,
+                            budget.as_ref(),
                         )?;
                         if let Some(observer) = observer {
                             observer(ShellRecordingCommit {
@@ -889,13 +960,28 @@ impl ShellRecordingWriter {
     ///
     /// Returns an error if final framing, flushing, syncing, or atomic publication fails.
     pub fn finish(
-        mut self,
+        self,
         offset_micros: u64,
         exit_code: Option<i32>,
         signal: Option<&str>,
         timed_out: bool,
         cancelled: bool,
     ) -> io::Result<ShellRecordingSummary> {
+        self.finish_with_budget(offset_micros, exit_code, signal, timed_out, cancelled, None)
+    }
+
+    fn finish_with_budget(
+        mut self,
+        offset_micros: u64,
+        exit_code: Option<i32>,
+        signal: Option<&str>,
+        timed_out: bool,
+        cancelled: bool,
+        budget: Option<&super::ShellExecutionBudget>,
+    ) -> io::Result<ShellRecordingSummary> {
+        if let Some(budget) = budget {
+            budget.check().map_err(io::Error::other)?;
+        }
         let signal = signal.unwrap_or_default().as_bytes();
         let signal_length = u16::try_from(signal.len()).map_err(|_| {
             io::Error::new(
@@ -913,6 +999,9 @@ impl ShellRecordingWriter {
         self.write_frame(FRAME_FINISH, offset_micros, &payload)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
+        if let Some(budget) = budget {
+            budget.check().map_err(io::Error::other)?;
+        }
         fs::rename(&self.partial_path, &self.final_path)?;
         self.finished = true;
         Ok(ShellRecordingSummary {
@@ -1354,6 +1443,78 @@ mod tests {
     }
 
     #[test]
+    fn expired_finalization_never_publishes_complete_recording() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("expired.bcsr");
+        let mut writer = ShellRecordingWriter::create(&path, 80, 24).expect("writer");
+        writer.write_output(1, b"captured").expect("frame");
+        let budget = super::super::ShellExecutionBudget {
+            deadline: Instant::now(),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+        };
+        assert!(
+            writer
+                .finish_with_budget(2, Some(0), None, false, false, Some(&budget))
+                .is_err()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn recording_backpressure_deadline_releases_failed_producer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("blocked-observer.bcsr");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer: ShellRecordingCommitObserver = Arc::new(move |_| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                let _ = started_tx.send(());
+                let _ = release_rx.lock().expect("release lock").recv();
+            }
+        });
+        let mut writer =
+            AsyncShellRecordingWriter::create_with_observer(&path, 80, 24, Some(observer))
+                .expect("writer");
+        writer
+            .write_output_with(
+                0,
+                &vec![b'x'; usize::try_from(RECORDING_PUBLICATION_BYTES).expect("size")],
+                None,
+                || {},
+            )
+            .expect("first frame");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked observer");
+        let budget = super::super::ShellExecutionBudget {
+            deadline: Instant::now() + Duration::from_millis(30),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+        };
+        for _ in 0..ASYNC_RECORDING_QUEUE_CAPACITY {
+            writer
+                .write_output_until(0, b"x", None, &budget)
+                .expect("fill queue");
+        }
+        let started = Instant::now();
+        assert_eq!(
+            writer
+                .write_output_until(0, b"x", None, &budget)
+                .expect_err("deadline")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        drop(writer);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            !path.exists(),
+            "failed capture cannot publish complete replay"
+        );
+        release_tx.send(()).expect("release observer");
+    }
+
+    #[test]
     fn publication_policy_uses_exact_time_and_byte_boundaries() {
         let started = Instant::now();
         let mut publication = RecordingPublicationState::new(100, started);
@@ -1517,6 +1678,7 @@ mod tests {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let failed = Arc::new(AtomicBool::new(false));
         let mut writer = AsyncShellRecordingWriter {
+            budget: None,
             sender,
             worker: None,
             sequence: Arc::new(Mutex::new(Instant::now())),

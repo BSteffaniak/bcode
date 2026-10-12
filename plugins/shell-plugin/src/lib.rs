@@ -11,6 +11,14 @@
 //! scrollback semantics. Live presentation uses invocation-owned primary replacement updates
 //! carrying bounded recording artifact revisions; durable replay uses shell-owned artifact
 //! references.
+//!
+//! Shell execution uses one deadline for command execution, reader startup, capture, and
+//! recording finalization. Terminated commands receive a bounded cleanup grace; an unfinished
+//! capture returns an explicit error and never supplies a complete replay reference. Unix PTY
+//! reads poll nonblocking descriptors so descendants retaining terminal handles cannot postpone
+//! the tool result indefinitely. Background jobs must detach stdin as well as stdout/stderr.
+//! Recording workers coalesce committed-boundary notices; only the invocation thread publishes
+//! host presentation callbacks, keeping output capture independent of presentation throughput.
 
 mod contracts;
 #[cfg(feature = "static-bundled")]
@@ -1505,7 +1513,8 @@ struct ShellInvocationActionReader {
 
 impl ShellInvocationActionReader {
     fn poll(&self, master: &dyn portable_pty::MasterPty) -> Result<(), String> {
-        loop {
+        // Bound each input batch so a resize flood cannot starve timeout/cancellation checks.
+        for _ in 0..32 {
             let response = self
                 .bridge
                 .request(&ServiceBridgeRequest::ReceiveInput {
@@ -1608,6 +1617,41 @@ fn terminate_terminal_process(
     child.kill()
 }
 
+fn reap_terminal_child(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+) -> Result<portable_pty::ExitStatus, String> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err("terminal process did not exit during bounded cleanup".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct TerminalCaptureUpdates {
+    latest: Arc<StdMutex<Option<recording::ShellRecordingCommit>>>,
+    observer: recording::ShellRecordingCommitObserver,
+}
+
+impl TerminalCaptureUpdates {
+    fn publish(&self) {
+        // Only the invocation thread calls the host; detached I/O workers never retain
+        // callbacks into an invocation that may already have returned.
+        let commit = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(commit) = commit {
+            (self.observer)(commit);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wait_for_terminal_shell_status(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -1617,11 +1661,15 @@ fn wait_for_terminal_shell_status(
     events: ServiceEventEmitter,
     control: Option<&ShellInvocationActionReader>,
     master: Option<&dyn portable_pty::MasterPty>,
+    updates: Option<&TerminalCaptureUpdates>,
 ) -> Result<TerminalShellStatus, String> {
     let started = Instant::now();
     let mut timed_out = false;
     let mut cancelled = false;
     let status = loop {
+        if let Some(updates) = updates {
+            updates.publish();
+        }
         if let (Some(control), Some(master)) = (control, master) {
             control.poll(master)?;
         }
@@ -1641,7 +1689,7 @@ fn wait_for_terminal_shell_status(
                 },
             );
             terminate_terminal_process(child).map_err(|error| error.to_string())?;
-            break child.wait().map_err(|error| error.to_string())?;
+            break reap_terminal_child(child)?;
         }
         if started.elapsed() >= timeout {
             timed_out = true;
@@ -1656,7 +1704,7 @@ fn wait_for_terminal_shell_status(
                 },
             );
             terminate_terminal_process(child).map_err(|error| error.to_string())?;
-            break child.wait().map_err(|error| error.to_string())?;
+            break reap_terminal_child(child)?;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -1731,6 +1779,11 @@ fn run_terminal_shell_command_inner(
     explicit_config: Option<&ShellToolConfig>,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
+    let started = Instant::now();
+    let budget = ShellExecutionBudget {
+        deadline: started + timeout,
+        cancellation: cancellation.clone(),
+    };
     let cwd = resolve_effective_cwd(arguments, paths.session_cwd);
     let shell_config = explicit_config.map_or_else(
         || shell_config_with_environment(cwd.as_deref(), environment),
@@ -1784,17 +1837,64 @@ fn run_terminal_shell_command_inner(
         .master
         .try_clone_reader()
         .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    let reader_fd = pair
+        .master
+        .as_raw_fd()
+        .map(|fd| {
+            use std::os::fd::{AsRawFd as _, BorrowedFd};
+            // SAFETY: the master owns this descriptor until after capture initialization.
+            let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+            // SAFETY: fcntl operates on an owned, valid descriptor. Its file description is
+            // shared with the cloned PTY reader, so that reader cannot block after poll.
+            let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0
+                || unsafe {
+                    libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(owned)
+        })
+        .transpose()
+        .map_err(|error: io::Error| error.to_string())?;
     let clean_artifact_path = clean_artifact_path(paths.artifact_dir, tool_call_id)?;
     let raw_artifact_path = raw_artifact_path(paths.artifact_dir, tool_call_id)?;
     let replay_artifact_path = replay_artifact_path(paths.artifact_dir, tool_call_id)?;
     let recording_path = recording_artifact_path(paths.artifact_dir, tool_call_id)?;
+    let latest_commit = Arc::new(StdMutex::new(None));
+    let updates = TerminalCaptureUpdates {
+        latest: Arc::clone(&latest_commit),
+        observer: shell_recording_commit_observer(
+            paths.primary_presentation.clone(),
+            events,
+            tool_call_id,
+            arguments.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS),
+            arguments_json.clone(),
+            progress_limits,
+            cancellation.clone(),
+        ),
+    };
     let (recording_ready_tx, recording_ready_rx) = std::sync::mpsc::channel();
-    let started = Instant::now();
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+    let capture_cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+    let capture_guard = CaptureCancellationGuard(capture_cancellation.clone());
+    let reader_budget = ShellExecutionBudget {
+        deadline: budget.deadline + Duration::from_millis(500),
+        cancellation: capture_cancellation,
+    };
     let cancellation_for_reader = cancellation.clone();
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
         move || {
-            read_limited_streaming(
+            #[cfg(unix)]
+            let mut reader = DeadlineTerminalReader {
+                reader: &mut reader,
+                fd: reader_fd,
+                budget: reader_budget.clone(),
+            };
+            let result = read_limited_streaming(
                 &mut reader,
                 events,
                 &tool_call_id,
@@ -1814,14 +1914,36 @@ fn run_terminal_shell_command_inner(
                     replay: replay_artifact_path,
                     recording: recording_path,
                     recording_ready: Some(recording_ready_tx),
+                    budget: Some(reader_budget),
+                    commits: Some(latest_commit),
                 },
-            )
+            );
+            let _ = stream_tx.send(result);
         }
     });
 
-    let recording = recording_ready_rx
-        .recv()
-        .map_err(|_| "recording reader did not initialize".to_owned())?;
+    let initialization_budget = ShellExecutionBudget {
+        deadline: if cancellation.is_cancelled() {
+            Instant::now() + Duration::from_millis(500)
+        } else {
+            budget.deadline + Duration::from_millis(500)
+        },
+        cancellation: if cancellation.is_cancelled() {
+            // A pre-cancelled invocation still gets a short chance to record its terminal state.
+            bcode_plugin_sdk::ServiceCancellation::default()
+        } else {
+            cancellation.clone()
+        },
+    };
+    let recording =
+        match initialization_budget.receive_with(&recording_ready_rx, || updates.publish()) {
+            Ok(recording) => recording,
+            Err(error) => {
+                let _ = terminate_terminal_process(&mut child);
+                let _ = reap_terminal_child(&mut child);
+                return Err(error);
+            }
+        };
     let applied_resizes = Arc::new(StdMutex::new(Vec::new()));
     let control = paths
         .input_bridge
@@ -1832,18 +1954,53 @@ fn run_terminal_shell_command_inner(
             recording,
             applied_resizes: Arc::clone(&applied_resizes),
         });
-    let status = wait_for_terminal_shell_status(
+    let status = match wait_for_terminal_shell_status(
         &mut child,
         cancellation,
-        timeout,
+        budget.deadline.saturating_duration_since(Instant::now()),
         tool_call_id,
         events,
         control.as_ref(),
         Some(&*pair.master),
-    )?;
+        Some(&updates),
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = terminate_terminal_process(&mut child);
+            let _ = reap_terminal_child(&mut child);
+            return Err(error);
+        }
+    };
     drop(pair.master);
-    let mut stream_output = join_reader(reader_thread)?;
-    let recording_ref = finalize_recording(&mut stream_output, started, &status, columns, rows)?;
+    let capture_budget = if status.timed_out || status.cancelled {
+        // Bounded cleanup grace preserves terminal status and recordings after killing the child.
+        ShellExecutionBudget {
+            deadline: Instant::now() + Duration::from_millis(500),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+        }
+    } else {
+        budget
+    };
+    let mut stream_output = capture_budget.receive_with(&stream_rx, || updates.publish())??;
+    reader_thread
+        .join()
+        .map_err(|_| "output reader thread panicked".to_owned())?;
+    let finalization_budget = ShellExecutionBudget {
+        deadline: capture_budget.deadline,
+        cancellation: capture_guard.0.clone(),
+    };
+    if let Some(writer) = &mut stream_output.recording_writer {
+        writer.set_budget(finalization_budget);
+    }
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = finalize_recording(&mut stream_output, started, &status, columns, rows)
+            .map(|recording_ref| (stream_output, status, recording_ref));
+        let _ = finish_tx.send(result);
+    });
+    let (stream_output, status, recording_ref) =
+        capture_budget.receive_with(&finish_rx, || updates.publish())??;
+    updates.publish();
     let (final_columns, final_rows) = applied_resizes
         .lock()
         .map_err(|_| "shell applied resize state poisoned".to_owned())?
@@ -1998,6 +2155,8 @@ fn shell_args(command: &str) -> Vec<String> {
 }
 
 struct TerminalStreamPaths {
+    commits: Option<Arc<StdMutex<Option<recording::ShellRecordingCommit>>>>,
+    budget: Option<ShellExecutionBudget>,
     clean: Option<PathBuf>,
     raw: Option<PathBuf>,
     replay: Option<PathBuf>,
@@ -2027,6 +2186,106 @@ struct ShellVisualStreamContext {
 
 const PRELUDE_GATE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
 const STREAM_READ_BUFFER_BYTES: usize = 16 * 1024;
+
+/// One deadline covers process execution, capture, and artifact finalization.
+#[derive(Clone)]
+struct ShellExecutionBudget {
+    deadline: Instant,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+}
+
+#[cfg(unix)]
+struct DeadlineTerminalReader<'a> {
+    reader: &'a mut Box<dyn Read + Send>,
+    fd: Option<std::os::fd::OwnedFd>,
+    budget: ShellExecutionBudget,
+}
+
+#[cfg(unix)]
+impl Read for DeadlineTerminalReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd as _;
+        loop {
+            self.budget.check().map_err(io::Error::other)?;
+            let Some(fd) = &self.fd else {
+                return Err(io::Error::other(
+                    "terminal does not support bounded capture",
+                ));
+            };
+            let mut poll = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll points to one initialized descriptor, owned for this reader's lifetime.
+            let ready = unsafe { libc::poll(&raw mut poll, 1, 10) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready > 0 {
+                match self.reader.read(buffer) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    result => return result,
+                }
+            }
+        }
+    }
+}
+
+struct CaptureCancellationGuard(bcode_plugin_sdk::ServiceCancellation);
+
+impl Drop for CaptureCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl ShellExecutionBudget {
+    fn stopped(&self) -> bool {
+        self.cancellation.is_cancelled() || Instant::now() >= self.deadline
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            Err("shell invocation cancelled; output capture/finalization incomplete".to_owned())
+        } else if Instant::now() >= self.deadline {
+            Err("shell invocation timed out; output capture/finalization incomplete".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn receive<T>(&self, receiver: &std::sync::mpsc::Receiver<T>) -> Result<T, String> {
+        self.receive_with(receiver, || {})
+    }
+
+    fn receive_with<T>(
+        &self,
+        receiver: &std::sync::mpsc::Receiver<T>,
+        publish: impl Fn(),
+    ) -> Result<T, String> {
+        loop {
+            self.check()?;
+            publish();
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(value) => return Ok(value),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("shell capture worker stopped before returning a result".to_owned());
+                }
+            }
+        }
+    }
+}
 
 struct PreludeGate {
     markers: Vec<Vec<u8>>,
@@ -2186,11 +2445,22 @@ fn read_limited_streaming<R>(
 where
     R: Read,
 {
+    let capture_budget = paths
+        .budget
+        .clone()
+        .unwrap_or_else(|| ShellExecutionBudget {
+            deadline: Instant::now()
+                + Duration::from_millis(visual_context.timeout_ms)
+                + Duration::from_millis(500),
+            cancellation: visual_context.cancellation.clone(),
+        });
     let mut raw = RetainedStream::new();
     let mut replay = RetainedStream::new();
     let mut raw_writer = raw_artifact_writer(paths.raw.as_deref())?;
     let mut replay_writer = raw_artifact_writer(paths.replay.as_deref())?;
     let mut clean_writer = clean_artifact_writer(paths.clean.as_deref())?;
+    let observer_budget = capture_budget.clone();
+    let commit_sender = paths.commits.clone();
     let mut recording_writer = paths
         .recording
         .as_deref()
@@ -2199,19 +2469,36 @@ where
                 path,
                 visual_context.columns,
                 visual_context.rows,
-                Some(shell_recording_commit_observer(
-                    visual_context.primary_presentation.clone(),
-                    events,
-                    tool_call_id,
-                    visual_context.timeout_ms,
-                    visual_context.arguments.clone(),
-                    visual_context.progress_limits,
-                    visual_context.cancellation.clone(),
-                )),
+                Some(Arc::new({
+                    let observer = shell_recording_commit_observer(
+                        visual_context.primary_presentation.clone(),
+                        events,
+                        tool_call_id,
+                        visual_context.timeout_ms,
+                        visual_context.arguments.clone(),
+                        visual_context.progress_limits,
+                        visual_context.cancellation.clone(),
+                    );
+                    move |commit| {
+                        if !observer_budget.stopped() {
+                            if let Some(sender) = &commit_sender {
+                                *sender
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(commit);
+                            } else {
+                                observer(commit);
+                            }
+                        }
+                    }
+                })),
             )
         })
         .transpose()
         .map_err(|error| error.to_string())?;
+    if let Some(writer) = &mut recording_writer {
+        writer.set_budget(capture_budget.clone());
+    }
     let recording_resize_sender = recording_writer
         .as_ref()
         .map(recording::AsyncShellRecordingWriter::resize_sender);
@@ -2243,11 +2530,11 @@ where
         let clean = clean_gate.write(chunk);
         if let Some(writer) = &mut recording_writer {
             writer
-                .write_output_with(
+                .write_output_until(
                     u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     chunk,
                     Some(&live),
-                    || {},
+                    &capture_budget,
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -2277,11 +2564,11 @@ where
         && let Some(writer) = &mut recording_writer
     {
         writer
-            .write_output_with(
+            .write_output_until(
                 u64::try_from(recording_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 &[],
                 Some(&live),
-                || {},
+                &capture_budget,
             )
             .map_err(|error| error.to_string())?;
     }
@@ -2514,14 +2801,6 @@ fn valid_utf8_prefix_len(bytes: &[u8], max_len: usize) -> usize {
         len = len.saturating_sub(1);
     }
     len
-}
-
-fn join_reader(
-    handle: std::thread::JoinHandle<Result<TerminalStreamOutput, String>>,
-) -> Result<TerminalStreamOutput, String> {
-    handle
-        .join()
-        .map_err(|_| "output reader thread panicked".to_string())?
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
@@ -3356,7 +3635,11 @@ mod tests {
         let cases = [
             (
                 contracts::ShellWorkflowCommand {
-                    argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
+                    argv: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "while :; do :; done".to_string(),
+                    ],
                     timeout_ms: 10,
                     accepted_exit_codes: None,
                     continue_on_unaccepted_exit: false,
@@ -5181,6 +5464,8 @@ mod tests {
                         replay: None,
                         recording,
                         recording_ready: None,
+                        budget: None,
+                        commits: None,
                     },
                 )
                 .expect("stream benchmark");
@@ -5213,6 +5498,229 @@ mod tests {
             overhead / 100,
             overhead % 100,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_capture_deadline_covers_inherited_stdin() {
+        let environment = isolated_config_environment("inherited-stdin");
+        let dir = tempfile::tempdir().expect("artifacts");
+        let started = Instant::now();
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "inherited-stdin",
+            &ShellRunArguments {
+                // Like the validation launcher: new session, redirected output, inherited stdin.
+                // The descendant exits on its own so this test never leaks a long-lived process.
+                command: "python3 -c 'import subprocess; subprocess.Popen([\"sleep\", \"2\"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); print(\"launched\")'".to_owned(),
+                cwd: None,
+                timeout_ms: Some(200),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(dir.path()),
+                input_bridge: None,
+                primary_presentation: None,
+            },
+            &environment,
+        );
+        assert!(
+            response.is_error,
+            "incomplete capture must not report success"
+        );
+        assert!(response.output.contains("timed out"), "{}", response.output);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            response.result.is_none(),
+            "no complete replay for unfinished capture"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_capture_cancellation_interrupts_inherited_stdin() {
+        let environment = isolated_config_environment("cancel-inherited-stdin");
+        let dir = tempfile::tempdir().expect("artifacts");
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let cancel = cancellation.clone();
+        let watcher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &cancellation,
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "cancel-inherited-stdin",
+            &ShellRunArguments {
+                command: "python3 -c 'import subprocess; subprocess.Popen([\"sleep\", \"2\"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)'".to_owned(),
+                cwd: None,
+                timeout_ms: Some(10_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(dir.path()),
+                input_bridge: None,
+                primary_presentation: None,
+            },
+            &environment,
+        );
+        watcher.join().expect("watcher");
+        assert!(response.is_error);
+        assert!(response.output.contains("cancelled"), "{}", response.output);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_output_flood_cannot_extend_deadline() {
+        let environment = isolated_config_environment("output-flood");
+        let dir = tempfile::tempdir().expect("artifacts");
+        let started = Instant::now();
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "output-flood",
+            &ShellRunArguments {
+                command: "cat /dev/zero".to_owned(),
+                cwd: None,
+                timeout_ms: Some(100),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(dir.path()),
+                input_bridge: None,
+                primary_presentation: None,
+            },
+            &environment,
+        );
+        assert!(response.is_error);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        if let Ok(output) = serde_json::from_str::<serde_json::Value>(&response.output) {
+            assert_eq!(output["timed_out"], true);
+        } else {
+            assert!(response.output.contains("timed out"));
+        }
+    }
+
+    #[test]
+    fn recording_presentation_coalesces_without_blocking_capture() {
+        let latest = Arc::new(StdMutex::new(None));
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let published = Arc::clone(&observed);
+        let updates = TerminalCaptureUpdates {
+            latest: Arc::clone(&latest),
+            observer: Arc::new(move |commit| published.lock().expect("observed").push(commit)),
+        };
+        for revision in 1..=1_000 {
+            *latest.lock().expect("latest") = Some(recording::ShellRecordingCommit {
+                path: PathBuf::from("recording.bcsr"),
+                committed_bytes: revision,
+                finalized: revision == 1_000,
+            });
+        }
+        updates.publish();
+        updates.publish();
+        let observed = observed.lock().expect("observed");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].committed_bytes, 1_000);
+        assert!(observed[0].finalized);
+        drop(observed);
+    }
+
+    #[test]
+    fn shell_budget_wait_observes_cancellation_and_deadline() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let budget = ShellExecutionBudget {
+            deadline: Instant::now() + Duration::from_millis(30),
+            cancellation: cancellation.clone(),
+        };
+        assert!(
+            budget
+                .receive(&receiver)
+                .expect_err("deadline")
+                .contains("timed out")
+        );
+        let budget = ShellExecutionBudget {
+            deadline: Instant::now() + Duration::from_secs(10),
+            cancellation: cancellation.clone(),
+        };
+        cancellation.cancel();
+        let started = Instant::now();
+        assert!(
+            budget
+                .receive(&receiver)
+                .expect_err("cancelled")
+                .contains("cancelled")
+        );
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_terminal_recording_preserves_exact_bytes() {
+        let environment = isolated_config_environment("binary-terminal");
+        let dir = tempfile::tempdir().expect("artifacts");
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "binary-terminal",
+            &ShellRunArguments {
+                command: "head -c 1048576 /dev/zero".to_owned(),
+                cwd: None,
+                timeout_ms: Some(10_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(dir.path()),
+                input_bridge: None,
+                primary_presentation: None,
+            },
+            &environment,
+        );
+        assert!(!response.is_error, "{}", response.output);
+        assert!(response.output.len() <= MAX_INLINE_TERMINAL_OUTPUT_BYTES + 1_024);
+        let Some(ToolInvocationResult::Artifact { artifact }) = response.result else {
+            panic!("expected recording");
+        };
+        let reference = artifact
+            .refs
+            .iter()
+            .find(|r| r.key == SHELL_RECORDING_REF_KEY)
+            .expect("recording");
+        let path = url::Url::parse(reference.storage_uri.as_deref().expect("URI"))
+            .expect("URL")
+            .to_file_path()
+            .expect("path");
+        let (summary, frames) = recording::read_recording(&path).expect("complete recording");
+        assert_eq!(summary.output_bytes, 1_048_576);
+        for frame in frames {
+            if let recording::ShellRecordingFrame::Output { bytes, .. } = frame {
+                assert!(bytes.iter().all(|byte| *byte == 0));
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -5269,6 +5777,7 @@ mod tests {
             ServiceEventEmitter::default(),
             None,
             None,
+            None,
         )
         .expect("cancelled child status");
 
@@ -5289,6 +5798,7 @@ mod tests {
             Duration::ZERO,
             "timeout-test",
             ServiceEventEmitter::default(),
+            None,
             None,
             None,
         )
@@ -5417,6 +5927,8 @@ mod tests {
                 replay: None,
                 recording: Some(path.clone()),
                 recording_ready: None,
+                budget: None,
+                commits: None,
             },
         )
         .expect("stream chunks");
@@ -5578,6 +6090,8 @@ mod tests {
                 replay: None,
                 recording: None,
                 recording_ready: None,
+                budget: None,
+                commits: None,
             },
         )
         .expect("baseline stream");
@@ -5599,6 +6113,8 @@ mod tests {
                 replay: None,
                 recording: Some(dir.path().join("recording.bcsr")),
                 recording_ready: None,
+                budget: None,
+                commits: None,
             },
         )
         .expect("recorded stream");
@@ -5652,6 +6168,8 @@ mod tests {
                 replay: None,
                 recording: Some(path.clone()),
                 recording_ready: None,
+                budget: None,
+                commits: None,
             },
         )
         .expect("stream output");
@@ -5694,6 +6212,8 @@ mod tests {
                 replay: None,
                 recording: None,
                 recording_ready: None,
+                budget: None,
+                commits: None,
             },
         )
         .expect("stream should read");
@@ -5728,6 +6248,8 @@ mod tests {
                 replay: None,
                 recording: None,
                 recording_ready: None,
+                budget: None,
+                commits: None,
             },
         )
         .expect("stream should read");

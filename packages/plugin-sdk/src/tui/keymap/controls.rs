@@ -257,7 +257,7 @@ impl LiteralText {
             return None;
         }
         let ch = match stroke.key {
-            KeyCode::Char(ch) if !ch.is_control() => {
+            KeyCode::Char(ch) if !matches!(ch, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}') => {
                 if mods.shift && ch.is_ascii_lowercase() {
                     ch.to_ascii_uppercase()
                 } else {
@@ -410,6 +410,21 @@ mod tests {
             registry.keys_for_action("list", &ControlAction::Up.id()),
             ["ctrl+p"]
         );
+    }
+
+    #[test]
+    fn literal_text_classification_matches_unicode_control_category() {
+        for value in 0..=0x0010_ffff {
+            let Some(ch) = char::from_u32(value) else {
+                continue;
+            };
+            let stroke = KeyStroke::simple(KeyCode::Char(ch));
+            assert_eq!(
+                LiteralText::from_stroke(stroke).is_none(),
+                ch.is_control(),
+                "U+{value:04X}"
+            );
+        }
     }
 
     #[test]
