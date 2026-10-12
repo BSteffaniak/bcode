@@ -13,9 +13,6 @@ version     = { workspace = true }
 [dependencies]
 bmux_mermaid_render = { workspace = true }
 
-[dev-dependencies]
-tempfile = { workspace = true }
-
 [[bin]]
 name = "bmux-mermaid-worker"
 path = "src/bin/worker.rs"

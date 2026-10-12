@@ -16,9 +16,6 @@ bmux_markdown = { workspace = true }
 [dev-dependencies]
 bcode_syntax_render = { workspace = true }
 bmux_tui            = { workspace = true }
-insta               = { workspace = true }
-unicode-width       = { workspace = true }
-url                 = { workspace = true }
 
 [features]
 default          = []

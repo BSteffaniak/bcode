@@ -2168,9 +2168,6 @@ dependencies = [
  "bcode_syntax_render",
  "bmux_markdown",
  "bmux_tui",
- "insta",
- "unicode-width 0.2.2",
- "url 2.5.8",
 ]
 
 [[package]]
@@ -2178,7 +2175,6 @@ name = "bcode_mermaid_render"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_mermaid_render",
- "tempfile",
 ]
 
 [[package]]

@@ -1,2 +1,0 @@
-```rust
-fn main() {
