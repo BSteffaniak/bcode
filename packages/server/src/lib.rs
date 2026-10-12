@@ -434,6 +434,7 @@ pub struct ServerState {
     invariant_guidance_generation: Arc<Mutex<BTreeMap<SessionId, u64>>>,
     invariant_background_tasks: Mutex<BTreeMap<SessionId, JoinHandle<()>>>,
     catalog_refresh_tasks: Mutex<JoinSet<()>>,
+    search_status_tasks: Mutex<JoinSet<()>>,
     skills: Option<SkillRegistry>,
     skill_prompt_options: SkillPromptCatalogOptions,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
@@ -2553,6 +2554,7 @@ impl ServerState {
             invariant_guidance_generation: Arc::new(Mutex::new(BTreeMap::new())),
             invariant_background_tasks: Mutex::new(BTreeMap::new()),
             catalog_refresh_tasks: Mutex::new(JoinSet::new()),
+            search_status_tasks: Mutex::new(JoinSet::new()),
             skills: init.skills,
             skill_prompt_options: init.skill_prompt_options,
             active_skills: Mutex::default(),
@@ -5459,35 +5461,7 @@ async fn run_constructed_server(
         "server.startup.session_search_enabled",
         i64::from(session_search_enabled),
     );
-    let phase = bcode_metrics::startup::phase("server.search_provider_status");
-    let search_providers = session_search::list_providers(&state).await.providers;
-    phase.finish();
-    state.metrics.set_gauge(
-        "server.startup.session_search_provider_count",
-        i64::try_from(search_providers.len()).unwrap_or(i64::MAX),
-    );
-    state.metrics.set_gauge(
-        "server.startup.session_search_index_bytes",
-        search_providers
-            .iter()
-            .fold(0_u64, |total, provider| {
-                total.saturating_add(provider.status.index_bytes)
-            })
-            .try_into()
-            .unwrap_or(i64::MAX),
-    );
-    state.metrics.set_gauge(
-        "server.startup.session_search_rebuilding_providers",
-        i64::try_from(
-            search_providers
-                .iter()
-                .filter(|provider| {
-                    provider.status.state == bcode_session_search::SearchProviderState::Rebuilding
-                })
-                .count(),
-        )
-        .unwrap_or(i64::MAX),
-    );
+    start_search_provider_status_bootstrap(&state).await;
     if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
@@ -5592,6 +5566,87 @@ async fn start_catalog_refresh(state: &ServerState) {
     }
 }
 
+async fn start_search_provider_status_bootstrap(state: &Arc<ServerState>) {
+    // Unknown counts are not a healthy empty provider set. Completeness and failures are separate.
+    for name in [
+        "server.startup.session_search_provider_count",
+        "server.startup.session_search_index_bytes",
+        "server.startup.session_search_rebuilding_providers",
+        "server.startup.session_search_discovery_failures",
+    ] {
+        state.metrics.set_gauge(name, -1);
+    }
+    state
+        .metrics
+        .set_gauge("server.startup.session_search_discovery_complete", 0);
+    let mut tasks = state.search_status_tasks.lock().await;
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut shutdown = state.subscribe_shutdown();
+    let task_state = Arc::clone(state);
+    tasks.spawn(async move {
+        let state = task_state;
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let operation = session_search::list_providers_cancellable(&state, &cancellation);
+        tokio::pin!(operation);
+        let response = tokio::select! {
+            biased;
+            _ = shutdown.recv() => {
+                cancellation.cancel();
+                let _ = operation.await;
+                return;
+            }
+            response = &mut operation => response,
+        };
+        if state.shutdown_requested.load(Ordering::SeqCst) {
+            return;
+        }
+        let search_providers = response.providers;
+        state.metrics.set_gauge(
+            "server.startup.session_search_discovery_failures",
+            i64::try_from(response.failures.len()).unwrap_or(i64::MAX),
+        );
+        state.metrics.set_gauge(
+            "server.startup.session_search_provider_count",
+            i64::try_from(search_providers.len()).unwrap_or(i64::MAX),
+        );
+        state.metrics.set_gauge(
+            "server.startup.session_search_index_bytes",
+            i64::try_from(search_providers.iter().fold(0_u64, |total, provider| {
+                total.saturating_add(provider.status.index_bytes)
+            }))
+            .unwrap_or(i64::MAX),
+        );
+        state.metrics.set_gauge(
+            "server.startup.session_search_rebuilding_providers",
+            i64::try_from(
+                search_providers
+                    .iter()
+                    .filter(|provider| {
+                        provider.status.state
+                            == bcode_session_search::SearchProviderState::Rebuilding
+                    })
+                    .count(),
+            )
+            .unwrap_or(i64::MAX),
+        );
+        state
+            .metrics
+            .set_gauge("server.startup.session_search_discovery_complete", 1);
+    });
+}
+
+async fn stop_search_provider_status_bootstrap(state: &ServerState) {
+    let mut tasks = state.search_status_tasks.lock().await;
+    // Shutdown signals cancellation through the service API; do not abandon physical work.
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "search status bootstrap task failed during shutdown");
+        }
+    }
+}
+
 async fn stop_catalog_refresh(state: &ServerState) {
     let mut tasks = state.catalog_refresh_tasks.lock().await;
     tasks.abort_all();
@@ -5660,6 +5715,11 @@ async fn shutdown_constructed_server(
     tracing::info!(target: "bcode_server::shutdown", "stopping idle watcher");
     let idle_watcher =
         trace_shutdown_stage("idle_watcher", state.stop_idle_shutdown_watcher()).await;
+    trace_shutdown_stage(
+        "search_status",
+        stop_search_provider_status_bootstrap(&state),
+    )
+    .await;
     trace_shutdown_stage("catalog_refresh", stop_catalog_refresh(&state)).await;
     tracing::info!(target: "bcode_server::shutdown", "flushing catalog updates");
     trace_shutdown_stage("catalog_updates", state.sessions.shutdown_catalog_updates()).await;
@@ -9814,9 +9874,8 @@ async fn handle_agent_permission_plugin_request(
             operation,
             payload,
         } => {
-            let result =
-                plugin_operations::call_service(state, &interface_id, operation, payload).await;
-            send_response(writer, request_id, plugin_service_response(result)).await
+            handle_call_plugin_service(request_id, state, writer, &interface_id, operation, payload)
+                .await
         }
         AgentSkillPluginRequest::PublishPluginEvent { topic, payload } => {
             let response = match plugin_operations::publish_event(state, &topic, &payload).await {
@@ -9826,6 +9885,22 @@ async fn handle_agent_permission_plugin_request(
             send_response(writer, request_id, response).await
         }
     }
+}
+
+async fn handle_call_plugin_service(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    interface_id: &str,
+    operation: String,
+    payload: Vec<u8>,
+) -> Result<(), ServerError> {
+    let result = if interface_id == bcode_session_import::SESSION_IMPORT_INTERFACE_ID {
+        session_import::call_import_service(state, &operation, &payload).await
+    } else {
+        plugin_operations::call_service(state, interface_id, operation, payload).await
+    };
+    send_response(writer, request_id, plugin_service_response(result)).await
 }
 
 async fn handle_permission_interaction_request(
@@ -30497,10 +30572,13 @@ async fn optional_selection_order(
         observation.operation.as_ref(),
     )
     .await?;
-    let input = serde_json::from_value::<bcode_model::judgement::OptionalRequest>(
-        prepared.get("judgement")?.clone(),
-    )
-    .ok()?;
+    let input = decode_prepared_selection(&prepared).ok()?;
+    let Some(input) = input else {
+        if let Some(operation) = &observation.operation {
+            operation.record_not_applicable();
+        }
+        return None;
+    };
     let judgement = tokio::select! {
         biased;
         () = cancel.cancelled() => return None,
@@ -30518,6 +30596,24 @@ async fn optional_selection_order(
     .await?;
     let ids: Vec<String> = serde_json::from_value(applied.get("ordered_ids")?.clone()).ok()?;
     valid_advisory_permutation(&candidates, &ids).then_some(ids)
+}
+
+fn decode_prepared_selection(
+    prepared: &serde_json::Value,
+) -> Result<Option<bcode_model::judgement::OptionalRequest>, ()> {
+    // The existing plugin contract explicitly returns {"judgement": null} for abstention.
+    // Missing, extra or malformed fields are not evidence of a no-work prerequisite.
+    let object = prepared.as_object().ok_or(())?;
+    if object.len() != 1 {
+        return Err(());
+    }
+    let judgement = object.get("judgement").ok_or(())?;
+    if judgement.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(judgement.clone())
+        .map(Some)
+        .map_err(|_| ())
 }
 
 fn valid_advisory_permutation(candidates: &[serde_json::Value], ids: &[String]) -> bool {
@@ -30581,6 +30677,22 @@ mod advisory_selection_boundary_tests {
             super::skill_catalog_ranking_purpose(true, true, &config),
             None
         );
+    }
+
+    #[test]
+    fn prepared_abstention_requires_exact_explicit_contract() {
+        assert!(matches!(
+            super::decode_prepared_selection(&serde_json::json!({"judgement": null})),
+            Ok(None)
+        ));
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"judgement": false}),
+            serde_json::json!({"judgement": null, "future": true}),
+            serde_json::Value::Null,
+        ] {
+            assert!(super::decode_prepared_selection(&malformed).is_err());
+        }
     }
 
     #[test]
@@ -31133,7 +31245,6 @@ async fn finish_server_registered_tool(
         .settled_tool_observations
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     observe_settled_tool_triage(invoker, &call, &result).await;
-    observe_settled_session_tool(invoker, &call, &result).await;
     Ok(result)
 }
 
@@ -31324,13 +31435,33 @@ async fn invoke_workflow_advisory_fenced(
     }
 }
 
+#[cfg(test)]
 async fn observe_settled_session_tool(
     invoker: &ServerToolInvoker<'_>,
     call: &bcode_model::ToolCall,
     result: &ToolInvocationResponse,
 ) {
-    let config = invoker.state.session_config(invoker.session_id).await;
-    if invoker.cancel_state.is_cancelled() {
+    observe_persisted_session_tool(
+        invoker.state,
+        invoker.session_id,
+        invoker.cancel_state,
+        call,
+        result,
+        &judgement::SettledProgressEvidence::Unknown,
+    )
+    .await;
+}
+
+async fn observe_persisted_session_tool(
+    state: &ServerState,
+    session_id: SessionId,
+    cancel_state: &TurnCancelState,
+    call: &bcode_model::ToolCall,
+    result: &ToolInvocationResponse,
+    evidence: &judgement::SettledProgressEvidence,
+) {
+    let config = state.session_config(session_id).await;
+    if cancel_state.is_cancelled() {
         return;
     }
     if !config
@@ -31338,34 +31469,30 @@ async fn observe_settled_session_tool(
         .enabled(bcode_model::judgement::Feature::ProgressMonitoring)
     {
         let _observation = consumer_observation(
-            invoker.cancel_state,
+            cancel_state,
             &config,
             bcode_model::judgement::Feature::ProgressMonitoring,
             false,
         );
         return;
     }
-    let scope = serde_json::json!({"kind": "session", "id": invoker.session_id.to_string()});
-    let request = invoker
-        .state
-        .progress_windows
-        .lock()
-        .ok()
-        .and_then(|mut windows| {
-            windows.get_mut(&invoker.session_id)?.observe(
-                &scope,
-                &call.name,
-                result.is_error.then(|| {
-                    use sha2::{Digest as _, Sha256};
-                    let end = result
-                        .output
-                        .floor_char_boundary(result.output.len().min(8192));
-                    hex::encode(Sha256::digest(&result.output.as_bytes()[..end]))
-                }),
-            )
-        });
+    let scope = serde_json::json!({"kind": "session", "id": session_id.to_string()});
+    let request = state.progress_windows.lock().ok().and_then(|mut windows| {
+        windows.get_mut(&session_id)?.observe_with_evidence(
+            &scope,
+            &call.name,
+            result.is_error.then(|| {
+                use sha2::{Digest as _, Sha256};
+                let end = result
+                    .output
+                    .floor_char_boundary(result.output.len().min(8192));
+                hex::encode(Sha256::digest(&result.output.as_bytes()[..end]))
+            }),
+            evidence,
+        )
+    });
     let observation = consumer_observation(
-        invoker.cancel_state,
+        cancel_state,
         &config,
         bcode_model::judgement::Feature::ProgressMonitoring,
         request.is_some(),
@@ -31374,19 +31501,19 @@ async fn observe_settled_session_tool(
         return;
     };
     let Some(reply) = invoke_optional_feature_service(
-        invoker.state,
+        state,
         "bcode.loop.progress-monitoring/v1",
         "observe",
         request.clone(),
         &config,
-        invoker.cancel_state,
+        cancel_state,
         observation.operation.as_ref(),
     )
     .await
     else {
         return;
     };
-    if invoker.cancel_state.is_cancelled() {
+    if cancel_state.is_cancelled() {
         return;
     }
     if reply.get("trigger").and_then(serde_json::Value::as_str) == Some("not_applicable")
@@ -31398,30 +31525,25 @@ async fn observe_settled_session_tool(
     {
         operation.record_not_applicable();
     }
-    let payload = invoker
-        .state
-        .progress_windows
-        .lock()
-        .ok()
-        .and_then(|mut windows| {
-            windows
-                .get_mut(&invoker.session_id)?
-                .accept(&scope, &request, &reply)
-        });
+    let payload = state.progress_windows.lock().ok().and_then(|mut windows| {
+        windows
+            .get_mut(&session_id)?
+            .accept(&scope, &request, &reply)
+    });
     let Some(payload) = payload else {
         return;
     };
     observation.finish(true, None);
-    deliver_progress_advisory(invoker, call, payload).await;
+    deliver_progress_advisory(state, session_id, call, payload).await;
 }
 
 async fn deliver_progress_advisory(
-    invoker: &ServerToolInvoker<'_>,
+    state: &ServerState,
+    session_id: SessionId,
     call: &bcode_model::ToolCall,
     payload: serde_json::Value,
 ) {
-    let Some(producer) = invoker
-        .state
+    let Some(producer) = state
         .plugins
         .registry()
         .service_registry()
@@ -31446,14 +31568,7 @@ async fn deliver_progress_advisory(
             payload,
         },
     );
-    append_tool_contribution_envelope(
-        invoker.state,
-        invoker.session_id,
-        &call.id,
-        &producer,
-        envelope,
-    )
-    .await;
+    append_tool_contribution_envelope(state, session_id, &call.id, &producer, envelope).await;
 }
 
 async fn deliver_diagnostic_advisory(
@@ -32227,7 +32342,6 @@ fn dispatch_prepared_model_tool_batch<'a>(
     let allow_user_questions = execution.allow_user_questions;
     let profile = execution.agent_profile.clone();
     Box::pin(async move {
-        use tool_host_retry::ToolBatchOutcome;
         let sink_capacity = calls.len().saturating_mul(256).max(1_024);
         let (sink, sink_receiver) = SessionInvocationSink::new(sink_capacity);
         let sink_drain = drain_session_invocation_sink(state, session_id, sink_receiver);
@@ -32284,19 +32398,58 @@ fn dispatch_prepared_model_tool_batch<'a>(
                 let _ = scope.control().begin_cancellation();
             }
             let flush = sink.flush().await;
-            flush.map(|()| batch)
+            (batch, flush)
         };
-        let (batch, ()) = tokio::join!(batch_flow, sink_drain);
-        let batch = match batch {
-            Ok(Some(batch)) => batch,
-            Ok(None) if cancel_state.is_cancelled() => return ToolBatchOutcome::Cancelled,
-            Ok(None) => return ToolBatchOutcome::EffectsUncertain,
-            Err(_) => return ToolBatchOutcome::PersistenceFailed,
-        };
-
-        persist_model_tool_batch_results(state, session_id, calls, batch, cancel_state.as_ref())
-            .await
+        let ((batch, flush), ()) = tokio::join!(batch_flow, sink_drain);
+        settle_model_tool_batch_results(
+            state,
+            session_id,
+            calls,
+            batch,
+            flush,
+            cancel_state.as_ref(),
+        )
+        .await
     })
+}
+
+async fn settle_model_tool_batch_results(
+    state: &ServerState,
+    session_id: SessionId,
+    calls: Vec<bcode_model::ToolCall>,
+    batch: Option<bcode_agent_runtime::ToolBatchExecutionOutput>,
+    flush: Result<(), String>,
+    cancel_state: &TurnCancelState,
+) -> tool_host_retry::ToolBatchOutcome {
+    use tool_host_retry::ToolBatchOutcome;
+    let Some(batch) = batch else {
+        // No physical settlement proof: retain registrations even if persistence also failed.
+        return if flush.is_err() {
+            ToolBatchOutcome::PersistenceFailed
+        } else {
+            ToolBatchOutcome::EffectsUncertain
+        };
+    };
+    if flush.is_err() {
+        for (index, call) in calls.into_iter().enumerate() {
+            if batch.settlement_at(index) == bcode_agent_runtime::ToolCallSettlement::Unresolved {
+                continue;
+            }
+            finish_registered_runtime_work(
+                state,
+                session_id,
+                WorkId::new(format!("tool_{}", call.id)),
+                RuntimeWorkStatus::Failed,
+                Some(
+                    "execution settled; lifecycle persistence failed, effects must not be replayed"
+                        .to_owned(),
+                ),
+            )
+            .await;
+        }
+        return ToolBatchOutcome::PersistenceFailed;
+    }
+    persist_model_tool_batch_results(state, session_id, calls, batch, cancel_state).await
 }
 
 async fn persist_model_tool_batch_results(
@@ -32306,32 +32459,116 @@ async fn persist_model_tool_batch_results(
     batch: bcode_agent_runtime::ToolBatchExecutionOutput,
     cancel_state: &TurnCancelState,
 ) -> tool_host_retry::ToolBatchOutcome {
+    persist_model_tool_batch_results_with(state, session_id, calls, batch, cancel_state, |input| {
+        append_tool_finished_event_inner(state, session_id, input)
+    })
+    .await
+}
+
+async fn persist_model_tool_batch_results_with<F, Fut>(
+    state: &ServerState,
+    session_id: SessionId,
+    calls: Vec<bcode_model::ToolCall>,
+    batch: bcode_agent_runtime::ToolBatchExecutionOutput,
+    cancel_state: &TurnCancelState,
+    mut append: F,
+) -> tool_host_retry::ToolBatchOutcome
+where
+    F: FnMut(ToolFinishedEventInput) -> Fut,
+    Fut: Future<Output = Result<bcode_session_models::SessionEvent, bcode_session::SessionError>>,
+{
     use tool_host_retry::ToolBatchOutcome;
-    for (call, result) in calls.into_iter().zip(batch.results) {
+    let mut persistence_failed = false;
+    let mut effects_uncertain = false;
+    let proof = (0..calls.len())
+        .map(|index| batch.settlement_at(index))
+        .collect::<Vec<_>>();
+    let mut results = batch.results.into_iter();
+    for (call, settlement) in calls.into_iter().zip(proof) {
+        let result = results.next();
+        if settlement == bcode_agent_runtime::ToolCallSettlement::Unresolved || result.is_none() {
+            // Unknown or grace-expired execution must retain its registration.
+            effects_uncertain = true;
+            continue;
+        }
+        let result = result.expect("checked result presence");
+        let runtime_error = result.as_ref().err().map(ToString::to_string);
+        let (progress_output, progress_is_error) = result.as_ref().map_or_else(
+            |_| (runtime_error.as_deref().unwrap_or_default(), true),
+            |output| {
+                (
+                    output.invocation.output.as_str(),
+                    output.invocation.is_error,
+                )
+            },
+        );
+        let end = progress_output.floor_char_boundary(progress_output.len().min(8192));
+        let progress_result = ToolInvocationResponse {
+            output: progress_output[..end].to_owned(),
+            is_error: progress_is_error,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        };
         let input = match result {
             Ok(output) => ToolFinishedEventInput {
-                tool_call_id: call.id,
+                tool_call_id: call.id.clone(),
                 result: output.invocation.output,
                 is_error: output.invocation.is_error,
                 content: output.invocation.content,
                 semantic_result: output.invocation.result.map(service_tool_result_to_session),
             },
             Err(error) => ToolFinishedEventInput {
-                tool_call_id: call.id,
+                tool_call_id: call.id.clone(),
                 result: error.to_string(),
                 is_error: true,
                 content: Vec::new(),
                 semantic_result: None,
             },
         };
-        if append_tool_finished_event_inner(state, session_id, input)
-            .await
-            .is_err()
-        {
-            return ToolBatchOutcome::PersistenceFailed;
+        let work_id = WorkId::new(format!("tool_{}", input.tool_call_id));
+        let persisted = append(input).await;
+        if let Ok(event) = &persisted {
+            // This path is reached only after sink flush and physical settlement proof.
+            // Failed writes and unresolved calls never acquire evidence authority.
+            let evidence = judgement::SettledProgressEvidence::from_persisted_result(
+                session_id,
+                &call.id,
+                settlement,
+                Some(event),
+            );
+            observe_persisted_session_tool(
+                state,
+                session_id,
+                cancel_state,
+                &call,
+                &progress_result,
+                &evidence,
+            )
+            .await;
+        }
+        if persisted.is_err() {
+            persistence_failed = true;
+            // Typed provenance proves settlement even when the result reports cancellation.
+            // A failing writer must not strand proven-settled work; take is idempotent.
+            finish_registered_runtime_work(
+                state,
+                session_id,
+                work_id,
+                RuntimeWorkStatus::Failed,
+                Some(
+                    "execution settled; result persistence failed, effects must not be replayed"
+                        .to_owned(),
+                ),
+            )
+            .await;
         }
     }
-    if cancel_state.is_cancelled() {
+    if persistence_failed {
+        ToolBatchOutcome::PersistenceFailed
+    } else if effects_uncertain {
+        ToolBatchOutcome::EffectsUncertain
+    } else if cancel_state.is_cancelled() {
         ToolBatchOutcome::Cancelled
     } else {
         ToolBatchOutcome::Completed
@@ -33778,6 +34015,24 @@ impl InvocationCancellation for ServerPluginInvocationCancellation {
     }
 }
 
+async fn settle_cancelled_plugin_tool(
+    invocation: &mut bcode_plugin::StreamingServiceInvocation,
+    scope: Option<&InvocationScope>,
+) -> ToolInvocationResponse {
+    let settlement = invocation.cancel_and_settle(Duration::from_secs(2)).await;
+    if let bcode_plugin::PluginInvocationSettlement::Settled(response) = settlement
+        && let Ok(response) = bcode_plugin::decode_service_response(response)
+    {
+        return response;
+    }
+    if let Some(scope) = scope {
+        scope.mark_settlement_unresolved();
+    }
+    tool_error(
+        "Tool cancelled; execution outcome is unknown. Side effects may have occurred; inspect affected resources before retrying.",
+    )
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn invoke_plugin_tool_transport(
     state: &ServerState,
@@ -33887,7 +34142,7 @@ async fn invoke_plugin_tool_transport(
             invocation.cancel.clone(),
         )))
     }) {
-        let response = invocation.settle_cancelled_tool().await;
+        let response = settle_cancelled_plugin_tool(&mut invocation, invocation_scope).await;
         return Ok(response);
     }
     let response = loop {
@@ -33897,7 +34152,7 @@ async fn invoke_plugin_tool_transport(
                 invocation.cancel.cancel();
                 drop(bridge_resolutions);
                 input_receiver.lock().await.close();
-                let response = invocation.settle_cancelled_tool().await;
+                let response = settle_cancelled_plugin_tool(&mut invocation, invocation_scope).await;
                 if let Some(scope) = invocation_scope {
                     let _ = scope.unregister_cancellation();
                 }
@@ -33913,7 +34168,7 @@ async fn invoke_plugin_tool_transport(
                 invocation.cancel.cancel();
                 drop(bridge_resolutions);
                 input_receiver.lock().await.close();
-                let response = invocation.settle_cancelled_tool().await;
+                let response = settle_cancelled_plugin_tool(&mut invocation, invocation_scope).await;
                 if let Some(scope) = invocation_scope {
                     let _ = scope.unregister_cancellation();
                 }
@@ -36434,7 +36689,11 @@ async fn append_tool_finished_event_inner(
             state,
             session_id,
             runtime_work_id,
-            runtime_status,
+            if generic_event.is_err() {
+                RuntimeWorkStatus::Failed
+            } else {
+                runtime_status
+            },
             generic_event.as_ref().err().map(|_| {
                 "execution ended; tool result persistence failed, effects must not be replayed"
                     .to_owned()
@@ -43988,6 +44247,121 @@ mod tests {
         drop(state);
     }
 
+    #[cfg(unix)]
+    async fn release_search_status_gate_and_wait(state: &ServerState) {
+        session_search::tests::STATUS_RELEASE.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .metrics
+                    .snapshot()
+                    .gauges
+                    .get("server.startup.session_search_discovery_complete")
+                    == Some(&1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("released status updates metrics");
+        assert_eq!(
+            state
+                .metrics
+                .snapshot()
+                .gauges
+                .get("server.startup.session_search_provider_count"),
+            Some(&1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn optional_search_status_gate_does_not_block_ipc_readiness() {
+        use session_search::tests::{
+            STATUS_CANCELLED, STATUS_RELEASE, STATUS_STARTED, TestProviderBehavior,
+        };
+        let guard = session_search::tests::lock_search_tests().await;
+        for cancel_pending in [false, true] {
+            STATUS_STARTED.store(false, Ordering::SeqCst);
+            STATUS_RELEASE.store(false, Ordering::SeqCst);
+            STATUS_CANCELLED.store(false, Ordering::SeqCst);
+            let state = Arc::new(session_search::tests::state_with_providers(&[(
+                "test.fast-session-search",
+                TestProviderBehavior::GatedStatus,
+            )]));
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint = IpcEndpoint::unix_socket(directory.path().join("optional-status.sock"));
+            let listener = LocalIpcListener::bind(&endpoint).unwrap();
+            let shutdown = bcode_agent_runtime::CancellationToken::new();
+            let daemon = bcode_config::DaemonConfig {
+                idle_shutdown: false,
+                ..Default::default()
+            };
+            let client = bcode_client::BcodeClient::new(endpoint);
+            let server = Box::pin(run_constructed_server(
+                Arc::clone(&state),
+                listener,
+                &daemon,
+                true,
+                &[],
+                shutdown.clone(),
+                None,
+            ));
+            let probe = async {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !STATUS_STARTED.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("real provider status call started");
+                tokio::time::timeout(Duration::from_secs(1), client.verified_server_status())
+                    .await
+                    .expect("optional service must not gate IPC readiness")
+                    .unwrap();
+                let metrics = state.metrics.snapshot();
+                assert_eq!(
+                    metrics
+                        .gauges
+                        .get("server.startup.session_search_discovery_complete"),
+                    Some(&0)
+                );
+                assert_eq!(
+                    metrics
+                        .gauges
+                        .get("server.startup.session_search_provider_count"),
+                    Some(&-1)
+                );
+                if !cancel_pending {
+                    release_search_status_gate_and_wait(&state).await;
+                }
+                shutdown.cancel();
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let (result, ()) = tokio::join!(server, probe);
+                result.unwrap();
+            })
+            .await
+            .expect("bootstrap shutdown settles without abandoned service");
+            assert!(state.search_status_tasks.lock().await.is_empty());
+            if cancel_pending {
+                assert!(STATUS_CANCELLED.load(Ordering::SeqCst));
+                assert_eq!(
+                    state
+                        .metrics
+                        .snapshot()
+                        .gauges
+                        .get("server.startup.session_search_discovery_complete"),
+                    Some(&0)
+                );
+            }
+            drop(state);
+        }
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn server_status_exposes_startup_measurement_dimensions() {
         let mut state = test_server_state(SessionManager::default());
@@ -48749,6 +49123,102 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         assert!(
             matches!(&protected_messages[0].content[0], ContentBlock::ToolResult { result } if result.output.starts_with("mandatory result") && result.output.contains(&protected.snippet))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_ranking_protected_shortlist_plugin_abstention_closes_zero_inference() {
+        use bcode_model::judgement::{
+            ApplicationDisposition, Feature, ObservationTerminal, TriggerDisposition,
+        };
+        let mut state = test_server_state(SessionManager::default());
+        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.skills".to_owned()]),
+                disabled: BTreeSet::new(),
+            },
+            &[bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/skills-plugin/bcode-plugin.toml"),
+                bcode_skills_plugin::static_plugin(),
+            )],
+        )
+        .unwrap();
+        let session = SessionId::new();
+        let mut store = judgement::TurnObservationStore::default();
+        let turn = store.begin(session, "protected-tool-ranking").unwrap();
+        let cancel = TurnCancelState::default();
+        *cancel.judgement_observation.lock().unwrap() = Some(turn.clone());
+        let mut config = bcode_config::BcodeConfig::default();
+        config.judgement.mode = bcode_config::JudgementMode::Auto;
+        config.judgement.recommendations = bcode_config::JudgementMode::Auto;
+        let candidates = vec![
+            serde_json::json!({"id":"required.read", "description":"protected reader", "protected":true}),
+            serde_json::json!({"id":"required.write", "description":"protected writer", "protected":true}),
+            serde_json::json!({"id":"optional.check", "description":"one optional check", "protected":false}),
+        ];
+        let observation = consumer_observation(&cancel, &config, Feature::Recommendations, true);
+        let order = optional_selection_order(
+            &state,
+            "repair task",
+            "recommendations",
+            candidates.clone(),
+            &config,
+            &cancel,
+            &observation,
+        )
+        .await;
+        assert!(order.is_none());
+        let baseline = vec![
+            "required.read".to_owned(),
+            "required.write".to_owned(),
+            "optional.check".to_owned(),
+        ];
+        observation.finish_recommendation(
+            bcode_model::judgement::RecommendationDomain::Tools,
+            baseline.clone(),
+            selection_observation(&candidates, &baseline, &baseline).unwrap(),
+            false,
+        );
+        drop(observation);
+        drop(state);
+        for feature in [
+            Feature::ToolResultTriage,
+            Feature::ContextReranking,
+            Feature::ProgressMonitoring,
+            Feature::SessionCategorization,
+        ] {
+            turn.begin_operation(feature, TriggerDisposition::Disabled)
+                .finish(ApplicationDisposition::BaselineRetained, None);
+        }
+        turn.close(
+            ObservationTerminal::Completed,
+            &[
+                Feature::ToolResultTriage,
+                Feature::ContextReranking,
+                Feature::ProgressMonitoring,
+                Feature::Recommendations,
+                Feature::SessionCategorization,
+            ],
+        );
+        let snapshot: bcode_model::judgement::TurnJudgementObservation = serde_json::from_str(
+            &store
+                .snapshot_json(session, "protected-tool-ranking")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(snapshot.complete);
+        let operation = &snapshot.operations[0];
+        assert_eq!(operation.trigger, TriggerDisposition::NotApplicable);
+        assert!(operation.inference_complete);
+        assert!(operation.inference.is_empty());
+        assert_eq!(
+            operation.application,
+            Some(ApplicationDisposition::BaselineRetained)
+        );
+        assert_eq!(
+            operation.recommendation.as_ref().unwrap().candidate_ids,
+            baseline
         );
     }
 
@@ -63663,6 +64133,21 @@ library = "test"
         drop(state);
     }
 
+    #[tokio::test]
+    async fn publication_fixture_reports_typed_replacement_failure() {
+        let (state, _request, edit, _root) =
+            Box::pin(prepare_restarted_publication_fixture()).await;
+        // A separate fixture invokes acceptance once, before any IPC normalization.
+        // Never retry publication or restage the candidate to obtain diagnostics.
+        let result = state
+            .accept_workflow_run_graph_publication(ClientId::new(), edit)
+            .await;
+        assert!(
+            result.is_ok(),
+            "replacement publication typed failure: {result:?}"
+        );
+    }
+
     async fn prepare_restarted_publication_fixture() -> (
         Arc<ServerState>,
         bcode_workflow_store::PreparedActivationDispatch,
@@ -71876,6 +72361,607 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn cancelled_batch_without_proof_retains_registration_and_uncertainty() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap()
+            .id;
+        let state = test_server_state(sessions);
+        let work_id = WorkId::new("tool_unknown");
+        state
+            .runtime_work
+            .start(
+                session_id,
+                RuntimeWorkSpec::new(
+                    work_id.clone(),
+                    RuntimeWorkKind::Tool,
+                    "unknown".into(),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                ),
+            )
+            .await;
+        let cancellation = TurnCancelState::default();
+        cancellation.cancel().await;
+        let outcome = settle_model_tool_batch_results(
+            &state,
+            session_id,
+            vec![bcode_model::ToolCall {
+                id: "unknown".into(),
+                name: "test.tool".into(),
+                arguments: serde_json::Value::Null,
+            }],
+            None,
+            Ok(()),
+            &cancellation,
+        )
+        .await;
+        assert_eq!(outcome, tool_host_retry::ToolBatchOutcome::EffectsUncertain);
+        assert!(
+            state
+                .runtime_work
+                .active_ids_for_session(session_id)
+                .await
+                .contains(&work_id)
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn proven_cancelled_calls_retire_but_missing_proof_stays_registered() {
+        use bcode_agent_runtime::ToolCallSettlement;
+        for settlement in [
+            Some(ToolCallSettlement::NeverDispatched),
+            Some(ToolCallSettlement::Settled),
+            Some(ToolCallSettlement::Unresolved),
+            None,
+        ] {
+            let sessions = SessionManager::default();
+            let session_id = sessions
+                .create_session(None, std::env::temp_dir())
+                .await
+                .unwrap()
+                .id;
+            let state = test_server_state(sessions);
+            let work_id = WorkId::new("tool_cancelled");
+            state
+                .runtime_work
+                .start(
+                    session_id,
+                    RuntimeWorkSpec::new(
+                        work_id.clone(),
+                        RuntimeWorkKind::Tool,
+                        "cancelled".into(),
+                        CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                    ),
+                )
+                .await;
+            let outcome = persist_model_tool_batch_results(
+                &state,
+                session_id,
+                vec![bcode_model::ToolCall {
+                    id: "cancelled".into(),
+                    name: "test.tool".into(),
+                    arguments: serde_json::Value::Null,
+                }],
+                bcode_agent_runtime::ToolBatchExecutionOutput {
+                    results: vec![Err(RuntimeError::Cancelled)],
+                    settlement: settlement.into_iter().collect(),
+                },
+                &TurnCancelState::default(),
+            )
+            .await;
+            let unresolved =
+                settlement.is_none() || settlement == Some(ToolCallSettlement::Unresolved);
+            assert_eq!(
+                outcome,
+                if unresolved {
+                    tool_host_retry::ToolBatchOutcome::EffectsUncertain
+                } else {
+                    tool_host_retry::ToolBatchOutcome::Completed
+                }
+            );
+            assert_eq!(
+                state
+                    .runtime_work
+                    .active_ids_for_session(session_id)
+                    .await
+                    .contains(&work_id),
+                unresolved
+            );
+            drop(state);
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_tool_sink_flush_failure_releases_only_completed_registrations() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap()
+            .id;
+        let state = test_server_state(sessions);
+        for id in ["tool_settled", "tool_still-active"] {
+            state
+                .runtime_work
+                .start(
+                    session_id,
+                    RuntimeWorkSpec::new(
+                        WorkId::new(id),
+                        RuntimeWorkKind::Tool,
+                        id.to_owned(),
+                        CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                    ),
+                )
+                .await;
+        }
+        // Exercise the real sink acknowledgement failure, not a successful persistence stub.
+        let (sink, receiver) = SessionInvocationSink::new(1);
+        drop(receiver);
+        let flush = sink.flush().await;
+        assert!(flush.is_err());
+        let outcome = settle_model_tool_batch_results(
+            &state,
+            session_id,
+            vec![bcode_model::ToolCall {
+                id: "settled".into(),
+                name: "test.tool".into(),
+                arguments: serde_json::Value::Null,
+            }],
+            Some(bcode_agent_runtime::ToolBatchExecutionOutput {
+                results: vec![Err(RuntimeError::ToolPreparationTimeout {
+                    tool_name: "test.tool".into(),
+                    timeout: Duration::from_millis(1),
+                })],
+                settlement: vec![bcode_agent_runtime::ToolCallSettlement::NeverDispatched],
+            }),
+            flush,
+            &TurnCancelState::default(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            tool_host_retry::ToolBatchOutcome::PersistenceFailed
+        );
+        let active = state.runtime_work.active_ids_for_session(session_id).await;
+        assert!(!active.contains(&WorkId::new("tool_settled")));
+        assert!(active.contains(&WorkId::new("tool_still-active")));
+        let history = state.sessions.session_history(session_id).await.unwrap();
+        assert!(history.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::RuntimeWorkFinished { work_id, status: RuntimeWorkStatus::Failed, message: Some(message), .. }
+            if work_id == &WorkId::new("tool_settled") && message.contains("must not be replayed"))));
+        // A failed flush without a returned batch is not physical settlement proof.
+        let outcome = settle_model_tool_batch_results(
+            &state,
+            session_id,
+            vec![bcode_model::ToolCall {
+                id: "still-active".into(),
+                name: "test.tool".into(),
+                arguments: serde_json::Value::Null,
+            }],
+            None,
+            Err("closed sink".into()),
+            &TurnCancelState::default(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            tool_host_retry::ToolBatchOutcome::PersistenceFailed
+        );
+        assert!(
+            state
+                .runtime_work
+                .active_ids_for_session(session_id)
+                .await
+                .contains(&WorkId::new("tool_still-active"))
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn settled_tool_result_failure_releases_remaining_batch_registrations() {
+        let state = test_server_state(SessionManager::default());
+        // A missing session makes canonical appends fail through the real session API.
+        let session_id = SessionId::new();
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for id in ["first", "second"] {
+            state
+                .runtime_work
+                .start(
+                    session_id,
+                    RuntimeWorkSpec::new(
+                        WorkId::new(format!("tool_{id}")),
+                        RuntimeWorkKind::Tool,
+                        id.to_owned(),
+                        CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                    ),
+                )
+                .await;
+            calls.push(bcode_model::ToolCall {
+                id: id.into(),
+                name: "test.tool".into(),
+                arguments: serde_json::Value::Null,
+            });
+            results.push(Err(RuntimeError::ToolPreparationTimeout {
+                tool_name: "test.tool".into(),
+                timeout: Duration::from_millis(1),
+            }));
+        }
+        let outcome = persist_model_tool_batch_results(
+            &state,
+            session_id,
+            calls,
+            bcode_agent_runtime::ToolBatchExecutionOutput {
+                settlement: vec![bcode_agent_runtime::ToolCallSettlement::Settled; results.len()],
+                results,
+            },
+            &TurnCancelState::default(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            tool_host_retry::ToolBatchOutcome::PersistenceFailed
+        );
+        assert!(
+            state
+                .runtime_work
+                .active_ids_for_session(session_id)
+                .await
+                .is_empty()
+        );
+        assert!(state.sessions.session_history(session_id).await.is_err());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_with_live_physical_work_never_retires_registration() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap()
+            .id;
+        let state = test_server_state(sessions);
+        let (release, wait) = oneshot::channel::<()>();
+        let (started, ready) = oneshot::channel();
+        let physical = tokio::spawn(async move {
+            started.send(()).unwrap();
+            wait.await.unwrap();
+        });
+        ready.await.unwrap();
+        let work_id = WorkId::new("tool_unsettled");
+        state
+            .runtime_work
+            .start(
+                session_id,
+                RuntimeWorkSpec::new(
+                    work_id.clone(),
+                    RuntimeWorkKind::Tool,
+                    "unsettled".into(),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                ),
+            )
+            .await;
+        // An actual deadline expires while independently running physical work remains alive.
+        let mut awaiting: ProviderCallFuture<
+            '_,
+            Result<bcode_agent_runtime::ToolBatchExecutionOutput, RuntimeError>,
+        > = Box::pin(std::future::pending());
+        let expired = finalize_cancelled_provider_call(&mut awaiting).await;
+        assert!(completed_result_after_cancellation(expired).is_none());
+        assert!(!physical.is_finished());
+        for failed_flush in [true, false] {
+            let (sink, receiver) = SessionInvocationSink::new(1);
+            drop(receiver);
+            let flush = if failed_flush {
+                sink.flush().await
+            } else {
+                Ok(())
+            };
+            let outcome = settle_model_tool_batch_results(
+                &state,
+                session_id,
+                vec![bcode_model::ToolCall {
+                    id: "unsettled".into(),
+                    name: "test.tool".into(),
+                    arguments: serde_json::Value::Null,
+                }],
+                // Same synthetic cancellation representation emitted by the runtime grace expiry.
+                Some(bcode_agent_runtime::ToolBatchExecutionOutput {
+                    results: vec![Err(RuntimeError::Cancelled)],
+                    settlement: Vec::new(),
+                }),
+                flush,
+                &TurnCancelState::default(),
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                if failed_flush {
+                    tool_host_retry::ToolBatchOutcome::PersistenceFailed
+                } else {
+                    tool_host_retry::ToolBatchOutcome::EffectsUncertain
+                }
+            );
+            assert!(!physical.is_finished());
+            assert!(
+                state
+                    .runtime_work
+                    .active_ids_for_session(session_id)
+                    .await
+                    .contains(&work_id)
+            );
+            let history = state.sessions.session_history(session_id).await.unwrap();
+            assert!(!history.iter().any(|event| matches!(&event.kind,
+                SessionEventKind::RuntimeWorkFinished { work_id: id, .. } if id == &work_id)));
+            assert!(!history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::ToolInvocationResultRecorded { .. }
+            )));
+        }
+        release.send(()).unwrap();
+        physical.await.unwrap();
+        state.runtime_work.finish(session_id, &work_id).await;
+        drop(state);
+    }
+
+    struct UnsettledInvoker {
+        started: AtomicUsize,
+        release: StdMutex<Option<oneshot::Receiver<()>>>,
+        physical: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    }
+
+    impl ToolInvoker for UnsettledInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _request: &'a ToolPreparationRequest,
+            _scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            Box::pin(async {
+                Ok(ToolPreparationResponse {
+                    authorization: Vec::new(),
+                    descriptor: serde_json::Value::Null,
+                })
+            })
+        }
+        fn invoke_tool<'a>(
+            &'a self,
+            _tool: &'a RegisteredTool,
+            _invocation: &'a PreparedToolInvocation,
+            _scope: &'a InvocationScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            let wait = self.release.lock().unwrap().take().unwrap();
+            let physical = tokio::spawn(async move {
+                let _ = wait.await;
+            });
+            *self.physical.lock().unwrap() = Some(physical);
+            self.started.store(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct AllowUnsettledBatch;
+    impl bcode_agent_runtime::ToolAuthorizationCoordinator for AllowUnsettledBatch {
+        fn authorize_batch<'a>(
+            &'a self,
+            requests: &'a [bcode_agent_runtime::ToolAuthorizationRequest],
+            _scope: &'a TurnScope,
+        ) -> RuntimeFuture<'a, Vec<bcode_agent_runtime::ToolAuthorizationDecision>> {
+            Box::pin(async move {
+                Ok(requests
+                    .iter()
+                    .map(|_| bcode_agent_runtime::ToolAuthorizationDecision::Allow)
+                    .collect())
+            })
+        }
+    }
+
+    async fn unsettled_tool_registry_fixture() -> (ServerState, SessionId, WorkId) {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap()
+            .id;
+        let state = test_server_state(sessions);
+        let work_id = WorkId::new("tool_runtime-unsettled");
+        state
+            .runtime_work
+            .start(
+                session_id,
+                RuntimeWorkSpec::new(
+                    work_id.clone(),
+                    RuntimeWorkKind::Tool,
+                    "runtime-unsettled".into(),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                ),
+            )
+            .await;
+        (state, session_id, work_id)
+    }
+
+    #[tokio::test]
+    async fn runtime_grace_expiry_with_physical_work_survives_server_sink_failure() {
+        let (state, session_id, work_id) = unsettled_tool_registry_fixture().await;
+        let (release, wait) = oneshot::channel();
+        let invoker = UnsettledInvoker {
+            started: AtomicUsize::new(0),
+            release: StdMutex::new(Some(wait)),
+            physical: StdMutex::new(None),
+        };
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(bcode_tool::ToolDefinition {
+            name: "unsettled".into(),
+            description: "test unsettled execution".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        let calls = vec![bcode_model::ToolCall {
+            id: "runtime-unsettled".into(),
+            name: "unsettled".into(),
+            arguments: serde_json::json!({}),
+        }];
+        let scope = TurnScope::without_events("runtime-grace", TurnGeneration::new(1));
+        let mut rounds = ToolRoundState::new(1);
+        let runtime = AgentRuntime::new();
+        let authorization = AllowUnsettledBatch;
+        let context = bcode_agent_runtime::RuntimePermissionContext::default();
+        let execution = runtime.execute_prepared_tool_batch(
+            &catalog,
+            &authorization,
+            &invoker,
+            &calls,
+            &mut rounds,
+            &context,
+            bcode_tool::ToolExecutionOptions::default(),
+            &scope,
+        );
+        let cancel = async {
+            while invoker.started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(scope.control().begin_cancellation());
+        };
+        let batch = tokio::time::timeout(Duration::from_secs(8), async {
+            let (batch, ()) = tokio::join!(execution, cancel);
+            batch.unwrap()
+        })
+        .await
+        .expect("runtime cancellation settlement is bounded");
+        assert!(matches!(
+            batch.results.as_slice(),
+            [Err(RuntimeError::Cancelled)]
+        ));
+        let physical = invoker.physical.lock().unwrap().take().unwrap();
+        drop(invoker);
+        assert!(!physical.is_finished());
+        let (sink, receiver) = SessionInvocationSink::new(1);
+        drop(receiver);
+        let flush = sink.flush().await;
+        assert!(flush.is_err());
+        let outcome = settle_model_tool_batch_results(
+            &state,
+            session_id,
+            calls,
+            Some(batch),
+            flush,
+            &TurnCancelState::default(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            tool_host_retry::ToolBatchOutcome::PersistenceFailed
+        );
+        assert!(!physical.is_finished());
+        assert!(
+            state
+                .runtime_work
+                .active_ids_for_session(session_id)
+                .await
+                .contains(&work_id)
+        );
+        let history = state.sessions.session_history(session_id).await.unwrap();
+        assert!(!history.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::RuntimeWorkFinished { work_id: id, .. } if id == &work_id)));
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationResultRecorded { .. }
+        )));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), physical)
+            .await
+            .unwrap()
+            .unwrap();
+        state.runtime_work.finish(session_id, &work_id).await;
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn first_result_write_failure_does_not_prevent_later_result_persistence() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap()
+            .id;
+        let state = test_server_state(sessions);
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for id in ["first", "second"] {
+            state
+                .runtime_work
+                .start(
+                    session_id,
+                    RuntimeWorkSpec::new(
+                        WorkId::new(format!("tool_{id}")),
+                        RuntimeWorkKind::Tool,
+                        id.into(),
+                        CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                    ),
+                )
+                .await;
+            calls.push(bcode_model::ToolCall {
+                id: id.into(),
+                name: "test.tool".into(),
+                arguments: serde_json::Value::Null,
+            });
+            results.push(Err(RuntimeError::ToolPreparationTimeout {
+                tool_name: "test.tool".into(),
+                timeout: Duration::from_millis(1),
+            }));
+        }
+        let state_ref = &state;
+        let outcome = persist_model_tool_batch_results_with(
+            &state,
+            session_id,
+            calls,
+            bcode_agent_runtime::ToolBatchExecutionOutput {
+                settlement: vec![bcode_agent_runtime::ToolCallSettlement::Settled; results.len()],
+                results,
+            },
+            &TurnCancelState::default(),
+            |input| async move {
+                if input.tool_call_id == "first" {
+                    Err(bcode_session::SessionError::EventSerialization(
+                        "injected first result failure".into(),
+                    ))
+                } else {
+                    append_tool_finished_event_inner(state_ref, session_id, input).await
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            tool_host_retry::ToolBatchOutcome::PersistenceFailed
+        );
+        assert!(
+            state
+                .runtime_work
+                .active_ids_for_session(session_id)
+                .await
+                .is_empty()
+        );
+        let history = state.sessions.session_history(session_id).await.unwrap();
+        drop(state);
+        let records = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationResultRecorded { record } => {
+                    Some(record.invocation_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records, ["second"]);
+        assert!(history.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::RuntimeWorkFinished { work_id, status: RuntimeWorkStatus::Failed, .. }
+                if work_id == &WorkId::new("tool_first"))));
+    }
+
+    #[tokio::test]
     async fn server_tool_timeout_is_visible_and_persistence_failure_is_not_retried() {
         let sessions = SessionManager::default();
         let session_id = sessions
@@ -71896,6 +72982,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 tool_name: "filesystem.list".to_owned(),
                 timeout: Duration::from_millis(1),
             })],
+            settlement: vec![bcode_agent_runtime::ToolCallSettlement::NeverDispatched],
         };
         let result = persist_model_tool_batch_results(
             &state,
@@ -96677,6 +97764,68 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("unregistered provider must fail");
         drop(state);
         assert_eq!(error.message, "history provider is unavailable");
+    }
+
+    #[tokio::test]
+    async fn persisted_terminal_success_supplies_progress_evidence() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("progress receipt".into()), test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let event = append_tool_finished_event_inner(
+            &test_server_state(sessions),
+            session,
+            ToolFinishedEventInput {
+                tool_call_id: "original-call".into(),
+                result: "opaque successful output".into(),
+                is_error: false,
+                content: Vec::new(),
+                semantic_result: None,
+            },
+        )
+        .await
+        .unwrap();
+        let evidence = judgement::SettledProgressEvidence::from_persisted_result(
+            session,
+            "original-call",
+            bcode_agent_runtime::ToolCallSettlement::Settled,
+            Some(&event),
+        );
+        let mut window = judgement::ProgressWindow::default();
+        window.set_objective("objective".into());
+        let request = window
+            .observe_with_evidence(
+                &serde_json::json!({"kind":"session", "id":session}),
+                "fixture.tool",
+                None,
+                &evidence,
+            )
+            .unwrap();
+        assert!(request["observations"][0]["evidence_key"].is_string());
+        assert!(window.advice.is_none());
+        for settlement in [
+            bcode_agent_runtime::ToolCallSettlement::Unresolved,
+            bcode_agent_runtime::ToolCallSettlement::NeverDispatched,
+        ] {
+            let unknown = judgement::SettledProgressEvidence::from_persisted_result(
+                session,
+                "original-call",
+                settlement,
+                Some(&event),
+            );
+            let request = window
+                .observe_with_evidence(
+                    &serde_json::json!({"kind":"session", "id":session}),
+                    "fixture.tool",
+                    None,
+                    &unknown,
+                )
+                .unwrap();
+            assert!(request["observations"][0]["evidence_key"].is_null());
+            assert!(window.advice.is_none());
+        }
     }
 
     #[tokio::test]

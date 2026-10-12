@@ -108,6 +108,9 @@ pub enum RuntimeError {
     /// Retrying would duplicate visible output, so planners must treat this as terminal.
     #[error("provider failed after visible output: {0}")]
     ProviderAfterOutput(Box<Self>),
+    /// Tool effects remain unresolved; no subsequent model round or automatic replay is safe.
+    #[error("tool invocation effects are unresolved; inspect affected resources before retrying")]
+    ToolEffectsUnresolved,
     /// The turn was cancelled before completion.
     #[error("agent turn cancelled")]
     Cancelled,
@@ -1113,11 +1116,33 @@ pub struct ToolExecutionOutput {
     pub events: Vec<AgentRuntimeEvent>,
 }
 
+/// Per-call proof of execution settlement, independent of its reported result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolCallSettlement {
+    /// Invocation was never dispatched; cancellation cannot conceal tool effects.
+    NeverDispatched,
+    /// The dispatched invocation future returned, including its cleanup.
+    Settled,
+    /// Physical effects have not been proven settled. Missing evidence defaults here.
+    #[default]
+    Unresolved,
+}
+
 /// Ordered outputs from one provider tool-call round.
 #[derive(Debug)]
 pub struct ToolBatchExecutionOutput {
     /// Per-call execution results in the same order as the requested calls.
     pub results: Vec<Result<ToolExecutionOutput>>,
+    /// Per-call physical settlement evidence in request order; missing entries are unresolved.
+    pub settlement: Vec<ToolCallSettlement>,
+}
+
+impl ToolBatchExecutionOutput {
+    /// Return settlement proof, failing closed when the producer omitted an entry.
+    #[must_use]
+    pub fn settlement_at(&self, index: usize) -> ToolCallSettlement {
+        self.settlement.get(index).copied().unwrap_or_default()
+    }
 }
 
 /// Host observer for product behavior around canonical tool rounds.
@@ -2170,6 +2195,9 @@ impl AgentRuntime {
         }
 
         let mut terminal = BTreeMap::<usize, Result<ToolExecutionOutput>>::new();
+        let settlement = (0..calls.len())
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
         let preparation_duration = RuntimePhaseDuration::start("preparation", Some(provider_round));
         let prepared = prepare_runtime_tool_batch(
             catalog,
@@ -2186,7 +2214,7 @@ impl AgentRuntime {
         if !scope.control().accepts_normal_output() {
             record_scheduler_cancellations(scope, prepared.len(), 0);
             insert_cancelled_calls(&mut terminal, &prepared);
-            return Ok(ordered_batch_output(calls.len(), terminal));
+            return Ok(ordered_batch_output(calls.len(), terminal, &settlement));
         }
 
         let authorization_duration =
@@ -2200,7 +2228,7 @@ impl AgentRuntime {
         if !scope.control().accepts_normal_output() {
             record_scheduler_cancellations(scope, approved.len(), 0);
             insert_cancelled_calls(&mut terminal, &approved);
-            return Ok(ordered_batch_output(calls.len(), terminal));
+            return Ok(ordered_batch_output(calls.len(), terminal, &settlement));
         }
 
         let result_policy = &self.tool_result_policy;
@@ -2232,27 +2260,26 @@ impl AgentRuntime {
                 serialization_reason,
                 "canonical tool execution group scheduled"
             );
-            let execution =
-                execute_runtime_tool_group(invoker, &group, concurrency, scope, result_policy)
-                    .await;
-            if execution.queued_cancellations != 0 || execution.running_cancellations != 0 {
-                record_scheduler_cancellations(
-                    scope,
-                    execution.queued_cancellations,
-                    execution.running_cancellations,
-                );
-            }
-            terminal.extend(execution.completions);
+            let execution = execute_runtime_tool_group(
+                invoker,
+                &group,
+                concurrency,
+                scope,
+                result_policy,
+                &settlement,
+            )
+            .await;
+            let observed_concurrency = execution.record_settlement(scope, &mut terminal);
             tracing::debug!(
                 provider_round,
                 batch_size = calls.len(),
                 group_size = group.len(),
-                observed_concurrency = execution.observed_concurrency,
+                observed_concurrency,
                 "canonical tool execution group completed"
             );
         }
 
-        Ok(ordered_batch_output(calls.len(), terminal))
+        Ok(ordered_batch_output(calls.len(), terminal, &settlement))
     }
 
     /// Run a stateless text-generation turn through a provider invoker.
@@ -3627,6 +3654,12 @@ fn append_tool_batch_results<O>(
 where
     O: ToolRoundObserver + ?Sized,
 {
+    if batch.results.len() != calls.len()
+        || (0..calls.len())
+            .any(|index| batch.settlement_at(index) == ToolCallSettlement::Unresolved)
+    {
+        return Err(RuntimeError::ToolEffectsUnresolved);
+    }
     for (call, result) in calls.iter().zip(batch.results) {
         let model_result = match result {
             Ok(output) => {
@@ -3743,6 +3776,24 @@ struct RuntimeToolGroupExecution {
     running_cancellations: usize,
 }
 
+impl RuntimeToolGroupExecution {
+    fn record_settlement(
+        self,
+        scope: &TurnScope,
+        terminal: &mut BTreeMap<usize, Result<ToolExecutionOutput>>,
+    ) -> usize {
+        if self.queued_cancellations != 0 || self.running_cancellations != 0 {
+            record_scheduler_cancellations(
+                scope,
+                self.queued_cancellations,
+                self.running_cancellations,
+            );
+        }
+        terminal.extend(self.completions);
+        self.observed_concurrency
+    }
+}
+
 // Bounds cooperative cleanup of active calls; queued calls still fail the scope gate.
 const TOOL_SETTLEMENT_GRACE: Duration = Duration::from_secs(3);
 
@@ -3752,6 +3803,7 @@ async fn execute_runtime_tool_group<I>(
     concurrency: usize,
     scope: &TurnScope,
     result_policy: &ToolResultPolicy,
+    settlement: &[AtomicUsize],
 ) -> RuntimeToolGroupExecution
 where
     I: ToolInvoker + ?Sized,
@@ -3773,8 +3825,14 @@ where
                 async move {
                     let _active = observation.enter();
                     let index = prepared.index;
-                    let result =
-                        invoke_prepared_tool(invoker, prepared, scope, result_policy).await;
+                    let result = invoke_prepared_tool(
+                        invoker,
+                        prepared,
+                        scope,
+                        result_policy,
+                        &settlement[index],
+                    )
+                    .await;
                     (index, result)
                 }
                 .instrument(tool_span)
@@ -3956,6 +4014,7 @@ async fn invoke_prepared_tool<I>(
     prepared: PreparedRuntimeToolCall,
     scope: &TurnScope,
     result_policy: &ToolResultPolicy,
+    settlement: &AtomicUsize,
 ) -> Result<ToolExecutionOutput>
 where
     I: ToolInvoker + ?Sized,
@@ -3975,6 +4034,7 @@ where
         return Err(RuntimeError::Cancelled);
     }
     let mut lifecycle = InvocationLifecycleGuard::start(invocation_scope.clone());
+    settlement.store(1, Ordering::Release);
     let invocation = invoker
         .invoke_tool(&prepared.tool, &prepared.invocation, &invocation_scope)
         .await
@@ -3982,6 +4042,9 @@ where
             tool_name: prepared.call.name.clone(),
             message: error.to_string(),
         });
+    if !invocation_scope.settlement_unresolved() {
+        settlement.store(2, Ordering::Release);
+    }
     let _ = invocation_scope.unregister_cancellation();
     let invocation = match invocation {
         Ok(invocation) => invocation,
@@ -4224,7 +4287,23 @@ fn tool_execution_output(
 fn ordered_batch_output(
     len: usize,
     mut results: BTreeMap<usize, Result<ToolExecutionOutput>>,
+    settlement: &[AtomicUsize],
 ) -> ToolBatchExecutionOutput {
+    let proof = (0..len)
+        .map(|index| {
+            if !results.contains_key(&index) {
+                return ToolCallSettlement::Unresolved;
+            }
+            match settlement
+                .get(index)
+                .map(|state| state.load(Ordering::Acquire))
+            {
+                Some(0) => ToolCallSettlement::NeverDispatched,
+                Some(2) => ToolCallSettlement::Settled,
+                _ => ToolCallSettlement::Unresolved,
+            }
+        })
+        .collect();
     ToolBatchExecutionOutput {
         results: (0..len)
             .map(|index| {
@@ -4233,18 +4312,21 @@ fn ordered_batch_output(
                     .unwrap_or(Err(RuntimeError::Cancelled))
             })
             .collect(),
+        settlement: proof,
     }
 }
 
 const fn empty_batch_output() -> ToolBatchExecutionOutput {
     ToolBatchExecutionOutput {
         results: Vec::new(),
+        settlement: Vec::new(),
     }
 }
 
 fn cancelled_batch_output(len: usize) -> ToolBatchExecutionOutput {
     ToolBatchExecutionOutput {
         results: (0..len).map(|_| Err(RuntimeError::Cancelled)).collect(),
+        settlement: vec![ToolCallSettlement::NeverDispatched; len],
     }
 }
 
@@ -5451,6 +5533,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_loop_stops_before_next_provider_round_on_unresolved_effects() {
+        let call = ToolCall {
+            id: "unknown-call".into(),
+            name: "nested-unresolved".into(),
+            arguments: serde_json::Value::Null,
+        };
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut provider = MultiRoundProvider::new(
+            [
+                vec![
+                    ProviderTurnEvent::ToolCallFinished { call },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::ToolCall,
+                    },
+                ],
+                vec![ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                }],
+            ],
+            Arc::clone(&requests),
+        );
+        let catalog =
+            UnifiedToolCatalog::new().with_inline_tool(tool_definition("nested-unresolved"));
+        let outcome = AgentRuntime::new()
+            .run_provider_tool_loop(
+                &mut provider,
+                AgentTurnRequest::new("model", "perform tool operation"),
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &LifecycleOutcomeInvoker,
+                &RuntimePermissionContext::default(),
+                &[],
+                ToolExecutionOptions::default(),
+                Arc::new(RuntimeStreamEventSink::default()),
+                InvocationCapabilities::default(),
+                &NoopToolRoundObserver,
+                &NoopProviderRoundPlanner,
+            )
+            .await;
+        assert!(matches!(outcome, Err(RuntimeError::ToolEffectsUnresolved)));
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn canonical_loop_runs_provider_batch_and_ordered_continuation() {
         let first = ToolCall {
             id: "call-1".to_string(),
@@ -6628,9 +6760,12 @@ mod tests {
             &'a self,
             _tool: &'a RegisteredTool,
             invocation: &'a PreparedToolInvocation,
-            _scope: &'a InvocationScope,
+            scope: &'a InvocationScope,
         ) -> RuntimeFuture<'a, ToolInvocationResponse> {
             Box::pin(async move {
+                if invocation.invocation.tool_name == "nested-unresolved" {
+                    scope.mark_settlement_unresolved();
+                }
                 match invocation.invocation.tool_name.as_str() {
                     "invoke-error" => Err(RuntimeError::ToolExecution {
                         tool_name: "invoke-error".to_string(),
@@ -6653,6 +6788,34 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn returned_nested_unknown_is_not_settlement_proof() {
+        let catalog =
+            UnifiedToolCatalog::new().with_inline_tool(tool_definition("nested-unresolved"));
+        let calls = [ToolCall {
+            id: "unknown-call".into(),
+            name: "nested-unresolved".into(),
+            arguments: serde_json::Value::Null,
+        }];
+        let mut rounds = ToolRoundState::new(1);
+        let output = AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &AllowBatchAuthorization::default(),
+                &LifecycleOutcomeInvoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &TurnScope::without_events("turn", TurnGeneration::new(1)),
+            )
+            .await
+            .expect("batch should return");
+        assert!(output.results[0].is_ok());
+        assert_eq!(output.settlement_at(0), ToolCallSettlement::Unresolved);
+        assert_eq!(output.settlement_at(1), ToolCallSettlement::Unresolved);
     }
 
     #[tokio::test]
@@ -7305,6 +7468,7 @@ mod tests {
         .expect("uncooperative invocations must not exceed bounded settlement")
         .expect("batch orchestration should finish");
 
+        assert_eq!(output.settlement, vec![ToolCallSettlement::Unresolved; 2]);
         assert!(
             output
                 .results
@@ -7571,6 +7735,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_before_permission_dispatch_has_never_dispatched_proof() {
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("first"));
+        let calls = [ToolCall {
+            id: "call-1".into(),
+            name: "first".into(),
+            arguments: serde_json::Value::Null,
+        }];
+        let invoker = ContractTestInvoker::new(1);
+        let authorization = BlockingAuthorization::default();
+        let scope = TurnScope::without_events("turn", TurnGeneration::new(10));
+        assert!(scope.control().begin_cancellation());
+        let mut rounds = ToolRoundState::new(1);
+        let output = AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &authorization,
+                &invoker,
+                &calls,
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &scope,
+            )
+            .await
+            .expect("cancelled batch returns provenance");
+        assert_eq!(authorization.observed.load(Ordering::SeqCst), 0);
+        assert_eq!(invoker.started.load(Ordering::SeqCst), 0);
+        assert!(matches!(output.results[0], Err(RuntimeError::Cancelled)));
+        assert_eq!(output.settlement_at(0), ToolCallSettlement::NeverDispatched);
+    }
+
+    #[tokio::test]
     async fn cancellation_during_authorization_starts_no_tools() {
         let catalog = UnifiedToolCatalog::new().with_inline_tool(tool_definition("first"));
         let calls = [ToolCall {
@@ -7605,6 +7801,7 @@ mod tests {
         let output = output.expect("batch orchestration should finish");
 
         assert_eq!(invoker.started.load(Ordering::SeqCst), 0);
+        assert_eq!(output.settlement_at(0), ToolCallSettlement::NeverDispatched);
         assert!(matches!(&output.results[0], Err(RuntimeError::Cancelled)));
     }
 
@@ -7793,6 +7990,13 @@ mod tests {
         let output = output.expect("batch orchestration should finish");
 
         assert_eq!(invoker.started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            output.settlement,
+            vec![
+                ToolCallSettlement::Settled,
+                ToolCallSettlement::NeverDispatched
+            ]
+        );
         assert_eq!(
             invoker.active.load(Ordering::SeqCst),
             0,

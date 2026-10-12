@@ -45,7 +45,7 @@ pub const MAX_TURN_OBSERVATION_BYTES: usize = 128 * 1024;
 /// Maximum retained consumer operations in one turn observation.
 pub const MAX_TURN_OPERATIONS: usize = 64;
 /// Compatibility boundary for transient product observations.
-pub const TURN_OBSERVATION_VERSION: u32 = 1;
+pub const TURN_OBSERVATION_VERSION: u32 = 2;
 
 /// Actual trigger disposition; ineligible work is not consumer execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,7 +155,7 @@ pub struct RecommendationSelectionObservation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsumerOperationObservation {
-    /// Monotonic turn-local operation identity.
+    /// V1 retained index; V2 monotonic producer ordinal, unaffected by passive compaction.
     pub operation_id: u64,
     /// Feature whose actual trigger was evaluated.
     pub feature: Feature,
@@ -184,6 +184,34 @@ pub enum ObservationScope {
     EvalAttempt,
 }
 
+/// Exact host-producer totals within the enclosing session/turn scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationAccounting {
+    /// Every begun operation, including operations that could not be retained.
+    pub begun: u64,
+    /// Lost operation identities, distinct from lost inference detail.
+    pub omitted_operations: u64,
+}
+
+/// Finalized zero-inference, detail-free baseline operations; not lost evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PassiveOperationAggregate {
+    /// Actual producer hook.
+    pub feature: Feature,
+    /// Only disabled or not-applicable is permitted.
+    pub trigger: TriggerDisposition,
+    /// Always baseline-retained, never an inferred application.
+    pub application: ApplicationDisposition,
+    /// Exact number of qualifying finalized operations.
+    pub count: u64,
+    /// First producer ordinal, not an event sequence.
+    pub first_operation_id: u64,
+    /// Last producer ordinal, not an event sequence.
+    pub last_operation_id: u64,
+}
+
 /// Disposable bounded snapshot. Absence after eviction/restart is unknown, not zero.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +226,12 @@ pub struct TurnJudgementObservation {
     pub turn_id: String,
     /// Retained operations in invocation order.
     pub operations: Vec<ConsumerOperationObservation>,
+    /// V2 exact accounting; absent in V1, required in V2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<OperationAccounting>,
+    /// V2 passive accounting, at most two buckets per feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passive_aggregates: Vec<PassiveOperationAggregate>,
     /// Explicit producer coverage certified at terminal settlement.
     pub covered_features: Vec<Feature>,
     /// Terminal closure; no later operation can alter the snapshot.
@@ -209,25 +243,140 @@ pub struct TurnJudgementObservation {
 }
 
 impl TurnJudgementObservation {
-    /// Validate compatibility, correlation shapes and bounded export.
-    ///
-    /// # Errors
-    /// Rejects unsupported versions, invalid identities, selection ordinals or oversized data.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != TURN_OBSERVATION_VERSION
-            || self.session_id.is_empty()
-            || self.session_id.len() > 128
-            || self.turn_id.is_empty()
-            || self.turn_id.len() > 128
-            || self.session_id.chars().any(char::is_control)
-            || self.turn_id.chars().any(char::is_control)
-            || self.operations.len() > MAX_TURN_OPERATIONS
-            || self.covered_features.len() > 6
-        {
-            return Err("invalid turn observation");
+    /// Whether retained or aggregated facts prove a producer hook was observed.
+    #[must_use]
+    pub fn has_feature(&self, feature: Feature) -> bool {
+        self.operations.iter().any(|op| op.feature == feature)
+            || self
+                .passive_aggregates
+                .iter()
+                .any(|op| op.feature == feature)
+    }
+
+    fn validate_accounting(&self) -> Result<(), &'static str> {
+        if self.schema_version == 1 {
+            if self.accounting.is_some() || !self.passive_aggregates.is_empty() {
+                return Err("legacy observation contains v2 accounting");
+            }
+        } else {
+            let accounting = self
+                .accounting
+                .as_ref()
+                .ok_or("missing operation accounting")?;
+            if self.passive_aggregates.len() > 12 || accounting.omitted_operations > self.omitted {
+                return Err("invalid passive accounting bound");
+            }
+            let mut total = self.operations.len() as u64;
+            let mut keys = Vec::new();
+            for aggregate in &self.passive_aggregates {
+                if !matches!(
+                    aggregate.trigger,
+                    TriggerDisposition::Disabled | TriggerDisposition::NotApplicable
+                ) || aggregate.application != ApplicationDisposition::BaselineRetained
+                    || aggregate.count == 0
+                    || aggregate.first_operation_id > aggregate.last_operation_id
+                    || aggregate.last_operation_id >= accounting.begun
+                    || aggregate.count
+                        > aggregate.last_operation_id - aggregate.first_operation_id + 1
+                    || keys.contains(&(aggregate.feature, aggregate.trigger))
+                {
+                    return Err("invalid passive aggregate");
+                }
+                let retained_in_range = self
+                    .operations
+                    .iter()
+                    .filter(|op| {
+                        aggregate.first_operation_id <= op.operation_id
+                            && op.operation_id <= aggregate.last_operation_id
+                    })
+                    .count() as u64;
+                if aggregate.count
+                    > (aggregate.last_operation_id - aggregate.first_operation_id + 1)
+                        .saturating_sub(retained_in_range)
+                    || self.operations.iter().any(|op| {
+                        op.operation_id == aggregate.first_operation_id
+                            || op.operation_id == aggregate.last_operation_id
+                    })
+                    || (aggregate.count == 1
+                        && aggregate.first_operation_id != aggregate.last_operation_id)
+                {
+                    return Err("passive aggregate ordinal collision");
+                }
+                keys.push((aggregate.feature, aggregate.trigger));
+                total = total
+                    .checked_add(aggregate.count)
+                    .ok_or("accounting overflow")?;
+            }
+            self.validate_passive_ordinals()?;
+            if total.checked_add(accounting.omitted_operations) != Some(accounting.begun) {
+                return Err("operation accounting mismatch");
+            }
         }
+        Ok(())
+    }
+
+    fn validate_passive_ordinals(&self) -> Result<(), &'static str> {
+        let mut endpoints = BTreeSet::new();
+        for aggregate in &self.passive_aggregates {
+            if !endpoints.insert(aggregate.first_operation_id)
+                || (aggregate.last_operation_id != aggregate.first_operation_id
+                    && !endpoints.insert(aggregate.last_operation_id))
+            {
+                return Err("duplicate passive ordinal");
+            }
+        }
+        // Bounds describe extrema, not contiguous membership. Check interval capacity
+        // without expanding potentially unbounded operation ordinal ranges.
+        for first in &endpoints {
+            for last in endpoints.range(*first..) {
+                let mut required = self
+                    .operations
+                    .iter()
+                    .filter(|op| *first <= op.operation_id && op.operation_id <= *last)
+                    .count() as u64;
+                for aggregate in &self.passive_aggregates {
+                    if *first <= aggregate.first_operation_id
+                        && aggregate.last_operation_id <= *last
+                    {
+                        required = required
+                            .checked_add(aggregate.count)
+                            .ok_or("ordinal accounting overflow")?;
+                    } else {
+                        let extrema = u64::from(
+                            *first <= aggregate.first_operation_id
+                                && aggregate.first_operation_id <= *last,
+                        ) + u64::from(
+                            aggregate.last_operation_id != aggregate.first_operation_id
+                                && *first <= aggregate.last_operation_id
+                                && aggregate.last_operation_id <= *last,
+                        );
+                        required = required
+                            .checked_add(extrema)
+                            .ok_or("ordinal accounting overflow")?;
+                    }
+                }
+                let available = last
+                    .checked_sub(*first)
+                    .and_then(|width| width.checked_add(1))
+                    .ok_or("ordinal range overflow")?;
+                if required > available {
+                    return Err("passive ordinal ranges cannot be disjoint");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_operations(&self) -> Result<(), &'static str> {
         for (index, operation) in self.operations.iter().enumerate() {
-            if operation.operation_id != index as u64 || operation.inference.len() > 8 {
+            if (self.schema_version == 1 && operation.operation_id != index as u64)
+                || (self.schema_version == 2
+                    && (operation.operation_id
+                        >= self.accounting.as_ref().ok_or("missing accounting")?.begun
+                        || (index > 0
+                            && self.operations[index - 1].operation_id >= operation.operation_id)))
+                || operation.inference.len() > 8
+            {
                 return Err("invalid operation observation");
             }
             if operation.inference_complete
@@ -269,6 +418,10 @@ impl TurnJudgementObservation {
                 recommendation.selection.validate()?;
             }
         }
+        Ok(())
+    }
+
+    fn validate_coverage(&self) -> Result<(), &'static str> {
         let all: &[Feature] = match self.scope {
             ObservationScope::NormalTurn => &[
                 Feature::ToolResultTriage,
@@ -279,6 +432,13 @@ impl TurnJudgementObservation {
             ],
             ObservationScope::EvalAttempt => &[Feature::EvalCategorization],
         };
+        if self
+            .passive_aggregates
+            .iter()
+            .any(|aggregate| !all.contains(&aggregate.feature))
+        {
+            return Err("aggregate outside observation scope");
+        }
         for feature in &self.covered_features {
             if !all.contains(feature) {
                 return Err("feature outside observation scope");
@@ -288,8 +448,7 @@ impl TurnJudgementObservation {
             && (self.terminal.is_none()
                 || self.omitted != 0
                 || !all.iter().all(|feature| {
-                    self.covered_features.contains(feature)
-                        && self.operations.iter().any(|op| op.feature == *feature)
+                    self.covered_features.contains(feature) && self.has_feature(*feature)
                 })
                 || self.operations.iter().any(|op| {
                     !op.inference_complete
@@ -299,6 +458,29 @@ impl TurnJudgementObservation {
         {
             return Err("invalid observation completeness");
         }
+        Ok(())
+    }
+
+    /// Validate compatibility, correlation shapes and bounded export.
+    ///
+    /// # Errors
+    /// Rejects unsupported versions, invalid identities, selection ordinals or oversized data.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !matches!(self.schema_version, 1 | TURN_OBSERVATION_VERSION)
+            || self.session_id.is_empty()
+            || self.session_id.len() > 128
+            || self.turn_id.is_empty()
+            || self.turn_id.len() > 128
+            || self.session_id.chars().any(char::is_control)
+            || self.turn_id.chars().any(char::is_control)
+            || self.operations.len() > MAX_TURN_OPERATIONS
+            || self.covered_features.len() > 6
+        {
+            return Err("invalid turn observation");
+        }
+        self.validate_accounting()?;
+        self.validate_operations()?;
+        self.validate_coverage()?;
         if serde_json::to_vec(self)
             .map_err(|_| "invalid turn observation")?
             .len()

@@ -22,6 +22,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 spec = importlib.util.spec_from_file_location('normal_study_driver', Path(__file__).with_name('judgement-normal-live.py'))
 normal = importlib.util.module_from_spec(spec)
@@ -166,6 +167,13 @@ def materialize(plan):
         folder.mkdir()
         combined.update(receipt_file=str(folder / 'admission-receipt.json'), result_file=str(folder / 'result.json'))
         schedule['trials'].append(combined)
+    context_receipts = {}
+    for trial in schedule['trials']:
+        if trial.get('adapter') == 'context' and not trial.get('gap'):
+            pair_id = trial.get('admission_pair_id')
+            cli.require(isinstance(pair_id, str) and pair_id, 'context pair identity required')
+            trial['receipt_file'] = context_receipts.setdefault(pair_id, trial['receipt_file'])
+    validate_context_pairs(schedule['trials'])
     schedule['driver_sha256'] = cli.digest(__file__)
     schedule['adapter_sha256'] = {name: cli.digest(Path(__file__).with_name('judgement-' + name + '-live.py'))
                                   for name in ('normal', 'context', 'navigation')}
@@ -186,7 +194,39 @@ def oracle_artifact(binding):
     return value
 
 
+def context_arm_report(report, trial):
+    cli.require(trial.get('admission_pair_id') and trial.get('report_arm') == trial['arm'],
+                'explicit context pair/arm binding required')
+    arms = report.get('arms')
+    cli.require(isinstance(arms, list) and len(arms) == 2
+                and {a.get('arm') for a in arms} == {'off', 'on'}, 'exact context pair report required')
+    return next(a for a in arms if a['arm'] == trial['arm'])
+
+
+def context_pair_terminal(report):
+    arms = report.get('arms', [])
+    return (len(arms) == 2 and {a.get('arm') for a in arms} == {'off', 'on'}
+            and all(a.get('terminal_proof', {}).get('verified') is True
+                    and (a.get('capture') or {}).get('outcome') in ('succeeded', 'failed', 'cancelled')
+                    for a in arms))
+
+
+def validate_context_pairs(trials):
+    pairs = {}
+    for trial in trials:
+        if trial.get('adapter') == 'context' and not trial.get('gap'):
+            cli.require(trial.get('admission_pair_id'), 'context requires pair-level admission')
+            pairs.setdefault(trial['admission_pair_id'], []).append(trial)
+    for pair in pairs.values():
+        cli.require(len(pair) == 2 and {t['arm'] for t in pair} == {'off', 'on'}
+                    and len({(t['job_file'], t['job_sha256'], t['report_file'], t['receipt_file']) for t in pair}) == 1
+                    and len({(t['case_id'], t['repetition']) for t in pair}) == 1,
+                    'context pair must share exact job/report/receipt')
+
+
 def summarize(report, trial):
+    if trial['adapter'] == 'context':
+        report = context_arm_report(report, trial)
     metric = trial['metric']
     capture = report.get('capture', report if trial['adapter'] == 'eval' else {}) or {}
     oracle = report.get('oracle') or {}
@@ -234,30 +274,56 @@ def reconcile(schedule):
             atomic(Path(trial['result_file']), result)
 
 
+def adapter_diagnostic(stream, returncode):
+    """Retain bounded allowlisted stderr only; arbitrary provider/traceback text is withheld."""
+    stream.seek(0)
+    raw = stream.read(4097)
+    allowed = (b'Pilot preflight missing source_order; consumer not started.\n',
+               b'Pilot schema prerequisite missing; execution effects unknown.\n',
+               b'Pilot precondition failed; no configuration/effectiveness attestation.\n')
+    return {'returncode': returncode, 'stderr': raw.decode('ascii') if raw in allowed else
+            'Untrusted adapter stderr withheld; execution effects unknown.',
+            'stderr_truncated': len(raw) > 4096,
+            'consumer_not_started': raw == allowed[0]}
+
+
+def require_settled_admissions(schedule):
+    """Fail closed before source rebinding or admitting more work, including filtered runs."""
+    for trial in schedule['trials']:
+        receipt_path = Path(trial['receipt_file'])
+        if not receipt_path.exists():
+            continue
+        receipt = cli.read_json(receipt_path)
+        cli.require(receipt.get('id') == trial.get('admission_pair_id', trial['id'])
+                    and receipt.get('job_sha256') == trial.get('job_sha256')
+                    and trial.get('job_file') and cli.digest(trial['job_file']) == trial['job_sha256'],
+                    'receipt/job correlation mismatch')
+        report_path = Path(trial['report_file'])
+        cli.require(report_path.is_file(), 'unresolved prior admission; no replay or continuation')
+        report = cli.read_json(report_path)
+        if trial.get('adapter') == 'context':
+            cli.require(context_pair_terminal(report),
+                        'context pair terminal proof missing; no replay or continuation')
+            context_arm_report(report, trial)
+        elif trial.get('adapter') == 'normal':
+            capture = report.get('capture') or {}
+            cli.require(capture.get('outcome') in ('succeeded', 'failed', 'cancelled')
+                        and capture.get('status') not in ('timed_out', 'public_operation_failed')
+                        and report.get('turn_id')
+                        and (report.get('history_after') or {}).get('complete') is True,
+                        'bounded canonical terminal proof missing; no replay or continuation')
+        else:
+            # Eval/navigation reports do not yet expose correlated terminal execution proof.
+            cli.require(False, 'adapter terminal correlation unsupported; no replay or continuation')
+
+
 def rebind_resume(schedule, output):
     """Explicit source revision after bounded proof of every prior admission's terminal capture."""
     cli.require(not output.exists(), 'fresh rebound schedule required')
     cli.external_path(str(output.parent))
     cli.require(cli.digest(schedule['corpus_file']) == schedule['corpus_sha256'], 'corpus changed')
-    for trial in schedule['trials']:
-        receipt_path = Path(trial['receipt_file'])
-        if not receipt_path.exists():
-            continue
-        cli.require(trial['adapter'] == 'normal',
-                    'non-normal terminal correlation is unsupported; rebind prohibited')
-        receipt = cli.read_json(receipt_path)
-        cli.require(receipt.get('id') == trial['id'] and receipt.get('job_sha256') == trial['job_sha256']
-                    and cli.digest(trial['job_file']) == trial['job_sha256'], 'receipt/job correlation mismatch')
-        report_path = Path(trial['report_file'])
-        cli.require(report_path.is_file(), 'unresolved prior admission; rebind prohibited')
-        report = cli.read_json(report_path)
-        capture = report.get('capture', report if trial['adapter'] == 'eval' else {}) or {}
-        cli.require(capture.get('outcome') in ('succeeded', 'failed', 'cancelled')
-                    and capture.get('status') not in ('timed_out', 'public_operation_failed'),
-                    'prior terminal capture unavailable; rebind prohibited')
-        if trial['adapter'] == 'normal':
-            cli.require(report.get('turn_id') and (report.get('history_after') or {}).get('complete') is True,
-                        'bounded canonical terminal proof missing')
+    validate_context_pairs(schedule['trials'])
+    require_settled_admissions(schedule)
     reconcile(schedule)
     rebound = copy.deepcopy(schedule)
     rebound['previous_driver_sha256'] = schedule.get('driver_sha256')
@@ -272,6 +338,8 @@ def rebind_resume(schedule, output):
 def run(schedule, limit, features=None, controls=None, repetitions=None):
     cli.require(type(limit) is int and 0 < limit <= len(schedule['trials']), 'finite admission limit required')
     cli.require(cli.digest(schedule['corpus_file']) == schedule['corpus_sha256'], 'corpus changed')
+    validate_context_pairs(schedule['trials'])
+    require_settled_admissions(schedule)
     if schedule.get('driver_sha256'):
         cli.require(cli.digest(__file__) == schedule['driver_sha256'], 'driver changed after freeze')
         cli.require(all(cli.digest(Path(__file__).with_name('judgement-' + name + '-live.py')) == digest
@@ -289,12 +357,16 @@ def run(schedule, limit, features=None, controls=None, repetitions=None):
             continue
         if trial.get('gap') or Path(trial['result_file']).exists():
             continue
+        require_settled_admissions(schedule)
         receipt = Path(trial['receipt_file'])
         cli.require(not receipt.exists(), 'unreconciled admission; never blindly repeat')
         cli.require(cli.digest(trial['job_file']) == trial['job_sha256'], 'job changed before admission')
         cli.require(cli.digest(schedule['subject']['executable']) == schedule['subject']['sha256'], 'subject changed')
-        cli.write_json(receipt, {'id': trial['id'], 'job_sha256': trial['job_sha256'],
-                                 'phase': 'admission_may_have_effects', 'automatic_retry': False})
+        try:
+            cli.write_json(receipt, {'id': trial.get('admission_pair_id', trial['id']), 'job_sha256': trial['job_sha256'],
+                                     'phase': 'admission_may_have_effects', 'automatic_retry': False})
+        except FileExistsError as error:
+            raise cli.PilotError('admission conflict; receipt already claimed; no dispatch') from error
         admitted += 1
         job = cli.read_json(trial['job_file'])
         if trial['adapter'] == 'eval':
@@ -305,9 +377,16 @@ def run(schedule, limit, features=None, controls=None, repetitions=None):
             reconcile(schedule)
             continue
         script = Path(__file__).with_name('judgement-' + trial['adapter'] + '-live.py')
-        completed = subprocess.run([sys.executable, '-B', str(script), '--file', trial['job_file']],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, timeout=600, check=False)
+        with tempfile.TemporaryFile() as stderr:
+            try:
+                completed = subprocess.run([sys.executable, '-B', str(script), '--file', trial['job_file']],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=stderr, timeout=600, check=False)
+            except subprocess.TimeoutExpired:
+                atomic(receipt.with_suffix('.diagnostic.json'), adapter_diagnostic(stderr, None))
+                raise
+            if completed.returncode != 0:
+                atomic(receipt.with_suffix('.diagnostic.json'), adapter_diagnostic(stderr, completed.returncode))
         reconcile(schedule)
         if completed.returncode != 0:
             break  # already-retained failure is a result; unretained effects require reconciliation
@@ -324,7 +403,9 @@ def reduce(schedule):
             'qualified_wins': 0, 'qualified_losses': 0, 'qualified_ties': 0, 'latency_ratios': []})
         group['assigned'] += 1
         path = Path(trial['result_file'])
-        result = cli.read_json(path) if path.exists() else {'gap': trial.get('gap') or 'not_admitted'}
+        result = cli.read_json(path) if path.exists() else {
+            'gap': 'admitted_without_report' if trial.get('receipt_file') and Path(trial['receipt_file']).exists()
+                   else trial.get('gap') or 'not_admitted'}
         truth = result.get('task_truth') or result.get('truth')
         group['intent_to_treat_' + (truth if truth in ('pass', 'fail') else 'unknown')] += 1
         trials_report.append({'id': trial.get('id'), 'treatment': trial.get('treatment'),

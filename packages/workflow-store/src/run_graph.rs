@@ -1711,8 +1711,9 @@ impl WorkflowStore {
 
     /// Read a staged edit under current execution authority without publishing it.
     ///
-    /// The stored envelope and provenance are validated in one snapshot. A transferred owner
-    /// may inspect a predecessor's intent, but inspection does not authorize publication.
+    /// The stored envelope and provenance are validated in one snapshot. Same-artifact
+    /// verified ownership transfer rebinds provenance atomically without changing intent;
+    /// this read never transfers authority or authorizes publication.
     ///
     /// # Errors
     ///
@@ -1732,6 +1733,60 @@ impl WorkflowStore {
             Self::staged_run_graph_edit_in(transaction.as_ref(), run_id, mutation_id, authority)?;
         super::database::commit(transaction)?;
         Ok(request)
+    }
+
+    /// Rebind retained candidates within the same-artifact ownership transfer transaction.
+    /// Request bytes, revision and mutation identity are never rewritten or restaged.
+    pub(super) fn transfer_graph_edit_candidates_in(
+        connection: &dyn Database,
+        run_id: &str,
+        expected: &super::WorkflowExecutionAuthority,
+        replacement: &super::WorkflowExecutionAuthority,
+    ) -> Result<(), WorkflowStoreError> {
+        Self::verify_execution_authority_in(connection, run_id, expected)?;
+        let replacement_json = super::bounded_json("graph edit authority", replacement)?;
+        let mut after = String::new();
+        loop {
+            let rows = super::database::rows(
+                connection,
+                &connection
+                    .select("workflow_graph_edit_candidates")
+                    .project(switchy_database::query::identifier("mutation_id"))
+                    .where_eq("run_id", run_id)
+                    .where_gt("mutation_id", after.as_str())
+                    .sort("mutation_id", SortDirection::Asc)
+                    .limit(64),
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let mutation_id = graph_stored_identity(&row, "mutation_id")?;
+                // Validates the complete bounded envelope and its exact prior authority.
+                Self::staged_run_graph_edit_in(connection, run_id, &mutation_id, expected)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "graph edit candidate disappeared during transfer".into(),
+                        )
+                    })?;
+                let changed = super::database::block_on(
+                    connection.exec_update_count(
+                        &connection
+                            .update("workflow_graph_edit_candidates")
+                            .value("authority_json", replacement_json.as_str())
+                            .where_eq("run_id", run_id)
+                            .where_eq("mutation_id", mutation_id.as_str()),
+                    ),
+                )?;
+                if changed != 1 {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "graph edit candidate transfer lost its ownership race".into(),
+                    ));
+                }
+                after = mutation_id;
+            }
+        }
+        Ok(())
     }
 
     fn staged_run_graph_edit_in(

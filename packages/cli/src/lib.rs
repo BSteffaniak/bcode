@@ -62,6 +62,12 @@ pub enum CliError {
     StartupReportUnavailable,
     #[error("client error: {0}")]
     Client(#[from] ClientError),
+    /// Failure of the bounded public workflow inspection read, not an execution outcome.
+    #[error("workflow inspection failed: {source}")]
+    WorkflowInspection {
+        #[source]
+        source: ClientError,
+    },
     /// Child creation may have committed; retain this identity and retry the same request.
     #[error(
         "child creation failed (child_id={child_id}, parent_id={parent_id}); retry the identical request with --parent {parent_id} --child-id {child_id}: {source}"
@@ -184,11 +190,46 @@ pub enum CliError {
     AuthPrimeFailed(String),
 }
 
+fn workflow_inspection_exit_code(source: &ClientError) -> u8 {
+    match source {
+        ClientError::Server { code, .. }
+            if matches!(
+                code.as_str(),
+                "invalid_exchange_resolution"
+                    | "invalid_invocation_input_producer"
+                    | "invalid_invocation_input_schema"
+                    | "invalid_invocation_input_id"
+                    | "invocation_input_too_large"
+            ) =>
+        {
+            2
+        }
+        ClientError::Server { code, .. }
+            if matches!(
+                code.as_str(),
+                "authorization_denied" | "workflow_operation_unauthorized"
+            ) =>
+        {
+            3
+        }
+        ClientError::Server { code, .. }
+            if matches!(
+                code.as_str(),
+                "cancelled" | "workflow_computation_cancelled" | "worktree_create_cancelled"
+            ) =>
+        {
+            4
+        }
+        _ => 1,
+    }
+}
+
 impl CliError {
     /// Stable process exit status for this CLI failure category.
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
+            Self::WorkflowInspection { source } => workflow_inspection_exit_code(source),
             Self::InvalidArguments(_)
             | Self::InvalidSessionHistoryRange
             | Self::NewSessionWithCommand
@@ -1694,7 +1735,8 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                         &client, run_id, limit,
                     ),
                 )
-                .await?,
+                .await
+                .map_err(|source| CliError::WorkflowInspection { source })?,
             )?;
         }
         WorkflowCommand::DiagnosticArtifacts {
@@ -8886,6 +8928,11 @@ enum JudgementCommand {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Validate a bounded capture job offline without dispatching consumer or provider work.
+    BenchmarkValidate {
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Compare captured benchmark observations offline without provider work.
     BenchmarkCompare {
         #[arg(long)]
@@ -8974,6 +9021,15 @@ async fn handle_judgement_command(command: JudgementCommand) -> Result<(), CliEr
                 .turn_judgement_observation(session_id, &turn_id)
                 .await?;
             print_json(&observation)?;
+        }
+        JudgementCommand::BenchmarkValidate { file } => {
+            let bytes = read_judgement_benchmark_input(
+                &file,
+                bcode_eval::judgement_capture::MAX_CAPTURE_BYTES,
+            )?;
+            bcode_eval::judgement_capture::decode_capture_job(&bytes)
+                .map_err(|error| CliError::InvalidArguments(error.into()))?;
+            println!("{{\"schema_version\":1,\"decoded\":true,\"execution_attempted\":false}}");
         }
         JudgementCommand::BenchmarkCapture { file } => capture_judgement_benchmark(&file).await?,
         JudgementCommand::BenchmarkCompare { file } => {
@@ -18760,6 +18816,7 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
             diagnostics,
         } => {
             let request = serde_json::to_vec(&DiscoverImportableSessionsRequest {
+                source_id: source.clone(),
                 include_diagnostics: diagnostics,
                 ..DiscoverImportableSessionsRequest::default()
             })?;
@@ -26517,6 +26574,40 @@ mod session_configuration_cli_tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn inspection_exit_code_preserves_underlying_client_category() {
+        use bcode_client::ClientError;
+
+        for (code, expected) in [
+            ("invalid_exchange_resolution", 2),
+            ("invalid_invocation_input_producer", 2),
+            ("invalid_invocation_input_schema", 2),
+            ("invalid_invocation_input_id", 2),
+            ("invocation_input_too_large", 2),
+            ("authorization_denied", 3),
+            ("workflow_operation_unauthorized", 3),
+            ("cancelled", 4),
+            ("workflow_computation_cancelled", 4),
+            ("worktree_create_cancelled", 4),
+            ("future_unknown_category", 1),
+        ] {
+            let source = || ClientError::Server {
+                code: code.into(),
+                message: "SECRET_FIXTURE_MARKER".into(),
+            };
+            let wrapped = CliError::WorkflowInspection { source: source() };
+            assert_eq!(wrapped.exit_code(), expected);
+            assert_eq!(wrapped.exit_code(), CliError::Client(source()).exit_code());
+        }
+        assert_eq!(
+            CliError::WorkflowInspection {
+                source: ClientError::UnexpectedResponse
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]

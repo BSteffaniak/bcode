@@ -2272,6 +2272,7 @@ impl WorkflowStore {
         let db: &dyn switchy_database::Database = &*tx;
         verify_store_schema(db)?;
         let pending = Self::pending_replacement_in(db, run_id)?.is_some();
+        Self::transfer_graph_edit_candidates_in(db, run_id, expected, replacement)?;
         let mut query = update("workflow_runs")
             .value(
                 "coordinator_daemon_instance_id",

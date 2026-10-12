@@ -37,6 +37,15 @@ pub struct ListImportSourcesResponse {
 /// Request payload for discovering importable sessions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoverImportableSessionsRequest {
+    /// Select one advertised source through the public import application boundary.
+    ///
+    /// Omitted or null values request aggregate discovery across registered providers.
+    /// Explicit values route to the unique advertised owner; unknown, disabled, or
+    /// ambiguously owned sources are rejected rather than selecting the first provider.
+    /// Provider adapters may ignore this additive field: the application routes and
+    /// filters results itself, while adapters retain locator/path confinement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     #[serde(default)]
     pub working_directory: Option<PathBuf>,
     /// Include diagnostic source/status entries in discovery summaries.

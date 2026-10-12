@@ -129,9 +129,23 @@ def pi_records(external_id, workspace, candidates):
     return records
 
 
+def auth_registry_environment(job, env):
+    """Select only the explicitly approved registry; never read or copy its contents."""
+    env.pop('BCODE_AUTH_SUBSCRIPTIONS', None)
+    if 'auth_subscriptions_path' not in job:
+        return
+    approved = Path('/Users/bsteffaniak/.local/state/bcode/auth/subscriptions.json')
+    path = Path(job['auth_subscriptions_path'])
+    require(path.is_absolute() and path == approved and not path.is_symlink()
+            and path.resolve(strict=True) == approved and path.is_file(),
+            'explicit approved auth registry file required')
+    env['BCODE_AUTH_SUBSCRIPTIONS'] = str(path)
+
+
 def command(job, arm, args, workspace, timeout=30):
     """Bound output on disk; never include CLI errors/config contents in diagnostics."""
     env = os.environ.copy()
+    auth_registry_environment(job, env)
     env['BCODE_CONFIG'] = arm['config_file']
     # Must match coordinator daemon startup: socket placement currently depends on TMPDIR.
     env['TMPDIR'] = str(EXTERNAL / 'tmp')
@@ -154,9 +168,23 @@ def command(job, arm, args, workspace, timeout=30):
             raise PilotError('CLI timeout; daemon effects unresolved') from None
         output.seek(0)
         raw = output.read(MAX_BYTES + 1)
-    require(result.returncode == 0, 'public CLI operation failed; no effectiveness attribution')
+    if result.returncode != 0:
+        error = PilotError('public CLI operation failed; no effectiveness attribution')
+        error.diagnostic = {'operation': public_operation(args), 'returncode': result.returncode,
+                            'error_code': 'public_cli_nonzero', 'stderr': 'untrusted stderr withheld'}
+        raise error
     require(len(raw) <= MAX_BYTES, 'public CLI output exceeded bound')
     return raw.decode('utf-8')
+
+
+def public_operation(args):
+    """Return fixed operation names without user-controlled arguments or secrets."""
+    operations = (('server', 'diagnose'), ('state', 'locations'), ('model', 'status'),
+                  ('session', 'import', 'sources'), ('session', 'import', 'discover'),
+                  ('session', 'import', 'open'), ('session', 'history'),
+                  ('judgement', 'benchmark-capture'), ('judgement', 'observe-turn'))
+    return next((' '.join(prefix) for prefix in operations if tuple(args[:len(prefix)]) == prefix),
+                'other_public_operation')
 
 
 def json_command(job, arm, args, workspace):
@@ -191,13 +219,86 @@ def verify_subject(job, arm, workspace):
             'state_id': daemon['state_location_id']}
 
 
+def bind_subject(template, job, arm, identity):
+    """Bind only explicitly deferred state identity from verified public diagnosis."""
+    declared = template['request']['subject']
+    if arm.get('state_binding') == 'verified_public_diagnose':
+        require(declared.get('state_id') is None, 'deferred state binding requires null state_id')
+        declared['state_id'] = identity['state_id']
+    mismatches = [key for key in identity if declared.get(key) != identity[key]]
+    if declared.get('executable') != job['subject_binary']:
+        mismatches.append('executable')
+    require(not mismatches, 'declared subject scope mismatch: ' + ','.join(mismatches))
+
+
+def bind_subject_report(result, template, job, arm, identity):
+    """Distinguish declared prebinding differences from verified postbinding identity."""
+    result['prebinding_subject_mismatch_fields'] = [k for k in identity
+        if template['request']['subject'].get(k) != identity[k]]
+    bind_subject(template, job, arm, identity)
+    result['subject_mismatch_fields'] = []
+    result['state_binding_provenance'] = arm.get('state_binding', 'explicit_template')
+
+
+def verify_pool(job, payload):
+    """Verify explicit pool membership, not equivalence between pool and credential profile."""
+    pool = job['configured_auth_reference']
+    profile = job['expected_request_auth_profile']
+    require(isinstance(pool, str) and pool and isinstance(profile, str) and profile,
+            'explicit auth reference and request profile required')
+    pools = payload
+    require(isinstance(pools, list) and len(pools) <= 64, 'bounded pool evidence required')
+    matches = [p for p in pools if p.get('pool') == pool]
+    require(len(matches) == 1, 'unique configured pool evidence required')
+    found = matches[0]
+    require(found.get('schema_version') == 1
+            and found.get('provider_plugin_id') == job['expected_selection']['provider']
+            and any(p.get('profile') == profile for p in found.get('profiles', [])),
+            'expected request profile pool membership unverified')
+    require(found.get('preferred_profile') == profile,
+            'expected resolved profile pool preference unverified')
+    return {'pool': pool, 'expected_request_auth_profile': profile,
+            'preferred_profile': found['preferred_profile'], 'membership_verified': True}
+
+
+def verify_request_identity(job, events, session_id, turn_id, start, end):
+    """Check every canonical request observation within the exact terminal turn interval."""
+    observations = []
+    for event in events:
+        if event.get('session_id') != session_id or not start < event.get('sequence', -1) < end:
+            continue
+        payload = event.get('kind', {}).get('request_context_observed')
+        if payload is not None:
+            request = (payload.get('observation') or {}).get('request')
+            require(isinstance(request, dict), 'canonical request auth evidence unavailable; outcome unknown')
+            require(request.get('model_turn_id') == turn_id, 'canonical request turn mismatch; outcome unknown')
+            observations.append(request)
+    require(observations, 'canonical request auth evidence unavailable; outcome unknown')
+    expected = job['expected_selection']
+    wanted = job['expected_request_auth_profile']
+    require(all(o.get('provider_plugin_id') == expected['provider']
+                and o.get('effective_model_id') == expected['model']
+                and o.get('effective_auth_profile') == wanted for o in observations),
+            'canonical request selection mismatch; outcome unknown')
+    return {'provider': expected['provider'], 'model': expected['model'],
+            'effective_auth_profile': wanted, 'request_observations': len(observations), 'verified': True}
+
+
 def verify_selection(job, arm, workspace, session_id):
     status = json_command(job, arm, ['model', 'status', session_id, '--json'], workspace)
     expected = job['expected_selection']
-    require(status['provider_plugin_id'] == expected['provider']
-            and status['effective_model_id'] == expected['model']
-            and status['auth_profile'] == expected['auth_profile'], 'effective base selection mismatch')
-    return {key: status[key] for key in ('provider_plugin_id', 'effective_model_id', 'auth_profile')}
+    actual = {key: status.get(key) for key in ('provider_plugin_id', 'effective_model_id', 'auth_profile')}
+    configured = job.get('configured_auth_reference', expected['auth_profile'])
+    require(isinstance(configured, str) and configured, 'explicit configured auth reference required')
+    resolved = job.get('expected_request_auth_profile', expected['auth_profile'])
+    wanted = dict(zip(actual, (expected['provider'], expected['model'], resolved)))
+    if actual != wanted:
+        error = PilotError('effective base selection mismatch')
+        error.diagnostic = {'operation': 'model status', 'error_code': 'effective_selection_mismatch',
+                            'actual_selection': actual, 'expected_selection': wanted,
+                            'mismatch_fields': [key for key in actual if actual[key] != wanted[key]]}
+        raise error
+    return actual
 
 
 def validate_overlay(job, arm):
@@ -222,10 +323,25 @@ def validate_overlay(job, arm):
             'explicit existing base configuration required')
 
 
+def verify_capture_isolation(job, arm, request):
+    """Encode the typed isolation fact only after validating the explicit treatment."""
+    validate_overlay(job, arm)
+    require(request['arm'] == arm['arm'] and request['feature'] == 'context_reranking',
+            'capture treatment mismatch')
+    request['isolated_feature'] = True
+
+
 def run(job):
     if os.environ.get('BCODE_IPC_ENDPOINT'):
         require(False, 'inherited IPC endpoint override unsupported')
     require(job['schema_version'] == 1, 'unsupported pilot schema')
+    auth_registry_environment(job, {})
+    if 'configured_auth_reference' in job or 'expected_request_auth_profile' in job:
+        require(all(isinstance(job.get(key), str) and job[key] for key in
+                    ('configured_auth_reference', 'expected_request_auth_profile')),
+                'both explicit auth normalization fields required')
+        require(job['expected_selection']['auth_profile'] == job['expected_request_auth_profile'],
+                'capture request auth pin differs from expected request profile')
     require([a['arm'] for a in job['arms']] == ['off', 'on'], 'exact first pilot off/on pair required')
     run_dir = external_path(job['run_directory'])
     require(not any(run_dir.iterdir()), 'fresh empty pilot directory required')
@@ -302,10 +418,12 @@ def run(job):
             (workspace / name).write_text(text, encoding='utf-8')
         try:
             identity = verify_subject(job, arm, workspace)
-            declared = template['request']['subject']
-            require(all(declared.get(k) == identity[k] for k in identity)
-                    and declared['executable'] == job['subject_binary'], 'declared subject scope mismatch')
             result['subject'] = identity
+            result['state_root'] = arm['state_root']
+            bind_subject_report(result, template, job, arm, identity)
+            if 'configured_auth_reference' in job or 'expected_request_auth_profile' in job:
+                result['auth_pool'] = verify_pool(job, json_command(job, arm,
+                    ['auth', 'pool', 'daemon-status'], workspace))
             external_id = str(uuid.uuid4())
             project = pi_root / ('judgement-context-' + external_id)
             project.mkdir()
@@ -341,6 +459,7 @@ def run(job):
             require(capture['schema_version'] == 1 and capture['allow_live']
                     and request['arm'] == arm['arm'] and request['feature'] == 'context_reranking'
                     and request['source'] == 'live_consumer', 'explicit ordinary live context template required')
+            verify_capture_isolation(job, arm, request)
             request['subject'].update(identity, executable=job['subject_binary'], configuration_complete=False,
                                       provider=job['expected_selection']['provider'],
                                       model=job['expected_selection']['model'],
@@ -359,6 +478,22 @@ def run(job):
             capture_started = True
             result['capture'] = json.loads(command(job, arm, ['judgement', 'benchmark-capture', '--file',
                                                               str(capture_path)], workspace, timeout=330))
+            # Preserve the completed response before independent artifact/coverage reads.
+            write_json(workspace.parent / (arm['arm'] + '-retained-capture.json'), result['capture'])
+            normal_spec = importlib.util.spec_from_file_location('context_terminal', Path(__file__).with_name('judgement-normal-live.py'))
+            normal_driver = importlib.util.module_from_spec(normal_spec)
+            normal_spec.loader.exec_module(normal_driver)
+            terminal_events, terminal_history = normal_driver.read_history(
+                dict(job, arm=arm, max_history_pages=job.get('max_history_pages', 8)), session_id, workspace)
+            turn_id, start, end = normal_driver.exact_terminal(terminal_events)
+            result['terminal_proof'] = {'verified': True, 'session_id': session_id, 'turn_id': turn_id,
+                                        'start_sequence': start, 'end_sequence': end,
+                                        'history_sha256': normal_driver.sha(terminal_history)}
+            if 'expected_request_auth_profile' in job:
+                result['request_selection'] = verify_request_identity(job, terminal_events, session_id, turn_id, start, end)
+            observation = json_command(job, arm, ['judgement', 'observe-turn', session_id, turn_id], workspace)
+            result['hook_evidence'] = normal_driver.hook_summary(observation, session_id, turn_id,
+                {'context_reranking': 'applied' if arm['arm'] == 'on' else 'disabled'})
             # No submitted Python is executed: the independent oracle interprets a bounded AST.
             require(digest(oracle) == job['oracle_sha256']
                     and digest(scenarios_path) == job['scenarios_sha256'], 'oracle identity changed')
@@ -374,7 +509,7 @@ def run(job):
             result['artifact_sha256'] = digest(artifact) if artifact.is_file() else None
             captured = result['capture']
             require(captured['scope'] == 'normal_turn' and captured['consumer_executed']
-                    and captured.get('output') and captured.get('outcome') == 'succeeded', 'application capture missing; outcome remains unknown')
+                    and captured.get('output') and captured.get('outcome') in ('succeeded', 'failed'), 'application capture missing; outcome remains unknown')
             selection = captured['output']
             require(selection.get('kind') == 'ranking' and 0 < len(selection['admitted']) < len(candidates),
                     'actual constrained history admission missing')
@@ -384,9 +519,11 @@ def run(job):
                         'off optional calls not verified zero')
         except (ValueError, KeyError, OSError, TypeError, subprocess.TimeoutExpired) as error:
             # Keep diagnostics content-free; errors from provider/CLI/module are untrusted.
+            if isinstance(error, PilotError) and hasattr(error, 'diagnostic'):
+                result['public_failure'] = error.diagnostic
             result['gap'] = (str(error) if isinstance(error, PilotError) else
                              'pilot unavailable; public response or oracle malformed')
-            if session_id and capture_started:
+            if session_id and capture_started and not result.get('terminal_proof', {}).get('verified'):
                 try:
                     command(job, arm, ['cancel', session_id, '--json'], workspace)
                     result['cancellation_requested'] = True
@@ -399,6 +536,97 @@ def run(job):
 
 
 class OfflineTests(unittest.TestCase):
+    def test_registry_environment_is_explicit_confined_and_metadata_only(self):
+        approved = '/Users/bsteffaniak/.local/state/bcode/auth/subscriptions.json'
+        env = {'BCODE_AUTH_SUBSCRIPTIONS': '/unapproved'}
+        auth_registry_environment({}, env)
+        self.assertNotIn('BCODE_AUTH_SUBSCRIPTIONS', env)
+        with mock.patch.object(Path, 'is_symlink', return_value=False), \
+                mock.patch.object(Path, 'resolve', return_value=Path(approved)), \
+                mock.patch.object(Path, 'is_file', return_value=True), \
+                mock.patch.object(Path, 'read_text', side_effect=AssertionError('no contents')):
+            auth_registry_environment({'auth_subscriptions_path': approved}, env)
+            self.assertEqual(env['BCODE_AUTH_SUBSCRIPTIONS'], approved)
+            for bad in ('relative', '/unapproved', approved + '/other'):
+                with self.assertRaises(PilotError):
+                    auth_registry_environment({'auth_subscriptions_path': bad}, {})
+        with mock.patch.object(Path, 'is_symlink', return_value=True):
+            with self.assertRaises(PilotError):
+                auth_registry_environment({'auth_subscriptions_path': approved}, {})
+
+    def test_pool_reference_and_request_identity_are_not_equivalent(self):
+        job = {'configured_auth_reference': 'openai', 'expected_request_auth_profile': 'openai-2',
+               'expected_selection': {'provider': 'p', 'model': 'm', 'auth_profile': 'openai-2'}}
+        pool = [{'schema_version': 1, 'pool': 'openai', 'provider_plugin_id': 'p',
+                 'preferred_profile': 'openai-2', 'profiles': [{'profile': 'openai-2'}]}]
+        self.assertTrue(verify_pool(job, pool)['membership_verified'])
+        pool[0]['preferred_profile'] = 'openai'
+        with self.assertRaisesRegex(PilotError, 'preference unverified'):
+            verify_pool(job, pool)
+        pool[0]['preferred_profile'] = 'openai-2'
+        with mock.patch(__name__ + '.json_command', return_value={
+                'provider_plugin_id': 'p', 'effective_model_id': 'm', 'auth_profile': 'openai-2'}):
+            self.assertEqual(verify_selection(job, {}, None, 's')['auth_profile'], 'openai-2')
+        with mock.patch(__name__ + '.json_command', return_value={
+                'provider_plugin_id': 'p', 'effective_model_id': 'm', 'auth_profile': 'openai'}):
+            with self.assertRaisesRegex(PilotError, 'effective base selection mismatch'):
+                verify_selection(job, {}, None, 's')
+        event = {'session_id': 's', 'sequence': 2, 'kind': {'request_context_observed': {'observation': {
+            'request': {'model_turn_id': 't', 'provider_plugin_id': 'p', 'effective_model_id': 'm',
+                        'effective_auth_profile': 'openai-2'}}}}}
+        self.assertTrue(verify_request_identity(job, [event], 's', 't', 1, 3)['verified'])
+        for events in ([], [dict(event, session_id='foreign')]):
+            with self.assertRaisesRegex(PilotError, 'unavailable'):
+                verify_request_identity(job, events, 's', 't', 1, 3)
+        request = event['kind']['request_context_observed']['observation']['request']
+        request['model_turn_id'] = 'wrong-turn'
+        with self.assertRaisesRegex(PilotError, 'turn mismatch'):
+            verify_request_identity(job, [event], 's', 't', 1, 3)
+        missing = copy.deepcopy(event)
+        del missing['kind']['request_context_observed']['observation']['request']
+        with self.assertRaisesRegex(PilotError, 'unavailable'):
+            verify_request_identity(job, [missing], 's', 't', 1, 3)
+        request['model_turn_id'] = 't'
+        request['effective_auth_profile'] = 'openai'
+        with self.assertRaisesRegex(PilotError, 'mismatch'):
+            verify_request_identity(job, [event], 's', 't', 1, 3)
+        pool[0]['profiles'] = []
+        with self.assertRaisesRegex(PilotError, 'unverified'):
+            verify_pool(job, pool)
+
+    def test_verified_model_selection_rejects_each_mismatched_pin(self):
+        expected = {'provider': 'provider', 'model': 'model', 'auth_profile': 'auth'}
+        status = {'provider_plugin_id': 'provider', 'effective_model_id': 'model', 'auth_profile': 'auth'}
+        with mock.patch(__name__ + '.json_command', return_value=status):
+            self.assertEqual(verify_selection({'expected_selection': expected}, {}, None, 's'), status)
+            for key in status:
+                bad = dict(status, **{key: 'different'})
+                with mock.patch(__name__ + '.json_command', return_value=bad):
+                    with self.assertRaisesRegex(PilotError, 'effective base selection mismatch'):
+                        verify_selection({'expected_selection': expected}, {}, None, 's')
+
+    def test_state_binding_uses_verified_identity_not_stale_template(self):
+        identity = {'artifact_id': 'artifact', 'executable_sha256': 'digest', 'state_id': 'actual-state'}
+        job = {'subject_binary': '/subject'}
+        template = {'request': {'subject': dict(identity, executable='/subject', state_id='old-state')}}
+        with self.assertRaisesRegex(PilotError, 'state_id'):
+            bind_subject(template, job, {}, identity)
+        with self.assertRaisesRegex(PilotError, 'null state_id'):
+            bind_subject(template, job, {'state_binding': 'verified_public_diagnose'}, identity)
+        template['request']['subject']['state_id'] = None
+        result = {}
+        bind_subject_report(result, template, job, {'state_binding': 'verified_public_diagnose'}, identity)
+        self.assertEqual(result['subject_mismatch_fields'], [])
+        self.assertEqual(result['prebinding_subject_mismatch_fields'], ['state_id'])
+        self.assertEqual(result['state_binding_provenance'], 'verified_public_diagnose')
+        self.assertEqual(template['request']['subject']['state_id'], 'actual-state')
+        for key in ('executable_sha256', 'artifact_id'):
+            bad = copy.deepcopy(template)
+            bad['request']['subject'][key] = 'wrong'
+            with self.assertRaisesRegex(PilotError, key):
+                bind_subject(bad, job, {}, identity)
+        self.assertNotIn('configuration_complete', template['request']['subject'])
+
     def test_external_artifact_root_includes_runs_not_only_tmp(self):
         root = Path('/Volumes/ehdd/bcode-eval-artifacts')
         with mock.patch.object(Path, 'resolve', autospec=True, side_effect=lambda path, **_: path):
@@ -475,6 +703,44 @@ class OfflineTests(unittest.TestCase):
                 mock.patch.object(subprocess, 'run', side_effect=launch):
             self.assertEqual(command(job, arm, ['server', 'diagnose'], '/subject/workspace'), '{}')
 
+    def test_capture_isolation_encodes_boolean_only_after_verified_overlay(self):
+        job = {'pi_root': '/external/pi', 'context_budget_bytes': 256,
+               'judgement_selection': {'provider_plugin_id': 'bcode.jev',
+                                      'model_id': 'jev-1.13.0', 'auth_profile': 'jev'}}
+        overlay = '''[judgement]
+mode="auto"
+tool_result_triage="off"
+context_reranking="auto"
+progress_monitoring="off"
+recommendations="off"
+session_categorization="off"
+eval_categorization="off"
+[judgement.selection]
+provider_plugin_id="bcode.jev"
+model_id="jev-1.13.0"
+auth_profile="jev"
+[session_import]
+enabled=true
+[session_import.pi]
+enabled=true
+path_mode="custom_only"
+paths=["/external/pi"]
+[model.tool_output]
+context_chars=256
+'''
+        arm = {'arm': 'on', 'overlay_toml': overlay, 'config_file': '/base.toml'}
+        request = {'arm': 'on', 'feature': 'context_reranking',
+                   'isolated_feature': 'context_reranking'}
+        with mock.patch.object(Path, 'is_file', return_value=True):
+            verify_capture_isolation(job, arm, request)
+            self.assertIs(json.loads(json.dumps(request))['isolated_feature'], True)
+            for bad in (overlay.replace('progress_monitoring="off"', 'progress_monitoring="auto"'),
+                        overlay.replace('context_reranking="auto"', 'context_reranking="off"')):
+                request['isolated_feature'] = None
+                with self.assertRaises(ValueError):
+                    verify_capture_isolation(job, dict(arm, overlay_toml=bad), request)
+                self.assertIsNone(request['isolated_feature'])
+
     def test_overlay_requires_explicit_isolation_and_jev_pin(self):
         job = {'pi_root': '/external/pi', 'context_budget_bytes': 256,
                'judgement_selection': {'provider_plugin_id': 'bcode.jev',
@@ -507,7 +773,15 @@ def main():
         return 0 if unittest.TextTestRunner().run(suite).wasSuccessful() else 1
     try:
         return run(read_json(args.file))
-    except (ValueError, KeyError, OSError, TypeError, ImportError):
+    except PilotError:
+        parser.exit(1, 'Pilot precondition failed; no configuration/effectiveness attestation.\n')
+    except KeyError as error:
+        # Emit only a fixed schema diagnostic, never arbitrary exception text or values.
+        message = ('Pilot preflight missing source_order; consumer not started.\n'
+                   if error.args == ('source_order',) else
+                   'Pilot schema prerequisite missing; execution effects unknown.\n')
+        parser.exit(1, message)
+    except (ValueError, OSError, TypeError, ImportError):
         parser.exit(1, 'Pilot precondition failed; no configuration/effectiveness attestation.\n')
 
 

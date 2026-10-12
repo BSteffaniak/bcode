@@ -13,6 +13,10 @@ pub(crate) struct CliErrorOutputOptions {
 }
 
 /// Secret-safe diagnostic envelope, independently versioned from IPC.
+///
+/// Schema v1 permits additive fixed codes without changing the envelope. Unknown
+/// codes remain unclassified and confer no retry authority. Inspection categories
+/// describe typed client failures, not verified collection or execution causes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct CliDiagnosticError {
     /// Exact supported diagnostic schema version.
@@ -30,6 +34,7 @@ impl CliDiagnosticError {
     #[must_use]
     pub fn from_error(error: &CliError) -> Self {
         match error {
+            CliError::WorkflowInspection { source } => Self::from_inspection_error(source),
             CliError::Client(error)
             | CliError::ChildSessionCreate { source: error, .. }
             | CliError::SessionListingInterrupted { source: error } => Self::from_client(error),
@@ -246,6 +251,58 @@ impl CliDiagnosticError {
             ),
         }
     }
+
+    // The reader exposes ClientError, not typed collection/revision context. Do not
+    // infer such context from server codes, messages, or the current run state.
+    const fn from_inspection_error(error: &bcode_client::ClientError) -> Self {
+        use bcode_client::ClientError;
+        let (code, phase, message) = match error {
+            ClientError::ConnectTimeout { .. } => (
+                "connection_timeout",
+                "connect",
+                "Verified daemon connection timed out.",
+            ),
+            ClientError::RequestTimeout { .. } => (
+                "workflow_inspection_request_timeout",
+                "workflow_inspection",
+                "Workflow inspection request timed out.",
+            ),
+            ClientError::Transport(_) => (
+                "workflow_inspection_transport_failure",
+                "workflow_inspection",
+                "Workflow inspection transport failed.",
+            ),
+            ClientError::Codec(_) => (
+                "workflow_inspection_decode_failure",
+                "workflow_inspection",
+                "Workflow inspection response could not be decoded.",
+            ),
+            ClientError::Protocol(_)
+            | ClientError::UnexpectedResponse
+            | ClientError::UnexpectedEnvelope => (
+                "workflow_inspection_protocol_failure",
+                "workflow_inspection",
+                "Workflow inspection protocol failed.",
+            ),
+            ClientError::IncompatibleDaemon { .. } => (
+                "workflow_inspection_incompatible_daemon",
+                "workflow_inspection",
+                "Workflow inspection daemon is incompatible.",
+            ),
+            ClientError::Server { .. } => (
+                "workflow_inspection_rejected",
+                "workflow_inspection",
+                "Daemon rejected workflow inspection; cause is unavailable.",
+            ),
+            _ => ("cli_failure", "operation", "CLI operation failed."),
+        };
+        Self {
+            schema_version: 1,
+            code,
+            phase,
+            message,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +356,97 @@ mod tests {
             serde_json::json!({"schema_version": 1, "code": "connection_timeout",
                 "phase": "connect", "message": "Verified daemon connection timed out."})
         );
+    }
+
+    #[test]
+    fn inspection_classifications_use_only_typed_categories_and_fixed_text() {
+        use bcode_client::ClientError;
+        let secret = "SECRET_FIXTURE_MARKER";
+        let cases = [
+            (
+                ClientError::RequestTimeout {
+                    timeout: std::time::Duration::from_secs(5),
+                },
+                "workflow_inspection_request_timeout",
+            ),
+            (
+                ClientError::Protocol(secret.into()),
+                "workflow_inspection_protocol_failure",
+            ),
+            (
+                ClientError::UnexpectedResponse,
+                "workflow_inspection_protocol_failure",
+            ),
+            (
+                ClientError::UnexpectedEnvelope,
+                "workflow_inspection_protocol_failure",
+            ),
+            (
+                ClientError::IncompatibleDaemon {
+                    message: secret.into(),
+                },
+                "workflow_inspection_incompatible_daemon",
+            ),
+            (
+                ClientError::Server {
+                    code: "connection_timeout".into(),
+                    message: secret.into(),
+                },
+                "workflow_inspection_rejected",
+            ),
+            (
+                ClientError::Server {
+                    code: format!("future_category_{secret}"),
+                    message: secret.into(),
+                },
+                "workflow_inspection_rejected",
+            ),
+            (
+                ClientError::DaemonStartupTimeout {
+                    timeout: std::time::Duration::from_secs(5),
+                },
+                "cli_failure",
+            ),
+            (
+                ClientError::WorktreeCreate {
+                    code: secret.into(),
+                    message: secret.into(),
+                    created_path: Some(secret.into()),
+                },
+                "cli_failure",
+            ),
+        ];
+        for (source, expected) in cases {
+            let diagnostic =
+                CliDiagnosticError::from_error(&CliError::WorkflowInspection { source });
+            let json = serde_json::to_value(diagnostic).unwrap();
+            assert_eq!(diagnostic.code, expected);
+            assert_eq!(diagnostic.schema_version, 1);
+            assert_eq!(json.as_object().unwrap().len(), 4);
+            assert!(!json.to_string().contains(secret));
+            assert_eq!(
+                diagnostic.phase,
+                if expected == "cli_failure" {
+                    "operation"
+                } else {
+                    "workflow_inspection"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn inspection_connect_timeout_preserves_existing_retry_classification() {
+        let source = bcode_client::ClientError::ConnectTimeout {
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let scoped = CliDiagnosticError::from_error(&CliError::WorkflowInspection { source });
+        let generic = CliDiagnosticError::from_error(&CliError::Client(
+            bcode_client::ClientError::ConnectTimeout {
+                timeout: std::time::Duration::from_secs(5),
+            },
+        ));
+        assert_eq!(scoped, generic);
     }
 
     #[test]

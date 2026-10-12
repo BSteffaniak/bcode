@@ -46,7 +46,7 @@ def receipt_projection(event):
     if name == 'model_turn_started' or name == 'model_turn_finished':
         result['turn_id'] = value['turn_id']
         if name == 'model_turn_finished':
-            cli.require(value['outcome'] in ('completed', 'failed', 'cancelled'), 'unknown terminal outcome')
+            cli.require(value['outcome'] in ('completed', 'failed', 'cancelled', 'provider_unavailable'), 'unknown terminal outcome')
             result['outcome'] = value['outcome']
     elif name in ('positioned_tool_call_requested', 'tool_call_requested'):
         result['tool_call_id_sha256'] = sha(value['tool_call_id'])
@@ -98,6 +98,13 @@ def exact_terminal(events):
     cli.require(end['kind']['model_turn_finished']['turn_id'] == turn_id
                 and end['sequence'] > start['sequence'], 'terminal turn correlation mismatch')
     return turn_id, start['sequence'], end['sequence']
+
+
+def require_available_terminal(events, end_sequence):
+    """Known provider absence is an unavailable gap, never successful task evidence."""
+    terminal = next(e for e in events if e['sequence'] == end_sequence)
+    cli.require(terminal['kind']['model_turn_finished']['outcome'] != 'provider_unavailable',
+                'provider unavailable; task evidence unavailable')
 
 
 def settled_writes(events, start, end):
@@ -180,6 +187,61 @@ def treatment_features(job, template, judgement):
     return mode, enabled
 
 
+def passive_facts(observation):
+    """Decode explicit v2 zero-inference accounting; never reinterpret legacy gaps."""
+    version = observation.get('schema_version')
+    cli.require(version in (1, 2), 'unsupported turn observation version')
+    aggregates = observation.get('passive_aggregates', [])
+    accounting = observation.get('accounting')
+    if version == 1:
+        cli.require(not aggregates and accounting is None, 'legacy aggregate ambiguity')
+        return []
+    cli.require(isinstance(accounting, dict) and set(accounting) == {'begun', 'omitted_operations'}
+                and all(type(v) is int and 0 <= v < 2**64 for v in accounting.values())
+                and isinstance(aggregates, list) and len(aggregates) <= 12,
+                'invalid aggregate accounting')
+    keys = set()
+    total = len(observation['operations']) + accounting['omitted_operations']
+    for aggregate in aggregates:
+        cli.require(set(aggregate) == {'feature', 'trigger', 'application', 'count',
+                                       'first_operation_id', 'last_operation_id'}
+                    and aggregate['feature'] in FEATURES
+                    and aggregate['trigger'] in ('disabled', 'not_applicable')
+                    and aggregate['application'] == 'baseline_retained', 'invalid passive qualifier')
+        count, first, last = (aggregate[k] for k in ('count', 'first_operation_id', 'last_operation_id'))
+        cli.require(all(type(v) is int and 0 <= v < 2**64 for v in (count, first, last))
+                    and 0 < count <= last - first + 1 and first <= last < accounting['begun'],
+                    'invalid passive ordinals')
+        retained = [op['operation_id'] for op in observation['operations']]
+        cli.require(first not in retained and last not in retained
+                    and (count != 1 or first == last)
+                    and count <= last - first + 1 - sum(first <= i <= last for i in retained),
+                    'passive ordinal collision')
+        key = (aggregate['feature'], aggregate['trigger'])
+        cli.require(key not in keys, 'duplicate passive bucket')
+        keys.add(key)
+        total += count
+    endpoints = []
+    for aggregate in aggregates:
+        endpoints.extend({aggregate['first_operation_id'], aggregate['last_operation_id']})
+    cli.require(len(endpoints) == len(set(endpoints)), 'duplicate passive ordinal')
+    for first in endpoints:
+        for last in endpoints:
+            if first > last:
+                continue
+            required = sum(first <= op['operation_id'] <= last for op in observation['operations'])
+            for aggregate in aggregates:
+                lo, hi = aggregate['first_operation_id'], aggregate['last_operation_id']
+                required += aggregate['count'] if first <= lo and hi <= last else sum(
+                    first <= ordinal <= last for ordinal in {lo, hi})
+            cli.require(required <= last - first + 1, 'passive ordinal ranges cannot be disjoint')
+    ids = [op['operation_id'] for op in observation['operations']]
+    cli.require(len(ids) <= 64 and all(type(i) is int and 0 <= i < accounting['begun'] for i in ids)
+                and ids == sorted(set(ids)) and total == accounting['begun']
+                and accounting['omitted_operations'] <= observation['omitted'], 'operation totals mismatch')
+    return aggregates
+
+
 def hook_summary(observation, session_id, turn_id, required):
     """Validated CLI facts only: independent application checks, never task-success evidence."""
     cli.require(isinstance(observation, dict) and observation.get('scope') == 'normal_turn'
@@ -187,20 +249,24 @@ def hook_summary(observation, session_id, turn_id, required):
                 and observation.get('complete') is True and observation.get('omitted') == 0
                 and observation.get('terminal') in ('completed', 'failed', 'cancelled'),
                 'exact complete normal observation required')
+    aggregates = passive_facts(observation)
     operations = observation['operations']
     summary = {}
     for feature, expected in required.items():
+        passive = [op for op in aggregates if op['feature'] == feature]
         ops = [op for op in operations if op['feature'] == feature]
-        cli.require(feature in observation['covered_features'] and ops and
+        cli.require(feature in observation['covered_features'] and (ops or passive) and
                     all(op['inference_complete'] is True and op['application'] is not None for op in ops),
                     'required hook coverage unavailable')
         if expected == 'disabled':
             satisfied = all(op['trigger'] == 'disabled' and not op['inference']
-                            and op['application'] == 'baseline_retained' for op in ops)
+                            and op['application'] == 'baseline_retained' for op in ops) and all(
+                                op['trigger'] == 'disabled' for op in passive)
         else:
             satisfied = any(op['application'] == expected and
-                            (expected != 'applied' or op['trigger'] == 'triggered') for op in ops)
+                            (expected != 'applied' or op['trigger'] == 'triggered') for op in ops) or (expected == 'baseline_retained' and bool(passive))
         summary[feature] = {'expected': expected, 'satisfied': satisfied,
+                            'passive_aggregates': passive,
                             'operations': [{'operation_id': op['operation_id'], 'trigger': op['trigger'],
                                             'application': op['application'],
                                             'inference_count': len(op['inference'])} for op in ops]}
@@ -230,6 +296,21 @@ def grade(job, workspace):
     cli.require(result.get('status') in ('pass', 'fail'), 'independent task truth unavailable')
     # Only fixed status plus hashes; arbitrary oracle prose stays outside reports.
     return {'status': result['status'], 'result_sha256': sha(result)}
+
+
+def bind_normal_subject(job, template, identity):
+    """Replace only the explicit typed unknown marker with verified public identity."""
+    subject = template['request']['subject']
+    if job.get('resolve_state_identity') is True:
+        cli.require(subject.get('state_id') == 'unknown',
+                    'deferred state requires exact unknown marker; stale identity rejected')
+        cli.require(isinstance(identity.get('state_id'), str)
+                    and identity['state_id'] not in ('', 'unknown'),
+                    'verified public state identity required')
+        subject['state_id'] = identity['state_id']
+    cli.require(all(subject.get(k) == v for k, v in identity.items())
+                and subject['executable'] == job['subject_binary'],
+                'declared subject identity mismatch')
 
 
 def run(job):
@@ -284,12 +365,7 @@ def run(job):
     session_id = None
     try:
         identity = cli.verify_subject(job, job['arm'], workspace)
-        if job.get('resolve_state_identity') is True:
-            cli.require('state_id' not in template['request']['subject'], 'unresolved state cannot carry stale identity')
-            template['request']['subject']['state_id'] = identity['state_id']
-        cli.require(all(template['request']['subject'].get(k) == v for k, v in identity.items())
-                    and template['request']['subject']['executable'] == job['subject_binary'],
-                    'declared subject identity mismatch')
+        bind_normal_subject(job, template, identity)
         created = cli.json_command(job, job['arm'], ['session', 'create', '--cwd', str(workspace), '--json'], workspace)
         session_id = str(uuid.UUID(created['id']))
         report['session_id'] = session_id
@@ -311,6 +387,7 @@ def run(job):
         cli.require([sha(e) for e in events[:len(before)]] == [sha(e) for e in before], 'canonical prefix changed')
         turn_id, start, end = exact_terminal(events)
         report['turn_id'] = turn_id
+        require_available_terminal(events, end)
         report['oracle'] = grade(job, workspace)
         primary_observation = None
         if treatment in ('all_on', 'leave_out') or job.get('required_hooks'):
@@ -362,6 +439,7 @@ def reconcile(job, report_path, output_path):
                     == [e['event_sha256'] for e in retained_before], 'retained canonical prefix mismatch')
         turn_id, start, end = exact_terminal(events)
         report['turn_id'] = turn_id
+        require_available_terminal(events, end)
         capture = retained['capture']
         subject = capture['request']['subject']
         cli.require(subject['executable_sha256'] == job['subject_sha256']

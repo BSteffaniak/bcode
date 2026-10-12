@@ -2634,6 +2634,7 @@ dependencies = [
  "bcode_model_catalog",
  "bcode_model_catalog_models",
  "bcode_model_provider_runtime",
+ "bcode_pi_session_import_plugin",
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_project_instructions",

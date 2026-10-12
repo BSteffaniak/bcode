@@ -128,6 +128,79 @@ fn legacy_capture_does_not_claim_normal_turn_coverage() {
         .remove("optional_operations_complete");
     let legacy: ConsumerCapture = serde_json::from_value(value).unwrap();
     assert!(!legacy.telemetry.optional_operations_complete);
+    assert!(legacy.telemetry.aggregated_turn_observation.is_none());
+}
+
+#[test]
+fn mixed_v2_aggregate_and_detailed_operation_round_trip_without_legacy_guessing() {
+    use bcode_model::judgement::{
+        ApplicationDisposition, ConsumerOperationObservation, ObservationScope,
+        ObservationTerminal, OperationAccounting, PassiveOperationAggregate, SelectionObservation,
+        TURN_OBSERVATION_VERSION, TriggerDisposition, TurnJudgementObservation,
+    };
+    let detailed = ConsumerOperationObservation {
+        operation_id: 100,
+        feature: Feature::ContextReranking,
+        trigger: TriggerDisposition::Disabled,
+        inference: vec![],
+        inference_complete: true,
+        application: Some(ApplicationDisposition::BaselineRetained),
+        selection: Some(SelectionObservation {
+            candidate_count: 1,
+            ordered: vec![0],
+            admitted: vec![0],
+        }),
+        recommendation: None,
+    };
+    let snapshot = TurnJudgementObservation {
+        schema_version: TURN_OBSERVATION_VERSION,
+        scope: ObservationScope::NormalTurn,
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        operations: vec![detailed],
+        accounting: Some(OperationAccounting {
+            begun: 201,
+            omitted_operations: 0,
+        }),
+        passive_aggregates: vec![PassiveOperationAggregate {
+            feature: Feature::ProgressMonitoring,
+            trigger: TriggerDisposition::Disabled,
+            application: ApplicationDisposition::BaselineRetained,
+            count: 200,
+            first_operation_id: 0,
+            last_operation_id: 200,
+        }],
+        covered_features: vec![Feature::ContextReranking, Feature::ProgressMonitoring],
+        terminal: Some(ObservationTerminal::Completed),
+        omitted: 0,
+        // Other required hooks are absent: accounting alone does not certify coverage.
+        complete: false,
+    };
+    assert!(snapshot.validate().is_ok());
+    let mut telemetry = CaptureTelemetry {
+        aggregated_turn_observation: Some(snapshot),
+        ..CaptureTelemetry::default()
+    };
+    let decoded: CaptureTelemetry =
+        serde_json::from_slice(&serde_json::to_vec(&telemetry).unwrap()).unwrap();
+    let retained = decoded.aggregated_turn_observation.unwrap();
+    assert!(retained.validate().is_ok());
+    assert_eq!(retained.accounting.as_ref().unwrap().begun, 201);
+    assert_eq!(retained.passive_aggregates[0].count, 200);
+    assert!(retained.operations[0].selection.is_some());
+    assert!(!decoded.optional_operations_complete);
+    assert_eq!(decoded.inference_calls, None);
+    telemetry.aggregated_turn_observation = None;
+    let legacy_value = serde_json::to_value(telemetry).unwrap();
+    assert!(legacy_value.get("aggregated_turn_observation").is_none());
+    let legacy: CaptureTelemetry = serde_json::from_value(legacy_value).unwrap();
+    assert!(legacy.aggregated_turn_observation.is_none());
+    let mut invalid = retained;
+    invalid.complete = true;
+    assert!(invalid.validate().is_err());
+    invalid.complete = false;
+    invalid.accounting.as_mut().unwrap().begun += 1;
+    assert!(invalid.validate().is_err());
 }
 
 #[test]
@@ -143,6 +216,7 @@ fn off_work_future_versions_and_unverified_provenance_fail_closed() {
         verification_cache_hit: None,
         optional_operation: None,
         optional_operations: vec![],
+        aggregated_turn_observation: None,
         optional_counts_incomplete: false,
         optional_operations_complete: false,
         calls: vec![],

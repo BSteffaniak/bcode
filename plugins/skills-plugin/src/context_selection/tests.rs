@@ -236,15 +236,91 @@ fn pressure_is_only_among_snippets_that_can_fit_individually() {
 }
 
 #[test]
-fn producer_owned_pressure_and_protected_data_keep_the_existing_contract() {
+fn finite_pressure_judgement_excludes_protected_evidence() {
+    let mut input = fixture();
+    input.candidates[0].snippet = "archive".into();
+    input.candidates[2].snippet = "current".into();
+    input.candidates[1].id = "protected-unique-id".into();
+    input.candidates[1].snippet = "protected-unique-snippet".into();
+    input.candidates[1].provenance = "protected-unique-provenance".into();
+    input.budget_bytes = Some(7);
+    let prepared = prepare(&input).judgement.unwrap();
+    let payload = serde_json::to_string(&prepared).unwrap();
+    for protected in [
+        "protected-unique-id",
+        "protected-unique-snippet",
+        "protected-unique-provenance",
+    ] {
+        assert!(!payload.contains(protected));
+    }
+    assert_eq!(prepared.request.questions.len(), 2);
+    assert!(prepared.request.questions.contains_key("candidate_0"));
+    assert!(prepared.request.questions.contains_key("candidate_2"));
+    let result = apply(&advised(input));
+    assert_eq!(result.ordered_ids[1], "protected-unique-id");
+    assert_eq!(
+        result.included_ids,
+        ["search-relevant", "protected-unique-id"]
+    );
+    assert!(result.applied);
+}
+
+#[test]
+fn unlimited_budget_preserves_baseline_without_inference() {
     let mut input = fixture();
     input.budget_bytes = None;
-    let prepared = prepare(&input).judgement.unwrap();
-    let serialized = serde_json::to_string(&prepared).unwrap();
-    assert!(!serialized.contains("explicit user requested evidence"));
-    assert!(!serialized.contains("tool:call-explicit"));
+    assert!(prepare(&input).judgement.is_none());
     let result = apply(&advised(input));
     assert_eq!(result.included_ids, result.ordered_ids);
+    assert_eq!(
+        result.ordered_ids,
+        ["read-distractor", "explicit", "search-relevant"]
+    );
+    assert!(!result.applied);
+}
+
+#[test]
+fn zero_or_one_fitting_optional_is_order_independent_around_protected_slots() {
+    for budget in [0, 1, 2, 3] {
+        for reverse in [false, true] {
+            let mut input = fixture();
+            input.candidates[0].snippet = "xxxxx".into();
+            input.candidates[2].snippet = "xx".into();
+            if reverse {
+                input.candidates.swap(0, 2);
+            }
+            input.budget_bytes = Some(budget);
+            assert!(prepare(&input).judgement.is_none());
+            let mut request = advised(input);
+            // Attempt to promote the oversized source across the protected slot.
+            request.judgement.response.as_mut().unwrap().answers = BTreeMap::from([
+                ("candidate_0".into(), Answer::YesNo { probability: 0.9 }),
+                ("candidate_2".into(), Answer::YesNo { probability: 0.1 }),
+            ]);
+            let result = apply(&request);
+            let expected = if budget < 2 {
+                vec!["explicit"]
+            } else if reverse {
+                vec!["search-relevant", "explicit"]
+            } else {
+                vec!["explicit", "search-relevant"]
+            };
+            assert_eq!(result.included_ids, expected);
+            assert_eq!(result.ordered_ids[1], "explicit");
+            assert!(!result.applied);
+        }
+    }
+}
+
+#[test]
+fn finite_competing_whole_snippets_still_offer_promotion() {
+    let mut input = fixture();
+    input.candidates[0].snippet = "archive".into();
+    input.candidates[2].snippet = "current".into();
+    input.budget_bytes = Some(7);
+    assert!(prepare(&input).judgement.is_some());
+    let result = apply(&advised(input));
+    assert_eq!(result.included_ids, ["search-relevant", "explicit"]);
     assert!(result.applied);
 }
 

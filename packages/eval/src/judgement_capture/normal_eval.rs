@@ -41,6 +41,16 @@ fn bounded_json(path: &Path) -> Result<serde_json::Value, ()> {
     serde_json::from_slice(&bytes).map_err(|_| ())
 }
 
+fn canonical_attempt_complete(completeness: &serde_json::Value) -> Result<(), ()> {
+    if completeness.pointer("/boundaries/canonical_attempt/complete")
+        == Some(&serde_json::Value::Bool(true))
+    {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 fn diagnosis_label(diagnosis: &serde_json::Value) -> Option<String> {
     diagnosis
         .pointer("/advisory_model_labels/failure_category")
@@ -73,10 +83,29 @@ fn attempt_observable(
         return Err(());
     }
     let operation = &observation.operation;
+    if operation.trigger == TriggerDisposition::NotApplicable {
+        // Successful attempts have no failure to categorize, independently of arm.
+        // This proves the baseline outcome, never categorization benefit.
+        return if observation.terminal == Some(ObservationTerminal::Completed)
+            && operation.application == Some(ApplicationDisposition::BaselineRetained)
+            && operation.inference_complete
+            && operation.inference.is_empty()
+            && operation.selection.is_none()
+            && operation.recommendation.is_none()
+        {
+            Ok(())
+        } else {
+            Err(())
+        };
+    }
     match arm {
         crate::judgement_benchmark::Arm::Off => {
-            let closed_disabled =
-                operation.trigger == TriggerDisposition::Disabled && operation.inference.is_empty();
+            // No failure prerequisite means the real consumer retained baseline without
+            // calling optional judgement, even when the configured arm is off.
+            let closed_baseline = matches!(
+                operation.trigger,
+                TriggerDisposition::Disabled | TriggerDisposition::NotApplicable
+            ) && operation.inference.is_empty();
             let disabled_call = operation.trigger == TriggerDisposition::Triggered
                 && operation.inference.len() == 1
                 && operation.inference.iter().all(|fact| {
@@ -93,7 +122,7 @@ fn attempt_observable(
                         && !fact.verification_cache_hit
                         && fact.transport_attempts.is_none_or(|count| count == 0)
                 });
-            if !(closed_disabled || disabled_call)
+            if !(closed_baseline || disabled_call)
                 || operation.application != Some(ApplicationDisposition::BaselineRetained)
             {
                 return Err(());
@@ -246,13 +275,28 @@ pub(super) fn execute(
         .join(&repetition.variant_id)
         .join("repetitions")
         .join(format!("{:04}", repetition.repetition));
-    let rep_dir = confined(&rep_dir, authorized_root)?;
-    if !repetition.artifacts.iter().any(|artifact| {
+    load_attempt_artifacts(&rep_dir, authorized_root, &repetition.artifacts, capture)?;
+    capture.trial_latency_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+    Ok(())
+}
+
+// Shared with the execution path: bounded public artifacts only, never replay or inference.
+fn load_attempt_artifacts(
+    rep_dir: &Path,
+    authorized_root: &Path,
+    artifacts: &[bcode_eval_models::EvalArtifactRef],
+    capture: &mut ConsumerCapture,
+) -> Result<(), ()> {
+    let rep_dir = confined(rep_dir, authorized_root)?;
+    if !artifacts.iter().any(|artifact| {
         artifact.kind == "eval_judgement_observation"
             && artifact.path == Path::new("eval-judgement-observation.json")
     }) {
         return Err(());
     }
+    capture.operation = "eval.canonical_attempt_coverage".into();
+    let completeness = bounded_json(&rep_dir.join("capture-completeness.json"))?;
+    canonical_attempt_complete(&completeness)?;
     capture.operation = "eval.observation_decode".into();
     let observation: EvalAttemptJudgementObservation = serde_json::from_value(bounded_json(
         &rep_dir.join("eval-judgement-observation.json"),
@@ -274,7 +318,6 @@ pub(super) fn execute(
     capture.operation = "eval.diagnosis_artifact".into();
     let diagnosis = bounded_json(&rep_dir.join("diagnosis.json"))?;
     capture.request.subject.configuration_complete = false;
-    capture.trial_latency_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
     apply_attempt(&observation, &diagnosis, capture)
 }
 
@@ -333,6 +376,230 @@ mod tests {
         observation.terminal = Some(ObservationTerminal::Failed);
         observation.schema_version += 1;
         assert!(attempt_observable(&observation, Arm::Off).is_err());
+    }
+
+    #[test]
+    fn canonical_capture_missing_or_unverified_is_not_a_successful_baseline() {
+        assert!(
+            canonical_attempt_complete(&serde_json::json!({
+                "boundaries": {"canonical_attempt": {"complete": true}}
+            }))
+            .is_ok()
+        );
+        for incomplete in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "boundaries": {"canonical_attempt": {"complete": false}}
+            }),
+            serde_json::json!({
+                "boundaries": {"canonical_attempt": {"complete": "true"}}
+            }),
+        ] {
+            assert!(canonical_attempt_complete(&incomplete).is_err());
+        }
+    }
+
+    #[test]
+    fn completed_no_trigger_is_valid_for_either_arm_but_not_failed_or_incomplete() {
+        use crate::judgement_benchmark::Arm;
+        let observation = EvalAttemptJudgementObservation::new(
+            "actual-run".into(),
+            "completed",
+            bcode_model::judgement::ConsumerOperationObservation {
+                operation_id: 0,
+                feature: Feature::EvalCategorization,
+                trigger: TriggerDisposition::NotApplicable,
+                inference: Vec::new(),
+                inference_complete: true,
+                application: Some(ApplicationDisposition::BaselineRetained),
+                selection: None,
+                recommendation: None,
+            },
+        );
+        for arm in [Arm::Off, Arm::On] {
+            assert!(attempt_observable(&observation, arm).is_ok());
+            let mut failed = observation.clone();
+            failed.terminal = Some(ObservationTerminal::Failed);
+            assert!(attempt_observable(&failed, arm).is_err());
+            let mut incomplete = observation.clone();
+            incomplete.complete = false;
+            assert!(attempt_observable(&incomplete, arm).is_err());
+            let mut missing_trace = observation.clone();
+            missing_trace.operation.inference_complete = false;
+            assert!(attempt_observable(&missing_trace, arm).is_err());
+            let mut malformed = observation.clone();
+            malformed.operation.application = Some(ApplicationDisposition::Applied);
+            assert!(attempt_observable(&malformed, arm).is_err());
+            let mut future = observation.clone();
+            future.schema_version += 1;
+            assert!(attempt_observable(&future, arm).is_err());
+        }
+    }
+
+    #[test]
+    fn off_not_applicable_requires_complete_terminal_baseline_without_inference() {
+        use crate::judgement_benchmark::Arm;
+        let observation = EvalAttemptJudgementObservation::new(
+            "actual-run".into(),
+            "completed",
+            bcode_model::judgement::ConsumerOperationObservation {
+                operation_id: 0,
+                feature: Feature::EvalCategorization,
+                trigger: TriggerDisposition::NotApplicable,
+                inference: Vec::new(),
+                inference_complete: true,
+                application: Some(ApplicationDisposition::BaselineRetained),
+                selection: None,
+                recommendation: None,
+            },
+        );
+        assert!(attempt_observable(&observation, Arm::Off).is_ok());
+        let request = serde_json::from_value(serde_json::json!({
+            "preregistration_id": "development", "task_id": "actual-task", "repetition": 0,
+            "feature": "eval_categorization", "arm": "off", "source": "live_consumer",
+            "capture_id": "capture", "pairing_id": "pair", "isolated_feature": null,
+            "subject": {"executable": "/isolated/bcode", "executable_sha256": "a".repeat(64),
+                "artifact_id": "test-artifact", "configuration_sha256": "b".repeat(64),
+                "configuration_complete": false, "provider": null, "model": null,
+                "auth_profile": null, "model_profile": "sol", "state_id": "verified-test-state"},
+            "cache_condition": "unknown", "timeout_ms": 1000
+        }))
+        .unwrap();
+        let mut capture = ConsumerCapture {
+            schema_version: super::super::CAPTURE_SCHEMA_VERSION,
+            scope: CaptureScope::NormalEvalAttempt,
+            request,
+            operation: "test".into(),
+            status: CaptureStatus::ConsumerUnavailable,
+            output: None,
+            consumer_executed: false,
+            outcome: crate::judgement_benchmark::TerminalOutcome::InfrastructureFailure,
+            operation_latency_ms: None,
+            trial_latency_ms: None,
+            authority_preserved: None,
+            request_only: None,
+            telemetry: super::super::CaptureTelemetry::default(),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let rep_dir = root.path().join("attempt");
+        fs::create_dir(&rep_dir).unwrap();
+        let artifacts = vec![bcode_eval_models::EvalArtifactRef {
+            kind: "eval_judgement_observation".into(),
+            path: "eval-judgement-observation.json".into(),
+        }];
+        let write = |name: &str, value: &serde_json::Value| {
+            fs::write(rep_dir.join(name), serde_json::to_vec(value).unwrap()).unwrap();
+        };
+        let completeness =
+            serde_json::json!({"boundaries":{"canonical_attempt":{"complete":true}}});
+        let observation_json = serde_json::to_value(&observation).unwrap();
+        write("capture-completeness.json", &completeness);
+        write("eval-judgement-observation.json", &observation_json);
+        write(
+            "admission.json",
+            &serde_json::json!({"run_id":"actual-run"}),
+        );
+        write("diagnosis.json", &serde_json::json!({}));
+        let initial_capture = capture.clone();
+        let original_subject = capture.request.subject.clone();
+        assert!(load_attempt_artifacts(&rep_dir, root.path(), &artifacts, &mut capture).is_ok());
+        assert_eq!(capture.request.subject, original_subject);
+        // Exercise the same file-loading/correlation path execute calls, without launching a run.
+        for (name, malformed) in [
+            ("capture-completeness.json", serde_json::json!({})),
+            (
+                "admission.json",
+                serde_json::json!({"run_id":"foreign-run"}),
+            ),
+            ("eval-judgement-observation.json", {
+                let mut value = observation_json.clone();
+                value["schema_version"] = serde_json::json!(2);
+                value
+            }),
+            ("eval-judgement-observation.json", {
+                let mut value = observation_json;
+                value["terminal"] = serde_json::json!("future_terminal");
+                value
+            }),
+        ] {
+            let path = rep_dir.join(name);
+            let original = fs::read(&path).unwrap();
+            write(name, &malformed);
+            let mut rejected = initial_capture.clone();
+            assert!(
+                load_attempt_artifacts(&rep_dir, root.path(), &artifacts, &mut rejected).is_err()
+            );
+            assert!(!rejected.consumer_executed);
+            assert_eq!(rejected.request.subject, original_subject);
+            fs::write(path, original).unwrap();
+        }
+        for name in [
+            "capture-completeness.json",
+            "admission.json",
+            "eval-judgement-observation.json",
+            "diagnosis.json",
+        ] {
+            let path = rep_dir.join(name);
+            let original = fs::read(&path).unwrap();
+            fs::remove_file(&path).unwrap();
+            let mut rejected = initial_capture.clone();
+            assert!(
+                load_attempt_artifacts(&rep_dir, root.path(), &artifacts, &mut rejected).is_err()
+            );
+            assert!(!rejected.consumer_executed);
+            fs::write(path, original).unwrap();
+        }
+        assert!(load_attempt_artifacts(&rep_dir, root.path(), &[], &mut capture).is_err());
+        assert!(capture.consumer_executed);
+        assert_eq!(capture.status, CaptureStatus::Captured);
+        assert_eq!(
+            capture.outcome,
+            crate::judgement_benchmark::TerminalOutcome::Succeeded
+        );
+        assert_eq!(capture.request.subject.state_id, "verified-test-state");
+        assert!(matches!(
+            capture.output,
+            Some(crate::judgement_benchmark::ConsumerOutput::Classification { label: None })
+        ));
+        // Either arm can observe a successful baseline without a categorization trigger.
+        // Acceptance preserves that outcome, not proof of optional inference or benefit.
+        assert!(attempt_observable(&observation, Arm::On).is_ok());
+        assert_eq!(
+            observation.operation.trigger,
+            TriggerDisposition::NotApplicable
+        );
+        assert!(observation.operation.inference.is_empty());
+        let mut invalid = observation.clone();
+        invalid.complete = false;
+        assert!(attempt_observable(&invalid, Arm::Off).is_err());
+        invalid = observation.clone();
+        invalid.terminal = None;
+        assert!(attempt_observable(&invalid, Arm::Off).is_err());
+        invalid = observation.clone();
+        invalid.operation.inference_complete = false;
+        assert!(attempt_observable(&invalid, Arm::Off).is_err());
+        invalid = observation.clone();
+        invalid.operation.application = Some(ApplicationDisposition::Applied);
+        assert!(attempt_observable(&invalid, Arm::Off).is_err());
+        invalid = observation.clone();
+        invalid
+            .operation
+            .inference
+            .push(bcode_model::judgement::OptionalOperationObservation {
+                outcome: bcode_model::judgement::OptionalOperationOutcome::Disabled,
+                discovery_invocations: 0,
+                model_listing_invocations: 0,
+                verification_invocations: 0,
+                inference_invocations: 0,
+                ..bcode_model::judgement::OptionalOperationObservation::default()
+            });
+        assert!(attempt_observable(&invalid, Arm::Off).is_err());
+        let mut encoded = serde_json::to_value(&observation).unwrap();
+        encoded["operation"]["trigger"] = serde_json::json!("future_trigger");
+        assert!(serde_json::from_value::<EvalAttemptJudgementObservation>(encoded).is_err());
+        invalid = observation;
+        invalid.schema_version += 1;
+        assert!(attempt_observable(&invalid, Arm::Off).is_err());
     }
 
     #[test]

@@ -109,6 +109,9 @@ bcode_loop_plugin = { workspace = true, features = [
     "static-bundled",
     "test-fixtures",
 ] }
+bcode_pi_session_import_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_prompt_profile_plugin = { workspace = true, features = [
     "static-bundled",
 ] }

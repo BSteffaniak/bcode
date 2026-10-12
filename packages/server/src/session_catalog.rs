@@ -988,7 +988,10 @@ async fn load_source(
     {
         let gate = state.session_catalog.discovery_gate.lock().await.clone();
         if let Some(gate) = gate {
-            gate.acquire().await.expect("discovery gate open").forget();
+            // Release opens discovery for subsequent generations too. Backfill or a
+            // concurrent mutation can invalidate the first load without consuming
+            // the test's only release and stranding its replacement.
+            drop(gate.acquire().await.expect("discovery gate open"));
         }
     }
     match plan {
@@ -1319,6 +1322,7 @@ async fn discover_import_source(
             bcode_session_import::SESSION_IMPORT_INTERFACE_ID,
             bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS,
             &bcode_session_import::DiscoverImportableSessionsRequest {
+                source_id: None,
                 working_directory: Some(working_directory.to_path_buf()),
                 include_diagnostics: false,
             },
@@ -2556,6 +2560,51 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_gate_release_allows_invalidated_generation_to_finish() {
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let directory = std::env::current_dir().unwrap();
+        let expected = state
+            .sessions
+            .create_session(Some("replacement generation".into()), directory.clone())
+            .await
+            .unwrap();
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        *state.session_catalog.discovery_gate.lock().await = Some(gate.clone());
+        state
+            .session_catalog
+            .ensure_source(&state, super::CatalogSourcePlan::InMemory)
+            .await;
+        // Fence the blocked load exactly as a concurrent native mutation does.
+        state
+            .session_catalog
+            .upsert_native_session(expected.clone())
+            .await;
+        state
+            .session_catalog
+            .ensure_source(&state, super::CatalogSourcePlan::InMemory)
+            .await;
+        gate.add_permits(1);
+        let mut revisions = state.session_catalog.subscribe();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                revisions.borrow_and_update();
+                let snapshot = state.session_catalog.snapshot(&state, &directory).await;
+                if snapshot.status == bcode_session_models::SessionCatalogStatus::Loaded {
+                    break snapshot;
+                }
+                revisions.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("one release must unblock replacement discovery too");
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].id, expected.id);
+        drop(state);
+    }
+
     #[tokio::test]
     async fn public_watcher_receives_cold_rows_and_discovery_completion_over_ipc() {
         let root = tempfile::tempdir().unwrap();

@@ -32,7 +32,7 @@ pub struct TurnObservationHandle(
 #[derive(Debug, Clone)]
 pub struct ConsumerOperationHandle {
     turn: TurnObservationHandle,
-    index: Option<usize>,
+    index: Option<u64>,
     pending: std::sync::Arc<std::sync::Mutex<(usize, bool)>>,
 }
 
@@ -68,6 +68,8 @@ impl TurnObservationStore {
                 session_id: session.to_string(),
                 turn_id: turn.into(),
                 operations: vec![],
+                accounting: Some(judgement::OperationAccounting::default()),
+                passive_aggregates: vec![],
                 covered_features: vec![],
                 terminal: None,
                 omitted: 0,
@@ -106,6 +108,51 @@ impl TurnObservationStore {
     }
 }
 
+fn compact_passive_operations(snapshot: &mut judgement::TurnJudgementObservation) {
+    let mut index = 0;
+    while index < snapshot.operations.len() {
+        let op = &snapshot.operations[index];
+        if !matches!(
+            op.trigger,
+            judgement::TriggerDisposition::Disabled | judgement::TriggerDisposition::NotApplicable
+        ) || op.application != Some(judgement::ApplicationDisposition::BaselineRetained)
+            || !op.inference_complete
+            || !op.inference.is_empty()
+            || op.selection.is_some()
+            || op.recommendation.is_some()
+        {
+            index += 1;
+            continue;
+        }
+        if let Some(aggregate) = snapshot
+            .passive_aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.feature == op.feature && aggregate.trigger == op.trigger)
+        {
+            let Some(count) = aggregate.count.checked_add(1) else {
+                snapshot.omitted = snapshot.omitted.saturating_add(1);
+                index += 1;
+                continue;
+            };
+            aggregate.count = count;
+            aggregate.first_operation_id = aggregate.first_operation_id.min(op.operation_id);
+            aggregate.last_operation_id = aggregate.last_operation_id.max(op.operation_id);
+        } else {
+            snapshot
+                .passive_aggregates
+                .push(judgement::PassiveOperationAggregate {
+                    feature: op.feature,
+                    trigger: op.trigger,
+                    application: judgement::ApplicationDisposition::BaselineRetained,
+                    count: 1,
+                    first_operation_id: op.operation_id,
+                    last_operation_id: op.operation_id,
+                });
+        }
+        snapshot.operations.remove(index);
+    }
+}
+
 impl TurnObservationHandle {
     /// Authenticated host correlation for a nested invocation, never current-turn discovery.
     pub fn invocation_scope(&self) -> Option<bcode_plugin::PluginInvocationScope> {
@@ -127,15 +174,26 @@ impl TurnObservationHandle {
             if snapshot.terminal.is_some() {
                 return None;
             }
-            if snapshot.operations.len() >= judgement::MAX_TURN_OPERATIONS {
+            let accounting = snapshot.accounting.as_mut()?;
+            let index = accounting.begun;
+            let Some(next) = accounting.begun.checked_add(1) else {
                 snapshot.omitted = snapshot.omitted.saturating_add(1);
                 return None;
+            };
+            accounting.begun = next;
+            if snapshot.operations.len() >= judgement::MAX_TURN_OPERATIONS {
+                compact_passive_operations(&mut snapshot);
             }
-            let index = snapshot.operations.len();
+            if snapshot.operations.len() >= judgement::MAX_TURN_OPERATIONS {
+                snapshot.omitted = snapshot.omitted.saturating_add(1);
+                let accounting = snapshot.accounting.as_mut()?;
+                accounting.omitted_operations = accounting.omitted_operations.saturating_add(1);
+                return None;
+            }
             snapshot
                 .operations
                 .push(judgement::ConsumerOperationObservation {
-                    operation_id: index as u64,
+                    operation_id: index,
                     feature,
                     trigger,
                     inference: vec![],
@@ -166,12 +224,7 @@ impl TurnObservationHandle {
                     .copied()
                     .take(6)
                     .fold(Vec::new(), |mut result, feature| {
-                        if !result.contains(&feature)
-                            && snapshot
-                                .operations
-                                .iter()
-                                .any(|operation| operation.feature == feature)
-                        {
+                        if !result.contains(&feature) && snapshot.has_feature(feature) {
                             result.push(feature);
                         }
                         result
@@ -196,7 +249,7 @@ impl TurnObservationHandle {
                 && snapshot
                     .covered_features
                     .iter()
-                    .all(|feature| snapshot.operations.iter().any(|op| op.feature == *feature))
+                    .all(|feature| snapshot.has_feature(*feature))
                 && snapshot.operations.iter().all(|op| {
                     op.inference_complete
                         && op.application.is_some()
@@ -209,15 +262,13 @@ impl TurnObservationHandle {
 impl ConsumerOperationHandle {
     /// Record a producer's explicit no-work prerequisite result, only before central work.
     pub fn record_not_applicable(&self) {
-        if !self
-            .pending
-            .lock()
-            .is_ok_and(|pending| pending.0 == 0 && !pending.1)
-        {
-            return;
-        }
         self.update(|op| {
-            if op.trigger == judgement::TriggerDisposition::Triggered
+            let allowed = self
+                .pending
+                .lock()
+                .is_ok_and(|pending| pending.0 == 0 && !pending.1);
+            if allowed
+                && op.trigger == judgement::TriggerDisposition::Triggered
                 && op.inference.is_empty()
                 && op.application.is_none()
             {
@@ -227,48 +278,45 @@ impl ConsumerOperationHandle {
         });
     }
 
-    /// Mark central work as pending before dispatch, including cancellation without a reply.
+    /// Mark central work as pending atomically with the retained operation, before dispatch.
     pub fn inference_started(&self) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.0 = pending.0.saturating_add(1);
-        }
-        self.update(|op| op.inference_complete = false);
+        self.update(|op| {
+            if let Ok(mut pending) = self.pending.lock() {
+                if let Some(count) = pending.0.checked_add(1) {
+                    pending.0 = count;
+                } else {
+                    pending.1 = true;
+                }
+            }
+            op.inference_complete = false;
+        });
     }
 
-    /// Retain normalized facts, never model prose or raw provider requests.
+    /// Retain normalized facts atomically with pending-work and application qualifiers.
     pub fn record_inference(&self, response: &judgement::OptionalResponse) {
-        let complete = self.pending.lock().is_ok_and(|mut pending| {
-            pending.0 = pending.0.saturating_sub(1);
-            pending.1 |= response.observation.is_none();
-            pending.0 == 0 && !pending.1
-        });
-        let Some(observation) = &response.observation else {
-            return;
-        };
-        if serde_json::to_vec(observation).map_or(true, |bytes| {
-            bytes.len() > judgement::MAX_TURN_OBSERVATION_BYTES / 4
-        }) {
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.1 = true;
-            }
-            self.update(|op| op.inference_complete = false);
-            return;
-        }
-        let within_bound = self.turn.0.lock().is_ok_and(|snapshot| {
-            self.index
-                .and_then(|index| snapshot.operations.get(index))
-                .is_some_and(|op| op.inference.len() < 8)
-        });
-        if !within_bound && let Ok(mut pending) = self.pending.lock() {
-            pending.1 = true;
-        }
         self.update(|op| {
-            if op.inference.len() >= 8 {
+            let Ok(mut pending) = self.pending.lock() else {
+                op.inference_complete = false;
+                return;
+            };
+            let unmatched = pending.0 == 0;
+            pending.0 = pending.0.saturating_sub(1);
+            pending.1 |= unmatched || response.observation.is_none();
+            let Some(observation) = &response.observation else {
+                op.inference_complete = false;
+                return;
+            };
+            if op.inference.len() >= 8
+                || serde_json::to_vec(observation).map_or(true, |bytes| {
+                    bytes.len() > judgement::MAX_TURN_OBSERVATION_BYTES / 4
+                })
+            {
+                pending.1 = true;
                 op.inference_complete = false;
                 return;
             }
             op.inference.push(observation.clone());
-            op.inference_complete = complete;
+            op.inference_complete = pending.0 == 0 && !pending.1;
         });
         // If an encoded bound was crossed, discard details and fail closed rather than export
         // an oversized snapshot. Operation/application identities remain retained.
@@ -333,11 +381,16 @@ impl ConsumerOperationHandle {
             if snapshot.terminal.is_some() {
                 return;
             }
-            if let Some(op) = self
-                .index
-                .and_then(|index| snapshot.operations.get_mut(index))
-            {
+            if let Some(op) = self.index.and_then(|index| {
+                snapshot
+                    .operations
+                    .iter_mut()
+                    .find(|op| op.operation_id == index)
+            }) {
                 apply(op);
+            } else if self.index.is_some() {
+                // A late mutation of an already compacted fact cannot silently acquire authority.
+                snapshot.omitted = snapshot.omitted.saturating_add(1);
             }
         }
     }
@@ -365,6 +418,69 @@ pub struct ProgressAdvice {
     drift_probability: f64,
 }
 
+/// Identity of a successful canonical terminal record, not a claim of objective progress.
+#[derive(Debug, Clone, Default)]
+pub enum SettledProgressEvidence {
+    #[default]
+    Unknown,
+    SuccessfulInvocation {
+        session_id: bcode_session_models::SessionId,
+        invocation_id: String,
+        sequence: u64,
+    },
+}
+
+impl SettledProgressEvidence {
+    pub(crate) fn from_persisted_result(
+        session_id: bcode_session_models::SessionId,
+        invocation_id: &str,
+        settlement: bcode_agent_runtime::ToolCallSettlement,
+        event: Option<&bcode_session_models::SessionEvent>,
+    ) -> Self {
+        let Some(event) = event else {
+            return Self::Unknown;
+        };
+        if settlement != bcode_agent_runtime::ToolCallSettlement::Settled
+            || event.schema_version != bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
+            || event.session_id != session_id
+            || event.sequence == 0
+        {
+            return Self::Unknown;
+        }
+        let bcode_session_models::SessionEventKind::ToolInvocationResultRecorded { record } =
+            &event.kind
+        else {
+            return Self::Unknown;
+        };
+        if record.is_error || record.invocation_id != invocation_id || invocation_id.is_empty() {
+            return Self::Unknown;
+        }
+        Self::SuccessfulInvocation {
+            session_id,
+            invocation_id: invocation_id.to_owned(),
+            sequence: event.sequence,
+        }
+    }
+
+    fn key(&self) -> Option<String> {
+        match self {
+            Self::Unknown => None,
+            Self::SuccessfulInvocation {
+                session_id,
+                invocation_id,
+                sequence,
+            } => {
+                use sha2::{Digest as _, Sha256};
+                let identity = serde_json::to_vec(&(session_id, invocation_id, sequence)).ok()?;
+                Some(format!(
+                    "settled-invocation:{}",
+                    hex::encode(Sha256::digest(identity))
+                ))
+            }
+        }
+    }
+}
+
 impl ProgressWindow {
     pub(crate) fn set_objective(&mut self, objective: String) {
         if self.objective != objective {
@@ -380,11 +496,26 @@ impl ProgressWindow {
         action: &str,
         failure_key: Option<String>,
     ) -> Option<serde_json::Value> {
+        self.observe_with_evidence(
+            scope,
+            action,
+            failure_key,
+            &SettledProgressEvidence::Unknown,
+        )
+    }
+
+    pub(crate) fn observe_with_evidence(
+        &mut self,
+        scope: &serde_json::Value,
+        action: &str,
+        failure_key: Option<String>,
+        evidence: &SettledProgressEvidence,
+    ) -> Option<serde_json::Value> {
         if self.objective.is_empty() || action.is_empty() || action.len() > 256 {
             return None;
         }
         if failure_key.is_none() {
-            // A settled success breaks the failure chain without claiming verified evidence.
+            // Preserve the existing success reset; receipt evidence is supplied separately.
             self.observations.clear();
         }
         self.sequence = self.sequence.checked_add(1)?;
@@ -392,12 +523,17 @@ impl ProgressWindow {
         if self.observations.len() == 8 {
             self.observations.pop_front();
         }
+        let evidence_key = failure_key.is_none().then(|| evidence.key()).flatten();
         self.observations.push_back(serde_json::json!({
             "sequence": self.sequence,
             "action": action,
             "failure_key": serde_json::Value::from(failure_key),
-            "evidence_key": null,
-            "summary": "Settled outcome; no verified evidence supplied",
+            "evidence_key": evidence_key,
+            "summary": if evidence_key.is_some() {
+                "Canonical successful invocation settled; objective progress not certified"
+            } else {
+                "Settled outcome; no verified evidence supplied"
+            },
         }));
         let request = serde_json::json!({
             "version": 1, "scope": scope, "objective": self.objective,
@@ -858,6 +994,153 @@ async fn invoke_judgement_model_with_config_observed(
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+
+    fn successful_progress_record(
+        session_id: bcode_session_models::SessionId,
+    ) -> bcode_session_models::SessionEvent {
+        bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 7,
+            timestamp_ms: 0,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "original-call".into(),
+                    model_output: "opaque result".into(),
+                    is_error: false,
+                    content: Vec::new(),
+                    presentation: None,
+                    result: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn canonical_success_evidence_is_stable_and_resets_failure_streak() {
+        let session = bcode_session_models::SessionId::new();
+        let event = successful_progress_record(session);
+        let evidence = SettledProgressEvidence::from_persisted_result(
+            session,
+            "original-call",
+            bcode_agent_runtime::ToolCallSettlement::Settled,
+            Some(&event),
+        );
+        assert!(evidence.key().is_some());
+        assert_eq!(
+            evidence.key(),
+            SettledProgressEvidence::from_persisted_result(
+                session,
+                "original-call",
+                bcode_agent_runtime::ToolCallSettlement::Settled,
+                Some(&event),
+            )
+            .key()
+        );
+        let scope = serde_json::json!({"kind":"session", "id":session});
+        let mut window = ProgressWindow::default();
+        window.set_objective("objective".into());
+        window
+            .observe(&scope, "action", Some("failure".into()))
+            .unwrap();
+        let request = window
+            .observe_with_evidence(&scope, "action", None, &evidence)
+            .unwrap();
+        assert_eq!(request["observations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            request["observations"][0]["evidence_key"],
+            evidence.key().unwrap()
+        );
+        assert!(request["observations"][0]["failure_key"].is_null());
+        assert!(window.advice.is_none());
+        // A repeated delivery retains identity; it cannot invent another evidence key.
+        let repeated = window
+            .observe_with_evidence(&scope, "action", None, &evidence)
+            .unwrap();
+        assert_eq!(
+            repeated["observations"][0]["evidence_key"],
+            request["observations"][0]["evidence_key"]
+        );
+    }
+
+    #[test]
+    fn uncertain_failed_or_mismatched_records_have_no_evidence_authority() {
+        use bcode_agent_runtime::ToolCallSettlement;
+        let session = bcode_session_models::SessionId::new();
+        let event = successful_progress_record(session);
+        for settlement in [
+            ToolCallSettlement::Unresolved,
+            ToolCallSettlement::NeverDispatched,
+        ] {
+            assert!(
+                SettledProgressEvidence::from_persisted_result(
+                    session,
+                    "original-call",
+                    settlement,
+                    Some(&event),
+                )
+                .key()
+                .is_none()
+            );
+        }
+        // A failed append has no canonical receipt to supply.
+        assert!(
+            SettledProgressEvidence::from_persisted_result(
+                session,
+                "original-call",
+                ToolCallSettlement::Settled,
+                None,
+            )
+            .key()
+            .is_none()
+        );
+        for (owner, id) in [
+            (bcode_session_models::SessionId::new(), "original-call"),
+            (session, "wrong-call"),
+        ] {
+            assert!(
+                SettledProgressEvidence::from_persisted_result(
+                    owner,
+                    id,
+                    ToolCallSettlement::Settled,
+                    Some(&event),
+                )
+                .key()
+                .is_none()
+            );
+        }
+        let mut failed = event.clone();
+        let bcode_session_models::SessionEventKind::ToolInvocationResultRecorded { record } =
+            &mut failed.kind
+        else {
+            unreachable!()
+        };
+        record.is_error = true;
+        let mut unsequenced = event;
+        unsequenced.sequence = 0;
+        for invalid in [failed, unsequenced] {
+            let evidence = SettledProgressEvidence::from_persisted_result(
+                session,
+                "original-call",
+                ToolCallSettlement::Settled,
+                Some(&invalid),
+            );
+            let mut window = ProgressWindow::default();
+            window.set_objective("objective".into());
+            let request = window
+                .observe_with_evidence(
+                    &serde_json::json!({"kind":"session", "id":session}),
+                    "action",
+                    None,
+                    &evidence,
+                )
+                .unwrap();
+            assert!(request["observations"][0]["evidence_key"].is_null());
+            assert!(window.advice.is_none());
+        }
+    }
+
     use judgement::{
         ApplicationDisposition as Application, Feature, ObservationTerminal as Terminal,
         TriggerDisposition as Trigger,
@@ -976,6 +1259,180 @@ mod observation_tests {
     }
 
     #[test]
+    fn finalized_passive_operations_aggregate_without_losing_totals_or_handles() {
+        let session = bcode_session_models::SessionId::new();
+        let mut store = TurnObservationStore::default();
+        let turn = store.begin(session, "passive").unwrap();
+        let active = turn.begin_operation(Feature::ToolResultTriage, Trigger::NotApplicable);
+        // Keep this handle unfinished across compaction; its ordinal must remain stable.
+        for feature in ALL.into_iter().cycle().take(200) {
+            turn.begin_operation(feature, Trigger::Disabled)
+                .finish(Application::BaselineRetained, None);
+        }
+        active.finish(Application::BaselineRetained, None);
+        turn.close(Terminal::Completed, &ALL);
+        let snapshot: judgement::TurnJudgementObservation =
+            serde_json::from_str(&store.snapshot_json(session, "passive").unwrap()).unwrap();
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.omitted, 0);
+        assert_eq!(snapshot.accounting.as_ref().unwrap().begun, 201);
+        assert_eq!(snapshot.accounting.as_ref().unwrap().omitted_operations, 0);
+        assert_eq!(
+            snapshot.operations.len() as u64
+                + snapshot
+                    .passive_aggregates
+                    .iter()
+                    .map(|op| op.count)
+                    .sum::<u64>(),
+            201
+        );
+        assert!(snapshot.operations.len() <= judgement::MAX_TURN_OPERATIONS);
+        assert!(snapshot.operations.iter().any(
+            |op| op.operation_id == 0 && op.application == Some(Application::BaselineRetained)
+        ));
+        assert!(
+            snapshot
+                .passive_aggregates
+                .iter()
+                .all(|op| op.application == Application::BaselineRetained)
+        );
+        assert!(snapshot.validate().is_ok());
+        let mut malformed = snapshot;
+        malformed.accounting.as_mut().unwrap().begun += 1;
+        assert!(malformed.validate().is_err());
+    }
+
+    #[test]
+    fn passive_detail_pending_and_late_mutation_cannot_be_certified() {
+        let session = bcode_session_models::SessionId::new();
+        let mut store = TurnObservationStore::default();
+        let turn = store.begin(session, "details").unwrap();
+        for _ in 0..65 {
+            turn.begin_operation(Feature::ContextReranking, Trigger::Disabled)
+                .finish(
+                    Application::BaselineRetained,
+                    Some(judgement::SelectionObservation {
+                        candidate_count: 1,
+                        ordered: vec![0],
+                        admitted: vec![0],
+                    }),
+                );
+        }
+        turn.close(Terminal::Completed, &ALL);
+        let snapshot: judgement::TurnJudgementObservation =
+            serde_json::from_str(&store.snapshot_json(session, "details").unwrap()).unwrap();
+        assert!(snapshot.passive_aggregates.is_empty());
+        assert_eq!(snapshot.omitted, 1);
+        assert_eq!(snapshot.accounting.unwrap().omitted_operations, 1);
+        assert!(!snapshot.complete);
+        let turn = store.begin(session, "pending-passive").unwrap();
+        for _ in 0..65 {
+            let operation =
+                turn.begin_operation(Feature::ProgressMonitoring, Trigger::NotApplicable);
+            operation.inference_started();
+            operation.finish(Application::BaselineRetained, None);
+        }
+        turn.close(Terminal::Completed, &ALL);
+        let snapshot: judgement::TurnJudgementObservation =
+            serde_json::from_str(&store.snapshot_json(session, "pending-passive").unwrap())
+                .unwrap();
+        assert!(snapshot.passive_aggregates.is_empty());
+        assert_eq!(snapshot.omitted, 1);
+        assert!(!snapshot.complete);
+        let turn = store.begin(session, "late").unwrap();
+        let early = turn.begin_operation(Feature::ProgressMonitoring, Trigger::Disabled);
+        early.finish(Application::BaselineRetained, None);
+        for feature in ALL.into_iter().cycle().take(65) {
+            turn.begin_operation(feature, Trigger::Disabled)
+                .finish(Application::BaselineRetained, None);
+        }
+        early.inference_started();
+        turn.close(Terminal::Completed, &ALL);
+        let snapshot: judgement::TurnJudgementObservation =
+            serde_json::from_str(&store.snapshot_json(session, "late").unwrap()).unwrap();
+        assert!(!snapshot.complete);
+        assert!(snapshot.omitted > 0);
+    }
+
+    #[test]
+    fn racing_finalization_and_inference_cannot_certify_passive_work() {
+        let session = bcode_session_models::SessionId::new();
+        let mut store = TurnObservationStore::default();
+        let turn = store.begin(session, "race").unwrap();
+        let operation = turn.begin_operation(Feature::ProgressMonitoring, Trigger::NotApplicable);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let pending = operation.clone();
+            let start = barrier.clone();
+            scope.spawn(move || {
+                start.wait();
+                pending.inference_started();
+            });
+            barrier.wait();
+            operation.finish(Application::BaselineRetained, None);
+            for feature in ALL.into_iter().cycle().take(100) {
+                turn.begin_operation(feature, Trigger::Disabled)
+                    .finish(Application::BaselineRetained, None);
+            }
+        });
+        turn.close(Terminal::Completed, &ALL);
+        let snapshot: judgement::TurnJudgementObservation =
+            serde_json::from_str(&store.snapshot_json(session, "race").unwrap()).unwrap();
+        assert!(!snapshot.complete);
+        // If start won the lock it remains pending; if compaction won, late start marks omitted.
+        assert!(
+            snapshot.omitted > 0
+                || snapshot
+                    .operations
+                    .iter()
+                    .any(|op| op.operation_id == 0 && !op.inference_complete)
+        );
+    }
+
+    #[test]
+    fn dropped_unfinished_handles_and_interleaved_detail_remain_truthful() {
+        let session = bcode_session_models::SessionId::new();
+        let mut store = TurnObservationStore::default();
+        let turn = store.begin(session, "interleaved").unwrap();
+        let dropped = turn.begin_operation(Feature::ProgressMonitoring, Trigger::Disabled);
+        drop(dropped);
+        for ordinal in 0..100 {
+            let operation = turn.begin_operation(Feature::ContextReranking, Trigger::Disabled);
+            let selection = (ordinal % 10 == 0).then(|| judgement::SelectionObservation {
+                candidate_count: 1,
+                ordered: vec![0],
+                admitted: vec![0],
+            });
+            operation.finish(Application::BaselineRetained, selection);
+        }
+        turn.close(Terminal::Completed, &ALL);
+        let snapshot: judgement::TurnJudgementObservation =
+            serde_json::from_str(&store.snapshot_json(session, "interleaved").unwrap()).unwrap();
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.omitted, 0);
+        assert_eq!(
+            snapshot
+                .operations
+                .iter()
+                .filter(|op| op.selection.is_some())
+                .count(),
+            10
+        );
+        assert_eq!(
+            snapshot.operations.len() as u64
+                + snapshot
+                    .passive_aggregates
+                    .iter()
+                    .map(|op| op.count)
+                    .sum::<u64>(),
+            101
+        );
+        assert!(snapshot.validate().is_ok());
+        let aggregate = &snapshot.passive_aggregates[0];
+        assert!(aggregate.count < aggregate.last_operation_id - aggregate.first_operation_id + 1);
+    }
+
+    #[test]
     fn cancellation_overflow_and_missing_inference_fail_closed() {
         let session = bcode_session_models::SessionId::new();
         let mut store = TurnObservationStore::default();
@@ -994,7 +1451,7 @@ mod observation_tests {
         assert!(snapshot.operations[0].inference.is_empty());
         let turn = store.begin(session, "overflow").unwrap();
         for _ in 0..65 {
-            turn.begin_operation(Feature::ToolResultTriage, Trigger::NotApplicable)
+            turn.begin_operation(Feature::ToolResultTriage, Trigger::Triggered)
                 .finish(Application::BaselineRetained, None);
         }
         turn.close(Terminal::Completed, &ALL);

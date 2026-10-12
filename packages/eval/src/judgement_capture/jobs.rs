@@ -108,3 +108,77 @@ pub fn compare_capture_job(bytes: &[u8]) -> Result<CaptureComparison, String> {
         raw_scores,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::decode_capture_job;
+
+    #[test]
+    fn normal_turn_capture_decodes_boolean_isolation_not_feature_name() {
+        let mut input = serde_json::json!({
+            "schema_version": 1,
+            "allow_live": true,
+            "request": {
+                "preregistration_id": "synthetic-pair",
+                "task_id": "synthetic-task",
+                "repetition": 0,
+                "feature": "context_reranking",
+                "arm": "off",
+                "source": "live_consumer",
+                "capture_id": "synthetic-off",
+                "pairing_id": "synthetic-pair",
+                "isolated_feature": "context_reranking",
+                "subject": {
+                    "executable": "/synthetic/bcode",
+                    "executable_sha256": "0".repeat(64),
+                    "artifact_id": "synthetic-artifact",
+                    "configuration_sha256": "unknown",
+                    "configuration_complete": false,
+                    "provider": "synthetic-provider",
+                    "model": "synthetic-model",
+                    "auth_profile": "synthetic-account",
+                    "model_profile": "synthetic-profile",
+                    "state_id": "synthetic-state"
+                },
+                "cache_condition": "unknown",
+                "timeout_ms": 240_000
+            },
+            "consumer": {
+                "kind": "normal_turn",
+                "request": {
+                    "session_id": "00000000-0000-4000-8000-000000000001",
+                    "prompt": "Implement a pure numeric function in solution.py.",
+                    "admission": {"execution": {
+                        "schema_version": bcode_session_models::TURN_EXECUTION_OPTIONS_SCHEMA_VERSION,
+                        "permission_mode": "enforce",
+                        "allow_user_questions": false,
+                        "agent_profile": "build",
+                        "provider_plugin_id": "synthetic-provider",
+                        "model_id": "synthetic-model",
+                        "tool_allowlist": ["filesystem.read", "filesystem.write"],
+                        "historical_context": [{
+                            "session_id": "00000000-0000-4000-8000-000000000001",
+                            "sequence": 2
+                        }]
+                    }},
+                    "max_events": 1200,
+                    "categorization_dimension": "task"
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&input).unwrap();
+        assert_eq!(
+            decode_capture_job(&bytes).unwrap_err(),
+            "invalid capture job"
+        );
+        input["request"]["isolated_feature"] = serde_json::json!(true);
+        let job = decode_capture_job(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(job.request.isolated_feature, Some(true));
+        let super::ConsumerRequest::NormalTurn { request } = job.consumer else {
+            panic!("expected normal-turn input");
+        };
+        request.admission.validate().unwrap();
+        assert_eq!(request.max_events, 1200);
+        assert_eq!(request.admission.execution.historical_context.len(), 1);
+    }
+}

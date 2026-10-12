@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use switchy::time::instant_now;
@@ -1119,6 +1119,7 @@ pub struct InvocationScope {
     turn: TurnScope,
     invocation_id: Arc<str>,
     exchange_ids: Arc<Mutex<BTreeSet<String>>>,
+    settlement_unresolved: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for InvocationScope {
@@ -1127,6 +1128,7 @@ impl fmt::Debug for InvocationScope {
             .debug_struct("InvocationScope")
             .field("invocation_id", &self.invocation_id)
             .field("turn", &self.turn)
+            .field("settlement_unresolved", &self.settlement_unresolved())
             .field(
                 "submitted_exchange_ids",
                 &self
@@ -1147,7 +1149,20 @@ impl InvocationScope {
             turn,
             invocation_id: invocation_id.into(),
             exchange_ids: Arc::new(Mutex::new(BTreeSet::new())),
+            settlement_unresolved: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Record that a nested executor returned without proving physical settlement.
+    /// This is monotonic and cannot be cleared by a later presentation result.
+    pub fn mark_settlement_unresolved(&self) {
+        self.settlement_unresolved.store(true, Ordering::Release);
+    }
+
+    /// Return whether a nested executor reported unresolved physical effects.
+    #[must_use]
+    pub fn settlement_unresolved(&self) -> bool {
+        self.settlement_unresolved.load(Ordering::Acquire)
     }
 
     /// Return the invocation identifier.

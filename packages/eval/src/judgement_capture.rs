@@ -192,6 +192,10 @@ pub struct CaptureTelemetry {
     /// All normalized optional operations, including every trajectory prefix.
     #[serde(default)]
     pub optional_operations: Vec<bcode_model::judgement::OptionalOperationObservation>,
+    /// V2 exact bounded producer envelope when passive operations were aggregated.
+    /// Retains totals, qualifiers and authenticated session/turn correlation, not guessed counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregated_turn_observation: Option<bcode_model::judgement::TurnJudgementObservation>,
     /// Bounded call ledger; absence does not mean zero calls.
     pub calls: Vec<CallMeasurement>,
 }
@@ -319,6 +323,9 @@ impl CaptureTelemetry {
             return Err(());
         }
         observation.validate().map_err(|_| ())?;
+        if !observation.passive_aggregates.is_empty() {
+            self.aggregated_turn_observation = Some(observation.clone());
+        }
         for operation in &observation.operations {
             for inference in &operation.inference {
                 if let Some(projection) = &inference.decision {

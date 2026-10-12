@@ -1,4 +1,9 @@
 //! Session import orchestration for the local server.
+//!
+//! The public `CallPluginService` application handler delegates the import interface here.
+//! This domain aggregates advertised sources and enforces resolved import policy; generic
+//! plugin-host interface routing still requires a unique provider. Provider adapters own
+//! locator confinement and format conversion. Portable import contracts contain only data.
 
 use crate::{ErrorResponse, ServerError, ServerState, SharedWriter, send_response};
 use bcode_ipc::{Response, ResponsePayload};
@@ -639,6 +644,12 @@ pub async fn import_external_session(
 ) -> Result<(SessionId, Vec<bcode_session_import::ImportWarning>), String> {
     let config_paths = bcode_config::default_config_paths_from(fallback_working_directory);
     require_import_enabled(bcode_config::load_config_from_paths(&config_paths))?;
+    let routes = import_source_routes(state)
+        .await
+        .map_err(|error| error.code.to_owned())?;
+    let (plugin_id, _) = routes
+        .get(source_id)
+        .ok_or_else(|| "unknown_import_source".to_owned())?;
     if let Some(existing) = all_cached_sessions(state)
         .await
         .into_iter()
@@ -650,82 +661,81 @@ pub async fn import_external_session(
     {
         return Ok((existing.id, Vec::new()));
     }
-    let providers = state
+    let discovery = state
         .plugins
-        .registry()
-        .service_registry()
-        .providers_for(SESSION_IMPORT_INTERFACE_ID)
-        .cloned()
-        .ok_or_else(|| "no session import providers are loaded".to_string())?;
-    for plugin_id in providers {
-        let discovery = state
-            .plugins
-            .invoke_service_json::<_, DiscoverImportableSessionsResponse>(
-                &plugin_id,
-                SESSION_IMPORT_INTERFACE_ID,
-                OP_DISCOVER_IMPORTABLE_SESSIONS,
-                &DiscoverImportableSessionsRequest::default(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(summary) = discovery.sessions.into_iter().find(|summary| {
-            summary.status == bcode_session_import::ImportableSessionStatus::Available
-                && summary.source_id == source_id
-                && summary.external_session_id == external_session_id
-        }) else {
-            continue;
-        };
-        let importable = state
-            .plugins
-            .invoke_service_json::<_, bcode_session_import::ImportableSession>(
-                &plugin_id,
-                SESSION_IMPORT_INTERFACE_ID,
-                OP_LOAD_IMPORTABLE_SESSION,
-                &LoadImportableSessionRequest {
-                    source_id: summary.source_id.clone(),
-                    external_session_id: summary.external_session_id.clone(),
-                    locator: summary.locator.clone(),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let name = importable
-            .summary
-            .title
-            .clone()
-            .or_else(|| Some(importable.summary.external_session_id.clone()));
-        let working_directory = importable
-            .summary
-            .working_directory
-            .clone()
-            .unwrap_or_else(|| fallback_working_directory.to_path_buf());
-        let events = importable
-            .events
-            .into_iter()
-            .scan(0_u64, |compacted_through_sequence, event| {
-                let provenance = import_event_provenance(&event, &importable.summary.locator);
-                let kind = imported_session_event_kind(event.kind, compacted_through_sequence);
-                Some((kind, provenance))
-            })
-            .collect();
-        let session = state
-            .sessions
-            .import_session(
-                name,
-                working_directory,
-                SessionImportSummary {
-                    source_id: importable.summary.source_id,
-                    source_display_name: importable.summary.source_display_name,
-                    external_session_id: importable.summary.external_session_id,
-                    imported_at_ms: current_unix_millis(),
-                },
-                events,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        return Ok((session.id, importable.warnings));
+        .invoke_service_json::<_, DiscoverImportableSessionsResponse>(
+            plugin_id,
+            SESSION_IMPORT_INTERFACE_ID,
+            OP_DISCOVER_IMPORTABLE_SESSIONS,
+            &DiscoverImportableSessionsRequest {
+                source_id: Some(source_id.to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(summary) = discovery.sessions.into_iter().find(|summary| {
+        summary.status == bcode_session_import::ImportableSessionStatus::Available
+            && summary.source_id == source_id
+            && summary.external_session_id == external_session_id
+    }) else {
+        return Err("external session not found".to_owned());
+    };
+    let importable = state
+        .plugins
+        .invoke_service_json::<_, bcode_session_import::ImportableSession>(
+            plugin_id,
+            SESSION_IMPORT_INTERFACE_ID,
+            OP_LOAD_IMPORTABLE_SESSION,
+            &LoadImportableSessionRequest {
+                source_id: summary.source_id.clone(),
+                external_session_id: summary.external_session_id.clone(),
+                locator: summary.locator.clone(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if importable.summary.source_id != source_id
+        || importable.summary.external_session_id != external_session_id
+        || importable.summary.locator != summary.locator
+    {
+        return Err("session_import_invalid_source".to_owned());
     }
-    Err("external session not found".to_string())
+    let name = importable
+        .summary
+        .title
+        .clone()
+        .or_else(|| Some(importable.summary.external_session_id.clone()));
+    let working_directory = importable
+        .summary
+        .working_directory
+        .clone()
+        .unwrap_or_else(|| fallback_working_directory.to_path_buf());
+    let events = importable
+        .events
+        .into_iter()
+        .scan(0_u64, |compacted_through_sequence, event| {
+            let provenance = import_event_provenance(&event, &importable.summary.locator);
+            let kind = imported_session_event_kind(event.kind, compacted_through_sequence);
+            Some((kind, provenance))
+        })
+        .collect();
+    let session = state
+        .sessions
+        .import_session(
+            name,
+            working_directory,
+            SessionImportSummary {
+                source_id: importable.summary.source_id,
+                source_display_name: importable.summary.source_display_name,
+                external_session_id: importable.summary.external_session_id,
+                imported_at_ms: current_unix_millis(),
+            },
+            events,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((session.id, importable.warnings))
 }
 
 fn import_event_provenance(
@@ -751,6 +761,272 @@ fn require_import_enabled(
     Ok(())
 }
 
+const fn import_service_error(
+    code: &'static str,
+    message: &'static str,
+) -> super::plugin_operations::PublicPluginError {
+    super::plugin_operations::PublicPluginError { code, message }
+}
+
+type ImportSourceRoutes =
+    std::collections::BTreeMap<String, (String, bcode_session_import::ImportSourceInfo)>;
+
+fn validate_import_service_request(
+    operation: &str,
+    payload: &[u8],
+) -> Result<Option<DiscoverImportableSessionsRequest>, super::plugin_operations::PublicPluginError>
+{
+    let invalid = || import_service_error("invalid_request", "invalid session import request");
+    if payload.len() > 256 * 1024 {
+        return Err(invalid());
+    }
+    match operation {
+        bcode_session_import::OP_LIST_IMPORT_SOURCES => {
+            if !payload.is_empty() && serde_json::from_slice::<Option<()>>(payload).is_err() {
+                return Err(invalid());
+            }
+            Ok(None)
+        }
+        OP_DISCOVER_IMPORTABLE_SESSIONS => {
+            let request: DiscoverImportableSessionsRequest = if payload.is_empty() {
+                DiscoverImportableSessionsRequest::default()
+            } else {
+                serde_json::from_slice(payload).map_err(|_| invalid())?
+            };
+            if request.source_id.as_ref().is_some_and(|source| {
+                source.is_empty() || source.len() > 256 || source.chars().any(char::is_control)
+            }) {
+                return Err(invalid());
+            }
+            Ok(Some(request))
+        }
+        OP_LOAD_IMPORTABLE_SESSION => {
+            let request: LoadImportableSessionRequest =
+                serde_json::from_slice(payload).map_err(|_| invalid())?;
+            if request.source_id.is_empty()
+                || request.external_session_id.is_empty()
+                || request.locator.is_empty()
+            {
+                return Err(invalid());
+            }
+            Ok(None)
+        }
+        _ => Err(import_service_error(
+            "unsupported_operation",
+            "unsupported aggregated session import operation",
+        )),
+    }
+}
+
+fn configured_import_source_enabled(
+    policy: &bcode_config::SessionImportConfig,
+    source: &str,
+) -> bool {
+    policy.enabled
+        && match source {
+            "pi" => policy.pi.enabled,
+            "opencode" => policy.opencode.enabled,
+            _ => true,
+        }
+}
+
+async fn import_source_routes(
+    state: &ServerState,
+) -> Result<ImportSourceRoutes, super::plugin_operations::PublicPluginError> {
+    let config = &state.startup_config;
+    let mut routes = std::collections::BTreeMap::new();
+    if !config.session_import.enabled {
+        return Ok(routes);
+    }
+    let providers = state
+        .plugins
+        .registry()
+        .service_registry()
+        .providers_for(SESSION_IMPORT_INTERFACE_ID)
+        .cloned()
+        .unwrap_or_default();
+    for plugin_id in providers {
+        let response: bcode_session_import::ListImportSourcesResponse = state
+            .plugins
+            .invoke_service_json(
+                &plugin_id,
+                SESSION_IMPORT_INTERFACE_ID,
+                bcode_session_import::OP_LIST_IMPORT_SOURCES,
+                &(),
+            )
+            .await
+            .map_err(|_| {
+                import_service_error(
+                    "session_import_unavailable",
+                    "session import source discovery failed",
+                )
+            })?;
+        for source in response.sources {
+            if !configured_import_source_enabled(&config.session_import, &source.source_id) {
+                continue;
+            }
+            if routes.len() >= 256 {
+                return Err(import_service_error(
+                    "session_import_response_limit",
+                    "session import source response exceeds the public response budget",
+                ));
+            }
+            if source.source_id.is_empty()
+                || routes
+                    .insert(source.source_id.clone(), (plugin_id.clone(), source))
+                    .is_some()
+            {
+                return Err(import_service_error(
+                    "session_import_ambiguous_source",
+                    "session import source ownership is invalid or ambiguous",
+                ));
+            }
+        }
+    }
+    Ok(routes)
+}
+
+/// Import-owned aggregation over advertised source identities; generic plugin routing is unchanged.
+///
+/// # Errors
+/// Rejects unknown operations, malformed requests, unavailable or ambiguous source ownership.
+pub async fn call_import_service(
+    state: &ServerState,
+    operation: &str,
+    payload: &[u8],
+) -> Result<
+    super::plugin_operations::PluginServiceOperationResult,
+    super::plugin_operations::PublicPluginError,
+> {
+    use bcode_session_import::{ListImportSourcesResponse, OP_LIST_IMPORT_SOURCES};
+    let discovery_request = validate_import_service_request(operation, payload)?;
+    let routes = import_source_routes(state).await?;
+    let response = match operation {
+        OP_LIST_IMPORT_SOURCES => serde_json::to_vec(&ListImportSourcesResponse {
+            sources: routes.into_values().map(|(_, source)| source).collect(),
+        }),
+        OP_DISCOVER_IMPORTABLE_SESSIONS => {
+            let request = discovery_request.expect("validated discovery request");
+            let selected = if let Some(source_id) = &request.source_id {
+                let (plugin_id, _) = routes.get(source_id).ok_or_else(|| {
+                    import_service_error(
+                        "unknown_import_source",
+                        "session import source is unknown or disabled",
+                    )
+                })?;
+                std::collections::BTreeSet::from([plugin_id.clone()])
+            } else {
+                routes
+                    .values()
+                    .map(|(plugin_id, _)| plugin_id.clone())
+                    .collect()
+            };
+            let mut sessions = Vec::new();
+            for plugin_id in selected {
+                let discovery: DiscoverImportableSessionsResponse = state
+                    .plugins
+                    .invoke_service_json(
+                        &plugin_id,
+                        SESSION_IMPORT_INTERFACE_ID,
+                        OP_DISCOVER_IMPORTABLE_SESSIONS,
+                        &request,
+                    )
+                    .await
+                    .map_err(|_| {
+                        import_service_error(
+                            "session_import_unavailable",
+                            "session import discovery failed",
+                        )
+                    })?;
+                for session in discovery.sessions {
+                    if routes
+                        .get(&session.source_id)
+                        .is_none_or(|(owner, _)| owner != &plugin_id)
+                    {
+                        return Err(import_service_error(
+                            "session_import_invalid_source",
+                            "provider returned an unowned import source",
+                        ));
+                    }
+                    if request
+                        .source_id
+                        .as_ref()
+                        .is_none_or(|source| source == &session.source_id)
+                    {
+                        if sessions.len() >= 1024 {
+                            return Err(import_service_error(
+                                "session_import_response_limit",
+                                "aggregated session import discovery exceeds the public response budget",
+                            ));
+                        }
+                        sessions.push(session);
+                    }
+                }
+            }
+            serde_json::to_vec(&DiscoverImportableSessionsResponse { sessions })
+        }
+        OP_LOAD_IMPORTABLE_SESSION => return load_source_service(state, &routes, payload).await,
+        _ => {
+            return Err(import_service_error(
+                "unsupported_operation",
+                "unsupported aggregated session import operation",
+            ));
+        }
+    };
+    encode_import_service_response(response)
+}
+
+fn encode_import_service_response(
+    response: Result<Vec<u8>, serde_json::Error>,
+) -> Result<
+    super::plugin_operations::PluginServiceOperationResult,
+    super::plugin_operations::PublicPluginError,
+> {
+    let response = response.map_err(|_| {
+        import_service_error(
+            "session_import_invalid_response",
+            "session import response could not be encoded",
+        )
+    })?;
+    if response.len() > 256 * 1024 {
+        return Err(import_service_error(
+            "session_import_response_limit",
+            "aggregated session import response exceeds the public response budget",
+        ));
+    }
+    Ok(super::plugin_operations::PluginServiceOperationResult {
+        payload: response,
+        error: None,
+    })
+}
+
+async fn load_source_service(
+    state: &ServerState,
+    routes: &ImportSourceRoutes,
+    payload: &[u8],
+) -> Result<
+    super::plugin_operations::PluginServiceOperationResult,
+    super::plugin_operations::PublicPluginError,
+> {
+    let request: LoadImportableSessionRequest = serde_json::from_slice(payload).map_err(|_| {
+        import_service_error("invalid_request", "invalid session import load request")
+    })?;
+    let (plugin_id, _) = routes.get(&request.source_id).ok_or_else(|| {
+        import_service_error(
+            "unknown_import_source",
+            "session import source is unknown or disabled",
+        )
+    })?;
+    super::plugin_operations::invoke_service(
+        state,
+        plugin_id,
+        SESSION_IMPORT_INTERFACE_ID,
+        OP_LOAD_IMPORTABLE_SESSION.to_owned(),
+        payload.to_vec(),
+    )
+    .await
+}
+
 fn import_error_response(error: &str) -> ErrorResponse {
     let (code, message) = match error {
         "session import configuration is unavailable" => (
@@ -761,6 +1037,18 @@ fn import_error_response(error: &str) -> ErrorResponse {
         "no session import providers are loaded" => (
             "session_import_unavailable",
             "session import provider is unavailable",
+        ),
+        "unknown_import_source" => (
+            "unknown_import_source",
+            "session import source is unknown or disabled",
+        ),
+        "session_import_ambiguous_source" => (
+            "session_import_ambiguous_source",
+            "session import source ownership is ambiguous",
+        ),
+        "session_import_unavailable" => (
+            "session_import_unavailable",
+            "session import source discovery failed",
         ),
         "external session not found" => (
             "external_session_not_found",
@@ -921,6 +1209,473 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_source_selection_is_additive_and_legacy_requests_aggregate() {
+        #[derive(serde::Deserialize)]
+        struct LegacyDiscoveryRequest {
+            #[serde(default)]
+            working_directory: Option<std::path::PathBuf>,
+            #[serde(default)]
+            include_diagnostics: bool,
+        }
+        use bcode_session_import::DiscoverImportableSessionsRequest;
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"source_id": null}),
+        ] {
+            let request: DiscoverImportableSessionsRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(request.source_id, None);
+            assert!(
+                serde_json::to_value(request)
+                    .unwrap()
+                    .get("source_id")
+                    .is_none()
+            );
+        }
+        let request = DiscoverImportableSessionsRequest {
+            source_id: Some("pi".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["source_id"], "pi");
+        assert_eq!(
+            serde_json::from_value::<DiscoverImportableSessionsRequest>(value.clone()).unwrap(),
+            request
+        );
+        let legacy: LegacyDiscoveryRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.working_directory, None);
+        assert!(!legacy.include_diagnostics);
+        assert!(
+            serde_json::from_value::<DiscoverImportableSessionsRequest>(
+                serde_json::json!({"source_id":42})
+            )
+            .is_err()
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_disabled_pi_is_excluded_with_real_provider_loaded() {
+        let pi = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
+            bcode_pi_session_import_plugin::static_plugin(),
+        );
+        let mut state = fixture_import_state(
+            &[pi],
+            std::collections::BTreeSet::from(["bcode.pi-session-import".into()]),
+        );
+        // Pi still advertises its source. The import application applies resolved policy.
+        let advertised: bcode_session_import::ListImportSourcesResponse = state
+            .plugins
+            .invoke_service_json(
+                "bcode.pi-session-import",
+                bcode_session_import::SESSION_IMPORT_INTERFACE_ID,
+                bcode_session_import::OP_LIST_IMPORT_SOURCES,
+                &(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            advertised
+                .sources
+                .iter()
+                .any(|source| source.source_id == "pi")
+        );
+        state.startup_config.session_import.pi.enabled = false;
+        let response =
+            super::call_import_service(&state, bcode_session_import::OP_LIST_IMPORT_SOURCES, &[])
+                .await
+                .unwrap();
+        let sources: bcode_session_import::ListImportSourcesResponse =
+            serde_json::from_slice(&response.payload).unwrap();
+        assert!(sources.sources.is_empty());
+        let response = super::call_import_service(
+            &state,
+            bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS,
+            &[],
+        )
+        .await
+        .unwrap();
+        let discovery: bcode_session_import::DiscoverImportableSessionsResponse =
+            serde_json::from_slice(&response.payload).unwrap();
+        assert!(discovery.sessions.is_empty());
+        for (operation, payload) in [
+            (
+                bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS,
+                br#"{"source_id":"pi"}"#.as_slice(),
+            ),
+            (
+                bcode_session_import::OP_LOAD_IMPORTABLE_SESSION,
+                br#"{"source_id":"pi","external_session_id":"fixture","locator":"fixture"}"#
+                    .as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                super::call_import_service(&state, operation, payload)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "unknown_import_source"
+            );
+        }
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    static IMPORT_FIXTURE_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct CountingImportFixture;
+
+    #[cfg(unix)]
+    impl bcode_plugin_sdk::RustPlugin for CountingImportFixture {
+        fn invoke_service(
+            &mut self,
+            _: bcode_plugin_sdk::NativeServiceContext,
+        ) -> bcode_plugin_sdk::ServiceResponse {
+            IMPORT_FIXTURE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bcode_plugin_sdk::ServiceResponse::error(
+                "unexpected_call",
+                "must not enumerate invalid requests",
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_import_requests_do_not_enumerate_providers() {
+        let bundle = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
+            bcode_plugin_sdk::static_plugin_vtable!(
+                CountingImportFixture,
+                include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml")
+            ),
+        );
+        let state = fixture_import_state(
+            &[bundle],
+            std::collections::BTreeSet::from(["bcode.pi-session-import".into()]),
+        );
+        IMPORT_FIXTURE_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        for (operation, payload, code) in [
+            ("future_operation", b"".as_slice(), "unsupported_operation"),
+            (
+                bcode_session_import::OP_LIST_IMPORT_SOURCES,
+                b"{".as_slice(),
+                "invalid_request",
+            ),
+            (
+                bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS,
+                b"{".as_slice(),
+                "invalid_request",
+            ),
+            (
+                bcode_session_import::OP_LOAD_IMPORTABLE_SESSION,
+                b"{}".as_slice(),
+                "invalid_request",
+            ),
+        ] {
+            assert_eq!(
+                super::call_import_service(&state, operation, payload)
+                    .await
+                    .unwrap_err()
+                    .code,
+                code
+            );
+        }
+        assert_eq!(
+            IMPORT_FIXTURE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    fn fixture_import_summary(source: &str) -> bcode_session_import::ImportableSessionSummary {
+        bcode_session_import::ImportableSessionSummary {
+            source_id: source.into(),
+            source_display_name: source.into(),
+            external_session_id: "fixture".into(),
+            locator: "fixture-locator".into(),
+            title: None,
+            working_directory: None,
+            created_at_ms: None,
+            updated_at_ms: None,
+            message_count: None,
+            status: bcode_session_import::ImportableSessionStatus::Available,
+            warnings: vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct ImportFixture<const PI: bool, const MODE: u8 = 0>;
+
+    #[cfg(unix)]
+    impl<const PI: bool, const MODE: u8> bcode_plugin_sdk::RustPlugin for ImportFixture<PI, MODE> {
+        fn invoke_service(
+            &mut self,
+            context: bcode_plugin_sdk::NativeServiceContext,
+        ) -> bcode_plugin_sdk::ServiceResponse {
+            use bcode_session_import::{
+                DiscoverImportableSessionsResponse, ImportSourceInfo, ListImportSourcesResponse,
+            };
+            if MODE == 2 {
+                let mut response = bcode_plugin_sdk::ServiceResponse::json(&serde_json::json!({
+                    "sources": [{"source_id":"pi", "display_name":"misleading success"}],
+                    "sessions": []
+                }))
+                .unwrap();
+                response.error = bcode_plugin_sdk::ServiceResponse::error(
+                    "fixture_failure",
+                    "private-fixture-secret",
+                )
+                .error;
+                return response;
+            }
+            let value = match context.request.operation.as_str() {
+                bcode_session_import::OP_LIST_IMPORT_SOURCES => {
+                    serde_json::to_value(ListImportSourcesResponse {
+                        sources: vec![ImportSourceInfo {
+                            source_id: if PI || MODE == 1 { "pi" } else { "opencode" }.into(),
+                            display_name: "fixture".into(),
+                            description: None,
+                        }],
+                    })
+                }
+                bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS => {
+                    serde_json::to_value(DiscoverImportableSessionsResponse {
+                        sessions: vec![fixture_import_summary(if PI { "pi" } else { "opencode" })],
+                    })
+                }
+                bcode_session_import::OP_LOAD_IMPORTABLE_SESSION => {
+                    serde_json::to_value(bcode_session_import::ImportableSession {
+                        summary: fixture_import_summary(if PI { "pi" } else { "opencode" }),
+                        events: vec![],
+                        warnings: vec![],
+                    })
+                }
+                _ => {
+                    return bcode_plugin_sdk::ServiceResponse::error(
+                        "unsupported_operation",
+                        "unsupported fixture operation",
+                    );
+                }
+            }
+            .unwrap();
+            bcode_plugin_sdk::ServiceResponse::json(&value).unwrap()
+        }
+    }
+
+    #[cfg(unix)]
+    fn fixture_import_state(
+        bundles: &[bcode_plugin::StaticBundledPlugin],
+        enabled: std::collections::BTreeSet<String>,
+    ) -> crate::ServerState {
+        crate::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::default(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled,
+                    disabled: std::collections::BTreeSet::new(),
+                },
+                bundles,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_source_ambiguity_and_error_envelopes_fail_closed() {
+        const PI_MANIFEST: &str =
+            include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml");
+        const OPENCODE_MANIFEST: &str =
+            include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml");
+        let pi = bcode_plugin::StaticBundledPlugin::new(
+            PI_MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(ImportFixture<true, 1>, PI_MANIFEST),
+        );
+        let duplicate = bcode_plugin::StaticBundledPlugin::new(
+            OPENCODE_MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(ImportFixture<false, 1>, OPENCODE_MANIFEST),
+        );
+        let error = bcode_plugin::StaticBundledPlugin::new(
+            OPENCODE_MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(ImportFixture<false, 2>, OPENCODE_MANIFEST),
+        );
+        for (provider, expected) in [
+            (duplicate, "session_import_ambiguous_source"),
+            (error, "session_import_unavailable"),
+        ] {
+            let state = fixture_import_state(
+                &[pi, provider],
+                std::collections::BTreeSet::from([
+                    "bcode.pi-session-import".into(),
+                    "bcode.opencode-session-import".into(),
+                ]),
+            );
+            for (operation, payload) in [
+                (bcode_session_import::OP_LIST_IMPORT_SOURCES, vec![]),
+                (bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS, br#"{"source_id":"pi"}"#.to_vec()),
+                (bcode_session_import::OP_LOAD_IMPORTABLE_SESSION, br#"{"source_id":"pi","external_session_id":"fixture","locator":"fixture-locator"}"#.to_vec()),
+            ] {
+                let failure = super::call_import_service(&state, operation, &payload).await.unwrap_err();
+                assert_eq!(failure.code, expected);
+                assert!(!failure.message.contains("private-fixture-secret"));
+            }
+            drop(state);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_discovery_and_load_routes(client: &bcode_client::BcodeClient, both: bool) {
+        use bcode_session_import::{
+            OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LOAD_IMPORTABLE_SESSION,
+            SESSION_IMPORT_INTERFACE_ID,
+        };
+        for source in [None, Some("pi"), both.then_some("opencode")] {
+            let response = client
+                .call_plugin_service(
+                    SESSION_IMPORT_INTERFACE_ID.into(),
+                    OP_DISCOVER_IMPORTABLE_SESSIONS.into(),
+                    serde_json::to_vec(&serde_json::json!({"source_id":source})).unwrap(),
+                )
+                .await
+                .unwrap();
+            let discovery: bcode_session_import::DiscoverImportableSessionsResponse =
+                serde_json::from_slice(&response.payload).unwrap();
+            assert_eq!(
+                discovery.sessions.len(),
+                if source.is_none() && both { 2 } else { 1 }
+            );
+            if let Some(source) = source {
+                assert!(
+                    discovery
+                        .sessions
+                        .iter()
+                        .all(|session| session.source_id == source)
+                );
+            }
+        }
+        for source in std::iter::once("pi").chain(both.then_some("opencode")) {
+            let response = client
+                .call_plugin_service(
+                    SESSION_IMPORT_INTERFACE_ID.into(),
+                    OP_LOAD_IMPORTABLE_SESSION.into(),
+                    serde_json::to_vec(&bcode_session_import::LoadImportableSessionRequest {
+                        source_id: source.into(),
+                        external_session_id: "fixture".into(),
+                        locator: "fixture-locator".into(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let imported: bcode_session_import::ImportableSession =
+                serde_json::from_slice(&response.payload).unwrap();
+            assert_eq!(imported.summary.source_id, source);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_import_sources_aggregate_and_route_with_disabled_and_unknown_sources() {
+        use bcode_session_import::{
+            ListImportSourcesResponse, OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES,
+            SESSION_IMPORT_INTERFACE_ID,
+        };
+        let pi = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
+            bcode_plugin_sdk::static_plugin_vtable!(
+                ImportFixture<true>,
+                include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml")
+            ),
+        );
+        let opencode = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml"),
+            bcode_plugin_sdk::static_plugin_vtable!(
+                ImportFixture<false>,
+                include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml")
+            ),
+        );
+        for both in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint =
+                bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("imports.sock"));
+            let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+            let client = bcode_client::BcodeClient::new(endpoint);
+            let shutdown = bcode_agent_runtime::CancellationToken::new();
+            let daemon = bcode_config::DaemonConfig {
+                idle_shutdown: false,
+                ..Default::default()
+            };
+            let server = Box::pin(crate::run_constructed_server(
+                std::sync::Arc::new(fixture_import_state(
+                    &[pi, opencode],
+                    std::iter::once("bcode.pi-session-import".to_owned())
+                        .chain(both.then(|| "bcode.opencode-session-import".to_owned()))
+                        .collect(),
+                )),
+                listener,
+                &daemon,
+                false,
+                &[],
+                shutdown.clone(),
+                None,
+            ));
+            let probe = async {
+                let response = client
+                    .call_plugin_service(
+                        SESSION_IMPORT_INTERFACE_ID.into(),
+                        OP_LIST_IMPORT_SOURCES.into(),
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+                let sources: ListImportSourcesResponse =
+                    serde_json::from_slice(&response.payload).unwrap();
+                assert_eq!(sources.sources.len(), if both { 2 } else { 1 });
+                assert!(
+                    sources
+                        .sources
+                        .iter()
+                        .any(|source| source.source_id == "pi")
+                );
+                assert_discovery_and_load_routes(&client, both).await;
+                let error = client
+                    .call_plugin_service(
+                        SESSION_IMPORT_INTERFACE_ID.into(),
+                        OP_DISCOVER_IMPORTABLE_SESSIONS.into(),
+                        br#"{"source_id":"unknown"}"#.to_vec(),
+                    )
+                    .await;
+                assert!(
+                    matches!(error, Err(bcode_client::ClientError::Server { code, .. }) if code == "unknown_import_source")
+                );
+                if !both {
+                    assert!(
+                        client
+                            .call_plugin_service(
+                                SESSION_IMPORT_INTERFACE_ID.into(),
+                                OP_DISCOVER_IMPORTABLE_SESSIONS.into(),
+                                br#"{"source_id":"opencode"}"#.to_vec()
+                            )
+                            .await
+                            .is_err()
+                    );
+                }
+                shutdown.cancel();
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let (result, ()) = tokio::join!(server, probe);
+                result.unwrap();
+            })
+            .await
+            .unwrap();
+        }
+    }
     #[test]
     fn history_snapshot_requires_unique_source_message_provenance() {
         let event = bcode_session_import::ImportableSessionEvent {

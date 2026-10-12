@@ -1978,6 +1978,13 @@ fn validate_apply_batch_response(
 /// provider does not conceal healthy providers.
 #[allow(clippy::too_many_lines)]
 pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersResponse {
+    list_providers_cancellable(state, &bcode_plugin_sdk::ServiceCancellation::default()).await
+}
+
+pub(super) async fn list_providers_cancellable(
+    state: &ServerState,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> ListSessionSearchProvidersResponse {
     if !state.session_search_enabled {
         return ListSessionSearchProvidersResponse {
             providers: Vec::new(),
@@ -1994,55 +2001,33 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
     let mut providers = Vec::new();
     let mut failures = Vec::new();
     for plugin_id in provider_ids.iter().cloned() {
-        let capabilities = state
-            .plugins
-            .invoke_service_json::<_, SessionSearchCapabilities>(
-                &plugin_id,
-                SESSION_SEARCH_INTERFACE_ID,
-                OP_CAPABILITIES,
-                &(),
-            )
-            .await;
-        let capabilities = match capabilities {
-            Ok(capabilities) if capabilities.provider_id == plugin_id => {
-                if let Err(error) = capabilities.validate() {
-                    failures.push(provider_failure(
-                        plugin_id,
-                        SearchErrorCode::InvalidRequest,
-                        &error.to_string(),
-                        false,
-                    ));
+        if cancellation.is_cancelled() {
+            failures.push(provider_failure(
+                plugin_id,
+                SearchErrorCode::ProviderUnavailable,
+                "provider discovery cancelled before completion",
+                true,
+            ));
+            break;
+        }
+        let capabilities =
+            match discover_provider_capabilities(state, &plugin_id, cancellation).await {
+                Ok(capabilities) => capabilities,
+                Err(failure) => {
+                    failures.push(failure);
                     continue;
                 }
-                capabilities
-            }
-            Ok(_) => {
-                failures.push(provider_failure(
-                    plugin_id,
-                    SearchErrorCode::InvalidRequest,
-                    "provider capability identity does not match plugin registration",
-                    false,
-                ));
-                continue;
-            }
-            Err(error) => {
-                let (code, retryable) = classify_provider_call_error(&error);
-                failures.push(provider_failure(
-                    plugin_id,
-                    code,
-                    &error.to_string(),
-                    retryable,
-                ));
-                continue;
-            }
-        };
+            };
         let status = state
             .plugins
-            .invoke_service_json::<_, SessionSearchStatus>(
+            .invoke_service_json_scoped_cancellable::<_, SessionSearchStatus>(
                 &plugin_id,
                 SESSION_SEARCH_INTERFACE_ID,
                 OP_STATUS,
                 &(),
+                bcode_plugin::PluginInvocationScope::Global,
+                Duration::from_secs(5),
+                cancellation,
             )
             .await;
         match status {
@@ -2079,6 +2064,19 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
             }
         }
     }
+    failures.extend(unloaded_provider_failures(state, &provider_ids));
+    failures.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    ListSessionSearchProvidersResponse {
+        providers,
+        failures,
+    }
+}
+
+fn unloaded_provider_failures(
+    state: &ServerState,
+    provider_ids: &BTreeSet<String>,
+) -> Vec<SessionSearchProviderFailure> {
+    let mut failures = Vec::new();
     for plugin_id in &state.plugins.selection().disabled {
         if !provider_ids.contains(plugin_id)
             && looks_like_session_search_provider(plugin_id, state.plugins.configs().get(plugin_id))
@@ -2104,11 +2102,47 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
             ));
         }
     }
-    failures.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
-    ListSessionSearchProvidersResponse {
-        providers,
-        failures,
+    failures
+}
+
+async fn discover_provider_capabilities(
+    state: &ServerState,
+    plugin_id: &str,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<SessionSearchCapabilities, SessionSearchProviderFailure> {
+    let capabilities = state
+        .plugins
+        .invoke_service_json_scoped_cancellable::<_, SessionSearchCapabilities>(
+            plugin_id,
+            SESSION_SEARCH_INTERFACE_ID,
+            OP_CAPABILITIES,
+            &(),
+            bcode_plugin::PluginInvocationScope::Global,
+            Duration::from_secs(5),
+            cancellation,
+        )
+        .await
+        .map_err(|error| {
+            let (code, retryable) = classify_provider_call_error(&error);
+            provider_failure(plugin_id.to_owned(), code, &error.to_string(), retryable)
+        })?;
+    if capabilities.provider_id != plugin_id {
+        return Err(provider_failure(
+            plugin_id.to_owned(),
+            SearchErrorCode::InvalidRequest,
+            "provider capability identity does not match plugin registration",
+            false,
+        ));
     }
+    capabilities.validate().map_err(|error| {
+        provider_failure(
+            plugin_id.to_owned(),
+            SearchErrorCode::InvalidRequest,
+            &error.to_string(),
+            false,
+        )
+    })?;
+    Ok(capabilities)
 }
 
 const fn classify_provider_call_error(
@@ -2922,7 +2956,12 @@ pub(crate) mod tests {
         CorruptApply,
         StaleApply,
         IncompatiblePolicy,
+        GatedStatus,
     }
+
+    pub static STATUS_STARTED: AtomicBool = AtomicBool::new(false);
+    pub static STATUS_RELEASE: AtomicBool = AtomicBool::new(false);
+    pub static STATUS_CANCELLED: AtomicBool = AtomicBool::new(false);
 
     #[derive(Debug, Clone)]
     struct StatefulProviderCheckpoint {
@@ -3103,6 +3142,30 @@ pub(crate) mod tests {
             }
             OP_CAPABILITIES => service_response(&provider_capabilities(provider.provider_id)),
             OP_STATUS => {
+                if matches!(provider.behavior, TestProviderBehavior::GatedStatus) {
+                    STATUS_STARTED.store(true, Ordering::SeqCst);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !STATUS_RELEASE.load(Ordering::SeqCst) {
+                        if cancellation_callback
+                            .is_some_and(|callback| callback(10, cancellation_user_data))
+                        {
+                            STATUS_CANCELLED.store(true, Ordering::SeqCst);
+                            return bcode_plugin_sdk::write_service_response(
+                                &ServiceResponse::error("cancelled", "status bootstrap cancelled"),
+                                output,
+                                output_capacity,
+                                output_len,
+                                bcode_plugin_sdk::ServiceEventEmitter::new(
+                                    event_callback,
+                                    event_user_data,
+                                ),
+                            );
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                }
                 let mut status = provider_status(provider.provider_id);
                 if matches!(provider.behavior, TestProviderBehavior::IncompatiblePolicy) {
                     status.state = SearchProviderState::Degraded;
@@ -3161,6 +3224,7 @@ pub(crate) mod tests {
                     | TestProviderBehavior::Crash
                     | TestProviderBehavior::RejectCleanup
                     | TestProviderBehavior::Stateful
+                    | TestProviderBehavior::GatedStatus
                     | TestProviderBehavior::UnavailableApply => None,
                 } {
                     return bcode_plugin_sdk::write_service_response(
@@ -3327,6 +3391,7 @@ pub(crate) mod tests {
                 | TestProviderBehavior::QuotaApply
                 | TestProviderBehavior::CorruptApply
                 | TestProviderBehavior::StaleApply
+                | TestProviderBehavior::GatedStatus
                 | TestProviderBehavior::IncompatiblePolicy => {
                     match context.request.payload_json::<SessionSearchRequest>() {
                         Ok(request) => service_response(&provider_search_response(

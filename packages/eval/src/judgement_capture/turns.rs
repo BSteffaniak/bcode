@@ -68,6 +68,29 @@ fn context_output(
         .iter()
         .filter(|operation| operation.feature == Feature::ContextReranking)
         .collect();
+    let aggregates: Vec<_> = observation
+        .passive_aggregates
+        .iter()
+        .filter(|op| op.feature == Feature::ContextReranking)
+        .collect();
+    if let Some(operation) = operations.first() {
+        if aggregates.iter().any(|other| {
+            other.trigger != operation.trigger
+                || Some(other.application) != operation.application
+                || operation.selection.is_some()
+        }) {
+            return Err(());
+        }
+    } else if !aggregates.is_empty() {
+        return if aggregates
+            .iter()
+            .all(|op| op.trigger == Trigger::NotApplicable)
+        {
+            Ok(None)
+        } else {
+            Err(())
+        };
+    }
     let operation = operations.first().ok_or(())?;
     // The legacy output has one selection, not a trajectory. Multiple rounds
     // qualify only if every consumer decision agrees; never pick a favorable round.
@@ -136,6 +159,14 @@ fn recommendation_output(
     };
     observation.validate().map_err(|_| ())?;
     if observation.terminal == Some(bcode_model::judgement::ObservationTerminal::Cancelled) {
+        return Err(());
+    }
+    if observation
+        .passive_aggregates
+        .iter()
+        .any(|op| op.feature == Feature::Recommendations && op.trigger != Trigger::NotApplicable)
+    {
+        // Detail-free disabled facts cannot stand in for a recommendation catalog.
         return Err(());
     }
     let mut selected = None;
@@ -210,6 +241,19 @@ fn disabled_baseline_observed(
             || operation.application
                 != Some(bcode_model::judgement::ApplicationDisposition::BaselineRetained)
             || !operation.inference.is_empty()
+        {
+            return false;
+        }
+    }
+    for aggregate in observation
+        .passive_aggregates
+        .iter()
+        .filter(|op| op.feature == feature)
+    {
+        found = true;
+        if aggregate.trigger != bcode_model::judgement::TriggerDisposition::Disabled
+            || aggregate.application
+                != bcode_model::judgement::ApplicationDisposition::BaselineRetained
         {
             return false;
         }
@@ -527,7 +571,9 @@ mod tests {
             Feature::SessionCategorization,
         ];
         TurnJudgementObservation {
-            schema_version: bcode_model::judgement::TURN_OBSERVATION_VERSION,
+            schema_version: 1,
+            accounting: None,
+            passive_aggregates: vec![],
             scope: ObservationScope::NormalTurn,
             session_id: "session".into(),
             turn_id: "turn".into(),
@@ -569,6 +615,60 @@ mod tests {
             arm,
             &["history:session:2".into(), "history:session:7".into()],
         )
+    }
+
+    #[test]
+    fn v2_passive_baseline_preserves_counts_and_legacy_semantics() {
+        let legacy = snapshot();
+        assert!(legacy.validate().is_ok());
+        let mut current = legacy.clone();
+        current.schema_version = bcode_model::judgement::TURN_OBSERVATION_VERSION;
+        current.accounting = Some(bcode_model::judgement::OperationAccounting {
+            begun: 200 + current.operations.len() as u64 - 1,
+            omitted_operations: 0,
+        });
+        let removed = current.operations.remove(0);
+        // Ordinals follow producer chronology; detailed records remain distinct.
+        current
+            .passive_aggregates
+            .push(bcode_model::judgement::PassiveOperationAggregate {
+                feature: removed.feature,
+                trigger: Trigger::Disabled,
+                application: Application::BaselineRetained,
+                count: 200,
+                first_operation_id: 0,
+                last_operation_id: 203,
+            });
+        assert!(current.validate().is_ok());
+        assert!(disabled_baseline_observed(
+            &current,
+            Feature::ToolResultTriage
+        ));
+        let mut telemetry = crate::judgement_capture::CaptureTelemetry::default();
+        telemetry.retain_turn_observation(&current).unwrap();
+        assert_eq!(telemetry.inference_calls, Some(0));
+        assert_eq!(
+            telemetry
+                .aggregated_turn_observation
+                .as_ref()
+                .unwrap()
+                .accounting
+                .as_ref()
+                .unwrap()
+                .begun,
+            204
+        );
+        current.passive_aggregates[0].trigger = Trigger::Triggered;
+        assert!(current.validate().is_err());
+        let mut future = legacy.clone();
+        future.schema_version = bcode_model::judgement::TURN_OBSERVATION_VERSION + 1;
+        assert!(future.validate().is_err());
+        let mut old_gap = legacy;
+        old_gap.omitted = 1;
+        old_gap.complete = false;
+        assert!(old_gap.validate().is_ok());
+        old_gap.complete = true;
+        assert!(old_gap.validate().is_err());
     }
 
     #[test]

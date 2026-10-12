@@ -15,6 +15,32 @@ def event(sequence, kind):
 
 
 class NormalPilotTests(unittest.TestCase):
+    def test_deferred_subject_requires_typed_unknown_and_exact_verified_identity(self):
+        identity = {'artifact_id': 'artifact', 'executable_sha256': 'digest', 'state_id': 'verified'}
+        job = {'resolve_state_identity': True, 'subject_binary': '/subject'}
+        def template(state='unknown'):
+            return {'request': {'subject': dict(identity, executable='/subject', state_id=state)}}
+        value = template()
+        pilot.bind_normal_subject(job, value, identity)
+        self.assertEqual(value['request']['subject']['state_id'], 'verified')
+        for marker in (None, '', 'stale', 'UNRESOLVED_DO_NOT_INVOKE', 'verified'):
+            with self.assertRaisesRegex(ValueError, 'unknown marker'):
+                pilot.bind_normal_subject(job, template(marker), identity)
+        missing = template()
+        del missing['request']['subject']['state_id']
+        with self.assertRaisesRegex(ValueError, 'unknown marker'):
+            pilot.bind_normal_subject(job, missing, identity)
+        for key in ('artifact_id', 'executable_sha256', 'executable'):
+            bad = template()
+            bad['request']['subject'][key] = 'wrong'
+            with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+                pilot.bind_normal_subject(job, bad, identity)
+        with self.assertRaisesRegex(ValueError, 'verified public'):
+            pilot.bind_normal_subject(job, template(), dict(identity, state_id='unknown'))
+        pilot.bind_normal_subject(dict(job, resolve_state_identity=False), template('verified'), identity)
+        with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+            pilot.bind_normal_subject(dict(job, resolve_state_identity=False), template(), identity)
+
     def test_zero_origin_bounded_pages_and_content_free_receipts(self):
         first = event(0, {'session_created': {'working_directory': '/external'}})
         last = event(1, {'assistant_message': {'text': 'secret-output'}})
@@ -44,6 +70,59 @@ class NormalPilotTests(unittest.TestCase):
             with self.subTest(pages=pages), mock.patch.object(pilot.cli, 'json_command', side_effect=pages), \
                     self.assertRaises(pilot.cli.PilotError):
                 pilot.read_history({'arm': {}, 'max_history_pages': 1}, 's', '/workspace')
+
+    def test_provider_unavailable_is_retained_but_never_task_success(self):
+        events = [event(1, {'model_turn_started': {'turn_id': 't'}}),
+                  event(5, {'model_turn_finished': {'turn_id': 't', 'outcome': 'provider_unavailable'}})]
+        with mock.patch.object(pilot.cli, 'json_command', return_value={
+                'events': events, 'has_more': False, 'compatibility_issues': []}):
+            actual, projection = pilot.read_history({'arm': {}, 'max_history_pages': 1}, 's', '/workspace')
+        self.assertEqual(projection['events'][-1]['outcome'], 'provider_unavailable')
+        self.assertEqual(pilot.exact_terminal(actual), ('t', 1, 5))
+        with self.assertRaisesRegex(pilot.cli.PilotError, 'provider unavailable; task evidence unavailable'):
+            pilot.require_available_terminal(actual, 5)
+        events[-1]['kind']['model_turn_finished']['outcome'] = 'future_unknown'
+        with self.assertRaisesRegex(pilot.cli.PilotError, 'unknown terminal outcome'):
+            pilot.receipt_projection(events[-1])
+
+    def test_v2_passive_counts_and_legacy_compatibility(self):
+        feature = 'progress_monitoring'
+        observation = {'schema_version': 2, 'scope': 'normal_turn', 'session_id': 's', 'turn_id': 't',
+                       'complete': True, 'omitted': 0, 'terminal': 'completed', 'covered_features': [feature],
+                       'operations': [], 'accounting': {'begun': 200, 'omitted_operations': 0},
+                       'passive_aggregates': [{'feature': feature, 'trigger': 'disabled',
+                           'application': 'baseline_retained', 'count': 200,
+                           'first_operation_id': 0, 'last_operation_id': 199}]}
+        summary = pilot.hook_summary(observation, 's', 't', {feature: 'disabled'})
+        self.assertTrue(summary['all_required_satisfied'])
+        self.assertEqual(summary['hooks'][feature]['passive_aggregates'][0]['count'], 200)
+        self.assertEqual(summary['hooks'][feature]['operations'], [])
+        import copy
+        interleaved = copy.deepcopy(observation)
+        interleaved['accounting']['begun'] = 201
+        interleaved['operations'] = [{'operation_id': 100, 'feature': feature, 'trigger': 'disabled',
+                                    'application': 'baseline_retained', 'inference': [],
+                                    'inference_complete': True}]
+        interleaved['passive_aggregates'][0]['last_operation_id'] = 200
+        self.assertTrue(pilot.hook_summary(interleaved, 's', 't', {feature: 'disabled'})['all_required_satisfied'])
+        collision = copy.deepcopy(interleaved)
+        collision['operations'][0]['operation_id'] = 200
+        with self.assertRaises(pilot.cli.PilotError):
+            pilot.passive_facts(collision)
+        collision = copy.deepcopy(observation)
+        collision['passive_aggregates'].append(dict(collision['passive_aggregates'][0], feature='tool_result_triage'))
+        collision['accounting']['begun'] = 400
+        with self.assertRaises(pilot.cli.PilotError):
+            pilot.passive_facts(collision)
+        for mutation in ('count', 'active', 'future', 'legacy', 'omitted'):
+            invalid = copy.deepcopy(observation)
+            if mutation == 'count': invalid['accounting']['begun'] += 1
+            elif mutation == 'active': invalid['passive_aggregates'][0]['trigger'] = 'triggered'
+            elif mutation == 'future': invalid['schema_version'] = 3
+            elif mutation == 'legacy': invalid['schema_version'] = 1
+            else: invalid['omitted'] = 1
+            with self.subTest(mutation=mutation), self.assertRaises(pilot.cli.PilotError):
+                pilot.hook_summary(invalid, 's', 't', {feature: 'disabled'})
 
     def test_only_exact_turn_terminal_is_truth(self):
         events = [event(1, {'model_turn_started': {'turn_id': 't'}}),
@@ -98,7 +177,7 @@ class NormalPilotTests(unittest.TestCase):
             overlay[feature] = 'auto' if arm == 'off' else 'off'
             with self.assertRaises(pilot.cli.PilotError):
                 pilot.treatment_features({'treatment': treatment}, template, overlay)
-        observation = {'scope': 'normal_turn', 'session_id': 's', 'turn_id': 't', 'complete': True,
+        observation = {'schema_version': 1, 'scope': 'normal_turn', 'session_id': 's', 'turn_id': 't', 'complete': True,
                        'omitted': 0, 'terminal': 'completed', 'covered_features': [feature],
                        'operations': [{'feature': feature, 'operation_id': 0, 'trigger': 'triggered',
                                        'inference_complete': True, 'inference': [{}], 'application': 'baseline_retained'}]}

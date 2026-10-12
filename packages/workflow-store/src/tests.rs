@@ -20565,6 +20565,241 @@ fn connected_publication_fixture() -> (
     (temp, store, run, authority, request)
 }
 
+fn candidate_transfer_snapshot(
+    store: &WorkflowStore,
+    run_id: &str,
+) -> Vec<(String, String, u64, u64)> {
+    crate::database::rows(
+        &store.connection,
+        &store
+            .connection
+            .select("workflow_graph_edit_candidates")
+            .project(switchy_database::query::identifier("mutation_id"))
+            .project(switchy_database::query::identifier("request_json"))
+            .project(switchy_database::query::identifier("expected_revision"))
+            .project(switchy_database::query::identifier("created_at_ms"))
+            .where_eq("run_id", run_id)
+            .sort("mutation_id", switchy_database::query::SortDirection::Asc)
+            .limit(256),
+    )
+    .unwrap()
+    .iter()
+    .map(|row| {
+        (
+            crate::database::text(row, "mutation_id").unwrap(),
+            crate::database::text(row, "request_json").unwrap(),
+            crate::database::unsigned(row, "expected_revision").unwrap(),
+            crate::database::unsigned(row, "created_at_ms").unwrap(),
+        )
+    })
+    .collect()
+}
+
+#[test]
+fn same_artifact_transfer_preserves_exact_candidates_and_fences_old_owner() {
+    let (temp, mut store, run, authority, request) = connected_publication_fixture();
+    let before = candidate_transfer_snapshot(&store, &run.run_id);
+    let replacement = WorkflowExecutionAuthority {
+        daemon_instance_id: "candidate-replacement".into(),
+        generation: authority.generation + 1,
+        fencing_token: "candidate-replacement-fence".into(),
+        ..authority.clone()
+    };
+    let mut foreign = replacement.clone();
+    foreign.target_artifact_id = "foreign-artifact".into();
+    assert!(
+        store
+            .transfer_execution_authority(&run.run_id, &authority, &foreign, 30)
+            .is_err()
+    );
+    assert_eq!(candidate_transfer_snapshot(&store, &run.run_id), before);
+    store
+        .transfer_execution_authority(&run.run_id, &authority, &replacement, 31)
+        .unwrap();
+    drop(store);
+    let store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+    assert_eq!(candidate_transfer_snapshot(&store, &run.run_id), before);
+    assert_eq!(
+        store
+            .staged_run_graph_edit(&run.run_id, &request.mutation_id, &replacement)
+            .unwrap(),
+        Some(request.clone())
+    );
+    assert!(
+        store
+            .staged_run_graph_edit(&run.run_id, &request.mutation_id, &authority)
+            .is_err()
+    );
+    assert_eq!(store.run_graph_revision(&run.run_id).unwrap(), Some(2));
+}
+
+#[test]
+fn candidate_transfer_pages_preserve_every_intent_and_fence_old_owner() {
+    let (temp, mut store, run, authority, mut request) = connected_publication_fixture();
+    request.expected_revision = 2;
+    for index in 0..129 {
+        request.mutation_id = format!("paged-{index:03}");
+        store
+            .stage_run_graph_edit(&request, &authority, 30)
+            .unwrap();
+    }
+    let before = candidate_transfer_snapshot(&store, &run.run_id);
+    assert_eq!(before.len(), 131);
+    let replacement = WorkflowExecutionAuthority {
+        daemon_instance_id: "paged-replacement".into(),
+        generation: authority.generation + 1,
+        fencing_token: "paged-replacement-fence".into(),
+        ..authority.clone()
+    };
+    store
+        .transfer_execution_authority(&run.run_id, &authority, &replacement, 31)
+        .unwrap();
+    drop(store);
+    let store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+    assert_eq!(candidate_transfer_snapshot(&store, &run.run_id), before);
+    for (mutation_id, payload, _, _) in before {
+        let expected: bcode_workflow::WorkflowRunGraphEditBatch =
+            serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            store
+                .staged_run_graph_edit(&run.run_id, &mutation_id, &replacement)
+                .unwrap(),
+            Some(expected)
+        );
+        assert!(
+            store
+                .staged_run_graph_edit(&run.run_id, &mutation_id, &authority)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn unsupported_and_malformed_candidate_envelopes_roll_back_transfer() {
+    for future in [false, true] {
+        let (temp, mut store, run, authority, request) = connected_publication_fixture();
+        let payload = if future {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value["version"] = serde_json::json!(u32::MAX);
+            value.to_string()
+        } else {
+            "{legacy-invalid-envelope".to_owned()
+        };
+        block_on(
+            update("workflow_graph_edit_candidates")
+                .value("request_json", payload.as_str())
+                .where_eq("run_id", run.run_id.as_str())
+                .where_eq("mutation_id", "connected")
+                .execute(&store.connection),
+        )
+        .unwrap();
+        let before = candidate_transfer_snapshot(&store, &run.run_id);
+        let replacement = WorkflowExecutionAuthority {
+            daemon_instance_id: "invalid-envelope-replacement".into(),
+            generation: authority.generation + 1,
+            fencing_token: "invalid-envelope-fence".into(),
+            ..authority.clone()
+        };
+        assert!(
+            store
+                .transfer_execution_authority(&run.run_id, &authority, &replacement, 31)
+                .is_err()
+        );
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        assert_eq!(candidate_transfer_snapshot(&store, &run.run_id), before);
+        assert_eq!(
+            store.execution_authority(&run.run_id).unwrap(),
+            Some(authority.clone())
+        );
+        // bound-connected was processed first; its provenance must have rolled back too.
+        assert_eq!(
+            store
+                .staged_run_graph_edit(&run.run_id, &request.mutation_id, &authority)
+                .unwrap(),
+            Some(request)
+        );
+        assert!(
+            store
+                .staged_run_graph_edit(&run.run_id, "connected", &authority)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn interrupted_candidate_transfer_rolls_back_without_rewriting_intent() {
+    let (temp, store, run, authority, request) = connected_publication_fixture();
+    let before = candidate_transfer_snapshot(&store, &run.run_id);
+    let replacement = WorkflowExecutionAuthority {
+        daemon_instance_id: "candidate-replacement".into(),
+        generation: authority.generation + 1,
+        fencing_token: "candidate-replacement-fence".into(),
+        ..authority.clone()
+    };
+    let transaction =
+        crate::database::begin(&store.connection, TransactionMode::Immediate).unwrap();
+    WorkflowStore::transfer_graph_edit_candidates_in(
+        transaction.as_ref(),
+        &run.run_id,
+        &authority,
+        &replacement,
+    )
+    .unwrap();
+    // Simulate interruption before the encompassing ownership transaction commits.
+    drop(transaction);
+    drop(store);
+    let store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+    assert_eq!(candidate_transfer_snapshot(&store, &run.run_id), before);
+    assert_eq!(
+        store.execution_authority(&run.run_id).unwrap(),
+        Some(authority.clone())
+    );
+    assert_eq!(
+        store
+            .staged_run_graph_edit(&run.run_id, &request.mutation_id, &authority)
+            .unwrap(),
+        Some(request)
+    );
+}
+
+#[test]
+fn inconsistent_candidate_aborts_entire_authority_transfer() {
+    let (_temp, mut store, run, authority, request) = connected_publication_fixture();
+    let before = candidate_transfer_snapshot(&store, &run.run_id);
+    // This sorts after bound-connected, exercising rollback of an earlier rebind too.
+    block_on(
+        update("workflow_graph_edit_candidates")
+            .value("authority_json", "{}")
+            .where_eq("run_id", run.run_id.as_str())
+            .where_eq("mutation_id", "connected")
+            .execute(&store.connection),
+    )
+    .unwrap();
+    let replacement = WorkflowExecutionAuthority {
+        daemon_instance_id: "candidate-replacement".into(),
+        generation: authority.generation + 1,
+        fencing_token: "candidate-replacement-fence".into(),
+        ..authority.clone()
+    };
+    assert!(
+        store
+            .transfer_execution_authority(&run.run_id, &authority, &replacement, 31)
+            .is_err()
+    );
+    assert_eq!(
+        store.execution_authority(&run.run_id).unwrap(),
+        Some(authority.clone())
+    );
+    assert_eq!(candidate_transfer_snapshot(&store, &run.run_id), before);
+    assert_eq!(
+        store
+            .staged_run_graph_edit(&run.run_id, &request.mutation_id, &authority)
+            .unwrap(),
+        Some(request)
+    );
+}
+
 #[test]
 fn preparation_failure_rolls_back_resource_leases_and_events() {
     let (_temp, mut store, run, _, _) = connected_publication_fixture();

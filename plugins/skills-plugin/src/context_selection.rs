@@ -72,10 +72,13 @@ pub fn prepare(input: &SelectionRequest) -> selection::PreparedSelection {
         .fold(0usize, |sum, candidate| {
             sum.saturating_add(candidate.snippet.len())
         });
+    // Without a budget every valid snippet is included. Protected slots consume
+    // no budget and oversized optional snippets consume nothing; if all individually
+    // fitting optional snippets fit together, no permutation can change inclusion.
     if !valid(input)
         || input
             .budget_bytes
-            .is_some_and(|budget| budget == 0 || bytes <= budget)
+            .is_none_or(|budget| budget == 0 || bytes <= budget)
     {
         return selection::PreparedSelection { judgement: None };
     }

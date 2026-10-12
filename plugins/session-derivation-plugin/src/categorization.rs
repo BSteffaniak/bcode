@@ -6,6 +6,8 @@
 //! not evidence of an actual miscellaneous task. Probabilities are provider-reported
 //! metadata, not calibrated evidence, and do not change label application.
 
+mod intent;
+
 use bcode_model::judgement::{
     self, Answer, Feature, OptionalRequest, OptionalResponse, Question, Request, State,
 };
@@ -50,13 +52,16 @@ pub struct NewestRequestFacts {
     /// Negation is a lexical cue, not a claim about its scope or resolved intent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sequence: Vec<String>,
+    /// Versioned, fixed-vocabulary grammatical evidence; absent in legacy facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent: Option<intent::Intent>,
 }
 
 /// Extract signals from at most 8192 characters and 512 words of one request.
 /// The returned value contains only fixed vocabulary, regardless of input contents.
 #[must_use]
 pub fn newest_request_facts(input: &str) -> NewestRequestFacts {
-    let bounded: String = input.chars().take(8192).collect();
+    let bounded = intent::lexical_projection(input);
     let mut facts = NewestRequestFacts::default();
     for source_word in bounded.split_whitespace().take(512) {
         let word = source_word
@@ -110,11 +115,15 @@ pub fn newest_request_facts(input: &str) -> NewestRequestFacts {
     if facts.tasks.is_empty() && facts.domains.is_empty() {
         facts.sequence.clear();
     }
+    if !facts.tasks.is_empty() || !facts.domains.is_empty() {
+        facts.intent = Some(intent::extract(input));
+    }
     facts
 }
 
 fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
-    if facts.tasks.is_empty() && facts.domains.is_empty()
+    if facts.intent.as_ref().is_some_and(|value| !value.valid())
+        || facts.tasks.is_empty() && facts.domains.is_empty()
         || facts.sequence.len() > 1024
         || facts.sequence.iter().any(|signal| {
             !facts.tasks.contains(signal)
@@ -150,7 +159,7 @@ fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
         questions.insert(
             "task".to_owned(),
             choice(
-                "Choose the requested advisory task from ordered lexical cues, not every mentioned task. negation marks a negative cue, boundary marks punctuation, contrast and only preserve those cues, and gap means omitted unknown words. These cues do not establish negation scope; use other when ambiguous or only prohibited tasks are supported.",
+                "Choose the requested advisory task using fixed-vocabulary intent version 1 when present, otherwise legacy ordered cues. Purpose/Step/Prohibition/Unresolved are bounded grammatical evidence, not resolved intent: explicit means_of can distinguish a goal from its means, but position alone cannot. Independent unresolved goals, incomplete evidence or uncertain scope may require other; never force a purpose label. negation marks a negative cue, boundary marks punctuation, contrast and only preserve those cues, and gap means omitted unknown words. These cues do not establish negation scope; use other when ambiguous or only prohibited tasks are supported.",
                 &facts.tasks,
             ),
         );
@@ -159,7 +168,7 @@ fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
         questions.insert(
             "domain".to_owned(),
             choice(
-                "Choose the domain of the requested task using ordered lexical cues, not a domain mentioned only in a prohibition. gap means omitted unknown words, not adjacency in the source; use other when intent or domain association is ambiguous.",
+                "Choose the domain of the requested task using fixed-vocabulary intent evidence when present and legacy ordered cues otherwise. Do not transfer a means or prohibited clause domain onto its purpose. Unresolved associations remain ambiguous. gap means omitted unknown words, not adjacency in the source; use other when intent or domain association is ambiguous.",
                 &facts.domains,
             ),
         );
@@ -510,6 +519,11 @@ mod tests {
         assert!(rank(&request).is_err());
     }
 
+    struct OptionalCallbackData {
+        response: Vec<u8>,
+        captured: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
     extern "C" fn optional_callback(
         input_ptr: *const u8,
         input_len: usize,
@@ -518,32 +532,19 @@ mod tests {
         output_len: *mut usize,
         user_data: *mut std::ffi::c_void,
     ) -> i32 {
-        let bytes = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-        let ServiceBridgeRequest::InvokeService(request) = serde_json::from_slice(bytes).unwrap()
-        else {
-            panic!("expected optional application invocation");
+        let data = unsafe { &*user_data.cast::<OptionalCallbackData>() };
+        if data.response.len() > output_capacity {
+            return -1;
+        }
+        let Ok(mut captured) = data.captured.lock() else {
+            return -1;
         };
-        assert_eq!(request.operation, judgement::OP_OPTIONAL_JUDGE);
-        let optional: OptionalRequest = serde_json::from_value(request.payload).unwrap();
-        assert_eq!(optional.feature, Feature::SessionCategorization);
-        assert_eq!(
-            optional.request.state,
-            State::Structured(serde_json::json!({
-                "tasks": ["debugging"], "domains": ["backend"],
-                "sequence": ["debugging", "backend", "gap"]
-            }))
-        );
-        let payload = unsafe { &*user_data.cast::<serde_json::Value>() };
-        let encoded = serde_json::to_vec(&ServiceBridgeResponse::Service(
-            ToolInvocationServiceResolution::Responded {
-                payload: payload.clone(),
-            },
-        ))
-        .unwrap();
-        assert!(encoded.len() <= output_capacity);
+        let bytes = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        captured.push(bytes.to_vec());
+        drop(captured);
         unsafe {
-            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-            *output_len = encoded.len();
+            std::ptr::copy_nonoverlapping(data.response.as_ptr(), output_ptr, data.response.len());
+            *output_len = data.response.len();
         }
         0
     }
@@ -575,6 +576,15 @@ mod tests {
             let expected = serde_json::from_value::<OptionalResponse>(payload.clone())
                 .unwrap()
                 .observation;
+            let callback = OptionalCallbackData {
+                response: serde_json::to_vec(&ServiceBridgeResponse::Service(
+                    ToolInvocationServiceResolution::Responded {
+                        payload: payload.clone(),
+                    },
+                ))
+                .unwrap(),
+                captured: std::sync::Mutex::new(Vec::new()),
+            };
             let request = CategorizationRequest {
                 session_id: SessionId::new(),
                 source_sequence: 7,
@@ -592,12 +602,34 @@ mod tests {
                 cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
                 bridge: bcode_plugin_sdk::ServiceBridge::new(
                     Some(optional_callback),
-                    std::ptr::from_ref(&payload).cast_mut().cast(),
+                    std::ptr::from_ref(&callback).cast_mut().cast(),
                     bcode_plugin_sdk::ServiceCancellation::default(),
                 ),
                 transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
             };
             let reply = invoke(&context);
+            drop(context);
+            let captured = callback.captured.into_inner().unwrap();
+            assert_eq!(captured.len(), 1);
+            let ServiceBridgeRequest::InvokeService(invocation) =
+                serde_json::from_slice(&captured[0]).unwrap()
+            else {
+                panic!("expected optional application invocation");
+            };
+            assert_eq!(invocation.operation, judgement::OP_OPTIONAL_JUDGE);
+            let optional: OptionalRequest = serde_json::from_value(invocation.payload).unwrap();
+            assert_eq!(optional.feature, Feature::SessionCategorization);
+            assert_eq!(
+                optional.request.state,
+                State::Structured(serde_json::json!({
+                    "tasks": ["debugging"], "domains": ["backend"],
+                    "sequence": ["debugging", "backend", "gap"],
+                    "intent": {"version": 1, "complete": true, "clauses": [{
+                        "ordinal": 0, "role": "unresolved", "tasks": ["debugging"],
+                        "domains": ["backend"], "means_of": null
+                    }]}
+                }))
+            );
             assert!(reply.error.is_none());
             let decoded: CategorizationServiceResponse =
                 serde_json::from_slice(&reply.payload).unwrap();
@@ -823,6 +855,92 @@ mod tests {
     }
 
     #[test]
+    fn intent_provider_state_is_typed_secret_safe_and_legacy_compatible() {
+        let source = "Document tooling by implementing token=SECRET /private/customer.";
+        let facts = newest_request_facts(source);
+        let query = optional_request(&facts).unwrap();
+        assert_eq!(query.request.questions.len(), 2);
+        let value = serde_json::to_value(&query).unwrap();
+        let encoded = value.to_string();
+        for secret in ["SECRET", "token=", "/private", "customer", "implementing"] {
+            assert!(!encoded.contains(secret));
+        }
+        let mut legacy = serde_json::to_value(&facts).unwrap();
+        legacy.as_object_mut().unwrap().remove("intent");
+        let legacy: NewestRequestFacts = serde_json::from_value(legacy).unwrap();
+        assert!(optional_request(&legacy).is_some());
+        let mut future = serde_json::to_value(&facts).unwrap();
+        future["intent"]["version"] = serde_json::json!(2);
+        let future: NewestRequestFacts = serde_json::from_value(future).unwrap();
+        assert!(optional_request(&future).is_none());
+    }
+
+    #[test]
+    fn quoted_and_identifier_only_sources_do_not_request_judgement() {
+        for source in [
+            "\"fix backend\"",
+            "`document tooling`",
+            "token=fix /private/backend tooling_document",
+        ] {
+            assert!(optional_request(&newest_request_facts(source)).is_none());
+        }
+    }
+
+    #[test]
+    fn intent_keeps_abstention_and_unavailable_response_behavior() {
+        let request = CategorizationRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            source_sequence: 1,
+            newest_request: "Document tooling by implementing an example. Implement backend."
+                .to_owned(),
+        };
+        let query = optional_request(&newest_request_facts(&request.newest_request)).unwrap();
+        assert!(query.request.questions.values().all(|question| matches!(question, Question::Choice { options, .. } if options.contains_key("other"))));
+        // Intent adds no local fallback labels or additional inference question.
+        assert_eq!(query.request.questions.len(), 2);
+        assert!(
+            labels(
+                &request,
+                &query.request,
+                OptionalResponse {
+                    observation: None,
+                    response: None
+                }
+            )
+            .is_none()
+        );
+        let answers = query
+            .request
+            .questions
+            .keys()
+            .map(|id| {
+                (
+                    id.clone(),
+                    Answer::Choice {
+                        selected: "other".to_owned(),
+                        probabilities: None,
+                        confidence: None,
+                    },
+                )
+            })
+            .collect();
+        let result = labels(
+            &request,
+            &query.request,
+            OptionalResponse {
+                observation: None,
+                response: Some(judgement::Response {
+                    answers,
+                    usage: None,
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(result.task, "other");
+        assert_eq!(result.domain, "other");
+    }
+
+    #[test]
     fn empty_or_untrusted_signals_do_not_request_judgement() {
         assert!(optional_request(&NewestRequestFacts::default()).is_none());
         assert!(
@@ -830,6 +948,7 @@ mod tests {
                 tasks: BTreeSet::from(["SECRET".into()]),
                 domains: BTreeSet::new(),
                 sequence: Vec::new(),
+                intent: None,
             })
             .is_none()
         );
