@@ -359,11 +359,12 @@ impl BcodeRuntimeModel {
         if self.chat.app.plugin_presentation().is_none()
             || !matches!(self.screen, BcodeRuntimeScreen::Chat)
             || self.loop_state.foreground().is_some()
-            || self
-                .loop_state
-                .routes_non_mouse_event_to_interactive_surface(
-                    self.chat.app.tui_config().interactions,
-                )
+            || (self.loop_state.has_interactive_surface()
+                && self
+                    .loop_state
+                    .routes_non_mouse_event_to_interactive_surface(
+                        self.chat.app.tui_config().interactions,
+                    ))
             || self.runtime_handle.is_none()
         {
             // Tool-owned input does not observe the composer or upgrade its damage.
@@ -8346,6 +8347,42 @@ mod tests {
         assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
         assert!(model.chat.app.take_pending_submission().is_empty());
         drop(model);
+    }
+
+    #[tokio::test]
+    async fn composer_root_normal_typing_is_observed_without_an_interactive_surface() {
+        use bmux_tui_runtime::Program;
+
+        let mut model = root_test_model();
+        model.chat.app.set_plugin_presentation(std::sync::Arc::new(
+            super::super::plugin_tui::PluginTuiPresentation::new(
+                bcode_plugin::PluginHost::default(),
+            ),
+        ));
+        let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+            root_test_model(),
+            bmux_tui_runtime::HeadlessPresenter::default(),
+            bmux_tui_runtime::RuntimeConfig::default(),
+        );
+        model.runtime_handle = Some(handle);
+        assert!(!model.loop_state.has_interactive_surface());
+        for key in ["@", "r"] {
+            model
+                .update(bmux_tui_runtime::RuntimeEvent::Terminal(
+                    bmux_tui::event::Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap()),
+                ))
+                .unwrap();
+        }
+        let observed = model
+            .loop_state
+            .composer_interaction
+            .document()
+            .expect("normal typing reaches contributor observation")
+            .text
+            .clone();
+        drop(model);
+        drop(runtime);
+        assert_eq!(observed, "@r");
     }
 
     #[tokio::test]
