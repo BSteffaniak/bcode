@@ -251,7 +251,7 @@ pub struct LiteralText(pub char);
 impl LiteralText {
     /// Classify a printable stroke without control, alt, super, hyper or meta modifiers.
     #[must_use]
-    pub fn from_stroke(stroke: KeyStroke) -> Option<Self> {
+    pub const fn from_stroke(stroke: KeyStroke) -> Option<Self> {
         let mods = stroke.modifiers;
         if mods.ctrl || mods.alt || mods.super_key || mods.hyper || mods.meta {
             return None;

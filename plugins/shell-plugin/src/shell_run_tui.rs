@@ -3771,6 +3771,324 @@ mod tests {
         payload
     }
 
+    #[cfg(feature = "embedded-python")]
+    fn assert_python_acceptance_lifecycle(source: &str, expected: &str) {
+        use crate::presentation::document::SourceOrigin;
+        let policy = bcode_config::ShellOutputPresentationPolicy::default();
+        let document = crate::presentation::present(source, &policy);
+        assert_eq!(document.execution_text(), source);
+        assert!(
+            document.sources.iter().any(|retained| {
+                matches!(retained.origin, SourceOrigin::Formatted { .. })
+                    && retained.text == expected
+            }),
+            "{:#?}",
+            document.sources
+        );
+        for (index, retained) in document.sources.iter().enumerate() {
+            if matches!(retained.origin, SourceOrigin::Formatted { .. }) {
+                assert!(
+                    document
+                        .original_ranges(
+                            crate::presentation::document::SourceId(index),
+                            0..retained.text.len(),
+                        )
+                        .is_none()
+                );
+            }
+        }
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            180,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let request = serde_json::json!({"command": source, "format_commands": true});
+        let draft = serde_json::json!({"preview": request.to_string()});
+        let live = serde_json::json!({"mode": "terminal", "arguments": {
+            "command": source, "presentation_policy": policy
+        }});
+        let final_payload = lifecycle_result_payload(&request, Some(policy), true);
+        let expected_rows =
+            lifecycle_command_rows(&adapter, "bcode.tool.request.shell.run", &request, &context);
+        let displayed = expected_rows
+            .iter()
+            .map(Line::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            displayed.contains(expected.trim_end_matches('\n')),
+            "{displayed}"
+        );
+        for (kind, payload) in [
+            ("bcode.tool.request.shell.run", &draft),
+            (SHELL_RUN_SCHEMA, &live),
+            (SHELL_RUN_SCHEMA, &final_payload),
+        ] {
+            // Line equality includes styles, not just text. The helper also checks exact copy.
+            assert_eq!(
+                lifecycle_command_rows(&adapter, kind, payload, &context),
+                expected_rows
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-python")]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "Python program text is intentional product input, not Rust formatting"
+    )]
+    fn python_formatter_acceptance_suites_dict_comments_and_nested_eval_lifecycle() {
+        let body = "if ready: data={'key':1};print(data) # keep\n";
+        let expected = "if ready:\n    data = {\"key\": 1}\n    print(data)  # keep\n";
+        let heredoc = format!("python3 - <<'PY'\n{body}PY\n");
+        assert_python_acceptance_lifecycle(&heredoc, expected);
+        let document = crate::presentation::present(
+            &heredoc,
+            &bcode_config::ShellOutputPresentationPolicy::default(),
+        );
+        assert!(document.display_text().contains("<<'PY'\nif ready:"));
+        assert!(!document.display_text().contains("<<'PY'\n\n"));
+        assert_python_acceptance_lifecycle(
+            "python3 -c 'if ready: data={\"key\":1};print(data)'",
+            "if ready:\n    data = {\"key\": 1}\n    print(data)\n",
+        );
+        assert_python_acceptance_lifecycle(
+            "python3 - <<-'PY'\n\tif ready:\n\t    print(1)\n\tPY\n",
+            "if ready:\n    print(1)\n",
+        );
+        assert_python_acceptance_lifecycle(
+            "bash -c 'python3 -c \"if ready: data={1:2};print(data)\"'",
+            "if ready:\n    data = {1: 2}\n    print(data)\n",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-python")]
+    fn python_formatter_acceptance_long_collection_and_string_rewrite_copy() {
+        assert_python_acceptance_lifecycle(
+            "python3 - <<'PY'\nvalues=[first_identifier_with_a_long_name,second_identifier_with_a_long_name,third_identifier_with_a_long_name]\nPY\n",
+            "values = [\n    first_identifier_with_a_long_name,\n    second_identifier_with_a_long_name,\n    third_identifier_with_a_long_name,\n]\n",
+        );
+        assert_python_acceptance_lifecycle(
+            "python3 - <<'PY'\nlabel='界😀';print(label);\nPY\n",
+            "label = \"界😀\"\nprint(label)\n",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-python")]
+    fn python_formatter_acceptance_invalid_and_incomplete_payloads_stay_literal() {
+        use crate::presentation::document::SourceOrigin;
+        for body in ["def f(", "if True print(1)"] {
+            let source = format!("python3 -c '{body}'");
+            let document = crate::presentation::present(
+                &source,
+                &bcode_config::ShellOutputPresentationPolicy::default(),
+            );
+            assert_eq!(document.execution_text(), source);
+            assert!(document.display_text().contains(body));
+            assert!(
+                !document
+                    .sources
+                    .iter()
+                    .any(|retained| { matches!(retained.origin, SourceOrigin::Formatted { .. }) })
+            );
+            let adapter = ShellRunTuiVisualAdapter::default();
+            let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            );
+            let request = serde_json::json!({"command": source});
+            let final_payload = lifecycle_result_payload(
+                &request,
+                Some(bcode_config::ShellOutputPresentationPolicy::default()),
+                true,
+            );
+            assert_eq!(
+                lifecycle_command_rows(
+                    &adapter,
+                    "bcode.tool.request.shell.run",
+                    &request,
+                    &context
+                ),
+                lifecycle_command_rows(&adapter, SHELL_RUN_SCHEMA, &final_payload, &context),
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-python")]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "Python program text is intentional product input, not Rust formatting"
+    )]
+    fn python_formatter_acceptance_disabled_preserves_bytes_and_syntax_roles() {
+        use crate::presentation::document::{Role, SourceOrigin};
+        let policy = bcode_config::ShellOutputPresentationPolicy {
+            enabled: false,
+            ..Default::default()
+        };
+        for source in [
+            "python3 - <<'PY'\nif ready:\n\tvalue={'key':42};print(value) # keep\nPY\n",
+            "bash -c 'python3 -c \"value={1:42};print(value)\"'",
+        ] {
+            let document = crate::presentation::present(source, &policy);
+            assert_eq!(document.display_text(), source);
+            assert_eq!(document.execution_text(), source);
+            assert!(
+                document
+                    .fragments
+                    .iter()
+                    .any(|fragment| fragment.role == Role::Number && fragment.text == "42")
+            );
+            assert!(
+                !document
+                    .sources
+                    .iter()
+                    .any(|retained| matches!(retained.origin, SourceOrigin::Formatted { .. }))
+            );
+            let adapter = ShellRunTuiVisualAdapter::default();
+            let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                180,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            );
+            let request = serde_json::json!({"command": source, "format_commands": false});
+            let draft = serde_json::json!({"preview": request.to_string()});
+            let live = serde_json::json!({"mode": "terminal", "arguments": {
+                "command": source, "presentation_policy": policy.clone()
+            }});
+            let final_payload = lifecycle_result_payload(&request, Some(policy.clone()), false);
+            let expected = lifecycle_command_rows(
+                &adapter,
+                "bcode.tool.request.shell.run",
+                &request,
+                &context,
+            );
+            for (kind, payload) in [
+                ("bcode.tool.request.shell.run", &draft),
+                (SHELL_RUN_SCHEMA, &live),
+                (SHELL_RUN_SCHEMA, &final_payload),
+            ] {
+                assert_eq!(
+                    lifecycle_command_rows(&adapter, kind, payload, &context),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-python")]
+    fn python_formatter_acceptance_width_reflow_has_no_fabricated_selection_cells() {
+        let source = "python3 - <<'PY'\nif ready: value='界😀';print(value);\nPY\n";
+        let body_start = source.find("if ready:").unwrap();
+        let body_end = source.rfind("PY\n").unwrap();
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let payload = serde_json::json!({"command": source});
+        for width in [0, 1, 2, 4, 8, 32, 100] {
+            let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                width,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            );
+            let projection = adapter.command_projection(&payload, &context);
+            if width == 0 {
+                assert!(projection.rows.is_empty());
+                continue;
+            }
+            assert_eq!(command::declared_copy(&projection), source);
+            assert!(
+                projection
+                    .rows
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width))
+            );
+            if width == 100 {
+                let body_row = projection
+                    .rows
+                    .iter()
+                    .position(|line| line.plain_text() == "if ready:")
+                    .unwrap();
+                assert!(
+                    projection
+                        .selection
+                        .iter()
+                        .filter(|(row, _)| *row == body_row)
+                        .all(|(_, selection)| selection.cells.is_empty())
+                );
+                assert!(projection.anchors.iter().any(|anchor| {
+                    anchor.row == body_row
+                        && anchor
+                            .source
+                            .as_ref()
+                            .is_some_and(|range| range.start == body_start)
+                }));
+            }
+            for (row, selection) in &projection.selection {
+                assert!(*row < projection.rows.len());
+                for cell in &selection.cells {
+                    assert!(cell.column + cell.width <= width);
+                    assert!(source.get(cell.bytes.clone()).is_some());
+                    // Formatted Python has region association, not exact scalar provenance.
+                    assert!(cell.bytes.end <= body_start || cell.bytes.start >= body_end);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-python")]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "Python dictionary syntax is intentional formatter input, not Rust formatting"
+    )]
+    fn python_formatter_acceptance_native_registry_admits_formatted_source_anchors() {
+        let registry = crate::shell_tui_registry();
+        for source in [
+            "python3 - <<'PY'\nif ready: data={1:2};print(data)\nPY\n",
+            "bash -c 'python3 -c \"if ready: data={1:2};print(data)\"'",
+        ] {
+            let payload = serde_json::json!({"command": source});
+            for width in [1, 4, 32, 120] {
+                let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                    width,
+                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                    None,
+                );
+                let adapter = ShellRunTuiVisualAdapter::default();
+                let projection = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::projection(
+                    &adapter,
+                    "bcode.tool.request.shell.run",
+                    &payload,
+                    &context,
+                );
+                bcode_plugin_sdk::tui_visual::validate_visual_anchors(
+                    &projection.anchors,
+                    projection.rows.len(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{error}; width={width}; anchors={:#?}", projection.anchors)
+                });
+                let accepted = registry
+                    .visual_projection(
+                        "shell-run-request-card",
+                        "bcode.tool.request.shell.run",
+                        &payload,
+                        &context,
+                    )
+                    .expect(
+                        "formatted command must survive the native registry validation boundary",
+                    );
+                assert_eq!(accepted.rows, projection.rows);
+                assert_eq!(command::declared_copy(&accepted), source);
+            }
+        }
+    }
+
     fn lifecycle_command_rows(
         adapter: &ShellRunTuiVisualAdapter,
         kind: &str,

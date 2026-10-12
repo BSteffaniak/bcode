@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(first.len(), 60);
         let identities: std::collections::BTreeSet<_> = first.iter().copied().collect();
         assert_eq!(identities.len(), 60);
-        for block in first.chunks_exact(3) {
+        for block in first.as_chunks::<3>().0 {
             assert!(
                 block
                     .iter()

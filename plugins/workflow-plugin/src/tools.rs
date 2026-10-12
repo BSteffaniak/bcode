@@ -704,7 +704,7 @@ fn invoke_context(
                         None
                     };
                     super::json_response(&bcode_tool::ToolInvocationResponse {
-                        output: projected.map_or_else(
+                        output: projected.unwrap_or_else(
                             || {
                                 if discovery_only {
                                     output_discovery_view(&context, &query)
@@ -716,7 +716,6 @@ fn invoke_context(
                                     context_output_with_navigation(&context, compact, &query)
                                 }
                             },
-                            std::convert::identity,
                         ),
                         is_error: false,
                         content: Vec::new(),

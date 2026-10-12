@@ -555,6 +555,31 @@ Unchanged gaps are not included. Legacy change metadata and retained sources rem
 available for compatibility; preview text is excluded from the compact model-facing
 result. This does not change live draft limits or introduce artifact pagination.
 
+## Embedded command formatting
+
+The shell plugin extracts statically associated interpreter arguments and stdin heredocs before
+language presentation. Python uses the published Ruff Rust formatter libraries (separate crate
+versioning from the Ruff application), with explicit defaults and an 88-column language policy.
+Formatting does not discover project configuration, execute Python, or change command bytes.
+The Nix development environment requires Rust 1.97 or newer for these libraries.
+
+Complete admitted Python programs receive syntax-aware indentation, spacing and line breaking.
+Invalid or incomplete programs retain their input bytes with tolerant syntax highlighting; formatting
+disabled bypasses Ruff entirely. JavaScript currently retains the conservative parser-backed adapter;
+a full formatter replacement requires separate backend and correspondence validation.
+
+Formatter output is a separate display source. Its input-region association supports stable anchors,
+but is not exact scalar correspondence: rewritten Python has no fabricated source-selection cells.
+Whole-command copy remains the original command, including removed punctuation and original quotes.
+Repeated region associations use generated-row anchor fallbacks instead of overlapping source ranges.
+Heredoc bodies reuse their existing line boundary rather than gaining a blank line during composition.
+
+Admission bounds bytes, syntax depth and traversal before formatting; accepted output and fragments
+are capped, and projections are cached independently of terminal width. Ruff has no cancellation
+callback: these limits do not claim a hard deadline or interruptibility. Local budget failures retain
+the enclosing source presentation and report a bounded limitation. BMUX owns terminal wrapping,
+clipping and measurement; language line width does not derive from terminal geometry.
+
 ## Interactive tool presentation
 
 `[tui.interactions]` controls terminal presentation for active plugin-owned interactions.

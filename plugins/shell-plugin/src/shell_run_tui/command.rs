@@ -137,6 +137,8 @@ pub(super) fn project_with_state(
     let identity = "shell-command:original";
     let mut frontier = 0;
     let mut segment_cursor = 0;
+    let mut anchor_end = 0;
+    let mut anchor_start = None;
     for measured in block.projection(&layout) {
         let row = result.rows.len();
         while segments
@@ -191,11 +193,15 @@ pub(super) fn project_with_state(
             .push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
                 key: format!("shell-command:{row}"),
                 row,
-                source: Some(bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
-                    identity: identity.to_owned(),
-                    start: anchor.unwrap_or(frontier),
-                    end: end.max(anchor.unwrap_or(frontier)),
-                }),
+                source: {
+                    admitted_anchor(
+                        identity,
+                        anchor.unwrap_or(frontier),
+                        end,
+                        &mut anchor_start,
+                        &mut anchor_end,
+                    )
+                },
             });
         frontier = end;
         result
@@ -218,6 +224,28 @@ pub(super) fn project_with_state(
         ));
     }
     result
+}
+
+// Rewritten/nested rows can share a source association. Preserve only non-overlapping
+// source anchors; other rows retain generated-row keys rather than invented byte geometry.
+fn admitted_anchor(
+    identity: &str,
+    start: usize,
+    end: usize,
+    previous_start: &mut Option<usize>,
+    previous_end: &mut usize,
+) -> Option<bcode_plugin_sdk::tui_visual::TuiVisualSourceRange> {
+    if start < *previous_end || *previous_start == Some(start) {
+        return None;
+    }
+    let end = end.max(start);
+    *previous_start = Some(start);
+    *previous_end = end;
+    Some(bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
+        identity: identity.to_owned(),
+        start,
+        end,
+    })
 }
 
 fn measured_anchor(
@@ -339,6 +367,7 @@ fn original_range(document: &Document, provenance: &Provenance) -> Option<Range<
     for _ in 0..document.sources.len() {
         match &document.sources.get(id.0)?.origin {
             SourceOrigin::Original => return Some(range),
+            SourceOrigin::Formatted { .. } => return document.original_region(id),
             SourceOrigin::Decoded { parent, encoded } => {
                 id = *parent;
                 range = encoded.clone();

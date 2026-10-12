@@ -143,6 +143,10 @@ repository = "https://github.com/BSteffaniak/bcode"
 version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
+ruff_formatter = { version = "0.0.17", default-features = false }
+ruff_python_formatter = { version = "0.0.17", default-features = false, features = [
+    "serde",
+] }
 # Internal brouter packages
 brouter_api_models           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/api/models" }
 brouter_catalog              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/catalog" }

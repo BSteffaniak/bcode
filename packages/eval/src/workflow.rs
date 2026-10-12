@@ -808,14 +808,12 @@ struct CliReadDiagnostic {
 
 fn readonly_connection_timeout(stderr: &[u8]) -> bool {
     stderr.len() <= 4096
-        && serde_json::from_slice::<CliReadDiagnostic>(stderr)
-            .ok()
-            .is_some_and(|error| {
-                error.schema_version == 1
-                    && error.code == "connection_timeout"
-                    && error.phase == "connect"
-                    && error.message == "Verified daemon connection timed out."
-            })
+        && serde_json::from_slice::<CliReadDiagnostic>(stderr).is_ok_and(|error| {
+            error.schema_version == 1
+                && error.code == "connection_timeout"
+                && error.phase == "connect"
+                && error.message == "Verified daemon connection timed out."
+        })
 }
 
 fn readonly_operation(args: &[String]) -> Option<&'static str> {

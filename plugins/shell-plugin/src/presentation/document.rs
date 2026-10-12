@@ -14,6 +14,13 @@ pub struct SourceId(pub usize);
 pub enum SourceOrigin {
     /// Exact command bytes supplied by the caller.
     Original,
+    /// Formatter-owned display bytes associated with, but not byte-equivalent to, input.
+    Formatted {
+        /// Earlier source supplying the program.
+        parent: SourceId,
+        /// Input region represented by this display source.
+        range: Range<usize>,
+    },
     /// A decoded program, not byte-for-byte interchangeable with its parent spelling.
     Decoded {
         /// Source containing the encoded spelling.
@@ -325,6 +332,53 @@ impl Document {
             }
         }
         (offset == range.end).then_some(ranges)
+    }
+
+    /// Retain formatter output without claiming byte-equivalence with its input.
+    /// The association provides a stable region anchor, not selectable-byte correspondence.
+    pub fn add_formatted(
+        &mut self,
+        text: String,
+        parent: SourceId,
+        range: Range<usize>,
+    ) -> Option<SourceId> {
+        self.sources.get(parent.0)?.text.get(range.clone())?;
+        let id = SourceId(self.sources.len());
+        self.sources.push(Source {
+            text,
+            origin: SourceOrigin::Formatted { parent, range },
+            correspondence: Vec::new(),
+        });
+        Some(id)
+    }
+
+    /// Return the original region associated with a source, without implying exact mapping.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "Option already carries must-use; repository policy forbids duplicating it"
+    )]
+    pub fn original_region(&self, id: SourceId) -> Option<Range<usize>> {
+        match &self.sources.get(id.0)?.origin {
+            SourceOrigin::Original => Some(0..self.execution_text().len()),
+            SourceOrigin::Decoded { parent, encoded } => {
+                if parent.0 >= id.0 {
+                    return None;
+                }
+                if *parent == SourceId(0) {
+                    Some(encoded.clone())
+                } else {
+                    self.original_region(*parent)
+                }
+            }
+            SourceOrigin::Formatted { parent, range } => {
+                if parent.0 >= id.0 {
+                    return None;
+                }
+                self.original_ranges(*parent, range.clone())
+                    .and_then(|ranges| Some(ranges.first()?.start..ranges.last()?.end))
+                    .or_else(|| self.original_region(*parent))
+            }
+        }
     }
 
     /// Append exact bytes from a validated source range; false leaves the document unchanged.

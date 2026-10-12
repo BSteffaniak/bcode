@@ -2844,6 +2844,87 @@ mod tests {
         }
     }
 
+    fn assert_shell_acceptance_native_route(app: &BmuxApp) {
+        let registry = app
+            .plugin_presentation()
+            .expect("shell presentation host installed")
+            .registry("bcode.shell")
+            .expect("static shell registry loaded");
+        assert!(
+            registry
+                .supports_visual_adapter("shell-run-request-card", "bcode.tool.request.shell.run",)
+        );
+        drop(registry);
+        assert!(
+            app.plugin_presentation()
+                .expect("shell presentation host installed")
+                .visual_route("bcode.tool.request.shell.run", 1, Some("bcode.shell"),)
+                .is_some(),
+            "shell request must have an available native adapter route"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "Python program text is intentional product input, not Rust formatting"
+    )]
+    fn python_formatter_acceptance_frames_reflow_and_restore_without_source_rewrite() {
+        let session_id = SessionId::new();
+        let command = "bash -c 'python3 -c \"if ready: data={1:2};print(data)\"'";
+        let arguments = serde_json::json!({"command": command, "cwd": "/tmp/project"}).to_string();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(&mut app, 120, 50)
+            .with_plugin_host(Arc::new(shell_plugin_host()))
+            .run([
+                shell_streamed_draft_step(session_id, 1, 1, &arguments),
+                TranscriptFrameStep {
+                    label: "python-narrow",
+                    input: TranscriptFrameInput::Resize(32, 50),
+                },
+                TranscriptFrameStep {
+                    label: "python-idle",
+                    input: TranscriptFrameInput::Observe,
+                },
+                TranscriptFrameStep {
+                    label: "python-wide",
+                    input: TranscriptFrameInput::Resize(120, 50),
+                },
+                TranscriptFrameStep {
+                    label: "python-request",
+                    input: durable_input(durable(
+                        session_id,
+                        1,
+                        SessionEventKind::ToolCallRequested {
+                            tool_call_id: "call-long-shell".to_owned(),
+                            producer_plugin_id: Some("bcode.shell".to_owned()),
+                            tool_name: "shell.run".to_owned(),
+                            arguments_json: arguments,
+                            working_directory: Some(std::path::PathBuf::from("/tmp/project")),
+                        },
+                    )),
+                },
+            ]);
+        assert_shell_acceptance_native_route(&app);
+        assert_eq!(frames.len(), 5);
+        assert_eq!(frames[1].text, frames[2].text);
+        assert_eq!(frames[0].text, frames[3].text);
+        let identity = &frames[0].observation.semantic_items[0].0;
+        for frame in &frames {
+            assert_eq!(frame.observation.semantic_items.len(), 1, "{}", frame.text);
+            assert_eq!(frame.observation.terminal_items.len(), 1, "{}", frame.text);
+            assert_eq!(&frame.observation.semantic_items[0].0, identity);
+            assert!(!frame.text.contains("{\"command\""), "{}", frame.text);
+        }
+        for index in [0, 3, 4] {
+            let text = &frames[index].text;
+            assert!(text.contains("if ready:"), "{text}");
+            assert!(text.contains("    data = {1: 2}"), "{text}");
+            assert!(text.contains("    print(data)"), "{text}");
+            assert!(!text.contains("data={1:2};print"), "{text}");
+        }
+    }
+
     #[test]
     fn nested_command_drafts_reflow_without_losing_lifecycle_identity() {
         let session_id = SessionId::new();
@@ -2887,6 +2968,7 @@ mod tests {
                     input: TranscriptFrameInput::Resize(100, 50),
                 },
             ]);
+        assert_shell_acceptance_native_route(&app);
         assert_eq!(frames.len(), 6);
         for frame in &frames {
             assert_eq!(frame.observation.semantic_items.len(), 1, "{}", frame.text);

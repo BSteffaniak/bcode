@@ -110,12 +110,10 @@ fn embed(
             break;
         }
         let Some(extracted) = extraction::extract(&source, &invocation, budget.max_source_bytes)
+            .filter(|extracted| !extracted.uncertain)
         else {
             continue;
         };
-        if extracted.uncertain {
-            continue;
-        }
         let adapter: Option<&dyn LanguageAdapter> = match extracted.language {
             #[cfg(feature = "embedded-python")]
             extraction::Language::Python if policy.python => Some(&python::PythonAdapter),
@@ -159,14 +157,15 @@ fn embed(
         };
         let nested_allowance = remaining.saturating_sub(1);
         let mut nested_remaining = nested_allowance;
-        let accepted = if input.depth >= budget.max_depth {
-            Err(AdapterFailure::BudgetExceeded)
-        } else if let Some(adapter) = adapter {
-            adapter.present_outcome(document, &input, budget)
-        } else {
-            present_nested(document, &input, policy, budget, &mut nested_remaining);
-            Ok(())
-        };
+        let accepted = present_child(
+            document,
+            &input,
+            budget,
+            policy,
+            extracted.language,
+            adapter,
+            &mut nested_remaining,
+        );
         if let Err(reason) = accepted {
             rollback(
                 document,
@@ -200,6 +199,40 @@ fn embed(
             continue;
         }
         *remaining = nested_remaining;
+    }
+}
+
+fn present_child(
+    document: &mut Document,
+    input: &AdapterInput,
+    budget: &Budget,
+    policy: &ShellOutputPresentationPolicy,
+    language: extraction::Language,
+    adapter: Option<&dyn LanguageAdapter>,
+    remaining: &mut usize,
+) -> Result<(), AdapterFailure> {
+    if input.depth >= budget.max_depth {
+        return Err(AdapterFailure::BudgetExceeded);
+    }
+    if !policy.enabled && language == extraction::Language::Python {
+        #[cfg(feature = "embedded-python")]
+        {
+            return if python::PythonAdapter::present_highlight(document, input, budget) {
+                Ok(())
+            } else {
+                Err(AdapterFailure::BudgetExceeded)
+            };
+        }
+        #[cfg(not(feature = "embedded-python"))]
+        {
+            return Err(AdapterFailure::Unavailable);
+        }
+    }
+    if let Some(adapter) = adapter {
+        adapter.present_outcome(document, input, budget)
+    } else {
+        present_nested(document, input, policy, budget, remaining);
+        Ok(())
     }
 }
 
@@ -345,11 +378,13 @@ fn replace(
             first.role,
         ));
     }
-    fragments.push(document::Fragment {
-        text: "\n".to_owned(),
-        role: Role::Whitespace,
-        provenance: Provenance::Generated,
-    });
+    if !source[..encoded.start].ends_with('\n') {
+        fragments.push(document::Fragment {
+            text: "\n".to_owned(),
+            role: Role::Whitespace,
+            provenance: Provenance::Generated,
+        });
+    }
     for mut fragment in replacement {
         if fragment.role == Role::Literal {
             // Preserve the local parent role, not an unrelated prefix's role. A decoded
@@ -749,12 +784,20 @@ mod tests {
                     match &fragment.provenance {
                         Provenance::Source { id, range } => {
                             assert_eq!(fragment.text, document.sources[id.0].text[range.clone()]);
-                            let ranges = document.original_ranges(*id, range.clone()).unwrap();
-                            assert!(
-                                ranges
-                                    .iter()
-                                    .all(|range| prefix.get(range.clone()).is_some())
-                            );
+                            if matches!(
+                                document.sources[id.0].origin,
+                                document::SourceOrigin::Formatted { .. }
+                            ) {
+                                assert_eq!(document.original_ranges(*id, range.clone()), None);
+                                assert!(document.original_region(*id).is_some());
+                            } else {
+                                let ranges = document.original_ranges(*id, range.clone()).unwrap();
+                                assert!(
+                                    ranges
+                                        .iter()
+                                        .all(|range| prefix.get(range.clone()).is_some())
+                                );
+                            }
                         }
                         Provenance::Generated => assert!(fragment.text.trim().is_empty()),
                     }

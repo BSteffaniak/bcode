@@ -16,11 +16,17 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        # Keep the native formatter crates and development tools on a compatible toolchain.
+        rustc =
+          assert pkgs.lib.versionAtLeast pkgs.rustc.version "1.97";
+          pkgs.rustc;
       in
       {
         devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
+          buildInputs = [
             rustc
+          ]
+          ++ (with pkgs; [
             cargo
             rustfmt
             clippy
@@ -29,7 +35,7 @@
             pkg-config
             openssl
             fish
-          ];
+          ]);
 
           shellHook = ''
             echo "bcode development environment loaded"
