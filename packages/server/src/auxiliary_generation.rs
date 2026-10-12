@@ -222,11 +222,19 @@ async fn stream(
     let payload = serde_json::to_vec(request).map_err(|_| "auxiliary request encoding failed")?;
     let mut invocation = tokio::time::timeout_at(
         deadline,
-        state.plugins.invoke_service_with_events(
+        state.plugins.invoke_service_with_events_and_bridge_scoped(
             provider,
             MODEL_PROVIDER_INTERFACE_ID_V3,
             OP_RUN_TURN,
             payload,
+            PluginInvocationScope::session(request.session_id.to_string()),
+            Some(super::server_model_provider_bridge(
+                state.plugins.clone(),
+                state.session_config(request.session_id).await,
+                state.optional_judgement.invalidation_handle(),
+                &request.turn_id,
+                provider,
+            )),
         ),
     )
     .await

@@ -160,7 +160,8 @@ async fn dispatch_one(
     } else {
         RuntimeWorkStatus::Failed
     };
-    finish_registered_runtime_work(state, facts.session_id, work_id, status, None).await;
+    let diagnostic = result.as_ref().err().cloned();
+    finish_registered_runtime_work(state, facts.session_id, work_id, status, diagnostic).await;
     !cancellation.is_cancelled()
 }
 

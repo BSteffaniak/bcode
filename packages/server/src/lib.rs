@@ -40938,7 +40938,8 @@ async fn handle_explicit_session_milestone(
     } else {
         RuntimeWorkStatus::Failed
     };
-    finish_registered_runtime_work(state, session_id, work_id, status, None).await;
+    let diagnostic = result.as_ref().err().cloned();
+    finish_registered_runtime_work(state, session_id, work_id, status, diagnostic).await;
     result
 }
 
@@ -41521,10 +41522,7 @@ async fn resolve_session_plugin_application_request(
                 payload: serde_json::to_value(result)
                     .map_err(|_| "milestone response encoding failed")?,
             },
-            Err(_) => bcode_tool::ToolInvocationServiceResolution::Failed {
-                code: "milestone_unavailable".into(),
-                message: "Milestone operation unavailable.".into(),
-            },
+            Err(error) => return Err(error),
         }));
     }
     let sessions = &state.sessions;

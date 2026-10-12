@@ -569,6 +569,10 @@ mod tests {
                     context,
                 );
             }
+            assert!(
+                context.bridge.is_available(),
+                "auxiliary inference requires the provider custody bridge"
+            );
             assert!(request.tools.is_empty());
             assert!(
                 request
