@@ -21,12 +21,11 @@ pub struct ShellAdapter;
 #[must_use]
 pub fn present(source: &str, policy: InputPolicy, budget: &Budget) -> Document {
     let mut document = Document::original(source);
-    let input = AdapterInput {
-        source: SourceId(0),
-        range: 0..source.len(),
-        depth: 0,
-    };
-    if policy == InputPolicy::Literal || !ShellAdapter.present(&mut document, &input, budget) {
+    if source.len() > budget.max_source_bytes
+        || budget.max_depth == 0
+        || !project(&mut document, budget, policy)
+    {
+        document.fragments.clear();
         document.push_source(SourceId(0), 0..source.len(), Role::Literal);
     }
     document
@@ -83,6 +82,7 @@ pub fn invocations(source: &str, budget: &Budget) -> Vec<super::extraction::Invo
         partial_word,
         tokens: &[],
         breaks: BTreeMap::new(),
+        subroles: BTreeMap::new(),
         roles: BTreeMap::new(),
         max_depth: syntax_depth(budget),
         remaining: budget.max_fragments,
@@ -107,7 +107,7 @@ impl LanguageAdapter for ShellAdapter {
         }
         // Build in a separate projection so failure cannot partially append or mutate sources.
         let mut projection = Document::original(source);
-        if !project(&mut projection, budget) {
+        if !project(&mut projection, budget, InputPolicy::Format) {
             return false;
         }
         if document
@@ -147,6 +147,7 @@ struct Plan<'a> {
     partial_word: Option<Range<usize>>,
     tokens: &'a [Token],
     breaks: BTreeMap<usize, Break>,
+    subroles: BTreeMap<usize, (usize, Role)>,
     roles: BTreeMap<usize, Role>,
     max_depth: usize,
     remaining: usize,
@@ -154,7 +155,7 @@ struct Plan<'a> {
     collect_invocations: bool,
 }
 
-fn project(document: &mut Document, budget: &Budget) -> bool {
+fn project(document: &mut Document, budget: &Budget, policy: InputPolicy) -> bool {
     let source = document.execution_text().to_owned();
     let (tokens, safe_end) = lex(&source, budget.max_fragments);
     let Some(tokens) = tokens else { return false };
@@ -162,7 +163,7 @@ fn project(document: &mut Document, budget: &Budget) -> bool {
         Parser::with_limits_and_profile(
             text,
             syntax_depth(budget),
-            budget.max_source_bytes.saturating_mul(32),
+            text.len().saturating_add(1).saturating_mul(32),
             ShellProfile::native(ShellDialect::Bash),
         )
         .parse()
@@ -171,14 +172,14 @@ fn project(document: &mut Document, budget: &Budget) -> bool {
     if !parsed.is_ok() {
         // Lexical nesting merely proposes a completion. A clean parser must verify it before
         // any original token receives structural meaning; recovered AST coverage is not trusted.
-        let Some(suffix) = recovery_suffix(&source[..safe_end], &tokens, syntax_depth(budget))
-        else {
-            return false;
-        };
-        let completed = format!("{}\ntrue\n{suffix}", &source[..safe_end]);
-        parsed = parse(&completed);
-        if !parsed.is_ok() {
-            return false;
+        if let Some(suffix) = recovery_suffix(&source[..safe_end], &tokens, syntax_depth(budget)) {
+            let completed = format!("{}\ntrue\n{suffix}", &source[..safe_end]);
+            if completed.len() <= budget.max_source_bytes {
+                let recovered = parse(&completed);
+                if recovered.is_ok() {
+                    parsed = recovered;
+                }
+            }
         }
     }
     let mut plan = Plan {
@@ -186,13 +187,74 @@ fn project(document: &mut Document, budget: &Budget) -> bool {
         partial_word: None,
         tokens: &tokens,
         breaks: BTreeMap::new(),
+        subroles: BTreeMap::new(),
         roles: BTreeMap::new(),
         max_depth: syntax_depth(budget),
         remaining: budget.max_fragments,
         invocations: Vec::new(),
         collect_invocations: false,
     };
-    plan.sequence(&parsed.file.body, 0, false, 0);
+    if parsed.is_ok() {
+        plan.sequence(&parsed.file.body, 0, false, 0);
+    } else {
+        // One bounded, independently clean prefix parse can authorize structure before a
+        // damaged statement. Recovered AST nodes themselves never authorize whitespace edits.
+        let diagnostic = parsed
+            .diagnostics
+            .iter()
+            .map(|item| item.span.start.offset())
+            .min();
+        let terminal = parsed.terminal_error.as_ref().and_then(|error| {
+            let shuck_parser::Error::Parse { line, column, .. } = error;
+            if *line == 0 || *column == 0 {
+                return None;
+            }
+            let start = source
+                .split_inclusive('\n')
+                .take(line.saturating_sub(1))
+                .map(str::len)
+                .sum::<usize>();
+            Some(start.saturating_add(column.saturating_sub(1)))
+        });
+        let uncertain = diagnostic.into_iter().chain(terminal).min().unwrap_or(0);
+        let ast_end = parsed
+            .file
+            .body
+            .stmts
+            .iter()
+            .map(|statement| statement.span.end.offset())
+            .filter(|end| *end < uncertain && *end <= safe_end)
+            .max()
+            .unwrap_or(0);
+        // Fatal parsing can discard the enclosing command list. Lexer separators only
+        // nominate boundaries; each candidate still needs a clean independent parse.
+        let mut candidates = std::collections::BTreeSet::new();
+        if ast_end != 0 {
+            candidates.insert(ast_end);
+        }
+        for token in &tokens {
+            if token.range.end <= uncertain
+                && matches!(token.kind, TokenKind::Semicolon | TokenKind::Newline)
+            {
+                candidates.insert(token.range.end);
+            }
+        }
+        let mut remaining_bytes = budget.max_source_bytes.saturating_mul(8);
+        for end in candidates.into_iter().rev() {
+            if end > remaining_bytes {
+                break;
+            }
+            remaining_bytes -= end;
+            let prefix = parse(&source[..end]);
+            if prefix.is_ok() {
+                plan.sequence(&prefix.file.body, 0, false, 0);
+                break;
+            }
+        }
+    }
+    if policy == InputPolicy::Literal {
+        plan.breaks.clear();
+    }
     emit(document, &source, &tokens, &plan, safe_end);
     document.fragments.len() <= budget.max_fragments
 }
@@ -393,6 +455,41 @@ impl Plan<'_> {
         }
     }
 
+    fn word_parts(&mut self, parts: &[shuck_ast::WordPartNode], depth: usize) {
+        if depth >= self.max_depth {
+            return;
+        }
+        for part in parts {
+            if self.remaining == 0 {
+                return;
+            }
+            self.remaining -= 1;
+            let range = part.span.start.offset()..part.span.end.offset();
+            if self.source.get(range.clone()).is_none() || range.is_empty() {
+                continue;
+            }
+            match &part.kind {
+                shuck_ast::WordPart::Variable(_)
+                | shuck_ast::WordPart::Parameter(_)
+                | shuck_ast::WordPart::ParameterExpansion { .. }
+                | shuck_ast::WordPart::Length(_)
+                | shuck_ast::WordPart::ArrayAccess(_)
+                | shuck_ast::WordPart::ArrayLength(_)
+                | shuck_ast::WordPart::Substring { .. }
+                | shuck_ast::WordPart::IndirectExpansion { .. }
+                | shuck_ast::WordPart::PrefixMatch { .. }
+                | shuck_ast::WordPart::Transformation { .. } => {
+                    self.subroles
+                        .insert(range.start, (range.end, Role::Variable));
+                }
+                shuck_ast::WordPart::DoubleQuoted { parts, .. } => {
+                    self.word_parts(parts, depth + 1);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn sequence(&mut self, sequence: &StmtSeq, indent: usize, first_break: bool, depth: usize) {
         for (index, statement) in sequence.stmts.iter().enumerate() {
             self.statement(statement, indent, first_break || index != 0, depth);
@@ -417,6 +514,9 @@ impl Plan<'_> {
                         invocation(self.source, statement, command, self.partial_word.as_ref())
                 {
                     self.invocations.push(invocation);
+                }
+                for word in std::iter::once(&command.name).chain(&command.args) {
+                    self.word_parts(&word.parts, 0);
                 }
                 let range = command.name.span.start.offset()..command.name.span.end.offset();
                 if self.tokens.iter().any(|token| token.range == range) {
@@ -702,6 +802,51 @@ fn invocation(
     Some(super::extraction::Invocation { words, stdin })
 }
 
+fn lexical_role(token: &Token, source: &str) -> Role {
+    let text = &source[token.range.clone()];
+    match token.kind {
+        TokenKind::Comment => Role::Comment,
+        TokenKind::QuotedWord | TokenKind::LiteralWord => Role::String,
+        TokenKind::Newline => Role::Whitespace,
+        TokenKind::Word
+            if text.strip_prefix('$').is_some_and(|name| {
+                let name = name
+                    .strip_prefix('{')
+                    .and_then(|name| name.strip_suffix('}'))
+                    .unwrap_or(name);
+                let mut bytes = name.bytes();
+                bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            }) =>
+        {
+            Role::Variable
+        }
+        TokenKind::Word
+            if text.starts_with('-')
+                && text.len() > 1
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_=./".contains(&byte))
+                && text.bytes().any(|byte| byte.is_ascii_alphabetic()) =>
+        {
+            Role::Flag
+        }
+        TokenKind::Word
+            if text.bytes().any(|byte| byte.is_ascii_digit())
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || b".+-".contains(&byte))
+                && text.parse::<f64>().is_ok() =>
+        {
+            Role::Number
+        }
+        kind if kind.is_word_like() => Role::Literal,
+        _ => Role::Operator,
+    }
+}
+
 fn emit(document: &mut Document, source: &str, tokens: &[Token], plan: &Plan<'_>, safe_end: usize) {
     let mut offset = 0;
     let mut previous_kind = None;
@@ -735,14 +880,16 @@ fn emit(document: &mut Document, source: &str, tokens: &[Token], plan: &Plan<'_>
             .roles
             .get(&token.range.start)
             .copied()
-            .unwrap_or_else(|| match token.kind {
-                TokenKind::Comment => Role::Comment,
-                TokenKind::QuotedWord => Role::String,
-                TokenKind::Newline => Role::Whitespace,
-                kind if kind.is_word_like() => Role::Literal,
-                _ => Role::Operator,
-            });
-        document.push_source(SourceId(0), token.range.clone(), role);
+            .unwrap_or_else(|| lexical_role(token, source));
+        let mut start = token.range.start;
+        for (&position, &(end, subrole)) in plan.subroles.range(token.range.clone()) {
+            if position >= start && end <= token.range.end {
+                document.push_source(SourceId(0), start..position, role);
+                document.push_source(SourceId(0), position..end, subrole);
+                start = end;
+            }
+        }
+        document.push_source(SourceId(0), start..token.range.end, role);
         offset = token.range.end;
         previous_kind = Some(token.kind);
     }
@@ -777,6 +924,81 @@ mod tests {
             }
         }
         assert!(source[previous..].trim().is_empty());
+    }
+
+    #[test]
+    fn literal_policy_retains_syntax_and_exact_source_for_every_utf8_prefix() {
+        for source in [
+            "echo --verbose $value 42 界😀; [[ unsupported ??? ]]; echo \"unfinished",
+            "if true; then echo --flag 12; fi; cat <<-EOF\n\t界; raw\nEOF",
+            "echo --flag 42; echo 'unterminated 界😀",
+            "echo --flag 42; function f() { echo 界; }; @@@ ???",
+        ] {
+            for end in (0..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+                let prefix = &source[..end];
+                let document = present(prefix, InputPolicy::Literal, &Budget::default());
+                assert_eq!(document.display_text(), prefix);
+                assert_eq!(document.execution_text(), prefix);
+                let mut offset = 0;
+                for fragment in &document.fragments {
+                    let Provenance::Source { id, range } = &fragment.provenance else {
+                        panic!("literal policy generated bytes");
+                    };
+                    assert_eq!(*id, SourceId(0));
+                    assert_eq!(range.start, offset);
+                    assert_eq!(fragment.text, prefix[range.clone()]);
+                    assert_eq!(
+                        document.original_ranges(*id, range.clone()),
+                        Some(vec![range.clone()])
+                    );
+                    offset = range.end;
+                }
+                assert_eq!(offset, prefix.len());
+                if end >= "echo --verbose".len() && source.starts_with("echo --verbose") {
+                    assert!(
+                        document
+                            .fragments
+                            .iter()
+                            .any(|fragment| fragment.role == Role::Flag
+                                && fragment.text == "--verbose"),
+                        "{prefix}"
+                    );
+                }
+                assert_provenance(prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn local_parse_uncertainty_preserves_lexical_roles_and_clean_structure() {
+        for tail in [
+            "[[ unsupported ???",
+            "echo \"unfinished",
+            "cat <<EOF\n界",
+            "echo $((1 +",
+        ] {
+            let source = format!("if true; then echo --flag $value 42; fi; {tail}");
+            let document = present(&source, InputPolicy::Format, &Budget::default());
+            for (text, role) in [
+                ("--flag", Role::Flag),
+                ("$value", Role::Variable),
+                ("42", Role::Number),
+            ] {
+                assert!(
+                    document
+                        .fragments
+                        .iter()
+                        .any(|fragment| fragment.text == text && fragment.role == role),
+                    "{source}: {text}"
+                );
+            }
+            assert!(
+                document.display_text().contains("then\n  echo"),
+                "{source}: {}",
+                document.display_text()
+            );
+            assert_provenance(&source);
+        }
     }
 
     #[test]

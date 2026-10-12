@@ -64,6 +64,16 @@ pub enum Role {
     Literal,
     /// Command name.
     Command,
+    /// Statically spelled shell option.
+    Flag,
+    /// Parser-recognized variable expansion.
+    Variable,
+    /// Numeric literal.
+    Number,
+    /// Embedded-language identifier.
+    Identifier,
+    /// Embedded-language function name or direct call target.
+    Function,
     /// Grammar-recognized control keyword.
     Keyword,
     /// Shell punctuation or operator.
@@ -99,7 +109,8 @@ pub struct Line {
 /// Presentation input policy; never changes execution bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputPolicy {
-    /// Display the original bytes without formatting or decoding embedded programs.
+    /// Display original bytes without whitespace formatting or embedded decoding;
+    /// source-validated syntax roles remain available.
     Literal,
     /// Allow source-backed structural presentation.
     Format,

@@ -347,8 +347,16 @@ fn source_revision(source: &str) -> u64 {
 
 fn role_style(role: Role) -> bmux_tui::prelude::Style {
     match role {
-        Role::Command => command_style(),
-        Role::Keyword => flag_style(),
+        Role::Command | Role::Function => command_style(),
+        Role::Keyword | Role::Flag => flag_style(),
+        Role::Variable | Role::Identifier => super::syntax_style(
+            |syntax| syntax.variable.to_tui(),
+            bmux_tui::prelude::Color::Blue,
+        ),
+        Role::Number => super::syntax_style(
+            |syntax| syntax.number.to_tui(),
+            bmux_tui::prelude::Color::Magenta,
+        ),
         Role::Operator => operator_style(),
         Role::String => string_style(),
         Role::Comment => muted_style(),

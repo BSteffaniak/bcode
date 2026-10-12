@@ -13,6 +13,8 @@ pub struct TranscriptFrameSnapshot {
     pub text: String,
     pub observation: TranscriptFrameObservation,
     pub markdown_fresh_equivalent: bool,
+    /// Painted cells retained with their styles so acceptance checks can detect lost highlighting.
+    pub cells: Vec<bmux_tui::buffer::Cell>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +251,7 @@ impl<'a> TranscriptFrameSequence<'a> {
             text,
             observation: self.app.frame_observation(),
             markdown_fresh_equivalent,
+            cells: buffer.cells().to_vec(),
         }
     }
 }
@@ -3014,12 +3017,8 @@ mod tests {
                             metadata: serde_json::json!({
                                 "mode": "terminal",
                                 "timeout_ms": 30_000,
-                                "arguments": {
-                                    "command": "printf 'hello from shell\\n'",
-                                    "cwd": "/tmp/project",
-                                    "columns": 100,
-                                    "rows": 30
-                                },
+                                "presentation_policy": bcode_config::ShellOutputPresentationPolicy::default(),
+                                "format_commands": true,
                                 "output_tail": "hello from shell\n",
                                 "exit_code": 0,
                                 "columns": 100,
@@ -3076,6 +3075,42 @@ mod tests {
         );
         assert!(frames[4].text.contains("exit code 0"), "{}", frames[4].text);
         assert!(frames[5].text.contains("exit code 0"), "{}", frames[5].text);
+        let painted_style = |frame: &TranscriptFrameSnapshot, needle: &str| {
+            let symbols = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+            frame
+                .cells
+                .windows(symbols.len())
+                .find(|cells| {
+                    cells
+                        .iter()
+                        .zip(&symbols)
+                        .all(|(cell, symbol)| &cell.symbol == symbol)
+                })
+                .map_or_else(
+                    || panic!("missing {needle} in {}: {}", frame.label, frame.text),
+                    |cells| cells[0].style,
+                )
+        };
+        let command_style = painted_style(&frames[1], "printf");
+        let string_style = painted_style(&frames[1], "'hello");
+        assert_ne!(
+            command_style.fg, string_style.fg,
+            "command and string must retain distinct syntax roles"
+        );
+        for frame in &frames[2..] {
+            assert_eq!(
+                painted_style(frame, "printf"),
+                command_style,
+                "{} lost command highlighting",
+                frame.label
+            );
+            assert_eq!(
+                painted_style(frame, "'hello"),
+                string_style,
+                "{} lost string highlighting",
+                frame.label
+            );
+        }
         assert_no_forbidden_frames(&frames, |frame| {
             (frame.text.contains("Tool · shell.run")
                 || frame.text.contains("{\"command\"")
@@ -3723,6 +3758,7 @@ mod tests {
                     anchor: None,
                 },
                 markdown_fresh_equivalent: true,
+                cells: Vec::new(),
             },
             TranscriptFrameSnapshot {
                 label: "flash".to_owned(),
@@ -3737,6 +3773,7 @@ mod tests {
                     anchor: None,
                 },
                 markdown_fresh_equivalent: true,
+                cells: Vec::new(),
             },
         ];
         let error = assert_no_forbidden_frames(&frames, |frame| {

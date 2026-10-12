@@ -156,26 +156,16 @@ fn parse_tokens(source: &str, budget: &Budget) -> Option<Vec<Token>> {
 }
 
 fn opaque(node: Node<'_>) -> bool {
-    node.is_error()
-        || (node.has_error()
-            && matches!(
-                node.kind(),
-                "lexical_declaration"
-                    | "variable_declaration"
-                    | "expression_statement"
-                    | "return_statement"
-                    | "throw_statement"
-            ))
-        || matches!(
-            node.kind(),
-            "string"
-                | "template_string"
-                | "regex"
-                | "comment"
-                | "hash_bang_line"
-                | "jsx_element"
-                | "jsx_self_closing_element"
-        )
+    matches!(
+        node.kind(),
+        "string"
+            | "template_string"
+            | "regex"
+            | "comment"
+            | "hash_bang_line"
+            | "jsx_element"
+            | "jsx_self_closing_element"
+    )
 }
 
 fn token(node: Node<'_>) -> Token {
@@ -197,32 +187,53 @@ fn token(node: Node<'_>) -> Token {
         "if" | "else" | "for" | "while" | "do" | "switch" | "case" | "default" | "return"
         | "throw" | "break" | "continue" | "function" | "class" | "const" | "let" | "var"
         | "try" | "catch" | "finally" | "async" | "await" => Role::Keyword,
+        "number" => Role::Number,
+        "identifier"
+        | "property_identifier"
+        | "shorthand_property_identifier"
+        | "shorthand_property_identifier_pattern" => {
+            if node.parent().is_some_and(|parent| {
+                (parent.kind() == "call_expression"
+                    && parent.child_by_field_name("function") == Some(node))
+                    || (matches!(
+                        parent.kind(),
+                        "function_declaration" | "function_expression" | "method_definition"
+                    ) && parent.child_by_field_name("name") == Some(node))
+            }) {
+                Role::Function
+            } else {
+                Role::Identifier
+            }
+        }
+        _ if node.is_error() => Role::Literal,
         _ if !node.is_named() => Role::Operator,
         _ => Role::Literal,
     };
+    let certain = !node.has_error() && !node.is_missing() && !node.is_error();
     Token {
         range: node.byte_range(),
         role,
-        opens: block && matches!(kind, "{" | "["),
-        closes: block && matches!(kind, "}" | "]"),
-        ends_statement: (kind == ","
-            && matches!(
-                parent,
-                "object" | "object_pattern" | "array" | "array_pattern"
-            ))
-            || (kind == ";"
-                && !for_header_semicolon(node)
+        opens: certain && block && matches!(kind, "{" | "["),
+        closes: certain && block && matches!(kind, "}" | "]"),
+        ends_statement: certain
+            && ((kind == ","
                 && matches!(
                     parent,
-                    "expression_statement"
-                        | "lexical_declaration"
-                        | "variable_declaration"
-                        | "return_statement"
-                        | "throw_statement"
-                        | "break_statement"
-                        | "continue_statement"
-                        | "empty_statement"
-                )),
+                    "object" | "object_pattern" | "array" | "array_pattern"
+                ))
+                || (kind == ";"
+                    && !for_header_semicolon(node)
+                    && matches!(
+                        parent,
+                        "expression_statement"
+                            | "lexical_declaration"
+                            | "variable_declaration"
+                            | "return_statement"
+                            | "throw_statement"
+                            | "break_statement"
+                            | "continue_statement"
+                            | "empty_statement"
+                    ))),
     }
 }
 
@@ -417,6 +428,28 @@ mod tests {
                     .any(|fragment| fragment.text == literal)
             );
             assert_coverage(&document, &source);
+        }
+    }
+
+    #[test]
+    fn recovered_statement_keeps_identifier_function_and_number_roles() {
+        let source = "const value=42;print(value); let result=(界";
+        for end in (0..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+            let prefix = &source[..end];
+            let document = present(prefix);
+            assert_coverage(&document, prefix);
+            if end >= "const value=42".len() {
+                assert!(
+                    document
+                        .fragments
+                        .iter()
+                        .any(|fragment| fragment.text == "42" && fragment.role == Role::Number),
+                    "{prefix}"
+                );
+            }
+            if end >= "const value=42;print(value)".len() {
+                assert!(document.fragments.iter().any(|fragment| fragment.text == "print" && fragment.role == Role::Function), "{prefix}");
+            }
         }
     }
 

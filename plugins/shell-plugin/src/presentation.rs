@@ -159,7 +159,14 @@ fn replace(
         role: Role::Whitespace,
         provenance: Provenance::Generated,
     });
-    fragments.extend(replacement);
+    for mut fragment in replacement {
+        // An uncertain embedded island retains the parent shell spelling's semantic role;
+        // successful local grammar classification may refine it, never erase it wholesale.
+        if fragment.role == Role::Literal {
+            fragment.role = old.role;
+        }
+        fragments.push(fragment);
+    }
     if encoded.end < range.end {
         fragments.push(document::Fragment {
             text: source[encoded.end..range.end].to_owned(),
@@ -177,6 +184,73 @@ fn replace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_recovery_retains_parent_roles_and_exact_copy_mapping_for_prefixes() {
+        for source in [
+            "python3 -c 'value=42;print(value); result=(界'",
+            "node -e 'const value=42;print(value); let result=(界'",
+        ] {
+            for end in (0..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+                let prefix = &source[..end];
+                let document = present(prefix, &ShellOutputPresentationPolicy::default());
+                assert_eq!(document.execution_text(), prefix);
+                assert_eq!(
+                    document,
+                    present(prefix, &ShellOutputPresentationPolicy::default())
+                );
+                for fragment in &document.fragments {
+                    match &fragment.provenance {
+                        Provenance::Source { id, range } => {
+                            assert_eq!(fragment.text, document.sources[id.0].text[range.clone()]);
+                            let ranges = document.original_ranges(*id, range.clone()).unwrap();
+                            assert!(
+                                ranges
+                                    .iter()
+                                    .all(|range| prefix.get(range.clone()).is_some())
+                            );
+                        }
+                        Provenance::Generated => assert!(fragment.text.trim().is_empty()),
+                    }
+                }
+                if end >= source.find("42").unwrap() + 2 {
+                    assert!(
+                        document
+                            .fragments
+                            .iter()
+                            .any(|fragment| fragment.text == "42" && fragment.role == Role::Number),
+                        "{prefix}: {}",
+                        document.display_text()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_embedded_projection_inherits_parent_role() {
+        let source = "node -e 'unknown'";
+        let mut document = Document::original(source);
+        document.push_source(SourceId(0), 0..source.len(), Role::String);
+        let encoded = 9..16;
+        let replacement = vec![document::Fragment {
+            text: source[encoded.clone()].to_owned(),
+            role: Role::Literal,
+            provenance: Provenance::Source {
+                id: SourceId(0),
+                range: encoded.clone(),
+            },
+        }];
+        assert!(replace(&mut document, SourceId(0), encoded, replacement));
+        assert!(
+            document
+                .fragments
+                .iter()
+                .filter(|fragment| matches!(fragment.provenance, Provenance::Source { .. }))
+                .all(|fragment| fragment.role == Role::String)
+        );
+        assert_eq!(document.display_text(), "node -e '\nunknown'");
+    }
 
     #[test]
     fn embeds_interpreter_source_and_keeps_copy_authority() {

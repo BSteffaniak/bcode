@@ -1321,17 +1321,18 @@ fn shell_terminal_prompt_rows(
     width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
-    let arguments = payload.get("arguments").unwrap_or(payload);
-    let command = arguments
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let cwd = arguments.get("cwd").and_then(serde_json::Value::as_str);
-    let format_commands = arguments
-        .get("format_commands")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    command::project(command, cwd, format_commands, width, context).rows
+    let input = NormalizedCommandInput::from_payload(
+        payload,
+        &bcode_config::ShellToolOutputConfig::default(),
+    );
+    command::project_with_policy(
+        &input.source,
+        input.cwd.as_deref(),
+        input.policy.policy(),
+        width,
+        context,
+    )
+    .rows
 }
 
 #[cfg(test)]
@@ -1360,57 +1361,126 @@ fn shell_command_projection_with_config(
     )
 }
 
+/// Command facts and presentation authority are selected independently. In particular, the TUI
+/// adds original request arguments to final artifact metadata; that must not shadow the policy
+/// execution resolved on the result itself.
+struct NormalizedCommandInput {
+    source: String,
+    cwd: Option<String>,
+    policy: EffectiveCommandPolicy,
+}
+
+enum EffectiveCommandPolicy {
+    /// Drafts, unexecuted requests, and historical results without a recorded policy.
+    Provisional(bcode_config::ShellOutputPresentationPolicy),
+    /// Execution-resolved policy, independent of subsequent renderer configuration changes.
+    Frozen(bcode_config::ShellOutputPresentationPolicy),
+    /// An explicit but unsupported or malformed policy must not acquire current defaults.
+    Rejected(bcode_config::ShellOutputPresentationPolicy),
+}
+
+impl EffectiveCommandPolicy {
+    const fn policy(&self) -> &bcode_config::ShellOutputPresentationPolicy {
+        match self {
+            Self::Provisional(policy) | Self::Frozen(policy) | Self::Rejected(policy) => policy,
+        }
+    }
+
+    fn recorded(value: &serde_json::Value) -> Self {
+        serde_json::from_value(value.clone()).map_or_else(
+            |_| {
+                Self::Rejected(bcode_config::ShellOutputPresentationPolicy {
+                    enabled: false,
+                    ..Default::default()
+                })
+            },
+            Self::Frozen,
+        )
+    }
+}
+
+impl NormalizedCommandInput {
+    fn from_payload(
+        payload: &serde_json::Value,
+        config: &bcode_config::ShellToolOutputConfig,
+    ) -> Self {
+        let draft = payload.get("preview").and_then(serde_json::Value::as_str);
+        let arguments = payload.get("arguments").unwrap_or(payload);
+        let source = draft
+            .map_or_else(
+                || {
+                    arguments
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                },
+                |preview| partial_json_string(preview, "command"),
+            )
+            .unwrap_or_default();
+        let cwd = draft.map_or_else(
+            || {
+                arguments
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            },
+            |preview| partial_json_string(preview, "cwd"),
+        );
+        let request_format = draft.map_or_else(
+            || {
+                arguments
+                    .get("format_commands")
+                    .and_then(serde_json::Value::as_bool)
+            },
+            |preview| partial_json::bool_field(preview, "format_commands"),
+        );
+        // ShellLiveRecordingPayload carries execution-augmented arguments, unlike final
+        // ShellRunResult metadata whose nested arguments are the original request. Final
+        // results always contain exit_code (including null), timed_out, and cancelled.
+        let live = payload.get("mode").and_then(serde_json::Value::as_str) == Some("terminal")
+            && payload.get("arguments").is_some()
+            && payload.get("exit_code").is_none()
+            && payload.get("timed_out").is_none()
+            && payload.get("cancelled").is_none();
+        let recorded = payload
+            .get("presentation_policy")
+            .or_else(|| live.then(|| arguments.get("presentation_policy")).flatten());
+        let policy = if draft.is_none()
+            && let Some(recorded) = recorded
+        {
+            EffectiveCommandPolicy::recorded(recorded)
+        } else {
+            // Historical result formatting is still an execution fact. A draft's late
+            // format_commands field changes formatting, not semantic highlighting.
+            let format = if draft.is_some() {
+                request_format
+            } else {
+                payload
+                    .get("format_commands")
+                    .and_then(serde_json::Value::as_bool)
+                    .or(request_format)
+            };
+            EffectiveCommandPolicy::Provisional(config.resolve_presentation_policy(format))
+        };
+        Self {
+            source,
+            cwd,
+            policy,
+        }
+    }
+}
+
 fn shell_command_projection_with_state(
     payload: &serde_json::Value,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     config: &bcode_config::ShellToolOutputConfig,
     state: &command::PresentationState,
 ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
-    let draft = payload.get("preview").and_then(serde_json::Value::as_str);
-    let arguments = payload.get("arguments").unwrap_or(payload);
-    let source = draft
-        .map_or_else(
-            || {
-                arguments
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            },
-            |preview| partial_json_string(preview, "command"),
-        )
-        .unwrap_or_default();
-    let cwd = draft.map_or_else(
-        || {
-            arguments
-                .get("cwd")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        },
-        |preview| partial_json_string(preview, "cwd"),
-    );
-    let format = draft.map_or_else(
-        || {
-            arguments
-                .get("format_commands")
-                .and_then(serde_json::Value::as_bool)
-        },
-        |preview| partial_json::bool_field(preview, "format_commands"),
-    );
-    // Unknown persisted policy versions must not silently acquire current defaults.
-    let policy = arguments.get("presentation_policy").map_or_else(
-        || config.resolve_presentation_policy(format),
-        |value| {
-            serde_json::from_value(value.clone()).unwrap_or_else(|_| {
-                let mut policy = config.resolve_presentation_policy(Some(false));
-                policy.enabled = false;
-                policy
-            })
-        },
-    );
+    let input = NormalizedCommandInput::from_payload(payload, config);
     command::project_with_state(
-        &source,
-        cwd.as_deref(),
-        &policy,
+        &input.source,
+        input.cwd.as_deref(),
+        input.policy.policy(),
         context.width(),
         context,
         state,
@@ -3609,44 +3679,298 @@ mod tests {
         }
     }
 
+    fn lifecycle_result_payload(
+        arguments: &serde_json::Value,
+        policy: Option<bcode_config::ShellOutputPresentationPolicy>,
+        format_commands: bool,
+    ) -> serde_json::Value {
+        // The production route serializes ShellRunResult into artifact metadata, then
+        // artifact_tool_result_item inserts the original request arguments alongside it.
+        let mut payload = serde_json::to_value(crate::contracts::ShellRunResult::Terminal {
+            exit_code: Some(0),
+            timed_out: false,
+            cancelled: false,
+            duration_ms: Some(12),
+            output_tail: String::new(),
+            output_truncated: false,
+            output_bytes: Some(0),
+            retained_output_bytes: Some(0),
+            columns: 80,
+            rows: 24,
+            format_commands,
+            presentation_policy: policy,
+        })
+        .unwrap();
+        payload["arguments"] = arguments.clone();
+        payload
+    }
+
+    fn lifecycle_command_rows(
+        adapter: &ShellRunTuiVisualAdapter,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
+        let projection = adapter.projection(kind, payload, context);
+        let count = adapter.command_projection(payload, context).rows.len();
+        let source =
+            NormalizedCommandInput::from_payload(payload, &adapter.output_config.lock().unwrap())
+                .source;
+        assert_eq!(command::declared_copy(&projection), source);
+        projection.rows.into_iter().take(count).collect()
+    }
+
     #[test]
     fn adapter_config_and_frozen_policy_agree_across_lifecycle() {
-        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
-        let command = "if true;then echo exact;fi";
-        let config = bcode_config::ShellToolOutputConfig {
-            format_commands: false,
-            ..Default::default()
-        };
+        let source = "if true;then printf '%s\\n' 'hello world';fi";
+        let config = bcode_config::ShellToolOutputConfig::default();
         let adapter = ShellRunTuiVisualAdapter::new(config.clone());
         let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
             80,
             bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
             None,
         );
-        let request = serde_json::json!({"command": command});
+        let arguments: crate::contracts::ShellRunArguments =
+            serde_json::from_value(serde_json::json!({"command": source, "cwd": "/tmp/project"}))
+                .unwrap();
+        let request = serde_json::to_value(arguments).unwrap();
+        assert!(request["format_commands"].is_null());
+        assert!(request["columns"].is_null());
+        assert!(request["timeout_ms"].is_null());
         let draft = serde_json::json!({"preview": request.to_string()});
-        let frozen = serde_json::json!({
-            "command": command, "presentation_policy": config.resolve_presentation_policy(None),
-        });
-        let projections = [
-            adapter.projection("bcode.tool.request.shell.run", &draft, &context),
-            adapter.projection("bcode.tool.request.shell.run", &request, &context),
-            adapter.projection(SHELL_RUN_SCHEMA, &frozen, &context),
-        ];
-        for projection in &projections {
-            assert_eq!(command::declared_copy(projection), command);
-            assert!(projection.rows[0].plain_text().contains(command));
-        }
-        adapter.configure(bcode_config::ShellToolOutputConfig::default());
-        let final_projection = adapter.projection(SHELL_RUN_SCHEMA, &frozen, &context);
-        assert!(final_projection.rows[0].plain_text().contains(command));
-        let future =
-            serde_json::json!({"command": command, "presentation_policy": {"version": 99}});
+        let frozen_policy = config.resolve_presentation_policy(None);
+        let mut live_arguments = request.clone();
+        live_arguments["format_commands"] = serde_json::json!(true);
+        live_arguments["presentation_policy"] = serde_json::to_value(&frozen_policy).unwrap();
+        let live = serde_json::to_value(crate::contracts::ShellLiveRecordingPayload {
+            mode: "terminal",
+            timeout_ms: crate::contracts::DEFAULT_SHELL_TIMEOUT_MS,
+            arguments: live_arguments,
+        })
+        .unwrap();
+        let final_payload = lifecycle_result_payload(&request, Some(frozen_policy), true);
+        let expected =
+            lifecycle_command_rows(&adapter, "bcode.tool.request.shell.run", &draft, &context);
         assert!(
-            adapter.projection(SHELL_RUN_SCHEMA, &future, &context).rows[0]
-                .plain_text()
-                .contains(command)
+            expected
+                .iter()
+                .any(|row| row.plain_text().contains("printf"))
         );
+        for (kind, payload) in [
+            ("bcode.tool.request.shell.run", &request),
+            (SHELL_RUN_SCHEMA, &live),
+            (SHELL_RUN_SCHEMA, &final_payload),
+        ] {
+            // Line equality includes span styles, not just source/copy identity.
+            assert_eq!(
+                lifecycle_command_rows(&adapter, kind, payload, &context),
+                expected
+            );
+        }
+        adapter.configure(bcode_config::ShellToolOutputConfig {
+            format_commands: false,
+            ..Default::default()
+        });
+        for payload in [&live, &final_payload] {
+            assert_eq!(
+                lifecycle_command_rows(&adapter, SHELL_RUN_SCHEMA, payload, &context),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn final_policy_is_independent_of_original_arguments_and_current_defaults() {
+        let source = "if true;then echo 'original source';fi";
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let config = bcode_config::ShellToolOutputConfig::default();
+        let policy = config.resolve_presentation_policy(None);
+        let adapter = ShellRunTuiVisualAdapter::new(config.clone());
+        let request = serde_json::json!({"command": source, "cwd": "/tmp/request"});
+        let expected =
+            lifecycle_command_rows(&adapter, "bcode.tool.request.shell.run", &request, &context);
+        let mut original = request;
+        original["format_commands"] = serde_json::json!(false);
+        original["presentation_policy"] = serde_json::json!({"version": 99});
+        let mut payload = lifecycle_result_payload(&original, Some(policy), false);
+        // Result fields must not be mistaken for source/request facts either.
+        payload["command"] = serde_json::json!("echo not-the-executed-source");
+        payload["cwd"] = serde_json::json!("/tmp/not-the-request");
+        adapter.configure(bcode_config::ShellToolOutputConfig {
+            format_commands: false,
+            ..Default::default()
+        });
+        let normalized = NormalizedCommandInput::from_payload(&payload, &config);
+        assert_eq!(normalized.source, source);
+        assert_eq!(normalized.cwd.as_deref(), Some("/tmp/request"));
+        assert!(matches!(
+            normalized.policy,
+            EffectiveCommandPolicy::Frozen(_)
+        ));
+        assert_eq!(
+            lifecycle_command_rows(&adapter, SHELL_RUN_SCHEMA, &payload, &context),
+            expected
+        );
+    }
+
+    #[test]
+    fn null_request_fields_do_not_shadow_final_execution_formatting() {
+        let arguments: crate::contracts::ShellRunArguments =
+            serde_json::from_value(serde_json::json!({"command": "if true;then echo exact;fi"}))
+                .unwrap();
+        let request = serde_json::to_value(arguments).unwrap();
+        assert!(request["cwd"].is_null());
+        assert!(request["format_commands"].is_null());
+        let config = bcode_config::ShellToolOutputConfig::default();
+        let payload = lifecycle_result_payload(&request, None, false);
+        let normalized = NormalizedCommandInput::from_payload(&payload, &config);
+        assert_eq!(normalized.source, request["command"].as_str().unwrap());
+        assert_eq!(normalized.cwd, None);
+        assert!(matches!(
+            normalized.policy,
+            EffectiveCommandPolicy::Provisional(_)
+        ));
+        assert!(!normalized.policy.policy().enabled);
+    }
+
+    #[test]
+    fn malformed_final_policy_never_falls_back_to_nested_or_current_policy() {
+        let config = bcode_config::ShellToolOutputConfig::default();
+        let adapter = ShellRunTuiVisualAdapter::new(config.clone());
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let source = "if true;then echo 'safe original';fi";
+        let request = serde_json::json!({
+            "command": source,
+            "format_commands": true,
+            "presentation_policy": config.resolve_presentation_policy(None),
+        });
+        let disabled = bcode_config::ShellOutputPresentationPolicy {
+            enabled: false,
+            ..Default::default()
+        };
+        let expected = lifecycle_command_rows(
+            &adapter,
+            SHELL_RUN_SCHEMA,
+            &lifecycle_result_payload(&request, Some(disabled), false),
+            &context,
+        );
+        assert!(expected[0].plain_text().contains(source));
+        for malformed in [
+            serde_json::json!({"version": 99}),
+            serde_json::json!({"enabled": "true"}),
+            serde_json::json!({"version": 1, "future_switch": true}),
+            serde_json::Value::Null,
+            serde_json::json!(false),
+        ] {
+            let mut payload = lifecycle_result_payload(&request, None, true);
+            payload["presentation_policy"] = malformed;
+            let normalized = NormalizedCommandInput::from_payload(&payload, &config);
+            assert!(matches!(
+                normalized.policy,
+                EffectiveCommandPolicy::Rejected(_)
+            ));
+            assert!(!normalized.policy.policy().enabled);
+            assert_eq!(
+                lifecycle_command_rows(&adapter, SHELL_RUN_SCHEMA, &payload, &context),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn draft_late_format_override_preserves_literal_highlighting_and_lifecycle_styles() {
+        let source = "printf '%s\\n' 'hello world' --flag";
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let encoded_source = serde_json::to_string(source).unwrap();
+        let previews = [
+            format!("{{\"command\":{encoded_source}"),
+            format!("{{\"command\":{encoded_source},\"format_commands\":f"),
+            format!("{{\"command\":{encoded_source},\"format_commands\":false}}"),
+            format!("{{\"format_commands\":false,\"command\":{encoded_source}}}"),
+        ];
+        let expected = lifecycle_command_rows(
+            &adapter,
+            "bcode.tool.request.shell.run",
+            &serde_json::json!({"preview": previews[0]}),
+            &context,
+        );
+        assert!(
+            expected
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| { span.content.contains("printf") && span.style == command_style() })
+        );
+        assert!(
+            expected.iter().flat_map(|row| &row.spans).any(|span| {
+                span.content.contains("hello world") && span.style == string_style()
+            })
+        );
+        for preview in &previews[1..] {
+            assert_eq!(
+                lifecycle_command_rows(
+                    &adapter,
+                    "bcode.tool.request.shell.run",
+                    &serde_json::json!({"preview": preview}),
+                    &context,
+                ),
+                expected
+            );
+        }
+        let structural = "if true;then echo exact;fi";
+        let early = serde_json::json!({
+            "preview": format!("{{\"command\":{}", serde_json::to_string(structural).unwrap()),
+        });
+        let late = serde_json::json!({
+            "preview": serde_json::json!({"command": structural, "format_commands": false}).to_string(),
+        });
+        let early_rows =
+            lifecycle_command_rows(&adapter, "bcode.tool.request.shell.run", &early, &context);
+        let late_rows =
+            lifecycle_command_rows(&adapter, "bcode.tool.request.shell.run", &late, &context);
+        assert!(early_rows.len() > late_rows.len());
+        assert!(late_rows[0].plain_text().contains(structural));
+        assert!(
+            late_rows
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| { span.content.contains("echo") && span.style == command_style() })
+        );
+        let request = serde_json::json!({"command": source, "format_commands": false});
+        let policy =
+            bcode_config::ShellToolOutputConfig::default().resolve_presentation_policy(Some(false));
+        let mut live_arguments = request.clone();
+        live_arguments["presentation_policy"] = serde_json::to_value(&policy).unwrap();
+        let live = serde_json::to_value(crate::contracts::ShellLiveRecordingPayload {
+            mode: "terminal",
+            timeout_ms: crate::contracts::DEFAULT_SHELL_TIMEOUT_MS,
+            arguments: live_arguments,
+        })
+        .unwrap();
+        let final_payload = lifecycle_result_payload(&request, Some(policy), false);
+        for (kind, payload) in [
+            ("bcode.tool.request.shell.run", &request),
+            (SHELL_RUN_SCHEMA, &live),
+            (SHELL_RUN_SCHEMA, &final_payload),
+        ] {
+            assert_eq!(
+                lifecycle_command_rows(&adapter, kind, payload, &context),
+                expected
+            );
+        }
     }
 
     #[test]

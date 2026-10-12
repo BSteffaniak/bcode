@@ -152,7 +152,8 @@ fn collect_statements(
     let mut tokens = Vec::new();
     let mut visits = 0;
     // A recovered module may contain complete statements before an unfinished suffix.
-    // Never descend into an erroneous statement: missing zero-width tokens are not source.
+    // Descend into recovery containers: clean source-backed leaves retain syntax roles.
+    // Missing tokens contribute no bytes; whitespace edits require locally certain neighbors.
     for index in 0..root.child_count() {
         let child = root.child(index)?;
         if !collect(
@@ -186,12 +187,14 @@ fn collect<'tree>(
         }
         let node = cursor.node();
         let kind = node.kind();
-        let certain = !node.has_error() && !node.is_missing() && !node.is_error();
-        let opaque = !certain
-            || matches!(
-                kind,
-                "string" | "concatenated_string" | "comment" | "line_continuation"
-            );
+        let certain = !node.has_error()
+            && !node.is_missing()
+            && !node.is_error()
+            && node.parent().is_none_or(|parent| !parent.has_error());
+        let opaque = matches!(
+            kind,
+            "string" | "concatenated_string" | "comment" | "line_continuation"
+        );
         if !opaque && cursor.goto_first_child() {
             continue;
         }
@@ -199,14 +202,23 @@ fn collect<'tree>(
             tokens.push(Token {
                 node,
                 range: node.byte_range(),
-                role: if !certain {
+                role: if node.is_missing() || (node.is_error() && node.child_count() == 0) {
                     Role::Literal
                 } else if matches!(kind, "string" | "concatenated_string") {
                     Role::String
                 } else if kind == "comment" {
                     Role::Comment
+                } else if kind == "identifier" {
+                    embedded_identifier_role(node)
+                } else if matches!(kind, "integer" | "float") {
+                    Role::Number
                 } else if node.is_named() {
                     Role::Literal
+                } else if kind
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                {
+                    Role::Keyword
                 } else {
                     Role::Operator
                 },
@@ -218,6 +230,18 @@ fn collect<'tree>(
                 return true;
             }
         }
+    }
+}
+
+fn embedded_identifier_role(node: Node<'_>) -> Role {
+    if let Some(parent) = node.parent()
+        && ((parent.kind() == "call" && parent.child_by_field_name("function") == Some(node))
+            || (parent.kind() == "function_definition"
+                && parent.child_by_field_name("name") == Some(node)))
+    {
+        Role::Function
+    } else {
+        Role::Identifier
     }
 }
 
@@ -349,6 +373,28 @@ mod tests {
             present("if ready:\n  x=1; y=2\n").display_text(),
             "if ready:\n  x = 1; y = 2\n"
         );
+    }
+
+    #[test]
+    fn recovered_statement_retains_source_backed_semantic_leaves() {
+        let source = "value=42;print(value); result=(界";
+        for end in (0..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+            let prefix = &source[..end];
+            let document = present(prefix);
+            assert_eq!(document.execution_text(), prefix);
+            if end >= "value=42".len() {
+                assert!(
+                    document
+                        .fragments
+                        .iter()
+                        .any(|fragment| fragment.text == "42" && fragment.role == Role::Number),
+                    "{prefix}"
+                );
+            }
+            if end >= "value=42;print(value)".len() {
+                assert!(document.fragments.iter().any(|fragment| fragment.text == "print" && fragment.role == Role::Function), "{prefix}");
+            }
+        }
     }
 
     #[test]
