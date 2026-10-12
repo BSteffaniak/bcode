@@ -89,6 +89,10 @@ pub enum BmuxAction {
     EditorDeleteWordForward,
     EditorDeleteToStart,
     EditorDeleteToEnd,
+    /// Undo the most recent composer edit.
+    EditorUndo,
+    /// Redo the most recently undone composer edit.
+    EditorRedo,
     SkillInvoke,
     SkillActivate,
     SkillDeactivate,
@@ -153,6 +157,8 @@ impl BmuxAction {
             Self::EditorDeleteWordForward => "tui.editor.deleteWordForward",
             Self::EditorDeleteToStart => "tui.editor.deleteToStart",
             Self::EditorDeleteToEnd => "tui.editor.deleteToEnd",
+            Self::EditorUndo => "tui.editor.undo",
+            Self::EditorRedo => "tui.editor.redo",
             Self::SkillInvoke => "tui.skill.invoke",
             Self::SkillActivate => "tui.skill.activate",
             Self::SkillDeactivate => "tui.skill.deactivate",
@@ -217,6 +223,8 @@ impl BmuxAction {
             Self::EditorDeleteWordForward => "Editor Delete Word Forward",
             Self::EditorDeleteToStart => "Editor Delete To Start",
             Self::EditorDeleteToEnd => "Editor Delete To End",
+            Self::EditorUndo => "Editor Undo",
+            Self::EditorRedo => "Editor Redo",
             Self::SkillInvoke => "Skill Invoke",
             Self::SkillActivate => "Skill Activate",
             Self::SkillDeactivate => "Skill Deactivate",
@@ -279,6 +287,8 @@ impl BmuxAction {
             "tui.editor.deleteWordForward" => Self::EditorDeleteWordForward,
             "tui.editor.deleteToStart" => Self::EditorDeleteToStart,
             "tui.editor.deleteToEnd" => Self::EditorDeleteToEnd,
+            "tui.editor.undo" => Self::EditorUndo,
+            "tui.editor.redo" => Self::EditorRedo,
             "tui.skill.invoke" => Self::SkillInvoke,
             "tui.skill.activate" => Self::SkillActivate,
             "tui.skill.deactivate" => Self::SkillDeactivate,
@@ -1050,7 +1060,9 @@ impl BmuxKeyMap {
             BmuxAction::EditorDeleteWordForward => TextEditCommand::Delete(TextDelete::WordForward),
             BmuxAction::EditorDeleteToStart => TextEditCommand::Delete(TextDelete::ToStart),
             BmuxAction::EditorDeleteToEnd => TextEditCommand::Delete(TextDelete::ToEnd),
-            BmuxAction::TranscriptClearSelection
+            BmuxAction::EditorUndo
+            | BmuxAction::EditorRedo
+            | BmuxAction::TranscriptClearSelection
             | BmuxAction::InputSubmitSteering
             | BmuxAction::InputSubmitFollowUp
             | BmuxAction::InputHistoryPrevious
@@ -1159,6 +1171,8 @@ impl BmuxKeyMap {
             | BmuxAction::EditorDeleteWordForward
             | BmuxAction::EditorDeleteToStart
             | BmuxAction::EditorDeleteToEnd
+            | BmuxAction::EditorUndo
+            | BmuxAction::EditorRedo
             | BmuxAction::SkillInvoke
             | BmuxAction::SkillActivate
             | BmuxAction::SkillDeactivate
@@ -1195,6 +1209,11 @@ fn default_chat_bindings() -> Vec<BmuxKeyBinding> {
         bind("alt+delete", BmuxAction::EditorDeleteWordForward),
         bind("ctrl+u", BmuxAction::EditorDeleteToStart),
         bind("ctrl+k", BmuxAction::EditorDeleteToEnd),
+        bind("ctrl+z", BmuxAction::EditorUndo),
+        bind("super+z", BmuxAction::EditorUndo),
+        bind("ctrl+shift+z", BmuxAction::EditorRedo),
+        bind("super+shift+z", BmuxAction::EditorRedo),
+        bind("ctrl+y", BmuxAction::EditorRedo),
         bind("shift+left", BmuxAction::EditorSelectLeft),
         bind("shift+right", BmuxAction::EditorSelectRight),
         bind("shift+alt+left", BmuxAction::EditorSelectWordLeft),

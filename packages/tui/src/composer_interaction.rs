@@ -7,7 +7,7 @@ use bcode_plugin_sdk::composer::{
     ComposerSearchRequest, ComposerSnapshot, ComposerSnapshotState, ComposerTextRange,
     MAX_COMPOSER_CANDIDATES, PluginOwnedComposerContribution,
 };
-use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui_components::selectable_list::{
@@ -310,26 +310,19 @@ impl ComposerInteraction {
             .map_or(ComposerContinuation::Finish, |candidate| {
                 candidate.continuation
             });
-        // Probe BMUX byte motions on a clone before publication. Never let any
-        // editor boundary adjustment change the accepted range or resulting cursor.
-        let mut staged = buffer.clone();
-        staged.move_cursor(TextMotion::Absolute(edit.range.start));
-        if staged.cursor_byte_index() != edit.range.start {
+        // The live BMUX editor validates positions and records one transaction,
+        // preserving its pre-edit cursor/selection and existing undo/redo history.
+        let expected = buffer.edit_state();
+        if buffer.replace_byte_range(
+            &expected,
+            edit.range.start..edit.range.end,
+            &edit.replacement,
+            result.cursor,
+            None,
+        ) != Ok(true)
+        {
             return false;
         }
-        staged.move_cursor_with_selection(
-            TextMotion::Absolute(edit.range.end),
-            SelectionMode::Extend,
-        );
-        if staged.cursor_byte_index() != edit.range.end {
-            return false;
-        }
-        staged.insert_str(&edit.replacement);
-        staged.move_cursor(TextMotion::Absolute(result.cursor));
-        if staged.text() != result.text || staged.cursor_byte_index() != result.cursor {
-            return false;
-        }
-        *buffer = staged;
         let route = self.route.clone();
         self.cancel();
         if continuation == ComposerContinuation::Finish {
@@ -502,10 +495,44 @@ pub mod tests {
         assert_eq!(next.contribution_id, request.contribution_id);
         assert_eq!(next.contribution_id, "topics");
         assert_ne!(next.request_id, request.request_id);
-        state.complete(completion(&next));
+        let mut finished = completion(&next);
+        let edit = &mut finished.snapshot.as_mut().unwrap().candidates[0].edit;
+        edit.replacement = "主题 finished 👩‍💻".into();
+        edit.cursor = edit.replacement.len();
+        state.complete(finished);
         assert!(state.apply(&mut buffer));
+        assert_eq!(buffer.text(), "主题 finished 👩‍💻");
         assert!(!state.observe(scope(), &buffer));
         assert!(!state.needs_activation());
+    }
+
+    #[test]
+    fn rejected_and_noop_transactions_preserve_redo_history() {
+        for invalid in [false, true] {
+            let mut state = ComposerInteraction::default();
+            let mut buffer = TextEditBuffer::from_text("#topic");
+            buffer.insert_str("!");
+            let future = buffer.edit_state();
+            assert!(buffer.undo());
+            let before = buffer.edit_state();
+            let request = begin(&mut state, &buffer);
+            let mut reply = completion(&request);
+            let edit = &mut reply.snapshot.as_mut().unwrap().candidates[0].edit;
+            if invalid {
+                // Valid UTF-8 byte offset inside the ZWJ grapheme: BMUX must reject.
+                edit.cursor = "主题 👩".len();
+            } else {
+                edit.replacement = request.document.text.clone();
+                edit.cursor = request.document.cursor;
+            }
+            assert!(state.complete(reply));
+            assert!(!state.apply(&mut buffer));
+            assert_eq!(buffer.edit_state(), before);
+            assert!(!buffer.can_undo());
+            assert!(buffer.can_redo());
+            assert!(buffer.redo());
+            assert_eq!(buffer.edit_state(), future);
+        }
     }
 
     #[test]
@@ -523,15 +550,12 @@ pub mod tests {
         let edit = &mut reply.snapshot.as_mut().unwrap().candidates[0].edit;
         edit.replacement = "a\u{301}".into();
         edit.cursor = 1;
-        // Locked BMUX Absolute accepts a UTF-8 boundary inside a combining grapheme.
-        // Prove that behavior directly rather than assuming grapheme snapping.
-        let mut probe = TextEditBuffer::from_text("a\u{301}");
-        probe.move_cursor(TextMotion::Absolute(1));
-        assert_eq!(probe.cursor_byte_index(), 1);
+        // The transactional API requires resulting grapheme boundaries, even
+        // where legacy Absolute motions accepted a UTF-8 boundary inside one.
+        let before = buffer.edit_state();
         assert!(state.complete(reply));
-        assert!(state.apply(&mut buffer));
-        assert_eq!(buffer.text(), "a\u{301}");
-        assert_eq!(buffer.cursor_byte_index(), 1);
+        assert!(!state.apply(&mut buffer));
+        assert_eq!(buffer.edit_state(), before);
     }
 
     #[test]

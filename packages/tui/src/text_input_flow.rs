@@ -50,7 +50,8 @@ pub fn handle_key_in_scope(
             return input
                 .native_stroke()
                 .map_or(TextInputOutcome::Ignored, |native| {
-                    TextInputControl::new(&single_line_policy()).handle_key(state, native)
+                    TextInputControl::new(&single_line_policy())
+                        .handle_key_with_history_action(state, native, None)
                 });
         }
         if keymap.registry().is_overridden_key(scope, stroke) {
@@ -93,6 +94,35 @@ pub fn handle_paste(state: &mut TextInputState, text: &str) -> TextInputOutcome 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chat_history_actions_do_not_edit_picker_history() {
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "command_palette".into(),
+            std::collections::BTreeMap::from([
+                ("ctrl+r".into(), "tui.editor.undo".into()),
+                ("ctrl+t".into(), "tui.editor.redo".into()),
+            ]),
+        );
+        let keymap = BmuxKeyMap::from_config(&config);
+        let mut input = state_with_text("a", false);
+        input.buffer_mut().insert_str("b");
+        let before = input.buffer().edit_state();
+        for key in ["ctrl+z", "super+z", "ctrl+y", "ctrl+r", "ctrl+t"] {
+            assert_eq!(
+                handle_key_in_scope(
+                    &mut input,
+                    &keymap,
+                    "command_palette",
+                    bmux_keyboard::parse_key_stroke(key).unwrap()
+                ),
+                TextInputOutcome::Ignored
+            );
+            assert_eq!(input.buffer().edit_state(), before);
+            assert!(input.buffer().can_undo());
+        }
+    }
+
     #[test]
     fn scoped_literal_unbind_and_navigation_remap_are_respected() {
         let mut config = bcode_config::TuiConfig::default();

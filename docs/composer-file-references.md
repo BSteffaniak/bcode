@@ -4,7 +4,7 @@ The bundled `bcode.file-references` plugin contributes workspace-relative path c
 
 Accepting a file replaces only the active token. Paths containing whitespace, quotes or backslashes are quoted/escaped by the plugin. Directory candidates explicitly request reactivation of the same contributor. Email addresses, escaped triggers, ordinary quoted prose and selected text do not activate completion.
 
-References insert text only: selecting a path does not attach or read its contents into model context. Normal authorized tools remain responsible for reading referenced files. Completion edits are atomically staged and validated, but acceptance in Bcode's current locked BMUX revision is **not undoable**. Upstream BMUX undo support is locally implemented and validated, but is not yet published or consumed by Bcode. Undo integration requires approval to publish the upstream revision, followed by a coordinated dependency update and editor integration.
+References insert text only: selecting a path does not attach or read its contents into model context. Normal authorized tools remain responsible for reading referenced files. Bcode consumes the published BMUX undo API: accepting a changed completion applies one validated live-editor transaction. Undo restores the prior text, cursor and selection; redo restores the accepted edit. Rejected or text-identical edits leave the editor and undo/redo history unchanged.
 
 ## Configuration
 
@@ -32,6 +32,31 @@ that scope's binding, so Tab no longer accepts a candidate in this example.
 Disabling a binding does not disable the plugin or suppress ordinary chat/editor
 handling of that key. Composer key arbitration applies only while the picker has
 visible measured rows and no foreground modal; ordinary typing stays editor-owned.
+
+### Composer undo and redo
+
+Chat editor actions are separate from picker acceptance. `tui.editor.undo` defaults
+to Ctrl+Z and Super+Z; `tui.editor.redo` defaults to Ctrl+Shift+Z,
+Super+Shift+Z and Ctrl+Y. Configure them in the chat scope:
+
+```toml
+[tui.keybindings.chat]
+"ctrl+r" = "tui.editor.undo"
+"ctrl+t" = "tui.editor.redo"
+```
+
+These remaps replace the respective actions' default keys. To disable only one
+shortcut while leaving the other defaults available, use an empty action ID instead:
+
+```toml
+[tui.keybindings.chat]
+"super+z" = ""
+"ctrl+y" = ""
+```
+
+The second example retains Ctrl+Z for undo and the Shift+Z shortcuts for redo.
+Recognized undo/redo commands with empty history do not insert text or submit a
+prompt. These chat actions do not enable undo/redo in picker or modal inputs.
 
 ### Plugin selection and search
 

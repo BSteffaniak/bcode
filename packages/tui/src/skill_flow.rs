@@ -138,7 +138,9 @@ fn handle_skill_picker_action(
         | BmuxAction::EditorDeleteWordForward
         | BmuxAction::EditorDeleteToStart
         | BmuxAction::InteractionFocusActive
-        | BmuxAction::EditorDeleteToEnd => skill_picker::SkillPickerAction::Continue,
+        | BmuxAction::EditorDeleteToEnd
+        | BmuxAction::EditorUndo
+        | BmuxAction::EditorRedo => skill_picker::SkillPickerAction::Continue,
     }
 }
 

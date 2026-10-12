@@ -80,8 +80,11 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
     else {
         return KeyOutcome::default();
     };
-    let outcome = TextInputControl::new(&composer_policy())
-        .handle_key(app.composer_state_mut(), text.native_stroke());
+    let outcome = TextInputControl::new(&composer_policy()).handle_key_with_history_action(
+        app.composer_state_mut(),
+        text.native_stroke(),
+        None,
+    );
     match outcome {
         TextInputOutcome::Submitted => {
             app.clear_pending_key_activation();
@@ -103,22 +106,46 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
     }
 }
 
+fn handle_composer_history(
+    app: &mut BmuxApp,
+    action: bmux_tui_components::text_input::TextInputHistoryAction,
+) -> KeyOutcome {
+    let result = TextInputControl::new(&composer_policy()).handle_key_with_history_action(
+        app.composer_state_mut(),
+        KeyStroke::simple(bmux_keyboard::KeyCode::Escape),
+        Some(action),
+    );
+    if result == TextInputOutcome::Edited {
+        app.reset_input_history_navigation();
+        app.wake_cursor();
+    }
+    KeyOutcome {
+        redraw: result != TextInputOutcome::Ignored,
+        request: KeyRequest::None,
+    }
+}
+
+fn exit_or_clear_composer(app: &mut BmuxApp) -> KeyOutcome {
+    if app.composer().is_empty() {
+        app.request_exit();
+    } else {
+        app.reset_input_history_navigation();
+        app.composer_mut().clear();
+        app.set_status("input cleared; press exit again to quit".to_owned());
+        app.wake_cursor();
+    }
+    KeyOutcome {
+        redraw: true,
+        request: KeyRequest::None,
+    }
+}
+
 pub fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<KeyOutcome> {
+    use bmux_tui_components::text_input::TextInputHistoryAction;
     let outcome = match action? {
-        BmuxAction::AppExit => {
-            if app.composer().is_empty() {
-                app.request_exit();
-            } else {
-                app.reset_input_history_navigation();
-                app.composer_mut().clear();
-                app.set_status("input cleared; press exit again to quit".to_owned());
-                app.wake_cursor();
-            }
-            KeyOutcome {
-                redraw: true,
-                request: KeyRequest::None,
-            }
-        }
+        BmuxAction::EditorUndo => handle_composer_history(app, TextInputHistoryAction::Undo),
+        BmuxAction::EditorRedo => handle_composer_history(app, TextInputHistoryAction::Redo),
+        BmuxAction::AppExit => exit_or_clear_composer(app),
         BmuxAction::AppInterrupt => KeyOutcome {
             redraw: true,
             request: KeyRequest::Interrupt,

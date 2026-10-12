@@ -8079,12 +8079,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composer_root_acceptance_is_one_undoable_transaction() {
+        for (undo, redo) in [
+            ("ctrl+z", "ctrl+shift+z"),
+            ("super+z", "super+shift+z"),
+            ("ctrl+z", "ctrl+y"),
+        ] {
+            let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+            model.chat.app.composer_mut().clear_history();
+            let before = model.chat.app.composer().edit_state();
+            composer_root_key(&mut model, "enter");
+            let after = model.chat.app.composer().edit_state();
+            assert_eq!(after.text, "主题 👩‍💻");
+            assert_ne!(before, after);
+            composer_root_key(&mut model, undo);
+            assert_eq!(model.chat.app.composer().edit_state(), before);
+            assert!(!model.chat.app.composer().can_undo());
+            assert!(model.chat.app.composer().can_redo());
+            composer_root_key(&mut model, redo);
+            assert_eq!(model.chat.app.composer().edit_state(), after);
+            assert!(!model.chat.app.composer().can_redo());
+            assert!(model.chat.app.take_pending_submission().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_root_history_remaps_and_independent_unbinds() {
+        let mut config = bcode_config::TuiConfig::default();
+        config
+            .keybindings
+            .chat
+            .insert("ctrl+r".into(), "tui.editor.undo".into());
+        config
+            .keybindings
+            .chat
+            .insert("ctrl+t".into(), "tui.editor.redo".into());
+        let mut model = composer_root_fixture(&config);
+        composer_root_key(&mut model, "enter");
+        let after = model.chat.app.composer().edit_state();
+        for key in ["ctrl+z", "super+z"] {
+            composer_root_key(&mut model, key);
+            assert_eq!(model.chat.app.composer().edit_state(), after);
+        }
+        composer_root_key(&mut model, "ctrl+r");
+        assert_eq!(model.chat.app.composer().text(), "#topic");
+        for key in ["ctrl+y", "ctrl+shift+z", "super+shift+z"] {
+            composer_root_key(&mut model, key);
+            assert_eq!(model.chat.app.composer().text(), "#topic");
+        }
+        composer_root_key(&mut model, "ctrl+t");
+        assert_eq!(model.chat.app.composer().edit_state(), after);
+
+        for (disabled, enabled) in [("ctrl+z", "super+z"), ("super+z", "ctrl+z")] {
+            let mut config = bcode_config::TuiConfig::default();
+            config
+                .keybindings
+                .chat
+                .insert(disabled.into(), String::new());
+            let mut model = composer_root_fixture(&config);
+            composer_root_key(&mut model, "enter");
+            let after = model.chat.app.composer().edit_state();
+            composer_root_key(&mut model, disabled);
+            assert_eq!(model.chat.app.composer().edit_state(), after);
+            composer_root_key(&mut model, enabled);
+            assert_eq!(model.chat.app.composer().text(), "#topic");
+        }
+        for disabled in ["ctrl+y", "ctrl+shift+z", "super+shift+z"] {
+            let mut config = bcode_config::TuiConfig::default();
+            config
+                .keybindings
+                .chat
+                .insert(disabled.into(), String::new());
+            let mut model = composer_root_fixture(&config);
+            composer_root_key(&mut model, "enter");
+            let after = model.chat.app.composer().edit_state();
+            composer_root_key(&mut model, "ctrl+z");
+            composer_root_key(&mut model, disabled);
+            assert_eq!(model.chat.app.composer().text(), "#topic");
+            let enabled = if disabled == "ctrl+y" {
+                "ctrl+shift+z"
+            } else {
+                "ctrl+y"
+            };
+            composer_root_key(&mut model, enabled);
+            assert_eq!(model.chat.app.composer().edit_state(), after);
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_root_empty_history_commands_are_consumed_without_edits() {
+        let mut model = root_test_model();
+        model.chat.app.replace_composer_with("主题 👩‍💻");
+        model.chat.app.composer_mut().clear_history();
+        model.chat.app.composer_mut().select_all();
+        let before = model.chat.app.composer().edit_state();
+        for key in [
+            "ctrl+z",
+            "super+z",
+            "ctrl+y",
+            "ctrl+shift+z",
+            "super+shift+z",
+        ] {
+            composer_root_key(&mut model, key);
+            assert_eq!(model.chat.app.composer().edit_state(), before);
+            assert!(!model.chat.app.composer().can_undo());
+            assert!(!model.chat.app.composer().can_redo());
+            assert!(model.chat.app.take_pending_submission().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_root_history_restores_selected_text_and_cursor() {
+        let mut model = root_test_model();
+        model.chat.app.replace_composer_with("主题 👩‍💻");
+        model.chat.app.composer_mut().clear_history();
+        model.chat.app.composer_mut().select_all();
+        let before = model.chat.app.composer().edit_state();
+        composer_root_key(&mut model, "x");
+        let after = model.chat.app.composer().edit_state();
+        assert_eq!(after.text, "x");
+        composer_root_key(&mut model, "ctrl+z");
+        assert_eq!(model.chat.app.composer().edit_state(), before);
+        composer_root_key(&mut model, "ctrl+y");
+        assert_eq!(model.chat.app.composer().edit_state(), after);
+    }
+
+    #[tokio::test]
+    async fn composer_root_noop_acceptance_dismisses_without_consuming_redo() {
+        let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+        model.chat.app.composer_mut().clear_history();
+        model.chat.app.composer_mut().insert_str("!");
+        let future = model.chat.app.composer().edit_state();
+        assert!(model.chat.app.composer_mut().undo());
+        let before = model.chat.app.composer().edit_state();
+        let request = super::super::composer_interaction::tests::begin(
+            &mut model.loop_state.composer_interaction,
+            model.chat.app.composer(),
+        );
+        let mut reply = super::super::composer_interaction::tests::completion(&request);
+        let edit = &mut reply.snapshot.as_mut().unwrap().candidates[0].edit;
+        edit.replacement = request.document.text.clone();
+        edit.cursor = request.document.cursor;
+        assert!(model.loop_state.composer_interaction.complete(reply));
+        paint_composer_root_fixture(&mut model, 90, 18);
+        composer_root_key(&mut model, "enter");
+        assert_eq!(model.chat.app.composer().edit_state(), before);
+        assert!(!model.loop_state.composer_interaction.visible());
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert!(!model.chat.app.composer().can_undo());
+        assert!(model.chat.app.composer().can_redo());
+        composer_root_key(&mut model, "ctrl+y");
+        let restored = model.chat.app.composer().edit_state();
+        drop(model);
+        assert_eq!(restored, future);
+    }
+
+    #[tokio::test]
     async fn composer_root_rejected_acceptance_consumes_enter_and_tab() {
         for key in ["enter", "tab"] {
             let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
+            model.chat.app.composer_mut().clear_history();
+            let original = model.chat.app.composer().edit_state();
             model.chat.app.composer_mut().insert_str("!");
+            let changed = model.chat.app.composer().edit_state();
+            assert!(model.chat.app.composer_mut().undo());
+            assert_eq!(model.chat.app.composer().edit_state(), original);
+            // Cursor-only staleness must not consume an existing redo branch.
+            model
+                .chat
+                .app
+                .composer_mut()
+                .move_cursor(bmux_text_edit::TextMotion::Start);
+            let before = model.chat.app.composer().edit_state();
             composer_root_key(&mut model, key);
-            assert_eq!(model.chat.app.composer().text(), "#topic!");
+            assert_eq!(model.chat.app.composer().edit_state(), before);
+            assert!(!model.chat.app.composer().can_undo());
+            assert!(model.chat.app.composer().can_redo());
+            assert!(model.chat.app.composer_mut().redo());
+            assert_eq!(model.chat.app.composer().edit_state(), changed);
             assert!(model.chat.app.take_pending_submission().is_empty());
             assert!(model.chat.app.status().contains("draft unchanged"));
             assert!(!model.loop_state.composer_interaction.visible());
