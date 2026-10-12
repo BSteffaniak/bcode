@@ -10,89 +10,56 @@ use std::ops::Range;
 use shuck_ast::{Command, CompoundCommand, ForSyntax, IfSyntax, Span, Stmt, StmtSeq, TokenKind};
 use shuck_parser::parser::{Lexer, Parser, ShellDialect, ShellProfile};
 
-use super::document::{
-    AdapterInput, Budget, Document, InputPolicy, LanguageAdapter, Role, SourceId,
-};
+#[cfg(test)]
+use super::document::{AdapterInput, LanguageAdapter};
+use super::document::{Budget, Document, InputPolicy, Role, SourceId};
 
-/// Shell adapter, also usable for explicitly extracted nested shell programs.
+use super::extraction;
+
+/// Shell adapter for the isolated adapter contract tests.
+#[cfg(test)]
 pub struct ShellAdapter;
 
-/// Present a shell command without changing execution/copy authority.
+/// A single source-validated shell analysis for presentation and embedded dispatch.
+pub(super) struct ShellProjection {
+    pub document: Document,
+    pub invocations: Vec<extraction::Invocation>,
+}
+
+/// Analyze complete or progressive shell input without changing execution/copy authority.
 #[must_use]
-pub fn present(source: &str, policy: InputPolicy, budget: &Budget) -> Document {
+pub(super) fn analyze(source: &str, policy: InputPolicy, budget: &Budget) -> ShellProjection {
     let mut document = Document::original(source);
-    if source.len() > budget.max_source_bytes
-        || budget.max_depth == 0
-        || !project(&mut document, budget, policy)
-    {
+    let invocations = if source.len() <= budget.max_source_bytes && budget.max_depth != 0 {
+        project(&mut document, budget, policy)
+    } else {
+        None
+    };
+    if invocations.is_none() {
         document.fragments.clear();
         document.push_source(SourceId(0), 0..source.len(), Role::Literal);
     }
-    document
+    ShellProjection {
+        document,
+        invocations: invocations.unwrap_or_default(),
+    }
 }
 
-/// Extract source-validated simple-command invocation facts for embedded-language dispatch.
-/// Recovery-only commands are never admitted. Invalid or exhausted input returns no facts.
+/// Present a shell command without changing execution/copy authority.
+#[cfg(test)]
 #[must_use]
-pub fn invocations(source: &str, budget: &Budget) -> Vec<super::extraction::Invocation> {
-    if source.len() > budget.max_source_bytes || budget.max_depth == 0 {
-        return Vec::new();
-    }
-    let parse = |text: &str| {
-        Parser::with_limits_and_profile(
-            text,
-            syntax_depth(budget),
-            budget.max_source_bytes.saturating_mul(32),
-            ShellProfile::native(ShellDialect::Bash),
-        )
-        .parse()
-    };
-    let mut completed = source.to_owned();
-    let mut partial_word = None;
-    let mut parsed = parse(source);
-    if !parsed.is_ok() {
-        if let Some((candidate, range)) = quote_completion(source, budget.max_fragments) {
-            completed = candidate;
-            partial_word = Some(range);
-            parsed = parse(&completed);
-        }
-        if !parsed.is_ok() {
-            let (tokens, safe_end) = lex(&completed, budget.max_fragments);
-            let Some(tokens) = tokens else {
-                return Vec::new();
-            };
-            let Some(suffix) =
-                recovery_suffix(&completed[..safe_end], &tokens, syntax_depth(budget))
-            else {
-                return Vec::new();
-            };
-            // A quote-completed word must remain in the input, not be discarded by recovery.
-            if partial_word.is_some() && safe_end != completed.len() {
-                return Vec::new();
-            }
-            completed = format!("{}\ntrue\n{suffix}", &completed[..safe_end]);
-            parsed = parse(&completed);
-            if !parsed.is_ok() {
-                return Vec::new();
-            }
-        }
-    }
-    let mut plan = Plan {
-        source,
-        partial_word,
-        tokens: &[],
-        breaks: BTreeMap::new(),
-        subroles: BTreeMap::new(),
-        roles: BTreeMap::new(),
-        max_depth: syntax_depth(budget),
-        remaining: budget.max_fragments,
-        invocations: Vec::new(),
-        collect_invocations: true,
-    };
-    plan.sequence(&parsed.file.body, 0, false, 0);
-    plan.invocations
+pub fn present(source: &str, policy: InputPolicy, budget: &Budget) -> Document {
+    analyze(source, policy, budget).document
 }
 
+/// Extract the same validated invocation facts used by shell presentation.
+#[cfg(test)]
+#[must_use]
+pub fn invocations(source: &str, budget: &Budget) -> Vec<extraction::Invocation> {
+    analyze(source, InputPolicy::Literal, budget).invocations
+}
+
+#[cfg(test)]
 impl LanguageAdapter for ShellAdapter {
     fn present(&self, document: &mut Document, input: &AdapterInput, budget: &Budget) -> bool {
         let Some(source) = document
@@ -107,7 +74,7 @@ impl LanguageAdapter for ShellAdapter {
         }
         // Build in a separate projection so failure cannot partially append or mutate sources.
         let mut projection = Document::original(source);
-        if !project(&mut projection, budget, InputPolicy::Format) {
+        if project(&mut projection, budget, InputPolicy::Format).is_none() {
             return false;
         }
         if document
@@ -155,36 +122,85 @@ struct Plan<'a> {
     collect_invocations: bool,
 }
 
-fn project(document: &mut Document, budget: &Budget, policy: InputPolicy) -> bool {
+fn project(
+    document: &mut Document,
+    budget: &Budget,
+    policy: InputPolicy,
+) -> Option<Vec<extraction::Invocation>> {
     let source = document.execution_text().to_owned();
     let (tokens, safe_end) = lex(&source, budget.max_fragments);
-    let Some(tokens) = tokens else { return false };
-    let parse = |text: &str| {
-        Parser::with_limits_and_profile(
-            text,
-            syntax_depth(budget),
-            text.len().saturating_add(1).saturating_mul(32),
-            ShellProfile::native(ShellDialect::Bash),
+    let tokens = tokens?;
+    // A parser may silently omit a targetless redirect from the AST. Such a tail must
+    // neither authorize that command nor acquire a synthetic recovery word as its target.
+    let stopped_redirect = (safe_end < source.len())
+        .then(|| Lexer::new(&source[safe_end..]).next_lexed_token())
+        .flatten()
+        .filter(|token| matches!(token.kind, TokenKind::HereDoc | TokenKind::HereDocStrip))
+        .filter(|token| {
+            source[safe_end + token.span.end.offset()..]
+                .trim()
+                .is_empty()
+        })
+        .map(|_| safe_end);
+    let dangling_redirect = tokens
+        .iter()
+        .rev()
+        .find(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Comment))
+        .filter(|token| redirect_needs_target(token.kind))
+        .map(|token| token.range.start)
+        .or(stopped_redirect);
+    // All full, completion and prefix attempts draw from one aggregate parse-byte allowance.
+    let mut remaining_bytes = budget.max_source_bytes.saturating_mul(8);
+    let mut parse = |text: &str| {
+        remaining_bytes = remaining_bytes.checked_sub(text.len().max(1))?;
+        Some(
+            Parser::with_limits_and_profile(
+                text,
+                syntax_depth(budget),
+                text.len().saturating_add(1).saturating_mul(32),
+                ShellProfile::native(ShellDialect::Bash),
+            )
+            .parse(),
         )
-        .parse()
     };
-    let mut parsed = parse(&source[..safe_end]);
-    if !parsed.is_ok() {
-        // Lexical nesting merely proposes a completion. A clean parser must verify it before
-        // any original token receives structural meaning; recovered AST coverage is not trusted.
-        if let Some(suffix) = recovery_suffix(&source[..safe_end], &tokens, syntax_depth(budget)) {
-            let completed = format!("{}\ntrue\n{suffix}", &source[..safe_end]);
-            if completed.len() <= budget.max_source_bytes {
-                let recovered = parse(&completed);
-                if recovered.is_ok() {
-                    parsed = recovered;
-                }
+    // Let the parser own heredoc scheduling. The lexer boundary still limits presentation
+    // and recovery; a clean full AST alone can validate heredoc invocation associations.
+    let mut parsed = parse(&source)?;
+    let mut partial_word = None;
+    let mut completed = source.clone();
+    if !parsed.is_ok()
+        && let Some((candidate, range)) = quote_completion(&source, budget.max_fragments)
+        && candidate.len() <= budget.max_source_bytes
+        && let Some(recovered) = parse(&candidate)
+    {
+        completed = candidate;
+        partial_word = Some(range);
+        parsed = recovered;
+    }
+    if !parsed.is_ok() && dangling_redirect.is_none() {
+        let (recovery_tokens, recovery_end) = lex(&completed, budget.max_fragments);
+        // Never discard a heredoc/error tail: omitted bytes could redirect the enclosing
+        // command. Only quote completion or a clean independent prefix may authorize it.
+        if let Some(recovery_tokens) = recovery_tokens
+            && recovery_end == completed.len()
+            && let Some(suffix) = recovery_suffix(
+                &completed[..recovery_end],
+                &recovery_tokens,
+                syntax_depth(budget),
+            )
+        {
+            let candidate = format!("{}\ntrue\n{suffix}", &completed[..recovery_end]);
+            if candidate.len() <= budget.max_source_bytes
+                && let Some(recovered) = parse(&candidate)
+                && recovered.is_ok()
+            {
+                parsed = recovered;
             }
         }
     }
     let mut plan = Plan {
         source: &source,
-        partial_word: None,
+        partial_word,
         tokens: &tokens,
         breaks: BTreeMap::new(),
         subroles: BTreeMap::new(),
@@ -192,71 +208,89 @@ fn project(document: &mut Document, budget: &Budget, policy: InputPolicy) -> boo
         max_depth: syntax_depth(budget),
         remaining: budget.max_fragments,
         invocations: Vec::new(),
-        collect_invocations: false,
+        collect_invocations: true,
     };
-    if parsed.is_ok() {
+    if parsed.is_ok() && dangling_redirect.is_none() {
         plan.sequence(&parsed.file.body, 0, false, 0);
-    } else {
-        // One bounded, independently clean prefix parse can authorize structure before a
-        // damaged statement. Recovered AST nodes themselves never authorize whitespace edits.
-        let diagnostic = parsed
-            .diagnostics
-            .iter()
-            .map(|item| item.span.start.offset())
-            .min();
-        let terminal = parsed.terminal_error.as_ref().and_then(|error| {
-            let shuck_parser::Error::Parse { line, column, .. } = error;
-            if *line == 0 || *column == 0 {
-                return None;
-            }
-            let start = source
-                .split_inclusive('\n')
-                .take(line.saturating_sub(1))
-                .map(str::len)
-                .sum::<usize>();
-            Some(start.saturating_add(column.saturating_sub(1)))
-        });
-        let uncertain = diagnostic.into_iter().chain(terminal).min().unwrap_or(0);
-        let ast_end = parsed
-            .file
-            .body
-            .stmts
-            .iter()
-            .map(|statement| statement.span.end.offset())
-            .filter(|end| *end < uncertain && *end <= safe_end)
-            .max()
-            .unwrap_or(0);
-        // Fatal parsing can discard the enclosing command list. Lexer separators only
-        // nominate boundaries; each candidate still needs a clean independent parse.
-        let mut candidates = std::collections::BTreeSet::new();
-        if ast_end != 0 {
-            candidates.insert(ast_end);
-        }
-        for token in &tokens {
-            if token.range.end <= uncertain
-                && matches!(token.kind, TokenKind::Semicolon | TokenKind::Newline)
-            {
-                candidates.insert(token.range.end);
-            }
-        }
-        let mut remaining_bytes = budget.max_source_bytes.saturating_mul(8);
-        for end in candidates.into_iter().rev() {
-            if end > remaining_bytes {
-                break;
-            }
-            remaining_bytes -= end;
-            let prefix = parse(&source[..end]);
-            if prefix.is_ok() {
-                plan.sequence(&prefix.file.body, 0, false, 0);
-                break;
-            }
-        }
+    } else if let Some(prefix) =
+        clean_prefix(&source, &tokens, &parsed, dangling_redirect, &mut parse)
+    {
+        plan.sequence(&prefix.file.body, 0, false, 0);
     }
     if policy == InputPolicy::Literal {
         plan.breaks.clear();
     }
     emit(document, &source, &tokens, &plan, safe_end);
-    document.fragments.len() <= budget.max_fragments
+    (document.fragments.len() <= budget.max_fragments).then_some(plan.invocations)
+}
+
+// These lexer kinds consume a following word in Shuck. Self-contained fd duplications
+// and fd closures deliberately do not require a separate target.
+const fn redirect_needs_target(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::RedirectOut
+            | TokenKind::RedirectAppend
+            | TokenKind::RedirectIn
+            | TokenKind::RedirectReadWrite
+            | TokenKind::HereDoc
+            | TokenKind::HereDocStrip
+            | TokenKind::HereString
+            | TokenKind::RedirectBoth
+            | TokenKind::RedirectBothAppend
+            | TokenKind::Clobber
+            | TokenKind::DupOutput
+            | TokenKind::DupInput
+            | TokenKind::RedirectFd
+            | TokenKind::RedirectFdAppend
+            | TokenKind::RedirectFdIn
+            | TokenKind::RedirectFdReadWrite
+    )
+}
+
+// Only independently clean separator prefixes authorize structure before a damaged statement.
+// AST ends are not boundaries: a damaged trailing redirect may still belong to that command.
+fn clean_prefix(
+    source: &str,
+    tokens: &[Token],
+    parsed: &shuck_parser::parser::ParseResult,
+    dangling_redirect: Option<usize>,
+    parse: &mut impl FnMut(&str) -> Option<shuck_parser::parser::ParseResult>,
+) -> Option<shuck_parser::parser::ParseResult> {
+    let diagnostic = parsed
+        .diagnostics
+        .iter()
+        .map(|item| item.span.start.offset())
+        .min();
+    let terminal = parsed.terminal_error.as_ref().and_then(|error| {
+        let shuck_parser::Error::Parse { line, column, .. } = error;
+        if *line == 0 || *column == 0 {
+            return None;
+        }
+        let start = source
+            .split_inclusive('\n')
+            .take(line.saturating_sub(1))
+            .map(str::len)
+            .sum::<usize>();
+        Some(start.saturating_add(column.saturating_sub(1)))
+    });
+    let uncertain = diagnostic
+        .into_iter()
+        .chain(terminal)
+        .chain(dangling_redirect)
+        .min()
+        .unwrap_or(0);
+    for token in tokens.iter().rev() {
+        if token.range.end <= uncertain
+            && matches!(token.kind, TokenKind::Semicolon | TokenKind::Newline)
+        {
+            let prefix = parse(&source[..token.range.end])?;
+            if prefix.is_ok() {
+                return Some(prefix);
+            }
+        }
+    }
+    None
 }
 
 // Composition depth is caller policy; shell syntax depth is bounded independently by work
@@ -1179,6 +1213,126 @@ mod tests {
     }
 
     #[test]
+    fn shared_analysis_retains_validated_regions_before_malformed_tails() {
+        let budget = Budget::default();
+        for source in [
+            "node -e 'const x=1;console.log(x)' ; [[ x == ]",
+            "node -e 'const x=1;console.log(x)' ; echo 'unfinished",
+            "if true; then node -e 'const x=1;console.log(x)'; fi; [[ x == ]",
+            "{ node -e 'const x=1;console.log(x)'; }; [[ x == ]",
+            "(node -e 'const x=1;console.log(x)'); [[ x == ]",
+            "node -e 'const x=1;console.log(x)' ; python -c 'print(",
+        ] {
+            let projection = analyze(source, InputPolicy::Format, &budget);
+            assert_eq!(projection.document.execution_text(), source);
+            assert_provenance(source);
+            let fact = projection
+                .invocations
+                .iter()
+                .find(|fact| &source[fact.words[0].clone()] == "node")
+                .unwrap_or_else(|| panic!("lost validated invocation: {source}"));
+            let extracted = extraction::extract(source, fact, budget.max_source_bytes).unwrap();
+            assert_eq!(extracted.text, "const x=1;console.log(x)");
+            assert!(extracted.complete && !extracted.uncertain);
+            assert!(projection.invocations.iter().all(|fact| {
+                fact.words
+                    .iter()
+                    .all(|range| source.get(range.clone()).is_some())
+            }));
+            // Presentation policy must not change discovery authority.
+            let literal = analyze(source, InputPolicy::Literal, &budget);
+            assert_eq!(literal.document.display_text(), source);
+            assert_eq!(
+                literal
+                    .invocations
+                    .iter()
+                    .map(|fact| &fact.words)
+                    .collect::<Vec<_>>(),
+                projection
+                    .invocations
+                    .iter()
+                    .map(|fact| &fact.words)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_analysis_retains_complete_and_progressive_programs() {
+        let budget = Budget::default();
+        for (source, complete) in [
+            ("node -e 'const x=1;console.log(x)'", true),
+            ("if true; then node -e 'const x=1;console.log(x)'", true),
+            ("node -e 'const x=1;console.log(x)", false),
+            ("if true; then node -e 'const x=1;console.log(x)", false),
+        ] {
+            let projection = analyze(source, InputPolicy::Format, &budget);
+            let fact = projection
+                .invocations
+                .iter()
+                .find(|fact| &source[fact.words[0].clone()] == "node")
+                .unwrap();
+            let extracted = extraction::extract(source, fact, budget.max_source_bytes).unwrap();
+            assert_eq!(extracted.text, "const x=1;console.log(x)");
+            assert_eq!(extracted.complete, complete);
+            assert!(!extracted.uncertain);
+            assert_provenance(source);
+        }
+    }
+
+    #[test]
+    fn damaged_inherited_redirections_do_not_authorize_nested_invocations() {
+        let budget = Budget::default();
+        for source in [
+            "{ node -e 'console.log(1)'; } >",
+            "{ node -e 'console.log(1)'; } <<",
+            "{ node -e 'console.log(1)'; } > 'unfinished",
+            "{ node -e 'console.log(1)'; } </dev/null; [[ x == ]",
+            "(node -e 'console.log(1)') </dev/null; [[ x == ]",
+        ] {
+            let projection = analyze(source, InputPolicy::Format, &budget);
+            assert!(
+                projection
+                    .invocations
+                    .iter()
+                    .all(|fact| { &source[fact.words[0].clone()] != "node" }),
+                "uncertain inheritance admitted: {source}"
+            );
+            assert_provenance(source);
+        }
+        for tail in [
+            ">",
+            ">\n",
+            "> # awaiting target\n",
+            ">>",
+            "<",
+            "2>",
+            "2>&",
+            "<<<",
+            "<<",
+            "> 'unfinished",
+        ] {
+            let source =
+                format!("node -e 'console.log(0)'; {{ node -e 'console.log(1)'; }} {tail}");
+            let projection = analyze(&source, InputPolicy::Format, &budget);
+            let programs = projection
+                .invocations
+                .iter()
+                .filter_map(|fact| extraction::extract(&source, fact, budget.max_source_bytes))
+                .map(|extracted| extracted.text)
+                .collect::<Vec<_>>();
+            assert_eq!(programs, ["console.log(0)"], "damaged tail: {tail}");
+            assert_provenance(&source);
+        }
+        let source = "node -e \"console.log($VALUE)\"; [[ x == ]";
+        let projection = analyze(source, InputPolicy::Format, &budget);
+        let extracted =
+            extraction::extract(source, &projection.invocations[0], budget.max_source_bytes)
+                .unwrap();
+        assert!(extracted.uncertain);
+    }
+
+    #[test]
     fn disabled_and_exhausted_presentation_is_literal() {
         let source = "if true; then echo x; fi";
         assert_eq!(
@@ -1199,10 +1353,9 @@ mod tests {
                 ..Budget::default()
             },
         ] {
-            assert_eq!(
-                present(source, InputPolicy::Format, &budget).display_text(),
-                source
-            );
+            let projection = analyze(source, InputPolicy::Format, &budget);
+            assert_eq!(projection.document.display_text(), source);
+            assert!(projection.invocations.is_empty());
         }
     }
 }

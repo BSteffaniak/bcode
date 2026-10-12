@@ -5,7 +5,6 @@
 //! statements can gain generated newlines after semicolons. Recovery regions stay literal.
 
 use std::ops::{ControlFlow, Range};
-use std::time::{Duration, Instant};
 
 use tree_sitter::{Node, ParseOptions, Parser};
 
@@ -25,6 +24,29 @@ struct Token<'tree> {
 }
 
 impl LanguageAdapter for PythonAdapter {
+    fn present_outcome(
+        &self,
+        document: &mut Document,
+        input: &AdapterInput,
+        budget: &Budget,
+    ) -> Result<(), super::document::AdapterFailure> {
+        if document
+            .sources
+            .get(input.source.0)
+            .and_then(|source| source.text.get(input.range.clone()))
+            .is_none()
+        {
+            return Err(super::document::AdapterFailure::Unavailable);
+        }
+        // The compiled grammar is fixed. Valid source admission fails only when parser work,
+        // traversal, or projection limits are exhausted; uncertain syntax is retained locally.
+        if self.present(document, input, budget) {
+            Ok(())
+        } else {
+            Err(super::document::AdapterFailure::BudgetExceeded)
+        }
+    }
+
     fn present(&self, document: &mut Document, input: &AdapterInput, budget: &Budget) -> bool {
         let Some(source) = document
             .sources
@@ -127,9 +149,10 @@ fn parse(source: &str) -> Option<tree_sitter::Tree> {
         .ok()?;
     // The callback bounds parser work even for adversarial incomplete input. Cancellation
     // drops this invocation's parser; no suspended parser state survives into another call.
-    let started = Instant::now();
+    let mut checks = 0_usize;
     let mut progress = |_state: &tree_sitter::ParseState| {
-        if started.elapsed() >= Duration::from_millis(20) {
+        checks += 1;
+        if checks > 256 {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())

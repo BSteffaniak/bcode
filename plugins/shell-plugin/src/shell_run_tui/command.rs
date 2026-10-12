@@ -207,6 +207,16 @@ pub(super) fn project_with_state(
     {
         command[last.byte_start..].clone_into(&mut last.text);
     }
+    if !document.issues.is_empty() {
+        result.rows.extend(bmux_tui::text::wrap_line_bounded(
+            &Line::from_spans(vec![Span::styled(
+                "  embedded presentation limited · original source retained",
+                muted_style(),
+            )]),
+            bmux_tui::text::TextWrapGeometry::uniform(usize::from(width)),
+            TextWrap::Character,
+        ));
+    }
     result
 }
 

@@ -6,7 +6,6 @@
 //! equivalence guarantee. Missing syntax is never synthesized.
 
 use std::ops::{ControlFlow, Range};
-use std::time::{Duration, Instant};
 
 use tree_sitter::{Node, ParseOptions, Parser};
 
@@ -19,6 +18,28 @@ use super::document::{
 pub struct JavaScriptAdapter;
 
 impl LanguageAdapter for JavaScriptAdapter {
+    fn present_outcome(
+        &self,
+        document: &mut Document,
+        input: &AdapterInput,
+        budget: &Budget,
+    ) -> Result<(), super::document::AdapterFailure> {
+        if document
+            .sources
+            .get(input.source.0)
+            .and_then(|source| source.text.get(input.range.clone()))
+            .is_none()
+        {
+            return Err(super::document::AdapterFailure::Unavailable);
+        }
+        // Fixed compiled grammar: uncertain syntax is source-backed, not a recognition failure.
+        if self.present(document, input, budget) {
+            Ok(())
+        } else {
+            Err(super::document::AdapterFailure::BudgetExceeded)
+        }
+    }
+
     fn present(&self, document: &mut Document, input: &AdapterInput, budget: &Budget) -> bool {
         let Some(source) = document
             .sources
@@ -67,11 +88,10 @@ fn parse_tokens(source: &str, budget: &Budget) -> Option<Vec<Token>> {
     parser
         .set_language(&tree_sitter_javascript::LANGUAGE.into())
         .ok()?;
-    let started = Instant::now();
     let mut checks = 0_usize;
     let mut progress = |_: &tree_sitter::ParseState| {
         checks += 1;
-        if checks > 256 || started.elapsed() > Duration::from_millis(20) {
+        if checks > 256 {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -87,9 +107,10 @@ fn parse_tokens(source: &str, budget: &Budget) -> Option<Vec<Token>> {
     if tree.root_node().has_error() {
         // An unfinished enclosing function/block can become one ERROR island, hiding otherwise
         // complete statements. Supply parser-only block closures to recover that prior structure.
+        // A deterministic work budget avoids changing presentation with machine load. Both
+        // original and recovery parses share the allowance; no parser-only suffix is displayed.
         // Counting opening bytes is an upper bound, not a second lexer: braces inside literals
-        // may produce extra recovery errors, which remain opaque. No suffix byte is displayed.
-        // Both parses share the same progress/time allowance; padding is at most source.len()+1.
+        // may produce extra recovery errors, which remain opaque.
         let closures = source.bytes().filter(|byte| *byte == b'{').count();
         if closures > budget.max_fragments {
             return None;

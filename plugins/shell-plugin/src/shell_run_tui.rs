@@ -3679,6 +3679,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn embedded_languages_keep_structure_and_styles_through_real_lifecycle() {
+        for source in [
+            "python3 -c 'x=42;print(x)' ; [[ x == ]",
+            "node -e 'const x=42;console.log(x)' ; [[ x == ]",
+            "bash -c 'node -e \"const x=42;console.log(x)\"' ; [[ x == ]",
+        ] {
+            let adapter = ShellRunTuiVisualAdapter::default();
+            let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                160,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            );
+            let arguments = serde_json::json!({"command": source, "format_commands": true});
+            let draft = serde_json::json!({"preview": serde_json::to_string(&arguments).unwrap()});
+            let live = serde_json::json!({"mode": "terminal", "arguments": {
+                "command": source, "presentation_policy": bcode_config::ShellOutputPresentationPolicy::default()
+            }});
+            let final_payload = lifecycle_result_payload(
+                &arguments,
+                Some(bcode_config::ShellOutputPresentationPolicy::default()),
+                true,
+            );
+            let expected =
+                lifecycle_command_rows(&adapter, "bcode.tool.request.shell.run", &draft, &context);
+            assert!(expected.len() > 1, "embedded program collapsed: {source}");
+            assert!(
+                expected
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content == "42" && span.style.fg == Some(Color::Magenta)),
+                "missing embedded number role: {source}"
+            );
+            for (kind, payload) in [
+                ("bcode.tool.request.shell.run", &arguments),
+                (SHELL_RUN_SCHEMA, &live),
+                (SHELL_RUN_SCHEMA, &final_payload),
+            ] {
+                assert_eq!(
+                    lifecycle_command_rows(&adapter, kind, payload, &context),
+                    expected,
+                    "{source}: {kind}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_formatting_disabled_preserves_encoded_bytes_and_roles() {
+        let source = "python3 -c 'x=42;print(x)'";
+        let policy = bcode_config::ShellOutputPresentationPolicy {
+            enabled: false,
+            ..Default::default()
+        };
+        let document = crate::presentation::present(source, &policy);
+        assert_eq!(document.display_text(), source);
+        assert_eq!(document.execution_text(), source);
+        assert!(
+            document
+                .fragments
+                .iter()
+                .any(|fragment| fragment.text == "42"
+                    && fragment.role == crate::presentation::document::Role::Number)
+        );
+    }
+
     fn lifecycle_result_payload(
         arguments: &serde_json::Value,
         policy: Option<bcode_config::ShellOutputPresentationPolicy>,

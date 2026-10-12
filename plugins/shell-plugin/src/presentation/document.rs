@@ -149,14 +149,50 @@ pub struct AdapterInput {
     pub depth: usize,
 }
 
+/// Why a local language projection could not be produced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterFailure {
+    /// Explicit byte, fragment, depth, or parser-work allowance was exhausted.
+    BudgetExceeded,
+    /// The source or language could not be safely recognized.
+    Unavailable,
+}
+
+/// A local, source-scoped presentation limitation, never an execution outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentationIssue {
+    /// Original source region retaining its enclosing presentation.
+    pub source: SourceId,
+    /// Source bytes affected by the limitation.
+    pub range: Range<usize>,
+    /// Normalized reason, without source text or parser-private diagnostics.
+    pub reason: AdapterFailure,
+}
+
 /// Parser-backed optional language presentation.
 ///
-/// A successful adapter appends fragments; failure must leave the document unchanged. Adapters
-/// must retain uncertain source literally, validate source coverage independently of recovered
-/// ASTs, and obey the supplied budgets. Callers choose adapters and enforce opt-out policy.
+/// Success appends source-backed fragments; failure leaves the document unchanged. Adapters
+/// validate source coverage independently of recovered ASTs and obey explicit work budgets.
 pub trait LanguageAdapter {
     /// Append a presentation of the input, returning false when admission/recognition fails.
     fn present(&self, document: &mut Document, input: &AdapterInput, budget: &Budget) -> bool;
+
+    /// Append a projection with a normalized, local failure reason.
+    ///
+    /// # Errors
+    /// Returns a local admission, recognition, or work-budget failure without changing execution.
+    fn present_outcome(
+        &self,
+        document: &mut Document,
+        input: &AdapterInput,
+        budget: &Budget,
+    ) -> Result<(), AdapterFailure> {
+        if self.present(document, input, budget) {
+            Ok(())
+        } else {
+            Err(AdapterFailure::Unavailable)
+        }
+    }
 }
 
 /// Source authority plus a renderer-neutral display projection.
@@ -166,6 +202,8 @@ pub struct Document {
     pub sources: Vec<Source>,
     /// Ordered displayed fragments.
     pub fragments: Vec<Fragment>,
+    /// Local projection failures; original source and enclosing presentation remain available.
+    pub issues: Vec<PresentationIssue>,
 }
 
 impl Document {
@@ -179,6 +217,7 @@ impl Document {
                 correspondence: Vec::new(),
             }],
             fragments: Vec::new(),
+            issues: Vec::new(),
         }
     }
 
