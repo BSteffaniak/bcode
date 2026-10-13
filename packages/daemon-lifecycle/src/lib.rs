@@ -3093,14 +3093,8 @@ impl StartupLock {
             &scope,
             || ping_ready(endpoint),
             |observation, elapsed| {
-                if observation != StartupLockObservation::Waiting {
-                    let phase = bcode_metrics::startup::phase_for(observation.phase_name(), &scope);
-                    if observation == StartupLockObservation::Timeout {
-                        phase.fail();
-                    } else {
-                        phase.finish();
-                    }
-                }
+                // Terminal outcomes are point observations in tracing below.
+                // The scoped lock_wait phase owns the actual elapsed interval.
                 tracing::debug!(
                     target: "bcode_daemon_lifecycle::startup",
                     artifact_id = %artifact,

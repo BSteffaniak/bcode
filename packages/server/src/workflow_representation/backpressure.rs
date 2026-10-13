@@ -81,6 +81,55 @@ where
     retry(operation).await
 }
 
+/// Observe the actual queue guard; telemetry adds no lock or alternate ownership registry.
+pub(super) struct ObservedWriteGuard<'a> {
+    guard: Option<tokio::sync::MutexGuard<'a, ()>>,
+    held: bcode_metrics::MetricsSpan,
+}
+
+impl Drop for ObservedWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Publish release only after relinquishing the real execution guard.
+        drop(self.guard.take());
+        self.held.finish_with_outcome(&"released");
+    }
+}
+
+/// Measure acquisition separately from actual possession, including cancelled waiters.
+/// The caller supplies the original lock future (including any fixture Pending observer).
+pub(super) async fn observe_write_lock<'a>(
+    metrics: &bcode_metrics::MetricsRegistry,
+    labels: bcode_metrics::MetricLabels,
+    lock: impl std::future::Future<Output = tokio::sync::MutexGuard<'a, ()>>,
+) -> ObservedWriteGuard<'a> {
+    metrics.record_event("workflow.writer_queue.wait_started", 1, labels.clone());
+    let wait = metrics
+        .span("workflow.writer_queue.wait")
+        .labels(labels.clone());
+    let guard = lock.await;
+    wait.finish_ok();
+    metrics.record_event("workflow.writer_queue.acquired", 1, labels.clone());
+    ObservedWriteGuard {
+        guard: Some(guard),
+        held: metrics.span("workflow.writer_queue.held").labels(labels),
+    }
+}
+
+pub(super) async fn queued_observed<T, F, Fut>(
+    path: &std::path::Path,
+    metrics: &bcode_metrics::MetricsRegistry,
+    labels: bcode_metrics::MetricLabels,
+    operation: F,
+) -> Result<T, RepresentationError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, RepresentationError>>,
+{
+    let queue = write_queue(path).map_err(|_| RepresentationError::MaintenanceRequired)?;
+    let _guard = observe_write_lock(metrics, labels, queue.lock()).await;
+    retry_observed(Some(metrics), operation).await
+}
+
 pub(super) fn normalize(error: RepresentationError) -> super::ServerError {
     if matches!(
         error,
@@ -96,6 +145,77 @@ pub(super) fn normalize(error: RepresentationError) -> super::ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observed_queue_separates_wait_from_holder_and_cancelled_waiter() {
+        use std::future::Future as _;
+        let file = tempfile::NamedTempFile::new().expect("queue file");
+        let queue = write_queue(file.path()).expect("queue");
+        let metrics = bcode_metrics::MetricsRegistry::default();
+        let labels = |operation: &str| {
+            std::collections::BTreeMap::from([("operation".into(), operation.into())])
+        };
+        let held = observe_write_lock(&metrics, labels("holder"), queue.lock()).await;
+        let mut waiter = Box::pin(observe_write_lock(&metrics, labels("waiter"), queue.lock()));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                waiter.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert!(
+            !metrics
+                .report()
+                .events
+                .iter()
+                .any(|event| event.name == "workflow.writer_queue.acquired"
+                    && event.labels.get("operation").map(String::as_str) == Some("waiter"))
+        );
+        drop(waiter);
+        assert!(
+            queue.try_lock().is_err(),
+            "waiter cancellation cannot release holder"
+        );
+        assert!(
+            metrics
+                .report()
+                .events
+                .iter()
+                .any(|event| event.name == "workflow.writer_queue.wait.total"
+                    && event.labels.get("operation").map(String::as_str) == Some("waiter")
+                    && event.labels.get("outcome").map(String::as_str) == Some("unfinished"))
+        );
+        let mut successor = Box::pin(observe_write_lock(
+            &metrics,
+            labels("successor"),
+            queue.lock(),
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                successor.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        drop(held);
+        let acquired = successor.await;
+        assert!(queue.try_lock().is_err());
+        drop(acquired);
+        assert!(queue.try_lock().is_ok());
+        let events = metrics.report().events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.name == "workflow.writer_queue.held.total")
+                .count(),
+            2
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.name == "workflow.writer_queue.held.total")
+                .all(|event| event.labels.get("outcome").map(String::as_str) == Some("released"))
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_waiter_never_executes_and_holder_release_unblocks_same_path() {

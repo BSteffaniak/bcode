@@ -213,6 +213,7 @@ mod tests {
                     tool_call_id: None,
                     status: bcode_session_models::RuntimeWorkStatus::Cancelling,
                     cancellable: true,
+                    observation: None,
                 },
             });
         assert_eq!(

@@ -1,8 +1,9 @@
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_plugin::PluginInvocationCancelHandle;
 use bcode_session::SessionOwnershipGuard;
-use bcode_session_models::RuntimeWorkSnapshot;
+pub use bcode_session_models::RuntimeWorkObservedStage as ObservedWorkStage;
 use bcode_session_models::{RuntimeWorkKind, RuntimeWorkStatus, SessionId, WorkId};
+use bcode_session_models::{RuntimeWorkObservation, RuntimeWorkSnapshot};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -141,8 +142,36 @@ impl RuntimeWorkSpec {
     }
 }
 
+/// Capability bound to one registration and one observed stage revision.
+#[derive(Debug, Clone)]
+pub struct WorkObservationToken {
+    session_id: SessionId,
+    work_id: WorkId,
+    owner: Arc<()>,
+    revision: Arc<()>,
+}
+
+/// Bounded local observation, not execution authority or durable history.
+#[derive(Debug)]
+pub struct WorkObservation {
+    pub work_id: WorkId,
+    pub stage: Option<ObservedWorkStage>,
+    pub elapsed: Option<std::time::Duration>,
+    pub cancellation_requested: bool,
+}
+
+/// Live pagination is best effort; removed/replaced entries require a fresh scan.
+#[derive(Debug)]
+pub struct WorkObservationPage {
+    pub entries: Vec<WorkObservation>,
+    pub next_after: Option<WorkId>,
+}
+
 #[derive(Debug, Clone)]
 struct ActiveRuntimeWork {
+    observation_owner: Arc<()>,
+    observation_revision: Arc<()>,
+    stage: Option<(ObservedWorkStage, std::time::Instant)>,
     spec: RuntimeWorkSpec,
     cancelled: bool,
     shared_execution: Option<std::sync::Weak<bcode_session::SharedExecutionSessionObservation>>,
@@ -163,6 +192,91 @@ pub struct RuntimeWorkManager {
 }
 
 impl RuntimeWorkManager {
+    /// Capture only an existing local registration; never admit missing work.
+    pub(super) async fn observation_token(
+        &self,
+        session_id: SessionId,
+        work_id: &WorkId,
+    ) -> Option<WorkObservationToken> {
+        let active = self.active.lock().await;
+        let work = active.get(&(session_id, work_id.clone()))?;
+        let result = Some(WorkObservationToken {
+            session_id,
+            work_id: work_id.clone(),
+            owner: Arc::clone(&work.observation_owner),
+            revision: Arc::clone(&work.observation_revision),
+        });
+        drop(active);
+        result
+    }
+
+    /// Advance the observation only while both owner and revision still match.
+    /// Returned token supersedes the old token, fencing delayed stage updates.
+    pub(super) async fn observe_stage(
+        &self,
+        token: &WorkObservationToken,
+        stage: ObservedWorkStage,
+    ) -> Option<WorkObservationToken> {
+        let mut active = self.active.lock().await;
+        let work = active.get_mut(&(token.session_id, token.work_id.clone()))?;
+        if !Arc::ptr_eq(&token.owner, &work.observation_owner)
+            || !Arc::ptr_eq(&token.revision, &work.observation_revision)
+        {
+            return None;
+        }
+        work.observation_revision = Arc::new(());
+        work.stage = Some((stage, std::time::Instant::now()));
+        let result = Some(WorkObservationToken {
+            session_id: token.session_id,
+            work_id: token.work_id.clone(),
+            owner: Arc::clone(&work.observation_owner),
+            revision: Arc::clone(&work.observation_revision),
+        });
+        drop(active);
+        result
+    }
+
+    /// Observe at most 128 entries through an ordered per-session range.
+    /// No labels, arguments, durable rows or foreign owners are inspected.
+    pub(super) async fn observation_page(
+        &self,
+        session_id: SessionId,
+        after: Option<&WorkId>,
+        limit: usize,
+    ) -> WorkObservationPage {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let limit = limit.clamp(1, 128);
+        let active = self.active.lock().await;
+        let lower = after.map_or_else(
+            || Included((session_id, WorkId::new(""))),
+            |id| Excluded((session_id, id.clone())),
+        );
+        let mut rows = active
+            .range((lower, Unbounded))
+            .take_while(|((session, _), _)| *session == session_id);
+        let now = std::time::Instant::now();
+        let entries: Vec<_> = rows
+            .by_ref()
+            .take(limit)
+            .map(|((_, id), work)| WorkObservation {
+                work_id: id.clone(),
+                stage: work.stage.map(|(stage, _)| stage),
+                elapsed: work
+                    .stage
+                    .map(|(_, started)| now.saturating_duration_since(started)),
+                cancellation_requested: work.cancelled,
+            })
+            .collect();
+        let next_after = rows
+            .next()
+            .and_then(|_| entries.last().map(|entry| entry.work_id.clone()));
+        drop(active);
+        WorkObservationPage {
+            entries,
+            next_after,
+        }
+    }
+
     /// Create a runtime work manager with aggregate cleanup diagnostics.
     #[must_use]
     pub fn with_metrics(metrics: MetricsRegistry) -> Self {
@@ -192,6 +306,9 @@ impl RuntimeWorkManager {
         let replaced = active.insert(
             (session_id, spec.work_id.clone()),
             ActiveRuntimeWork {
+                observation_owner: Arc::new(()),
+                observation_revision: Arc::new(()),
+                stage: None,
                 spec,
                 cancelled,
                 shared_execution: None,
@@ -435,9 +552,9 @@ impl RuntimeWorkManager {
 
     /// Return active work snapshots across every session, tagged with their owning session.
     pub async fn active_all(&self) -> Vec<(SessionId, RuntimeWorkSnapshot)> {
-        self.active
-            .lock()
-            .await
+        let active = self.active.lock().await;
+        let now = std::time::Instant::now();
+        let snapshots = active
             .iter()
             .map(|((session_id, work_id), work)| {
                 (
@@ -452,11 +569,14 @@ impl RuntimeWorkManager {
                         } else {
                             RuntimeWorkStatus::Running
                         },
+                        observation: observed_work_at(work, now),
                         cancellable: work.spec.cancellation.is_cancellable(),
                     },
                 )
             })
-            .collect()
+            .collect();
+        drop(active);
+        snapshots
     }
 
     /// Return active work snapshots for a session.
@@ -483,9 +603,9 @@ impl RuntimeWorkManager {
     }
 
     pub async fn active_for_session(&self, session_id: SessionId) -> Vec<RuntimeWorkSnapshot> {
-        self.active
-            .lock()
-            .await
+        let active = self.active.lock().await;
+        let now = std::time::Instant::now();
+        let snapshots = active
             .iter()
             .filter(|((active_session_id, _), _)| *active_session_id == session_id)
             .map(|((_, work_id), work)| RuntimeWorkSnapshot {
@@ -498,10 +618,24 @@ impl RuntimeWorkManager {
                 } else {
                     RuntimeWorkStatus::Running
                 },
+                observation: observed_work_at(work, now),
                 cancellable: work.spec.cancellation.is_cancellable(),
             })
-            .collect()
+            .collect();
+        drop(active);
+        snapshots
     }
+}
+
+fn observed_work_at(
+    work: &ActiveRuntimeWork,
+    now: std::time::Instant,
+) -> Option<RuntimeWorkObservation> {
+    work.stage.map(|(stage, started)| RuntimeWorkObservation {
+        stage,
+        elapsed_ms: u64::try_from(now.saturating_duration_since(started).as_millis())
+            .unwrap_or(u64::MAX),
+    })
 }
 
 const fn runtime_work_kind_label(kind: RuntimeWorkKind) -> &'static str {
@@ -519,6 +653,134 @@ const fn runtime_work_kind_label(kind: RuntimeWorkKind) -> &'static str {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn start_observation_fixture(
+        manager: &RuntimeWorkManager,
+        session: SessionId,
+        id: &WorkId,
+    ) {
+        manager
+            .start(
+                session,
+                RuntimeWorkSpec::new(
+                    id.clone(),
+                    RuntimeWorkKind::PluginInvocation,
+                    "not diagnostic content".into(),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                ),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn observation_stages_survive_cancellation_until_retirement() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        let id = WorkId::new("observed");
+        assert!(manager.observation_token(session, &id).await.is_none());
+        start_observation_fixture(&manager, session, &id).await;
+        let initial = manager.observation_page(session, None, 1).await;
+        assert_eq!(initial.entries[0].stage, None);
+        assert_eq!(initial.entries[0].elapsed, None);
+        let mut token = manager.observation_token(session, &id).await.unwrap();
+        for stage in [
+            ObservedWorkStage::Dispatch,
+            ObservedWorkStage::ReceiptWait,
+            ObservedWorkStage::Cleanup,
+        ] {
+            token = manager.observe_stage(&token, stage).await.unwrap();
+        }
+        manager.cancel_with_children(session, &id).await;
+        let cancelled = manager.observation_page(session, None, 1).await;
+        assert_eq!(cancelled.entries[0].stage, Some(ObservedWorkStage::Cleanup));
+        assert!(cancelled.entries[0].elapsed.is_some());
+        assert!(cancelled.entries[0].cancellation_requested);
+        let session_snapshot = manager.active_for_session(session).await;
+        let all_snapshot = manager.active_all().await;
+        assert_eq!(
+            session_snapshot[0].observation.as_ref().unwrap().stage,
+            ObservedWorkStage::Cleanup
+        );
+        assert_eq!(
+            all_snapshot[0].1.observation.as_ref().unwrap().stage,
+            ObservedWorkStage::Cleanup
+        );
+        assert_eq!(session_snapshot[0].status, RuntimeWorkStatus::Cancelling);
+        token = manager
+            .observe_stage(&token, ObservedWorkStage::Retirement)
+            .await
+            .unwrap();
+        assert!(manager.finish(session, &id).await);
+        assert!(
+            manager
+                .observe_stage(&token, ObservedWorkStage::Dispatch)
+                .await
+                .is_none()
+        );
+        assert!(
+            manager
+                .observation_page(session, None, 1)
+                .await
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_tokens_fence_stale_revisions_and_replaced_owners() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        let id = WorkId::new("replaced");
+        start_observation_fixture(&manager, session, &id).await;
+        let old = manager.observation_token(session, &id).await.unwrap();
+        let current = manager
+            .observe_stage(&old, ObservedWorkStage::Cleanup)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .observe_stage(&old, ObservedWorkStage::Dispatch)
+                .await
+                .is_none()
+        );
+        start_observation_fixture(&manager, session, &id).await;
+        assert!(
+            manager
+                .observe_stage(&current, ObservedWorkStage::Retirement)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            manager.observation_page(session, None, 1).await.entries[0].stage,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_pages_are_bounded_session_scoped_and_exclusive() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        for index in 0..130 {
+            start_observation_fixture(&manager, session, &WorkId::new(format!("work-{index:03}")))
+                .await;
+        }
+        start_observation_fixture(&manager, SessionId::new(), &WorkId::new("foreign")).await;
+        let page = manager.observation_page(session, None, usize::MAX).await;
+        assert_eq!(page.entries.len(), 128);
+        let cursor = page.next_after.unwrap();
+        let tail = manager.observation_page(session, Some(&cursor), 128).await;
+        assert_eq!(tail.entries.len(), 2);
+        assert!(tail.entries.iter().all(|entry| entry.work_id > cursor));
+        assert!(tail.next_after.is_none());
+        assert_eq!(
+            manager
+                .observation_page(session, None, 0)
+                .await
+                .entries
+                .len(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn typed_service_cancellation_remains_routable_until_settlement() {

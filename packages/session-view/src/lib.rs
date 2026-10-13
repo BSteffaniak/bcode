@@ -13789,6 +13789,7 @@ mod tests {
             tool_call_id: None,
             status: bcode_session_models::RuntimeWorkStatus::Running,
             cancellable: true,
+            observation: None,
         }]);
 
         let work = &view.snapshot().runtime_work[0];
@@ -13806,6 +13807,7 @@ mod tests {
             tool_call_id: None,
             status: bcode_session_models::RuntimeWorkStatus::Cancelled,
             cancellable: true,
+            observation: None,
         }]);
         assert!(view.snapshot().runtime_work.is_empty());
         view.set_runtime_work_snapshots(&[]);

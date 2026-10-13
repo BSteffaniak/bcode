@@ -50,6 +50,9 @@ pub async fn subscribe(
 ///
 /// Limits are clamped to the session history read budget; zero requests one event,
 /// never an unlimited persistence query.
+///
+/// # Errors
+/// Returns the session error if bounded runtime-work history is unavailable.
 pub async fn history(
     state: &ServerState,
     session_id: SessionId,
@@ -75,6 +78,40 @@ pub async fn history(
 /// Return active runtime work for one session without transport framing.
 pub async fn list(state: &ServerState, session_id: SessionId) -> Vec<RuntimeWorkSnapshot> {
     state.runtime_work.active_for_session(session_id).await
+}
+
+/// Return a bounded live-observation page from this daemon's runtime-work owner.
+///
+/// Limits are clamped to 1..=128. This does not discover foreign owners or recover
+/// historical stages. Absence of a stage is unknown, not idle or completed.
+/// Callers must apply the same session authorization as other runtime-work reads.
+pub async fn observations(
+    state: &ServerState,
+    session_id: SessionId,
+    after: Option<&WorkId>,
+    limit: usize,
+) -> bcode_session_models::RuntimeWorkObservationPage {
+    let page = state
+        .runtime_work
+        .observation_page(session_id, after, limit)
+        .await;
+    bcode_session_models::RuntimeWorkObservationPage {
+        entries: page
+            .entries
+            .into_iter()
+            .map(|entry| bcode_session_models::RuntimeWorkObservationEntry {
+                work_id: entry.work_id,
+                observation: entry.stage.zip(entry.elapsed).map(|(stage, elapsed)| {
+                    bcode_session_models::RuntimeWorkObservation {
+                        stage,
+                        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    }
+                }),
+                cancellation_requested: entry.cancellation_requested,
+            })
+            .collect(),
+        next_after: page.next_after,
+    }
 }
 
 /// Request cancellation of registered runtime work without transport framing.

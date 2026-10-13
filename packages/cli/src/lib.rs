@@ -29072,6 +29072,7 @@ mod json_stream_output_tests {
             tool_call_id: Some("call".into()),
             status: RuntimeWorkStatus::Cancelling,
             cancellable: true,
+            observation: None,
         }];
         let spans = vec![bcode_client::RuntimeWorkSpan {
             work_id: WorkId::new("w"),

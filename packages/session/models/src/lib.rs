@@ -2516,6 +2516,53 @@ impl RuntimeWorkSpan {
     }
 }
 
+/// A content-free stage observed by the current local runtime-work owner.
+///
+/// Absence means unknown, not idle. This is diagnostic metadata, not execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeWorkObservedStage {
+    /// Dispatch is in progress.
+    Dispatch,
+    /// An accepted operation is waiting to publish its receipt.
+    ReceiptWait,
+    /// Cleanup has started; cancellation is not yet terminal.
+    Cleanup,
+    /// The owner is retiring its registration.
+    Retirement,
+}
+
+/// Ephemeral observation bound to a live work registration, never durable resume evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeWorkObservation {
+    /// Stage actually observed by the owning operation.
+    pub stage: RuntimeWorkObservedStage,
+    /// Monotonic milliseconds since entering this stage, measured at snapshot time.
+    pub elapsed_ms: u64,
+}
+
+/// One content-free observation of locally owned active work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeWorkObservationEntry {
+    /// Exact active-work identity.
+    pub work_id: WorkId,
+    /// Missing when the owner has not instrumented a stage.
+    pub observation: Option<RuntimeWorkObservation>,
+    /// Cancellation was requested; this is not proof of termination.
+    pub cancellation_requested: bool,
+}
+
+/// A bounded, best-effort page of live observations, not a durable replay cursor.
+///
+/// Entries may disappear or arrive behind the cursor; rescan for a fresh inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeWorkObservationPage {
+    /// Observed entries in work-identity order.
+    pub entries: Vec<RuntimeWorkObservationEntry>,
+    /// Exclusive cursor for the next live page; absence means this scan reached its end.
+    pub next_after: Option<WorkId>,
+}
+
 /// Current runtime-work state exposed by application operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkSnapshot {
@@ -2532,6 +2579,9 @@ pub struct RuntimeWorkSnapshot {
     pub status: RuntimeWorkStatus,
     /// Whether cancellation may currently be requested.
     pub cancellable: bool,
+    /// Optional local owner observation. Missing on older peers and unobserved work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<RuntimeWorkObservation>,
 }
 
 /// Durable runtime work category.

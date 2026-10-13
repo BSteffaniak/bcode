@@ -29,7 +29,8 @@ mod plugin_context;
 mod plugin_operations;
 mod request_routing;
 mod runtime_work;
-mod runtime_work_operations;
+/// Transport-neutral runtime-work reads, observations and cancellation operations.
+pub mod runtime_work_operations;
 mod server_operations;
 mod session_activity;
 mod session_bulk_migration;
@@ -39014,35 +39015,32 @@ async fn commit_workflow_prompt_observation(
     observation: bcode_workflow_store::AttemptObservation,
 ) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
     let completion_gate = workflow_drive_gate(state, &request.activation.run_id);
-    #[cfg(test)]
-    let trace_session = receipt["session_id"]
-        .as_str()
-        .and_then(|value| value.parse::<SessionId>().ok());
-    #[cfg(test)]
-    if let Some(session_id) = trace_session {
-        trace_workflow_owner_lifecycle(
-            state,
-            session_id,
-            &request.dispatch_identity,
-            "drive-gate-wait",
-        );
-    }
+    let labels = MetricLabels::from([
+        ("run_id".to_owned(), request.activation.run_id.clone()),
+        (
+            "activation_id".to_owned(),
+            request.activation.activation_id.clone(),
+        ),
+        (
+            "dispatch_identity".to_owned(),
+            request.dispatch_identity.clone(),
+        ),
+    ]);
+    state.metrics.add_counter_with_labels(
+        "workflow.owner.drive_gate_wait.started",
+        1,
+        labels.clone(),
+    );
+    let wait_span = state
+        .metrics
+        .span("workflow.owner.drive_gate_wait")
+        .labels(labels.clone());
     let completion_guard = completion_gate.lock().await;
-    #[cfg(test)]
-    if let Some(session_id) = trace_session {
-        trace_workflow_owner_lifecycle(
-            state,
-            session_id,
-            &request.dispatch_identity,
-            "drive-gate-acquired",
-        );
-        trace_workflow_owner_lifecycle(
-            state,
-            session_id,
-            &request.dispatch_identity,
-            "receipt-persist-enter",
-        );
-    }
+    wait_span.finish_ok();
+    let held_span = state
+        .metrics
+        .span("workflow.owner.drive_gate_held")
+        .labels(labels);
     let receipt_result = workflow_representation::owner::persist_receipt(
         state,
         &bcode_workflow_store::DispatchReceipt {
@@ -39057,39 +39055,17 @@ async fn commit_workflow_prompt_observation(
         authority,
     )
     .await;
-    #[cfg(test)]
-    if let Some(session_id) = trace_session {
-        trace_workflow_owner_lifecycle(
-            state,
-            session_id,
-            &request.dispatch_identity,
-            "receipt-persist-return",
-        );
-    }
-    receipt_result?;
-    #[cfg(test)]
-    if let Some(session_id) = trace_session {
-        trace_workflow_owner_lifecycle(
-            state,
-            session_id,
-            &request.dispatch_identity,
-            "observation-settle-enter",
-        );
+    if let Err(error) = receipt_result {
+        drop(completion_guard);
+        held_span.finish_err();
+        return Err(error);
     }
     let settlement_result =
         workflow_representation::owner::settle_observation(state, request, authority, observation)
             .await;
-    #[cfg(test)]
-    if let Some(session_id) = trace_session {
-        trace_workflow_owner_lifecycle(
-            state,
-            session_id,
-            &request.dispatch_identity,
-            "observation-settle-return",
-        );
-    }
-    let summary = settlement_result?;
     drop(completion_guard);
+    held_span.finish_result(&settlement_result);
+    let summary = settlement_result?;
     Ok(summary)
 }
 
@@ -39141,6 +39117,19 @@ async fn complete_workflow_prompt_dispatch(
     shared_permit: Option<bcode_session::SharedExecutionSessionPermit>,
     observation: Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError>,
 ) {
+    let work_id = WorkId::new(request.dispatch_identity.clone());
+    let observation_token = state
+        .runtime_work
+        .observation_token(session_id, &work_id)
+        .await;
+    let observation_token = if let Some(token) = observation_token {
+        state
+            .runtime_work
+            .observe_stage(&token, runtime_work::ObservedWorkStage::ReceiptWait)
+            .await
+    } else {
+        None
+    };
     #[cfg(test)]
     trace_workflow_owner_lifecycle(
         state,
@@ -39179,15 +39168,14 @@ async fn complete_workflow_prompt_dispatch(
             (RuntimeWorkStatus::Suspended, Some("workflow prompt settlement unresolved; inspect or reconcile the retained receipt".into()))
         }
     };
+    if let Some(token) = observation_token {
+        let _ = state
+            .runtime_work
+            .observe_stage(&token, runtime_work::ObservedWorkStage::Retirement)
+            .await;
+    }
     drop(shared_permit);
-    finish_registered_runtime_work(
-        state,
-        session_id,
-        WorkId::new(request.dispatch_identity.clone()),
-        status,
-        message,
-    )
-    .await;
+    finish_registered_runtime_work(state, session_id, work_id, status, message).await;
     if let Ok((summary, _)) = result {
         continue_settled_workflow_prompt(state, request, summary).await;
     }
@@ -40646,6 +40634,16 @@ async fn register_workflow_node_runtime_work(
         .with_parent_work_id(Some(run_work_id.clone())),
     )
     .await;
+    if let Some(token) = state
+        .runtime_work
+        .observation_token(session_id, &work_id)
+        .await
+    {
+        let _ = state
+            .runtime_work
+            .observe_stage(&token, runtime_work::ObservedWorkStage::Dispatch)
+            .await;
+    }
     #[cfg(test)]
     trace_workflow_owner_lifecycle(state, session_id, dispatch_identity, "register-return");
     work_id

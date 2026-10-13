@@ -1927,6 +1927,19 @@ async fn fixture_stage_diagnostic(
     checkpoint: &str,
     started: std::time::Instant,
 ) {
+    // Read the same bounded production telemetry used by normal diagnostics,
+    // rather than maintaining a parallel fixture lifecycle inventory.
+    let report = state.metrics.report();
+    eprintln!(
+        "fixture-stage={checkpoint} telemetry-retained={} coverage=bounded-recent-not-complete",
+        report.events.len(),
+    );
+    for event in report.events.iter().rev().take(24).rev() {
+        eprintln!(
+            "fixture-stage={checkpoint} metric={} timestamp_ms={} value={} labels={:?}",
+            event.name, event.unix_ms, event.value, event.labels,
+        );
+    }
     let observed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         for (session, work) in state.runtime_work.active_all().await.into_iter().take(100) {
             eprintln!("fixture-stage={checkpoint} elapsed={:?} session={session} work={} kind={:?} status={:?} origin=runtime-registration-not-classified-synthetic", started.elapsed(), work.work_id, work.kind, work.status);

@@ -9,6 +9,20 @@ use bcode_workflow_store::{
 };
 use representation::attempts::owner_boundary;
 
+fn owner_queue_labels(
+    operation: &'static str,
+    run_id: &str,
+    activation_id: &str,
+    dispatch_identity: &str,
+) -> bcode_metrics::MetricLabels {
+    std::collections::BTreeMap::from([
+        ("operation".into(), operation.into()),
+        ("run_id".into(), run_id.into()),
+        ("activation_id".into(), activation_id.into()),
+        ("dispatch_identity".into(), dispatch_identity.into()),
+    ])
+}
+
 fn owner_stage_span(
     metrics: &bcode_metrics::MetricsRegistry,
     name: &'static str,
@@ -75,9 +89,17 @@ async fn check_owner_admission_inner(
         RunLookup::Legacy => retained.check_owner_admission(request, authority),
         RunLookup::Available(_) => {
             let db = open(retained.path(), true).map_err(store_error)?;
-            super::backpressure::queued(retained.path(), || {
-                owner_boundary::check_owner_admission(&db, request, authority)
-            })
+            super::backpressure::queued_observed(
+                retained.path(),
+                &state.metrics,
+                owner_queue_labels(
+                    "owner_admission",
+                    &request.activation.run_id,
+                    &request.activation.activation_id,
+                    &request.dispatch_identity,
+                ),
+                || owner_boundary::check_owner_admission(&db, request, authority),
+            )
             .await
             .map_err(store_error)
         }
@@ -257,14 +279,15 @@ async fn persist_receipt_inner(
         RunLookup::Available(_) => {
             let queue = super::backpressure::write_queue(retained.path()).map_err(store_error)?;
             #[cfg(not(test))]
-            let _write = queue.lock().await;
+            let publication_lock = queue.lock();
             #[cfg(test)]
-            let _write = {
+            let key = (
+                retained.path().canonicalize().map_err(store_error)?,
+                receipt.dispatch_identity.clone(),
+            );
+            #[cfg(test)]
+            let publication_lock = async {
                 use std::future::Future as _;
-                let key = (
-                    retained.path().canonicalize().map_err(store_error)?,
-                    receipt.dispatch_identity.clone(),
-                );
                 let lock = queue.lock();
                 tokio::pin!(lock);
                 std::future::poll_fn(|cx| {
@@ -276,6 +299,17 @@ async fn persist_receipt_inner(
                 })
                 .await
             };
+            let _write = super::backpressure::observe_write_lock(
+                &state.metrics,
+                owner_queue_labels(
+                    "receipt_publication",
+                    &receipt.run_id,
+                    &receipt.activation_id,
+                    &receipt.dispatch_identity,
+                ),
+                publication_lock,
+            )
+            .await;
             let db = open(retained.path(), true).map_err(store_error)?;
             if let Some(existing) = super::backpressure::retry(|| {
                 owner_boundary::receipt(&db, &receipt.dispatch_identity)
@@ -425,7 +459,17 @@ async fn settle_observation_inner(
         _ => return Err(store_error("unsupported owner storage")),
     }
     let queue = super::backpressure::write_queue(retained.path()).map_err(store_error)?;
-    let _write = queue.lock().await;
+    let _write = super::backpressure::observe_write_lock(
+        &state.metrics,
+        owner_queue_labels(
+            "settlement",
+            &request.activation.run_id,
+            &request.activation.activation_id,
+            &request.dispatch_identity,
+        ),
+        queue.lock(),
+    )
+    .await;
     let db = open(retained.path(), true).map_err(store_error)?;
     super::backpressure::retry(|| {
         owner_boundary::verify(&db, &request.activation.run_id, authority)
@@ -435,22 +479,7 @@ async fn settle_observation_inner(
     let mut summary = bcode_workflow_store::ReceiptReconciliationSummary::default();
     match observation {
         Observation::Succeeded { output } => {
-            let revision = super::backpressure::retry(|| {
-                representation::graph_pages::revision(&db, &request.activation.run_id)
-            })
-            .await
-            .map_err(store_error)?;
-            let completion = super::backpressure::retry(|| {
-                representation::graph::completion::complete(
-                    &db,
-                    authority,
-                    revision,
-                    &request.dispatch_identity,
-                    &output,
-                )
-            })
-            .await;
-            completion.map_err(store_error)?;
+            complete_successful_observation(&db, request, authority, &output).await?;
             summary.succeeded.push(request.dispatch_identity.clone());
         }
         Observation::Cancelled | Observation::Failed { .. } => {
@@ -499,6 +528,33 @@ async fn settle_observation_inner(
         .map_err(store_error)?;
     }
     Ok(summary)
+}
+
+/// Commit validated success against the current graph revision under the caller's
+/// already-held writer guard, preserving the existing replay-safe retry boundaries.
+async fn complete_successful_observation(
+    db: &dyn switchy_database::Database,
+    request: &PreparedActivationDispatch,
+    authority: &WorkflowExecutionAuthority,
+    output: &bcode_workflow_store::ValidatedOutput,
+) -> Result<(), WorkflowStoreError> {
+    let revision = super::backpressure::retry(|| {
+        representation::graph_pages::revision(db, &request.activation.run_id)
+    })
+    .await
+    .map_err(store_error)?;
+    super::backpressure::retry(|| {
+        representation::graph::completion::complete(
+            db,
+            authority,
+            revision,
+            &request.dispatch_identity,
+            output,
+        )
+    })
+    .await
+    .map_err(store_error)?;
+    Ok(())
 }
 
 /// Commit cancellation intent and signal a bounded receipt page through existing operation owners.

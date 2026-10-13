@@ -8957,6 +8957,7 @@ mod tests {
             tool_call_id: Some("call-1".to_owned()),
             status: bcode_session_models::RuntimeWorkStatus::Running,
             cancellable: true,
+            observation: None,
         }]);
 
         assert!(matches!(
