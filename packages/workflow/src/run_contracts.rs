@@ -2837,7 +2837,9 @@ pub struct WorkflowInventoryQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkflowInventoryCoverage {
-    /// Installed source observers verify current membership; exhaustion needs no continuation.
+    /// Installed observers verify current membership only; exhaustion needs no continuation.
+    /// Payload proof may independently be unavailable on retained entries. This does
+    /// not establish checksum verification, execution provenance, or semantic history.
     CurrentInventoryComplete,
     /// Source verification is unavailable; no empty-inventory assertion.
     Unavailable {

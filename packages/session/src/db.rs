@@ -1537,7 +1537,9 @@ impl SessionDb {
             session_id,
             crate::child_creation_observation::ChildCreationStage::SchemaInitialization,
         );
-        run_session_migrations(&**db.db).await?;
+        // Keep migration runner state on the heap while polling the synchronous
+        // database compiler through nested session-creation futures.
+        Box::pin(run_session_migrations(&**db.db)).await?;
         drop(stage_timer);
         let stage_timer = crate::child_creation_observation::timer(
             session_id,

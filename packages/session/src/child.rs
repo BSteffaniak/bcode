@@ -586,9 +586,27 @@ impl SessionManager {
         let stage_timer = timer(request.child_id, Stage::Staging);
         let staging = child_staging_path(&root, &request)?;
         drop(stage_timer);
-        let summary = self
-            .prepare_child_storage(&staging, &request, execution.as_ref())
-            .await?;
+        let manager = self.clone();
+        let task_staging = staging.clone();
+        let task_request = request.clone();
+        let (mut sender, receiver) = tokio::sync::oneshot::channel();
+        // The task owns the maintenance lease until storage is closed. Closing
+        // the receiver cancels preparation, not ownership, and never publishes.
+        tokio::spawn(async move {
+            let summary = manager
+                .prepare_child_storage_cancelled(
+                    &task_staging,
+                    &task_request,
+                    execution.as_ref(),
+                    Some(&mut sender),
+                )
+                .await;
+            drop(manager);
+            let _ = sender.send(summary.map(|summary| (summary, ownership)));
+        });
+        let (summary, ownership) = receiver
+            .await
+            .map_err(|_| invalid("child preparation task ended without a handoff"))??;
         let stage_timer = timer(request.child_id, Stage::RenameAndSync);
         fs::rename(db::session_dir_path(&staging, request.child_id), &canonical)?;
         File::open(&root)?.sync_all()?;
@@ -602,13 +620,42 @@ impl SessionManager {
         Ok(summary)
     }
 
+    #[cfg(test)]
     async fn prepare_child_storage(
         &self,
         staging: &std::path::Path,
         request: &SessionChildCreateRequest,
         execution: Option<&crate::ExecutionSessionProvenance>,
     ) -> Result<SessionSummary, SessionError> {
+        self.prepare_child_storage_cancelled(staging, request, execution, None)
+            .await
+    }
+
+    async fn prepare_child_storage_cancelled(
+        &self,
+        staging: &std::path::Path,
+        request: &SessionChildCreateRequest,
+        execution: Option<&crate::ExecutionSessionProvenance>,
+        mut handoff: Option<
+            &mut tokio::sync::oneshot::Sender<
+                Result<(SessionSummary, lease::SessionMaintenanceGuard), SessionError>,
+            >,
+        >,
+    ) -> Result<SessionSummary, SessionError> {
+        let cancelled = async |handoff: &mut Option<
+            &mut tokio::sync::oneshot::Sender<
+                Result<(SessionSummary, lease::SessionMaintenanceGuard), SessionError>,
+            >,
+        >| {
+            if let Some(sender) = handoff {
+                sender.closed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let database = db::SessionDb::initialize_turso_in_root(request.child_id, staging).await?;
+        // Initialization is allowed to finish under the task-owned lease so its
+        // database can always be explicitly closed before cancellation releases it.
         let now = self.next_activity_timestamp_ms();
         let created = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -631,7 +678,7 @@ impl SessionManager {
                 request: Box::new(request.clone()),
             },
         };
-        let result: Result<SessionSummary, SessionError> = async {
+        let preparation = async {
             let stage_timer = timer(request.child_id, Stage::CreationEvents);
             database
                 .append_event_batch(&[(created, Some(now)), (relationship, Some(now))])
@@ -663,8 +710,12 @@ impl SessionManager {
                 .summary();
             drop(stage_timer);
             Ok(summary)
-        }
-        .await;
+        };
+        let result = tokio::select! {
+            biased;
+            () = cancelled(&mut handoff) => Err(invalid("child preparation cancelled")),
+            result = preparation => result,
+        };
         let stage_timer = timer(request.child_id, Stage::DatabaseClose);
         let close = database.close().await;
         drop(stage_timer);
@@ -1050,6 +1101,124 @@ mod tests {
         assert!(page.children.iter().any(|summary| summary.id == child.id));
         assert!(manager.session_is_owned(parent.id).await);
         drop(guard);
+    }
+
+    #[test]
+    fn nested_execution_child_initialization_preserves_ownership_and_events() {
+        // Use an ordinary OS thread stack and a current-thread runtime so this
+        // regression also runs without feature-unified multi-thread Tokio.
+        std::thread::spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(execution_child_initialization());
+        })
+        .join()
+        .unwrap();
+    }
+
+    async fn execution_child_initialization() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let guard = manager
+            .acquire_session_ownership(parent.id, crate::SessionOwnershipKind::RuntimeWork)
+            .await
+            .unwrap();
+        let provenance = retry_execution_provenance(parent.id);
+        let (first, second) = tokio::join!(
+            manager.create_child_execution_session(request(parent.id), provenance.clone()),
+            manager.create_child_execution_session(request(parent.id), provenance),
+        );
+        for child in [first.unwrap(), second.unwrap()] {
+            let events = manager
+                .query_child_sessions(SessionChildQuery {
+                    parent_id: parent.id,
+                    after: None,
+                    limit: 10,
+                })
+                .await
+                .unwrap();
+            assert!(events.complete);
+            assert!(events.children.iter().any(|entry| entry.id == child.id));
+            assert!(!manager.session_is_owned(child.id).await);
+            let db = db::SessionDb::open_turso_in_root(child.id, root.path())
+                .await
+                .unwrap();
+            let events = db.events_range(0, 2, 3).await.unwrap();
+            assert_eq!(events.len(), 3);
+            assert!(matches!(
+                events[0].kind,
+                SessionEventKind::SessionCreated { .. }
+            ));
+            assert!(matches!(
+                events[1].kind,
+                SessionEventKind::ChildSessionCreated { .. }
+            ));
+            assert!(matches!(
+                events[2].kind,
+                SessionEventKind::ExecutionSessionCreated { .. }
+            ));
+            db.validate_write_readiness().await.unwrap();
+            db.close().await.unwrap();
+        }
+        assert!(manager.session_is_owned(parent.id).await);
+        drop(guard);
+        tokio::task::yield_now().await;
+        manager.release_session_ownership(parent.id).await.unwrap();
+        assert!(!manager.session_is_owned(parent.id).await);
+    }
+
+    #[tokio::test]
+    async fn cancelled_preparation_holds_lease_and_retry_never_observes_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let request = request(parent.id);
+        let staging = child_staging_path(root.path(), &request).unwrap();
+        let guard =
+            lease::acquire_session_maintenance_guard(root.path(), request.child_id).unwrap();
+        let (mut sender, receiver) = tokio::sync::oneshot::channel();
+        let (ready_send, ready) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let task_manager = manager.clone();
+        let task_request = request.clone();
+        let task = tokio::spawn(async move {
+            ready_send.send(()).unwrap();
+            resumed.await.unwrap();
+            let result = task_manager
+                .prepare_child_storage_cancelled(&staging, &task_request, None, Some(&mut sender))
+                .await;
+            assert!(result.is_err());
+            // Explicit close has completed before handoff fails and drops ownership.
+            assert!(sender.send(result.map(|summary| (summary, guard))).is_err());
+        });
+        ready.await.unwrap();
+        assert!(lease::acquire_session_maintenance_guard(root.path(), request.child_id).is_err());
+        drop(receiver);
+        assert!(lease::acquire_session_maintenance_guard(root.path(), request.child_id).is_err());
+        assert!(!db::session_dir_path(root.path(), request.child_id).exists());
+        resume.send(()).unwrap();
+        task.await.unwrap();
+        assert!(!db::session_dir_path(root.path(), request.child_id).exists());
+        let released =
+            lease::acquire_session_maintenance_guard(root.path(), request.child_id).unwrap();
+        drop(released);
+        let child = manager.create_child_session(request.clone()).await.unwrap();
+        assert_eq!(child.id, request.child_id);
+        assert!(!manager.session_is_owned(child.id).await);
+        let database = db::SessionDb::open_turso_in_root(child.id, root.path())
+            .await
+            .unwrap();
+        assert_eq!(database.events_range(0, 1, 2).await.unwrap().len(), 2);
+        database.close().await.unwrap();
     }
 
     fn retry_execution_provenance(

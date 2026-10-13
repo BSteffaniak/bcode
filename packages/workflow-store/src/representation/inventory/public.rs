@@ -199,6 +199,12 @@ async fn entry(
                         || link.node_id != attempt.node_id
                         || link.activation_id != attempt.activation_id
                         || link.attempt != attempt.attempt
+                        || crate::dispatch_identity(
+                            &link.run_id,
+                            &link.node_id,
+                            &link.activation_id,
+                            link.attempt,
+                        ) != id
                     {
                         return Err(Error::MaintenanceRequired);
                     }
@@ -216,34 +222,40 @@ async fn entry(
                 diagnostic_applicability: Diagnostic::Unsupported,
             }
         }
-        Source::ChildRuns => {
-            let rows = tx
-                .select("workflow_lineage_v2")
-                .columns(&[
-                    "root_run_id",
-                    "parent_node_id",
-                    "parent_activation_id",
-                    "parent_attempt",
-                ])
-                .where_eq("run_id", id.as_str())
-                .where_eq("parent_run_id", query.run_id.as_str())
-                .limit(1)
-                .execute(tx)
-                .await?;
-            let row = rows.first().ok_or(Error::MaintenanceRequired)?;
-            let Some(DatabaseValue::Int64(number)) = row.get("parent_attempt") else {
-                return Err(Error::MaintenanceRequired);
-            };
-            Entry::ChildRun {
-                child_run_id: id,
-                root_run_id: text(row, "root_run_id")?,
-                parent: bcode_workflow::WorkflowHistoryAttemptCorrelation {
-                    run_id: query.run_id.clone(),
-                    node_id: text(row, "parent_node_id")?,
-                    activation_id: text(row, "parent_activation_id")?,
-                    attempt: u32::try_from(number).map_err(|_| Error::MaintenanceRequired)?,
-                },
-            }
-        }
+        Source::ChildRuns => child_entry(tx, query, id).await?,
+    })
+}
+
+async fn child_entry(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    query: &Query,
+    id: String,
+) -> Result<Entry, Error> {
+    let rows = tx
+        .select("workflow_lineage_v2")
+        .columns(&[
+            "root_run_id",
+            "parent_node_id",
+            "parent_activation_id",
+            "parent_attempt",
+        ])
+        .where_eq("run_id", id.as_str())
+        .where_eq("parent_run_id", query.run_id.as_str())
+        .limit(1)
+        .execute(tx)
+        .await?;
+    let row = rows.first().ok_or(Error::MaintenanceRequired)?;
+    let Some(DatabaseValue::Int64(number)) = row.get("parent_attempt") else {
+        return Err(Error::MaintenanceRequired);
+    };
+    Ok(Entry::ChildRun {
+        child_run_id: id,
+        root_run_id: text(row, "root_run_id")?,
+        parent: bcode_workflow::WorkflowHistoryAttemptCorrelation {
+            run_id: query.run_id.clone(),
+            node_id: text(row, "parent_node_id")?,
+            activation_id: text(row, "parent_activation_id")?,
+            attempt: u32::try_from(number).map_err(|_| Error::MaintenanceRequired)?,
+        },
     })
 }

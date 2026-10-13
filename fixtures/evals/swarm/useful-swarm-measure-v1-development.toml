@@ -1,0 +1,98 @@
+schema_version = 1
+id = "useful-swarm-measure-v1-development"
+name = "Useful swarm paired development smoke"
+description = "One paired repetition on existing training local and parallel tasks; direct, single, baseline auto and explicit adaptive auto. No statistical or superiority claim."
+
+[run]
+repetitions = 1
+timeout_ms = 180000
+timeout_mode = "idle"
+max_duration_ms = 600000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+
+[metadata]
+paired_schedule_seed = 20261006
+require_paired_quality = true
+split = "development"
+claim_scope = "diagnostic only; artifact quality, runtime completion and evidence coverage remain distinct"
+capture_allowance_ms = 120000
+activity_scan_allowance_ms = 30000
+workflow_activity_ipc_allowance_ms = 15000
+workflow_inspection_ipc_allowance_ms = 15000
+activity_readiness_allowance_ms = 30000
+adaptive_admission = "typed WorkflowEvalSwarmPolicy; requires newly built eval adapter and loop plugin"
+
+[[variants]]
+id = "direct"
+executor = "agent"
+model = "gpt-6.1-sol"
+config_toml = "[model]\nprofile = 'sol'\nauth_pool = 'openai'\nauth_profile = 'openai-2'\n[observability]\npersist_model_requests = true\npersist_tool_io = true\n[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+
+[[variants]]
+id = "single"
+executor = "workflow"
+model = "gpt-6.1-sol"
+config_toml = "[model]\nprofile = 'sol'\nauth_pool = 'openai'\nauth_profile = 'openai-2'\n[observability]\npersist_model_requests = true\npersist_tool_io = true\n[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/bcode-eval-artifacts/useful-swarm-measure-v1/target/debug/bcode"
+strategy = "no-delegation"
+stop_condition = "Satisfy every TASK.md contract, deliver answer.json, preserve required inputs, and verify functional behavior; do not claim completion without artifacts."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[variants]]
+id = "baseline-auto"
+executor = "workflow"
+model = "gpt-6.1-sol"
+config_toml = "[model]\nprofile = 'sol'\nauth_pool = 'openai'\nauth_profile = 'openai-2'\n[observability]\npersist_model_requests = true\npersist_tool_io = true\n[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/bcode-eval-artifacts/useful-swarm-measure-v1/target/debug/bcode"
+strategy = "auto"
+swarm_policy = "baseline"
+stop_condition = "Satisfy every TASK.md contract, deliver answer.json, preserve required inputs, and verify functional behavior; do not claim completion without artifacts."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[variants]]
+id = "adaptive-auto"
+executor = "workflow"
+model = "gpt-6.1-sol"
+config_toml = "[model]\nprofile = 'sol'\nauth_pool = 'openai'\nauth_profile = 'openai-2'\n[observability]\npersist_model_requests = true\npersist_tool_io = true\n[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/bcode-eval-artifacts/useful-swarm-measure-v1/target/debug/bcode"
+strategy = "auto"
+swarm_policy = "adaptive-v1"
+stop_condition = "Satisfy every TASK.md contract, deliver answer.json, preserve required inputs, and verify functional behavior; do not claim completion without artifacts."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[cases]]
+id = "train-local"
+fixture = "representative-v1/workspaces/train-local"
+prompt = "Read TASK.md and the supplied source modules. Complete its task and write answer.json. Never modify input.json or TASK.md. No grading assets are part of this workspace."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' train-local"
+preserve_files = ["input.json", "TASK.md"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' train-local"
+timeout_ms = 30000
+required = true
+
+[[cases]]
+id = "train-parallel"
+fixture = "representative-v1/workspaces/train-parallel"
+prompt = "Read TASK.md and the supplied source modules. Complete its task and write answer.json. Never modify input.json or TASK.md. No grading assets are part of this workspace."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' train-parallel"
+preserve_files = ["input.json", "TASK.md"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' train-parallel"
+timeout_ms = 30000
+required = true

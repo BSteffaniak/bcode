@@ -39987,22 +39987,26 @@ async fn prepare_workflow_execution_child(
     };
     match configuration.execution_target {
         bcode_workflow::PromptContextTarget::FreshIsolated => {
-            state
-                .sessions
-                .create_child_execution_session(child_request, provenance.clone())
-                .await
+            // Heap-pin child preparation so its migration/storage state is not
+            // retained inline in the already nested dispatch future.
+            Box::pin(
+                state
+                    .sessions
+                    .create_child_execution_session(child_request, provenance.clone()),
+            )
+            .await
         }
         bcode_workflow::PromptContextTarget::FixedGenerationFork => {
-            state
-                .sessions
-                .create_pinned_child_execution_session(
+            Box::pin(
+                state.sessions.create_pinned_child_execution_session(
                     child_request,
                     provenance.clone(),
                     provenance
                         .parent_generation
                         .expect("validated pinned generation"),
-                )
-                .await
+                ),
+            )
+            .await
         }
         bcode_workflow::PromptContextTarget::SharedParentSequential => {
             unreachable!("shared execution handled separately")

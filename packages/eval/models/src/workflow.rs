@@ -10,6 +10,9 @@ pub struct WorkflowEvalConfig {
     pub binary: PathBuf,
     /// Goal strategy: auto, collaborate, or no-delegation.
     pub strategy: String,
+    /// Optional versioned swarm policy; omission preserves the executable's baseline default.
+    #[serde(default)]
+    pub swarm_policy: Option<WorkflowEvalSwarmPolicy>,
     /// Authored controlled-entry acceptance; not used when `generated_entry` is true.
     pub stop_condition: String,
     /// Preserve normal generation for product-entry evaluation rather than controlled inputs.
@@ -47,6 +50,27 @@ pub struct WorkflowEvalConfig {
     pub judge: Option<WorkflowEvalJudge>,
 }
 
+/// Explicit policy used by a workflow comparison; unknown future policies are rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowEvalSwarmPolicy {
+    /// Preserve baseline orchestration.
+    Baseline,
+    /// Exercise opt-in adaptive orchestration version one.
+    AdaptiveV1,
+}
+
+impl WorkflowEvalSwarmPolicy {
+    /// Exact plugin command argument.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::AdaptiveV1 => "adaptive-v1",
+        }
+    }
+}
+
 /// Judge is part of the subject, not the independent oracle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,4 +83,29 @@ pub struct WorkflowEvalJudge {
     pub account: String,
     /// Completion probability percentage.
     pub threshold: u8,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkflowEvalConfig, WorkflowEvalSwarmPolicy};
+
+    #[test]
+    fn policy_is_explicit_and_unknown_versions_are_rejected() {
+        let mut value = serde_json::json!({
+            "binary": "/test/bcode", "strategy": "auto", "stop_condition": "verify",
+            "max_iterations": 3, "concurrency": 4, "worker_attempts": 16
+        });
+        let baseline: WorkflowEvalConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(baseline.swarm_policy, None);
+        for policy in [
+            WorkflowEvalSwarmPolicy::Baseline,
+            WorkflowEvalSwarmPolicy::AdaptiveV1,
+        ] {
+            value["swarm_policy"] = serde_json::json!(policy.as_str());
+            let config: WorkflowEvalConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(config.swarm_policy, Some(policy));
+        }
+        value["swarm_policy"] = serde_json::json!("adaptive-v2");
+        assert!(serde_json::from_value::<WorkflowEvalConfig>(value).is_err());
+    }
 }

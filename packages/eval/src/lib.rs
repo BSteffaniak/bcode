@@ -1678,8 +1678,12 @@ async fn execute_agent_variant_async(
                 .map_err(|error| EvalError::Client(error.to_string()))?;
         }
         if let Some(model) = &variant.model {
+            let current = client
+                .session_model_status(session.id)
+                .await
+                .map_err(|error| EvalError::Client(error.to_string()))?;
             client
-                .set_session_model(session.id, None, model.clone())
+                .set_session_model(session.id, current.provider_plugin_id, model.clone())
                 .await
                 .map_err(|error| EvalError::Client(error.to_string()))?;
         }

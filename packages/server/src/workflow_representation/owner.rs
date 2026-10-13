@@ -603,7 +603,7 @@ pub async fn cancel(state: &ServerState, run_id: &str) -> Result<Option<bool>, S
             super::backpressure::retry(|| owner_boundary::verify(&db, run_id, &guard.authority))
                 .await
                 .map_err(|_| unavailable())?;
-            crate::signal_workflow_attempt_cancellation(
+            if crate::signal_workflow_attempt_cancellation(
                 state,
                 &bcode_workflow_store::ActiveAttemptCancellation {
                     run_id: receipt.run_id,
@@ -614,7 +614,16 @@ pub async fn cancel(state: &ServerState, run_id: &str) -> Result<Option<bool>, S
                     receipt: Some(receipt.receipt),
                 },
             )
-            .await?;
+            .await
+            .is_err()
+            {
+                // Durable intent remains pending. Receipt observation, not a missing
+                // local runtime handle or a failed signal, establishes termination.
+                tracing::debug!(
+                    stage = "receipt_signal",
+                    "workflow cancellation signalling deferred"
+                );
+            }
         }
         cursor = next;
         if cursor.is_none() {
@@ -807,6 +816,170 @@ mod instrumentation_tests {
                 .get("outcome")
                 .map(String::as_str)
                 == Some("ok"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use bcode_workflow_store::AsyncAttemptStatusObserver;
+
+    async fn admit_missing_runtime_receipt(
+        state: &ServerState,
+        db: &dyn switchy_database::Database,
+        authority: &WorkflowExecutionAuthority,
+        parent: crate::SessionId,
+    ) -> (
+        bcode_workflow_store::PreparedAttempt,
+        bcode_workflow_store::DispatchReceipt,
+    ) {
+        let activation = representation::graph::ready(db, "new", 1, None, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let prepared = bcode_workflow_store::PreparedAttempt {
+            run_id: "new".into(),
+            node_id: activation.node_id.clone(),
+            activation_id: activation.activation_id.clone(),
+            attempt: 1,
+            side_effect: bcode_workflow::DispatchSideEffect::Mutating,
+            intent: serde_json::json!({}),
+            prepared_at_ms: 1,
+        };
+        let dispatch = representation::attempts::prepare(db, authority, &prepared)
+            .await
+            .unwrap();
+        let receipt = bcode_workflow_store::DispatchReceipt {
+            run_id: "new".into(),
+            node_id: activation.node_id,
+            activation_id: activation.activation_id,
+            attempt: 1,
+            dispatch_identity: dispatch,
+            admitted_at_ms: 2,
+            receipt: serde_json::json!({
+                "owner": crate::workflow_receipts::AGENT_TURN_OWNER,
+                "session_id": parent, "turn_id": "lost-runtime-turn",
+                "output_schema_id": "output"
+            }),
+        };
+        persist_receipt(state, &receipt, authority).await.unwrap();
+        (prepared, receipt)
+    }
+
+    fn cancellation_target(
+        receipt: &bcode_workflow_store::DispatchReceipt,
+    ) -> bcode_workflow_store::ActiveAttemptCancellation {
+        bcode_workflow_store::ActiveAttemptCancellation {
+            run_id: receipt.run_id.clone(),
+            node_id: receipt.node_id.clone(),
+            activation_id: receipt.activation_id.clone(),
+            attempt: receipt.attempt,
+            dispatch_identity: receipt.dispatch_identity.clone(),
+            receipt: Some(receipt.receipt.clone()),
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_receipt_without_runtime_defers_signal_until_terminal_evidence() {
+        let (_root, _sessions, state, definition) =
+            super::super::tests::typed_provider_fixture().await;
+        let db = open(&crate::workflow_store_path(&state), true).unwrap();
+        let authority = owner_boundary::execution_authority(&db, "new")
+            .await
+            .unwrap()
+            .unwrap();
+        let parent: crate::SessionId = representation::runs::association(&db, "new")
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (prepared, receipt) =
+            admit_missing_runtime_receipt(&state, &db, &authority, parent).await;
+        let dispatch = receipt.dispatch_identity.clone();
+        state
+            .sessions
+            .append_model_turn_started(parent, "lost-runtime-turn".into())
+            .await
+            .unwrap();
+        assert!(super::super::status(&state, "new").await.unwrap().is_some());
+        let signal =
+            crate::signal_workflow_attempt_cancellation(&state, &cancellation_target(&receipt))
+                .await;
+        assert!(
+            matches!(signal, Err(WorkflowStoreError::InvalidData(message))
+            if message.starts_with("active runtime work not found for workflow dispatch:"))
+        );
+        assert_eq!(cancel(&state, "new").await.unwrap(), Some(true));
+        assert_eq!(cancel(&state, "new").await.unwrap(), Some(false));
+        assert!(
+            owner_boundary::terminal_outcome(&db, "new", &dispatch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        state
+            .sessions
+            .append_model_turn_finished(
+                parent,
+                "lost-runtime-turn".into(),
+                bcode_session_models::ModelTurnOutcome::Cancelled,
+                None,
+            )
+            .await
+            .unwrap();
+        let observation = crate::WorkflowTurnReceiptObserver { state: &state }
+            .observe_async(&bcode_workflow_store::AttemptReconciliationRequest {
+                run_id: receipt.run_id.clone(),
+                node_id: receipt.node_id.clone(),
+                activation_id: receipt.activation_id.clone(),
+                attempt: 1,
+                dispatch_identity: dispatch.clone(),
+                side_effect: prepared.side_effect,
+                receipt: receipt.receipt.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            observation,
+            bcode_workflow_store::AttemptObservation::Cancelled
+        ));
+        settle_observation(
+            &state,
+            &PreparedActivationDispatch {
+                activation: bcode_workflow_store::PendingActivation {
+                    run_id: "new".into(),
+                    node_id: receipt.node_id.clone(),
+                    activation_id: receipt.activation_id.clone(),
+                    dependency_generation: 0,
+                    input: None,
+                    node: definition.node(&receipt.node_id).unwrap().clone(),
+                    created_at_ms: 1,
+                },
+                attempt: 1,
+                dispatch_identity: dispatch.clone(),
+                intent: prepared.intent,
+            },
+            &authority,
+            observation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            owner_boundary::terminal_outcome(&db, "new", &dispatch)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            super::super::status(&state, "new")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            bcode_workflow::RunStatus::Cancelled
         );
     }
 }

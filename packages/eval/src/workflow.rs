@@ -1253,7 +1253,7 @@ pub fn execute(
     let digest = hex::encode(hasher.finalize());
     write_json(
         rep_dir.join("subject.json"),
-        &serde_json::json!({"schema_version":1,"binary":config.binary,"sha256":digest,"strategy":config.strategy,"judge":config.judge,"acceptance":config.stop_condition}),
+        &serde_json::json!({"schema_version":1,"binary":config.binary,"sha256":digest,"strategy":config.strategy,"swarm_policy":config.swarm_policy,"judge":config.judge,"acceptance":config.stop_condition}),
     )?;
     let timeout_policy = suite.run.resolved_timeout(case);
     if timeout_policy.timeout_ms == 0 || timeout_policy.max_duration_ms == Some(0) {
@@ -1366,12 +1366,27 @@ pub fn execute(
         .as_str()
         .ok_or_else(|| EvalError::Validation("session response missing identity".into()))?;
     if let Some(model) = &variant.model {
+        let selection = invoke(
+            &[
+                "model".into(),
+                "status".into(),
+                session_id.into(),
+                "--json".into(),
+            ],
+            "model-status",
+            remaining(),
+        )?;
+        let provider = selection["provider_plugin_id"].as_str().ok_or_else(|| {
+            EvalError::Validation("workflow model selection has no resolved provider".into())
+        })?;
         invoke(
             &[
                 "session".into(),
                 "set-model".into(),
                 session_id.into(),
                 model.clone(),
+                "--provider".into(),
+                provider.into(),
                 "--json".into(),
             ],
             "model-selection",
@@ -1397,6 +1412,9 @@ pub fn execute(
         "--swarm-instructions".into(),
         config.guidance.clone(),
     ];
+    if let Some(policy) = config.swarm_policy {
+        args.extend(["--swarm-policy".into(), policy.as_str().into()]);
+    }
     if config.generated_entry {
         let position = args
             .iter()

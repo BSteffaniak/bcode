@@ -5,7 +5,7 @@
 //! Serializable schema types for Bcode eval suites, runs, and reports.
 
 mod workflow;
-pub use workflow::{WorkflowEvalConfig, WorkflowEvalJudge};
+pub use workflow::{WorkflowEvalConfig, WorkflowEvalJudge, WorkflowEvalSwarmPolicy};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
