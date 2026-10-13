@@ -13,9 +13,8 @@
 //! The declared profile must explicitly pin the enabled provider plugin owner, subscription method,
 //! sshenv backend, and `device_seal = "off"`. No API key, token, identity value or flow state is an
 //! argument. The identity file contains one plain age secret identity and must be owner-only.
-//! Initialization currently requires upstream sshenv plain-age recipient support; the locked vault
-//! revision rejects it. Keep that failure visible and preserve state, never substitute SSH/device
-//! custody, manually construct vault ciphertext, or claim that initialization succeeded.
+//! Native age wrapping is provided by the pinned sshenv vault. Preserve initialization failures
+//! without substituting SSH/device custody or manually constructing vault ciphertext.
 
 use crate::CliError;
 use std::path::PathBuf;

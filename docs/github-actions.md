@@ -93,12 +93,12 @@ Initialization requires Linux and interactive `CONNECT` confirmation; reconnect
 requires stopping the broker, settling prior work, and `RECONNECT` confirmation.
 Readiness is local and non-mutating, not proof of remote provider support.
 
-**Initialization is currently blocked:** the locked sshenv vault rejects the plain-age
-recipient required by this custody profile. The command reports failure rather than
-copying legacy vault ciphertext or substituting another custody policy. A typed upstream
-vault capability and verified dependency update are required before connect-once
-subscription setup can be accepted. Existing custody tests do not establish successful
-fresh operator enrollment. Direct API mode does not close this subscription acceptance gate.
+The pinned sshenv vault supports native age recipients without a hardware/plugin feature.
+Initialization creates encrypted custody through its typed APIs; it does not copy legacy
+vault ciphertext or substitute another custody policy. Local tests cover fresh initialization,
+fenced enrollment publication and readiness after reopen. These are not proof of live Linux
+operator enrollment or subscription provider permission/support. Direct API mode does not
+close the separate subscription acceptance gate.
 
 ## Optional scoped broker OIDC mode
 

@@ -434,11 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_age_initialization_failure_has_no_storage_or_enrollment_authority() {
+    fn plain_age_initialization_and_enrollment_commit_before_readiness() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("custody");
         let (resolved, method) = selection();
-        let result = RetainedAuthRequestCustody::initialize_enrollment(
+        let retained = RetainedAuthRequestCustody::initialize_enrollment(
             &path,
             resolved,
             "test-provider",
@@ -447,17 +447,63 @@ mod tests {
             RECIPIENT,
             vec![Zeroizing::new(IDENTITY.into())],
             &Keys,
+        )
+        .unwrap();
+        assert_eq!(
+            retained.enrollment_readiness().unwrap(),
+            CustodyEnrollmentReadiness::Empty
         );
-        // The locked vault rejects plain age recipients before storage creation. This is a
-        // production capability gap, not successful enrollment, repair, or permission to fall back.
-        let Err(error) = result else {
-            panic!("update this failure expectation when typed upstream plain-age support lands");
-        };
-        assert!(matches!(error, AuthVaultLifecycleError::WriteFailed(_)));
-        assert!(!path.exists());
-        let diagnostic = format!("{error:?}");
-        assert!(!diagnostic.contains(IDENTITY));
-        assert!(!diagnostic.contains(RECIPIENT));
+        let mut flow = retained
+            .begin_enrollment(CustodyEnrollmentMode::Initialize)
+            .unwrap();
+        assert!(
+            retained
+                .begin_enrollment(CustodyEnrollmentMode::Initialize)
+                .is_err()
+        );
+        assert_eq!(
+            retained.enrollment_readiness().unwrap(),
+            CustodyEnrollmentReadiness::ReconnectRequired
+        );
+        flow.next_request().unwrap();
+        flow.accept(AuthFlowResponse {
+            schema_version: bcode_provider_auth_models::AUTH_FLOW_SCHEMA_VERSION,
+            status: AuthFlowStatus::Succeeded,
+            state: None,
+            effects: Vec::new(),
+            diagnostics: Vec::new(),
+            credentials: BTreeMap::from([
+                ("access".into(), "test-access".into()),
+                ("refresh".into(), "test-refresh".into()),
+            ]),
+        })
+        .unwrap();
+        retained.complete_enrollment(flow).unwrap();
+        assert_eq!(
+            retained.enrollment_readiness().unwrap(),
+            CustodyEnrollmentReadiness::Ready
+        );
+        drop(retained);
+        let (resolved, method) = selection();
+        let reopened = RetainedAuthRequestCustody::new(
+            CredentialCustodyStorage::open(&path).unwrap(),
+            resolved,
+            "test-provider",
+            "test-plugin",
+            method,
+            vec![Zeroizing::new(IDENTITY.into())],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.enrollment_readiness().unwrap(),
+            CustodyEnrollmentReadiness::Ready
+        );
+        assert!(
+            reopened
+                .begin_enrollment(CustodyEnrollmentMode::Initialize)
+                .is_err()
+        );
     }
 
     #[test]
