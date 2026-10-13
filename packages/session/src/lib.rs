@@ -6232,6 +6232,78 @@ mod tests {
         ));
     }
 
+    // Historical serialization input, not an assertion about implementation source text.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PreObservationTracePayload {
+        ModelRequestBuilt {
+            provider: String,
+            model: String,
+            agent_id: String,
+            message_count: usize,
+            tool_count: usize,
+            system_prompt_chars: usize,
+            prompt_cache_mode: String,
+            conversation_reuse_mode: String,
+            uses_previous_provider_response: bool,
+            metadata: BTreeMap<String, String>,
+            request: Option<TraceBlobRef>,
+        },
+        ProviderRound {
+            provider_turn_id: Option<String>,
+            provider: String,
+            round: Option<u32>,
+            stop_reason: Option<String>,
+            duration_ms: Option<u64>,
+            error: Option<String>,
+        },
+        ProviderEvent {
+            event_type: String,
+            detail: Option<String>,
+        },
+    }
+
+    #[test]
+    fn legacy_provider_event_json_and_bmux_bytes_preserve_baseline() {
+        let old = PreObservationTracePayload::ProviderEvent {
+            event_type: "request_projection".into(),
+            detail: Some("legacy detail".into()),
+        };
+        let expected = SessionTracePayload::ProviderEvent {
+            event_type: "request_projection".into(),
+            detail: Some("legacy detail".into()),
+        };
+        let json = serde_json::to_vec(&old).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<SessionTracePayload>(&json).unwrap(),
+            expected
+        );
+        let named_bytes = bmux_codec::to_vec(&(old.clone(), 91_u64)).unwrap();
+        let (decoded, tail): (SessionTracePayload, u64) =
+            bmux_codec::from_bytes(&named_bytes).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(tail, 91);
+        let positional_bytes = bmux_codec::to_positional_vec(&(old.clone(), 91_u64)).unwrap();
+        let (decoded, tail): (SessionTracePayload, u64) =
+            bmux_codec::from_positional_bytes(&positional_bytes)
+                .expect("historical positional ProviderEvent must decode unchanged");
+        assert_eq!(decoded, expected);
+        assert_eq!(tail, 91);
+        // Unchanged payloads remain readable by historical readers.
+        assert_eq!(serde_json::to_vec(&expected).unwrap(), json);
+        let (decoded, tail): (PreObservationTracePayload, u64) =
+            bmux_codec::from_bytes(&bmux_codec::to_vec(&(expected.clone(), 91_u64)).unwrap())
+                .unwrap();
+        assert_eq!(decoded, old);
+        assert_eq!(tail, 91);
+        let (decoded, tail): (PreObservationTracePayload, u64) = bmux_codec::from_positional_bytes(
+            &bmux_codec::to_positional_vec(&(expected, 91_u64)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, old);
+        assert_eq!(tail, 91);
+    }
+
     #[test]
     fn all_trace_payload_variants_round_trip_through_bmux_codec() {
         let payloads = vec![

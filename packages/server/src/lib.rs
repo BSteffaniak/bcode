@@ -15944,14 +15944,33 @@ async fn admit_turn_inner(
     ),
     bcode_session::SessionError,
 > {
+    let diagnostic_labels = turn_admission_diagnostic_labels(session_id, &admission);
     let mut admission = admission;
-    validate_interaction_route(state, session_id, &admission.execution).await?;
+    observe_turn_admission_result(
+        state,
+        &diagnostic_labels,
+        "model.admission.route_validation",
+        validate_interaction_route(state, session_id, &admission.execution),
+    )
+    .await?;
     if admission.execution.agent_profile.is_none() {
-        admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
+        admission.execution.agent_profile = Some(
+            observe_turn_admission_phase(
+                state,
+                &diagnostic_labels,
+                "model.admission.agent_context",
+                session_agent_selection(state, session_id),
+            )
+            .await,
+        );
     }
-    let mut selection =
-        session_model_selection_with_runtime_context(state, session_id, runtime_context.clone())
-            .await;
+    let mut selection = observe_turn_admission_phase(
+        state,
+        &diagnostic_labels,
+        "model.admission.model_context",
+        session_model_selection_with_runtime_context(state, session_id, runtime_context.clone()),
+    )
+    .await;
     apply_turn_model_selection(&mut selection, &admission.execution);
     let config = runtime_context
         .as_ref()
@@ -15959,19 +15978,43 @@ async fn admit_turn_inner(
         .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
         .unwrap_or_else(|| state.startup_config.clone());
     let descriptor = submission_execution_descriptor(&selection, &config, &admission.execution);
-    let (admission, events) = state
-        .sessions
-        .admit_queued_turn_with_descriptor_and_events(
+    let (admission, events) = observe_turn_admission_result(
+        state,
+        &diagnostic_labels,
+        "model.admission.durable_admission",
+        state.sessions.admit_queued_turn_with_descriptor_and_events(
             session_id, client_id, text, admission, descriptor,
+        ),
+    )
+    .await?;
+    observe_turn_admission_phase(
+        state,
+        &diagnostic_labels,
+        "model.admission.event_publication",
+        async {
+            for event in &events {
+                publish_session_event(state, event).await;
+            }
+        },
+    )
+    .await;
+    if !events.is_empty() {
+        let session = observe_turn_admission_result(
+            state,
+            &diagnostic_labels,
+            "model.admission.catalog_summary",
+            state.sessions.session_summary(session_id),
         )
-        .await?;
-    for event in &events {
-        publish_session_event(state, event).await;
-    }
-    if !events.is_empty()
-        && let Ok(session) = state.sessions.session_summary(session_id).await
-    {
-        state.session_catalog.upsert_native_session(session).await;
+        .await;
+        if let Ok(session) = session {
+            observe_turn_admission_phase(
+                state,
+                &diagnostic_labels,
+                "model.admission.catalog_update",
+                state.session_catalog.upsert_native_session(session),
+            )
+            .await;
+        }
     }
     let user_event = events.into_iter().rev().find(|event| {
         matches!(
@@ -17688,23 +17731,58 @@ async fn lock_turn_marker_commit(
     Ok(guard)
 }
 
-async fn observe_turn_admission_phase<F, T>(
-    state: &ServerState,
-    labels: &MetricLabels,
+fn observe_turn_admission_phase<'a, F, T>(
+    state: &'a ServerState,
+    labels: &'a MetricLabels,
     phase: &'static str,
     future: F,
-) -> T
+) -> impl std::future::Future<Output = T> + 'a
 where
-    F: std::future::Future<Output = T>,
+    F: std::future::Future<Output = T> + Send + 'a,
+    T: 'a,
 {
-    state
-        .metrics
-        .add_counter_with_labels(format!("{phase}.started"), 1, labels.clone());
-    // Reaching the return boundary is not a claim that a Result succeeded.
-    let mut span = state.metrics.span(phase).labels(labels.clone());
-    let result = future.await;
-    span.finish_with_outcome(&"returned");
-    result
+    observe_turn_admission_phase_outcome(state, labels, phase, future, |_| "returned")
+}
+
+fn observe_turn_admission_result<'a, F, T, E>(
+    state: &'a ServerState,
+    labels: &'a MetricLabels,
+    phase: &'static str,
+    future: F,
+) -> impl std::future::Future<Output = Result<T, E>> + 'a
+where
+    F: std::future::Future<Output = Result<T, E>> + Send + 'a,
+    T: 'a,
+    E: 'a,
+{
+    observe_turn_admission_phase_outcome(state, labels, phase, future, |result| {
+        if result.is_ok() { "ok" } else { "error" }
+    })
+}
+
+fn observe_turn_admission_phase_outcome<'a, F, T>(
+    state: &'a ServerState,
+    labels: &'a MetricLabels,
+    phase: &'static str,
+    future: F,
+    outcome: impl FnOnce(&T) -> &'static str + Send + 'a,
+) -> impl std::future::Future<Output = T> + 'a
+where
+    F: std::future::Future<Output = T> + Send + 'a,
+    T: 'a,
+{
+    // Erase the nested future's concrete type before constructing observer state.
+    let future: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>> =
+        Box::pin(future);
+    async move {
+        state
+            .metrics
+            .add_counter_with_labels(format!("{phase}.started"), 1, labels.clone());
+        let mut span = state.metrics.span(phase).labels(labels.clone());
+        let result = future.await;
+        span.finish_with_outcome(&outcome(&result));
+        result
+    }
 }
 
 fn turn_admission_diagnostic_labels(
@@ -17738,21 +17816,21 @@ async fn submit_session_model_turn_admission_inner(
         turn_admission_lock(state, session_id),
     )
     .await;
-    let admission_guard = observe_turn_admission_phase(
+    let admission_guard = observe_turn_admission_result(
         state,
         &diagnostic_labels,
         "model.admission.lock_wait",
         lock_turn_admission(&admission_lock, cancel_state.as_deref()),
     )
     .await?;
-    let ownership = observe_turn_admission_phase(
+    let ownership = observe_turn_admission_result(
         state,
         &diagnostic_labels,
         "model.admission.queued_ownership",
         queued_turn_ownership(state, session_id),
     )
     .await?;
-    let admission_commit = observe_turn_admission_phase(
+    let admission_commit = observe_turn_admission_result(
         state,
         &diagnostic_labels,
         "model.admission.marker_commit",
@@ -19437,12 +19515,37 @@ async fn required_workflow_drive_authority(
         })
 }
 
+async fn drive_represented_workflow_phase(
+    state: &Arc<ServerState>,
+    run_id: &str,
+    labels: &MetricLabels,
+) -> Result<bool, ServerError> {
+    if !Box::pin(observe_turn_admission_result(
+        state,
+        labels,
+        "workflow.driver.represented_drive",
+        workflow_representation::drive_if_represented(state, run_id),
+    ))
+    .await?
+    {
+        return Ok(false);
+    }
+    observe_turn_admission_result(
+        state,
+        labels,
+        "workflow.driver.represented_retirement",
+        settle_locally_owned_represented_runtime_work(state, run_id),
+    )
+    .await?;
+    Ok(true)
+}
+
 async fn drive_workflow_run_exclusive(
     state: &Arc<ServerState>,
     run_id: &str,
 ) -> Result<(), ServerError> {
-    if Box::pin(workflow_representation::drive_if_represented(state, run_id)).await? {
-        settle_locally_owned_represented_runtime_work(state, run_id).await?;
+    let labels = MetricLabels::from([("run_id".to_owned(), run_id.to_owned())]);
+    if drive_represented_workflow_phase(state, run_id, &labels).await? {
         return Ok(());
     }
     let authority = required_workflow_drive_authority(state, run_id).await?;
@@ -19553,6 +19656,30 @@ fn workflow_scheduling_stopped(
 }
 
 async fn dispatch_workflow_pending_page(
+    state: &Arc<ServerState>,
+    path: &Path,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    cursors: (&mut Option<String>, &mut Option<String>),
+    now_ms: u64,
+) -> Result<
+    (
+        bcode_workflow_store::ControlSettlementSummary,
+        bcode_workflow_store::ActivationDispatchSummary,
+    ),
+    ServerError,
+> {
+    let labels = MetricLabels::from([("run_id".to_owned(), run_id.to_owned())]);
+    observe_turn_admission_result(
+        state,
+        &labels,
+        "workflow.driver.pending_dispatch",
+        dispatch_workflow_pending_page_inner(state, path, run_id, authority, cursors, now_ms),
+    )
+    .await
+}
+
+async fn dispatch_workflow_pending_page_inner(
     state: &Arc<ServerState>,
     path: &Path,
     run_id: &str,
@@ -92854,6 +92981,108 @@ event_symbol = "bcode_plugin_handle_event_v1"
             );
         }
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn admission_phase_boxes_unpolled_payload_without_starting_metrics() {
+        let mut state = test_server_state_with_fake_provider(SessionManager::default());
+        state.metrics = MetricsRegistry::in_memory();
+        let labels = MetricLabels::default();
+        let payload = [7_u8; 8 * 1024];
+        let observed = observe_turn_admission_result(
+            &state,
+            &labels,
+            "model.admission.test_boxed",
+            async move {
+                tokio::task::yield_now().await;
+                Ok::<_, ()>(
+                    payload
+                        .iter()
+                        .map(|value| usize::from(*value))
+                        .sum::<usize>(),
+                )
+            },
+        );
+        assert!(std::mem::size_of_val(&observed) < payload.len());
+        assert!(state.metrics.report().events.is_empty());
+        assert_eq!(observed.await, Ok(7 * payload.len()));
+        let report = state.metrics.report();
+        drop(state);
+        assert!(report.events.iter().any(|event| {
+            event.name == "model.admission.test_boxed.total"
+                && event
+                    .labels
+                    .get("outcome")
+                    .is_some_and(|outcome| outcome == "ok")
+        }));
+    }
+
+    #[tokio::test]
+    async fn admission_phase_held_wait_is_unfinished_when_observer_is_dropped() {
+        let mut state = test_server_state_with_fake_provider(SessionManager::default());
+        state.metrics = MetricsRegistry::in_memory();
+        let lock = Mutex::new(());
+        let guard = lock.lock().await;
+        let labels = MetricLabels::default();
+        let mut observed = Box::pin(observe_turn_admission_phase(
+            &state,
+            &labels,
+            "model.admission.test_wait",
+            lock.lock(),
+        ));
+        assert!(futures::poll!(&mut observed).is_pending());
+        let report = state.metrics.report();
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| event.name == "model.admission.test_wait.started")
+        );
+        assert!(
+            !report
+                .events
+                .iter()
+                .any(|event| event.name == "model.admission.test_wait.total")
+        );
+        drop(observed);
+        drop(guard);
+        let report = state.metrics.report();
+        drop(state);
+        assert!(report.events.iter().any(|event| {
+            event.name == "model.admission.test_wait.total"
+                && event
+                    .labels
+                    .get("outcome")
+                    .is_some_and(|outcome| outcome == "unfinished")
+        }));
+    }
+
+    #[tokio::test]
+    async fn admission_phase_preserves_returned_errors_and_success_outcomes() {
+        let mut state = test_server_state_with_fake_provider(SessionManager::default());
+        state.metrics = MetricsRegistry::in_memory();
+        let labels = MetricLabels::default();
+        let error =
+            observe_turn_admission_result(&state, &labels, "model.admission.test_result", async {
+                Err::<(), _>(7)
+            })
+            .await;
+        assert_eq!(error, Err(7));
+        let success =
+            observe_turn_admission_result(&state, &labels, "model.admission.test_result", async {
+                Ok::<_, ()>(9)
+            })
+            .await;
+        assert_eq!(success, Ok(9));
+        let report = state.metrics.report();
+        drop(state);
+        let outcomes: Vec<_> = report
+            .events
+            .iter()
+            .filter(|event| event.name == "model.admission.test_result.total")
+            .map(|event| event.labels.get("outcome").unwrap().as_str())
+            .collect();
+        assert_eq!(outcomes, ["error", "ok"]);
     }
 
     #[tokio::test]
