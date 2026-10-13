@@ -1022,10 +1022,17 @@ pub enum Request {
         limit: usize,
     },
     /// Bounded versioned attempt semantic history, not legacy opaque events.
+    WorkflowCommittedHistory {
+        query: bcode_workflow::WorkflowCommittedHistoryQuery,
+    },
     WorkflowLifecycleHistory {
         query: bcode_workflow::WorkflowLifecycleHistoryQuery,
     },
     /// Read finite, pinned attempt history, not legacy opaque events.
+    /// Read generation-pinned canonical current facts without execution authority.
+    WorkflowInventory {
+        query: bcode_workflow::WorkflowInventoryQuery,
+    },
     WorkflowSemanticHistory {
         query: bcode_workflow::WorkflowSemanticHistoryQuery,
     },
@@ -2680,8 +2687,14 @@ pub enum ResponsePayload {
     WorkflowEventHistory {
         events: Vec<bcode_workflow::WorkflowHistoryEvent>,
     },
+    WorkflowCommittedHistory {
+        page: bcode_workflow::WorkflowCommittedHistoryPage,
+    },
     WorkflowLifecycleHistory {
         page: bcode_workflow::WorkflowLifecycleHistoryPage,
+    },
+    WorkflowInventory {
+        page: bcode_workflow::WorkflowInventoryPage,
     },
     WorkflowSemanticHistory {
         page: bcode_workflow::WorkflowSemanticHistoryPage,
@@ -3798,6 +3811,27 @@ mod child_wire_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn committed_history_query_roundtrip_retains_pin_and_version() {
+        let query = bcode_workflow::WorkflowCommittedHistoryQuery {
+            version: 1,
+            run_id: "run".into(),
+            after_sequence: 4,
+            through_sequence: Some(200),
+            limit: 25,
+        };
+        let request = super::Request::WorkflowCommittedHistory {
+            query: query.clone(),
+        };
+        let decoded =
+            serde_json::from_slice::<super::Request>(&serde_json::to_vec(&request).unwrap())
+                .unwrap();
+        let super::Request::WorkflowCommittedHistory { query: actual } = decoded else {
+            panic!("committed history request");
+        };
+        assert_eq!(actual, query);
+        actual.validate().unwrap();
+    }
     #[test]
     fn lifecycle_history_query_and_page_roundtrip_without_legacy_conversion() {
         use bcode_workflow::*;

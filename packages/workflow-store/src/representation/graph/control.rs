@@ -44,6 +44,7 @@ pub async fn settle(
         .ok_or(Error::InvalidAdmission)?;
     let input: Value = decode(&row, "input_json")?;
     let run: crate::NewWorkflowRun = decode(&root, "admission_json")?;
+    let mut emitted_outcome = None;
     let value = match node.kind {
         NodeKind::Branch => {
             skip_branch(&*tx, run_id, &node, &input).await?;
@@ -70,27 +71,22 @@ pub async fn settle(
                 .and_then(Value::as_u64)
                 .ok_or(Error::InvalidAdmission)?;
             let bound = max.min(u64::from(run.limits.cycle_cap));
+            record_repeat(&*tx, run_id, node_id, id, generation, false).await?;
             super::control_state::record(&*tx, run_id, node_id, generation).await?;
             if repeat && generation < bound {
                 restart(&*tx, &run, current, node_id, &input).await?;
                 tx.commit().await?;
                 return Ok(true);
             }
-            let policy: bcode_workflow::WorkflowRepeatExhaustionPolicy = node
-                .configuration
-                .get("exhaustion_policy")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|_| Error::InvalidAdmission)?
-                .unwrap_or_default();
+            let policy = repeat_policy(&node)?;
             if repeat && policy == bcode_workflow::WorkflowRepeatExhaustionPolicy::Fail {
+                record_repeat(&*tx, run_id, node_id, id, generation, true).await?;
                 super::control_state::fail(&*tx, run_id, id).await?;
                 tx.commit().await?;
                 return Ok(true);
             }
             if policy == bcode_workflow::WorkflowRepeatExhaustionPolicy::EmitOutcome {
-                serde_json::to_value(bcode_workflow::WorkflowRepeatOutcome {
+                let outcome = bcode_workflow::WorkflowRepeatOutcome {
                     version: bcode_workflow::WORKFLOW_REPEAT_OUTCOME_VERSION,
                     outcome: if repeat {
                         bcode_workflow::WorkflowRepeatOutcomeKind::IterationLimitReached
@@ -102,8 +98,10 @@ pub async fn settle(
                     cycle_cap: u64::from(run.limits.cycle_cap),
                     effective_iteration_bound: bound,
                     value: input.clone(),
-                })
-                .map_err(|_| Error::InvalidAdmission)?
+                };
+                let value = serde_json::to_value(&outcome).map_err(|_| Error::InvalidAdmission)?;
+                emitted_outcome = Some(outcome);
+                value
             } else {
                 input.clone()
             }
@@ -111,8 +109,67 @@ pub async fn settle(
         _ => return Err(Error::UnsupportedLifecycle),
     };
     commit_control(&*tx, &run, &node, id, current, &value).await?;
+    if let Some(outcome) = emitted_outcome {
+        super::control_state::repeat_outcome::record_control_in(&*tx, owner, run_id, id, &outcome)
+            .await?;
+    }
     tx.commit().await?;
     Ok(true)
+}
+
+fn repeat_policy(
+    node: &bcode_workflow::NodeDefinition,
+) -> Result<bcode_workflow::WorkflowRepeatExhaustionPolicy, Error> {
+    node.configuration
+        .get("exhaustion_policy")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| Error::InvalidAdmission)
+        .map(Option::unwrap_or_default)
+}
+
+async fn record_repeat(
+    db: &dyn Database,
+    run: &str,
+    node: &str,
+    activation: &str,
+    generation: u64,
+    failed: bool,
+) -> Result<(), Error> {
+    use super::super::journal::public_events::control::{Commitment, Operation, Outcome, record};
+    let key = encode(&(run, node))?;
+    let source = if failed {
+        ("workflow_control_failures_v2", activation, 1)
+    } else {
+        (
+            "workflow_repeat_cycles_v2",
+            key.as_str(),
+            i64::try_from(generation).map_err(|_| Error::InvalidAdmission)?,
+        )
+    };
+    record(
+        db,
+        Commitment {
+            run,
+            node,
+            activation,
+            operation: if failed {
+                Operation::RepeatFailed
+            } else {
+                Operation::RepeatAdvanced
+            },
+            outcome: if failed {
+                Outcome::Failed
+            } else {
+                Outcome::Continued
+            },
+            time: u64::try_from(super::super::runs::timestamp()?)
+                .map_err(|_| Error::InvalidAdmission)?,
+            source: Some(source),
+        },
+    )
+    .await
 }
 
 async fn restart(

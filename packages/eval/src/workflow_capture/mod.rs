@@ -152,5 +152,10 @@ impl ModelCoverage {
     }
 }
 
+mod committed;
+pub use committed::capture as capture_committed;
+mod inventory;
+pub use inventory::capture as capture_inventory;
+
 #[cfg(test)]
 mod tests;

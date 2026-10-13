@@ -769,8 +769,14 @@ pub enum RuntimeAndModelRequest {
         limit: usize,
     },
     /// Return one bounded page of durable workflow events.
+    WorkflowCommittedHistory {
+        query: bcode_workflow::WorkflowCommittedHistoryQuery,
+    },
     WorkflowLifecycleHistory {
         query: bcode_workflow::WorkflowLifecycleHistoryQuery,
+    },
+    WorkflowInventory {
+        query: bcode_workflow::WorkflowInventoryQuery,
     },
     WorkflowSemanticHistory {
         query: bcode_workflow::WorkflowSemanticHistoryQuery,
@@ -1700,8 +1706,18 @@ impl RoutedRequest {
                 cursor,
                 limit,
             })),
+            Request::WorkflowCommittedHistory { query } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowCommittedHistory {
+                    query,
+                }))
+            }
             Request::WorkflowLifecycleHistory { query } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowLifecycleHistory {
+                    query,
+                }))
+            }
+            Request::WorkflowInventory { query } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowInventory {
                     query,
                 }))
             }

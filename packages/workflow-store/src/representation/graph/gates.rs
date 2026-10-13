@@ -135,6 +135,7 @@ pub async fn resolve_observed(
         .execute(&*tx)
         .await?;
     let run: crate::NewWorkflowRun = decode(root, "admission_json")?;
+    record_gate_resolution(&*tx, run_id, node_id, id).await?;
     super::completion::retain_control(&*tx, run_id, &node, id, &value).await?;
     super::frontier::enqueue(&*tx, run_id, current, node_id, &value).await?;
     let (_, activated) = super::frontier::drain_observed(&*tx, &run, 32).await?;
@@ -153,6 +154,29 @@ pub async fn resolve_observed(
         activated,
         run_status: super::super::runs::RunState::decode(&text(root, "status")?)?,
     })
+}
+
+async fn record_gate_resolution(
+    db: &dyn Database,
+    run: &str,
+    node: &str,
+    activation: &str,
+) -> Result<(), Error> {
+    use super::super::journal::public_events::control::{Commitment, Operation, Outcome, record};
+    record(
+        db,
+        Commitment {
+            run,
+            node,
+            activation,
+            operation: Operation::GateResolved,
+            outcome: Outcome::Succeeded,
+            time: u64::try_from(super::super::runs::timestamp()?)
+                .map_err(|_| Error::InvalidAdmission)?,
+            source: None,
+        },
+    )
+    .await
 }
 
 /// Persist an explicit approval denial without claiming outstanding attempts had no effects.
@@ -217,6 +241,25 @@ pub async fn deny_observed(
         .is_empty();
     if !duplicate && text(root, "status")? != "paused" {
         return Err(Error::InvalidAdmission);
+    }
+    if !duplicate {
+        use super::super::journal::public_events::control::{
+            Commitment, Operation, Outcome, record,
+        };
+        record(
+            &*tx,
+            Commitment {
+                run: run_id,
+                node: node_id,
+                activation: id,
+                operation: Operation::GateDenied,
+                outcome: Outcome::Failed,
+                time: u64::try_from(super::super::runs::timestamp()?)
+                    .map_err(|_| Error::InvalidAdmission)?,
+                source: Some(("workflow_control_failures_v2", id, 1)),
+            },
+        )
+        .await?;
     }
     super::control_state::fail(&*tx, run_id, id).await?;
     tx.commit().await?;

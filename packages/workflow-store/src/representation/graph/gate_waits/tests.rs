@@ -1,4 +1,5 @@
 use super::*;
+mod snapshot;
 use crate::representation::{
     self as rep,
     controls::{GateDecision, GateRequest, resolve_gate},

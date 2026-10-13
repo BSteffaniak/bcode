@@ -948,6 +948,7 @@ fn readonly_operation(args: &[String]) -> Option<&'static str> {
         args.first().map(String::as_str),
         args.get(1).map(String::as_str),
     ) {
+        (Some("workflow"), Some("inventory-run")) => Some("workflow_inventory"),
         (Some("workflow"), Some("inspect-run")) => Some("workflow_inspect"),
         (Some("workflow"), Some("activity-run")) => Some("workflow_activity"),
         (Some("workflow"), Some("activity-close")) => Some("workflow_activity_close"),
@@ -1889,7 +1890,45 @@ pub fn execute(
             "error": result.err().map(|error| error.to_string()),
         }));
     }
+    if capabilities.canonical_eval_coverage.is_some()
+        && let Err(error) =
+            workflow_capture::capture_committed(run_id, rep_dir, capture_deadline, invoke)
+    {
+        write_json(
+            rep_dir.join("workflow-committed-events-error.json"),
+            &error.to_string(),
+        )?;
+    }
+    let inventory = if capabilities.canonical_eval_coverage.is_some() {
+        match workflow_capture::capture_inventory(run_id, rep_dir, capture_deadline, invoke) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                write_json(
+                    rep_dir.join("canonical-inventory-error.json"),
+                    &error.to_string(),
+                )?;
+                None
+            }
+        }
+    } else {
+        // Historical representations retain their existing capture contract;
+        // absence never certifies current canonical inventory proof.
+        None
+    };
+    if let Some(capture) = &inventory {
+        write_json(
+            rep_dir.join("canonical-inventory-facts.json"),
+            &serde_json::json!({
+                "schema_version": 1, "scope": "current canonical facts, not full semantic history",
+                "runs": capture.runs, "sessions": capture.sessions,
+                "outputs": capture.outputs, "attempts": capture.attempts,
+            }),
+        )?;
+    }
     let mut event_sessions = vec![session_id.to_owned()];
+    if let Some(capture) = &inventory {
+        event_sessions.extend(capture.sessions.iter().cloned());
+    }
     event_sessions.extend(
         final_inspection["child_sessions"]
             .as_array()
@@ -1908,10 +1947,10 @@ pub fn execute(
                     coverage.complete_for(run_id, graph.revision, capabilities.run.status)
                 })
             });
-    let mut canonical_attempt_complete = !capture_failed
-        && scoped_workflow_complete
-        && outputs.as_array().is_some_and(|values| values.len() < 100);
+    let mut canonical_attempt_complete =
+        !capture_failed && scoped_workflow_complete && inventory.is_some();
     let mut capture_complete = !capture_failed
+        && (capabilities.canonical_eval_coverage.is_none() || inventory.is_some())
         && final_inspection["unavailable_collections"]
             .as_array()
             .is_none_or(Vec::is_empty)

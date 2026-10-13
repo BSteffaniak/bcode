@@ -96,6 +96,16 @@ pub(in crate::representation) async fn finish(
         recorded_at_ms: proof.recorded_at_ms,
         payload,
     };
+    super::super::journal::public_events::append(
+        tx,
+        &event.run_id,
+        &event.operation_id,
+        event.recorded_at_ms,
+        super::super::journal::public_events::Fact::Lifecycle {
+            payload: event.payload.clone(),
+        },
+    )
+    .await?;
     tx.insert(EVENTS)
         .value("identity", event.operation_id.as_str())
         .value("run_id", event.run_id.as_str())
@@ -122,6 +132,19 @@ pub(in crate::representation) async fn finish(
     .await
 }
 /// Read bounded, pinned run admission/status facts, never full workflow history.
+/// # Errors
+/// Rejects invalid cursors, unavailable installation or inconsistent proof state.
+pub(in crate::representation) async fn coverage(
+    db: &dyn Database,
+    run: &str,
+) -> Result<bcode_workflow::WorkflowSemanticHistoryCoverage, Error> {
+    installation::verify(db).await?;
+    let baseline = checkpoints::baseline_for(db, run, TABLES).await?;
+    Ok(checkpoints::coverage_of(&baseline))
+}
+
+/// Read bounded, pinned run admission/status facts, never full workflow history.
+///
 /// # Errors
 /// Rejects invalid cursors, unavailable installation or inconsistent proof state.
 pub async fn page(

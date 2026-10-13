@@ -532,7 +532,7 @@ async fn typed_provider_fixture_with_delegation(
     .await
 }
 
-async fn typed_provider_fixture_with_target(
+pub(super) async fn typed_provider_fixture_with_target(
     delegation: bool,
     target: bcode_workflow::PromptContextTarget,
 ) -> (
@@ -2944,7 +2944,7 @@ async fn represented_acceptance_recovery_live_owner_cancel_settles_exact_turn() 
     stop_fixture_driver(&state).await;
 }
 
-async fn prepare_acceptance_recovery_fixture(
+pub(super) async fn prepare_acceptance_recovery_fixture(
     state: &std::sync::Arc<ServerState>,
     db: &dyn Database,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,

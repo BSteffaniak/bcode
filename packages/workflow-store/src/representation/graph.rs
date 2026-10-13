@@ -16,6 +16,7 @@ mod cancellation;
 pub mod completion;
 /// Bounded branch/repeat control settlement.
 pub mod control;
+pub use control_state::repeat_outcome;
 mod control_state;
 pub mod fanout;
 /// Incremental homogeneous fan-out members and capacity.

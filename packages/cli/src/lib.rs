@@ -1589,6 +1589,32 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
         WorkflowCommand::Package { command } => {
             Box::pin(handle_workflow_package_command(&client, command)).await?;
         }
+        WorkflowCommand::PublicEvents {
+            run_id,
+            after_sequence,
+            through_sequence,
+            limit,
+            json: _,
+        } => {
+            let query = bcode_workflow::WorkflowCommittedHistoryQuery {
+                version: 1,
+                run_id,
+                after_sequence,
+                through_sequence,
+                limit,
+            };
+            query.validate().map_err(|_| {
+                CliError::InvalidArguments("invalid committed history query".into())
+            })?;
+            print_json(
+                &Box::pin(
+                    bcode_workflow::WorkflowRunApplication::workflow_committed_history(
+                        &client, query,
+                    ),
+                )
+                .await?,
+            )?;
+        }
         WorkflowCommand::LifecycleHistoryRun {
             run_id,
             cursor_json,
@@ -1601,6 +1627,43 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                         &client, query,
                     ),
                 )
+                .await?,
+            )?;
+        }
+        WorkflowCommand::InventoryRun {
+            run,
+            run_id,
+            source,
+            cursor_json,
+            limit,
+            json: _,
+        } => {
+            let run_id = run.or(run_id).ok_or_else(|| {
+                CliError::InvalidArguments("inventory run identity required".into())
+            })?;
+            let source = serde_json::from_value::<bcode_workflow::WorkflowInventorySource>(
+                serde_json::Value::String(source.replace('-', "_")),
+            )
+            .map_err(|_| CliError::InvalidArguments("unsupported inventory source".into()))?;
+            let cursor = cursor_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|_| CliError::InvalidArguments("invalid inventory cursor".into()))?;
+            let query = bcode_workflow::WorkflowInventoryQuery {
+                version: bcode_workflow::WORKFLOW_INVENTORY_VERSION,
+                run_id,
+                source,
+                cursor,
+                limit,
+            };
+            query
+                .validate()
+                .map_err(|_| CliError::InvalidArguments("invalid inventory query".into()))?;
+            print_json(
+                &Box::pin(bcode_workflow::WorkflowRunApplication::workflow_inventory(
+                    &client, query,
+                ))
                 .await?,
             )?;
         }
@@ -4966,6 +5029,18 @@ enum WorkflowCommand {
         #[arg(long, value_name = "JSON_FILE")]
         input: Option<PathBuf>,
     },
+    /// Read one finite, pinned public committed-event page (JSON), not full history.
+    PublicEvents {
+        run_id: String,
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+        #[arg(long)]
+        through_sequence: Option<u64>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Return one pinned `RunLifecycleV1` lifecycle history page; not full workflow history.
     LifecycleHistoryRun {
         #[arg(long)]
@@ -4974,6 +5049,24 @@ enum WorkflowCommand {
         cursor_json: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+    /// Return one bounded generation-pinned current inventory page as JSON.
+    InventoryRun {
+        /// Run identity (positional form).
+        #[arg(required_unless_present = "run_id", conflicts_with = "run_id")]
+        run: Option<String>,
+        /// Compatibility spelling for existing callers.
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long, value_parser = ["outputs", "attempt-contributors", "child-runs", "attempt_contributors", "child_runs"])]
+        source: String,
+        #[arg(long)]
+        cursor_json: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Explicit machine-output flag; inventory always returns JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Return one pinned `AttemptsV1` semantic history page; not full workflow history.
     SemanticHistoryRun {
@@ -30145,6 +30238,143 @@ mod latency_diagnosis_tests {
 
 #[cfg(test)]
 mod client_timeout_cli_tests {
+    #[test]
+    fn inventory_run_accepts_portable_sources_and_legacy_spelling() {
+        use clap::Parser as _;
+        for source in [
+            "outputs",
+            "attempt-contributors",
+            "child-runs",
+            "attempt_contributors",
+            "child_runs",
+        ] {
+            let cli = super::Cli::try_parse_from([
+                "bcode",
+                "workflow",
+                "inventory-run",
+                "run",
+                "--source",
+                source,
+                "--limit",
+                "100",
+                "--json",
+            ])
+            .unwrap();
+            let Some(super::Commands::Workflow {
+                command:
+                    super::WorkflowCommand::InventoryRun {
+                        run,
+                        run_id,
+                        source: parsed,
+                        cursor_json,
+                        limit,
+                        json,
+                    },
+            }) = cli.command
+            else {
+                panic!("inventory command")
+            };
+            assert_eq!(run.as_deref(), Some("run"));
+            assert!(run_id.is_none());
+            assert_eq!(parsed, source);
+            assert!(cursor_json.is_none());
+            assert_eq!(limit, 100);
+            assert!(json);
+        }
+        let cli = super::Cli::try_parse_from([
+            "bcode",
+            "workflow",
+            "inventory-run",
+            "--run-id",
+            "run",
+            "--source",
+            "outputs",
+            "--cursor-json",
+            "{\"version\":1}",
+        ])
+        .unwrap();
+        let Some(super::Commands::Workflow {
+            command:
+                super::WorkflowCommand::InventoryRun {
+                    run,
+                    run_id,
+                    cursor_json,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("inventory command")
+        };
+        assert!(run.is_none());
+        assert_eq!(run_id.as_deref(), Some("run"));
+        assert_eq!(cursor_json.as_deref(), Some("{\"version\":1}"));
+        assert!(
+            super::Cli::try_parse_from([
+                "bcode",
+                "workflow",
+                "inventory-run",
+                "--source",
+                "outputs"
+            ])
+            .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "bcode",
+                "workflow",
+                "inventory-run",
+                "run",
+                "--run-id",
+                "other",
+                "--source",
+                "outputs"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn committed_history_cli_preserves_exact_pinned_query() {
+        let cli = <super::Cli as clap::Parser>::try_parse_from([
+            "bcode",
+            "workflow",
+            "public-events",
+            "run",
+            "--after-sequence",
+            "4",
+            "--through-sequence",
+            "200",
+            "--limit",
+            "25",
+            "--json",
+        ])
+        .unwrap();
+        let Some(super::Commands::Workflow {
+            command:
+                super::WorkflowCommand::PublicEvents {
+                    run_id,
+                    after_sequence,
+                    through_sequence,
+                    limit,
+                    json,
+                },
+        }) = cli.command
+        else {
+            panic!("public-events command");
+        };
+        assert!(json);
+        let query = bcode_workflow::WorkflowCommittedHistoryQuery {
+            version: 1,
+            run_id,
+            after_sequence,
+            through_sequence,
+            limit,
+        };
+        query.validate().unwrap();
+        assert_eq!(query.after_sequence, 4);
+        assert_eq!(query.through_sequence, Some(200));
+        assert_eq!(query.limit, 25);
+    }
     #[test]
     fn lifecycle_history_cli_maps_exact_run_cursor_and_rejects_invalid_bounds() {
         let cli = <super::Cli as clap::Parser>::try_parse_from([

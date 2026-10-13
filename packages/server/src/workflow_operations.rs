@@ -385,6 +385,21 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         .await
         .map_err(run_operation_failure)
     }
+    async fn workflow_committed_history(
+        &self,
+        query: bcode_workflow::WorkflowCommittedHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowCommittedHistoryPage, Self::Error> {
+        query
+            .validate()
+            .map_err(|_| bcode_workflow::WorkflowRunOperationFailure {
+                code: "workflow_committed_history_invalid_query".into(),
+                message: "invalid committed history query".into(),
+            })?;
+        crate::workflow_representation::discovery::committed_history(self.state, &query)
+            .await
+            .map_err(run_operation_failure)
+    }
+
     async fn workflow_lifecycle_history(
         &self,
         query: bcode_workflow::WorkflowLifecycleHistoryQuery,
@@ -402,6 +417,21 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
                 message: "lifecycle history query is unsupported or inconsistent".into(),
             })?;
         crate::workflow_representation::discovery::lifecycle_history(self.state, &query)
+            .await
+            .map_err(run_operation_failure)
+    }
+
+    async fn workflow_inventory(
+        &self,
+        query: bcode_workflow::WorkflowInventoryQuery,
+    ) -> Result<bcode_workflow::WorkflowInventoryPage, Self::Error> {
+        query
+            .validate()
+            .map_err(|_| bcode_workflow::WorkflowRunOperationFailure {
+                code: "workflow_inventory_invalid_query".into(),
+                message: "inventory query is unsupported or inconsistent".into(),
+            })?;
+        crate::workflow_representation::discovery::inventory(self.state, &query)
             .await
             .map_err(run_operation_failure)
     }
@@ -7377,7 +7407,16 @@ async fn start_run_with_stage(
     )
     .await;
     *phase = "initial_execution";
-    super::drive_workflow_run(state, &run_id).await?;
+    if let Err(error) = super::drive_workflow_run(state, &run_id).await {
+        // Admission can commit a receipt before the first driver call fails. Only
+        // verified terminal evidence permits releasing its runtime registration.
+        if let Err(reconciliation) =
+            crate::workflow_representation::owner::reconcile_failed_start(state, &run_id).await
+        {
+            tracing::warn!(run_id = %run_id, error = %reconciliation, "failed-start reconciliation unavailable");
+        }
+        return Err(error);
+    }
     drop(workflow_session_ownership);
     Ok(bcode_workflow::WorkflowRunStartResponse {
         run,

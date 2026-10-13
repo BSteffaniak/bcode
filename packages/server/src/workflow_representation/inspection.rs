@@ -12,6 +12,10 @@ use sha2::Digest;
 use switchy_database::Database as _;
 
 mod admission;
+mod descendants;
+mod leases;
+mod repeats;
+mod waits;
 
 fn stage(name: &str) -> ServerError {
     ServerError::WorkflowStorageUnavailable(format!("workflow inspection unavailable at {name}"))
@@ -41,17 +45,17 @@ struct CollectionCompleteness {
     child_sessions: Option<bool>,
     activations: Option<bool>,
     child_run_links: Option<bool>,
+    descendant_runs: Option<bool>,
+    waits: Option<bool>,
+    resource_leases: Option<bool>,
 }
 
 fn unavailable_collections(complete: CollectionCompleteness) -> Vec<String> {
     let unsupported = [
         "events",
-        "waits",
         "mutation_approvals",
         "decisions",
         "grants",
-        "resource_leases",
-        "descendant_runs",
         "repeat_outcomes",
     ];
     unsupported
@@ -62,6 +66,9 @@ fn unavailable_collections(complete: CollectionCompleteness) -> Vec<String> {
                 ("child_sessions", complete.child_sessions),
                 ("activations", complete.activations),
                 ("child_run_links", complete.child_run_links),
+                ("descendant_runs", complete.descendant_runs),
+                ("waits", complete.waits),
+                ("resource_leases", complete.resource_leases),
             ]
             .into_iter()
             .filter_map(|(name, completeness)| (completeness != Some(true)).then_some(name)),
@@ -114,35 +121,25 @@ async fn inspect_canonical(
             .await
             .map_err(|_| stage("revision"))?;
     let graph = canonical_graph(&*tx, run_id, revision, limit, bound).await?;
+    let (waits, waits_complete) = waits::inspect(&*tx, run_id, revision, bound).await;
     let terminal_output = terminal(&*tx, &run).await.map_err(|_| stage("terminal"))?;
     let (activations, activations_complete) = activations(&*tx, run_id, revision, bound)
         .await
         .map_err(|_| stage("activations"))?;
-    let attempts = super::backpressure::retry(|| {
-        representation::inspection_attempts::page_in(&*tx, run_id, None, bound)
-    })
-    .await
-    .map_err(|_| stage("attempts"))?;
+    let attempts = canonical_attempts(&*tx, run_id, bound).await?;
+    let (resource_leases, leases_complete) = leases::inspect(&*tx, run_id, bound).await;
+    let repeat_outcomes = repeats::inspect(&*tx, run_id, bound).await;
     let outputs = output_summaries(&*tx, run_id, bound).await?;
     let child_sessions = sessions(state, &*tx, run_id, bound)
         .await
         .map_err(|_| stage("sessions"))?;
-    let children = super::backpressure::retry(|| {
-        representation::hierarchy::children_in(&*tx, run_id, None, bound)
-    })
-    .await
-    .map_err(|_| stage("children"))?;
-    let children_complete = children.next_child_run_id.is_none();
-    let child_run_links = children.children;
+    let (child_run_links, children_complete, descendant_runs, descendants_complete) =
+        canonical_descendants(&*tx, run_id, bound).await?;
     let (admission_observations, admission_observations_complete) =
         admission::inspect(&*tx, run_id, bound).await;
     // A graph revision fences topology only, not concurrent attempt/output transitions.
     // Reject changed topology rather than returning a mixed-revision aggregate.
-    let final_revision =
-        super::backpressure::retry(|| representation::graph_pages::revision(&*tx, run_id))
-            .await
-            .map_err(|_| stage("final_revision"))?;
-    verify_revision(revision, final_revision)?;
+    verify_snapshot_revision(&*tx, run_id, revision).await?;
     let sessions_complete =
         attempts.len() < usize::from(bound) && child_sessions.len() < usize::from(bound);
     let exhausted = bcode_workflow::WorkflowCanonicalCollectionCoverage::from_verified;
@@ -175,6 +172,9 @@ async fn inspect_canonical(
             child_sessions: Some(sessions_complete),
             activations: Some(activations_complete),
             child_run_links: Some(children_complete),
+            descendant_runs: Some(descendants_complete),
+            waits: waits_complete,
+            resource_leases: leases_complete,
         }),
         execution_allowance: None,
         continuation: None,
@@ -187,17 +187,69 @@ async fn inspect_canonical(
         attempts,
         outputs,
         events: vec![],
-        waits: vec![],
+        waits,
         mutation_approvals: vec![],
         decisions: vec![],
         grants: vec![],
-        resource_leases: vec![],
+        resource_leases,
         child_run_links,
-        descendant_runs: vec![],
-        repeat_outcomes: vec![],
+        descendant_runs,
+        repeat_outcomes,
         child_sessions,
         coordinator: None,
     })
+}
+
+async fn canonical_descendants(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run: &str,
+    bound: u16,
+) -> Result<
+    (
+        Vec<bcode_workflow::WorkflowRunLink>,
+        bool,
+        Vec<bcode_workflow::WorkflowDescendantRunSummary>,
+        bool,
+    ),
+    ServerError,
+> {
+    let children =
+        super::backpressure::retry(|| representation::hierarchy::children_in(tx, run, None, bound))
+            .await
+            .map_err(|_| stage("children"))?;
+    let complete = children.next_child_run_id.is_none();
+    let (descendants, descendants_complete) =
+        descendants::inspect(tx, run, &children.children, complete, bound).await?;
+    Ok((
+        children.children,
+        complete,
+        descendants,
+        descendants_complete,
+    ))
+}
+
+async fn canonical_attempts(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run_id: &str,
+    bound: u16,
+) -> Result<Vec<bcode_workflow::AttemptSummary>, ServerError> {
+    super::backpressure::retry(|| {
+        representation::inspection_attempts::page_in(tx, run_id, None, bound)
+    })
+    .await
+    .map_err(|_| stage("attempts"))
+}
+
+async fn verify_snapshot_revision(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run_id: &str,
+    revision: u64,
+) -> Result<(), ServerError> {
+    let final_revision =
+        super::backpressure::retry(|| representation::graph_pages::revision(tx, run_id))
+            .await
+            .map_err(|_| stage("final_revision"))?;
+    verify_revision(revision, final_revision)
 }
 
 async fn canonical_graph(
@@ -286,32 +338,33 @@ async fn terminal(
         return Ok(None);
     }
     let run_id = &run.run_id;
-    let terminal_output = representation::graph::completion::terminal_in(db, run_id)
+    let output = representation::graph::completion::terminal_in(db, run_id)
+        .await
+        .map_err(|_| unavailable())?;
+    let Some(output) = output else {
+        return Ok(None);
+    };
+    let output = representation::graph::completion::proven_output(db, run_id, &output.output_id)
         .await
         .map_err(|_| unavailable())?
-        .map(|output| {
-            let checksum = bcode_workflow::workflow_canonical_value_sha256(&output.value)
-                .map_err(|_| unavailable())?;
-            if run.terminal_output_id.as_deref() != Some(output.output_id.as_str())
-                || run.terminal_output_checksum_sha256.as_deref() != Some(checksum.as_str())
-            {
-                return Err(unavailable());
-            }
-            Ok(WorkflowTerminalOutputInspection {
-                version: bcode_workflow::WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION,
-                checksum_sha256: checksum,
-                output_id: output.output_id,
-                node_id: output.node_id,
-                activation_id: output.activation_id,
-                schema_id: output.schema_id,
-                schema_version: output.schema_version,
-                value: output.value,
-                artifact_reference: output.artifact_reference,
-                created_at_ms: output.created_at_ms,
-            })
-        })
-        .transpose()?;
-    Ok(terminal_output)
+        .ok_or_else(unavailable)?;
+    if run.terminal_output_id.as_deref() != Some(output.output_id.as_str())
+        || run.terminal_output_checksum_sha256.as_deref() != Some(output.checksum_sha256.as_str())
+    {
+        return Err(unavailable());
+    }
+    Ok(Some(WorkflowTerminalOutputInspection {
+        version: bcode_workflow::WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION,
+        checksum_sha256: output.checksum_sha256,
+        output_id: output.output_id,
+        node_id: output.node_id,
+        activation_id: output.activation_id,
+        schema_id: output.schema_id,
+        schema_version: output.schema_version,
+        value: output.value,
+        artifact_reference: output.artifact_reference,
+        created_at_ms: output.created_at_ms,
+    }))
 }
 
 async fn activations(
@@ -393,12 +446,18 @@ mod tests {
                 child_sessions: status,
                 activations: status,
                 child_run_links: status,
+                descendant_runs: status,
+                waits: status,
+                resource_leases: status,
             });
             for name in [
                 "admission_observations",
                 "child_sessions",
                 "activations",
                 "child_run_links",
+                "descendant_runs",
+                "waits",
+                "resource_leases",
             ] {
                 assert_eq!(
                     names.iter().any(|value| value == name),
@@ -407,7 +466,36 @@ mod tests {
             }
             // Supported collection completeness cannot certify legacy event history.
             assert!(names.iter().any(|name| name == "events"));
-            assert!(names.iter().any(|name| name == "descendant_runs"));
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_child_absence_is_observed_not_assumed() {
+        let (_root, _sessions, state, definition) =
+            super::super::tests::typed_provider_fixture().await;
+        let run = super::super::status(&state, "new").await.unwrap().unwrap();
+        state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .persist_definition(&run.definition_id, run.definition_version, &definition)
+            .unwrap();
+        let inspection = super::inspect(&state, "new", 100).await.unwrap().unwrap();
+        assert!(inspection.child_run_links.is_empty());
+        assert!(inspection.descendant_runs.is_empty());
+        assert!(
+            !inspection
+                .unavailable_collections
+                .iter()
+                .any(|name| name == "descendant_runs")
+        );
+        for unsupported in ["events", "decisions", "grants", "repeat_outcomes"] {
+            assert!(
+                inspection
+                    .unavailable_collections
+                    .iter()
+                    .any(|name| name == unsupported)
+            );
         }
     }
 

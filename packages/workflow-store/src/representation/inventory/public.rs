@@ -152,12 +152,15 @@ async fn entry(
     previous: Option<&Key>,
 ) -> Result<Entry, Error> {
     Ok(match query.source {
-        // Representation-v2 outputs do not retain the independently stored
-        // checksum proof required by WorkflowOutputInspection. Never synthesize it.
-        Source::Outputs => Entry::OutputUnavailable {
-            output_id: id,
-            reason: Reason::MissingProof,
-        },
+        Source::Outputs => super::super::graph::completion::proven_output(tx, &query.run_id, &id)
+            .await?
+            .map_or(
+                Entry::OutputUnavailable {
+                    output_id: id,
+                    reason: Reason::MissingProof,
+                },
+                |output| Entry::Output { output },
+            ),
         Source::AttemptContributors => {
             let attempts = crate::representation::inspection_attempts::page_in(
                 tx,
@@ -181,9 +184,7 @@ async fn entry(
                 .execute(tx)
                 .await?;
             let session = match links.as_slice() {
-                [] => Session::Unavailable {
-                    reason: Reason::MissingProof,
-                },
+                [] => missing_session(tx, &query.run_id, &attempt).await?,
                 [row] => {
                     let Some(DatabaseValue::String(json)) = row.get("link_json") else {
                         return Err(Error::MaintenanceRequired);
@@ -223,6 +224,37 @@ async fn entry(
             }
         }
         Source::ChildRuns => child_entry(tx, query, id).await?,
+    })
+}
+
+async fn missing_session(
+    db: &dyn Database,
+    run: &str,
+    attempt: &bcode_workflow::AttemptSummary,
+) -> Result<Session, Error> {
+    let revision = super::super::graph_pages::revision(db, run).await?;
+    let node = super::super::graph_pages::node(db, run, revision, &attempt.node_id).await?;
+    // Only deterministic built-in controls have an authoritative no-session capability.
+    // Task/plugin/call operations may dispatch work; absent receipt/link does not prove
+    // preadmission rejection, including failed/cancelled attempts.
+    if node.is_some_and(|node| {
+        matches!(
+            node.kind,
+            bcode_workflow::NodeKind::Branch
+                | bcode_workflow::NodeKind::Repeat
+                | bcode_workflow::NodeKind::Parallel
+                | bcode_workflow::NodeKind::FanOut
+                | bcode_workflow::NodeKind::Input
+                | bcode_workflow::NodeKind::Approval
+        )
+    }) {
+        return Ok(Session::NotApplicable {
+            reason:
+                bcode_workflow::WorkflowInventorySessionNotApplicableReason::CanonicalNonSessionNode,
+        });
+    }
+    Ok(Session::Unavailable {
+        reason: Reason::MissingProof,
     })
 }
 

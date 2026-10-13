@@ -547,11 +547,25 @@ impl bcode_workflow::WorkflowRunApplication for BcodeClient {
     ) -> Result<Vec<bcode_workflow::AttemptSummary>, Self::Error> {
         Self::workflow_attempt_history(self, run_id, cursor, limit).await
     }
+    async fn workflow_committed_history(
+        &self,
+        query: bcode_workflow::WorkflowCommittedHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowCommittedHistoryPage, Self::Error> {
+        Self::workflow_committed_history(self, query).await
+    }
+
     async fn workflow_lifecycle_history(
         &self,
         query: bcode_workflow::WorkflowLifecycleHistoryQuery,
     ) -> Result<bcode_workflow::WorkflowLifecycleHistoryPage, Self::Error> {
         Self::workflow_lifecycle_history(self, query).await
+    }
+
+    async fn workflow_inventory(
+        &self,
+        query: bcode_workflow::WorkflowInventoryQuery,
+    ) -> Result<bcode_workflow::WorkflowInventoryPage, Self::Error> {
+        Self::workflow_inventory(self, query).await
     }
 
     async fn workflow_semantic_history(
@@ -6932,6 +6946,32 @@ impl BcodeClient {
         }
     }
 
+    /// Read bounded public facts with independent source coverage, without execution.
+    /// # Errors
+    /// Rejects invalid queries, transport failures and inconsistent responses.
+    pub async fn workflow_committed_history(
+        &self,
+        query: bcode_workflow::WorkflowCommittedHistoryQuery,
+    ) -> Result<bcode_workflow::WorkflowCommittedHistoryPage, ClientError> {
+        query
+            .validate()
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+        match self
+            .send_request(Request::WorkflowCommittedHistory {
+                query: query.clone(),
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowCommittedHistory { page } => {
+                query
+                    .validate_page(&page)
+                    .map_err(|_| ClientError::UnexpectedResponse)?;
+                Ok(page)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Read one exact, pinned lifecycle-history page without execution or provider work.
     ///
     /// # Errors
@@ -6950,6 +6990,33 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowLifecycleHistory { page } => {
+                query
+                    .validate_page(&page)
+                    .map_err(|_| ClientError::UnexpectedResponse)?;
+                Ok(page)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one generation-pinned canonical current inventory page.
+    ///
+    /// # Errors
+    /// Rejects invalid queries, transport failures and inconsistent responses.
+    pub async fn workflow_inventory(
+        &self,
+        query: bcode_workflow::WorkflowInventoryQuery,
+    ) -> Result<bcode_workflow::WorkflowInventoryPage, ClientError> {
+        query
+            .validate()
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+        match self
+            .send_request(Request::WorkflowInventory {
+                query: query.clone(),
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowInventory { page } => {
                 query
                     .validate_page(&page)
                     .map_err(|_| ClientError::UnexpectedResponse)?;

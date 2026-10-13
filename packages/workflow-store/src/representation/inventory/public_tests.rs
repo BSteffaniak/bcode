@@ -4,6 +4,68 @@ use bcode_workflow::{
     WorkflowInventoryQuery as Query, WorkflowInventorySource as Source,
 };
 #[tokio::test]
+async fn output_payload_proof_is_verified_not_generated_by_inventory() {
+    let db = super::tests::fixture().await;
+    let output = crate::ValidatedOutput {
+        output_id: "proven".into(),
+        run_id: "run".into(),
+        node_id: "node".into(),
+        activation_id: "activation".into(),
+        schema_id: "json".into(),
+        schema_version: 1,
+        value: serde_json::json!({"value":7}),
+        artifact_reference: None,
+        created_at_ms: 1,
+    };
+    let expected = bcode_workflow::workflow_canonical_value_sha256(&output.value).unwrap();
+    let mut encoded = serde_json::to_value(output).unwrap();
+    db.insert("workflow_outputs_v2")
+        .value("output_id", "proven")
+        .value("run_id", "run")
+        .value("activation_id", "activation")
+        .value("output_json", serde_json::to_string(&encoded).unwrap())
+        .execute(&*db)
+        .await
+        .unwrap();
+    let query = Query {
+        version: 1,
+        run_id: "run".into(),
+        source: Source::Outputs,
+        cursor: None,
+        limit: 100,
+    };
+    let missing = page(&*db, &query).await.unwrap();
+    assert!(matches!(
+        missing.entries[0],
+        Entry::OutputUnavailable { .. }
+    ));
+    for (version, checksum, accepted) in [
+        (1, expected.clone(), true),
+        (2, expected.clone(), false),
+        (1, "0".repeat(64), false),
+    ] {
+        encoded["capture_proof"] =
+            serde_json::json!({"version":version,"checksum_sha256":checksum});
+        db.update("workflow_outputs_v2")
+            .value("output_json", serde_json::to_string(&encoded).unwrap())
+            .where_eq("output_id", "proven")
+            .execute(&*db)
+            .await
+            .unwrap();
+        let result = page(&*db, &query).await;
+        if accepted {
+            let result = result.unwrap();
+            let Entry::Output { output } = &result.entries[0] else {
+                panic!("proof unavailable");
+            };
+            assert_eq!(output.checksum_sha256, expected);
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn public_outputs_pin_source_and_report_missing_stored_proof() {
     let db = super::tests::fixture().await;
     for n in 0..105 {
@@ -39,6 +101,53 @@ async fn public_outputs_pin_source_and_report_missing_stored_proof() {
         Err(RepresentationError::InventoryStalePage)
     ));
 }
+#[tokio::test]
+async fn canonical_control_kind_is_explicit_non_session_but_missing_task_link_is_unknown() {
+    let (db, identity) = contributor_fixture().await;
+    let query = Query {
+        version: 1,
+        run_id: "run".into(),
+        source: Source::AttemptContributors,
+        cursor: None,
+        limit: 100,
+    };
+    let before = page(&*db, &query).await.unwrap();
+    assert!(matches!(
+        &before.entries[0],
+        Entry::AttemptContributor {
+            session: bcode_workflow::WorkflowInventorySessionLink::Unavailable { .. },
+            ..
+        }
+    ));
+    let mut node = crate::representation::graph_pages::node(&*db, "run", 1, "work")
+        .await
+        .unwrap()
+        .unwrap();
+    node.kind = bcode_workflow::NodeKind::Parallel;
+    db.update("workflow_definition_nodes_v2")
+        .value("node_json", serde_json::to_string(&node).unwrap())
+        .where_eq("run_id", "run")
+        .where_eq("node_id", "work")
+        .execute(&*db)
+        .await
+        .unwrap();
+    let control = page(&*db, &query).await.unwrap();
+    assert!(matches!(&control.entries[0], Entry::AttemptContributor { session:bcode_workflow::WorkflowInventorySessionLink::NotApplicable { reason:bcode_workflow::WorkflowInventorySessionNotApplicableReason::CanonicalNonSessionNode }, .. }));
+    // Even terminal failure without receipt does not imply no session for a task.
+    node.kind = bcode_workflow::NodeKind::Task;
+    db.update("workflow_definition_nodes_v2")
+        .value("node_json", serde_json::to_string(&node).unwrap())
+        .where_eq("run_id", "run")
+        .where_eq("node_id", "work")
+        .execute(&*db)
+        .await
+        .unwrap();
+    let again = page(&*db, &query).await.unwrap();
+    assert!(
+        matches!(&again.entries[0], Entry::AttemptContributor { attempt, session:bcode_workflow::WorkflowInventorySessionLink::Unavailable { .. }, .. } if attempt.dispatch_identity == identity)
+    );
+}
+
 #[tokio::test]
 async fn public_attempt_facts_keep_private_payloads_out_and_fence_link_updates() {
     let (db, identity) = contributor_fixture().await;

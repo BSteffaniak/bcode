@@ -18,6 +18,23 @@ drivers to completion. It uses the fake provider and one process; it is not yet 
 multi-process daemon/IPC acceptance test. Storage subprocess tests separately cover
 retained-handle writes and interruption safety. Neither claim includes old binaries.
 
+## Scoped committed-event diagnostics
+
+`workflow public-events <run-id>` exposes versioned, bounded, sequence-pinned
+committed-event pages through the portable workflow application contract. It is
+separate from the legacy `workflow events` API. Producers append typed public
+facts within the source transaction and retain the producer's recorded timestamp.
+Attempt, lifecycle, and control-source coverage remain independent; admission
+opt-in and page exhaustion do not certify complete workflow history. Unknown event
+kinds retain identity and time while their unreviewed payloads are withheld.
+
+The evaluation harness retains these pages alongside canonical inventory and
+session evidence without relaxing its full-capture acceptance gate. Unsupported
+decision, grant, repeat-history, or other required collections remain visible.
+Repeat emission summaries and lease acquisition facts are recorded by their owning
+transactions; readers verify canonical identities and do not reconstruct or
+backfill historical facts from current counters or status.
+
 ## Scoped durable attempt history
 
 The representation's semantic history contract version 1 records only `AttemptsV1`:

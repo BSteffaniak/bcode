@@ -518,6 +518,14 @@ pub trait WorkflowRunApplication: Sync {
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<crate::AttemptSummary>, Self::Error>> + Send;
 
+    /// Read bounded public committed facts with independent finite source coverage.
+    /// # Errors
+    /// Rejects unsupported queries, unavailable state or inconsistent pages.
+    fn workflow_committed_history(
+        &self,
+        query: WorkflowCommittedHistoryQuery,
+    ) -> impl std::future::Future<Output = Result<WorkflowCommittedHistoryPage, Self::Error>> + Send;
+
     /// Read exact bounded run lifecycle history without execution authority.
     ///
     /// # Errors
@@ -526,6 +534,15 @@ pub trait WorkflowRunApplication: Sync {
         &self,
         query: WorkflowLifecycleHistoryQuery,
     ) -> impl std::future::Future<Output = Result<WorkflowLifecycleHistoryPage, Self::Error>> + Send;
+
+    /// Read one generation-pinned canonical current inventory page.
+    ///
+    /// # Errors
+    /// Rejects invalid queries, unsupported storage and inconsistent pages.
+    fn workflow_inventory(
+        &self,
+        query: WorkflowInventoryQuery,
+    ) -> impl std::future::Future<Output = Result<WorkflowInventoryPage, Self::Error>> + Send;
 
     /// Read bounded pinned attempt history, not full workflow semantics.
     ///
@@ -2028,6 +2045,192 @@ pub struct WorkflowHistoryEvent {
     pub created_at_ms: u64,
 }
 
+/// Independent compatibility version for committed public diagnostics.
+pub const WORKFLOW_COMMITTED_HISTORY_VERSION: u32 = 1;
+
+/// Finite producer scope; no variant denotes complete workflow semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCommittedHistoryScope {
+    /// Guarded preparation, receipt commitment and terminal settlement.
+    AttemptsV1,
+    /// Guarded admission and run status commitments.
+    RunLifecycleV1,
+    /// Guarded output insertions, control failures and repeat counter commitments.
+    ControlSourcesV1,
+}
+
+/// Bounded read of immutable committed diagnostics, not a durable resume subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCommittedHistoryQuery {
+    /// Exact supported wire version.
+    pub version: u32,
+    /// Owning run identity.
+    pub run_id: String,
+    /// Exclusive consumed sequence; gaps are permitted.
+    pub after_sequence: u64,
+    /// Inclusive stable high-water; omitted only on the first page.
+    pub through_sequence: Option<u64>,
+    /// One through one hundred records.
+    pub limit: usize,
+}
+
+/// Public diagnostics retaining independent scope coverage and the exact scan pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCommittedHistoryPage {
+    /// Supported wire version.
+    pub version: u32,
+    /// Owning run.
+    pub run_id: String,
+    /// Original event-family opt-in; not proof of full coverage.
+    pub from_admission: bool,
+    /// Exactly the finite producer scopes declared by this family.
+    pub scopes: Vec<WorkflowCommittedHistoryScope>,
+    /// Independently verified attempt source obligations.
+    pub attempt_coverage: WorkflowSemanticHistoryCoverage,
+    /// Independently verified lifecycle source obligations.
+    pub lifecycle_coverage: WorkflowSemanticHistoryCoverage,
+    /// Independently verified output/failure/counter guards, not all graph semantics.
+    pub control_coverage: WorkflowSemanticHistoryCoverage,
+    /// Inclusive scan high-water, unchanged across continuation.
+    pub through_sequence: u64,
+    /// Exclusive continuation when more retained records remain.
+    pub next_after_sequence: Option<u64>,
+    /// Producer-defined diagnostics; unknown event kinds retain withheld public payloads.
+    pub events: Vec<WorkflowHistoryEvent>,
+}
+
+impl WorkflowCommittedHistoryQuery {
+    /// Validate bounded query facts without opening storage.
+    /// # Errors
+    /// Rejects unknown versions, invalid IDs, bounds and unpinned continuation.
+    pub fn validate(&self) -> Result<(), WorkflowSemanticHistoryError> {
+        if self.version != WORKFLOW_COMMITTED_HISTORY_VERSION {
+            return Err(WorkflowSemanticHistoryError::UnsupportedVersion);
+        }
+        if self.run_id.is_empty()
+            || self.run_id.len() > 256
+            || !(1..=100).contains(&self.limit)
+            || self
+                .through_sequence
+                .is_some_and(|pin| self.after_sequence > pin)
+            || (self.after_sequence != 0 && self.through_sequence.is_none())
+        {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        Ok(())
+    }
+    /// Verify exact identity, scopes, stable pin, ordering and bounded continuation.
+    /// # Errors
+    /// Rejects malformed, unpinned, mismatched or oversized public pages.
+    pub fn validate_page(
+        &self,
+        page: &WorkflowCommittedHistoryPage,
+    ) -> Result<(), WorkflowSemanticHistoryError> {
+        self.validate()?;
+        if page.version != self.version
+            || page.run_id != self.run_id
+            || page.events.len() > self.limit
+            || page.scopes
+                != [
+                    WorkflowCommittedHistoryScope::AttemptsV1,
+                    WorkflowCommittedHistoryScope::RunLifecycleV1,
+                    WorkflowCommittedHistoryScope::ControlSourcesV1,
+                ]
+            || self
+                .through_sequence
+                .is_some_and(|pin| pin != page.through_sequence)
+            || self.after_sequence > page.through_sequence
+        {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        let mut previous = self.after_sequence;
+        for event in &page.events {
+            if event.run_id != self.run_id
+                || event.event_seq <= previous
+                || event.event_seq > page.through_sequence
+                || event.event_type.is_empty()
+                || event.event_type.len() > 512
+                || serde_json::to_vec(&event.payload)
+                    .map_err(|_| WorkflowSemanticHistoryError::InvalidPage)?
+                    .len()
+                    > 8192
+            {
+                return Err(WorkflowSemanticHistoryError::InvalidPage);
+            }
+            previous = event.event_seq;
+        }
+        if page.next_after_sequence.is_some_and(|next| {
+            page.events.is_empty() || next != previous || next >= page.through_sequence
+        }) {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        if !page.from_admission && (!page.events.is_empty() || page.next_after_sequence.is_some()) {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod committed_history_tests {
+    use super::{
+        WorkflowCommittedHistoryPage as Page, WorkflowCommittedHistoryQuery as Query,
+        WorkflowCommittedHistoryScope as Scope, WorkflowHistoryEvent,
+        WorkflowSemanticHistoryCoverage as Coverage,
+    };
+    #[test]
+    fn committed_history_requires_stable_pin_and_preserves_scoped_gaps() {
+        let mut query = Query {
+            version: 1,
+            run_id: "run".into(),
+            after_sequence: 0,
+            through_sequence: None,
+            limit: 1,
+        };
+        let mut page = Page {
+            version: 1,
+            run_id: "run".into(),
+            from_admission: true,
+            scopes: vec![
+                Scope::AttemptsV1,
+                Scope::RunLifecycleV1,
+                Scope::ControlSourcesV1,
+            ],
+            attempt_coverage: Coverage::CompleteFromAdmission,
+            lifecycle_coverage: Coverage::HistoricalGap,
+            control_coverage: Coverage::Unsupported,
+            through_sequence: 200,
+            next_after_sequence: Some(4),
+            events: vec![WorkflowHistoryEvent {
+                event_seq: 4,
+                run_id: "run".into(),
+                event_type: "future_v99".into(),
+                payload: serde_json::json!({"unavailable":"unreviewed_event_payload"}),
+                created_at_ms: 12,
+            }],
+        };
+        query.validate_page(&page).unwrap();
+        let encoded = serde_json::to_vec(&page).unwrap();
+        assert_eq!(serde_json::from_slice::<Page>(&encoded).unwrap(), page);
+        query.after_sequence = 4;
+        assert!(query.validate().is_err());
+        query.through_sequence = Some(200);
+        page.events[0].event_seq = 8;
+        page.next_after_sequence = Some(8);
+        query.validate_page(&page).unwrap();
+        page.through_sequence = 201;
+        assert!(query.validate_page(&page).is_err());
+        page.through_sequence = 200;
+        page.scopes.pop();
+        assert!(query.validate_page(&page).is_err());
+        query.version = 2;
+        assert!(query.validate().is_err());
+    }
+}
+
 /// Durable attempt-history wire boundary. Unknown versions reject.
 pub const WORKFLOW_SEMANTIC_HISTORY_VERSION: u32 = 1;
 
@@ -2870,6 +3073,14 @@ pub enum WorkflowInventoryDiagnosticApplicability {
     Unsupported,
 }
 
+/// Authoritative reason execution-session evidence does not apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowInventorySessionNotApplicableReason {
+    /// Revision-pinned built-in control node executes without a session.
+    CanonicalNonSessionNode,
+}
+
 /// Verified durable session membership, independent of live session ownership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -2882,6 +3093,11 @@ pub enum WorkflowInventorySessionLink {
         workspace_snapshot: String,
         /// Durable link acceptance timestamp.
         created_at_ms: u64,
+    },
+    /// Revision-pinned canonical node semantics require no execution session.
+    NotApplicable {
+        /// Authoritative domain classification, never inferred from missing links.
+        reason: WorkflowInventorySessionNotApplicableReason,
     },
     /// Missing or unsupported link metadata remains explicitly unavailable.
     Unavailable {

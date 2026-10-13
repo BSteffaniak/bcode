@@ -55,11 +55,14 @@ async fn typed_output_page_rejects_damage_and_invalid_limits() {
             artifact_reference: None,
             created_at_ms: 2,
         };
+        let mut encoded = serde_json::to_value(&output).unwrap();
+        encoded["capture_proof"] = serde_json::json!({"version":1,
+            "checksum_sha256":bcode_workflow::workflow_canonical_value_sha256(&output.value).unwrap()});
         db.insert("workflow_outputs_v2")
             .value("output_id", id)
             .value("run_id", "outputs")
             .value("activation_id", id)
-            .value("output_json", serde_json::to_string(&output).unwrap())
+            .value("output_json", serde_json::to_string(&encoded).unwrap())
             .execute(&db)
             .await
             .unwrap();
@@ -126,11 +129,16 @@ async fn assert_basic_inspection(state: &ServerState) {
     ));
 }
 
-#[test]
-fn inspection_preserves_exact_identity_and_domain_checksum() {
+#[tokio::test]
+async fn inspection_preserves_stored_proof_and_rejects_missing_future_or_corrupt_checksum() {
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        bcode_workflow_store::WorkflowStore::create_coexistence_baseline(root.path()).unwrap();
+    let db = open(store.path(), true).unwrap();
+    representation::install(&db).await.unwrap();
     let value = serde_json::json!({"unicode":"界", "nested":[1, true, null]});
     let expected = bcode_workflow::workflow_canonical_value_sha256(&value).unwrap();
-    let inspected = inspect(bcode_workflow_store::ValidatedOutput {
+    let output = bcode_workflow_store::ValidatedOutput {
         output_id: "output".into(),
         run_id: "run".into(),
         node_id: "worker".into(),
@@ -140,14 +148,46 @@ fn inspection_preserves_exact_identity_and_domain_checksum() {
         value: value.clone(),
         artifact_reference: Some("artifact".into()),
         created_at_ms: 42,
-    })
-    .unwrap();
-    assert_eq!(inspected.checksum_sha256, expected);
-    assert_eq!(inspected.value, value);
-    assert_eq!(inspected.activation_id, "activation");
-    assert_eq!(inspected.artifact_reference.as_deref(), Some("artifact"));
-    assert_eq!(inspected.schema_version, 2);
-    assert_eq!(inspected.created_at_ms, 42);
+    };
+    let mut encoded = serde_json::to_value(output).unwrap();
+    db.insert("workflow_outputs_v2")
+        .value("output_id", "output")
+        .value("run_id", "run")
+        .value("activation_id", "activation")
+        .value("output_json", serde_json::to_string(&encoded).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(
+        representation::graph::completion::proven_output(&db, "run", "output")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for (version, checksum, valid) in [
+        (1, expected.clone(), true),
+        (2, expected.clone(), false),
+        (1, "0".repeat(64), false),
+    ] {
+        encoded["capture_proof"] =
+            serde_json::json!({"version":version,"checksum_sha256":checksum});
+        db.update("workflow_outputs_v2")
+            .value("output_json", serde_json::to_string(&encoded).unwrap())
+            .where_eq("output_id", "output")
+            .execute(&db)
+            .await
+            .unwrap();
+        let inspected =
+            representation::graph::completion::proven_output(&db, "run", "output").await;
+        if valid {
+            let inspected = inspected.unwrap().unwrap();
+            assert_eq!(inspected.checksum_sha256, expected);
+            assert_eq!(inspected.value, value);
+            assert_eq!(inspected.activation_id, "activation");
+        } else {
+            assert!(inspected.is_err());
+        }
+    }
 }
 
 #[tokio::test]

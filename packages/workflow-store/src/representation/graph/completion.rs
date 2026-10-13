@@ -3,6 +3,71 @@ use super::{Database, DatabaseValue, Error, FilterableQuery, TransactionMode, de
 use crate::{ValidatedOutput, WorkflowExecutionAuthority};
 use switchy_database::schema::{DataType, create_index, create_table};
 const OUTPUTS: &str = "workflow_outputs_v2";
+
+fn encode_proven_output(output: &ValidatedOutput) -> Result<String, Error> {
+    let mut value = serde_json::to_value(output).map_err(|_| Error::InvalidAdmission)?;
+    value["capture_proof"] = serde_json::json!({
+        "version": 1,
+        "checksum_sha256": bcode_workflow::workflow_canonical_value_sha256(&output.value)
+            .map_err(|_| Error::InvalidAdmission)?,
+    });
+    encode(&value)
+}
+
+/// Read independently retained checksum proof. Missing older proof remains unavailable.
+/// # Errors
+/// Rejects unsupported proof versions, inconsistent identities or checksum damage.
+pub async fn proven_output(
+    db: &dyn Database,
+    run: &str,
+    id: &str,
+) -> Result<Option<bcode_workflow::WorkflowOutputInspection>, Error> {
+    let rows = db
+        .select(OUTPUTS)
+        .where_eq("run_id", run)
+        .where_eq("output_id", id)
+        .limit(1)
+        .execute(db)
+        .await?;
+    let row = rows.first().ok_or(Error::MaintenanceRequired)?;
+    let value: serde_json::Value = decode(row, "output_json")?;
+    let Some(proof) = value.get("capture_proof") else {
+        return Ok(None);
+    };
+    if proof.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(Error::MaintenanceRequired);
+    }
+    let checksum = proof
+        .get("checksum_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(Error::MaintenanceRequired)?;
+    let output: ValidatedOutput =
+        serde_json::from_value(value.clone()).map_err(|_| Error::MaintenanceRequired)?;
+    crate::validate_output(&output).map_err(|_| Error::MaintenanceRequired)?;
+    if output.run_id != run
+        || output.output_id != id
+        || row.get("activation_id") != Some(DatabaseValue::String(output.activation_id.clone()))
+        || bcode_workflow::workflow_canonical_value_sha256(&output.value)
+            .map_err(|_| Error::MaintenanceRequired)?
+            != checksum
+    {
+        return Err(Error::MaintenanceRequired);
+    }
+    Ok(Some(bcode_workflow::WorkflowOutputInspection {
+        version: bcode_workflow::WORKFLOW_OUTPUT_INSPECTION_VERSION,
+        checksum_sha256: checksum.to_owned(),
+        output_id: output.output_id,
+        run_id: output.run_id,
+        node_id: output.node_id,
+        activation_id: output.activation_id,
+        schema_id: output.schema_id,
+        schema_version: output.schema_version,
+        value: output.value,
+        artifact_reference: output.artifact_reference,
+        created_at_ms: output.created_at_ms,
+    }))
+}
+
 pub(super) async fn install(db: &dyn Database) -> Result<(), Error> {
     create_table(OUTPUTS)
         .column(super::super::column("output_id", DataType::Text, false))
@@ -83,17 +148,19 @@ pub(super) async fn complete_in(
     {
         return Err(Error::InvalidAdmission);
     }
-    let json = encode(output)?;
+    let json = encode_proven_output(output)?;
+    record_output(tx, output).await?;
     let existing = tx
         .select(OUTPUTS)
         .where_eq("output_id", output.output_id.as_str())
         .limit(1)
         .execute(tx)
         .await?;
-    if let Some(row) = existing.first()
-        && row.get("output_json") != Some(DatabaseValue::String(json.clone()))
-    {
-        return Err(Error::InvalidAdmission);
+    if let Some(row) = existing.first() {
+        let retained: ValidatedOutput = decode(row, "output_json")?;
+        if retained != *output {
+            return Err(Error::InvalidAdmission);
+        }
     }
     super::super::attempts::settle_in(
         tx,
@@ -182,14 +249,32 @@ pub(super) async fn retain_control(
         }
         return Ok(());
     }
+    record_output(db, &output).await?;
     db.insert(OUTPUTS)
         .value("output_id", output.output_id.as_str())
         .value("run_id", run)
         .value("activation_id", id)
-        .value("output_json", encode(&output)?)
+        .value("output_json", encode_proven_output(&output)?)
         .execute(db)
         .await?;
     Ok(())
+}
+
+async fn record_output(db: &dyn Database, output: &ValidatedOutput) -> Result<(), Error> {
+    use super::super::journal::public_events::control::{Commitment, Operation, Outcome, record};
+    record(
+        db,
+        Commitment {
+            run: &output.run_id,
+            node: &output.node_id,
+            activation: &output.activation_id,
+            operation: Operation::OutputCommitted,
+            outcome: Outcome::Succeeded,
+            time: output.created_at_ms,
+            source: Some((OUTPUTS, &output.output_id, 0)),
+        },
+    )
+    .await
 }
 
 /// Read a verified canonical terminal output reference from the current exit activation.
@@ -259,6 +344,15 @@ pub async fn reconcile_child(
     let settled = match result {
         None | Some(super::super::hierarchy::ChildResult::Pending) => None,
         Some(super::super::hierarchy::ChildResult::Completed(value)) => {
+            record_child(
+                &*tx,
+                run,
+                node,
+                activation,
+                terminal_at_ms,
+                super::super::journal::public_events::control::Outcome::Succeeded,
+            )
+            .await?;
             let revision = super::super::graph_pages::revision(&*tx, run).await?;
             let target = super::super::graph_pages::node(&*tx, run, revision, node)
                 .await?
@@ -286,6 +380,20 @@ pub async fn reconcile_child(
                 }
                 _ => return Err(Error::MaintenanceRequired),
             };
+            record_child(
+                &*tx,
+                run,
+                node,
+                activation,
+                terminal_at_ms,
+                match outcome {
+                    super::super::attempts::TerminalOutcome::Failed => {
+                        super::super::journal::public_events::control::Outcome::Failed
+                    }
+                    _ => super::super::journal::public_events::control::Outcome::Cancelled,
+                },
+            )
+            .await?;
             super::super::attempts::settle_in(&*tx, owner, run, &dispatch, outcome, terminal_at_ms)
                 .await?;
             None
@@ -293,6 +401,30 @@ pub async fn reconcile_child(
     };
     tx.commit().await?;
     Ok(settled)
+}
+
+async fn record_child(
+    db: &dyn Database,
+    run: &str,
+    node: &str,
+    activation: &str,
+    time: u64,
+    outcome: super::super::journal::public_events::control::Outcome,
+) -> Result<(), Error> {
+    use super::super::journal::public_events::control::{Commitment, Operation, record};
+    record(
+        db,
+        Commitment {
+            run,
+            node,
+            activation,
+            time,
+            outcome,
+            operation: Operation::ChildReconciled,
+            source: None,
+        },
+    )
+    .await
 }
 
 /// Page exact canonical outputs in stable identity order, without replaying graph history.
@@ -402,4 +534,33 @@ async fn duplicate_completion(
         return Err(Error::InvalidAdmission);
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+
+    #[test]
+    fn producer_retains_versioned_proof_without_changing_normal_output_contract() {
+        let output = ValidatedOutput {
+            output_id: "output".into(),
+            run_id: "run".into(),
+            node_id: "node".into(),
+            activation_id: "activation".into(),
+            schema_id: "json".into(),
+            schema_version: 1,
+            value: serde_json::json!({"b":2,"a":"界"}),
+            artifact_reference: None,
+            created_at_ms: 1,
+        };
+        let encoded = encode_proven_output(&output).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["capture_proof"]["version"], 1);
+        assert_eq!(
+            value["capture_proof"]["checksum_sha256"],
+            bcode_workflow::workflow_canonical_value_sha256(&output.value).unwrap()
+        );
+        let decoded: ValidatedOutput = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, output);
+    }
 }

@@ -8,6 +8,8 @@ use switchy_database::{
     query::FilterableQuery,
     schema::{DataType, create_index, create_table},
 };
+/// Current canonical lease observation with producer-owned acquisition facts.
+pub mod lease_observation;
 const CANCEL: &str = "workflow_cancellation_v2";
 const LEASES: &str = "workflow_resource_leases_v2";
 const HANDOFFS: &str = "workflow_handoffs_v2";
@@ -318,6 +320,7 @@ async fn ensure_quiescent(tx: &dyn DatabaseTransaction, run_id: &str) -> Result<
 }
 
 pub(super) async fn install(db: &dyn Database) -> Result<(), Error> {
+    lease_observation::install(db).await?;
     create_table(RECOVERY)
         .column(column("run_id", DataType::Text, false))
         .primary_key("run_id")
@@ -568,7 +571,15 @@ pub(super) async fn reserve(
     if conflicts_normalized(tx, run_id, &claims).await? {
         return Err(Error::CapacityUnavailable);
     }
+    let acquired_at_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::InvalidAdmission)?
+            .as_millis(),
+    )
+    .map_err(|_| Error::InvalidAdmission)?;
     for (key, access) in claims {
+        lease_observation::record(tx, run_id, dispatch_identity, &key, acquired_at_ms).await?;
         tx.insert(LEASES)
             .value("run_id", run_id)
             .value("dispatch_identity", dispatch_identity)
@@ -632,6 +643,7 @@ pub(super) async fn release(
     run_id: &str,
     dispatch_identity: &str,
 ) -> Result<(), Error> {
+    lease_observation::release(tx, run_id, dispatch_identity).await?;
     tx.delete(LEASES)
         .where_eq("run_id", run_id)
         .where_eq("dispatch_identity", dispatch_identity)

@@ -239,6 +239,17 @@ fn unsupported_lifecycle_history(
     Ok(page)
 }
 
+/// Read one verified current inventory page without initialization or maintenance.
+pub async fn inventory(
+    state: &ServerState,
+    query: &bcode_workflow::WorkflowInventoryQuery,
+) -> Result<bcode_workflow::WorkflowInventoryPage, ServerError> {
+    query.validate().map_err(|_| unavailable())?;
+    let page = super::outputs::inventory_page(state, query).await?;
+    query.validate_page(&page).map_err(|_| unavailable())?;
+    Ok(page)
+}
+
 pub async fn semantic_history(
     state: &ServerState,
     query: &bcode_workflow::WorkflowSemanticHistoryQuery,
@@ -304,6 +315,67 @@ fn unsupported_semantic_history(
     Ok(page)
 }
 
+/// Read typed bounded committed facts without initialization, replay or execution authority.
+pub async fn committed_history(
+    state: &ServerState,
+    query: &bcode_workflow::WorkflowCommittedHistoryQuery,
+) -> Result<bcode_workflow::WorkflowCommittedHistoryPage, ServerError> {
+    use bcode_workflow::{
+        WorkflowCommittedHistoryPage, WorkflowCommittedHistoryScope as Scope,
+        WorkflowSemanticHistoryCoverage as Coverage,
+    };
+    query.validate().map_err(|_| unavailable())?;
+    let retained = retained_store(state).await?;
+    let scopes = vec![
+        Scope::AttemptsV1,
+        Scope::RunLifecycleV1,
+        Scope::ControlSourcesV1,
+    ];
+    let page = match lookup_at(retained.path(), &query.run_id).await? {
+        RunLookup::Available(_) => {
+            let db = super::open(retained.path(), false)?;
+            let limit = u16::try_from(query.limit).map_err(|_| unavailable())?;
+            let page = super::representation::journal::public_events::page(
+                &db,
+                query.version,
+                &query.run_id,
+                query.after_sequence,
+                query.through_sequence,
+                limit,
+            )
+            .await
+            .map_err(|_| unavailable())?;
+            WorkflowCommittedHistoryPage {
+                version: page.version,
+                run_id: page.run_id,
+                from_admission: page.from_admission,
+                scopes,
+                attempt_coverage: page.attempt_coverage,
+                lifecycle_coverage: page.lifecycle_coverage,
+                control_coverage: page.control_coverage,
+                through_sequence: page.through_sequence,
+                next_after_sequence: page.next_after_sequence,
+                events: page.events,
+            }
+        }
+        RunLookup::Legacy | RunLookup::UnsupportedRepresentation => WorkflowCommittedHistoryPage {
+            version: query.version,
+            run_id: query.run_id.clone(),
+            from_admission: false,
+            scopes,
+            attempt_coverage: Coverage::Unsupported,
+            lifecycle_coverage: Coverage::Unsupported,
+            control_coverage: Coverage::Unsupported,
+            through_sequence: 0,
+            next_after_sequence: None,
+            events: Vec::new(),
+        },
+        RunLookup::Missing | RunLookup::Degraded => return Err(unavailable()),
+    };
+    query.validate_page(&page).map_err(|_| unavailable())?;
+    Ok(page)
+}
+
 pub async fn events(
     state: &ServerState,
     run: &str,
@@ -322,6 +394,87 @@ pub async fn events(
 
 #[cfg(test)]
 mod semantic_history_tests {
+    #[tokio::test]
+    async fn committed_history_discovery_preserves_real_admission_and_wire_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            bcode_workflow_store::WorkflowStore::create_coexistence_baseline(root.path()).unwrap();
+        let path = store.path().to_path_buf();
+        let mut state = crate::tests::test_server_state(crate::SessionManager::default());
+        state.workflow_store = std::sync::Arc::new(std::sync::Mutex::new(store));
+        let db = super::super::open(&path, true).unwrap();
+        let definition = bcode_workflow::WorkflowBuilder::new(
+            "history",
+            bcode_workflow::Step::task("worker", |v: u32, _| async move { Ok(v) }),
+        )
+        .build()
+        .unwrap()
+        .definition()
+        .clone();
+        let identity =
+            bcode_workflow::WorkflowDefinitionIdentity::for_definition("history", &definition)
+                .unwrap();
+        state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .persist_definition(
+                &identity.definition_id,
+                identity.definition_version,
+                &definition,
+            )
+            .unwrap();
+        super::super::representation::install(&db).await.unwrap();
+        super::super::representation::journal::install(&db)
+            .await
+            .unwrap();
+        let run = bcode_workflow_store::NewWorkflowRun {
+            run_id: "committed".into(),
+            definition_id: identity.definition_id,
+            definition_version: identity.definition_version,
+            workspace_snapshot: "fixture".into(),
+            parent_session_id: None,
+            parent_session_generation: None,
+            binding: None,
+            authored_provenance: None,
+            input: Some(serde_json::json!(1)),
+            execution_authority: None,
+            created_at_ms: 1,
+            authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                version: 1,
+                provider_id: "fixture".into(),
+                profile_id: "build".into(),
+                policy_digest_sha256: "a".repeat(64),
+            },
+            authorization_ceiling: bcode_workflow::WorkflowToolCapability::ReadOnly,
+            limits: bcode_workflow::WorkflowRunLimits::default(),
+        };
+        super::super::representation::admit_registered_observed(&db, &run, &definition, true)
+            .await
+            .unwrap();
+        let query = bcode_workflow::WorkflowCommittedHistoryQuery {
+            version: 1,
+            run_id: run.run_id,
+            after_sequence: 0,
+            through_sequence: None,
+            limit: 1,
+        };
+        let page = super::committed_history(&state, &query).await.unwrap();
+        drop(state);
+        assert!(page.from_admission);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].created_at_ms, run.created_at_ms);
+        let response = bcode_ipc::ResponsePayload::WorkflowCommittedHistory { page: page.clone() };
+        let decoded = serde_json::from_slice::<bcode_ipc::ResponsePayload>(
+            &serde_json::to_vec(&response).unwrap(),
+        )
+        .unwrap();
+        let bcode_ipc::ResponsePayload::WorkflowCommittedHistory { page: wire } = decoded else {
+            panic!("committed page");
+        };
+        query.validate_page(&wire).unwrap();
+        assert_eq!(wire, page);
+    }
     #[test]
     fn legacy_semantic_boundary_never_promotes_opaque_history_or_cursor_coverage() {
         use bcode_workflow::*;

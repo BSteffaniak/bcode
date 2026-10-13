@@ -11,8 +11,11 @@ use switchy_database::{
 };
 
 pub(super) use installation::install_in;
+pub mod diagnostics;
 mod installation;
 mod observers;
+/// Timed public facts committed by semantic producers.
+pub mod public_events;
 #[cfg(test)]
 mod tests;
 
@@ -117,6 +120,7 @@ pub async fn install(db: &dyn Database) -> Result<(), Error> {
         .await?;
     super::verified(&*tx).await?;
     installation::install_in(&*tx).await?;
+    public_events::install(&*tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -160,6 +164,8 @@ pub async fn enable_admission(
             return Err(Error::InvalidAdmission);
         }
     }
+    public_events::install(tx).await?;
+    public_events::enable(tx, run_id).await?;
     tx.insert(COVERAGE)
         .value("run_id", run_id)
         .value("version", VERSION)

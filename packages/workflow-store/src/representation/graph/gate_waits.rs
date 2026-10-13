@@ -56,12 +56,27 @@ pub async fn page_after(
     after: Option<&str>,
     limit: u16,
 ) -> Result<GatePage, Error> {
+    let tx = db.begin_transaction().await?;
+    let result = page_in(&*tx, run, expected_revision, after, limit).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// Read canonical gate waits in the caller's existing snapshot without mutation.
+/// # Errors
+/// Rejects invalid bounds, stale revisions, missing runs and incompatible state.
+pub async fn page_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run: &str,
+    expected_revision: Option<u64>,
+    after: Option<&str>,
+    limit: u16,
+) -> Result<GatePage, Error> {
     if !(1..=100).contains(&limit) || (after.is_some() && expected_revision.is_none()) {
         return Err(Error::InvalidAdmission);
     }
-    let tx = db.begin_transaction().await?;
-    super::super::verified(&*tx).await?;
-    let revision = super::super::graph_pages::revision(&*tx, run).await?;
+    super::super::verified(tx).await?;
+    let revision = super::super::graph_pages::revision(tx, run).await?;
     if expected_revision.is_some_and(|v| v != revision) {
         return Err(Error::InvalidAdmission);
     }
@@ -70,11 +85,11 @@ pub async fn page_after(
         .columns(&["status"])
         .where_eq("run_id", run)
         .limit(1)
-        .execute(&*tx)
+        .execute(tx)
         .await?;
     let root = roots.first().ok_or(Error::InvalidAdmission)?;
     let status = super::super::runs::RunState::decode(&super::text(root, "status")?)?;
-    let blocks = super::super::safety::admission_blocks(&*tx, run).await?;
+    let blocks = super::super::safety::admission_blocks(tx, run).await?;
     let mut result = GatePage {
         revision,
         gates: Vec::new(),
@@ -86,24 +101,23 @@ pub async fn page_after(
         || blocks.recovery
         || blocks.user_paused
     {
-        tx.commit().await?;
         return Ok(result);
     }
-    let activations = super::ready_in(&*tx, run, revision, after, limit).await?;
+    let activations = super::ready_in(tx, run, revision, after, limit).await?;
     if let Some(last) = activations.last()
-        && !super::ready_in(&*tx, run, revision, Some(&last.node_id), 1)
+        && !super::ready_in(tx, run, revision, Some(&last.node_id), 1)
             .await?
             .is_empty()
     {
         result.next_node_id = Some(last.node_id.clone());
     }
     for activation in activations {
-        if !super::is_ready_activation(&*tx, run, &activation.node_id, &activation.activation_id)
+        if !super::is_ready_activation(tx, run, &activation.node_id, &activation.activation_id)
             .await?
         {
             continue;
         }
-        let node = super::execution_node(&*tx, run, &activation.node_id).await?;
+        let node = super::execution_node(tx, run, &activation.node_id).await?;
         let kind = match node.kind {
             NodeKind::Input => GateKind::Input,
             NodeKind::Approval => GateKind::Approval,
@@ -147,6 +161,5 @@ pub async fn page_after(
             response_schema,
         });
     }
-    tx.commit().await?;
     Ok(result)
 }

@@ -6745,7 +6745,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowMutationApprovals { .. } => "list_workflow_mutation_approvals",
         Request::ResolveWorkflowMutationApproval { .. } => "resolve_workflow_mutation_approval",
         Request::WorkflowAttemptHistory { .. } => "workflow_attempt_history",
+        Request::WorkflowCommittedHistory { .. } => "workflow_committed_history",
         Request::WorkflowLifecycleHistory { .. } => "workflow_lifecycle_history",
+        Request::WorkflowInventory { .. } => "workflow_inventory",
         Request::WorkflowSemanticHistory { .. } => "workflow_semantic_history",
         Request::WorkflowObservations { .. } => "workflow_observations",
         Request::WorkflowEventHistory { .. } => "workflow_event_history",
@@ -9305,6 +9307,20 @@ async fn handle_workflow_run_request(
             };
             send_response(writer, request_id, response).await
         }
+        RuntimeAndModelRequest::WorkflowCommittedHistory { query } => {
+            let result = Box::pin(
+                bcode_workflow::WorkflowRunApplication::workflow_committed_history(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    query,
+                ),
+            )
+            .await;
+            let response = match result {
+                Ok(page) => Response::Ok(ResponsePayload::WorkflowCommittedHistory { page }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
         RuntimeAndModelRequest::WorkflowLifecycleHistory { query } => {
             let result = Box::pin(
                 bcode_workflow::WorkflowRunApplication::workflow_lifecycle_history(
@@ -9315,6 +9331,18 @@ async fn handle_workflow_run_request(
             .await;
             let response = match result {
                 Ok(page) => Response::Ok(ResponsePayload::WorkflowLifecycleHistory { page }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        RuntimeAndModelRequest::WorkflowInventory { query } => {
+            let result = Box::pin(bcode_workflow::WorkflowRunApplication::workflow_inventory(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                query,
+            ))
+            .await;
+            let response = match result {
+                Ok(page) => Response::Ok(ResponsePayload::WorkflowInventory { page }),
                 Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
             };
             send_response(writer, request_id, response).await

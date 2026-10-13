@@ -187,11 +187,31 @@ pub(super) async fn finish(
         dispatch_identity,
         payload,
     };
+    append_public_event(tx, &event).await?;
     append_acknowledged_event(
         tx,
         &event,
         integer(obligation, "sequence")?,
         transition.baseline,
+    )
+    .await
+}
+
+/// Append the already proven attempt facts without changing their recorded clock.
+async fn append_public_event(
+    tx: &dyn DatabaseTransaction,
+    event: &WorkflowSemanticHistoryEvent,
+) -> Result<(), Error> {
+    super::journal::public_events::append(
+        tx,
+        &event.run_id,
+        &event.operation_id,
+        event.recorded_at_ms,
+        super::journal::public_events::Fact::Attempt {
+            dispatch_identity: event.dispatch_identity.clone(),
+            attempt: event.attempt.clone(),
+            payload: event.payload.clone(),
+        },
     )
     .await
 }
@@ -284,7 +304,7 @@ pub(super) fn source_row(
     })
 }
 
-async fn coverage(
+pub(in crate::representation) async fn coverage(
     db: &dyn Database,
     run: &str,
 ) -> Result<bcode_workflow::WorkflowSemanticHistoryCoverage, Error> {

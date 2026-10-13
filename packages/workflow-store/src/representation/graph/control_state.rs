@@ -1,9 +1,12 @@
 //! Canonical repeat counters and control failure facts.
 use super::{Database, DatabaseValue, Error, FilterableQuery};
 use switchy_database::schema::{DataType, create_table};
+/// Immutable observed repeat emission outcomes.
+pub mod repeat_outcome;
 const CYCLES: &str = "workflow_repeat_cycles_v2";
 const FAILURES: &str = "workflow_control_failures_v2";
 pub(super) async fn install(db: &dyn Database) -> Result<(), Error> {
+    repeat_outcome::install(db).await?;
     for table in [CYCLES, FAILURES] {
         create_table(table)
             .column(super::super::column("identity", DataType::Text, false))
