@@ -22,6 +22,16 @@ fn complete(rep: &EvalRepetitionResult) -> bool {
 
 type Identity = (String, u32);
 
+fn consistent(variant: &EvalVariantRunResult) -> bool {
+    variant.cases.iter().all(|case| {
+        case.variant_id == variant.variant_id
+            && case
+                .repetitions
+                .iter()
+                .all(|rep| rep.variant_id == variant.variant_id && rep.case_id == case.case_id)
+    })
+}
+
 fn inventory(variant: &EvalVariantRunResult) -> BTreeMap<Identity, Vec<&EvalRepetitionResult>> {
     let mut rows = BTreeMap::<Identity, Vec<&EvalRepetitionResult>>::new();
     for case in &variant.cases {
@@ -86,7 +96,8 @@ fn report_inner(
         .iter()
         .filter(|value| value.variant_id == "single")
         .collect();
-    let baseline = (baselines.len() == 1).then(|| inventory(baselines[0]));
+    let baseline =
+        (baselines.len() == 1 && consistent(baselines[0])).then(|| inventory(baselines[0]));
     let planned: BTreeSet<_> = scheduled.into_iter().flatten().cloned().collect();
     let mut identities = planned.clone();
     for variant in variants {
@@ -102,12 +113,14 @@ fn report_inner(
     let references = baseline.as_ref().unwrap_or(&empty);
     for candidate in variants.iter().filter(|value| value.variant_id != "single") {
         let observations = inventory(candidate);
+        let candidate_consistent = consistent(candidate);
         for id in &identities {
             let reference = unique(references, id);
-            let observed = unique(&observations, id);
+            let observed = unique(&observations, id).filter(|_| candidate_consistent);
             let expected = scheduled.is_none() || planned.contains(id);
             coverage_complete &= expected && reference.is_some() && observed.is_some();
-            let quality_evaluable = reference.is_some_and(|value| !execution_failed(value))
+            let quality_evaluable = expected
+                && reference.is_some_and(|value| !execution_failed(value))
                 && observed.is_some_and(|value| !execution_failed(value));
             let evidence_complete =
                 reference.is_some_and(complete) && observed.is_some_and(complete);
@@ -278,6 +291,50 @@ mod tests {
             result["uncertainty"]["candidates"][0]["candidate_failed_trials"],
             1
         );
+    }
+
+    #[test]
+    fn inconsistent_embedded_identity_cannot_certify_a_pair() {
+        let planned = vec![("case".into(), 1)];
+        for corrupt_case in [true, false] {
+            let mut candidate = variant("swarm", &[true]);
+            let rep = &mut candidate.cases[0].repetitions[0];
+            if corrupt_case {
+                rep.case_id = "other".into();
+            } else {
+                rep.variant_id = "other".into();
+            }
+            let result = report_with_schedule(&[variant("single", &[true]), candidate], &planned);
+            assert_eq!(result["coverage_complete"], false);
+            assert_eq!(result["evaluable_pairs"], 0);
+            assert_eq!(
+                result["pairs"][0]["candidate_outcome"],
+                "ambiguous_duplicate"
+            );
+        }
+    }
+
+    #[test]
+    fn unexpected_trials_do_not_dilute_scheduled_quality() {
+        let planned = vec![("case".into(), 1)];
+        let result = report_with_schedule(
+            &[
+                variant("single", &[true, false, false]),
+                variant("swarm", &[false, true, true]),
+            ],
+            &planned,
+        );
+        let summary = &result["uncertainty"]["candidates"][0];
+        assert_eq!(summary["evaluable_trials"], 1);
+        assert_eq!(summary["successes"], 0);
+        assert_eq!(summary["regressions"], 1);
+        assert_eq!(summary["paired_gains"], 0);
+        assert_eq!(summary["paired_success_rate_difference"], -1.0);
+        assert_eq!(
+            summary["paired_effect_interval_95"],
+            serde_json::Value::Null
+        );
+        assert_eq!(result["coverage_complete"], false);
     }
 
     #[test]

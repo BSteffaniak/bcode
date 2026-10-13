@@ -138,6 +138,62 @@ pub fn capture_history(
 /// Capture only collections explicitly supported by canonical public inspection.
 /// `events_unsupported` must come from its typed unavailable-collection contract,
 /// never an inferred error string or empty events array.
+/// Capture legacy boundaries and independent implemented semantic scopes.
+/// Responses remain retained even when another scope fails.
+pub fn capture_history_scopes(
+    run_id: &str,
+    directory: &Path,
+    events_unsupported: bool,
+    deadline: std::time::Instant,
+    invoke: impl Fn(&[String], &str, Duration) -> Result<Value, EvalError>,
+) -> Result<(), EvalError> {
+    let bounded = |args: &[String], kind: &str, allowance: Duration| {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(EvalError::Validation(
+                "workflow capture deadline elapsed".into(),
+            ));
+        }
+        invoke(args, kind, allowance.min(remaining))
+    };
+    let mut semantic = serde_json::Map::new();
+    let mut failed = false;
+    for scope in [
+        super::semantic_capture::Scope::Attempts,
+        super::semantic_capture::Scope::Lifecycle,
+    ] {
+        let (boundary, result) =
+            super::semantic_capture::capture(scope, run_id, directory, deadline, &bounded);
+        if result.is_err() {
+            failed = true;
+            // Fixed diagnostics only; invocation failures may contain untrusted private content.
+            write_json(
+                directory.join(format!("{}-capture-error.json", scope.name())),
+                &serde_json::json!({"code":"semantic_capture_incomplete","scope":scope.name()}),
+            )?;
+        }
+        write_json(
+            directory.join(format!("{}-capture-boundary.json", scope.name())),
+            &boundary,
+        )?;
+        semantic.insert(scope.name().into(), boundary);
+    }
+    let legacy = capture_history_with_capabilities(run_id, directory, events_unsupported, bounded);
+    let path = directory.join("capture-completeness.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    manifest["semantic_scopes"] = Value::Object(semantic);
+    // Do not promote scoped captures into legacy/full-history acceptance.
+    manifest["complete"] = Value::Bool(false);
+    write_json(path, &manifest)?;
+    legacy?;
+    if failed {
+        return Err(EvalError::Validation(
+            "implemented semantic history capture incomplete".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn capture_history_with_capabilities(
     run_id: &str,
     directory: &Path,

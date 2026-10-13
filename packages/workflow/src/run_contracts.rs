@@ -2299,6 +2299,241 @@ fn semantic_history_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Independent graph-history wire boundary; attempts and lifecycle stay unchanged.
+pub const WORKFLOW_GRAPH_HISTORY_VERSION: u32 = 1;
+
+/// Finite direct-run graph source declaration, never full workflow history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowGraphHistoryScope {
+    /// Initial graph and committed revision publication, including canonical rows.
+    /// Excludes candidate staging, cancellation acceptance and runtime activations.
+    GraphRevisionV1,
+}
+
+/// Fixed-size normalized graph facts; no executable definitions or private blobs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowGraphHistoryPayload {
+    /// Initial graph committed at admission, not reconstructed from historical state.
+    GraphInitialized {
+        /// Initial positive revision.
+        revision: u64,
+        /// Full normalized definition and canonical edge-ID map SHA-256.
+        graph_sha256: String,
+    },
+    /// Exact graph edit committed; does not certify cancellation acceptance history.
+    GraphPublished {
+        /// Exact authored mutation identity, at most 256 UTF-8 bytes.
+        mutation_id: String,
+        /// Previous committed revision.
+        previous_revision: u64,
+        /// Committed successor revision.
+        revision: u64,
+        /// Full previous definition and canonical edge-ID map SHA-256.
+        previous_graph_sha256: String,
+        /// Full committed definition and canonical edge-ID map SHA-256.
+        graph_sha256: String,
+        /// SHA-256 of the exact typed reconciliation declaration, not effect proof.
+        reconciliation_sha256: String,
+    },
+}
+impl WorkflowGraphHistoryPayload {
+    fn valid(&self) -> bool {
+        match self {
+            Self::GraphInitialized {
+                revision,
+                graph_sha256,
+            } => *revision == 1 && semantic_history_digest(graph_sha256),
+            Self::GraphPublished {
+                mutation_id,
+                previous_revision,
+                revision,
+                previous_graph_sha256,
+                graph_sha256,
+                reconciliation_sha256,
+            } => {
+                !mutation_id.is_empty()
+                    && mutation_id.len() <= 256
+                    && !mutation_id.chars().any(char::is_control)
+                    && *previous_revision > 0
+                    && previous_revision.checked_add(1) == Some(*revision)
+                    && [previous_graph_sha256, graph_sha256, reconciliation_sha256]
+                        .into_iter()
+                        .all(|value| semantic_history_digest(value))
+            }
+        }
+    }
+}
+
+/// Run-local graph observation; no attempt coordinates are invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowGraphHistoryEvent {
+    /// Exact owning run.
+    pub run_id: String,
+    /// Run-local observation sequence.
+    pub sequence: u64,
+    /// Stable lowercase SHA-256 operation identity.
+    pub operation_id: String,
+    /// Unix milliseconds recorded in the source transaction.
+    pub recorded_at_ms: u64,
+    /// Normalized committed facts.
+    pub payload: WorkflowGraphHistoryPayload,
+}
+
+/// Exclusive continuation pinned to exact scope, coverage and high-water.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowGraphHistoryCursor {
+    /// Independent wire version.
+    pub version: u32,
+    /// Exact owning run.
+    pub run_id: String,
+    /// Finite source scope.
+    pub scope: WorkflowGraphHistoryScope,
+    /// Immutable coverage; exhaustion never heals a gap.
+    pub coverage: WorkflowSemanticHistoryCoverage,
+    /// Inclusive pinned observation high-water.
+    pub through_sequence: u64,
+    /// Exclusive last consumed sequence.
+    pub after_sequence: u64,
+}
+
+/// Bounded graph facts, not durable resume or full semantic coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowGraphHistoryPage {
+    /// Exact input observation boundary.
+    pub cursor: WorkflowGraphHistoryCursor,
+    /// At most 100 ordered observations.
+    pub events: Vec<WorkflowGraphHistoryEvent>,
+    /// Exact continuation when retained observations remain.
+    pub next_cursor: Option<WorkflowGraphHistoryCursor>,
+}
+
+/// Frontend-independent bounded graph-history query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowGraphHistoryQuery {
+    /// Independent wire version.
+    pub version: u32,
+    /// Exact owning run.
+    pub run_id: String,
+    /// Explicit finite source scope.
+    pub scope: WorkflowGraphHistoryScope,
+    /// Absent initially; otherwise exact pinned continuation.
+    pub cursor: Option<WorkflowGraphHistoryCursor>,
+    /// Positive event bound, at most 100.
+    pub limit: usize,
+}
+impl WorkflowGraphHistoryQuery {
+    /// Validate query compatibility and pinned coordinates.
+    /// # Errors
+    /// Rejects unknown versions, invalid bounds or inconsistent cursor identity.
+    pub fn validate(&self) -> Result<(), WorkflowSemanticHistoryError> {
+        use WorkflowSemanticHistoryError::{InvalidPage, UnsupportedVersion};
+        if self.version != WORKFLOW_GRAPH_HISTORY_VERSION {
+            return Err(UnsupportedVersion);
+        }
+        if !semantic_history_id(&self.run_id) || !(1..=100).contains(&self.limit) {
+            return Err(InvalidPage);
+        }
+        if let Some(cursor) = &self.cursor
+            && (cursor.version != self.version
+                || cursor.run_id != self.run_id
+                || cursor.scope != self.scope
+                || cursor.after_sequence > cursor.through_sequence)
+        {
+            return Err(InvalidPage);
+        }
+        Ok(())
+    }
+    /// Verify the response against this exact query.
+    /// # Errors
+    /// Rejects an invalid query, changed boundary or oversized response.
+    pub fn validate_page(
+        &self,
+        page: &WorkflowGraphHistoryPage,
+    ) -> Result<(), WorkflowSemanticHistoryError> {
+        self.validate()?;
+        if page.cursor.scope != self.scope || page.events.len() > self.limit {
+            return Err(WorkflowSemanticHistoryError::InvalidPage);
+        }
+        page.validate(&self.run_id, self.cursor.as_ref())
+    }
+}
+impl WorkflowGraphHistoryPage {
+    /// Validate portable consistency, not producer honesty or canonical authority.
+    /// # Errors
+    /// Rejects unsupported versions, changed boundaries and malformed observations.
+    pub fn validate(
+        &self,
+        run: &str,
+        requested: Option<&WorkflowGraphHistoryCursor>,
+    ) -> Result<(), WorkflowSemanticHistoryError> {
+        use WorkflowSemanticHistoryError::{ChangedBoundary, InvalidPage, UnsupportedVersion};
+        let cursor = &self.cursor;
+        if cursor.version != WORKFLOW_GRAPH_HISTORY_VERSION {
+            return Err(UnsupportedVersion);
+        }
+        if requested.is_some_and(|value| value != cursor) {
+            return Err(ChangedBoundary);
+        }
+        if cursor.run_id != run
+            || !semantic_history_id(run)
+            || cursor.after_sequence > cursor.through_sequence
+            || self.events.len() > 100
+            || (requested.is_none() && cursor.after_sequence != 0)
+        {
+            return Err(InvalidPage);
+        }
+        if matches!(
+            cursor.coverage,
+            WorkflowSemanticHistoryCoverage::Unsupported
+                | WorkflowSemanticHistoryCoverage::Unavailable
+        ) {
+            return if self.events.is_empty() && self.next_cursor.is_none() {
+                Ok(())
+            } else {
+                Err(InvalidPage)
+            };
+        }
+        let mut last = cursor.after_sequence;
+        let mut operations = std::collections::BTreeSet::new();
+        for event in &self.events {
+            if event.run_id != run
+                || !event.payload.valid()
+                || !semantic_history_digest(&event.operation_id)
+                || !operations.insert(&event.operation_id)
+                || event.sequence <= last
+                || event.sequence > cursor.through_sequence
+                || (cursor.coverage == WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+                    && last.checked_add(1) != Some(event.sequence))
+            {
+                return Err(InvalidPage);
+            }
+            last = event.sequence;
+        }
+        match &self.next_cursor {
+            Some(next) => {
+                let mut expected = cursor.clone();
+                expected.after_sequence = last;
+                if self.events.is_empty() || last >= cursor.through_sequence || *next != expected {
+                    return Err(InvalidPage);
+                }
+            }
+            None if cursor.coverage == WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+                && last != cursor.through_sequence =>
+            {
+                return Err(InvalidPage);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+}
+
 /// Independent lifecycle-history compatibility boundary; attempts v1 is unchanged.
 pub const WORKFLOW_LIFECYCLE_HISTORY_VERSION: u32 = 1;
 
@@ -2513,6 +2748,337 @@ impl WorkflowLifecycleHistoryPage {
                 return Err(InvalidPage);
             }
             None => {}
+        }
+        Ok(())
+    }
+}
+
+/// Current inventory wire boundary, independent of semantic history.
+pub const WORKFLOW_INVENTORY_VERSION: u32 = 1;
+
+/// Independently generation-fenced canonical inventory sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowInventorySource {
+    /// Retained canonical outputs.
+    Outputs,
+    /// Canonical attempts, including unavailable execution-session links.
+    AttemptContributors,
+    /// Canonical direct child lineage; recursively query each verified child separately.
+    ChildRuns,
+}
+
+/// Exclusive examined source position; never a guessed session position.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "identity",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum WorkflowInventoryKey {
+    /// Canonical output identity.
+    Output(String),
+    /// Canonical dispatch identity, including attempts without session metadata.
+    Dispatch(String),
+    /// Canonical direct child run identity.
+    ChildRun(String),
+}
+impl WorkflowInventoryKey {
+    fn valid_for(&self, source: WorkflowInventorySource) -> bool {
+        match (self, source) {
+            (Self::Output(id), WorkflowInventorySource::Outputs)
+            | (Self::ChildRun(id), WorkflowInventorySource::ChildRuns) => semantic_history_id(id),
+            (Self::Dispatch(id), WorkflowInventorySource::AttemptContributors) => {
+                semantic_history_digest(id)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Current source membership pin. No historical snapshot or durable resume promise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowInventoryCursor {
+    /// Independent wire version.
+    pub version: u32,
+    /// Exact queried run.
+    pub run_id: String,
+    /// Exact independently fenced source.
+    pub source: WorkflowInventorySource,
+    /// Verified observer installation identity.
+    pub installation_id: String,
+    /// Verified graph revision.
+    pub graph_revision: u64,
+    /// Durable source-specific generation; zero is valid at verified installation.
+    pub source_generation: u64,
+    /// Exclusive examined source key.
+    pub after: Option<WorkflowInventoryKey>,
+}
+
+/// Bounded current inventory request; reads never install or repair observers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowInventoryQuery {
+    /// Independent wire version.
+    pub version: u32,
+    /// Exact queried run.
+    pub run_id: String,
+    /// Explicit source, never inferred from an empty response.
+    pub source: WorkflowInventorySource,
+    /// Exact prior continuation, absent initially.
+    pub cursor: Option<WorkflowInventoryCursor>,
+    /// Maximum entries, one through 100.
+    pub limit: usize,
+}
+
+/// Explicit current-source availability; never admission-history coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowInventoryCoverage {
+    /// Installed source observers verify current membership; exhaustion needs no continuation.
+    CurrentInventoryComplete,
+    /// Source verification is unavailable; no empty-inventory assertion.
+    Unavailable {
+        /// Normalized reason only.
+        reason: WorkflowInventoryUnavailableReason,
+    },
+}
+
+/// Secret-safe current inventory failure classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowInventoryUnavailableReason {
+    /// Installation missing; normal reads must not install it.
+    MissingInstallation,
+    /// Unsupported representation or source.
+    Unsupported,
+    /// Required durable proof or provenance absent.
+    MissingProof,
+    /// Durable coordinates conflict.
+    Inconsistent,
+}
+
+/// Diagnostic applicability is unavailable until operation/receipt semantics classify it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowInventoryDiagnosticApplicability {
+    /// Domain classification unsupported; neither applicable nor not-applicable inferred.
+    Unsupported,
+}
+
+/// Verified durable session membership, independent of live session ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowInventorySessionLink {
+    /// Exact canonical attempt/session relation.
+    Verified {
+        /// Opaque session-domain identity.
+        session_id: String,
+        /// Immutable workspace snapshot identity.
+        workspace_snapshot: String,
+        /// Durable link acceptance timestamp.
+        created_at_ms: u64,
+    },
+    /// Missing or unsupported link metadata remains explicitly unavailable.
+    Unavailable {
+        /// Normalized provenance failure.
+        reason: WorkflowInventoryUnavailableReason,
+    },
+}
+
+/// Current canonical source facts, not a runtime inventory or terminal-idle inference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowInventoryEntry {
+    /// Canonical output whose stored proof was verified, not synthesized on read.
+    Output {
+        /// Exact verified output and checksum proof.
+        output: WorkflowOutputInspection,
+    },
+    /// Output identity retained while required stored proof is unavailable.
+    OutputUnavailable {
+        /// Canonical output identity.
+        output_id: String,
+        /// Normalized missing proof reason.
+        reason: WorkflowInventoryUnavailableReason,
+    },
+    /// Canonical dispatch coordinates with explicit link and applicability status.
+    AttemptContributor {
+        /// Canonical attempt fact.
+        attempt: AttemptSummary,
+        /// Verified link or explicit unavailable provenance.
+        session: WorkflowInventorySessionLink,
+        /// Domain-owned applicability, currently unsupported.
+        diagnostic_applicability: WorkflowInventoryDiagnosticApplicability,
+    },
+    /// Canonical direct child membership.
+    ChildRun {
+        /// Exact child identity.
+        child_run_id: String,
+        /// Exact composition root lineage identity; not an allowance-generation fence.
+        root_run_id: String,
+        /// Parent activation that admitted the child.
+        parent: WorkflowHistoryAttemptCorrelation,
+    },
+}
+impl WorkflowInventoryEntry {
+    /// Source key used for ordered continuation validation.
+    #[must_use]
+    pub fn key(&self) -> WorkflowInventoryKey {
+        match self {
+            Self::Output { output } => WorkflowInventoryKey::Output(output.output_id.clone()),
+            Self::OutputUnavailable { output_id, .. } => {
+                WorkflowInventoryKey::Output(output_id.clone())
+            }
+            Self::AttemptContributor { attempt, .. } => {
+                WorkflowInventoryKey::Dispatch(attempt.dispatch_identity.clone())
+            }
+            Self::ChildRun { child_run_id, .. } => {
+                WorkflowInventoryKey::ChildRun(child_run_id.clone())
+            }
+        }
+    }
+}
+
+/// Bounded generation-verified current membership. Changes invalidate continuation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowInventoryPage {
+    /// Exact input pin, including exclusive examined key.
+    pub cursor: WorkflowInventoryCursor,
+    /// Current source verification, never complete-from-admission history.
+    pub coverage: WorkflowInventoryCoverage,
+    /// Strictly ordered bounded facts.
+    pub entries: Vec<WorkflowInventoryEntry>,
+    /// Exact same pin with advanced source key; none means scoped exhaustion only.
+    pub next_cursor: Option<WorkflowInventoryCursor>,
+}
+impl WorkflowInventoryQuery {
+    /// Validate exact source, cursor coordinates and request bounds.
+    /// # Errors
+    /// Rejects future versions, wrong source/key/run, invalid installation or bounds.
+    pub fn validate(&self) -> Result<(), WorkflowSemanticHistoryError> {
+        use WorkflowSemanticHistoryError::{InvalidPage, UnsupportedVersion};
+        if self.version != WORKFLOW_INVENTORY_VERSION {
+            return Err(UnsupportedVersion);
+        }
+        if !semantic_history_id(&self.run_id) || !(1..=100).contains(&self.limit) {
+            return Err(InvalidPage);
+        }
+        if let Some(c) = &self.cursor
+            && (c.version != self.version
+                || c.run_id != self.run_id
+                || c.source != self.source
+                || !semantic_history_id(&c.installation_id)
+                || c.graph_revision == 0
+                || c.after
+                    .as_ref()
+                    .is_some_and(|key| !key.valid_for(self.source)))
+        {
+            return Err(InvalidPage);
+        }
+        Ok(())
+    }
+    /// Validate exact response pin, ordered entries and advancing continuation.
+    /// # Errors
+    /// Rejects mismatched boundaries, future versions, inconsistent facts or stalled pages.
+    pub fn validate_page(
+        &self,
+        page: &WorkflowInventoryPage,
+    ) -> Result<(), WorkflowSemanticHistoryError> {
+        use WorkflowSemanticHistoryError::{ChangedBoundary, InvalidPage};
+        self.validate()?;
+        let c = &page.cursor;
+        let pinned = Self {
+            cursor: Some(c.clone()),
+            ..self.clone()
+        };
+        pinned.validate()?;
+        if self.cursor.as_ref().is_some_and(|requested| requested != c) {
+            return Err(ChangedBoundary);
+        }
+        if self.cursor.is_none() && c.after.is_some() || page.entries.len() > self.limit {
+            return Err(InvalidPage);
+        }
+        if matches!(page.coverage, WorkflowInventoryCoverage::Unavailable { .. }) {
+            return if page.entries.is_empty() && page.next_cursor.is_none() {
+                Ok(())
+            } else {
+                Err(InvalidPage)
+            };
+        }
+        let mut last = c.after.clone();
+        for entry in &page.entries {
+            let key = entry.key();
+            if !key.valid_for(self.source) || last.as_ref().is_some_and(|previous| previous >= &key)
+            {
+                return Err(InvalidPage);
+            }
+            match entry {
+                WorkflowInventoryEntry::Output { output }
+                    if output.run_id != self.run_id
+                        || output.version != 1
+                        || !semantic_history_digest(&output.checksum_sha256) =>
+                {
+                    return Err(InvalidPage);
+                }
+                WorkflowInventoryEntry::AttemptContributor { attempt, .. }
+                    if attempt.run_id != self.run_id
+                        || attempt.attempt == 0
+                        || !semantic_history_id(&attempt.node_id)
+                        || !semantic_history_id(&attempt.activation_id) =>
+                {
+                    return Err(InvalidPage);
+                }
+                WorkflowInventoryEntry::ChildRun {
+                    parent,
+                    root_run_id,
+                    ..
+                } if parent.run_id != self.run_id
+                    || parent.attempt == 0
+                    || !semantic_history_id(root_run_id) =>
+                {
+                    return Err(InvalidPage);
+                }
+                _ => {}
+            }
+            match entry {
+                WorkflowInventoryEntry::AttemptContributor {
+                    session:
+                        WorkflowInventorySessionLink::Verified {
+                            session_id,
+                            workspace_snapshot,
+                            ..
+                        },
+                    ..
+                } if !semantic_history_id(session_id)
+                    || !semantic_history_id(workspace_snapshot) =>
+                {
+                    return Err(InvalidPage);
+                }
+                WorkflowInventoryEntry::ChildRun { parent, .. }
+                    if !semantic_history_id(&parent.node_id)
+                        || !semantic_history_id(&parent.activation_id) =>
+                {
+                    return Err(InvalidPage);
+                }
+                _ => {}
+            }
+            last = Some(key);
+        }
+        if let Some(next) = &page.next_cursor {
+            let expected = WorkflowInventoryCursor {
+                after: last,
+                ..c.clone()
+            };
+            if next != &expected {
+                return Err(ChangedBoundary);
+            }
+            if next.after == c.after {
+                return Err(InvalidPage);
+            }
         }
         Ok(())
     }
@@ -2737,6 +3303,108 @@ pub struct WorkflowRunInspection {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn graph_history_preserves_canonical_mutation_identity_and_rejects_future_facts() {
+        use super::*;
+        let mutation = "héllo / @ graph";
+        let payload = WorkflowGraphHistoryPayload::GraphPublished {
+            mutation_id: mutation.into(),
+            previous_revision: 1,
+            revision: 2,
+            previous_graph_sha256: "a".repeat(64),
+            graph_sha256: "b".repeat(64),
+            reconciliation_sha256: "c".repeat(64),
+        };
+        assert!(payload.valid());
+        let page = WorkflowGraphHistoryPage {
+            cursor: WorkflowGraphHistoryCursor {
+                version: WORKFLOW_GRAPH_HISTORY_VERSION,
+                run_id: "graph-run".into(),
+                scope: WorkflowGraphHistoryScope::GraphRevisionV1,
+                coverage: WorkflowSemanticHistoryCoverage::HistoricalGap,
+                through_sequence: 1,
+                after_sequence: 0,
+            },
+            events: vec![WorkflowGraphHistoryEvent {
+                run_id: "graph-run".into(),
+                sequence: 1,
+                operation_id: "d".repeat(64),
+                recorded_at_ms: 10,
+                payload,
+            }],
+            next_cursor: None,
+        };
+        page.validate("graph-run", None).unwrap();
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorkflowGraphHistoryPage>(json.clone()).unwrap(),
+            page
+        );
+        let mut future = json.clone();
+        future["events"][0]["payload"]["kind"] = serde_json::json!("future");
+        assert!(serde_json::from_value::<WorkflowGraphHistoryPage>(future).is_err());
+        let mut omitted = json;
+        omitted["cursor"]
+            .as_object_mut()
+            .unwrap()
+            .remove("coverage");
+        assert!(serde_json::from_value::<WorkflowGraphHistoryPage>(omitted).is_err());
+        let mut unavailable = page.clone();
+        unavailable.cursor.coverage = WorkflowSemanticHistoryCoverage::Unavailable;
+        assert!(unavailable.validate("graph-run", None).is_err());
+        unavailable.events.clear();
+        unavailable.validate("graph-run", None).unwrap();
+        let mut changed = page;
+        changed.cursor.version += 1;
+        assert_eq!(
+            changed.validate("graph-run", None),
+            Err(WorkflowSemanticHistoryError::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn graph_history_pins_query_and_complete_sequence_boundaries() {
+        use super::*;
+        let query = WorkflowGraphHistoryQuery {
+            version: WORKFLOW_GRAPH_HISTORY_VERSION,
+            run_id: "graph-run".into(),
+            scope: WorkflowGraphHistoryScope::GraphRevisionV1,
+            cursor: None,
+            limit: 1,
+        };
+        let mut page = WorkflowGraphHistoryPage {
+            cursor: WorkflowGraphHistoryCursor {
+                version: WORKFLOW_GRAPH_HISTORY_VERSION,
+                run_id: query.run_id.clone(),
+                scope: query.scope,
+                coverage: WorkflowSemanticHistoryCoverage::CompleteFromAdmission,
+                through_sequence: 1,
+                after_sequence: 0,
+            },
+            events: vec![WorkflowGraphHistoryEvent {
+                run_id: query.run_id.clone(),
+                sequence: 1,
+                operation_id: "a".repeat(64),
+                recorded_at_ms: 1,
+                payload: WorkflowGraphHistoryPayload::GraphInitialized {
+                    revision: 1,
+                    graph_sha256: "b".repeat(64),
+                },
+            }],
+            next_cursor: None,
+        };
+        query.validate_page(&page).unwrap();
+        page.cursor.through_sequence = 2;
+        assert!(query.validate_page(&page).is_err());
+        let mut next = page.cursor.clone();
+        next.after_sequence = 1;
+        page.next_cursor = Some(next);
+        query.validate_page(&page).unwrap();
+        let mut bad = query;
+        bad.limit = 0;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
     fn lifecycle_history_roundtrip_pins_boundary_and_rejects_future_or_private_facts() {
         use super::*;
         let query = WorkflowLifecycleHistoryQuery {
@@ -2819,6 +3487,78 @@ mod tests {
             let mut invalid = query.clone();
             invalid.limit = limit;
             assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn inventory_current_pin_rejects_wrong_scope_future_generation_and_stalls() {
+        use super::*;
+        let query = WorkflowInventoryQuery {
+            version: 1,
+            run_id: "run".into(),
+            source: WorkflowInventorySource::Outputs,
+            cursor: None,
+            limit: 1,
+        };
+        let cursor = WorkflowInventoryCursor {
+            version: 1,
+            run_id: "run".into(),
+            source: query.source,
+            installation_id: "install".into(),
+            graph_revision: 1,
+            source_generation: 0,
+            after: None,
+        };
+        let mut page = WorkflowInventoryPage {
+            cursor: cursor.clone(),
+            coverage: WorkflowInventoryCoverage::CurrentInventoryComplete,
+            entries: vec![WorkflowInventoryEntry::OutputUnavailable {
+                output_id: "output".into(),
+                reason: WorkflowInventoryUnavailableReason::MissingProof,
+            }],
+            next_cursor: Some(WorkflowInventoryCursor {
+                after: Some(WorkflowInventoryKey::Output("output".into())),
+                ..cursor.clone()
+            }),
+        };
+        assert_eq!(query.validate_page(&page), Ok(()));
+        let encoded = serde_json::to_value(&page).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorkflowInventoryPage>(encoded.clone()).unwrap(),
+            page
+        );
+        page.next_cursor.as_mut().unwrap().source_generation = 1;
+        assert_eq!(
+            query.validate_page(&page),
+            Err(WorkflowSemanticHistoryError::ChangedBoundary)
+        );
+        page.next_cursor = Some(cursor.clone());
+        assert_eq!(
+            query.validate_page(&page),
+            Err(WorkflowSemanticHistoryError::ChangedBoundary)
+        );
+        let wrong = WorkflowInventoryQuery {
+            cursor: Some(WorkflowInventoryCursor {
+                after: Some(WorkflowInventoryKey::Dispatch("a".repeat(64))),
+                ..cursor
+            }),
+            ..query.clone()
+        };
+        assert!(wrong.validate().is_err());
+        let mut future = encoded;
+        future["coverage"] = serde_json::json!({"kind":"complete_from_admission"});
+        assert!(serde_json::from_value::<WorkflowInventoryPage>(future).is_err());
+        page.cursor.source = WorkflowInventorySource::ChildRuns;
+        assert!(query.validate_page(&page).is_err());
+        for limit in [0, 101] {
+            assert!(
+                WorkflowInventoryQuery {
+                    limit,
+                    ..query.clone()
+                }
+                .validate()
+                .is_err()
+            );
         }
     }
 

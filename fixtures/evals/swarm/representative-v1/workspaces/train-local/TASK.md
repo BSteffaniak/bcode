@@ -1,0 +1,1 @@
+Fix the cross-module posted-amount calculation. Keep evaluate(rows), parse.amount and validate.accepted APIs. Read docstrings. Write answer.json as {"result": evaluate(input.json)}; preserve input.json and TASK.md. This small patch needs no prescribed collaboration.

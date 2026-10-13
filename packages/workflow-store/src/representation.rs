@@ -9,6 +9,8 @@ use switchy_database::{Database, DatabaseValue, TransactionMode};
 pub mod activity;
 mod admission_policy;
 mod admission_projection;
+/// Store-local generation-fenced current membership inventory.
+pub mod inventory;
 mod registered;
 pub use registered::{admit_registered, admit_registered_observed};
 /// Monotonic execution and retry allowance controls.
@@ -70,6 +72,9 @@ pub enum RepresentationError {
     /// The execution graph lifecycle is not yet implemented for this operation.
     #[error("workflow representation lifecycle unsupported")]
     UnsupportedLifecycle,
+    /// Inventory continuation no longer matches its immutable source boundary.
+    #[error("workflow inventory page is stale")]
+    InventoryStalePage,
     /// Current durable owner does not match the caller.
     #[error("workflow representation authority conflict")]
     AuthorityConflict,

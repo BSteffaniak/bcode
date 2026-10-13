@@ -49,7 +49,7 @@ fn candidate_summary(id: &str, pairs: &[&Value]) -> Value {
     let evaluable: Vec<_> = pairs
         .iter()
         .copied()
-        .filter(|pair| pair["quality_evaluable"] == true)
+        .filter(|pair| pair["quality_evaluable"] == true && pair["scheduled"] == true)
         .collect();
     let successes = evaluable
         .iter()
@@ -59,10 +59,17 @@ fn candidate_summary(id: &str, pairs: &[&Value]) -> Value {
         .iter()
         .filter(|pair| pair["baseline_passed"] == true)
         .count();
-    let regressions = count("quality_regression", &json!(true));
+    let regressions = evaluable
+        .iter()
+        .filter(|pair| pair["quality_regression"] == true)
+        .count();
+    let gains = evaluable
+        .iter()
+        .filter(|pair| pair["baseline_passed"] == false && pair["candidate_passed"] == true)
+        .count();
     let mut ratios: Vec<_> = pairs
         .iter()
-        .filter(|pair| pair["speed_eligible"] == true)
+        .filter(|pair| pair["speed_eligible"] == true && pair["scheduled"] == true)
         .filter_map(|pair| pair["latency_ratio"].as_f64())
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect();
@@ -106,6 +113,12 @@ fn candidate_summary(id: &str, pairs: &[&Value]) -> Value {
         "evaluable_success_rate": rate(successes, evaluable.len()),
         "success_rate_wilson_95": wilson(successes, evaluable.len()),
         "regressions": regressions, "baseline_pass_trials": baseline_passes,
+        "paired_gains": gains,
+        "paired_success_rate_difference": rate(successes, evaluable.len()).zip(rate(baseline_passes, evaluable.len())).map(|(candidate, baseline)| candidate - baseline),
+        "paired_effect_interval_95": null,
+        "paired_effect_uncertainty": "not estimated: repeated observations of a small fixed task set are not independent task samples",
+        "latency_ratio_interval_95": null,
+        "quality_basis": "legacy combined execution and required-judge outcome; not an independent artifact-quality scalar",
         "regression_rate_wilson_95": wilson(regressions, baseline_passes),
         "successful_pair_latency_ratio_p50": quantile(50),
         "successful_pair_latency_ratio_p95": quantile(95), "speed_sample_count": ratios.len(),
@@ -133,6 +146,35 @@ pub fn describe(pairs: &[Value]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::wilson;
+
+    #[test]
+    fn three_successful_pairs_do_not_invent_effect_certainty() {
+        let pairs: Vec<_> = (1..=3)
+            .map(|repetition| {
+                serde_json::json!({
+                    "candidate": "swarm", "repetition": repetition,
+                    "schedule_known": true, "scheduled": true,
+                    "candidate_outcome": "passed", "baseline_outcome": "passed",
+                    "quality_evaluable": true, "candidate_passed": true,
+                    "baseline_passed": true, "quality_regression": false,
+                    "speed_eligible": true, "latency_ratio": 0.5,
+                })
+            })
+            .collect();
+        let result = super::describe(&pairs);
+        let summary = &result["candidates"][0];
+        assert_eq!(summary["paired_success_rate_difference"], 0.0);
+        assert_eq!(
+            summary["paired_effect_interval_95"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            summary["latency_ratio_interval_95"],
+            serde_json::Value::Null
+        );
+        assert_eq!(summary["noninferiority_established"], false);
+        assert_eq!(summary["speed_sample_count"], 3);
+    }
 
     #[test]
     fn intervals_do_not_claim_certainty_from_tiny_samples() {

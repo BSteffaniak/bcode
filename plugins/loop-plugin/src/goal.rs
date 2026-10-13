@@ -31,7 +31,7 @@ pub fn start_response(arguments: &str) -> InvokeCommandResponse {
         effects: vec![CommandEffect::OpenPluginSurface {
             surface_kind: SURFACE_KIND.into(),
             instance_id: "goal-start".into(),
-            options: serde_json::json!({"collaboration":arguments.collaborate, "agents": match arguments.mode() { swarm::Mode::Auto => "auto", swarm::Mode::Collaborate => "collaborate", swarm::Mode::NoDelegation => "no-delegation" }, "worker_attempts":allowance, "concurrency":arguments.concurrency, "swarm_instructions":arguments.swarm_instructions}),
+            options: serde_json::json!({"collaboration":arguments.collaborate, "agents": match arguments.mode() { swarm::Mode::Auto => "auto", swarm::Mode::Collaborate => "collaborate", swarm::Mode::NoDelegation => "no-delegation" }, "swarm_policy":arguments.swarm_policy, "worker_attempts":allowance, "concurrency":arguments.concurrency, "swarm_instructions":arguments.swarm_instructions}),
         }],
     }
 }
@@ -41,6 +41,20 @@ pub fn start_response(arguments: &str) -> InvokeCommandResponse {
 struct GeneratedGoalPrompts {
     implementation_prompt: String,
     stop_condition: String,
+}
+
+pub fn generation_request_with_policy(
+    objective: &str,
+    guidance: &str,
+    progress_document: bool,
+    collaboration: CollaborationMode,
+    policy: swarm::Policy,
+) -> PluginStructuredGenerationRequest {
+    let mut request = generation_request(objective, guidance, progress_document, collaboration);
+    if policy == swarm::Policy::AdaptiveV1 {
+        request.system_prompt.push_str("\n\nSelected strategy: adaptive-v1. Preserve this strategy in both generated prompts without overriding user requirements, roles or timing: optional tiny local work stays local; required collaboration uses actual useful contributions, not ceremonial duplicate work. Identify independent useful scopes, focused objectives and exact artifact references, concise evidence handoff, one integration and targeted correction of unresolved criteria. Evaluation starts with genuinely supplied contributions and retrieves verified evidence only for concrete gaps; summaries are not full worker results. No-delegation prohibits workers. These defaults grant no authority and must not narrow the original objective or verification requirements.");
+    }
+    request
 }
 
 pub fn generation_request(
@@ -478,6 +492,14 @@ impl PluginTuiSurfaceFactory for GoalSurfaceFactory {
                     }
                 }
             };
+            surface.editor.swarm_policy = request
+                .options
+                .get("swarm_policy")
+                .map(|value| {
+                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())
+                })
+                .transpose()?
+                .unwrap_or_default();
             surface.editor.worker_attempts = request
                 .options
                 .get("worker_attempts")
@@ -1011,11 +1033,12 @@ impl GoalSurface {
         self.source = Some((objective.clone(), guidance.clone(), limit));
         self.phase = GoalPhase::Generating { review };
         self.editor.status = "Preparing source context… Cancel stops generation.".into();
-        let mut request = generation_request(
+        let mut request = generation_request_with_policy(
             &objective,
             &guidance,
             self.editor.progress_document.is_some(),
             self.editor.collaboration,
+            self.editor.swarm_policy,
         );
         request.source_session_id = self.editor.session_id;
         let live = crate::goal_live::GenerationView::default();

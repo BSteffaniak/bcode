@@ -970,6 +970,7 @@ struct LoopSurface {
     hints: std::collections::BTreeMap<String, String>,
     origin: SetupKind,
     collaboration: CollaborationMode,
+    swarm_policy: swarm::Policy,
     worker_attempts: Option<u64>,
     swarm_ui: swarm_ui::SwarmUi,
     delegation_readiness: Option<()>,
@@ -1030,16 +1031,18 @@ pub fn test_loop_start_request(
         "Verify acceptance task".into(),
         max_iterations,
     )?;
-    build_start_request(
+    build_start_request_with_policy(
         &input,
         session_id,
         SetupKind::Loop,
         CollaborationMode::Disabled,
         false,
         None,
+        swarm::Policy::Baseline,
     )
 }
 
+#[cfg(test)]
 fn build_start_request(
     input: &LoopWorkflowInput,
     session_id: SessionId,
@@ -1048,17 +1051,46 @@ fn build_start_request(
     progress_document: bool,
     worker_attempts: Option<u64>,
 ) -> Result<PluginWorkflowStartRequest, String> {
-    let spec = if progress_document {
-        goal_workflow_spec(input)?
-    } else if origin == SetupKind::Goal && collaboration != CollaborationMode::NoDelegation {
-        optional_goal_spec(&loop_workflow_spec(input)?)?
+    build_start_request_with_policy(
+        input,
+        session_id,
+        origin,
+        collaboration,
+        progress_document,
+        worker_attempts,
+        swarm::Policy::Baseline,
+    )
+}
+
+fn build_start_request_with_policy(
+    input: &LoopWorkflowInput,
+    session_id: SessionId,
+    origin: SetupKind,
+    collaboration: CollaborationMode,
+    progress_document: bool,
+    worker_attempts: Option<u64>,
+    policy: swarm::Policy,
+) -> Result<PluginWorkflowStartRequest, String> {
+    let spec = if policy == swarm::Policy::AdaptiveV1 && origin == SetupKind::Goal {
+        let adaptive = adaptive_goal_spec(&loop_workflow_spec(input)?, collaboration)?;
+        if progress_document {
+            goal_workflow_spec_from_base(input, &adaptive)?
+        } else {
+            adaptive
+        }
     } else {
-        loop_workflow_spec(input)?
-    };
-    let spec = if collaboration == CollaborationMode::Requested {
-        collaborating_goal_spec(&spec)?
-    } else {
-        spec
+        let base = if progress_document {
+            goal_workflow_spec(input)?
+        } else if origin == SetupKind::Goal && collaboration != CollaborationMode::NoDelegation {
+            optional_goal_spec(&loop_workflow_spec(input)?)?
+        } else {
+            loop_workflow_spec(input)?
+        };
+        if collaboration == CollaborationMode::Requested {
+            collaborating_goal_spec(&base)?
+        } else {
+            base
+        }
     };
     let spec = if collaboration == CollaborationMode::NoDelegation {
         swarm::no_delegation_spec(&spec)?
@@ -1177,6 +1209,7 @@ impl LoopSurface {
             hints: std::collections::BTreeMap::new(),
             origin: SetupKind::Loop,
             collaboration: CollaborationMode::Disabled,
+            swarm_policy: swarm::Policy::Baseline,
             worker_attempts: None,
             swarm_ui: swarm_ui::SwarmUi::default(),
             delegation_readiness: None,
@@ -1716,13 +1749,14 @@ impl LoopSurface {
         input.judgement_evaluation = self.selected_judgement().inspect_err(|_| {
             self.field = Field::Evaluation;
         })?;
-        let mut request = build_start_request(
+        let mut request = build_start_request_with_policy(
             &input,
             session_id,
             self.origin,
             self.collaboration,
             self.progress_document.is_some(),
             self.worker_attempts,
+            self.swarm_policy,
         )?;
         if self.origin == SetupKind::Goal {
             self.swarm_ui.apply_limits(&mut request)?;
@@ -3444,6 +3478,65 @@ fn bypass_unblocked_input(definition: &mut bcode_workflow::WorkflowDefinition) {
     progress.configuration["true_nodes"] = serde_json::json!([]);
 }
 
+fn adaptive_goal_spec(
+    base: &bcode_workflow::WorkflowSpec<LoopWorkflowIteration>,
+    collaboration: CollaborationMode,
+) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
+    let mut definition = base.definition().clone();
+    let requirement = match collaboration {
+        CollaborationMode::Requested => {
+            "Collaboration is required: obtain actual useful worker contributions and honor user-designated roles and timing. Do not substitute solo completion."
+        }
+        CollaborationMode::NoDelegation => {
+            "Delegation is prohibited: do not stage or spawn workers, even when adaptive defaults suggest collaboration. Surface conflicting requirements."
+        }
+        CollaborationMode::Auto | CollaborationMode::Disabled => {
+            "Collaboration is optional unless the user requires it. Keep tiny local work local when delegation would not help."
+        }
+    };
+    for (id, prompt) in [
+        (
+            "loop.implementation",
+            include_str!("../prompts/goal-adaptive-v1-coordination.md"),
+        ),
+        (
+            "loop.evaluation",
+            include_str!("../prompts/goal-adaptive-v1-evaluation.md"),
+        ),
+    ] {
+        let node = definition
+            .nodes
+            .get_mut(id)
+            .ok_or("goal agent node is missing")?;
+        let mut config: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(node.configuration.clone())
+                .map_err(|error| error.to_string())?;
+        if id == "loop.evaluation" {
+            // Replace discovery-first baseline instructions only in the opt-in candidate.
+            config.system_prompt = format!(
+                "{requirement}\n\n{prompt}\n\n{}",
+                include_str!("../prompts/goal-stop-condition-guidance.md")
+            );
+        } else {
+            config.system_prompt = format!(
+                "{}\n\n{requirement}\n\n{prompt}\n\n{}",
+                config.system_prompt,
+                include_str!("../prompts/goal-iteration-guidance.md")
+            );
+            if collaboration == CollaborationMode::Requested {
+                config.activity_producer = Some(bcode_workflow::WorkflowActivityProducer {
+                    plugin: PLUGIN_ID.into(),
+                    stage: "coordination".into(),
+                });
+            }
+        }
+        config.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+        node.configuration = serde_json::to_value(config).map_err(|error| error.to_string())?;
+    }
+    bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
+        .map_err(|error| error.to_string())
+}
+
 fn collaborating_goal_spec(
     base: &bcode_workflow::WorkflowSpec<LoopWorkflowIteration>,
 ) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
@@ -3539,9 +3632,14 @@ fn optional_goal_spec(
 fn goal_workflow_spec(
     input: &LoopWorkflowInput,
 ) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
-    let mut definition = optional_goal_spec(&loop_workflow_spec(input)?)?
-        .definition()
-        .clone();
+    goal_workflow_spec_from_base(input, &optional_goal_spec(&loop_workflow_spec(input)?)?)
+}
+
+fn goal_workflow_spec_from_base(
+    input: &LoopWorkflowInput,
+    base: &bcode_workflow::WorkflowSpec<LoopWorkflowIteration>,
+) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
+    let mut definition = base.definition().clone();
     let mut configuration = loop_agent_configuration::<LoopWorkflowIteration>(
         include_str!("../prompts/goal-initialization.md"),
         "build",

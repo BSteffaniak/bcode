@@ -1,0 +1,108 @@
+schema_version = 1
+id = "swarm-representative-v1-holdout"
+name = "Representative holdout task families v1"
+[run]
+repetitions = 3
+timeout_ms = 600000
+isolation = "temp_copy"
+randomize_case_order = true
+fail_fast = false
+[metadata]
+paired_schedule_seed = 20261012
+require_paired_quality = true
+split = "holdout"
+fixture_version = "representative-v1"
+claim_scope = "fixed task-family diagnostic; no superiority or independent-task generalization"
+
+[[variants]]
+id = "direct"
+executor = "agent"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n"
+
+[[variants]]
+id = "single"
+executor = "workflow"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n"
+[variants.metadata.workflow]
+binary = "/Users/bsteffaniak/.local/state/bcode/daemon-images/bcode-c1aeee325f5c6e43de2b6bf87ef7c0d6/da0664cded30b18a5801a4c34534440e57c188cfc903f38939fc08dfde11c2c7/bcode"
+strategy = "no-delegation"
+stop_condition = "Satisfy every TASK.md contract, deliver answer.json, preserve required inputs, and verify functional behavior; do not claim completion without artifacts."
+max_iterations = 3
+concurrency = 4
+worker_attempts = 16
+
+[[variants]]
+id = "auto"
+executor = "workflow"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "/Users/bsteffaniak/.local/state/bcode/daemon-images/bcode-c1aeee325f5c6e43de2b6bf87ef7c0d6/da0664cded30b18a5801a4c34534440e57c188cfc903f38939fc08dfde11c2c7/bcode"
+strategy = "auto"
+stop_condition = "Satisfy every TASK.md contract, deliver answer.json, preserve required inputs, and verify functional behavior; do not claim completion without artifacts."
+max_iterations = 3
+concurrency = 4
+worker_attempts = 16
+
+[[variants]]
+id = "collaboration"
+executor = "workflow"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "/Users/bsteffaniak/.local/state/bcode/daemon-images/bcode-c1aeee325f5c6e43de2b6bf87ef7c0d6/da0664cded30b18a5801a4c34534440e57c188cfc903f38939fc08dfde11c2c7/bcode"
+strategy = "collaborate"
+stop_condition = "Satisfy every TASK.md contract, deliver answer.json, preserve required inputs, and verify functional behavior; do not claim completion without artifacts."
+max_iterations = 3
+concurrency = 4
+worker_attempts = 16
+
+[[cases]]
+id = "holdout-debug"
+fixture = "representative-v1/workspaces/holdout-debug"
+prompt = "Read TASK.md and the supplied source modules. Complete its task and write answer.json. Never modify input.json or TASK.md. No grading assets are part of this workspace."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' holdout-debug"
+preserve_files = ["input.json", "TASK.md"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' holdout-debug"
+timeout_ms = 30000
+required = true
+
+[[cases]]
+id = "holdout-parallel"
+fixture = "representative-v1/workspaces/holdout-parallel"
+prompt = "Read TASK.md and the supplied source modules. Complete its task and write answer.json. Never modify input.json or TASK.md. No grading assets are part of this workspace."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' holdout-parallel"
+preserve_files = ["input.json", "TASK.md"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' holdout-parallel"
+timeout_ms = 30000
+required = true
+
+[[cases]]
+id = "holdout-recovery"
+fixture = "representative-v1/workspaces/holdout-recovery"
+prompt = "Read TASK.md and the supplied source modules. Complete its task and write answer.json. Never modify input.json or TASK.md. No grading assets are part of this workspace."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' holdout-recovery"
+preserve_files = ["input.json", "TASK.md"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' holdout-recovery"
+timeout_ms = 30000
+required = true
+
+[[cases]]
+id = "holdout-review"
+fixture = "representative-v1/workspaces/holdout-review"
+prompt = "Read TASK.md and the supplied source modules. Complete its task and write answer.json. Never modify input.json or TASK.md. No grading assets are part of this workspace."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' holdout-review"
+preserve_files = ["input.json", "TASK.md"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/representative-v1/oracles/grade.py' holdout-review"
+timeout_ms = 30000
+required = true

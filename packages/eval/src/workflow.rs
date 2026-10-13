@@ -1840,7 +1840,9 @@ pub fn execute(
             "capture inspection run identity mismatch".into(),
         ));
     }
-    if let Err(error) = super::capture_workflow_history(&capabilities, rep_dir, invoke) {
+    if let Err(error) =
+        super::capture_workflow_history_until(&capabilities, rep_dir, capture_deadline, invoke)
+    {
         capture_failed = true;
         write_json(
             rep_dir.join("history-capture-error.json"),

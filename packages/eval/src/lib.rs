@@ -14,6 +14,7 @@
 mod agent_cleanup;
 mod agent_progress;
 mod capture;
+mod semantic_capture;
 
 /// Capture supported public workflow history collections from verified inspection capabilities.
 /// Finite observation exhaustion does not certify semantic history completeness.
@@ -25,13 +26,34 @@ pub fn capture_workflow_history(
     directory: &std::path::Path,
     invoke: impl Fn(&[String], &str, std::time::Duration) -> Result<serde_json::Value, EvalError>,
 ) -> Result<(), EvalError> {
-    capture::capture_history_with_capabilities(
+    capture_workflow_history_until(
+        inspection,
+        directory,
+        std::time::Instant::now() + std::time::Duration::from_mins(2),
+        invoke,
+    )
+}
+
+/// Capture public history under the caller's shared post-execution deadline.
+/// Scoped semantic exhaustion never certifies unsupported full-history boundaries.
+///
+/// # Errors
+/// Rejects expired allowances, incomplete coverage and inconsistent public pages;
+/// available responses and per-scope failure boundaries are retained.
+pub fn capture_workflow_history_until(
+    inspection: &bcode_workflow::WorkflowRunInspection,
+    directory: &std::path::Path,
+    deadline: std::time::Instant,
+    invoke: impl Fn(&[String], &str, std::time::Duration) -> Result<serde_json::Value, EvalError>,
+) -> Result<(), EvalError> {
+    capture::capture_history_scopes(
         &inspection.run.run_id,
         directory,
         inspection
             .unavailable_collections
             .iter()
             .any(|collection| collection == "events"),
+        deadline,
         invoke,
     )
 }
@@ -213,6 +235,11 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
         )));
     }
     validate_id("suite", &suite.id)?;
+    if !suite.score.cost.is_finite() || suite.score.cost != 0.0 {
+        return Err(EvalError::Validation(
+            "cost-weighted scoring is unsupported without an explicit normalized cost score contract; set score.cost = 0".into(),
+        ));
+    }
     if suite.variants.is_empty() {
         return Err(EvalError::Validation(
             "suite must define at least one variant".into(),
@@ -3776,7 +3803,9 @@ fn aggregate_variant(
         )
     });
     let stability = 1.0 - pass_rate_variance(&cases);
-    let cost = 1.0;
+    // The legacy numeric score contract has no unknown variant. Cost-weighted
+    // suites are rejected at validation; this placeholder earns no cost credit.
+    let cost = 0.0;
     let mut overall = suite.score.correctness.mul_add(
         correctness,
         suite.score.efficiency.mul_add(
@@ -4184,6 +4213,7 @@ pub fn render_summary_markdown(result: &EvalRunResult) -> String {
         }
     }
 
+    out.push_str("\nCost estimates require complete per-attempt usage and supported pricing buckets; n/a is unknown, not zero. Token sums are observed subtotals, not proof of complete usage. Cost-weighted scoring is unsupported.\n");
     out.push_str("\n## Token and Cost Breakdown\n\n");
     out.push_str("| Variant | Model | Input | Cached Input | Output | Reasoning | Total | Est Cost | Pricing |\n");
     out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---|\n");
@@ -4348,9 +4378,8 @@ pub fn render_terminal_summary(result: &EvalRunResult) -> String {
 #[derive(Debug, Clone, Copy, Default)]
 struct ModelPricing {
     input: f64,
-    cached_input: f64,
+    cached_input: Option<f64>,
     output: f64,
-    reasoning: f64,
 }
 
 #[derive(Debug, Default)]
@@ -4387,17 +4416,15 @@ impl VariantReportMetrics {
         let reasoning_tokens = sum_refs_metric(&repetitions, "reasoning_tokens");
         let total_tokens = sum_refs_metric(&repetitions, "total_tokens");
         let price = model.as_ref().and_then(|model| pricing.get(model));
-        let estimated_cost = price.map(|price| {
-            (input_tokens / 1_000_000.0).mul_add(
-                price.input,
-                (cached_input_tokens / 1_000_000.0).mul_add(
-                    price.cached_input,
-                    (output_tokens / 1_000_000.0).mul_add(
-                        price.output,
-                        (reasoning_tokens / 1_000_000.0) * price.reasoning,
-                    ),
-                ),
-            )
+        let estimated_cost = price.and_then(|price| {
+            if repetitions.is_empty() {
+                return None;
+            }
+            repetitions.iter().try_fold(0.0, |total, repetition| {
+                let cost = report_repetition_cost(&repetition.measurements, *price)?;
+                let sum = total + cost;
+                sum.is_finite().then_some(sum)
+            })
         });
         Self {
             repetitions: repetitions.len(),
@@ -4553,23 +4580,51 @@ fn pricing_table_from_suite(suite: &EvalSuite) -> BTreeMap<String, ModelPricing>
 }
 
 fn model_pricing_from_value(value: &serde_json::Value) -> Option<ModelPricing> {
+    let rate = |key: &str| {
+        value
+            .get(key)?
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    let cached_input = if value.get("cached_input_per_million").is_some() {
+        Some(rate("cached_input_per_million")?)
+    } else {
+        None
+    };
     Some(ModelPricing {
-        input: value.get("input_per_million")?.as_f64()?,
-        cached_input: value
-            .get("cached_input_per_million")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or_default(),
-        output: value.get("output_per_million")?.as_f64()?,
-        reasoning: value
-            .get("reasoning_per_million")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or_else(|| {
-                value
-                    .get("output_per_million")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or_default()
-            }),
+        input: rate("input_per_million")?,
+        cached_input,
+        output: rate("output_per_million")?,
     })
+}
+
+// This legacy report tariff covers ordinary input, cache reads and output only.
+// Missing usage is not zero. Cache writes and separately reported reasoning need
+// normalized request pricing provenance; do not guess their billing relationship.
+fn report_repetition_cost(metrics: &EvalMeasurementSet, price: ModelPricing) -> Option<f64> {
+    let tokens = |key: &str| {
+        metrics
+            .get(key)
+            .copied()
+            .filter(|value| value.is_finite() && *value >= 0.0 && value.fract() == 0.0)
+    };
+    let input = tokens("input_tokens")?;
+    let cached = tokens("cached_input_tokens")?;
+    let output = tokens("output_tokens")?;
+    if cached > input
+        || tokens("cache_write_input_tokens")? != 0.0
+        || tokens("reasoning_tokens")? != 0.0
+    {
+        return None;
+    }
+    let cached_cost = if cached == 0.0 {
+        0.0
+    } else {
+        cached * price.cached_input?
+    };
+    let cost =
+        ((input - cached).mul_add(price.input, cached_cost) + output * price.output) / 1_000_000.0;
+    cost.is_finite().then_some(cost)
 }
 
 fn format_number(value: f64) -> String {
@@ -5095,6 +5150,141 @@ variants = ["nope"]
             error.to_string().contains("unknown variant nope"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn report_pricing_requires_valid_rates_and_explicit_cache_prices() {
+        let ordinary = serde_json::json!({"input_per_million": 2.0, "output_per_million": 4.0});
+        let price = model_pricing_from_value(&ordinary).expect("ordinary rates");
+        assert!(price.cached_input.is_none());
+        for bad in [-1.0, f64::INFINITY, f64::NAN] {
+            let value = serde_json::json!({"input_per_million": bad, "output_per_million": 4.0});
+            assert!(model_pricing_from_value(&value).is_none());
+        }
+        let invalid_cache = serde_json::json!({"input_per_million": 2.0, "output_per_million": 4.0, "cached_input_per_million": -1.0});
+        assert!(model_pricing_from_value(&invalid_cache).is_none());
+    }
+
+    fn priced_usage() -> EvalMeasurementSet {
+        [
+            ("input_tokens".into(), 100.0),
+            ("cached_input_tokens".into(), 80.0),
+            ("output_tokens".into(), 10.0),
+            ("cache_write_input_tokens".into(), 0.0),
+            ("reasoning_tokens".into(), 0.0),
+        ]
+        .into()
+    }
+
+    #[test]
+    fn report_cost_subtracts_cache_reads_and_fails_closed_on_unknown_buckets() {
+        let price = ModelPricing {
+            input: 2.0,
+            cached_input: Some(0.5),
+            output: 4.0,
+        };
+        let usage = priced_usage();
+        let cost = report_repetition_cost(&usage, price).expect("complete cost");
+        assert!((cost - 0.000_12).abs() < 1e-12);
+        assert!(
+            report_repetition_cost(
+                &usage,
+                ModelPricing {
+                    cached_input: None,
+                    ..price
+                }
+            )
+            .is_none()
+        );
+        for key in usage.keys() {
+            let mut missing = usage.clone();
+            missing.remove(key);
+            assert!(report_repetition_cost(&missing, price).is_none());
+        }
+        for (key, value) in [
+            ("cached_input_tokens", 101.0),
+            ("input_tokens", -1.0),
+            ("output_tokens", f64::NAN),
+            ("output_tokens", 0.5),
+            ("cache_write_input_tokens", 1.0),
+            ("reasoning_tokens", 1.0),
+        ] {
+            let mut invalid = usage.clone();
+            invalid.insert(key.into(), value);
+            assert!(report_repetition_cost(&invalid, price).is_none());
+        }
+        let mut zero_cache = usage;
+        zero_cache.insert("cached_input_tokens".into(), 0.0);
+        assert!(
+            report_repetition_cost(
+                &zero_cache,
+                ModelPricing {
+                    cached_input: None,
+                    ..price
+                }
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn report_variant_cost_requires_every_attempt_including_failures() {
+        let mut variant = variant_result("priced", "unused", 0.0);
+        let repetition = |passed| EvalRepetitionResult {
+            case_id: "case".into(),
+            variant_id: "priced".into(),
+            repetition: 1,
+            passed,
+            exit_code: Some(i32::from(!passed)),
+            wall_time_ms: 1,
+            timeout: None,
+            measurements: priced_usage(),
+            judges: vec![],
+            diagnostics: vec![],
+            artifacts: vec![],
+        };
+        variant.cases.push(EvalCaseRunResult {
+            case_id: "case".into(),
+            variant_id: "priced".into(),
+            pass_rate: 0.5,
+            repetitions: vec![repetition(true), repetition(false)],
+        });
+        let prices = [(
+            "model".into(),
+            ModelPricing {
+                input: 2.0,
+                cached_input: Some(0.5),
+                output: 4.0,
+            },
+        )]
+        .into();
+        let models = [("priced".into(), "model".into())].into();
+        let metrics = VariantReportMetrics::from_variant(&variant, &prices, &models);
+        assert!((metrics.estimated_cost.expect("both attempts") - 0.000_24).abs() < 1e-12);
+        variant.cases[0].repetitions[1].measurements.clear();
+        assert!(
+            VariantReportMetrics::from_variant(&variant, &prices, &models)
+                .estimated_cost
+                .is_none()
+        );
+        variant.cases.clear();
+        assert!(
+            VariantReportMetrics::from_variant(&variant, &prices, &models)
+                .estimated_cost
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cost_weighted_scoring_is_rejected_instead_of_fabricated() {
+        let mut suite = minimal_suite("").expect("suite");
+        suite.score.cost = 1.0;
+        assert!(
+            matches!(validate_suite(&suite), Err(EvalError::Validation(message)) if message.contains("cost-weighted scoring"))
+        );
+        suite.score.cost = 0.0;
+        let aggregated = aggregate_variant(&suite, &suite.variants[0], vec![]);
+        assert_eq!(aggregated.score.cost.to_bits(), 0.0_f64.to_bits());
     }
 
     fn variant_result(id: &str, metric: &str, value: f64) -> EvalVariantRunResult {

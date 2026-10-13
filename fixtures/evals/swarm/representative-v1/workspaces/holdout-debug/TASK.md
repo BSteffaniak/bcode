@@ -1,0 +1,1 @@
+Repair timestamp-window selection across decode.py, window.py and app.py using their contracts. Keep public APIs. Write answer.json with result equal to evaluate(input.json). Preserve input.json and TASK.md.

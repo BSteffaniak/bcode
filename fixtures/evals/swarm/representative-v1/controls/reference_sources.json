@@ -1,0 +1,31 @@
+{
+  "holdout-debug": {
+    "window.py": "def inside(value, start, end):\n    return start <= value < end\n"
+  },
+  "holdout-parallel": {
+    "intervals.py": "def solve(rows):\n    out = []\n    for start, end in sorted(rows):\n        if out and start <= out[-1][1]: out[-1][1] = max(end, out[-1][1])\n        else: out.append([start, end])\n    return out\n",
+    "metrics.py": "def solve(rows):\n    return sorted(rows)[(len(rows)-1)//2] if rows else None\n",
+    "routes.py": "def solve(rows):\n    out = {}\n    for r in rows:\n        key = r[\"destination\"]\n        choice = [r[\"cost\"], r[\"hop\"]]\n        if key not in out or choice < out[key]: out[key] = choice\n    return dict(sorted(out.items()))\n",
+    "tags.py": "def solve(rows):\n    if not rows: return []\n    shared = set(rows[0])\n    for row in rows[1:]: shared.intersection_update(row)\n    return sorted(shared)\n"
+  },
+  "holdout-recovery": {
+    "app.py": "from decode import decode\nfrom publish import publish, TransientError\ndef evaluate(request):\n    state = {\"attempts\":0,\"commits\":[]}\n    values = decode(request[\"rows\"])\n    for attempt in range(3):\n        try:\n            published = publish(values,state,request[\"failures\"])\n            return {\"published\":published,**state}\n        except TransientError:\n            if attempt == 2: raise\n",
+    "decode.py": "def decode(rows):\n    from decimal import Decimal\n    values = {}\n    for r in rows:\n        cents = Decimal(r[\"amount\"])*100\n        if not cents.is_finite() or cents != cents.to_integral_value(): raise ValueError(\"non-cent amount\")\n        if r[\"id\"] in values: raise ValueError(\"duplicate id\")\n        values[r[\"id\"]] = int(cents)\n    return values\n",
+    "publish.py": "class TransientError(Exception): pass\ndef publish(values, state, failures):\n    state[\"attempts\"] += 1\n    if state[\"attempts\"] <= failures: raise TransientError(\"injected\")\n    state[\"commits\"].append(dict(values))\n    return dict(values)\n"
+  },
+  "holdout-review": {},
+  "train-handoff": {
+    "normalize.py": "def normalize(rows):\n    values = {}\n    for r in rows:\n        if r[\"id\"] in values: raise ValueError(\"duplicate id\")\n        values[r[\"id\"]] = int(r[\"value\"].strip())\n    return values\n",
+    "rank.py": "def rank(values):\n    ids = sorted(values, key=lambda k: (values[k],k))\n    return {\"ordered_ids\":ids,\"checksum\":sum((i+1)*values[k] for i,k in enumerate(ids))}\n"
+  },
+  "train-local": {
+    "validate.py": "def accepted(row):\n    return row.get(\"status\", \"pending\") == \"posted\"\n"
+  },
+  "train-parallel": {
+    "inventory.py": "def solve(rows):\n    out = {}\n    for r in rows:\n        if not r.get(\"void\", False): out[r[\"sku\"]] = out.get(r[\"sku\"], 0) + r[\"qty\"]\n    return dict(sorted(out.items()))\n",
+    "ledger.py": "def solve(rows):\n    return sum(rows)\n",
+    "paths.py": "def solve(rows):\n    return len({part for row in rows for part in row.split(\"/\") if part})\n",
+    "words.py": "def solve(rows):\n    out = {}\n    for row in rows:\n        for word in row.lower().split(): out[word] = out.get(word, 0) + 1\n    return dict(sorted(out.items()))\n"
+  },
+  "train-review": {}
+}

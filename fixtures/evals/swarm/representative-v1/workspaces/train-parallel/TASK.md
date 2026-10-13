@@ -1,0 +1,1 @@
+Repair all four independent subsystem contracts and app.evaluate integration. All docstrings are requirements, including empty inputs, duplicates and ties. Write answer.json as {"result": evaluate(input.json)}. Preserve input.json and TASK.md. Independent scopes can be worked in parallel; integration must verify all four, not a selected subset.

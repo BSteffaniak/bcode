@@ -1,7 +1,9 @@
 //! Plugin-owned noninteractive goal entry. No slash-command emulation.
+#[cfg(test)]
+use super::build_start_request;
 use super::{
     BcodeClient, DEFAULT_MAX_ITERATIONS, LoopWorkflowInput, MAX_PROMPT_BYTES, SessionId, SetupKind,
-    build_start_request, goal, legacy_state_exists, unsupported_legacy_message,
+    build_start_request_with_policy, goal, legacy_state_exists, unsupported_legacy_message,
 };
 use bcode_plugin_sdk::{StaticCliFuture, StaticCliOutcome, StaticCliRegistration};
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -59,6 +61,19 @@ enum JudgeFailure {
 }
 
 impl GoalCli {
+    fn generation_request(
+        &self,
+        guidance: &str,
+    ) -> bcode_plugin_sdk::tui::PluginStructuredGenerationRequest {
+        goal::generation_request_with_policy(
+            &self.objective,
+            guidance,
+            self.progress_document,
+            self.swarm.mode().collaboration(),
+            self.swarm.swarm_policy,
+        )
+    }
+
     fn judgement(&self) -> Result<Option<super::judgement_evaluation::EvaluationConfig>, String> {
         let Some(provider) = &self.judge_provider else {
             return Ok(None);
@@ -149,8 +164,7 @@ async fn run(args: GoalCli) -> Result<(), String> {
             None,
         )
     } else {
-        let mut generation =
-            goal::generation_request(&args.objective, &guidance, progress, collaboration);
+        let mut generation = args.generation_request(&guidance);
         generation.source_session_id = Some(args.session);
         let generated = client
             .generate_structured_output(
@@ -181,13 +195,14 @@ async fn run(args: GoalCli) -> Result<(), String> {
         )
     };
     input.judgement_evaluation = judgement;
-    let mut request = build_start_request(
+    let mut request = build_start_request_with_policy(
         &input,
         args.session,
         SetupKind::Goal,
         collaboration,
         progress,
         args.swarm.worker_attempts.map(std::num::NonZeroU64::get),
+        args.swarm.swarm_policy,
     )?;
     if let Some(concurrency) = args.swarm.concurrency {
         request.limits.concurrency_cap = Some(concurrency.get());
@@ -484,6 +499,58 @@ mod tests {
             assert_eq!(ui.definition, cli.definition);
             assert_eq!(ui.input, cli.input);
             assert_eq!(ui.limits, cli.limits);
+        }
+    }
+
+    #[test]
+    fn adaptive_policy_cli_and_surface_emit_same_candidate() {
+        let session = SessionId::new();
+        let session_text = session.to_string();
+        for mode in ["auto", "collaborate", "no-delegation"] {
+            let args = GoalCli::try_parse_from([
+                "goal",
+                "--session",
+                &session_text,
+                "--objective",
+                "Implement",
+                "--agents",
+                mode,
+                "--swarm-policy",
+                "adaptive-v1",
+            ])
+            .unwrap();
+            let mut surface = crate::LoopSurface::new(Some(session));
+            surface.origin = SetupKind::Goal;
+            surface.collaboration = args.swarm.mode().collaboration();
+            surface.swarm_policy = args.swarm.swarm_policy;
+            surface.prompt = crate::text_state("Implement");
+            surface.condition = crate::text_state("Verify");
+            let ui = surface.build_start_request(session).unwrap();
+            let input =
+                LoopWorkflowInput::new("Implement".into(), "Verify".into(), DEFAULT_MAX_ITERATIONS)
+                    .unwrap();
+            let cli = build_start_request_with_policy(
+                &input,
+                session,
+                SetupKind::Goal,
+                args.swarm.mode().collaboration(),
+                false,
+                None,
+                args.swarm.swarm_policy,
+            )
+            .unwrap();
+            assert_eq!(ui.definition, cli.definition);
+            assert_eq!(ui.input, cli.input);
+            assert_eq!(ui.limits, cli.limits);
+            let evaluator: bcode_workflow::WorkflowPromptConfiguration = serde_json::from_value(
+                ui.definition.nodes["loop.evaluation"].configuration.clone(),
+            )
+            .unwrap();
+            assert!(
+                evaluator
+                    .system_prompt
+                    .contains("Adaptive swarm evaluation v1")
+            );
         }
     }
 

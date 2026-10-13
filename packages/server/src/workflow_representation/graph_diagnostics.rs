@@ -46,7 +46,9 @@ pub(super) const fn normalize(error: &RepresentationError) -> crate::ServerError
     let failure = match error {
         RepresentationError::AuthorityConflict => PublicationFailure::Authority,
         RepresentationError::CapacityUnavailable => PublicationFailure::Capacity,
-        RepresentationError::InvalidAdmission => PublicationFailure::InvalidAdmission,
+        RepresentationError::InvalidAdmission | RepresentationError::InventoryStalePage => {
+            PublicationFailure::InvalidAdmission
+        }
         RepresentationError::MaintenanceRequired => PublicationFailure::Maintenance,
         RepresentationError::UnsupportedLifecycle | RepresentationError::UnsupportedStore => {
             PublicationFailure::Unsupported

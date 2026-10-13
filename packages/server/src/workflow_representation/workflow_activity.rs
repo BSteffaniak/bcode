@@ -638,7 +638,9 @@ impl SharedVerificationFailure {
                 SharedVerificationCategory::Unsupported
             }
             Error::MaintenanceRequired => SharedVerificationCategory::MaintenanceRequired,
-            Error::InvalidAdmission => SharedVerificationCategory::InvalidState,
+            Error::InvalidAdmission | Error::InventoryStalePage => {
+                SharedVerificationCategory::InvalidState
+            }
             Error::AuthorityConflict => SharedVerificationCategory::AuthorityConflict,
             Error::CapacityUnavailable => SharedVerificationCategory::CapacityUnavailable,
         };

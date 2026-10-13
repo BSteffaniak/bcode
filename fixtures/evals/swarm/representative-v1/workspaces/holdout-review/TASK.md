@@ -1,0 +1,1 @@
+Review catalog, transfer and safe modules against their contracts, without editing source or inputs. Write answer.json as {"findings": [{"file":..., "function":..., "category":..., "severity":..., "explanation":...}]}. Include only actual defects, short kebab-case categories and medium severity. Provide concrete behavioral explanations; correct modules are distractors.

@@ -1,0 +1,1 @@
+{"inventory": [{"qty": 2, "sku": "b"}, {"qty": 3, "sku": "b"}, {"qty": 9, "sku": "a", "void": true}], "ledger": [10, -3, 2], "paths": ["/a/b", "a/c/", "/"], "words": ["Red blue", "RED"]}

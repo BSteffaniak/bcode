@@ -1,0 +1,1 @@
+Repair normalization and dependent ranking. app.evaluate must consume the normalized mapping through rank.rank, not independently reread raw records. Write answer.json as {"result": evaluate(input.json)}. Preserve input.json and TASK.md. Correct output alone does not prove workflow handoff; runtime evidence is independently required.
