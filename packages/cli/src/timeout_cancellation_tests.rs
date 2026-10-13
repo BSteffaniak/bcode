@@ -502,13 +502,15 @@ async fn headless_subscription_uses_total_budget_not_transport_timeout() {
     });
     let client =
         BcodeClient::new(endpoint).with_request_timeout(std::time::Duration::from_secs(30));
+    // Compatibility verification hashes the test executable before subscription.
+    // Leave setup slack; the total budget still must beat the 30-second transport timeout.
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
         send_message_observed(
             &client,
             session_id,
             scripted_send_options(),
-            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100)),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2)),
         ),
     )
     .await

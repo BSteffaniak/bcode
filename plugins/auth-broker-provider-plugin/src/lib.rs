@@ -615,7 +615,6 @@ mod tests {
     fn bundled_vtable_exposes_local_bootstrap_cli() {
         let vtable = static_plugin();
         let registration = vtable.cli_registration.expect("bundled CLI registration")();
-        assert!(!registration.requires_daemon);
         let matches = (registration.command)()
             .try_get_matches_from([
                 "auth-broker",
@@ -630,6 +629,7 @@ mod tests {
                 "600",
             ])
             .expect("public command syntax");
+        assert!(!(registration.requires_daemon)(&matches));
         let runtime = ProviderRuntime::new().expect("runtime");
         let result = runtime
             .block_on((registration.invoke)(matches))

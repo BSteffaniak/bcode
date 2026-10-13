@@ -6,42 +6,69 @@ on:
         description: Arbitrary task for Bcode (trusted maintainers only)
         required: true
         type: string
+      auth-mode:
+        description: Explicit authentication mode (no fallback)
+        type: choice
+        options: [broker-oidc, direct]
+        default: broker-oidc
       timeout-secs:
-        description: Execution budget in seconds
-        default: '600'
+        description: Execution budget; broker budget must fit actual OIDC lease minus 10 seconds
+        default: '120'
         type: string
 permissions:
   contents: read
+  actions: write
+  id-token: write
 concurrency:
   group: bcode-prompt
   cancel-in-progress: false
 jobs:
   run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Download pinned release
-        id: release
+      - uses: dtolnay/rust-toolchain@1.95.0
+        id: rust
+      - name: Native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libclang-dev cmake
+      - name: Stage deterministic committed build source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir .bcode-ci-source
+          mkdir -p "$RUNNER_TEMP/bcode-ci-target/release"
+          git archive HEAD | tar -x -C .bcode-ci-source
+      - name: Build or restore source binary
+        uses: BSteffaniak/cache-artifact@d6e8db732a6386ed62cfc72146d012d4ff634e53
+        with:
+          directory: .bcode-ci-source
+          working-directory: ${{ runner.temp }}/bcode-ci-target/release
+          github-token: ${{ github.token }}
+          command: cargo build --manifest-path '${{ github.workspace }}/.bcode-ci-source/Cargo.toml' --locked --release -p bcode --bin bcode --no-default-features --features app,static-bundled-plugins --target-dir '${{ runner.temp }}/bcode-ci-target'
+          output-path: ${{ runner.temp }}/bcode-ci-target/release/bcode
+          artifact-name: bcode-ci-ubuntu24-x64-${{ steps.rust.outputs.cachekey }}
+          cache-key-prefix: bcode-ci-ubuntu24-x64-static-v1-${{ steps.rust.outputs.cachekey }}
+          make-executable: true
+          verify-command: --version
+      - name: Stage trusted binary and policy outside checkout
+        id: staged
         shell: bash
         env:
-          RELEASE_URL: ${{ vars.BCODE_ACTION_RELEASE_URL }}
-          RELEASE_SHA256: ${{ vars.BCODE_ACTION_RELEASE_SHA256 }}
+          BUILT_BINARY: ${{ runner.temp }}/bcode-ci-target/release/bcode
         run: |
           set -euo pipefail
           umask 077
-          [[ "$RELEASE_URL" == https://* && "$RELEASE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo 'Configure BCODE_ACTION_RELEASE_URL and BCODE_ACTION_RELEASE_SHA256 first'; exit 1; }
-          directory=$(mktemp -d "$RUNNER_TEMP/bcode-download.XXXXXXXX")
-          curl --fail --location --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 --max-filesize 536870912 "$RELEASE_URL" -o "$directory/release.tar.gz"
-          printf 'archive=%s\n' "$directory/release.tar.gz" >> "$GITHUB_OUTPUT"
-      - uses: ./.github/actions/setup-bcode
-        id: setup
-        with:
-          archive: ${{ steps.release.outputs.archive }}
-          sha256: ${{ vars.BCODE_ACTION_RELEASE_SHA256 }}
-      - name: Prepare explicit API authentication configuration
+          directory=$(mktemp -d "$RUNNER_TEMP/bcode-inputs.XXXXXXXX")
+          install -m 700 "$BUILT_BINARY" "$directory/bcode"
+          install -m 600 .github/bcode/ci-agent.toml "$directory/agent.toml"
+          printf 'binary=%s\nagent-config=%s\n' "$directory/bcode" "$directory/agent.toml" >> "$GITHUB_OUTPUT"
+      - name: Prepare explicit direct API configuration
+        if: inputs.auth-mode == 'direct'
         id: config
         shell: bash
         env:
@@ -67,18 +94,31 @@ jobs:
           scheme = "api_key"
           [auth.profiles.github-api.map.api_key]
           env = "BCODE_ACTION_API_KEY"
-          [tools.shell.env]
-          mode = "inherit"
           EOF
           printf 'path=%s\n' "$directory/bcode.toml" >> "$GITHUB_OUTPUT"
-      - name: Execute prompt
-        id: bcode
+      - name: Execute through broker
+        if: inputs.auth-mode == 'broker-oidc'
+        uses: ./.github/actions/run-bcode
+        with:
+          binary: ${{ steps.staged.outputs.binary }}
+          auth-mode: broker-oidc
+          broker-url: ${{ vars.BCODE_ACTION_BROKER_URL }}
+          broker-audience: ${{ vars.BCODE_ACTION_BROKER_AUDIENCE }}
+          agent: build
+          agent-config: ${{ steps.staged.outputs.agent-config }}
+          prompt: ${{ inputs.prompt }}
+          timeout-secs: ${{ inputs.timeout-secs }}
+      - name: Execute through direct API
+        if: inputs.auth-mode == 'direct'
         uses: ./.github/actions/run-bcode
         env:
           BCODE_ACTION_API_KEY: ${{ secrets.BCODE_ACTION_API_KEY }}
         with:
-          binary: ${{ steps.setup.outputs.binary }}
+          binary: ${{ steps.staged.outputs.binary }}
+          auth-mode: direct
           config: ${{ steps.config.outputs.path }}
           profile: github
+          agent: build
+          agent-config: ${{ steps.staged.outputs.agent-config }}
           prompt: ${{ inputs.prompt }}
           timeout-secs: ${{ inputs.timeout-secs }}

@@ -977,6 +977,40 @@ fn config_only_rejects_fifo_without_waiting_for_writer() {
 }
 
 #[test]
+fn broker_daemon_clients_do_not_autostart_a_missing_server() {
+    for arguments in [
+        vec!["server", "startup-probe"],
+        vec![
+            "plugin",
+            "call",
+            "bcode.auth-broker/v1",
+            "serve",
+            "--daemon",
+        ],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("trusted.toml"), "").unwrap();
+        let output = run_cli_at_root(
+            root.path(),
+            &[
+                &[
+                    "--config-only",
+                    "trusted.toml",
+                    "--request-timeout-secs",
+                    "2",
+                ][..],
+                &arguments,
+            ]
+            .concat(),
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        assert!(!output.status.success());
+        assert!(!root.path().join("bcode-state/daemon-images").exists());
+    }
+}
+
+#[test]
 fn config_only_ignores_malformed_environment_configuration_in_process() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("trusted.toml"), "").unwrap();

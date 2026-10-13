@@ -1,0 +1,53 @@
+# Substitute every UNSET value, then install as /data/broker.toml (root-owned 0644).
+# No credentials, identity values, auth pools, or environment-secret fallbacks here.
+[model]
+profile = "broker"
+
+[model.profiles.broker]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "UNSET_EXPLICIT_CATALOG_MODEL_ID"
+auth_profile = "broker-owner"
+
+[auth.profiles.broker-owner]
+backend = "sshenv"
+provider_id = "openai"
+owner_plugin_id = "bcode.openai-compatible"
+scheme = "chatgpt"
+
+[auth.profiles.broker-owner.settings]
+device_seal = "off"
+
+[daemon]
+idle_shutdown = false
+
+[plugins]
+enabled = ["bcode.auth-broker", "bcode.openai-compatible"]
+
+[plugins.config."bcode.auth-broker".model_host]
+allowed_plugin_id = "bcode.auth-broker"
+model_profile = "broker"
+# Change only after confirming your account/provider permits this use.
+supported_account_use = false
+max_turns = 128
+max_scope_seconds = 900
+
+[plugins.config."bcode.auth-broker".model_host.custody]
+provider_id = "openai"
+directory = "/data/custody"
+identity_file = "/run/bcode/age-identity"
+
+[plugins.config."bcode.auth-broker".serve]
+bind = "0.0.0.0:8080"
+# Fly HTTPS ingress terminates TLS. Do not expose port 8080 directly.
+trusted_tls_ingress = true
+audience = "UNSET_EXACT_HTTPS_OIDC_AUDIENCE"
+max_leases = 128
+lease_seconds = 900
+
+[[plugins.config."bcode.auth-broker".serve.allow]]
+repository_id = "UNSET_NUMERIC_GITHUB_REPOSITORY_ID"
+repository = "UNSET_OWNER/UNSET_REPOSITORY"
+workflow_ref = "UNSET_OWNER/UNSET_REPOSITORY/.github/workflows/UNSET_WORKFLOW.yml@refs/heads/UNSET_BRANCH"
+git_ref = "refs/heads/UNSET_BRANCH"
+subject = "repo:UNSET_OWNER/UNSET_REPOSITORY:ref:refs/heads/UNSET_BRANCH"
+# For a reusable workflow add its exact job_workflow_ref only when required.

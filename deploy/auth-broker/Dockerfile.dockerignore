@@ -1,0 +1,31 @@
+# Dockerfile-specific allowlist: do not send checkout state, local config, secrets,
+# .git, build outputs, or credential files to a remote builder.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!clippy.toml
+!.cargo/
+!.cargo/**
+!packages/
+!packages/**
+!plugins/
+!plugins/**
+!catalog/
+!catalog/**
+!workers/
+!workers/**
+!xtask/
+!xtask/**
+!examples/
+!examples/**
+!deploy/
+!deploy/auth-broker/
+!deploy/auth-broker/Dockerfile
+!deploy/auth-broker/Dockerfile.dockerignore
+!deploy/auth-broker/supervise.sh
+# Even within source trees, never upload conventional private key/env files.
+**/.env
+**/.env.*
+**/*.pem
+**/age-identity

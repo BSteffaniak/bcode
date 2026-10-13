@@ -1,0 +1,41 @@
+# Trusted maintainer CI policy. This is not an OS sandbox.
+[agent.build.tools]
+"workflow.stage_delegation" = false
+"workflow.stage_task_group" = false
+"workflow.stage_agent_task" = false
+"workflow.stage_prompt_task" = false
+"workflow.stage_run_graph_edit" = false
+"workflow.publish_run_graph_edit" = false
+"workflow.accept_run_graph_publication" = false
+"question" = false
+"ask" = false
+[agent.build.permission]
+external_directory = "deny"
+[agent.build.permission.read]
+"*" = "allow"
+[agent.build.permission.write]
+"*" = "allow"
+[agent.build.permission.edit]
+"*" = "allow"
+[agent.build.permission.tools]
+"*" = "deny"
+"filesystem.read" = "allow"
+"filesystem.list" = "allow"
+"filesystem.find" = "allow"
+"filesystem.grep" = "allow"
+"filesystem.exists" = "allow"
+"filesystem.stat" = "allow"
+"filesystem.write" = "allow"
+"filesystem.edit" = "allow"
+"filesystem.multi_edit" = "allow"
+[agent.build.permission.command]
+"*" = "deny"
+"git status*" = "allow"
+"git diff*" = "allow"
+"git --no-pager status*" = "allow"
+"git --no-pager diff*" = "allow"
+"cargo fmt*" = "allow"
+"cargo check*" = "allow"
+"cargo test*" = "allow"
+"cargo clippy*" = "allow"
+"rg *" = "allow"

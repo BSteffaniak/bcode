@@ -6,27 +6,46 @@ Do not run fork-controlled code, workflows, configuration, or prompts with crede
 
 ## First run
 
-Build/publish a distribution containing the new `run` command and matching bundled
-plugins through the existing release tooling. An older released binary does not
-acquire this command merely by using the new Action.
+The dispatch workflow builds Bcode directly with Cargo and reuses the binary through
+pinned `cache-artifact`; no published Linux distribution is required. The cache identity
+includes source content, the locked dependencies, runner platform, feature-set version,
+and Rust toolchain identity. The trusted binary and agent configuration are copied outside
+the checkout before execution. Only trusted maintainer dispatches may use this cache.
 
-Configure these repository variables:
+Choose `broker-oidc` (default) or `direct` explicitly:
 
-* `BCODE_ACTION_RELEASE_URL`: HTTPS URL for the reviewed Linux tar.gz distribution.
-* `BCODE_ACTION_RELEASE_SHA256`: independently reviewed SHA-256 of that distribution.
-* `BCODE_ACTION_MODEL`: explicit OpenAI API model ID available to your account.
+* Broker: configure `BCODE_ACTION_BROKER_URL` and `BCODE_ACTION_BROKER_AUDIENCE`.
+  Deploy and enroll the single-owner broker as described in [Fly.io setup](github-actions-fly.md).
+  The broker allowlist must match this repository's immutable ID, workflow path, ref and subject.
+* Direct: configure `BCODE_ACTION_MODEL` and secret `BCODE_ACTION_API_KEY`.
+  This explicitly uses Platform API billing, not ChatGPT subscription billing.
 
-Set repository/environment secret `BCODE_ACTION_API_KEY` to an OpenAI API key.
-This explicitly uses Platform API billing, not ChatGPT subscription billing.
 Run **Bcode prompt** (`bcode-prompt.yml`) with your task and execution budget.
 The workflow must be on the default branch for GitHub's normal dispatch interface.
+Broker mode requests a GitHub OIDC token; it does not receive the API key or subscription
+refresh credentials. Neither mode silently falls back to the other. The short default
+budget is 120 seconds; broker preparation rejects budgets exceeding the actual lease.
 No publication credentials, auth JSON synchronization, or secrets-writing PAT is needed.
 
-The workflow generates a non-secret configuration in private runner storage,
-passes prompt text as data, installs a verified distribution and invokes the reusable
-run Action. Only an observed completed turn returns success. Unknown outcome is
-failure, not permission to rerun effects. Permissions/interaction waits fail rather
-than opening a terminal prompt; configure permitted tools in reviewed configuration.
+The workflow passes prompt text as data and invokes the reusable run Action.
+Only an observed completed turn returns success. Unknown outcome is failure, not permission
+to rerun effects. Permissions/interaction waits fail rather than opening a terminal prompt.
+
+## Unattended agent policy
+
+The reviewed `.github/bcode/ci-agent.toml` uses the ordinary `[agent.build]` policy
+schema, like local build/plan configuration. It allows checkout filesystem edits and a
+small set of validation/read commands, denies external-directory access, and disables
+interactive questions and workflow delegation. It is not a permission bypass or sandbox:
+Cargo executes trusted project build scripts/tests, and shell commands can run project code.
+Review this policy for the actual task; denied or approval-dependent work fails closed.
+
+The run Action accepts `agent` and an absolute `agent-config` outside the checkout.
+It combines that trusted policy with either auth configuration. `run --agent` selects the
+registered profile through the session application API before submitting the prompt.
+Use `plan` plus an appropriate reviewed policy for read-only tasks; do not copy private
+user config or credentials into CI. Filesystem layout and provider OIDC remain separate
+from agent authorization.
 
 ## Reuse outside this repository
 
@@ -55,7 +74,10 @@ cancellation has a separate bounded grace. Hard kill/SIGTERM may prevent result 
 The API key is available to the trusted Bcode process and may be inherited by tools.
 Environment filtering is not credential isolation: arbitrary same-user code may
 inspect processes, files or the runner. Use ephemeral runners and trusted maintainers.
-Do not grant `id-token: write` or publication credentials to this workflow. Checkout
+Broker mode requires `id-token: write`; restrict it to trusted maintainer workflows
+and enforce the exact broker allowlist. The cache step needs `actions: write` for artifact
+publication; the run step does not inherit its token. Do not add repository publication
+credentials to the agent environment. Checkout
 uses `persist-credentials: false`. No PR/fork triggers are supplied.
 
 The run Action retains private result and diagnostic files for the current job,

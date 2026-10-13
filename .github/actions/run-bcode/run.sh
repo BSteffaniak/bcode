@@ -17,7 +17,7 @@ scratch=$(mktemp -d "$parent/bcode-run.XXXXXXXX")
 cleanup() {
   # A lease is not a refresh credential. Remove private copies on every exit;
   # broker TTL reaps remote work after cancellation/unknown runner loss.
-  rm -f -- "$scratch/broker-token" "$scratch/broker-expiry" "$scratch/broker.toml"
+  rm -f -- "$scratch/broker-token" "$scratch/broker-expiry" "$scratch/broker.toml" "$scratch/run.toml"
   unset BCODE_AUTH_BROKER_TOKEN BCODE_AUTH_BROKER_EXPIRES_AT
 }
 trap cleanup EXIT
@@ -50,6 +50,16 @@ case "${BCODE_ACTION_AUTH_MODE:-direct}" in
     ;;
   *) fail ;;
 esac
+if [[ -n "${BCODE_ACTION_AGENT_CONFIG:-}" ]]; then
+  [[ "$BCODE_ACTION_AGENT_CONFIG" = /* && -f "$BCODE_ACTION_AGENT_CONFIG" && ! -L "$BCODE_ACTION_AGENT_CONFIG" ]] || fail
+  policy=$(cd -- "$(dirname -- "$BCODE_ACTION_AGENT_CONFIG")" && pwd -P)/$(basename -- "$BCODE_ACTION_AGENT_CONFIG")
+  [[ "$policy" != "$workspace" && "$policy" != "$workspace/"* ]] || fail
+  # Both inputs are operator-trusted configuration; duplicate tables fail closed in Bcode.
+  cat -- "$BCODE_ACTION_CONFIG" > "$scratch/run.toml"
+  printf '\n' >> "$scratch/run.toml"
+  cat -- "$policy" >> "$scratch/run.toml"
+  BCODE_ACTION_CONFIG="$scratch/run.toml"
+fi
 printf '%s' "$BCODE_ACTION_PROMPT" > "$scratch/prompt.txt"
 unset BCODE_ACTION_PROMPT
 unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
@@ -57,7 +67,7 @@ args=()
 set +e
 "$BCODE_ACTION_BINARY" --config-only "$BCODE_ACTION_CONFIG" --profile "$BCODE_ACTION_PROFILE" \
   --state-root "$scratch/state" --no-credential-discovery --json-errors "${args[@]}" \
-  run --cwd "$workspace" --file "$scratch/prompt.txt" --timeout-secs "$BCODE_ACTION_TIMEOUT" \
+  run --agent "${BCODE_ACTION_AGENT:-build}" --cwd "$workspace" --file "$scratch/prompt.txt" --timeout-secs "$BCODE_ACTION_TIMEOUT" \
   > "$scratch/result.json" 2> "$scratch/diagnostics.json"
 status=$?
 set -e

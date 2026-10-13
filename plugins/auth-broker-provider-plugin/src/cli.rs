@@ -26,9 +26,9 @@ enum Operation {
         timeout_secs: u64,
     },
 }
-pub(crate) fn registration() -> StaticCliRegistration {
+pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
-        requires_daemon: false,
+        requires_daemon: |_| false,
         command: Cli::command,
         invoke,
     }

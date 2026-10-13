@@ -155,7 +155,11 @@ async fn run_with_host(
             }
         };
         writeln!(std::io::stdout(), "{message}")?;
-        return Ok(());
+        return if readiness == CustodyEnrollmentReadiness::Ready {
+            Ok(())
+        } else {
+            Err(setup_error(message))
+        };
     }
     let mode = match operation {
         SetupOperation::Initialize => CustodyEnrollmentMode::Initialize,

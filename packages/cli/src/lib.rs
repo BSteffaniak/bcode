@@ -13365,6 +13365,7 @@ async fn call_plugin_service(
     let payload = payload.unwrap_or_default().into_bytes();
     if daemon {
         let response = BcodeClient::default_endpoint()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning)
             .call_plugin_service(interface_id.to_string(), operation.to_string(), payload)
             .await?;
         return print_service_response(response, json);
@@ -14640,7 +14641,8 @@ fn print_server_identity(status: &ServerStatus, verbose: bool) -> Result<(), Cli
 }
 
 async fn daemon_startup_probe() -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
+    let client = BcodeClient::default_endpoint()
+        .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
     let started = Instant::now();
     client.connect("bcode-daemon-startup-probe").await?;
     println!("{}", started.elapsed().as_micros());

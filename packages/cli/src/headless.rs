@@ -16,6 +16,9 @@ pub struct RunOptions {
     /// Trusted working directory. This is not an OS sandbox.
     #[arg(long)]
     cwd: PathBuf,
+    /// Explicit registered agent profile for unattended tool policy.
+    #[arg(long, default_value = "build")]
+    agent: String,
     /// Total budget for input, preflight, session creation, admission, and observation.
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=86400))]
     timeout_secs: u64,
@@ -152,6 +155,9 @@ pub async fn run(
             Ok(client.create_session_in_working_directory(None, cwd).await?)
         }).await?;
         session_id = Some(session.id);
+        request(Some(deadline), async {
+            Ok(client.set_session_agent(session.id, options.agent.clone()).await?)
+        }).await?;
         let status = request(Some(deadline), async { Ok(client.session_model_status(session.id).await?) }).await?;
         let observed_selection = (status.provider_plugin_id, status.effective_model_id, status.auth_profile);
         let requested_selection = (selection.provider_plugin_id, selection.model_id, selection.auth_profile);
@@ -297,6 +303,32 @@ mod tests {
         );
         assert!(claim_fresh_state_with_environment(Some(&root), &environment).is_err());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn reviewed_ci_policy_parses_without_credentials_or_model_selection() {
+        let config: bcode_config::BcodeConfig =
+            toml::from_str(include_str!("../../../.github/bcode/ci-agent.toml")).unwrap();
+        let policy = &config.agent["build"];
+        assert_eq!(
+            serde_json::to_value(policy.permission.external_directory).unwrap(),
+            "deny"
+        );
+        assert!(!policy.tools["workflow.stage_delegation"]);
+        assert_eq!(
+            serde_json::to_value(policy.permission.command["cargo test*"]).unwrap(),
+            "allow"
+        );
+    }
+
+    #[test]
+    fn run_selects_explicit_agent_policy() {
+        let cli = Cli::try_parse_from(["bcode", "run", "--cwd", ".", "--stdin", "--agent", "plan"])
+            .unwrap();
+        let Some(super::super::Commands::Run(options)) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.agent, "plan");
     }
 
     #[test]

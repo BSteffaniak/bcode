@@ -1,0 +1,52 @@
+# Operator template: replace UNSET values before any Fly operation.
+app = "UNSET_FLY_APP"
+primary_region = "UNSET_FLY_REGION"
+kill_signal = "SIGTERM"
+# Best-effort upper bound; shutdown can be cut short by infrastructure failure.
+kill_timeout = 300
+
+[build]
+  dockerfile = "deploy/auth-broker/Dockerfile"
+
+[deploy]
+  # One persistent owner: stop the old Machine before starting its replacement.
+  strategy = "immediate"
+
+[env]
+  BCODE_CONFIG = "/data/broker.toml"
+  RUST_LOG = "off"
+  # Initial bootstrap is deliberately not serving. Switch to "serve" only after
+  # explicit enrollment/readiness.
+  BCODE_BROKER_MODE = "maintenance"
+
+[[mounts]]
+  source = "broker_data"
+  destination = "/data"
+
+[[restart]]
+  policy = "never"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.tcp_checks]]
+    grace_period = "60s"
+    interval = "15s"
+    timeout = "2s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

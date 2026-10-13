@@ -11,6 +11,8 @@ export BCODE_ACTION_BROKER_URL=https://broker.example BCODE_ACTION_BROKER_AUDIEN
 export BCODE_ACTION_TIMEOUT=600 BCODE_ACTION_PROMPT='prompt as data'
 export ACTIONS_ID_TOKEN_REQUEST_TOKEN=synthetic-oidc ACTIONS_ID_TOKEN_REQUEST_URL=https://x.actions.githubusercontent.com/token
 export BCODE_ACTION_CONFIG='' BCODE_ACTION_PROFILE=''
+export BCODE_ACTION_AGENT=build BCODE_ACTION_AGENT_CONFIG="$root/agent.toml"
+printf '[agent.build.permission]\nexternal_directory = "deny"\n' > "$BCODE_ACTION_AGENT_CONFIG"
 export TEST_MARKER="$root/marker"
 cat > "$BCODE_ACTION_BINARY" <<'MOCK'
 #!/usr/bin/env bash
@@ -28,7 +30,11 @@ if [[ "$*" == *'auth-broker prepare'* ]]; then
 fi
 [[ -z "${BCODE_AUTH_BROKER_TOKEN:-}" && -z "${BCODE_AUTH_BROKER_EXPIRES_AT:-}" && -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" && -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]] || exit 93
 if [[ "$*" == *'stop-if-idle'* ]]; then exit 0; fi
-[[ "$*" == *'--profile github-broker'* ]] || exit 94
+[[ "$*" == *'--profile github-broker'* && "$*" == *'--agent build'* ]] || exit 94
+while (( $# )); do
+  case "$1" in --config-only) config=$2; shift 2 ;; *) shift ;; esac
+ done
+grep -q 'external_directory = "deny"' "$config" || exit 97
 printf 'executed\n' > "$TEST_MARKER"
 printf '{"outcome":"completed"}\n'
 MOCK
