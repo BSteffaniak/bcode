@@ -39,6 +39,8 @@ bcode_session_migration = { workspace = true }
 bcode_session_migration_target = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_session_search = { workspace = true }
+bcode_session_view = { workspace = true }
+bcode_session_view_models = { workspace = true }
 bcode_settings = { workspace = true }
 bcode_skill = { workspace = true }
 bcode_skill_models = { workspace = true }
@@ -124,8 +126,6 @@ bcode_session_derivation_plugin = { workspace = true, features = [
 bcode_session_milestones_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
-bcode_session_view = { workspace = true }
-bcode_session_view_models = { workspace = true }
 bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_skills_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_tantivy_session_search_plugin = { workspace = true, features = [

@@ -73,6 +73,32 @@ pub struct WorkflowAuthoringApplication<'a> {
 }
 
 impl<'a> WorkflowAuthoringApplication<'a> {
+    /// Access the same caller-bound session operations used by transport adapters.
+    ///
+    /// This does not create another runtime or grant additional caller authority.
+    #[must_use]
+    pub const fn session_application(&self) -> super::SessionApplicationHandle<'_> {
+        super::SessionApplicationHandle::new(self.state, self.client_id)
+    }
+
+    /// Open bounded renderer-neutral observation using the canonical session projector.
+    ///
+    /// # Errors
+    /// Rejects unavailable selected storage, shutdown, invalid bounds or incompatible history.
+    pub async fn observe_session(
+        &self,
+        request: bcode_session_models::SessionObservationRequest,
+    ) -> Result<super::SessionObservation, bcode_session_models::SessionApplicationFailure> {
+        use bcode_session_models::SessionObservationApplication as _;
+        self.session_application()
+            .observe_session(request)
+            .await
+            .map_err(|_| bcode_session_models::SessionApplicationFailure {
+                code: "session_observation_unavailable".into(),
+                message: "Bounded session observation is unavailable".into(),
+            })
+    }
+
     #[must_use]
     pub(crate) const fn new(
         state: &'a std::sync::Arc<ServerState>,

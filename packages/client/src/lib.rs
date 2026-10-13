@@ -489,6 +489,133 @@ pub enum ClientError {
     UnexpectedEnvelope,
 }
 
+fn session_application_failure(
+    error: ClientError,
+) -> bcode_session_models::SessionApplicationFailure {
+    match error {
+        ClientError::Server { code, message } => {
+            bcode_session_models::SessionApplicationFailure { code, message }
+        }
+        _ => bcode_session_models::SessionApplicationFailure {
+            code: "session_transport_unavailable".into(),
+            message: "Session operation could not complete through the application connection"
+                .into(),
+        },
+    }
+}
+
+impl bcode_session_models::SessionApplication for BcodeClient {
+    async fn create_session(
+        &self,
+        request: bcode_session_models::CreateSessionRequest,
+    ) -> Result<SessionSummary, bcode_session_models::SessionApplicationFailure> {
+        if !request.working_directory.is_absolute() {
+            return Err(bcode_session_models::SessionApplicationFailure {
+                code: "invalid_working_directory".into(),
+                message: "Working directory must be absolute".into(),
+            });
+        }
+        Self::create_session_in_working_directory(self, request.name, request.working_directory)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn inspect_session(
+        &self,
+        session_id: SessionId,
+        query: SessionInspectionQuery,
+    ) -> Result<SessionInspectionPage, bcode_session_models::SessionApplicationFailure> {
+        Self::session_inspection(self, session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn rename_session(
+        &self,
+        session_id: SessionId,
+        name: Option<String>,
+    ) -> Result<SessionSummary, bcode_session_models::SessionApplicationFailure> {
+        Self::rename_session(self, session_id, name)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn change_session_working_directory(
+        &self,
+        session_id: SessionId,
+        working_directory: std::path::PathBuf,
+    ) -> Result<
+        bcode_session_models::SessionWorkingDirectoryChange,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        if !working_directory.is_absolute() {
+            return Err(bcode_session_models::SessionApplicationFailure {
+                code: "invalid_working_directory".into(),
+                message: "Working directory must be absolute".into(),
+            });
+        }
+        match self
+            .send_request(Request::ChangeSessionWorkingDirectory {
+                session_id,
+                working_directory,
+            })
+            .await
+            .map_err(session_application_failure)?
+        {
+            ResponsePayload::SessionWorkingDirectoryChanged { session, changed } => {
+                Ok(bcode_session_models::SessionWorkingDirectoryChange { session, changed })
+            }
+            _ => Err(session_application_failure(ClientError::UnexpectedResponse)),
+        }
+    }
+    async fn submit_turn(
+        &self,
+        session_id: SessionId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    ) -> Result<bcode_session_models::TurnAdmission, bcode_session_models::SessionApplicationFailure>
+    {
+        Self::submit_turn(self, session_id, text, admission)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn set_session_model(
+        &self,
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+    ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
+        Self::set_session_model(self, session_id, provider_plugin_id, model_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn set_session_agent(
+        &self,
+        session_id: SessionId,
+        agent_id: String,
+    ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
+        Self::set_session_agent(self, session_id, agent_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn cancel_session_turn(
+        &self,
+        session_id: SessionId,
+        clear_queue: bool,
+        expected_turn_id: Option<String>,
+    ) -> Result<bool, bcode_session_models::SessionApplicationFailure> {
+        match self
+            .send_request(Request::CancelSessionTurn {
+                session_id,
+                clear_queue,
+                expected_turn_id,
+            })
+            .await
+            .map_err(session_application_failure)?
+        {
+            ResponsePayload::TurnCancellationRequested { cancelled } => Ok(cancelled),
+            _ => Err(session_application_failure(ClientError::UnexpectedResponse)),
+        }
+    }
+}
+
 impl bcode_workflow::WorkflowRunApplication for BcodeClient {
     async fn start_workflow_template(
         &self,

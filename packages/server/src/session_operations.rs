@@ -335,12 +335,12 @@ pub enum SubmitTurnError {
     Dispatch(super::ServerError),
 }
 
-/// Admit and enqueue an interactive turn while the caller holds the session admission lock.
+/// Admit and enqueue an interactive turn under the canonical session admission lock.
 ///
-/// The caller retains that lock and the ownership slot through response delivery to preserve
-/// admission ordering and the lease lifetime on rejection or admission error. Accepted work
-/// takes ownership from the slot when queued.
-/// Namespace fencing and interactive-priority selection must precede this operation.
+/// The operation acquires its own admission lock. The caller retains the ownership slot until
+/// operation settlement (legacy adapters may retain it through response delivery). Accepted
+/// work takes ownership from the slot when queued. Namespace fencing and interactive-priority
+/// selection must precede this operation.
 ///
 /// # Errors
 /// Returns admission errors for ownership or durable admission failures, and dispatch errors
@@ -1971,6 +1971,58 @@ async fn observe_activity(
         states,
         evidence: Some(evidence),
     }
+}
+
+/// Refuse ambiguous or foreign canonical location claims without opening session storage.
+///
+/// This is the transport-neutral counterpart of the legacy adapter's location guard. The
+/// coordinator should route that adapter guard through this operation as part of wiring.
+///
+/// # Errors
+/// Returns a normalized failure for unverifiable, non-primary, or ambiguous location claims.
+pub async fn require_selected_location(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+) -> Result<(), bcode_session_models::application::SessionApplicationFailure> {
+    use bcode_session_models::application::SessionApplicationFailure;
+    let failure = |code: &str, message: &str| SessionApplicationFailure {
+        code: code.to_owned(),
+        message: message.to_owned(),
+    };
+    let claims =
+        super::session_catalog::exact_location_claims(state, session_id).map_err(|()| {
+            failure(
+                "session_location_unverifiable",
+                "session storage location claims cannot be verified",
+            )
+        })?;
+    if claims.len() == 1
+        && state
+            .daemon_status
+            .state_location_id
+            .as_ref()
+            .is_some_and(|primary| primary != &claims[0])
+    {
+        return Err(failure(
+            "session_location_not_primary",
+            "session belongs to a readable state location; connect to its owning state location to attach",
+        ));
+    }
+    let locations = if claims.len() > 1 {
+        claims
+    } else {
+        state
+            .session_catalog
+            .ambiguous_location_ids(session_id)
+            .await
+    };
+    if !locations.is_empty() {
+        return Err(failure(
+            "session_location_ambiguous",
+            "session is claimed by multiple state locations; explicit maintenance must resolve the conflict before opening canonical storage",
+        ));
+    }
+    Ok(())
 }
 
 /// Create and publish one canonical session without transport framing.

@@ -36,8 +36,12 @@ mod runtime_work;
 pub mod runtime_work_operations;
 mod server_operations;
 mod session_activity;
+mod session_application;
 mod session_bulk_migration;
 mod session_compression;
+pub use session_application::SessionApplicationHandle;
+mod session_observation;
+pub use session_observation::{SessionObservation, SessionObservationDelivery};
 mod session_operations;
 mod session_search_operations;
 mod settled_turn_observers;
@@ -7012,7 +7016,20 @@ async fn handle_request_inner(
         SessionLifecycleRequest::CreateSession {
             name,
             working_directory,
-        } => handle_create_session(request_id, state, writer, name, working_directory).await,
+        } => {
+            use bcode_session_models::SessionApplication as _;
+            let result = SessionApplicationHandle::new(state, client_id)
+                .create_session(bcode_session_models::CreateSessionRequest {
+                    name,
+                    working_directory,
+                })
+                .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |session| Response::Ok(ResponsePayload::SessionCreated { session }),
+            );
+            send_response(writer, request_id, response).await
+        }
         SessionLifecycleRequest::CreateChildSession { request } => {
             handle_create_child_session(request_id, state, writer, request).await
         }
@@ -7143,12 +7160,22 @@ async fn handle_request_inner(
             session_id,
             working_directory,
         } => {
-            handle_change_session_working_directory(
-                request_id,
-                state,
+            use bcode_session_models::SessionApplication as _;
+            let result = SessionApplicationHandle::new(state, client_id)
+                .change_session_working_directory(session_id, working_directory)
+                .await;
+            send_response(
                 writer,
-                session_id,
-                working_directory,
+                request_id,
+                result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |change| {
+                        Response::Ok(ResponsePayload::SessionWorkingDirectoryChanged {
+                            session: change.session,
+                            changed: change.changed,
+                        })
+                    },
+                ),
             )
             .await
         }
@@ -7220,7 +7247,19 @@ async fn handle_request_inner(
             handle_record_ralph_lifecycle(request_id, state, writer, request).await
         }
         SessionLifecycleRequest::RenameSession { session_id, name } => {
-            handle_rename_session(request_id, state, writer, session_id, name).await
+            use bcode_session_models::SessionApplication as _;
+            let result = SessionApplicationHandle::new(state, client_id)
+                .rename_session(session_id, name)
+                .await;
+            send_response(
+                writer,
+                request_id,
+                result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |session| Response::Ok(ResponsePayload::SessionRenamed { session }),
+                ),
+            )
+            .await
         }
         SessionLifecycleRequest::DeleteSession { session_id } => {
             handle_delete_session(request_id, state, writer, session_id).await
@@ -7438,7 +7477,19 @@ async fn handle_request_inner(
             .await
         }
         SessionLifecycleRequest::SessionInspection { session_id, query } => {
-            handle_session_inspection(request_id, client_id, state, writer, session_id, query).await
+            use bcode_session_models::SessionApplication as _;
+            let result = SessionApplicationHandle::new(state, client_id)
+                .inspect_session(session_id, query)
+                .await;
+            send_response(
+                writer,
+                request_id,
+                result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |page| Response::Ok(ResponsePayload::SessionInspection { page }),
+                ),
+            )
+            .await
         }
     }
 }
@@ -9616,13 +9667,17 @@ async fn handle_core_runtime_request(
             provider_plugin_id,
             model_id,
         } => {
-            handle_set_session_model(
-                request_id,
-                state,
+            use bcode_session_models::SessionApplication as _;
+            let result = SessionApplicationHandle::new(state, client_id)
+                .set_session_model(session_id, provider_plugin_id, model_id)
+                .await;
+            send_response(
                 writer,
-                session_id,
-                provider_plugin_id,
-                model_id,
+                request_id,
+                result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |()| Response::Ok(ResponsePayload::SessionModelSet),
+                ),
             )
             .await
         }
@@ -9996,11 +10051,48 @@ async fn handle_contextual_plugin_request(
     send_response(writer, request_id, response).await
 }
 
+async fn handle_application_set_agent(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    agent_id: String,
+) -> Result<(), ServerError> {
+    use bcode_session_models::SessionApplication as _;
+    let result = SessionApplicationHandle::new(state, client_id)
+        .set_session_agent(session_id, agent_id)
+        .await;
+    send_response(
+        writer,
+        request_id,
+        result.map_or_else(
+            |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+            |()| Response::Ok(ResponsePayload::SessionAgentSet),
+        ),
+    )
+    .await
+}
+
+fn permission_rule_response(
+    agent_id: &str,
+    category: &str,
+    pattern: String,
+    action: &str,
+) -> Response {
+    match interaction_operations::add_permission_rule(agent_id, category, pattern, action) {
+        Ok(path) => Response::Ok(ResponsePayload::PermissionRuleAdded {
+            config_path: path.display().to_string(),
+        }),
+        Err(error) => Response::Err(ErrorResponse::new("config_error", error.message())),
+    }
+}
+
 async fn handle_agent_permission_plugin_request(
     request: AgentSkillPluginRequest,
     request_id: u64,
     client_id: ClientId,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
@@ -10028,21 +10120,17 @@ async fn handle_agent_permission_plugin_request(
         AgentSkillPluginRequest::SetSessionAgent {
             session_id,
             agent_id,
-        } => handle_set_session_agent(request_id, state, writer, session_id, agent_id).await,
+        } => {
+            handle_application_set_agent(request_id, client_id, state, writer, session_id, agent_id)
+                .await
+        }
         AgentSkillPluginRequest::AddPermissionRule {
             agent_id,
             category,
             pattern,
             action,
         } => {
-            let response = match interaction_operations::add_permission_rule(
-                &agent_id, &category, pattern, &action,
-            ) {
-                Ok(path) => Response::Ok(ResponsePayload::PermissionRuleAdded {
-                    config_path: path.display().to_string(),
-                }),
-                Err(error) => Response::Err(ErrorResponse::new("config_error", error.message())),
-            };
+            let response = permission_rule_response(&agent_id, &category, pattern, &action);
             send_response(writer, request_id, response).await
         }
         AgentSkillPluginRequest::ListPluginServices => {
@@ -10667,34 +10755,6 @@ async fn handle_composer_draft(
         Response::Ok(ResponsePayload::ComposerDraft { draft }),
     )
     .await
-}
-
-fn handle_create_session<'a>(
-    request_id: u64,
-    state: &'a ServerState,
-    writer: &'a SharedWriter,
-    name: Option<String>,
-    working_directory: PathBuf,
-) -> ProviderCallFuture<'a, Result<(), ServerError>> {
-    Box::pin(async move {
-        let session = match session_operations::create(state, name, working_directory).await {
-            Ok(session) => session,
-            Err(error) => {
-                return send_response(
-                    writer,
-                    request_id,
-                    Response::Err(ErrorResponse::new(error.code(), error.message())),
-                )
-                .await;
-            }
-        };
-        send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::SessionCreated { session }),
-        )
-        .await
-    })
 }
 
 async fn handle_reconcile_session_children(
@@ -11331,33 +11391,6 @@ async fn validate_session_working_directory(
                 format!("session working directory cannot be resolved: {error}"),
             )
         })
-}
-
-async fn handle_change_session_working_directory(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    working_directory: PathBuf,
-) -> Result<(), ServerError> {
-    match session_operations::change_working_directory(state, session_id, working_directory).await {
-        Ok((session, changed)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionWorkingDirectoryChanged { session, changed }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(error.code(), error.message())),
-            )
-            .await
-        }
-    }
 }
 
 async fn handle_list_worktrees(
@@ -13279,36 +13312,6 @@ fn path_is_inside(path: &Path, root: &Path) -> bool {
     normalized_path == normalized_root || normalized_path.starts_with(normalized_root)
 }
 
-async fn handle_rename_session(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    name: Option<String>,
-) -> Result<(), ServerError> {
-    match session_operations::rename(state, session_id, name).await {
-        Ok(session) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionRenamed { session }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_rename_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ActiveLiveStateKey {
     Contribution {
@@ -14904,37 +14907,6 @@ async fn handle_session_search_backfill(
                     format!("session_search_{:?}", error.code).to_lowercase(),
                     error.message,
                 )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_inspection(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    query: bcode_session_models::SessionInspectionQuery,
-) -> Result<(), ServerError> {
-    match session_operations::inspect(state, client_id, session_id, query).await {
-        Ok(page) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionInspection { page }),
-            )
-            .await
-        }
-        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
-            send_incompatible_active_session_response(writer, request_id, &namespace).await
-        }
-        Err(session_operations::ReadHistoryError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
             )
             .await
         }
@@ -18494,51 +18466,17 @@ async fn handle_submit_turn(
     text: String,
     admission: bcode_session_models::TurnAdmissionMetadata,
 ) -> Result<(), ServerError> {
-    if let Some(active_namespace) = state
-        .active_session_namespace_mismatch(session_id, client_id)
-        .await
-    {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    if admission.priority != bcode_session_models::TurnPriority::Interactive {
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::TurnAdmission {
-                admission: bcode_session_models::TurnAdmission::Rejected(
-                    bcode_session_models::TurnRejectionReason::ExecutionPolicy,
-                ),
-            }),
-        )
+    use bcode_session_models::SessionApplication as _;
+    let result = SessionApplicationHandle::new(state, client_id)
+        .submit_turn(session_id, text, admission)
         .await;
-    }
-    let mut ownership = None;
-    let admission = match session_operations::submit_turn(
-        state,
-        session_id,
-        client_id,
-        text,
-        admission,
-        &mut ownership,
-    )
-    .await
-    {
-        Ok(admission) => admission,
-        Err(session_operations::SubmitTurnError::Admission(error)) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await;
-        }
-        Err(session_operations::SubmitTurnError::Dispatch(error)) => return Err(error),
-    };
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::TurnAdmission { admission }),
+        result.map_or_else(
+            |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+            |admission| Response::Ok(ResponsePayload::TurnAdmission { admission }),
+        ),
     )
     .await
 }
@@ -18690,47 +18628,6 @@ async fn handle_append_presentation_note(
             .await
         }
         Err(session_operations::AppendPresentationNoteError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_set_session_model(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    provider_plugin_id: Option<String>,
-    model_id: String,
-) -> Result<(), ServerError> {
-    match session_operations::set_model(state, session_id, provider_plugin_id, model_id).await {
-        Ok(()) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionModelSet),
-            )
-            .await
-        }
-        Err(session_operations::SetModelError::SkillRequiredModelActive(skill_id)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "skill_required_model_active",
-                    format!(
-                        "skill {skill_id} declares a required model; deactivate it before changing the session model"
-                    ),
-                )),
-            )
-            .await
-        }
-        Err(session_operations::SetModelError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -19745,44 +19642,6 @@ async fn handle_agent_policy_status(
     .await
 }
 
-async fn handle_set_session_agent(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    agent_id: String,
-) -> Result<(), ServerError> {
-    match session_operations::set_agent(state, session_id, agent_id).await {
-        Ok(()) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionAgentSet),
-            )
-            .await
-        }
-        Err(session_operations::SetAgentError::UnknownAgent(agent_id)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "unknown_agent",
-                    format!("unknown prompt profile: {agent_id}"),
-                )),
-            )
-            .await
-        }
-        Err(session_operations::SetAgentError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
-}
-
 fn dispatch_provider_turn_cleanup(
     plugins: bcode_plugin::PluginRuntimeHost,
     metrics: MetricsRegistry,
@@ -19892,18 +19751,17 @@ async fn handle_cancel_session_turn(
     clear_queue: bool,
     expected_turn_id: Option<String>,
 ) -> Result<(), ServerError> {
-    let cancelled = session_operations::cancel_turn(
-        state,
-        session_id,
-        clear_queue,
-        client_id,
-        expected_turn_id,
-    )
-    .await?;
+    use bcode_session_models::SessionApplication as _;
+    let result = SessionApplicationHandle::new(state, client_id)
+        .cancel_session_turn(session_id, clear_queue, expected_turn_id)
+        .await;
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled }),
+        result.map_or_else(
+            |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+            |cancelled| Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled }),
+        ),
     )
     .await
 }
