@@ -3,7 +3,10 @@
 pub mod focused_input;
 pub mod keymap;
 
-pub use focused_input::{FocusedTextFieldEdit, FocusedTextFieldIdentity, FocusedTextFieldSnapshot};
+pub use focused_input::{
+    FocusedTextFieldAdapter, FocusedTextFieldEdit, FocusedTextFieldEditResult,
+    FocusedTextFieldIdentity, FocusedTextFieldSnapshot,
+};
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -1946,6 +1949,26 @@ impl PluginTuiEventResult {
     }
 }
 
+/// Completion result with semantic mutation separate from terminal routing and effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginTuiFocusedTextFieldEditResult {
+    /// Explicit live editor mutation outcome; never inferred from redraw.
+    pub edit_result: FocusedTextFieldEditResult,
+    /// Independent consumption, presentation and plugin effects.
+    pub event: PluginTuiEventResult,
+}
+
+impl PluginTuiFocusedTextFieldEditResult {
+    /// Reject unsupported or stale completion without falling through to submission.
+    #[must_use]
+    pub const fn rejected(error: bcode_plugin_models::composer::ComposerValidationError) -> Self {
+        Self {
+            edit_result: FocusedTextFieldEditResult::Rejected(error),
+            event: PluginTuiEventResult::consumed(),
+        }
+    }
+}
+
 /// Native Rust plugin surface rendered directly with `bmux_tui`.
 pub trait PluginTuiSurface: Send {
     /// Stable surface identifier.
@@ -2045,15 +2068,37 @@ pub trait PluginTuiSurface: Send {
         None
     }
 
-    /// Synchronously apply a completion to the live owner-managed editor.
-    /// Owners validate current focus/state and preserve editor history. Rejections
-    /// and no-ops are consumed, never submission. The default is disabled.
+    /// Consume-only legacy completion hook. New hosts use
+    /// `apply_focused_text_field_edit_result`; legacy-only overrides do not opt in.
+    /// Rejections and no-ops are consumed, never submission.
     fn apply_focused_text_field_edit(
         &mut self,
         _edit: &FocusedTextFieldEdit,
         _host: &dyn PluginTuiHost,
     ) -> PluginTuiEventResult {
         PluginTuiEventResult::consumed()
+    }
+
+    /// Route ordinary focused-editor input before surface fallback. Opted-in owners
+    /// must remove that editor routing from fallback so ignored input is not retried.
+    fn focused_text_field_event(
+        &mut self,
+        _event: &Event,
+        _host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        PluginTuiEventResult::from_legacy(PluginTuiAction::None)
+    }
+
+    /// Apply completion with an explicit mutation outcome. Unsupported legacy-only
+    /// surfaces fail closed; legacy redraw or effects cannot prove an edit occurred.
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        _edit: &FocusedTextFieldEdit,
+        _host: &dyn PluginTuiHost,
+    ) -> PluginTuiFocusedTextFieldEditResult {
+        PluginTuiFocusedTextFieldEditResult::rejected(
+            bcode_plugin_models::composer::ComposerValidationError::Stale,
+        )
     }
 
     /// Attach a renderer-neutral update stream to this retained surface.
@@ -2099,6 +2144,15 @@ pub enum TerminalInteractionInput {
     Consumed,
     /// The renderer translated the event into semantic controller input.
     Semantic(InteractionInput),
+}
+
+/// Typed completion result, separating live mutation from semantic controller input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalFocusedTextFieldEditResult {
+    /// Live editor mutation outcome.
+    pub edit_result: FocusedTextFieldEditResult,
+    /// Owner-defined semantic change input; processed only for `Applied`.
+    pub input: TerminalInteractionInput,
 }
 
 /// Terminal renderer/adapter for a typed renderer-neutral interaction.
@@ -2217,10 +2271,9 @@ where
         None
     }
 
-    /// Validate against the live editor and apply one history-preserving completion.
-    /// Return the existing semantic `Change` input only for an actual change;
-    /// rejected/no-op requests return `Consumed`, never submit. Do not retain a
-    /// mutable editor reference. The default disables completion application.
+    /// Legacy consume-only completion hook. Override the explicit-result hook to
+    /// opt in; this legacy response cannot establish a live mutation outcome.
+    /// Never return submission input for completion acceptance.
     fn apply_focused_text_field_edit(
         &mut self,
         _edit: &FocusedTextFieldEdit,
@@ -2228,6 +2281,33 @@ where
         _host: &dyn PluginTuiHost,
     ) -> TerminalInteractionInput {
         TerminalInteractionInput::Consumed
+    }
+
+    /// Route ordinary focused-editor input before the surface's fallback `input`.
+    /// Opted-in renderers must not retry editor routing from fallback.
+    fn focused_text_field_event(
+        &mut self,
+        _event: &Event,
+        _snapshot: &C::Snapshot,
+        _host: &dyn PluginTuiHost,
+    ) -> TerminalInteractionInput {
+        TerminalInteractionInput::Ignored
+    }
+
+    /// Apply completion with explicit live mutation and owner-defined change input.
+    /// The compatibility default never invokes or infers success from the legacy hook.
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        _edit: &FocusedTextFieldEdit,
+        _snapshot: &C::Snapshot,
+        _host: &dyn PluginTuiHost,
+    ) -> TerminalFocusedTextFieldEditResult {
+        TerminalFocusedTextFieldEditResult {
+            edit_result: FocusedTextFieldEditResult::Rejected(
+                bcode_plugin_models::composer::ComposerValidationError::Stale,
+            ),
+            input: TerminalInteractionInput::Consumed,
+        }
     }
 
     /// Translate terminal input and report whether it was consumed.
@@ -2448,21 +2528,53 @@ where
         edit: &FocusedTextFieldEdit,
         host: &dyn PluginTuiHost,
     ) -> PluginTuiEventResult {
-        let Some(current) = self.focused_text_field() else {
-            return PluginTuiEventResult::consumed();
-        };
-        if !matches!(edit.validate(&current), Ok(Some(_))) {
-            return PluginTuiEventResult::consumed();
-        }
+        self.apply_focused_text_field_edit_result(edit, host).event
+    }
+
+    fn focused_text_field_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
         let input = self
             .renderer
-            .apply_focused_text_field_edit(edit, &self.snapshot, host);
-        // Completion acceptance never falls through to host submission, even when
-        // the owner rejects after a fresh live-editor check.
-        if matches!(input, TerminalInteractionInput::Ignored) {
-            return PluginTuiEventResult::consumed();
-        }
+            .focused_text_field_event(event, &self.snapshot, host);
         self.apply_terminal_input(input)
+    }
+
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        edit: &FocusedTextFieldEdit,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiFocusedTextFieldEditResult {
+        use bcode_plugin_models::composer::ComposerValidationError;
+        let Some(current) = self.focused_text_field() else {
+            return PluginTuiFocusedTextFieldEditResult::rejected(ComposerValidationError::Stale);
+        };
+        match edit.validate(&current) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return PluginTuiFocusedTextFieldEditResult {
+                    edit_result: FocusedTextFieldEditResult::Noop,
+                    event: PluginTuiEventResult::consumed(),
+                };
+            }
+            Err(error) => return PluginTuiFocusedTextFieldEditResult::rejected(error),
+        }
+        let result = self
+            .renderer
+            .apply_focused_text_field_edit_result(edit, &self.snapshot, host);
+        let event = if result.edit_result == FocusedTextFieldEditResult::Applied
+            && !matches!(result.input, TerminalInteractionInput::Ignored)
+        {
+            self.apply_terminal_input(result.input)
+        } else {
+            PluginTuiEventResult::consumed()
+        };
+        PluginTuiFocusedTextFieldEditResult {
+            edit_result: result.edit_result,
+            event,
+        }
     }
 }
 
@@ -2772,10 +2884,181 @@ mod typed_interaction_surface_tests {
                 cursor: 13,
             },
         };
+        let result = surface.apply_focused_text_field_edit_result(&edit, &TestHost);
+        assert_eq!(
+            result.edit_result,
+            FocusedTextFieldEditResult::Rejected(
+                bcode_plugin_models::composer::ComposerValidationError::Stale
+            )
+        );
+        assert_eq!(result.event, PluginTuiEventResult::consumed());
         let result = surface.apply_focused_text_field_edit(&edit, &TestHost);
         assert_eq!(result, PluginTuiEventResult::consumed());
         assert_eq!(surface.snapshot, 1);
         assert_eq!(surface.work_shape().snapshot_materializations, 2);
+    }
+
+    #[derive(Default)]
+    struct CompletionRenderer {
+        result: Option<FocusedTextFieldEditResult>,
+    }
+
+    impl TerminalInteractionRenderer<NoEffectController> for CompletionRenderer {
+        const SURFACE_KIND: &'static str = "test.completion";
+
+        fn id(&self) -> &'static str {
+            "completion"
+        }
+        fn title(&self) -> &'static str {
+            "Completion"
+        }
+        fn preferred_height(&mut self, _snapshot: &usize, _width: u16) -> u16 {
+            1
+        }
+        fn render(&mut self, _snapshot: &usize, _area: Rect, _frame: &mut PaintCx<'_, '_>) {}
+        fn input(
+            &mut self,
+            _event: &Event,
+            _snapshot: &usize,
+            _host: &dyn PluginTuiHost,
+        ) -> TerminalInteractionInput {
+            TerminalInteractionInput::Ignored
+        }
+
+        fn focused_text_field(&self, _snapshot: &usize) -> Option<FocusedTextFieldSnapshot> {
+            Some(FocusedTextFieldSnapshot {
+                identity: FocusedTextFieldIdentity {
+                    owner_id: "test".into(),
+                    field_id: "field".into(),
+                    lifetime: 1,
+                },
+                generation: 1,
+                document: bcode_plugin_models::composer::ComposerDocument {
+                    document_id: "test-document".into(),
+                    revision: 1,
+                    text: "#é".into(),
+                    cursor: 3,
+                    selection: None,
+                },
+                eligible: true,
+                content_rect: Rect::new(1, 1, 10, 1),
+                anchor: Rect::new(3, 1, 1, 1),
+            })
+        }
+
+        fn apply_focused_text_field_edit(
+            &mut self,
+            _edit: &FocusedTextFieldEdit,
+            _snapshot: &usize,
+            _host: &dyn PluginTuiHost,
+        ) -> TerminalInteractionInput {
+            panic!("legacy edit cannot establish explicit success");
+        }
+
+        fn apply_focused_text_field_edit_result(
+            &mut self,
+            _edit: &FocusedTextFieldEdit,
+            _snapshot: &usize,
+            _host: &dyn PluginTuiHost,
+        ) -> TerminalFocusedTextFieldEditResult {
+            TerminalFocusedTextFieldEditResult {
+                edit_result: self.result.unwrap_or(FocusedTextFieldEditResult::Rejected(
+                    bcode_plugin_models::composer::ComposerValidationError::Stale,
+                )),
+                input: TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                    direction: bcode_tool::InteractionNavigation::Next,
+                }),
+            }
+        }
+    }
+
+    struct LegacyCompletionSurface;
+
+    impl PluginTuiSurface for LegacyCompletionSurface {
+        fn id(&self) -> &'static str {
+            "legacy-completion"
+        }
+        fn title(&self) -> &'static str {
+            "Legacy completion"
+        }
+        fn render(&mut self, _area: Rect, _frame: &mut PaintCx<'_, '_>) {}
+        fn handle_event(&mut self, _event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+            PluginTuiAction::Redraw
+        }
+        fn apply_focused_text_field_edit(
+            &mut self,
+            _edit: &FocusedTextFieldEdit,
+            _host: &dyn PluginTuiHost,
+        ) -> PluginTuiEventResult {
+            panic!("explicit default must not infer success from legacy hook");
+        }
+    }
+
+    #[test]
+    fn direct_and_typed_unsupported_completion_defaults_agree() {
+        let renderer = CompletionRenderer::default();
+        let expected = renderer.focused_text_field(&0).unwrap();
+        let edit = FocusedTextFieldEdit {
+            edit: bcode_plugin_models::composer::ComposerEdit {
+                document_id: expected.document.document_id.clone(),
+                revision: 1,
+                range: bcode_plugin_models::composer::ComposerTextRange { start: 0, end: 3 },
+                expected_text: "#é".into(),
+                replacement: "topic".into(),
+                cursor: 5,
+            },
+            expected,
+        };
+        let mut direct = LegacyCompletionSurface;
+        let mut typed = TypedTerminalInteractionSurface::new(NoEffectController::new(()), renderer);
+        let direct = direct.apply_focused_text_field_edit_result(&edit, &TestHost);
+        let typed = typed.apply_focused_text_field_edit_result(&edit, &TestHost);
+        assert_eq!(direct, typed);
+        assert_eq!(direct.event, PluginTuiEventResult::consumed());
+        assert_eq!(
+            direct.edit_result,
+            FocusedTextFieldEditResult::Rejected(
+                bcode_plugin_models::composer::ComposerValidationError::Stale
+            )
+        );
+    }
+
+    #[test]
+    fn typed_completion_processes_owner_semantics_only_for_explicit_applied() {
+        for edit_result in [
+            FocusedTextFieldEditResult::Applied,
+            FocusedTextFieldEditResult::Noop,
+            FocusedTextFieldEditResult::Rejected(
+                bcode_plugin_models::composer::ComposerValidationError::Stale,
+            ),
+        ] {
+            let mut surface = TypedTerminalInteractionSurface::new(
+                NoEffectController::new(()),
+                CompletionRenderer {
+                    result: Some(edit_result),
+                },
+            );
+            let expected = surface.focused_text_field().unwrap();
+            let edit = FocusedTextFieldEdit {
+                edit: bcode_plugin_models::composer::ComposerEdit {
+                    document_id: expected.document.document_id.clone(),
+                    revision: 1,
+                    range: bcode_plugin_models::composer::ComposerTextRange { start: 0, end: 3 },
+                    expected_text: "#é".into(),
+                    replacement: "topic".into(),
+                    cursor: 5,
+                },
+                expected,
+            };
+            let result = surface.apply_focused_text_field_edit_result(&edit, &TestHost);
+            assert_eq!(result.edit_result, edit_result);
+            assert_eq!(result.event.outcome, EventOutcome::Handled);
+            assert_eq!(result.event.action, PluginTuiAction::None);
+            assert_eq!(
+                surface.snapshot,
+                usize::from(edit_result == FocusedTextFieldEditResult::Applied)
+            );
+        }
     }
 
     #[test]

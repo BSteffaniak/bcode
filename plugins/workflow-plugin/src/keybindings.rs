@@ -100,13 +100,17 @@ fn custom(scope: &str) -> &'static [(&'static str, &'static str, &'static str)] 
         RUNS => RUN_ACTIONS,
         DISCOVER => DISCOVER_ACTIONS,
         AUTHOR => AUTHOR_ACTIONS,
+        EDIT | FORM => &[
+            ("undo", "Undo text edit", "ctrl+z"),
+            ("redo", "Redo text edit", "ctrl+shift+z"),
+        ],
         _ => &[],
     }
 }
 
 fn controls(scope: &str) -> &'static [ControlAction] {
     match scope {
-        FORM => &[
+        FORM | EDIT => &[
             ControlAction::Up,
             ControlAction::Down,
             ControlAction::Left,
@@ -135,7 +139,7 @@ fn controls(scope: &str) -> &'static [ControlAction] {
             ControlAction::FocusNext,
             ControlAction::FocusPrevious,
         ],
-        EDIT | SEARCH => &[
+        SEARCH => &[
             ControlAction::Cancel,
             ControlAction::Submit,
             ControlAction::Backspace,

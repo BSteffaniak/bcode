@@ -39,8 +39,10 @@ use bcode_code_review_models::{
 };
 use bcode_ipc::PluginServiceResponse;
 use bcode_plugin_sdk::tui::{
-    PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest, PluginSessionViewUpdate,
-    PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme,
+    FocusedTextFieldAdapter, FocusedTextFieldEdit, FocusedTextFieldEditResult,
+    FocusedTextFieldSnapshot, PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest,
+    PluginSessionViewUpdate, PluginTuiAction, PluginTuiEventResult,
+    PluginTuiFocusedTextFieldEditResult, PluginTuiHost, PluginTuiSurface, PluginTuiTheme,
 };
 use bcode_session_models::{
     ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
@@ -441,21 +443,62 @@ impl PluginTuiSurface for CodeReviewSurface {
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let mut needs_redraw = handle_effective_event(&mut self.app, event, host);
-        needs_redraw |= self.app.flush_pending_clipboard_text(host);
-        self.app.queue_selected_file_load();
-        if self.ensure_selected_repository_file_load(host) {
-            needs_redraw = true;
+        if self.app.comment_editor.is_some()
+            && self.app.prompt_state.is_none()
+            && self.app.import_state.is_none()
+            && self.app.publish_state.is_none()
+        {
+            return PluginTuiAction::None;
         }
-        if let Some(session_id) = self.app.take_session_to_open() {
-            PluginTuiAction::OpenSession { session_id }
-        } else if self.app.should_exit {
-            PluginTuiAction::Close { outcome: None }
-        } else if needs_redraw {
-            PluginTuiAction::Redraw
-        } else {
-            PluginTuiAction::None
+        handle_review_surface_event(self, event, host).action
+    }
+
+    fn handle_event_result(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        if self.app.comment_editor.is_some()
+            && self.app.prompt_state.is_none()
+            && self.app.import_state.is_none()
+            && self.app.publish_state.is_none()
+        {
+            return PluginTuiEventResult {
+                outcome: bmux_tui::event::EventOutcome::Ignored,
+                action: PluginTuiAction::None,
+            };
         }
+        handle_review_surface_event(self, event, host)
+    }
+
+    fn focused_text_field_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        if self.app.comment_editor.is_none()
+            || self.app.prompt_state.is_some()
+            || self.app.import_state.is_some()
+            || self.app.publish_state.is_some()
+        {
+            return PluginTuiEventResult {
+                outcome: bmux_tui::event::EventOutcome::Ignored,
+                action: PluginTuiAction::None,
+            };
+        }
+        handle_review_surface_event(self, event, host)
+    }
+
+    fn focused_text_field(&self) -> Option<FocusedTextFieldSnapshot> {
+        self.app.focused_comment_input()
+    }
+
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        edit: &FocusedTextFieldEdit,
+        _host: &dyn PluginTuiHost,
+    ) -> PluginTuiFocusedTextFieldEditResult {
+        self.app.apply_comment_input(edit)
     }
 
     fn session_navigation_finished(&mut self, session_id: SessionId, result: Result<(), String>) {
@@ -494,6 +537,57 @@ impl PluginTuiSurface for CodeReviewSurface {
                 PluginTuiAction::None
             }
         })
+    }
+}
+
+fn handle_review_surface_event(
+    surface: &mut CodeReviewSurface,
+    event: &Event,
+    host: &dyn PluginTuiHost,
+) -> PluginTuiEventResult {
+    let before = surface
+        .app
+        .comment_editor
+        .as_ref()
+        .map(|editor| (editor.buffer.edit_state(), editor.preview, editor.action));
+    let status_before = surface.app.status_message.clone();
+    let handled = handle_effective_event(&mut surface.app, event, host);
+    if !handled {
+        return PluginTuiEventResult {
+            outcome: bmux_tui::event::EventOutcome::Ignored,
+            action: PluginTuiAction::None,
+        };
+    }
+    let after = surface
+        .app
+        .comment_editor
+        .as_ref()
+        .map(|editor| (editor.buffer.edit_state(), editor.preview, editor.action));
+    let mut needs_redraw = before.is_none()
+        || before != after
+        || status_before != surface.app.status_message
+        || matches!(event, Event::Resize(_));
+    needs_redraw |= surface.app.flush_pending_clipboard_text(host);
+    surface.app.queue_selected_file_load();
+    if surface.ensure_selected_repository_file_load(host) {
+        needs_redraw = true;
+    }
+    let action = if let Some(session_id) = surface.app.take_session_to_open() {
+        PluginTuiAction::OpenSession { session_id }
+    } else if surface.app.should_exit {
+        PluginTuiAction::Close { outcome: None }
+    } else if needs_redraw {
+        PluginTuiAction::Redraw
+    } else {
+        PluginTuiAction::None
+    };
+    PluginTuiEventResult {
+        outcome: if needs_redraw {
+            bmux_tui::event::EventOutcome::Redraw
+        } else {
+            bmux_tui::event::EventOutcome::Handled
+        },
+        action,
     }
 }
 
@@ -2378,6 +2472,10 @@ fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
 }
 
 fn handle_effective_event(app: &mut ReviewApp, event: &Event, host: &dyn PluginTuiHost) -> bool {
+    #[cfg(test)]
+    if app.comment_editor.is_some() {
+        app.comment_input_invocations += 1;
+    }
     let scope = crate::keybindings::review_scope(app);
     let resolved_event;
     let event = if let Event::Key(stroke) = event {
@@ -2400,10 +2498,21 @@ fn handle_effective_event(app: &mut ReviewApp, event: &Event, host: &dyn PluginT
     } else {
         event
     };
-    handle_event_no_resize(app, event)
+    let handled = handle_event_no_resize(app, event);
+    app.observe_comment_input();
+    handled
 }
 
 fn handle_event_no_resize(app: &mut ReviewApp, event: &Event) -> bool {
+    if let Event::Focus(focus) = event {
+        app.terminal_focused = matches!(focus, FocusEvent::Gained);
+    }
+    let handled = handle_event_no_resize_inner(app, event);
+    app.observe_comment_input();
+    handled
+}
+
+fn handle_event_no_resize_inner(app: &mut ReviewApp, event: &Event) -> bool {
     if let Event::Key(stroke) = event
         && is_review_exit_key(*stroke)
     {
@@ -2540,7 +2649,11 @@ fn handle_comment_editor_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
                 stroke,
                 TextInputEnterBehavior::InsertNewline,
             ),
-            TextInputKeyOutcome::Edited | TextInputKeyOutcome::Submitted
+            TextInputKeyOutcome::Edited
+                | TextInputKeyOutcome::Submitted
+                | TextInputKeyOutcome::Redraw
+                | TextInputKeyOutcome::EdgeUp
+                | TextInputKeyOutcome::EdgeDown
         );
     }
     false
@@ -4988,8 +5101,10 @@ impl ReviewCommentAction {
 }
 
 /// Active draft comment editor.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReviewCommentEditor {
+    /// Completion metadata for this editor lifetime; geometry is retained from painting.
+    pub(crate) focused_input: FocusedTextFieldAdapter,
     /// Anchor being commented on.
     pub anchor: ReviewCommentAnchor,
     /// Editable comment buffer.
@@ -5004,11 +5119,26 @@ pub struct ReviewCommentEditor {
     pub mode: ReviewCommentEditorMode,
 }
 
+impl Clone for ReviewCommentEditor {
+    fn clone(&self) -> Self {
+        Self {
+            focused_input: FocusedTextFieldAdapter::new("bcode.code-review", "comment"),
+            anchor: self.anchor.clone(),
+            buffer: self.buffer.clone(),
+            preview: self.preview,
+            action: self.action,
+            existing_comment_count: self.existing_comment_count,
+            mode: self.mode.clone(),
+        }
+    }
+}
+
 impl ReviewCommentEditor {
     /// Create an editor for an anchor.
     #[must_use]
-    pub const fn new(anchor: ReviewCommentAnchor, action: ReviewCommentAction) -> Self {
+    pub fn new(anchor: ReviewCommentAnchor, action: ReviewCommentAction) -> Self {
         Self {
+            focused_input: FocusedTextFieldAdapter::new("bcode.code-review", "comment"),
             anchor,
             buffer: TextEditBuffer::new(),
             preview: false,
@@ -5022,6 +5152,7 @@ impl ReviewCommentEditor {
     #[must_use]
     pub fn edit(anchor: ReviewCommentAnchor, comment_id: String, body: String) -> Self {
         Self {
+            focused_input: FocusedTextFieldAdapter::new("bcode.code-review", "comment"),
             anchor,
             buffer: TextEditBuffer::from_text(&body),
             preview: false,
@@ -5553,6 +5684,11 @@ pub struct ReviewApp {
     pub workspace_materialization_failed: bool,
     /// Active draft editor, if open.
     pub comment_editor: Option<ReviewCommentEditor>,
+    /// Whether the terminal currently owns focus.
+    pub(crate) terminal_focused: bool,
+    pub(crate) comment_input_visible: bool,
+    #[cfg(test)]
+    comment_input_invocations: usize,
     /// External review import awaiting provider discovery/invocation.
     pub pending_external_import_request: Option<PendingExternalImportRequest>,
     /// Discovered external review importers.
@@ -5644,6 +5780,60 @@ pub struct ReviewApp {
 }
 
 impl ReviewApp {
+    pub(crate) fn observe_comment_input(&mut self) {
+        let eligible = self.terminal_focused
+            && self.comment_input_visible
+            && self.prompt_state.is_none()
+            && self.import_state.is_none()
+            && self.publish_state.is_none()
+            && !self.should_exit;
+        if let Some(editor) = &mut self.comment_editor {
+            editor
+                .focused_input
+                .observe(&editor.buffer, eligible && !editor.preview);
+        }
+    }
+
+    fn focused_comment_input(&self) -> Option<FocusedTextFieldSnapshot> {
+        if !self.terminal_focused
+            || !self.comment_input_visible
+            || self.prompt_state.is_some()
+            || self.import_state.is_some()
+            || self.publish_state.is_some()
+            || self.should_exit
+        {
+            return None;
+        }
+        let editor = self.comment_editor.as_ref()?;
+        if editor.preview {
+            return None;
+        }
+        editor.focused_input.snapshot(&editor.buffer)
+    }
+
+    fn apply_comment_input(
+        &mut self,
+        edit: &FocusedTextFieldEdit,
+    ) -> PluginTuiFocusedTextFieldEditResult {
+        self.observe_comment_input();
+        if self.focused_comment_input().is_none() {
+            return PluginTuiFocusedTextFieldEditResult::rejected(
+                bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+            );
+        }
+        let editor = self
+            .comment_editor
+            .as_mut()
+            .expect("validated comment editor");
+        let edit_result = editor.focused_input.apply(&mut editor.buffer, edit);
+        let event = if edit_result == FocusedTextFieldEditResult::Applied {
+            PluginTuiEventResult::from_legacy(PluginTuiAction::Redraw)
+        } else {
+            PluginTuiEventResult::consumed()
+        };
+        PluginTuiFocusedTextFieldEditResult { edit_result, event }
+    }
+
     /// Create a new review app.
     #[must_use]
     pub fn new(review: ReviewSummary) -> Self {
@@ -5679,6 +5869,10 @@ impl ReviewApp {
             workspace_materialization_in_progress: false,
             workspace_materialization_failed: false,
             comment_editor: None,
+            terminal_focused: true,
+            comment_input_visible: false,
+            #[cfg(test)]
+            comment_input_invocations: 0,
             pending_external_import_request: None,
             external_importers: Vec::new(),
             import_state: None,
@@ -12682,9 +12876,18 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct ClipboardTestHost {
         copied: Mutex<Vec<String>>,
+        keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
     }
 
     impl PluginTuiHost for ClipboardTestHost {
+        fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {
+            self.keymap.action_for_key(scope, stroke).map(str::to_owned)
+        }
+
+        fn keymap_is_overridden(&self, scope: &str, stroke: KeyStroke) -> bool {
+            self.keymap.is_overridden_key(scope, stroke)
+        }
+
         fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
 
         fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
@@ -12794,6 +12997,299 @@ pub(crate) mod tests {
                 .expect("changed identity invalidates cache")
                 .is_none()
         );
+    }
+
+    fn paint_comment_input(app: &mut ReviewApp, width: u16, height: u16) {
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        crate::code_review_tui_render::render(
+            app,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            None,
+        );
+    }
+
+    fn comment_completion(app: &ReviewApp, replacement: &str) -> FocusedTextFieldEdit {
+        use bcode_plugin_sdk::composer::{ComposerEdit, ComposerTextRange};
+        let expected = app
+            .focused_comment_input()
+            .expect("visible focused comment");
+        let edit = ComposerEdit {
+            document_id: expected.document.document_id.clone(),
+            revision: expected.document.revision,
+            range: ComposerTextRange {
+                start: 0,
+                end: expected.document.text.len(),
+            },
+            expected_text: expected.document.text.clone(),
+            replacement: replacement.to_owned(),
+            cursor: replacement.len(),
+        };
+        FocusedTextFieldEdit { expected, edit }
+    }
+
+    #[test]
+    fn comment_completion_updates_live_buffer_and_history_without_submitting() {
+        let mut app = sample_app();
+        app.open_review_comment_editor();
+        app.comment_editor.as_mut().unwrap().buffer.insert_str("#é");
+        paint_comment_input(&mut app, 100, 30);
+        let request = comment_completion(&app, "review 界🙂");
+        let result = app.apply_comment_input(&request);
+        assert_eq!(result.edit_result, FocusedTextFieldEditResult::Applied);
+        assert!(app.draft_comments.is_empty());
+        let editor = app.comment_editor.as_mut().unwrap();
+        assert_eq!(editor.buffer.text(), "review 界🙂");
+        assert!(editor.buffer.undo());
+        assert_eq!(editor.buffer.text(), "#é");
+        assert!(editor.buffer.redo());
+        assert_eq!(editor.buffer.text(), "review 界🙂");
+        assert!(app.focused_comment_input().is_none());
+        paint_comment_input(&mut app, 100, 30);
+        assert!(app.save_comment_editor());
+        assert!(
+            app.draft_comments
+                .values()
+                .flatten()
+                .any(|comment| comment.body == "review 界🙂")
+        );
+    }
+
+    #[test]
+    fn comment_completion_noop_and_selection_rejection_are_consumed() {
+        let mut app = sample_app();
+        app.open_review_comment_editor();
+        app.comment_editor.as_mut().unwrap().buffer = TextEditBuffer::from_text("hello");
+        paint_comment_input(&mut app, 100, 30);
+        let request = comment_completion(&app, "hello");
+        let state = app.comment_editor.as_ref().unwrap().buffer.edit_state();
+        let result = app.apply_comment_input(&request);
+        assert_eq!(result.edit_result, FocusedTextFieldEditResult::Noop);
+        assert_eq!(result.event.outcome, bmux_tui::event::EventOutcome::Handled);
+        assert_eq!(
+            app.comment_editor.as_ref().unwrap().buffer.edit_state(),
+            state
+        );
+        app.comment_editor
+            .as_mut()
+            .unwrap()
+            .buffer
+            .select_to_wrapped_position(70, 0, 0);
+        let result = app.apply_comment_input(&request);
+        assert!(matches!(
+            result.edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+        assert_eq!(result.event.outcome, bmux_tui::event::EventOutcome::Handled);
+        assert!(app.draft_comments.is_empty());
+        assert!(
+            app.comment_editor
+                .as_ref()
+                .unwrap()
+                .buffer
+                .selection()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn comment_completion_requires_retained_visible_focus_and_current_lifetime() {
+        let mut app = sample_app();
+        app.open_file_comment_editor();
+        app.comment_editor
+            .as_mut()
+            .unwrap()
+            .buffer
+            .insert_str("note");
+        assert!(app.focused_comment_input().is_none());
+        paint_comment_input(&mut app, 100, 30);
+        let request = comment_completion(&app, "completed");
+        handle_event_no_resize(&mut app, &Event::Focus(FocusEvent::Lost));
+        handle_event_no_resize(&mut app, &Event::Focus(FocusEvent::Gained));
+        paint_comment_input(&mut app, 100, 30);
+        assert!(matches!(
+            app.apply_comment_input(&request).edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+        app.comment_editor.as_mut().unwrap().preview = true;
+        paint_comment_input(&mut app, 100, 30);
+        assert!(app.focused_comment_input().is_none());
+        app.comment_editor.as_mut().unwrap().preview = false;
+        paint_comment_input(&mut app, 0, 0);
+        assert!(app.focused_comment_input().is_none());
+        paint_comment_input(&mut app, 10, 4);
+        assert!(app.focused_comment_input().is_none());
+        app.open_file_comment_editor();
+        app.comment_editor
+            .as_mut()
+            .unwrap()
+            .buffer
+            .insert_str("note");
+        paint_comment_input(&mut app, 100, 30);
+        assert!(matches!(
+            app.apply_comment_input(&request).edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+        app.comment_editor.as_mut().unwrap().mode = ReviewCommentEditorMode::Edit {
+            comment_id: "draft-id".into(),
+            previous_body: "note".into(),
+        };
+        paint_comment_input(&mut app, 100, 30);
+        let request = comment_completion(&app, "draft update");
+        assert_eq!(
+            app.apply_comment_input(&request).edit_result,
+            FocusedTextFieldEditResult::Applied
+        );
+        assert!(matches!(
+            app.comment_editor.as_ref().unwrap().mode,
+            ReviewCommentEditorMode::Edit { .. }
+        ));
+    }
+
+    #[test]
+    fn hidden_then_revealed_comment_rejects_pre_hide_completion() {
+        let mut app = sample_app();
+        app.open_review_comment_editor();
+        app.comment_editor.as_mut().unwrap().buffer = TextEditBuffer::from_text("same text");
+        paint_comment_input(&mut app, 100, 30);
+        let request = comment_completion(&app, "completed");
+        paint_comment_input(&mut app, 10, 4);
+        assert!(app.focused_comment_input().is_none());
+        paint_comment_input(&mut app, 100, 30);
+        assert!(app.focused_comment_input().is_some());
+        let state = app.comment_editor.as_ref().unwrap().buffer.edit_state();
+        let result = app.apply_comment_input(&request);
+        assert!(matches!(
+            result.edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+        assert_eq!(result.event.outcome, bmux_tui::event::EventOutcome::Handled);
+        assert_eq!(
+            app.comment_editor.as_ref().unwrap().buffer.edit_state(),
+            state
+        );
+        assert!(app.draft_comments.is_empty());
+        let current = comment_completion(&app, "completed");
+        assert_eq!(
+            app.apply_comment_input(&current).edit_result,
+            FocusedTextFieldEditResult::Applied
+        );
+    }
+
+    #[test]
+    fn comment_owner_shared_conformance_preserves_semantics() {
+        let mut app = sample_app();
+        app.open_review_comment_editor();
+        let editor = app.comment_editor.as_mut().unwrap();
+        editor.existing_comment_count = 2;
+        editor.buffer.insert_str("reply 界🙂");
+        paint_comment_input(&mut app, 100, 30);
+        bcode_plugin_sdk::tui::focused_input::test_support::assert_noop_and_stale_preserve_field(
+            &mut app,
+            ReviewApp::focused_comment_input,
+            |owner, edit| owner.apply_comment_input(edit).edit_result,
+        );
+        assert!(app.draft_comments.is_empty());
+        assert_eq!(
+            app.comment_editor.as_ref().unwrap().existing_comment_count,
+            2
+        );
+        let request = comment_completion(&app, "completed reply");
+        assert_eq!(
+            app.apply_comment_input(&request).edit_result,
+            FocusedTextFieldEditResult::Applied
+        );
+        assert_eq!(
+            app.comment_editor.as_ref().unwrap().existing_comment_count,
+            2
+        );
+        assert!(app.draft_comments.is_empty());
+        app.open_file_picker();
+        paint_comment_input(&mut app, 100, 30);
+        assert!(app.focused_comment_input().is_none());
+        assert!(matches!(
+            app.apply_comment_input(&request).edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn ignored_comment_input_reaches_parent_once_and_never_retries_editor() {
+        let mut app = sample_app();
+        app.open_review_comment_editor();
+        let mut surface = CodeReviewSurface {
+            client: BcodeClient::default_endpoint(),
+            repo_path: PathBuf::from("/repo"),
+            review_target: ReviewOpenTarget::WorkingTreeUnstaged,
+            app,
+            theme: None,
+            file_store: AsyncValueStore::new(),
+            agent_streams: ReviewAgentStreamStore::default(),
+        };
+        let host = ClipboardTestHost {
+            keymap: bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                crate::keybindings::actions(),
+                BTreeMap::new(),
+            )
+            .expect("effective review keymap"),
+            ..ClipboardTestHost::default()
+        };
+        let event = Event::Paste("live input".into());
+        let result = surface.focused_text_field_event(&event, &host);
+        assert_ne!(result.outcome, bmux_tui::event::EventOutcome::Ignored);
+        assert_eq!(
+            surface.app.comment_editor.as_ref().unwrap().buffer.text(),
+            "live input"
+        );
+        assert!(matches!(
+            surface.handle_event(&event, &host),
+            PluginTuiAction::None
+        ));
+        assert_eq!(
+            surface.app.comment_editor.as_ref().unwrap().buffer.text(),
+            "live input"
+        );
+        let invocations_before = surface.app.comment_input_invocations;
+        let event = Event::Key(bmux_keyboard::parse_key_stroke("alt+z").unwrap());
+        let result = surface.focused_text_field_event(&event, &host);
+        assert_eq!(result.outcome, bmux_tui::event::EventOutcome::Ignored);
+        let mut parent_calls = 0;
+        if result.outcome == bmux_tui::event::EventOutcome::Ignored
+            && surface.handle_event_result(&event, &host).outcome
+                == bmux_tui::event::EventOutcome::Ignored
+        {
+            parent_calls += 1;
+        }
+        assert_eq!(parent_calls, 1);
+        assert_eq!(
+            surface.app.comment_input_invocations,
+            invocations_before + 1
+        );
+
+        surface.app.comment_editor.as_mut().unwrap().buffer = TextEditBuffer::new();
+        surface.app.selected_file = usize::MAX; // no unrelated file-load redraw
+        let event = Event::Key(bmux_keyboard::parse_key_stroke("backspace").unwrap());
+        let before = surface
+            .app
+            .comment_editor
+            .as_ref()
+            .unwrap()
+            .buffer
+            .edit_state();
+        let result = surface.focused_text_field_event(&event, &host);
+        assert_eq!(result.outcome, bmux_tui::event::EventOutcome::Handled);
+        assert!(matches!(result.action, PluginTuiAction::None));
+        assert_eq!(
+            surface
+                .app
+                .comment_editor
+                .as_ref()
+                .unwrap()
+                .buffer
+                .edit_state(),
+            before
+        );
+        assert!(surface.app.draft_comments.is_empty());
     }
 
     pub fn sample_app() -> ReviewApp {

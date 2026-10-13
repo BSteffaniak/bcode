@@ -100,7 +100,7 @@ impl ComposerInteraction {
             start: range.start,
             end: range.end,
         });
-        let new_scope = self.scope.as_ref() != Some(&scope) || self.focused_field.is_some();
+        let new_scope = self.scope.as_ref() != Some(&scope);
         self.focused_field = None;
         let changed = new_scope
             || self.selection != selection
@@ -176,7 +176,8 @@ impl ComposerInteraction {
                     .focused_field
                     .as_ref()
                     .is_some_and(|previous| previous.identity == field.identity);
-            let finished = same_owner
+            let finished = self.scope.as_ref() == Some(&scope)
+                && (same_owner || self.focused_field.is_none())
                 && self.dismissed
                 && self.document.as_ref().is_some_and(|document| {
                     document.text == field.document.text
@@ -402,64 +403,6 @@ impl ComposerInteraction {
             .map(|candidate| candidate.edit.clone())
     }
 
-    /// Validate everything before touching the live editor; all editing uses BMUX mechanics.
-    pub fn apply(&mut self, buffer: &mut TextEditBuffer) -> bool {
-        let Some(document) = self.document.as_ref() else {
-            return false;
-        };
-        let selection = buffer.selection().map(|range| ComposerTextRange {
-            start: range.start,
-            end: range.end,
-        });
-        if buffer.text() != document.text
-            || buffer.cursor_byte_index() != document.cursor
-            || selection != self.selection
-        {
-            self.cancel();
-            return false;
-        }
-        let Some(edit) = self.selected_edit() else {
-            return false;
-        };
-        let Ok(result) = edit.apply(document) else {
-            return false;
-        };
-        let continuation = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .candidates
-                    .get(self.list.focused().or_else(|| self.list.selected())?)
-            })
-            .map_or(ComposerContinuation::Finish, |candidate| {
-                candidate.continuation
-            });
-        // The live BMUX editor validates positions and records one transaction,
-        // preserving its pre-edit cursor/selection and existing undo/redo history.
-        let expected = buffer.edit_state();
-        if buffer.replace_byte_range(
-            &expected,
-            edit.range.start..edit.range.end,
-            &edit.replacement,
-            result.cursor,
-            None,
-        ) != Ok(true)
-        {
-            return false;
-        }
-        let route = self.route.clone();
-        self.cancel();
-        if continuation == ComposerContinuation::Finish {
-            self.document = Some(result);
-            self.selection = None;
-            self.dismissed = true;
-        } else {
-            self.reactivate_route = route;
-        }
-        true
-    }
-
     pub const fn take_reactivation(&mut self) -> Option<PluginOwnedComposerContribution> {
         self.reactivate_route.take()
     }
@@ -518,7 +461,66 @@ pub mod tests {
         COMPOSER_INTERFACE_ID, ComposerCandidate, ComposerContribution,
     };
 
-    fn scope() -> ComposerScope {
+    // Transaction fixture for legacy contributor-state tests; production acceptance
+    // routes through the owner adapter and its explicit edit result.
+    fn apply_fixture(state: &mut ComposerInteraction, buffer: &mut TextEditBuffer) -> bool {
+        let Some(document) = state.document.as_ref() else {
+            return false;
+        };
+        let selection = buffer.selection().map(|range| ComposerTextRange {
+            start: range.start,
+            end: range.end,
+        });
+        if buffer.text() != document.text
+            || buffer.cursor_byte_index() != document.cursor
+            || selection != state.selection
+        {
+            state.cancel();
+            return false;
+        }
+        let Some(edit) = state.selected_edit() else {
+            return false;
+        };
+        let Ok(result) = edit.apply(document) else {
+            return false;
+        };
+        let continuation = state
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .candidates
+                    .get(state.list.focused().or_else(|| state.list.selected())?)
+            })
+            .map_or(ComposerContinuation::Finish, |candidate| {
+                candidate.continuation
+            });
+        // The live BMUX editor validates positions and records one transaction,
+        // preserving its pre-edit cursor/selection and existing undo/redo history.
+        let expected = buffer.edit_state();
+        if buffer.replace_byte_range(
+            &expected,
+            edit.range.start..edit.range.end,
+            &edit.replacement,
+            result.cursor,
+            None,
+        ) != Ok(true)
+        {
+            return false;
+        }
+        let route = state.route.clone();
+        state.cancel();
+        if continuation == ComposerContinuation::Finish {
+            state.document = Some(result);
+            state.selection = None;
+            state.dismissed = true;
+        } else {
+            state.reactivate_route = route;
+        }
+        true
+    }
+
+    pub fn scope() -> ComposerScope {
         ComposerScope {
             session: None,
             agent_id: Some("build".into()),
@@ -645,6 +647,20 @@ pub mod tests {
     }
 
     #[test]
+    fn unpainted_observation_retains_dismissal_until_an_ordinary_edit() {
+        let mut state = ComposerInteraction::default();
+        let mut buffer = TextEditBuffer::from_text("@topic");
+        state.observe(scope(), &buffer);
+        state.dismiss();
+        assert!(!state.observe(scope(), &buffer));
+        assert!(!state.needs_activation());
+        buffer.insert_str("x");
+        assert!(state.observe(scope(), &buffer));
+        assert_eq!(state.document().unwrap().text, "@topicx");
+        assert!(state.needs_activation());
+    }
+
+    #[test]
     fn loading_commands_consume_without_presentation_or_candidate_effect() {
         use bmux_tui_components::completion::CompletionCommand;
         let mut state = ComposerInteraction::default();
@@ -667,7 +683,7 @@ pub mod tests {
         let mut buffer = TextEditBuffer::from_text("#topic");
         let request = begin(&mut state, &buffer);
         assert!(state.complete(completion(&request)));
-        assert!(state.apply(&mut buffer));
+        assert!(apply_fixture(&mut state, &mut buffer));
         assert_eq!(buffer.text(), "主题 👩‍💻");
         assert_eq!(buffer.cursor_byte_index(), buffer.text().len());
         buffer.insert_str("x");
@@ -675,7 +691,7 @@ pub mod tests {
         state.complete(completion(&request));
         buffer.insert_str("!");
         let before = buffer.clone();
-        assert!(!state.apply(&mut buffer));
+        assert!(!apply_fixture(&mut state, &mut buffer));
         assert_eq!(buffer.text(), before.text());
     }
 
@@ -689,7 +705,7 @@ pub mod tests {
         reply.snapshot.as_mut().unwrap().candidates[0].continuation =
             ComposerContinuation::Reactivate;
         state.complete(reply);
-        assert!(state.apply(&mut buffer));
+        assert!(apply_fixture(&mut state, &mut buffer));
         state.observe(scope(), &buffer);
         let route = state.take_reactivation().unwrap();
         assert_eq!(route.plugin_id, "example.topics");
@@ -707,7 +723,7 @@ pub mod tests {
         edit.replacement = "主题 finished 👩‍💻".into();
         edit.cursor = edit.replacement.len();
         state.complete(finished);
-        assert!(state.apply(&mut buffer));
+        assert!(apply_fixture(&mut state, &mut buffer));
         assert_eq!(buffer.text(), "主题 finished 👩‍💻");
         assert!(!state.observe(scope(), &buffer));
         assert!(!state.needs_activation());
@@ -733,7 +749,7 @@ pub mod tests {
                 edit.cursor = request.document.cursor;
             }
             assert!(state.complete(reply));
-            assert!(!state.apply(&mut buffer));
+            assert!(!apply_fixture(&mut state, &mut buffer));
             assert_eq!(buffer.edit_state(), before);
             assert!(!buffer.can_undo());
             assert!(buffer.can_redo());
@@ -750,7 +766,7 @@ pub mod tests {
         let mut reply = completion(&request);
         reply.snapshot.as_mut().unwrap().candidates[0].edit.cursor = 1;
         assert!(state.complete(reply));
-        assert!(!state.apply(&mut buffer));
+        assert!(!apply_fixture(&mut state, &mut buffer));
         assert_eq!(buffer.text(), "#topic");
         let request = begin(&mut state, &buffer);
         let mut reply = completion(&request);
@@ -761,7 +777,7 @@ pub mod tests {
         // where legacy Absolute motions accepted a UTF-8 boundary inside one.
         let before = buffer.edit_state();
         assert!(state.complete(reply));
-        assert!(!state.apply(&mut buffer));
+        assert!(!apply_fixture(&mut state, &mut buffer));
         assert_eq!(buffer.edit_state(), before);
     }
 

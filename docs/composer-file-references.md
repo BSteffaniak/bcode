@@ -6,6 +6,48 @@ Accepting a file replaces only the active token. Paths containing whitespace, qu
 
 References insert text only: selecting a path does not attach or read its contents into model context. Normal authorized tools remain responsible for reading referenced files. Bcode consumes the published BMUX undo API: accepting a changed completion applies one validated live-editor transaction. Undo restores the prior text, cursor and selection; redo restores the accepted edit. Rejected or text-identical edits leave the editor and undo/redo history unchanged.
 
+## Focused-input integration
+
+Completion is a transient interaction attached to the focused editor, not a separate
+modal focus owner. The terminal host composes input once: completion, then the
+owner's focused editor hook, then its surface/application fallback. Only `Ignored`
+propagates; `Handled` stops without requiring a redraw or semantic effect. A
+consumed acceptance never also submits the parent form. Outside-popup pointer
+input dismisses completion and proceeds through ordinary routing once, without
+replaying the event. Application-level interrupts and navigation retain their
+explicit priority policy.
+
+Terminal owners opt in through `PluginTuiSurface` or
+`TerminalInteractionRenderer`, using `FocusedTextFieldAdapter` at the SDK's TUI
+boundary:
+
+* Construct an adapter for each editor lifetime; reset it when the editor is replaced.
+* Observe the live editor after edits, selection/cursor changes, focus changes and
+  eligibility changes. Secret and non-prose controls do not opt in.
+* Record content and caret geometry from the actual retained visible BMUX
+  presentation. A hidden or clipped caret must observe ineligible state; revealing
+  it again invalidates requests from the earlier visible presentation.
+* Route ordinary editor input through `focused_text_field_event`. Surface fallback
+  must not retry an editor that already received the event.
+* Apply replacements through `apply_focused_text_field_edit_result`. `Applied`,
+  `Noop` and `Rejected` are separate from event consumption, redraw and plugin
+  effects. Only `Applied` updates owner semantic state; no-op and rejected edits
+  preserve editor state and history.
+
+The adapter owns document validation, lifetime/generation fencing and atomic live
+buffer replacement. Owners retain eligibility and semantic change handling; the
+host does not recognize plugin types or infer an applied edit from a redraw.
+The main composer uses this same edit contract, with draft autosave and history
+navigation policy kept in its owner adapter.
+
+Current opt-ins include question custom answers, Loop/Goal Prompt and Condition,
+review comments, and workflow generation prose. Workflow inspector and wait fields
+require explicitly marked plain-text prose (`contentMediaType = "text/plain"`)
+and exclude secret, structured and ambiguous schema controls. Unannotated workflow
+strings, credentials, numeric controls, paths and picker filters are not blanket
+completion targets. Choosing a reference still inserts text only and does not
+grant resource access.
+
 ## Configuration
 
 ### Composer interaction keys

@@ -1250,7 +1250,7 @@ impl ChatLoopState {
         edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
         client: &BcodeClient,
         launch: super::plugin_surface_host::FreshSessionSettings,
-    ) -> Option<bcode_plugin_sdk::tui::PluginTuiEventResult> {
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult> {
         if self.root_plugin_surface_is_suspended() {
             return None;
         }
@@ -1262,7 +1262,7 @@ impl ChatLoopState {
             launch,
             std::sync::Arc::clone(&surface.active_tasks),
         );
-        let result = active.apply_focused_text_field_edit(edit, &host);
+        let result = active.apply_focused_text_field_edit_result(edit, &host);
         surface.effects_pending = true;
         surface.invalidation.request();
         Some(result)
@@ -1312,7 +1312,11 @@ impl ChatLoopState {
         };
         surface.effects_pending = true;
         surface.invalidation.request();
-        Some(active.handle_event_result(event, &host))
+        Some(super::plugin_surface_host::compose_surface_input(
+            active.as_mut(),
+            event,
+            &host,
+        ))
     }
 
     pub fn root_plugin_surface_invalidation(&self) -> Option<bmux_tui_runtime::InvalidationSignal> {
@@ -2092,18 +2096,30 @@ impl ChatLoopState {
     pub fn apply_interactive_focused_text_field_edit(
         &mut self,
         edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
-    ) -> InteractiveSurfaceEventOutcome {
+    ) -> (
+        bcode_plugin_sdk::tui::FocusedTextFieldEditResult,
+        InteractiveSurfaceEventOutcome,
+    ) {
         if self
             .interactive_focused_text_field()
             .is_none_or(|current| edit.validate(&current).is_err())
         {
-            return InteractiveSurfaceEventOutcome::Consumed;
+            return (
+                bcode_plugin_sdk::tui::FocusedTextFieldEditResult::Rejected(
+                    bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+                ),
+                InteractiveSurfaceEventOutcome::Consumed,
+            );
         }
-        self.interactive_surface
-            .as_mut()
-            .map_or(InteractiveSurfaceEventOutcome::Consumed, |surface| {
-                surface.apply_focused_text_field_edit(edit)
-            })
+        self.interactive_surface.as_mut().map_or(
+            (
+                bcode_plugin_sdk::tui::FocusedTextFieldEditResult::Rejected(
+                    bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+                ),
+                InteractiveSurfaceEventOutcome::Consumed,
+            ),
+            |surface| surface.apply_focused_text_field_edit(edit),
+        )
     }
 
     pub(super) fn routes_non_mouse_event_to_interactive_surface(

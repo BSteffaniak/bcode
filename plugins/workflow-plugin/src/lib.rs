@@ -8,6 +8,8 @@ mod authoring_tui;
 #[cfg(feature = "static-bundled")]
 mod cli;
 mod keybindings;
+mod prose;
+mod prose_editor;
 mod tools;
 pub mod tui;
 

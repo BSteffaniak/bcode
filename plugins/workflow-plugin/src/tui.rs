@@ -1,5 +1,10 @@
 //! Workflow graph/status TUI surface.
 
+use bcode_plugin_sdk::tui::{
+    FocusedTextFieldAdapter, FocusedTextFieldEdit, FocusedTextFieldEditResult,
+    FocusedTextFieldSnapshot, PluginTuiEventResult, PluginTuiFocusedTextFieldEditResult,
+};
+
 use crate::keybindings::{self, Hints};
 
 use bcode_plugin_sdk::tui::{
@@ -400,6 +405,9 @@ struct WorkflowInputField {
     name: String,
     kind: WorkflowInputFieldKind,
     required: bool,
+    prose: bool,
+    secret: bool,
+    completion: std::cell::RefCell<FocusedTextFieldAdapter>,
     editor: TextInputState,
 }
 
@@ -522,6 +530,15 @@ impl WorkflowInputForm {
         }
     }
 
+    fn hide_completion_fields(&self) {
+        for field in &self.fields {
+            field
+                .completion
+                .borrow_mut()
+                .observe_input(&field.editor, false);
+        }
+    }
+
     fn validate(&self) -> Result<serde_json::Value, String> {
         let value = if self.fields.is_empty() {
             serde_json::from_str::<serde_json::Value>(self.editor.buffer().text())
@@ -612,6 +629,13 @@ fn simple_object_fields(
             name: name.clone(),
             kind,
             required: required.contains(name.as_str()),
+            prose: crate::prose::prose_field(schema, name),
+            secret: crate::prose::is_secret_schema(schema)
+                || crate::prose::is_secret_schema(property),
+            completion: std::cell::RefCell::new(FocusedTextFieldAdapter::new(
+                "workflow.wait",
+                name,
+            )),
             editor: TextInputState::new(TextEditBuffer::from_text(initial)),
         });
     }
@@ -886,6 +910,14 @@ impl WorkflowStatusSurface {
                 "Action target is stale or unavailable; confirmation was not opened".to_string(),
             );
             return PluginTuiAction::Redraw;
+        }
+        if let Some(form) = &self.input_form {
+            for field in &form.fields {
+                field
+                    .completion
+                    .borrow_mut()
+                    .observe_input(&field.editor, false);
+            }
         }
         self.pending_confirmation = Some(PendingWorkflowConfirmation {
             title: title.into(),
@@ -3600,9 +3632,18 @@ impl WorkflowStatusSurface {
                     } else {
                         form.focused_field = (form.focused_field + 1) % form.fields.len();
                     }
+                    for (index, field) in form.fields.iter().enumerate() {
+                        field.completion.borrow_mut().observe_input(
+                            &field.editor,
+                            field.prose && !field.secret && index == form.focused_field,
+                        );
+                    }
                     return PluginTuiAction::Redraw;
                 }
                 let field = &mut form.fields[form.focused_field];
+                if field.prose || field.secret {
+                    return PluginTuiAction::None;
+                }
                 let _area = if field.editor.content_area().is_empty() {
                     Rect::new(0, 0, 80, 1)
                 } else {
@@ -4212,9 +4253,17 @@ impl WorkflowStatusSurface {
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
-        form: &WorkflowInputForm,
+        form: &mut WorkflowInputForm,
     ) {
+        for field in &form.fields {
+            field.completion.borrow_mut().painted_input(
+                &field.editor,
+                Rect::default(),
+                Rect::default(),
+            );
+        }
         if area.is_empty() {
+            form.hide_completion_fields();
             return;
         }
         let pane = Pane::new()
@@ -4233,6 +4282,7 @@ impl WorkflowStatusSurface {
         paint_workflow_component(&shell, state.area, frame);
         let inner = pane.inner_area(&state);
         if inner.height == 0 {
+            form.hide_completion_fields();
             return;
         }
         frame.write_line(
@@ -4281,8 +4331,7 @@ impl WorkflowStatusSurface {
         let editor_height = inner
             .bottom()
             .saturating_sub(editor_y)
-            .saturating_sub(footer_rows)
-            .max(1);
+            .saturating_sub(footer_rows);
         let editor_area = Rect::new(inner.x, editor_y, inner.width, editor_height);
         let styles = TextInputBoxStyles {
             text: theme.text,
@@ -4312,13 +4361,16 @@ impl WorkflowStatusSurface {
             paint_workflow_component(&component, editor_area, frame);
         } else {
             let row_height = 3_u16;
-            for (index, field) in form.fields.iter().enumerate() {
+            for (index, field) in form.fields.iter_mut().enumerate() {
                 let row = u16::try_from(index).unwrap_or(u16::MAX);
                 let y = editor_y.saturating_add(row.saturating_mul(row_height));
                 if y >= inner.bottom().saturating_sub(footer_rows) {
                     break;
                 }
-                let editor = field.editor.clone();
+                if field.secret {
+                    continue;
+                }
+                let editor = std::mem::take(&mut field.editor);
                 let kind = match field.kind {
                     WorkflowInputFieldKind::String => "text",
                     WorkflowInputFieldKind::Boolean => "true/false",
@@ -4335,9 +4387,13 @@ impl WorkflowStatusSurface {
                 .required(field.required)
                 .help(kind)
                 .policy(
-                    TextInputBoxPolicy::field()
-                        .focused(index == form.focused_field)
-                        .rows(1, Some(1)),
+                    (if field.prose {
+                        TextInputBoxPolicy::bare()
+                    } else {
+                        TextInputBoxPolicy::field()
+                    })
+                    .focused(index == form.focused_field)
+                    .rows(1, Some(1)),
                 )
                 .styles(styles);
                 paint_workflow_component(
@@ -4350,6 +4406,50 @@ impl WorkflowStatusSurface {
                     ),
                     frame,
                 );
+                field.editor = retained.into_inner();
+                if index == form.focused_field && field.prose {
+                    let anchor = frame
+                        .cursor()
+                        .filter(|cursor| cursor.visible)
+                        .map_or_else(Rect::default, |cursor| {
+                            Rect::new(cursor.position.x, cursor.position.y, 1, 1)
+                        });
+                    let local = field.editor.content_area();
+                    let content = Rect::new(
+                        inner.x.saturating_add(local.x),
+                        y.saturating_add(local.y),
+                        local.width,
+                        local.height,
+                    )
+                    .intersection(frame.clip());
+                    field
+                        .editor
+                        .set_content_area(content, &TextInputPolicy::chat_composer());
+                    let visible = !content.is_empty()
+                        && !anchor.is_empty()
+                        && content.intersection(anchor) == anchor;
+                    field
+                        .completion
+                        .borrow_mut()
+                        .observe_input(&field.editor, visible);
+                    field
+                        .completion
+                        .borrow_mut()
+                        .painted_input(&field.editor, content, anchor);
+                }
+            }
+        }
+        for field in &form.fields {
+            if field
+                .completion
+                .borrow()
+                .snapshot_input(&field.editor)
+                .is_none()
+            {
+                field
+                    .completion
+                    .borrow_mut()
+                    .observe_input(&field.editor, false);
             }
         }
         let mut footer_y = inner.bottom().saturating_sub(1);
@@ -4388,38 +4488,13 @@ impl WorkflowStatusSurface {
         );
     }
 
-    fn render_themed(
+    fn prepare_workspace_presentation(
         &mut self,
-        area: Rect,
-        frame: &mut PaintCx<'_, '_>,
-        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
+        content: Rect,
+        mode_tabs: Rect,
+        mode_content: Rect,
+        theme: WorkflowSurfaceTheme,
     ) {
-        let theme = WorkflowSurfaceTheme::resolve(theme);
-        frame.fill(LocalRect::terminal(area), " ", theme.canvas);
-        let pane = Pane::new()
-            .title(Line::from_spans(vec![Span::styled(
-                "Workflow Status",
-                theme.focused.add_modifier(Modifier::BOLD),
-            )]))
-            .padding(Insets::new(1, 1, 1, 1))
-            .styles(PaneStyles {
-                background: Some(theme.canvas),
-                border: theme.component.border,
-                focused_border: theme.focused,
-            });
-        let pane_state = PaneState::new(area);
-        let retained = std::cell::Cell::new(pane_state);
-        let shell =
-            PaneComponent::new("workflow.pane", pane.clone(), &retained, TextBlock::new(""));
-        paint_workflow_component(&shell, pane_state.area, frame);
-        let content = pane.inner_area(&pane_state);
-        let mode_tabs = Rect::new(content.x, content.y, content.width, 1);
-        let mode_content = Rect::new(
-            content.x,
-            content.y.saturating_add(1),
-            content.width,
-            content.height.saturating_sub(1),
-        );
         self.workspace_mode_state
             .set_selected(Some(self.workspace_mode.index()));
         self.discover_areas = Self::calculate_discover_areas(content);
@@ -4453,6 +4528,41 @@ impl WorkflowStatusSurface {
             .set_selected(Some(self.session_activity_tab));
         self.action_row_state.interaction.focused =
             self.workspace_focus == WorkflowWorkspaceFocus::Actions;
+    }
+
+    fn render_themed(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
+    ) {
+        let theme = WorkflowSurfaceTheme::resolve(theme);
+        frame.fill(LocalRect::terminal(area), " ", theme.canvas);
+        let pane = Pane::new()
+            .title(Line::from_spans(vec![Span::styled(
+                "Workflow Status",
+                theme.focused.add_modifier(Modifier::BOLD),
+            )]))
+            .padding(Insets::new(1, 1, 1, 1))
+            .styles(PaneStyles {
+                background: Some(theme.canvas),
+                border: theme.component.border,
+                focused_border: theme.focused,
+            });
+        let pane_state = PaneState::new(area);
+        let retained = std::cell::Cell::new(pane_state);
+        let shell =
+            PaneComponent::new("workflow.pane", pane.clone(), &retained, TextBlock::new(""));
+        paint_workflow_component(&shell, pane_state.area, frame);
+        let content = pane.inner_area(&pane_state);
+        let mode_tabs = Rect::new(content.x, content.y, content.width, 1);
+        let mode_content = Rect::new(
+            content.x,
+            content.y.saturating_add(1),
+            content.width,
+            content.height.saturating_sub(1),
+        );
+        self.prepare_workspace_presentation(content, mode_tabs, mode_content, theme);
         if let Some(form) = &self.launch_form {
             self.render_launch_form(content, frame, theme, form);
             return;
@@ -4461,8 +4571,9 @@ impl WorkflowStatusSurface {
             self.render_confirmation(content, frame, theme, confirmation);
             return;
         }
-        if let Some(form) = &self.input_form {
-            self.render_input_form(content, frame, theme, form);
+        if let Some(mut form) = self.input_form.take() {
+            self.render_input_form(content, frame, theme, &mut form);
+            self.input_form = Some(form);
             return;
         }
         if self.subscription_requested || self.catalog.is_some() {
@@ -4563,6 +4674,98 @@ impl WorkflowStatusSurface {
 }
 
 impl PluginTuiSurface for WorkflowStatusSurface {
+    fn focused_text_field(&self) -> Option<FocusedTextFieldSnapshot> {
+        if self.pending_confirmation.is_some() || self.launch_form.is_some() {
+            return None;
+        }
+        let form = self.input_form.as_ref()?;
+        let field = form.fields.get(form.focused_field)?;
+        if !field.prose || field.secret {
+            return None;
+        }
+        field.completion.borrow().snapshot_input(&field.editor)
+    }
+
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        edit: &FocusedTextFieldEdit,
+        _host: &dyn PluginTuiHost,
+    ) -> PluginTuiFocusedTextFieldEditResult {
+        let mut disabled = FocusedTextFieldAdapter::new("workflow.disabled", "none");
+        let mut empty = TextInputState::default();
+        let result = if self.pending_confirmation.is_none()
+            && self.launch_form.is_none()
+            && let Some(form) = self.input_form.as_mut()
+            && let Some(field) = form.fields.get_mut(form.focused_field)
+            && field.prose
+            && !field.secret
+        {
+            field
+                .completion
+                .borrow_mut()
+                .observe_input(&field.editor, true);
+            let result = field
+                .completion
+                .borrow_mut()
+                .apply_input(&mut field.editor, edit);
+            if result == FocusedTextFieldEditResult::Applied {
+                form.error = None;
+            }
+            result
+        } else {
+            disabled.apply_input(&mut empty, edit)
+        };
+        PluginTuiFocusedTextFieldEditResult {
+            edit_result: result,
+            event: if result == FocusedTextFieldEditResult::Applied {
+                PluginTuiEventResult::from_legacy(PluginTuiAction::Redraw)
+            } else {
+                PluginTuiEventResult::consumed()
+            },
+        }
+    }
+
+    fn focused_text_field_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        let ignored = || PluginTuiEventResult::from_legacy(PluginTuiAction::None);
+        if self.pending_confirmation.is_some() || self.launch_form.is_some() {
+            return ignored();
+        }
+        let Some(form) = self.input_form.as_mut() else {
+            return ignored();
+        };
+        let Some(event) = keybindings::routed_event(host, keybindings::FORM, event) else {
+            return ignored();
+        };
+        if matches!(&event, Event::Key(key) if key.key == KeyCode::Escape || key.key == KeyCode::Tab || (key.key == KeyCode::Enter && key.modifiers.ctrl))
+        {
+            return ignored();
+        }
+        let Some(field) = form.fields.get_mut(form.focused_field) else {
+            return ignored();
+        };
+        if !field.prose || field.secret {
+            return ignored();
+        }
+        let outcome = bmux_tui_components::text_input::TextInputControl::new(
+            &TextInputPolicy::chat_composer(),
+        )
+        .handle_event(&mut field.editor, &event);
+        field
+            .completion
+            .borrow_mut()
+            .observe_input(&field.editor, true);
+        if outcome == bmux_tui_components::text_input::TextInputOutcome::Ignored {
+            ignored()
+        } else {
+            form.error = None;
+            PluginTuiEventResult::from_legacy(PluginTuiAction::Redraw)
+        }
+    }
+
     fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
         self.keymap_hints.refresh(host);
     }
@@ -10771,6 +10974,141 @@ mod tests {
             99
         );
         assert!(surface.live_status.contains("Discarded stale"));
+    }
+
+    fn assert_wait_hide_reveal_rejects_old_snapshot(surface: &mut WorkflowStatusSurface) {
+        use bcode_plugin_sdk::composer::{ComposerEdit, ComposerTextRange};
+        let expected = surface
+            .focused_text_field()
+            .expect("painted wait prose before hide");
+        let cursor = expected.document.cursor;
+        let stale = FocusedTextFieldEdit {
+            edit: ComposerEdit {
+                document_id: expected.document.document_id.clone(),
+                revision: expected.document.revision,
+                range: ComposerTextRange {
+                    start: cursor,
+                    end: cursor,
+                },
+                expected_text: String::new(),
+                replacement: "x".into(),
+                cursor: cursor + 1,
+            },
+            expected: expected.clone(),
+        };
+        render_workspace_buffer(surface, 1, 1);
+        assert!(surface.focused_text_field().is_none());
+        render_workspace_buffer(surface, 100, 30);
+        let revealed = surface
+            .focused_text_field()
+            .expect("same wait prose revealed");
+        assert_eq!(revealed.identity, expected.identity);
+        assert_ne!(revealed.generation, expected.generation);
+        assert_eq!(revealed.document.text, expected.document.text);
+        assert_eq!(revealed.document.cursor, expected.document.cursor);
+        assert_eq!(revealed.document.selection, expected.document.selection);
+        let result = surface.apply_focused_text_field_edit_result(&stale, &TestHost);
+        assert!(matches!(
+            result.edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+        assert_eq!(result.event, PluginTuiEventResult::consumed());
+        assert_eq!(surface.focused_text_field(), Some(revealed));
+        assert!(surface.pending_action_target.is_none());
+    }
+
+    #[test]
+    fn wait_prose_completion_focus_visibility_and_semantic_submit_are_separate() {
+        use bcode_plugin_sdk::composer::{ComposerEdit, ComposerTextRange};
+        let schema = serde_json::json!({"type":"object","properties":{"answer":{"type":"string","contentMediaType":"text/plain"},"plain":{"type":"string"},"secret":{"type":"string","contentMediaType":"text/plain","writeOnly":true}},"required":["answer"]});
+        let mut surface = projected_surface();
+        surface.input_form = Some(WorkflowInputForm {
+            run_id: "run-1".into(),
+            node_id: "wait".into(),
+            activation_id: "activation-1".into(),
+            prompt: "Answer".into(),
+            fields: simple_object_fields(
+                Some(&schema),
+                Some(&serde_json::json!({"answer":"hello"})),
+            ),
+            expected_schema: Some(schema),
+            focused_field: 0,
+            editor: TextInputState::default(),
+            error: None,
+        });
+        render_workspace_buffer(&mut surface, 100, 30);
+        assert_wait_hide_reveal_rejects_old_snapshot(&mut surface);
+        bcode_plugin_sdk::tui::focused_input::test_support::assert_noop_and_stale_preserve_field(
+            &mut surface,
+            PluginTuiSurface::focused_text_field,
+            |surface, edit| {
+                surface
+                    .apply_focused_text_field_edit_result(edit, &TestHost)
+                    .edit_result
+            },
+        );
+        let expected = surface.focused_text_field().unwrap();
+        let edit = FocusedTextFieldEdit {
+            edit: ComposerEdit {
+                document_id: expected.document.document_id.clone(),
+                revision: expected.document.revision,
+                range: ComposerTextRange { start: 0, end: 5 },
+                expected_text: "hello".into(),
+                replacement: "completed".into(),
+                cursor: 9,
+            },
+            expected,
+        };
+        assert_eq!(
+            surface
+                .apply_focused_text_field_edit_result(&edit, &TestHost)
+                .edit_result,
+            FocusedTextFieldEditResult::Applied
+        );
+        assert_eq!(
+            surface.input_form.as_ref().unwrap().validate().unwrap()["answer"],
+            "completed"
+        );
+        assert!(surface.input_form.is_some());
+        assert!(surface.focused_text_field().is_none());
+        let form = surface.input_form.as_mut().unwrap();
+        assert!(form.fields[0].editor.buffer_mut().undo());
+        assert_eq!(form.fields[0].editor.buffer().text(), "hello");
+        assert!(form.fields[0].editor.buffer_mut().redo());
+        form.fields[0]
+            .completion
+            .borrow_mut()
+            .observe_input(&form.fields[0].editor, true);
+        let run = surface.runs.get_mut("run-1").unwrap();
+        run.actions
+            .push(bcode_workflow_view_models::WorkflowActionAffordance {
+                kind: bcode_workflow_view_models::WorkflowActionKind::ProvideInput,
+                target: bcode_workflow_view_models::WorkflowActionTarget::Activation {
+                    run_id: "run-1".into(),
+                    node_id: "wait".into(),
+                    activation_id: "activation-1".into(),
+                },
+                enabled: true,
+                unavailable_reason: None,
+            });
+        let submit = Event::Key(bmux_keyboard::parse_key_stroke("ctrl+enter").unwrap());
+        assert!(matches!(
+            surface.handle_control_center_event(&submit),
+            PluginTuiAction::InvokePluginCommand { .. }
+        ));
+        assert!(surface.pending_action_target.is_some());
+        render_workspace_buffer(&mut surface, 100, 30);
+        let tab = Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Tab));
+        surface.handle_control_center_event(&tab);
+        assert!(surface.focused_text_field().is_none());
+        assert_eq!(
+            surface
+                .apply_focused_text_field_edit_result(&edit, &TestHost)
+                .event,
+            PluginTuiEventResult::consumed()
+        );
+        render_workspace_buffer(&mut surface, 1, 1);
+        assert!(surface.focused_text_field().is_none());
     }
 
     struct FooterKeymapHost(bcode_plugin_sdk::tui::keymap::KeymapRegistry);

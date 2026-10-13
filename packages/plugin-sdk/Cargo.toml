@@ -25,7 +25,7 @@ bcode_workflow_view_models = { workspace = true }
 bmux_keyboard              = { workspace = true, optional = true }
 bmux_text_edit             = { workspace = true, optional = true }
 bmux_tui                   = { workspace = true, optional = true }
-bmux_tui_components        = { workspace = true, optional = true }
+bmux_tui_components        = { workspace = true, features = ["text-input"], optional = true }
 clap                       = { workspace = true, features = ["std"] }
 # BMUX's keyboard backend requires Crossterm's Windows support when TUI is enabled.
 crossterm  = { workspace = true, optional = true }

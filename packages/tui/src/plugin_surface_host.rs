@@ -36,6 +36,21 @@ use tokio::sync::mpsc;
 const DEFAULT_PLUGIN_SESSION_VIEW_BUFFER: usize = 32;
 const MAX_PLUGIN_SESSION_VIEW_BUFFER: usize = 256;
 
+/// Compose an ordinary focused editor and its owning surface. Only ignored input
+/// propagates; an effect-free consumed event must never become submission.
+pub fn compose_surface_input(
+    surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+    event: &bmux_tui::event::Event,
+    host: &dyn PluginTuiHost,
+) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+    let editor = surface.focused_text_field_event(event, host);
+    if editor.outcome == bmux_tui::event::EventOutcome::Ignored {
+        surface.handle_event_result(event, host)
+    } else {
+        editor
+    }
+}
+
 /// Host services for plugin-owned TUI surfaces running inside Bcode's TUI.
 #[derive(Debug, Clone)]
 struct BcodePluginTuiHost {

@@ -977,6 +977,8 @@ struct LoopSurface {
     fresh_session: FreshSessionState,
     prompt: TextInputState,
     condition: TextInputState,
+    prose_fields: std::cell::RefCell<[bcode_plugin_sdk::tui::FocusedTextFieldAdapter; 2]>,
+    visible_prose_carets: [bool; 2],
     limit: TextInputState,
     evaluation: TextInputState,
     judgement_enabled: EvaluationMode,
@@ -1180,7 +1182,12 @@ impl LoopSurface {
             delegation_readiness: None,
             fresh_session: FreshSessionState::Idle,
             prompt: text_state(""),
+            visible_prose_carets: [false; 2],
             condition: text_state(""),
+            prose_fields: std::cell::RefCell::new([
+                bcode_plugin_sdk::tui::FocusedTextFieldAdapter::new(SURFACE_KIND, "prompt"),
+                bcode_plugin_sdk::tui::FocusedTextFieldAdapter::new(SURFACE_KIND, "condition"),
+            ]),
             limit: text_state(&DEFAULT_MAX_ITERATIONS.to_string()),
             evaluation: text_state(""),
             judgement_enabled: EvaluationMode::Standard,
@@ -1516,7 +1523,7 @@ impl LoopSurface {
         )
         .intersection(content)
         .intersection(area);
-        Self::render_input(
+        let _ = Self::render_input(
             self.evaluation_area,
             frame,
             &label,
@@ -2283,6 +2290,82 @@ impl LoopSurface {
             );
         }
     }
+    fn handle_owner_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.field == Field::Evaluation
+            && let Some(event) = keymap::event(host, keymap::JUDGEMENT, event, false)
+        {
+            let action = self.handle_judgement_key(&event, host);
+            if !matches!(action, PluginTuiAction::None) {
+                return action;
+            }
+        }
+        let scope = if self.origin == SetupKind::Goal {
+            keymap::GOAL
+        } else {
+            keymap::SETUP
+        };
+        let Some(event) = keymap::event(host, scope, event, self.field != Field::Evaluation) else {
+            return PluginTuiAction::None;
+        };
+        self.handle_resolved_event(&event, host)
+    }
+
+    fn paint_prose_fields(&mut self, frame: &mut PaintCx<'_, '_>) {
+        let prompt_anchor = Self::render_input(
+            self.prompt_area,
+            frame,
+            if self.setup_kind == SetupKind::Goal {
+                "Goal (required)"
+            } else {
+                "Iteration prompt"
+            },
+            &mut self.prompt,
+            self.field == Field::Prompt && self.goal_option_focus.is_none(),
+            self.prompt_area.height,
+            self.theme.as_ref(),
+        );
+        let condition_anchor = Self::render_input(
+            self.condition_area,
+            frame,
+            if self.setup_kind == SetupKind::Goal {
+                "Additional guidance (optional)"
+            } else {
+                "Stop condition"
+            },
+            &mut self.condition,
+            self.field == Field::Condition && self.goal_option_focus.is_none(),
+            self.condition_area.height,
+            self.theme.as_ref(),
+        );
+        self.visible_prose_carets = [prompt_anchor.is_some(), condition_anchor.is_some()];
+        self.observe_prose();
+        if let Some(anchor) = prompt_anchor {
+            self.prose_fields.get_mut()[0].painted_input(
+                &self.prompt,
+                self.prompt.content_area().intersection(self.prompt_area),
+                anchor,
+            );
+        }
+        if let Some(anchor) = condition_anchor {
+            self.prose_fields.get_mut()[1].painted_input(
+                &self.condition,
+                self.condition
+                    .content_area()
+                    .intersection(self.condition_area),
+                anchor,
+            );
+        }
+        self.visible_prose_carets = [
+            self.prose_fields.borrow()[0]
+                .snapshot_input(&self.prompt)
+                .is_some(),
+            self.prose_fields.borrow()[1]
+                .snapshot_input(&self.condition)
+                .is_some(),
+        ];
+        self.observe_prose();
+    }
+
     fn render_input(
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
@@ -2291,7 +2374,7 @@ impl LoopSurface {
         focused: bool,
         rows: u16,
         theme: Option<&PluginTuiTheme>,
-    ) {
+    ) -> Option<Rect> {
         let styles = theme.map_or_else(TextInputBoxStyles::default, |theme| TextInputBoxStyles {
             text: theme.text,
             focused_text: theme.focused,
@@ -2305,28 +2388,26 @@ impl LoopSurface {
             disabled_background: theme.canvas,
         });
         let retained = std::cell::RefCell::new(state.clone());
-        let input = TextInputBoxComponent::new(
-            match label {
-                "Goal (required)" | "Iteration prompt" => "loop.prompt",
-                "Additional guidance (optional)" | "Stop condition" => "loop.condition",
-                "Max iterations (blank = 20)" | "Maximum iterations" => "loop.limit",
-                _ => "loop.evaluation",
-            },
-            TextInputPolicy::chat_composer(),
-            &retained,
-        )
-        .styles(styles)
-        .label(label)
-        .policy(TextInputBoxPolicy {
-            field_chrome: true,
-            panel_chrome: true,
-            background: true,
-            cursor: true,
-            focused,
-            disabled: false,
-            min_rows: rows,
-            max_rows: Some(rows),
-        });
+        let input_id = match label {
+            "Goal (required)" | "Iteration prompt" => "loop.prompt",
+            "Additional guidance (optional)" | "Stop condition" => "loop.condition",
+            "Max iterations (blank = 20)" | "Maximum iterations" => "loop.limit",
+            _ => "loop.evaluation",
+        };
+        let input =
+            TextInputBoxComponent::new(input_id, TextInputPolicy::chat_composer(), &retained)
+                .styles(styles)
+                .label(label)
+                .policy(TextInputBoxPolicy {
+                    field_chrome: true,
+                    panel_chrome: true,
+                    background: true,
+                    cursor: true,
+                    focused,
+                    disabled: false,
+                    min_rows: rows,
+                    max_rows: Some(rows),
+                });
         let layout = input.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
         frame.with_child(
             i32::from(area.x),
@@ -2335,7 +2416,9 @@ impl LoopSurface {
             |cx| input.paint(&layout, cx),
         );
         *state = retained.into_inner();
-        let local = state.content_area();
+        let local = layout.find_rect(&bmux_tui::component::LayoutId::new(format!(
+            "{input_id}.input"
+        )))?;
         state.set_content_area(
             Rect::new(
                 area.x.saturating_add(local.x),
@@ -2345,6 +2428,17 @@ impl LoopSurface {
             ),
             &TextInputPolicy::chat_composer(),
         );
+        focused
+            .then(|| frame.logical_cursor())
+            .flatten()
+            .and_then(|(x, y)| {
+                Some(Rect::new(
+                    u16::try_from(x).ok()?,
+                    u16::try_from(y).ok()?,
+                    1,
+                    1,
+                ))
+            })
     }
 }
 
@@ -2381,6 +2475,12 @@ impl PluginTuiSurface for LoopSurface {
     }
 
     fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
+        self.observe_prose();
+        {
+            let fields = self.prose_fields.get_mut();
+            fields[0].painted_input(&self.prompt, Rect::default(), Rect::default());
+            fields[1].painted_input(&self.condition, Rect::default(), Rect::default());
+        }
         let modal_theme = self.modal_theme();
         let modal = ModalFrame::new(
             ModalSizing::new(Size::new(64, 26), Size::new(100, 36), Insets::all(2)),
@@ -2431,33 +2531,8 @@ impl PluginTuiSurface for LoopSurface {
         self.prompt_area = self.prompt_area.intersection(content).intersection(area);
         self.condition_area = self.condition_area.intersection(content).intersection(area);
         self.limit_area = self.limit_area.intersection(content).intersection(area);
-        Self::render_input(
-            self.prompt_area,
-            frame,
-            if self.setup_kind == SetupKind::Goal {
-                "Goal (required)"
-            } else {
-                "Iteration prompt"
-            },
-            &mut self.prompt,
-            self.field == Field::Prompt && self.goal_option_focus.is_none(),
-            self.prompt_area.height,
-            self.theme.as_ref(),
-        );
-        Self::render_input(
-            self.condition_area,
-            frame,
-            if self.setup_kind == SetupKind::Goal {
-                "Additional guidance (optional)"
-            } else {
-                "Stop condition"
-            },
-            &mut self.condition,
-            self.field == Field::Condition && self.goal_option_focus.is_none(),
-            self.condition_area.height,
-            self.theme.as_ref(),
-        );
-        Self::render_input(
+        self.paint_prose_fields(frame);
+        let _ = Self::render_input(
             self.limit_area,
             frame,
             if self.setup_kind == SetupKind::Goal {
@@ -2484,25 +2559,108 @@ impl PluginTuiSurface for LoopSurface {
         self.render(area, frame);
     }
 
-    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        if self.field == Field::Evaluation
-            && let Some(event) = keymap::event(host, keymap::JUDGEMENT, event, false)
-        {
-            let action = self.handle_judgement_key(&event, host);
-            if !matches!(action, PluginTuiAction::None) {
-                return action;
-            }
+    fn focused_text_field(&self) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        self.observe_prose();
+        match self.field {
+            Field::Prompt => self.prose_fields.borrow()[0].snapshot_input(&self.prompt),
+            Field::Condition => self.prose_fields.borrow()[1].snapshot_input(&self.condition),
+            Field::Limit | Field::Evaluation => None,
         }
-        let scope = if self.origin == SetupKind::Goal {
-            keymap::GOAL
-        } else {
-            keymap::SETUP
-        };
-        let Some(event) = keymap::event(host, scope, event, self.field != Field::Evaluation) else {
-            return PluginTuiAction::None;
-        };
-        self.handle_resolved_event(&event, host)
     }
+
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+        _host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult {
+        use bcode_plugin_sdk::tui::{
+            FocusedTextFieldEditResult, PluginTuiEventResult, PluginTuiFocusedTextFieldEditResult,
+        };
+        self.observe_prose();
+        let edit_result = match self.field {
+            Field::Prompt => self.prose_fields.get_mut()[0].apply_input(&mut self.prompt, edit),
+            Field::Condition => {
+                self.prose_fields.get_mut()[1].apply_input(&mut self.condition, edit)
+            }
+            Field::Limit | Field::Evaluation => {
+                return PluginTuiFocusedTextFieldEditResult::rejected(
+                    bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+                );
+            }
+        };
+        let event = if edit_result == FocusedTextFieldEditResult::Applied {
+            self.active_state_mut()
+                .sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
+            PluginTuiEventResult::from_legacy(PluginTuiAction::Redraw)
+        } else {
+            PluginTuiEventResult::consumed()
+        };
+        PluginTuiFocusedTextFieldEditResult { edit_result, event }
+    }
+
+    fn apply_focused_text_field_edit(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+        host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+        self.apply_focused_text_field_edit_result(edit, host).event
+    }
+
+    fn focused_text_field_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+        self.observe_prose();
+        if !matches!(self.field, Field::Prompt | Field::Condition)
+            || self.swarm_ui.open
+            || self.goal_option_focus.is_some()
+        {
+            return bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(PluginTuiAction::None);
+        }
+        if matches!(
+            self.fresh_session,
+            FreshSessionState::Creating
+                | FreshSessionState::Configuring
+                | FreshSessionState::Attaching
+                | FreshSessionState::NeedsConfiguration
+        ) {
+            return bcode_plugin_sdk::tui::PluginTuiEventResult::consumed();
+        }
+        let action = self.handle_event(event, host);
+        self.observe_prose();
+        if matches!(action, PluginTuiAction::None)
+            && matches!(event, Event::Key(stroke) if host.keymap_action(if self.origin == SetupKind::Goal { keymap::GOAL } else { keymap::SETUP }, *stroke).as_deref() == Some("bcode.loop.start"))
+        {
+            return bcode_plugin_sdk::tui::PluginTuiEventResult::consumed();
+        }
+        bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(action)
+    }
+
+    fn handle_event_result(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+        // The focused hook already tried the prose editor, including ignored input.
+        if matches!(self.field, Field::Prompt | Field::Condition)
+            && !self.swarm_ui.open
+            && self.goal_option_focus.is_none()
+        {
+            return bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(PluginTuiAction::None);
+        }
+        let action = self.handle_event(event, host);
+        self.observe_prose();
+        bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(action)
+    }
+
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        self.observe_prose();
+        let action = self.handle_owner_event(event, host);
+        self.observe_prose();
+        action
+    }
+
     fn render_with_host(
         &mut self,
         area: Rect,
@@ -2542,6 +2700,37 @@ impl PluginTuiSurface for LoopSurface {
 }
 
 impl LoopSurface {
+    fn observe_prose(&self) {
+        let enabled = !self.swarm_ui.open
+            && self.goal_option_focus.is_none()
+            && matches!(
+                self.goal_phase,
+                goal::GoalPhase::Draft | goal::GoalPhase::Generated
+            )
+            && !matches!(
+                self.fresh_session,
+                FreshSessionState::Creating
+                    | FreshSessionState::Configuring
+                    | FreshSessionState::Attaching
+                    | FreshSessionState::NeedsConfiguration
+            );
+        let mut fields = self.prose_fields.borrow_mut();
+        fields[0].observe_input(
+            &self.prompt,
+            enabled && self.field == Field::Prompt && self.visible_prose_carets[0],
+        );
+        fields[1].observe_input(
+            &self.condition,
+            enabled && self.field == Field::Condition && self.visible_prose_carets[1],
+        );
+    }
+
+    fn invalidate_prose(&self) {
+        let mut fields = self.prose_fields.borrow_mut();
+        fields[0].observe_input(&self.prompt, false);
+        fields[1].observe_input(&self.condition, false);
+    }
+
     fn handle_resolved_event(
         &mut self,
         event: &Event,
@@ -3473,6 +3662,63 @@ fn legacy_state_root() -> PathBuf {
 mod representation_tests;
 
 #[cfg(test)]
+fn assert_hidden_prose_roundtrip(surface: &mut dyn PluginTuiSurface, host: &dyn PluginTuiHost) {
+    use bcode_plugin_sdk::tui::{FocusedTextFieldEdit, FocusedTextFieldEditResult};
+    let area = Rect::new(0, 0, 100, 40);
+    let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+    surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+    let original = surface.focused_text_field().expect("visible prose caret");
+    let request = FocusedTextFieldEdit {
+        edit: bcode_plugin_sdk::composer::ComposerEdit {
+            document_id: original.document.document_id.clone(),
+            revision: original.document.revision,
+            range: bcode_plugin_sdk::composer::ComposerTextRange {
+                start: 0,
+                end: original.document.text.len(),
+            },
+            expected_text: original.document.text.clone(),
+            replacement: "visible prose".into(),
+            cursor: "visible prose".len(),
+        },
+        expected: original.clone(),
+    };
+    PaintCx::new(&mut Frame::new(&mut buffer)).with_child(0, 0, LocalRect::new(0, 0, 1, 1), |cx| {
+        surface.render(area, cx);
+    });
+    assert!(surface.focused_text_field().is_none());
+    assert!(matches!(
+        surface
+            .apply_focused_text_field_edit_result(&request, host)
+            .edit_result,
+        FocusedTextFieldEditResult::Rejected(_)
+    ));
+    surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+    let restored = surface.focused_text_field().expect("restored prose caret");
+    assert_eq!(restored.document.text, original.document.text);
+    assert!(restored.generation > original.generation);
+    assert!(matches!(
+        surface
+            .apply_focused_text_field_edit_result(&request, host)
+            .edit_result,
+        FocusedTextFieldEditResult::Rejected(_)
+    ));
+}
+
+#[cfg(test)]
+fn routed_surface_input(
+    surface: &mut dyn PluginTuiSurface,
+    event: &Event,
+    host: &dyn PluginTuiHost,
+) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+    let result = surface.focused_text_field_event(event, host);
+    if result.outcome == bmux_tui::event::EventOutcome::Ignored {
+        surface.handle_event_result(event, host)
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3895,6 +4141,110 @@ mod tests {
             ]),
             accepted_min_items: std::collections::BTreeSet::from([0, 1]),
             ..SchemaDialect::default()
+        }
+    }
+
+    #[test]
+    fn loop_prose_hidden_reveal_invalidates_original_acceptance() {
+        let host = TestHost::default();
+        for field in [Field::Prompt, Field::Condition] {
+            let mut surface = LoopSurface::new(Some(SessionId::new()));
+            surface.field = field;
+            surface
+                .active_state_mut()
+                .buffer_mut()
+                .insert_str("日本語 👩‍💻");
+            assert_hidden_prose_roundtrip(&mut surface, &host);
+            assert!(surface.pending_workflow_start.is_none());
+        }
+    }
+
+    #[test]
+    fn prose_completion_owner_matrix_preserves_semantics_and_eligibility() {
+        use bcode_plugin_sdk::tui::{FocusedTextFieldEdit, FocusedTextFieldEditResult};
+        fn paint(surface: &mut LoopSurface) {
+            let area = Rect::new(0, 0, 100, 40);
+            let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+            surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        }
+        let host = TestHost::default();
+        for field in [Field::Prompt, Field::Condition] {
+            let mut surface = LoopSurface::new(None);
+            surface.field = field;
+            surface
+                .active_state_mut()
+                .buffer_mut()
+                .insert_str("日本語 👩‍💻 e\u{301}");
+            paint(&mut surface);
+            let current = surface.focused_text_field().unwrap();
+            let before_conformance = surface.active_state_mut().clone();
+            bcode_plugin_sdk::tui::focused_input::test_support::assert_noop_and_stale_preserve_field(
+                &mut surface, PluginTuiSurface::focused_text_field,
+                |surface, edit| {
+                    let result = surface.apply_focused_text_field_edit_result(edit, &host);
+                    assert_eq!(*surface.active_state_mut(), before_conformance);
+                    assert!(surface.pending_workflow_start.is_none());
+                    result.edit_result
+                },
+            );
+            let edit = FocusedTextFieldEdit {
+                edit: bcode_plugin_sdk::composer::ComposerEdit {
+                    document_id: current.document.document_id.clone(),
+                    revision: current.document.revision,
+                    range: bcode_plugin_sdk::composer::ComposerTextRange {
+                        start: 0,
+                        end: current.document.text.len(),
+                    },
+                    expected_text: current.document.text.clone(),
+                    replacement: "自然な文章".into(),
+                    cursor: "自然な文章".len(),
+                },
+                expected: current.clone(),
+            };
+            let result = surface.apply_focused_text_field_edit_result(&edit, &host);
+            assert_eq!(result.edit_result, FocusedTextFieldEditResult::Applied);
+            assert!(surface.pending_workflow_start.is_none());
+            assert!(host.request.lock().unwrap().is_none());
+            assert_eq!(input_text(surface.active_state_mut()), "自然な文章");
+            assert!(surface.active_state_mut().buffer_mut().undo());
+            assert_eq!(
+                input_text(surface.active_state_mut()),
+                current.document.text
+            );
+            assert!(surface.active_state_mut().buffer_mut().redo());
+            assert_eq!(input_text(surface.active_state_mut()), "自然な文章");
+            paint(&mut surface);
+            let fresh = surface.focused_text_field().unwrap();
+            let mut noop = edit.clone();
+            noop.expected = fresh.clone();
+            noop.edit
+                .document_id
+                .clone_from(&fresh.document.document_id);
+            noop.edit.revision = fresh.document.revision;
+            noop.edit.range.end = fresh.document.text.len();
+            noop.edit.expected_text.clone_from(&fresh.document.text);
+            noop.edit.replacement.clone_from(&fresh.document.text);
+            noop.edit.cursor = 0;
+            let before = surface.active_state_mut().clone();
+            let result = surface.apply_focused_text_field_edit_result(&noop, &host);
+            assert_eq!(result.edit_result, FocusedTextFieldEditResult::Noop);
+            assert_eq!(*surface.active_state_mut(), before);
+            assert_eq!(result.event.outcome, bmux_tui::event::EventOutcome::Handled);
+            surface.field = Field::Limit;
+            assert!(surface.focused_text_field().is_none());
+            surface.field = field;
+            paint(&mut surface);
+            assert!(matches!(
+                surface
+                    .apply_focused_text_field_edit_result(&noop, &host)
+                    .edit_result,
+                FocusedTextFieldEditResult::Rejected(_)
+            ));
+            surface.swarm_ui.open = true;
+            assert!(surface.focused_text_field().is_none());
+            surface.swarm_ui.open = false;
+            surface.goal_phase = goal::GoalPhase::Generating { review: false };
+            assert!(surface.focused_text_field().is_none());
         }
     }
 
@@ -5734,41 +6084,41 @@ mod tests {
         };
 
         assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('p')), &host),
+            routed_surface_input(&mut surface, &key(KeyCode::Char('p')), &host).action,
             PluginTuiAction::Redraw
         );
         assert_eq!(surface.prompt.buffer().text(), "p");
 
         assert_eq!(
-            surface.handle_event(&key(KeyCode::Tab), &host),
+            routed_surface_input(&mut surface, &key(KeyCode::Tab), &host).action,
             PluginTuiAction::Redraw
         );
         assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('c')), &host),
+            routed_surface_input(&mut surface, &key(KeyCode::Char('c')), &host).action,
             PluginTuiAction::Redraw
         );
         assert_eq!(surface.condition.buffer().text(), "c");
 
         assert_eq!(
-            surface.handle_event(&key(KeyCode::Tab), &host),
+            routed_surface_input(&mut surface, &key(KeyCode::Tab), &host).action,
             PluginTuiAction::Redraw
         );
         assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('4')), &host),
+            routed_surface_input(&mut surface, &key(KeyCode::Char('4')), &host).action,
             PluginTuiAction::Redraw
         );
         assert_eq!(surface.limit.buffer().text(), "4");
         assert_eq!(
-            surface.handle_event(&key(KeyCode::Tab), &host),
+            routed_surface_input(&mut surface, &key(KeyCode::Tab), &host).action,
             PluginTuiAction::Redraw
         );
         assert_eq!(
-            surface.handle_event(&key(KeyCode::Char(' ')), &host),
+            routed_surface_input(&mut surface, &key(KeyCode::Space), &host).action,
             PluginTuiAction::Redraw
         );
         assert_eq!(surface.judgement_enabled, EvaluationMode::Judgement);
         assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('+')), &host),
+            routed_surface_input(&mut surface, &key(KeyCode::Char('+')), &host).action,
             PluginTuiAction::Redraw
         );
         assert_eq!(surface.judgement_threshold, 95);

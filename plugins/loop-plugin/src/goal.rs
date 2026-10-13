@@ -582,6 +582,95 @@ async fn preflight_message_with_timeout(
 }
 
 impl GoalSurface {
+    fn handle_owner_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let resolved = match self.resolve_event(event, host) {
+            Ok(resolved) => resolved,
+            Err(action) => return action,
+        };
+        let event = &resolved;
+        if self.editor.swarm_ui.open {
+            if let Err(error) = self
+                .editor
+                .swarm_ui
+                .resolved_event(&mut self.editor.collaboration, event)
+            {
+                self.editor.swarm_ui.error.clone_from(&error);
+                self.editor.status = error;
+            }
+            self.editor.worker_attempts = self.editor.swarm_ui.attempts().ok().flatten();
+            self.editor.delegation_readiness = None;
+            return PluginTuiAction::Redraw;
+        }
+        if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
+            && matches!(event, Event::Key(key) if key.modifiers.ctrl && key.key == KeyCode::Char('s'))
+        {
+            self.open_swarm();
+            return PluginTuiAction::Redraw;
+        }
+        if let Some(action) = self.handle_live_event(event) {
+            return action;
+        }
+        if let Event::Key(stroke) = event {
+            if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
+                && stroke.key == KeyCode::Char('d')
+                && stroke.modifiers.ctrl
+            {
+                return self.check_delegation(host);
+            }
+            if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
+                self.phase = GoalPhase::Closed;
+                return PluginTuiAction::Close { outcome: None };
+            }
+            if self.phase == GoalPhase::Draft
+                && !matches!(
+                    self.editor.fresh_session,
+                    FreshSessionState::Creating
+                        | FreshSessionState::Configuring
+                        | FreshSessionState::NeedsConfiguration
+                        | FreshSessionState::Attaching
+                )
+            {
+                if stroke.modifiers.ctrl && stroke.key == KeyCode::Char('p') {
+                    self.editor.progress_document = if self.editor.progress_document.is_some() {
+                        None
+                    } else {
+                        Some(ProgressDocumentSetup::default())
+                    };
+                    return PluginTuiAction::Redraw;
+                }
+                if stroke.modifiers.ctrl && stroke.key == KeyCode::Char('r') {
+                    return self.generate(host, true);
+                }
+                if stroke.key == KeyCode::Enter
+                    && (stroke.modifiers.ctrl
+                        || (self.editor.field == Field::Limit
+                            && self.editor.goal_option_focus.is_none()))
+                {
+                    return self.generate(host, false);
+                }
+            }
+        }
+        if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
+            && !matches!(
+                self.editor.fresh_session,
+                FreshSessionState::Creating
+                    | FreshSessionState::Configuring
+                    | FreshSessionState::Attaching
+            )
+            && let Some(action) = self.handle_options(event, host)
+        {
+            return action;
+        }
+        // Freeze source inputs during generation; no stale response can replace newer edits.
+        if matches!(
+            self.phase,
+            GoalPhase::CheckingDelegation { .. } | GoalPhase::Generating { .. } | GoalPhase::Closed
+        ) {
+            return PluginTuiAction::None;
+        }
+        self.editor.handle_resolved_event(event, host)
+    }
+
     fn cancelled_generation(&mut self, result: GenerationResult) -> PluginTuiAction {
         self.phase = GoalPhase::Draft;
         self.source = None;
@@ -634,6 +723,11 @@ impl GoalSurface {
     fn open_swarm(&mut self) {
         if self.phase == GoalPhase::Generated {
             if let Some((objective, _, limit)) = self.source.take() {
+                self.editor
+                    .prose_fields
+                    .get_mut()
+                    .iter_mut()
+                    .for_each(bcode_plugin_sdk::tui::FocusedTextFieldAdapter::reset);
                 self.editor.prompt = text_state(&objective);
                 self.editor.condition = text_state(&self.draft_guidance);
                 self.editor.limit = text_state(&limit.to_string());
@@ -1187,6 +1281,11 @@ impl PluginTuiSurface for GoalSurface {
         match result {
             Ok(input) => {
                 self.source = Some((objective, guidance, limit));
+                self.editor
+                    .prose_fields
+                    .get_mut()
+                    .iter_mut()
+                    .for_each(bcode_plugin_sdk::tui::FocusedTextFieldAdapter::reset);
                 self.editor.prompt = text_state(&input.implementation_prompt);
                 self.editor.condition = text_state(&input.stop_condition);
                 self.editor.limit = text_state(&limit.to_string());
@@ -1206,93 +1305,79 @@ impl PluginTuiSurface for GoalSurface {
         }
         PluginTuiAction::Redraw
     }
+    fn focused_text_field(&self) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        if !matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated) || self.live.is_some() {
+            self.editor.invalidate_prose();
+            return None;
+        }
+        self.editor.focused_text_field()
+    }
+
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+        host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult {
+        if self.focused_text_field().is_none() {
+            return bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult::rejected(
+                bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+            );
+        }
+        self.editor.apply_focused_text_field_edit_result(edit, host)
+    }
+
+    fn apply_focused_text_field_edit(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+        host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+        self.apply_focused_text_field_edit_result(edit, host).event
+    }
+
+    fn focused_text_field_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+        if !matches!(self.editor.field, Field::Prompt | Field::Condition)
+            || self.editor.swarm_ui.open
+            || self.editor.goal_option_focus.is_some()
+        {
+            return bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(PluginTuiAction::None);
+        }
+        let action = self.handle_event(event, host);
+        let _ = self.focused_text_field();
+        if matches!(action, PluginTuiAction::None)
+            && !matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
+        {
+            return bcode_plugin_sdk::tui::PluginTuiEventResult::consumed();
+        }
+        bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(action)
+    }
+
+    fn handle_event_result(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+        if matches!(self.editor.field, Field::Prompt | Field::Condition)
+            && !self.editor.swarm_ui.open
+            && self.editor.goal_option_focus.is_none()
+        {
+            return bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(PluginTuiAction::None);
+        }
+        let action = self.handle_event(event, host);
+        let _ = self.focused_text_field();
+        bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(action)
+    }
+
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let resolved = match self.resolve_event(event, host) {
-            Ok(resolved) => resolved,
-            Err(action) => return action,
-        };
-        let event = &resolved;
-        if self.editor.swarm_ui.open {
-            if let Err(error) = self
-                .editor
-                .swarm_ui
-                .resolved_event(&mut self.editor.collaboration, event)
-            {
-                self.editor.swarm_ui.error.clone_from(&error);
-                self.editor.status = error;
-            }
-            self.editor.worker_attempts = self.editor.swarm_ui.attempts().ok().flatten();
-            self.editor.delegation_readiness = None;
-            return PluginTuiAction::Redraw;
-        }
-        if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
-            && matches!(event, Event::Key(key) if key.modifiers.ctrl && key.key == KeyCode::Char('s'))
-        {
-            self.open_swarm();
-            return PluginTuiAction::Redraw;
-        }
-        if let Some(action) = self.handle_live_event(event) {
-            return action;
-        }
-        if let Event::Key(stroke) = event {
-            if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
-                && stroke.key == KeyCode::Char('d')
-                && stroke.modifiers.ctrl
-            {
-                return self.check_delegation(host);
-            }
-            if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
-                self.phase = GoalPhase::Closed;
-                return PluginTuiAction::Close { outcome: None };
-            }
-            if self.phase == GoalPhase::Draft
-                && !matches!(
-                    self.editor.fresh_session,
-                    FreshSessionState::Creating
-                        | FreshSessionState::Configuring
-                        | FreshSessionState::NeedsConfiguration
-                        | FreshSessionState::Attaching
-                )
-            {
-                if stroke.modifiers.ctrl && stroke.key == KeyCode::Char('p') {
-                    self.editor.progress_document = if self.editor.progress_document.is_some() {
-                        None
-                    } else {
-                        Some(ProgressDocumentSetup::default())
-                    };
-                    return PluginTuiAction::Redraw;
-                }
-                if stroke.modifiers.ctrl && stroke.key == KeyCode::Char('r') {
-                    return self.generate(host, true);
-                }
-                if stroke.key == KeyCode::Enter
-                    && (stroke.modifiers.ctrl
-                        || (self.editor.field == Field::Limit
-                            && self.editor.goal_option_focus.is_none()))
-                {
-                    return self.generate(host, false);
-                }
-            }
-        }
-        if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
-            && !matches!(
-                self.editor.fresh_session,
-                FreshSessionState::Creating
-                    | FreshSessionState::Configuring
-                    | FreshSessionState::Attaching
-            )
-            && let Some(action) = self.handle_options(event, host)
-        {
-            return action;
-        }
-        // Freeze source inputs during generation; no stale response can replace newer edits.
-        if matches!(
-            self.phase,
-            GoalPhase::CheckingDelegation { .. } | GoalPhase::Generating { .. } | GoalPhase::Closed
-        ) {
-            return PluginTuiAction::None;
-        }
-        self.editor.handle_resolved_event(event, host)
+        self.editor.goal_phase = self.phase;
+        self.editor.observe_prose();
+        let action = self.handle_owner_event(event, host);
+        self.editor.goal_phase = self.phase;
+        self.editor.observe_prose();
+        action
     }
 }
 
@@ -1474,6 +1559,106 @@ mod tests {
 
     mod collaboration {
         include!("goal_collaboration_tests.rs");
+    }
+
+    #[test]
+    fn goal_prose_hidden_reveal_invalidates_original_acceptance() {
+        let host = Host::default();
+        for field in [Field::Prompt, Field::Condition] {
+            let mut surface = GoalSurface::new(Some(SessionId::new()));
+            surface.editor.field = field;
+            surface
+                .editor
+                .active_state_mut()
+                .buffer_mut()
+                .insert_str("日本語 👩‍💻");
+            let area = Rect::new(0, 0, 100, 40);
+            let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            surface.render(area, &mut PaintCx::new(&mut frame));
+            let painted_cursor = frame.cursor();
+            assert!(
+                surface.focused_text_field().is_some(),
+                "Goal field {field:?}: phase={:?} options={:?} visible={:?} prompt_area={:?} condition_area={:?} prompt_content={:?} condition_content={:?} prompt_editor={:?} condition_editor={:?} fields={:?} painted_cursor={painted_cursor:?}",
+                surface.phase,
+                surface.editor.goal_option_focus.map(|option| match option {
+                    GoalOption::Swarm => "swarm",
+                    GoalOption::Progress => "progress",
+                    GoalOption::Review => "review",
+                }),
+                surface.editor.visible_prose_carets,
+                surface.editor.prompt_area,
+                surface.editor.condition_area,
+                surface.editor.prompt.content_area(),
+                surface.editor.condition.content_area(),
+                surface.editor.prompt.buffer().edit_state(),
+                surface.editor.condition.buffer().edit_state(),
+                surface.editor.prose_fields
+            );
+            assert_hidden_prose_roundtrip(&mut surface, &host);
+            assert_eq!(surface.phase, GoalPhase::Draft);
+            assert!(host.starts.lock().unwrap().is_empty());
+            assert_eq!(*host.generations.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn goal_prose_completion_uses_shared_hooks_without_generating_or_starting() {
+        use bcode_plugin_sdk::tui::FocusedTextFieldEditResult;
+        let host = Host::default();
+        let mut surface = GoalSurface::new(None);
+        surface
+            .editor
+            .prompt
+            .buffer_mut()
+            .insert_str("日本語 👩‍💻 e\u{301}");
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        surface.render(
+            area,
+            &mut PaintCx::new(&mut bmux_tui::frame::Frame::new(&mut buffer)),
+        );
+        let before = surface.editor.prompt.clone();
+        bcode_plugin_sdk::tui::focused_input::test_support::assert_noop_and_stale_preserve_field(
+            &mut surface,
+            PluginTuiSurface::focused_text_field,
+            |surface, edit| {
+                let result = surface.apply_focused_text_field_edit_result(edit, &host);
+                assert_eq!(surface.editor.prompt, before);
+                assert_eq!(surface.phase, GoalPhase::Draft);
+                assert!(host.starts.lock().unwrap().is_empty());
+                assert_eq!(*host.generations.lock().unwrap(), 0);
+                result.edit_result
+            },
+        );
+        let current = surface.focused_text_field().unwrap();
+        surface.phase = GoalPhase::Generating { review: false };
+        assert!(surface.focused_text_field().is_none());
+        surface.phase = GoalPhase::Draft;
+        surface.render(
+            area,
+            &mut PaintCx::new(&mut bmux_tui::frame::Frame::new(&mut buffer)),
+        );
+        let request = bcode_plugin_sdk::tui::FocusedTextFieldEdit {
+            edit: bcode_plugin_sdk::composer::ComposerEdit {
+                document_id: current.document.document_id.clone(),
+                revision: current.document.revision,
+                range: bcode_plugin_sdk::composer::ComposerTextRange {
+                    start: 0,
+                    end: current.document.text.len(),
+                },
+                expected_text: current.document.text.clone(),
+                replacement: "新しい目標".into(),
+                cursor: "新しい目標".len(),
+            },
+            expected: current,
+        };
+        assert!(matches!(
+            surface
+                .apply_focused_text_field_edit_result(&request, &host)
+                .edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
     }
 
     #[derive(Default)]
@@ -2300,21 +2485,21 @@ mod tests {
                 },
             })
         };
-        surface.handle_event(&key(KeyCode::Tab, true), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Tab, true), &host);
         assert!(surface.editor.goal_option_focus == Some(GoalOption::Review));
-        surface.handle_event(&key(KeyCode::Tab, true), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Tab, true), &host);
         assert!(surface.editor.goal_option_focus == Some(GoalOption::Progress));
-        surface.handle_event(&key(KeyCode::Char(' '), false), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Space, false), &host);
         assert!(surface.editor.progress_document.is_some());
-        surface.handle_event(&key(KeyCode::Tab, true), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Tab, true), &host);
         assert!(surface.editor.goal_option_focus == Some(GoalOption::Swarm));
-        surface.handle_event(&key(KeyCode::Tab, true), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Tab, true), &host);
         assert!(surface.editor.goal_option_focus.is_none());
         assert_eq!(surface.editor.field, Field::Evaluation);
-        surface.handle_event(&key(KeyCode::Tab, false), &host);
-        surface.handle_event(&key(KeyCode::Tab, false), &host);
-        surface.handle_event(&key(KeyCode::Tab, false), &host);
-        surface.handle_event(&key(KeyCode::Enter, false), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Tab, false), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Tab, false), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Tab, false), &host);
+        routed_surface_input(&mut surface, &key(KeyCode::Enter, false), &host);
         assert!(matches!(
             surface.phase,
             GoalPhase::Generating { review: true }

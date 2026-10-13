@@ -229,6 +229,10 @@ pub struct BcodeRuntimeModel {
     pub selected_plain_text: Option<String>,
     /// Last successfully committed terminal frame area.
     pub committed_area: bmux_tui::geometry::Rect,
+    /// Lifecycle adapter selected by the existing foreground/focus authority.
+    focused_input_owner: Option<FocusedInputOwner>,
+    composer_field: bcode_plugin_sdk::tui::FocusedTextFieldAdapter,
+    focused_input_command: Option<bmux_tui_runtime::Command<BcodeRuntimeMessage>>,
     focused_visual: Option<String>,
     /// Last successfully committed frame layout used for regional damage projection.
     committed_layout: Option<super::render::FrameLayout>,
@@ -290,10 +294,52 @@ impl RootTimer {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FocusedInputOwner {
+    Composer,
+    RootSurface,
+    InteractiveSurface,
+}
+
 impl BcodeRuntimeModel {
-    /// Arbitrate only the visible generic composer interaction, before ordinary chat bindings.
-    fn handle_composer_interaction_key(&mut self, stroke: bmux_keyboard::KeyStroke) -> bool {
-        self.composer_interaction_key_outcome(stroke) != bmux_tui::event::EventOutcome::Ignored
+    /// Compose the transient interaction exactly once before the owner's ordinary input.
+    fn compose_focused_input_event(&mut self, event: &Event) -> bmux_tui::event::EventOutcome {
+        if let Event::Key(stroke) = event {
+            // Application-level interrupts and navigation retain priority over completion.
+            if self.root_interactive_surface_host_key(*stroke).is_some()
+                && (!matches!(self.focused_input_owner, Some(FocusedInputOwner::Composer))
+                    || stroke.key != bmux_keyboard::KeyCode::Escape)
+            {
+                return bmux_tui::event::EventOutcome::Ignored;
+            }
+            return self.composer_interaction_key_outcome(*stroke);
+        }
+        if let Event::Mouse(mouse) = event {
+            let outcome = self.loop_state.composer_interaction.list_event(event);
+            if matches!(
+                outcome,
+                bmux_tui_components::selectable_list::SelectableListOutcome::Selected(_)
+            ) {
+                self.accept_composer_candidate();
+            }
+            if !matches!(
+                outcome,
+                bmux_tui_components::selectable_list::SelectableListOutcome::Ignored
+            ) {
+                return bmux_tui::event::EventOutcome::Redraw;
+            }
+            // An outside press dismisses the transient interaction, then reaches the
+            // ordinary owner once. It is never replayed against a new hit map.
+            if self.loop_state.composer_interaction.visible()
+                && matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_))
+            {
+                self.loop_state.composer_interaction.dismiss();
+                self.invalidation = self
+                    .invalidation
+                    .merge(super::invalidation::UiInvalidation::Structural);
+            }
+        }
+        bmux_tui::event::EventOutcome::Ignored
     }
 
     fn composer_interaction_key_outcome(
@@ -343,69 +389,114 @@ impl BcodeRuntimeModel {
         }
     }
 
+    /// Resolve the live field through the retained lifecycle adapter, never its plugin kind.
+    fn active_focused_field(&self) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        match self.focused_input_owner? {
+            FocusedInputOwner::Composer => self.composer_field.snapshot(self.chat.app.composer()),
+            FocusedInputOwner::RootSurface => self.loop_state.root_focused_text_field(),
+            FocusedInputOwner::InteractiveSurface => {
+                self.loop_state.interactive_focused_text_field()
+            }
+        }
+    }
+
+    fn apply_active_focused_edit(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+    ) -> bcode_plugin_sdk::tui::FocusedTextFieldEditResult {
+        use bcode_plugin_sdk::tui::FocusedTextFieldEditResult;
+        let rejected = FocusedTextFieldEditResult::Rejected(
+            bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+        );
+        match self.focused_input_owner {
+            Some(FocusedInputOwner::RootSurface) => {
+                let client = self.loop_state.foreground_client();
+                let launch = self.fresh_session_settings();
+                let Some(result) = self
+                    .loop_state
+                    .apply_root_focused_text_field_edit(edit, &client, launch)
+                else {
+                    return rejected;
+                };
+                let damage = self.apply_root_surface_event_result(result.event);
+                self.invalidation = self.invalidation.merge(damage);
+                result.edit_result
+            }
+            Some(FocusedInputOwner::InteractiveSurface) => {
+                let (result, outcome) = self
+                    .loop_state
+                    .apply_interactive_focused_text_field_edit(edit);
+                if let super::interactive_surface::InteractiveSurfaceEventOutcome::Resolved(
+                    resolution,
+                ) = &outcome
+                    && let Some(interaction_id) = self
+                        .loop_state
+                        .active_interactive_surface_id()
+                        .map(ToOwned::to_owned)
+                {
+                    self.focused_input_command = Some(self.interactive_surface_resolution_command(
+                        interaction_id,
+                        resolution.clone(),
+                    ));
+                }
+                if matches!(
+                    outcome,
+                    super::interactive_surface::InteractiveSurfaceEventOutcome::Redraw
+                        | super::interactive_surface::InteractiveSurfaceEventOutcome::Relayout
+                ) {
+                    self.invalidation = self
+                        .invalidation
+                        .merge(super::invalidation::UiInvalidation::Structural);
+                }
+                result
+            }
+            Some(FocusedInputOwner::Composer) => {
+                let result = self
+                    .composer_field
+                    .apply(self.chat.app.composer_mut(), edit);
+                if result == FocusedTextFieldEditResult::Applied {
+                    self.chat.app.reset_input_history_navigation();
+                    self.chat.app.wake_cursor();
+                    self.draft_autosave.observe(&self.chat, Instant::now());
+                }
+                result
+            }
+            _ => rejected,
+        }
+    }
+
+    fn reject_composer_candidate(&mut self) {
+        self.loop_state.composer_interaction.dismiss();
+        self.chat
+            .app
+            .set_status("Suggestion could not be applied; draft unchanged".to_owned());
+    }
+
     /// An acceptance intent is consumed even when its validated edit cannot be committed.
     fn accept_composer_candidate(&mut self) {
         if let Some(edit) = self.loop_state.composer_interaction.focused_edit() {
-            let standalone =
-                self.loop_state.foreground() == Some(super::foreground::Foreground::Plugin);
-            let current = if standalone {
-                self.loop_state.root_focused_text_field()
-            } else {
-                self.loop_state.interactive_focused_text_field()
-            };
-            let Some(current) = current else {
-                self.loop_state.composer_interaction.dismiss();
+            let Some(current) = self.active_focused_field() else {
+                self.reject_composer_candidate();
                 return;
             };
             match edit.validate(&current) {
                 Ok(Some(next)) => {
-                    let changed = if standalone {
-                        let client = self.loop_state.foreground_client();
-                        let launch = self.fresh_session_settings();
-                        self.loop_state
-                            .apply_root_focused_text_field_edit(&edit, &client, launch)
-                            .is_some_and(|result| {
-                                matches!(
-                                    result.action,
-                                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-                                )
-                            })
-                    } else {
-                        let outcome = self
-                            .loop_state
-                            .apply_interactive_focused_text_field_edit(&edit);
-                        matches!(outcome, super::interactive_surface::InteractiveSurfaceEventOutcome::Redraw
-                            | super::interactive_surface::InteractiveSurfaceEventOutcome::Relayout)
-                    };
-                    if changed {
+                    if self.apply_active_focused_edit(&edit)
+                        == bcode_plugin_sdk::tui::FocusedTextFieldEditResult::Applied
+                    {
                         self.loop_state
                             .composer_interaction
                             .finish_focused_edit(next);
                     } else {
-                        self.loop_state.composer_interaction.dismiss();
+                        self.reject_composer_candidate();
                     }
                 }
-                Ok(None) => {
-                    self.loop_state.composer_interaction.dismiss();
-                }
-                Err(_) => self.loop_state.composer_interaction.dismiss(),
+                Ok(None) => self.loop_state.composer_interaction.dismiss(),
+                Err(_) => self.reject_composer_candidate(),
             }
             return;
         }
-        if self
-            .loop_state
-            .composer_interaction
-            .apply(self.chat.app.composer_mut())
-        {
-            self.chat.app.reset_input_history_navigation();
-            self.chat.app.wake_cursor();
-            self.draft_autosave.observe(&self.chat, Instant::now());
-        } else {
-            self.loop_state.composer_interaction.dismiss();
-            self.chat
-                .app
-                .set_status("Suggestion could not be applied; draft unchanged".to_owned());
-        }
+        self.loop_state.composer_interaction.dismiss();
     }
 
     /// Reconcile the complete composer observation before replies/input and after every root update.
@@ -419,13 +510,22 @@ impl BcodeRuntimeModel {
                     .routes_non_mouse_event_to_interactive_surface(
                         self.chat.app.tui_config().interactions,
                     ));
-        let field = if standalone {
-            self.loop_state.root_focused_text_field()
-        } else if interactive_owner {
-            self.loop_state.interactive_focused_text_field()
-        } else {
+        self.focused_input_owner = if standalone {
+            Some(FocusedInputOwner::RootSurface)
+        } else if self.loop_state.foreground().is_some()
+            || !matches!(self.screen, BcodeRuntimeScreen::Chat)
+        {
             None
+        } else if interactive_owner {
+            Some(FocusedInputOwner::InteractiveSurface)
+        } else {
+            Some(FocusedInputOwner::Composer)
         };
+        self.composer_field.observe(
+            self.chat.app.composer(),
+            matches!(self.focused_input_owner, Some(FocusedInputOwner::Composer)),
+        );
+        let field = self.active_focused_field();
         if self.chat.app.plugin_presentation().is_none()
             || (!matches!(self.screen, BcodeRuntimeScreen::Chat) && !standalone)
             || (self.loop_state.foreground().is_some() && !standalone)
@@ -446,15 +546,21 @@ impl BcodeRuntimeModel {
             self.loop_state.composer_interaction.cancel();
             return;
         };
-        let changed = if let Some(field) = field {
-            self.loop_state
-                .composer_interaction
-                .observe_focused_field(scope.clone(), field)
-        } else {
-            self.loop_state
-                .composer_interaction
-                .observe(scope.clone(), self.chat.app.composer())
+        let Some(field) = field else {
+            // Observe ordinary edits immediately, but do not activate or accept until
+            // the adapter has geometry committed for that exact editor state.
+            if matches!(self.focused_input_owner, Some(FocusedInputOwner::Composer)) {
+                self.loop_state
+                    .composer_interaction
+                    .observe(scope, self.chat.app.composer());
+            }
+            self.loop_state.composer_interaction.cancel();
+            return;
         };
+        let changed = self
+            .loop_state
+            .composer_interaction
+            .observe_focused_field(scope.clone(), field);
         if changed {
             self.invalidation = self
                 .invalidation
@@ -698,6 +804,9 @@ impl BcodeRuntimeModel {
             transcript_selection: bmux_tui::selection::SelectionController::new(),
             selected_plain_text: None,
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
+            focused_input_owner: None,
+            focused_input_command: None,
+            composer_field: bcode_plugin_sdk::tui::FocusedTextFieldAdapter::new("chat", "composer"),
             focused_visual: None,
             committed_layout: None,
             last_presented_at: None,
@@ -979,22 +1088,107 @@ impl BcodeRuntimeModel {
     }
 
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
+    fn apply_root_surface_event_result(
+        &mut self,
+        result: bcode_plugin_sdk::tui::PluginTuiEventResult,
+    ) -> super::invalidation::UiInvalidation {
+        let has_effect = result.outcome == bmux_tui::event::EventOutcome::Redraw
+            || !matches!(result.action, bcode_plugin_sdk::tui::PluginTuiAction::None);
+        match result.action {
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+            | bcode_plugin_sdk::tui::PluginTuiAction::Redraw => {}
+            bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome } => {
+                if let Some((plugin_id, outcome)) = self
+                    .loop_state
+                    .close_root_plugin_surface_with_outcome(outcome)
+                {
+                    return self.apply_plugin_surface_close(&plugin_id, outcome);
+                }
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::OpenSession { session_id } => {
+                self.suspend_screen_for_session_navigation();
+                self.loop_state
+                    .suspend_root_plugin_surface_for_session(session_id);
+                super::session_flow::start_switch_session(
+                    &mut self.chat,
+                    session_id,
+                    super::history_flow::initial_transcript_window_request(self.committed_area),
+                );
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::OpenSurface {
+                plugin_id,
+                surface_id,
+                options,
+            } => {
+                self.chat
+                    .replace_effect(super::effects::TuiEffect::OpenPluginSurface {
+                        plugin_id,
+                        surface_kind: surface_id.clone(),
+                        instance_id: format!("workflow-related-{surface_id}"),
+                        options,
+                        working_directory: self.settings.launch_working_directory().to_path_buf(),
+                        session_id: self.chat.attached_session_id(),
+                    });
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns => {
+                let (updates, requests) = super::plugin_surface_host::subscribe_workflow_views(
+                    self.loop_state.foreground_client(),
+                    self.loop_state
+                        .root_plugin_surface_invalidation()
+                        .expect("plugin surface invalidation"),
+                );
+                self.loop_state
+                    .attach_root_plugin_surface_updates(updates, requests);
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::SelectWorkflowRun { run_id } => {
+                self.loop_state.request_root_workflow_run(run_id);
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::UpdateWorkflowCatalogQuery {
+                filter,
+                sort,
+                group,
+                search,
+            } => {
+                self.loop_state
+                    .request_root_workflow_query(filter, sort, group, search);
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::LoadMoreWorkflowRuns { cursor } => {
+                self.loop_state.request_more_root_workflow_runs(cursor);
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::InvokePluginCommand {
+                plugin_id,
+                command_id,
+                arguments,
+            } => {
+                self.chat
+                    .replace_effect(super::effects::TuiEffect::InvokePluginCommand {
+                        plugin_id,
+                        command_id,
+                        arguments,
+                        working_directory: self.settings.launch_working_directory().to_path_buf(),
+                        session_id: self.chat.attached_session_id(),
+                    });
+            }
+            bcode_plugin_sdk::tui::PluginTuiAction::RunCommand { command } => {
+                self.chat.app.replace_composer_with(&command);
+                self.loop_state.close_root_plugin_surface();
+            }
+        }
+        if has_effect {
+            super::invalidation::UiInvalidation::Structural
+        } else {
+            // Explicit Handled/None stays in the owning surface, without manufacturing damage.
+            super::invalidation::UiInvalidation::None
+        }
+    }
+
+    // Retain the existing scoped lint exceptions for the unchanged terminal
+    // fallback dispatcher; focused-input composition lives outside this handler.
+    #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
         self.synchronize_selection_lifecycle();
         if self.return_from_borrowed_chat(&event) {
             return super::invalidation::UiInvalidation::Structural;
-        }
-        if let Event::Key(stroke) = &event {
-            let outcome = self.composer_interaction_key_outcome(*stroke);
-            match outcome {
-                bmux_tui::event::EventOutcome::Ignored => {}
-                bmux_tui::event::EventOutcome::Handled => {
-                    return super::invalidation::UiInvalidation::None;
-                }
-                bmux_tui::event::EventOutcome::Redraw => {
-                    return super::invalidation::UiInvalidation::Structural;
-                }
-            }
         }
         if self.loop_state.has_root_plugin_surface()
             && !self.loop_state.root_plugin_surface_is_suspended()
@@ -1007,99 +1201,9 @@ impl BcodeRuntimeModel {
                     self.fresh_session_settings(),
                 )
                 .expect("plugin surface was present");
-            let has_effect = !matches!(result.action, bcode_plugin_sdk::tui::PluginTuiAction::None);
-            match result.action {
-                bcode_plugin_sdk::tui::PluginTuiAction::None
-                | bcode_plugin_sdk::tui::PluginTuiAction::Redraw => {}
-                bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome } => {
-                    if let Some((plugin_id, outcome)) = self
-                        .loop_state
-                        .close_root_plugin_surface_with_outcome(outcome)
-                    {
-                        return self.apply_plugin_surface_close(&plugin_id, outcome);
-                    }
-                }
-                bcode_plugin_sdk::tui::PluginTuiAction::OpenSession { session_id } => {
-                    self.suspend_screen_for_session_navigation();
-                    self.loop_state
-                        .suspend_root_plugin_surface_for_session(session_id);
-                    super::session_flow::start_switch_session(
-                        &mut self.chat,
-                        session_id,
-                        super::history_flow::initial_transcript_window_request(self.committed_area),
-                    );
-                }
-                bcode_plugin_sdk::tui::PluginTuiAction::OpenSurface {
-                    plugin_id,
-                    surface_id,
-                    options,
-                } => {
-                    self.chat
-                        .replace_effect(super::effects::TuiEffect::OpenPluginSurface {
-                            plugin_id,
-                            surface_kind: surface_id.clone(),
-                            instance_id: format!("workflow-related-{surface_id}"),
-                            options,
-                            working_directory: self
-                                .settings
-                                .launch_working_directory()
-                                .to_path_buf(),
-                            session_id: self.chat.attached_session_id(),
-                        });
-                }
-                bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns => {
-                    let (updates, requests) = super::plugin_surface_host::subscribe_workflow_views(
-                        self.loop_state.foreground_client(),
-                        self.loop_state
-                            .root_plugin_surface_invalidation()
-                            .expect("plugin surface invalidation"),
-                    );
-                    self.loop_state
-                        .attach_root_plugin_surface_updates(updates, requests);
-                }
-                bcode_plugin_sdk::tui::PluginTuiAction::SelectWorkflowRun { run_id } => {
-                    self.loop_state.request_root_workflow_run(run_id);
-                }
-                bcode_plugin_sdk::tui::PluginTuiAction::UpdateWorkflowCatalogQuery {
-                    filter,
-                    sort,
-                    group,
-                    search,
-                } => {
-                    self.loop_state
-                        .request_root_workflow_query(filter, sort, group, search);
-                }
-                bcode_plugin_sdk::tui::PluginTuiAction::LoadMoreWorkflowRuns { cursor } => {
-                    self.loop_state.request_more_root_workflow_runs(cursor);
-                }
-                bcode_plugin_sdk::tui::PluginTuiAction::InvokePluginCommand {
-                    plugin_id,
-                    command_id,
-                    arguments,
-                } => {
-                    self.chat
-                        .replace_effect(super::effects::TuiEffect::InvokePluginCommand {
-                            plugin_id,
-                            command_id,
-                            arguments,
-                            working_directory: self
-                                .settings
-                                .launch_working_directory()
-                                .to_path_buf(),
-                            session_id: self.chat.attached_session_id(),
-                        });
-                }
-                bcode_plugin_sdk::tui::PluginTuiAction::RunCommand { command } => {
-                    self.chat.app.replace_composer_with(&command);
-                    self.loop_state.close_root_plugin_surface();
-                }
+            if result.outcome != bmux_tui::event::EventOutcome::Ignored {
+                return self.apply_root_surface_event_result(result);
             }
-            return if has_effect {
-                super::invalidation::UiInvalidation::Structural
-            } else {
-                // Explicit Handled/None stays in the owning surface, without manufacturing damage.
-                super::invalidation::UiInvalidation::None
-            };
         }
         if self.loop_state.has_session_picker() {
             if let Event::Mouse(mouse) = &event
@@ -1634,9 +1738,6 @@ impl BcodeRuntimeModel {
                     }
                     return super::invalidation::UiInvalidation::Structural;
                 }
-                if self.handle_composer_interaction_key(stroke) {
-                    return super::invalidation::UiInvalidation::Structural;
-                }
                 if self.loop_state.has_slash_palette() {
                     match self.loop_state.handle_slash_palette_key(
                         &mut self.chat,
@@ -1727,25 +1828,6 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
-                if self.loop_state.foreground().is_none() {
-                    let outcome = self
-                        .loop_state
-                        .composer_interaction
-                        .list_event(&Event::Mouse(mouse));
-                    if matches!(
-                        outcome,
-                        bmux_tui_components::selectable_list::SelectableListOutcome::Selected(_)
-                    ) {
-                        self.accept_composer_candidate();
-                        return super::invalidation::UiInvalidation::Structural;
-                    }
-                    if !matches!(
-                        outcome,
-                        bmux_tui_components::selectable_list::SelectableListOutcome::Ignored
-                    ) {
-                        return super::invalidation::UiInvalidation::Structural;
-                    }
-                }
                 if !self.loop_state.modal_foreground()
                     && self.chat.app.child_panel_open()
                     && matches!(
@@ -2513,6 +2595,7 @@ impl BcodeRuntimeModel {
     }
 
     fn handle_session_changed(&mut self) {
+        self.composer_field.reset();
         self.clear_transcript_selection();
         self.selection_session = self.chat.app.session_id();
         self.committed_selection = bmux_tui::selection::SelectionScene::new();
@@ -2527,6 +2610,9 @@ impl BcodeRuntimeModel {
         handle: &bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
     ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
         let (mut commands, notes) = self.loop_state.take_pending_effects(&mut self.chat, handle);
+        if let Some(command) = self.focused_input_command.take() {
+            commands.push(command);
+        }
         self.ordered_notes.append(notes);
         for effect in self.ordered_notes.take_ready() {
             commands.push(self.loop_state.ordered_effect_command(effect, handle));
@@ -2948,6 +3034,15 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
             program.refresh_selected_plain_text();
         }
         program.committed_area = self.terminal.area();
+        if matches!(
+            program.focused_input_owner,
+            Some(FocusedInputOwner::Composer)
+        ) {
+            let area = program.chat.app.composer_content_area();
+            program
+                .composer_field
+                .painted(program.chat.app.composer(), area, area);
+        }
         program.committed_layout = layout;
         Ok(bmux_tui_runtime::PresentReport {
             changed_cells: draw_stats.changed_cells,
@@ -3664,40 +3759,6 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 if self.return_from_borrowed_chat(&event) {
                     return Ok(bmux_tui_runtime::Update::redraw());
                 }
-                if let Event::Key(stroke) = &event {
-                    let outcome = self.composer_interaction_key_outcome(*stroke);
-                    if outcome != bmux_tui::event::EventOutcome::Ignored {
-                        if outcome == bmux_tui::event::EventOutcome::Handled {
-                            return Ok(bmux_tui_runtime::Update::none());
-                        }
-                        self.invalidation = self
-                            .invalidation
-                            .merge(super::invalidation::UiInvalidation::Structural);
-                        self.presentation_damage = bmux_tui::damage::Damage::Full;
-                        self.fast_temporal_presentation = false;
-                        return Ok(bmux_tui_runtime::Update::redraw());
-                    }
-                }
-                if let Event::Mouse(_) = &event {
-                    let outcome = self.loop_state.composer_interaction.list_event(&event);
-                    if matches!(
-                        outcome,
-                        bmux_tui_components::selectable_list::SelectableListOutcome::Selected(_)
-                    ) {
-                        self.accept_composer_candidate();
-                    }
-                    if !matches!(
-                        outcome,
-                        bmux_tui_components::selectable_list::SelectableListOutcome::Ignored
-                    ) {
-                        self.invalidation = self
-                            .invalidation
-                            .merge(super::invalidation::UiInvalidation::Structural);
-                        self.presentation_damage = bmux_tui::damage::Damage::Full;
-                        self.fast_temporal_presentation = false;
-                        return Ok(bmux_tui_runtime::Update::redraw());
-                    }
-                }
                 if self.loop_state.has_interactive_surface() && !self.loop_state.modal_foreground()
                 {
                     if let Event::Key(stroke) = event
@@ -3761,6 +3822,22 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         return Ok(bmux_tui_runtime::Update::redraw());
                     }
                 }
+                let outcome = self.compose_focused_input_event(&event);
+                if outcome != bmux_tui::event::EventOutcome::Ignored {
+                    if outcome == bmux_tui::event::EventOutcome::Handled {
+                        return Ok(bmux_tui_runtime::Update::none());
+                    }
+                    self.invalidation = self
+                        .invalidation
+                        .merge(super::invalidation::UiInvalidation::Structural);
+                    self.presentation_damage = bmux_tui::damage::Damage::Full;
+                    self.fast_temporal_presentation = false;
+                    let command = self.focused_input_command.take();
+                    let update = bmux_tui_runtime::Update::redraw();
+                    return Ok(command.map_or(update, |command| {
+                        bmux_tui_runtime::Update::redraw().with_command(command)
+                    }));
+                }
                 let route_to_surface = !self.loop_state.modal_foreground()
                     && match event {
                         Event::Mouse(mouse) if self.loop_state.has_interactive_surface() => self
@@ -3777,7 +3854,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     match self.loop_state.handle_interactive_surface_event(&event) {
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Ignored => {}
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed => {
-                            return Ok(bmux_tui_runtime::Update::redraw());
+                            return Ok(bmux_tui_runtime::Update::none());
                         }
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Redraw => {
                             self.invalidation = self
@@ -8279,9 +8356,39 @@ mod tests {
         model: super::BcodeRuntimeModel,
         field: std::sync::Arc<std::sync::Mutex<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot>>,
         submits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        editor_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     fn standalone_focused_owner_fixture() -> StandaloneFocusedOwnerFixture {
+        standalone_focused_owner_fixture_with_outcome(bmux_tui::event::EventOutcome::Ignored)
+    }
+
+    fn standalone_focused_field()
+    -> std::sync::Arc<std::sync::Mutex<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot>> {
+        use bcode_plugin_sdk::tui::FocusedTextFieldSnapshot;
+        std::sync::Arc::new(std::sync::Mutex::new(FocusedTextFieldSnapshot {
+            identity: bcode_plugin_sdk::tui::FocusedTextFieldIdentity {
+                owner_id: "standalone".into(),
+                field_id: "input".into(),
+                lifetime: 1,
+            },
+            generation: 0,
+            document: bcode_plugin_sdk::composer::ComposerDocument {
+                document_id: "standalone-input".into(),
+                revision: 0,
+                text: "@topic".into(),
+                cursor: 6,
+                selection: None,
+            },
+            eligible: true,
+            content_rect: bmux_tui::geometry::Rect::new(0, 4, 40, 1),
+            anchor: bmux_tui::geometry::Rect::new(6, 4, 1, 1),
+        }))
+    }
+
+    fn standalone_focused_owner_fixture_with_outcome(
+        editor_outcome: bmux_tui::event::EventOutcome,
+    ) -> StandaloneFocusedOwnerFixture {
         use bcode_plugin_sdk::tui::{
             FocusedTextFieldEdit, FocusedTextFieldSnapshot, PluginTuiAction, PluginTuiEventResult,
         };
@@ -8289,6 +8396,8 @@ mod tests {
         struct Owner {
             field: std::sync::Arc<std::sync::Mutex<FocusedTextFieldSnapshot>>,
             submits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            editor_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            editor_outcome: EventOutcome,
         }
         impl bcode_plugin_sdk::tui::PluginTuiSurface for Owner {
             fn id(&self) -> &'static str {
@@ -8314,64 +8423,65 @@ mod tests {
                 }
                 PluginTuiAction::None
             }
+            fn focused_text_field_event(
+                &mut self,
+                _: &Event,
+                _: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> PluginTuiEventResult {
+                self.editor_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                PluginTuiEventResult {
+                    outcome: self.editor_outcome,
+                    action: PluginTuiAction::None,
+                }
+            }
             fn focused_text_field(&self) -> Option<FocusedTextFieldSnapshot> {
                 Some(self.field.lock().unwrap().clone())
             }
-            fn apply_focused_text_field_edit(
+            fn apply_focused_text_field_edit_result(
                 &mut self,
                 edit: &FocusedTextFieldEdit,
                 _: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
-            ) -> PluginTuiEventResult {
+            ) -> bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult {
                 let mut field = self.field.lock().unwrap();
                 let document = edit.validate(&field);
                 if let Ok(Some(document)) = document {
                     field.document = document;
                     field.generation += 1;
                     drop(field);
-                    PluginTuiEventResult {
-                        outcome: EventOutcome::Redraw,
-                        action: PluginTuiAction::Redraw,
+                    bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult {
+                        edit_result: bcode_plugin_sdk::tui::FocusedTextFieldEditResult::Applied,
+                        event: PluginTuiEventResult {
+                            outcome: EventOutcome::Redraw,
+                            action: PluginTuiAction::Redraw,
+                        },
                     }
                 } else {
                     drop(field);
-                    PluginTuiEventResult {
-                        outcome: EventOutcome::Handled,
-                        action: PluginTuiAction::None,
-                    }
+                    bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult::rejected(
+                        bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+                    )
                 }
             }
         }
         let mut model = root_test_model();
-        let field = std::sync::Arc::new(std::sync::Mutex::new(FocusedTextFieldSnapshot {
-            identity: bcode_plugin_sdk::tui::FocusedTextFieldIdentity {
-                owner_id: "standalone".into(),
-                field_id: "input".into(),
-                lifetime: 1,
-            },
-            generation: 0,
-            document: bcode_plugin_sdk::composer::ComposerDocument {
-                document_id: "standalone-input".into(),
-                revision: 0,
-                text: "@topic".into(),
-                cursor: 6,
-                selection: None,
-            },
-            eligible: true,
-            content_rect: bmux_tui::geometry::Rect::new(0, 4, 40, 1),
-            anchor: bmux_tui::geometry::Rect::new(6, 4, 1, 1),
-        }));
+        let field = standalone_focused_field();
         let submits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let editor_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         model.loop_state.queue_root_plugin_surface(
             "test.owner",
             Box::new(Owner {
                 field: field.clone(),
                 submits: submits.clone(),
+                editor_calls: editor_calls.clone(),
+                editor_outcome,
             }),
         );
         StandaloneFocusedOwnerFixture {
             model,
             field,
             submits,
+            editor_calls,
         }
     }
 
@@ -8381,7 +8491,9 @@ mod tests {
             mut model,
             field,
             submits,
+            ..
         } = standalone_focused_owner_fixture();
+        model.focused_input_owner = Some(super::FocusedInputOwner::RootSurface);
         let observed = field.lock().unwrap().clone();
         model.loop_state.composer_interaction.observe_focused_field(
             super::super::composer_interaction::ComposerScope {
@@ -8410,13 +8522,63 @@ mod tests {
         assert_eq!(submits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn ordinary_focused_input_is_delivered_once_and_only_ignored_reaches_surface() {
+        use bmux_tui::event::{Event, EventOutcome};
+        use bmux_tui_runtime::Program;
+        for outcome in [
+            EventOutcome::Ignored,
+            EventOutcome::Handled,
+            EventOutcome::Redraw,
+        ] {
+            let mut fixture = standalone_focused_owner_fixture_with_outcome(outcome);
+            fixture
+                .model
+                .update(bmux_tui_runtime::RuntimeEvent::Terminal(Event::Key(
+                    bmux_keyboard::parse_key_stroke("enter").unwrap(),
+                )))
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .editor_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                fixture.submits.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(outcome == EventOutcome::Ignored)
+            );
+            assert!(fixture.model.chat.app.take_pending_submission().is_empty());
+        }
+    }
+
+    fn begin_root_composer(
+        model: &mut super::BcodeRuntimeModel,
+    ) -> bcode_plugin_sdk::composer::ComposerSearchRequest {
+        model.focused_input_owner = Some(super::FocusedInputOwner::Composer);
+        model
+            .composer_field
+            .observe(model.chat.app.composer(), true);
+        let area = bmux_tui::geometry::Rect::new(0, 16, 90, 2);
+        model
+            .composer_field
+            .painted(model.chat.app.composer(), area, area);
+        model.loop_state.composer_interaction.observe_focused_field(
+            super::super::composer_interaction::tests::scope(),
+            model
+                .composer_field
+                .snapshot(model.chat.app.composer())
+                .unwrap(),
+        );
+        super::super::composer_interaction::tests::begin_observed(
+            &mut model.loop_state.composer_interaction,
+        )
+    }
+
     fn composer_root_fixture(config: &bcode_config::TuiConfig) -> super::BcodeRuntimeModel {
         let mut model = root_test_model_with_tui_config(config);
         model.chat.app.replace_composer_with("#topic");
-        let request = super::super::composer_interaction::tests::begin(
-            &mut model.loop_state.composer_interaction,
-            model.chat.app.composer(),
-        );
+        let request = begin_root_composer(&mut model);
         let mut reply = super::super::composer_interaction::tests::completion(&request);
         let candidates = &mut reply.snapshot.as_mut().unwrap().candidates;
         let mut second = candidates[0].clone();
@@ -8441,9 +8603,10 @@ mod tests {
     }
 
     fn composer_root_key(model: &mut super::BcodeRuntimeModel, key: &str) {
-        model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
-            bmux_keyboard::parse_key_stroke(key).unwrap(),
-        ));
+        let event = bmux_tui::event::Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap());
+        if model.compose_focused_input_event(&event) == bmux_tui::event::EventOutcome::Ignored {
+            model.handle_basic_terminal_event(event);
+        }
     }
 
     #[tokio::test]
@@ -8642,10 +8805,7 @@ mod tests {
         let future = model.chat.app.composer().edit_state();
         assert!(model.chat.app.composer_mut().undo());
         let before = model.chat.app.composer().edit_state();
-        let request = super::super::composer_interaction::tests::begin(
-            &mut model.loop_state.composer_interaction,
-            model.chat.app.composer(),
-        );
+        let request = begin_root_composer(&mut model);
         let mut reply = super::super::composer_interaction::tests::completion(&request);
         let edit = &mut reply.snapshot.as_mut().unwrap().candidates[0].edit;
         edit.replacement = request.document.text.clone();
@@ -8709,7 +8869,7 @@ mod tests {
                 MouseEventKind::Down(MouseButton::Left),
                 MouseEventKind::Up(MouseButton::Left),
             ] {
-                model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
+                model.compose_focused_input_event(&Event::Mouse(MouseEvent::new(kind, point)));
             }
             assert_eq!(model.chat.app.composer().text(), "#topic");
         }
@@ -8718,7 +8878,7 @@ mod tests {
             MouseEventKind::Down(MouseButton::Left),
             MouseEventKind::Up(MouseButton::Left),
         ] {
-            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+            model.compose_focused_input_event(&Event::Mouse(MouseEvent::new(
                 kind,
                 Point::new(list.x, list.y),
             )));
@@ -8743,7 +8903,7 @@ mod tests {
             MouseEventKind::Down(MouseButton::Left),
             MouseEventKind::Up(MouseButton::Left),
         ] {
-            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
+            model.compose_focused_input_event(&Event::Mouse(MouseEvent::new(kind, point)));
         }
         assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
         assert!(model.chat.app.take_pending_submission().is_empty());
@@ -8763,13 +8923,13 @@ mod tests {
         paint_composer_root_fixture(&mut model, 90, 18);
         let list = model.loop_state.composer_interaction.painted_list.unwrap();
         let point = bmux_tui::geometry::Point::new(list.x, list.y.saturating_add(1));
-        model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+        model.compose_focused_input_event(&Event::Mouse(MouseEvent::new(
             MouseEventKind::Down(MouseButton::Left),
             point,
         )));
         // Production redraw between press and release must retain pointer state.
         paint_composer_root_fixture(&mut model, 90, 18);
-        model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+        model.compose_focused_input_event(&Event::Mouse(MouseEvent::new(
             MouseEventKind::Up(MouseButton::Left),
             point,
         )));
@@ -8824,10 +8984,7 @@ mod tests {
     async fn composer_root_pending_reply_is_fenced_when_plugin_backend_is_disabled() {
         let mut model = root_test_model();
         model.chat.app.replace_composer_with("#topic");
-        let request = super::super::composer_interaction::tests::begin(
-            &mut model.loop_state.composer_interaction,
-            model.chat.app.composer(),
-        );
+        let request = begin_root_composer(&mut model);
         // No enabled plugin presentation exists after disable/unload. Root reconciliation
         // must cancel the retained pending request even when the text has not changed.
         assert!(model.chat.app.plugin_presentation().is_none());
@@ -8844,9 +9001,11 @@ mod tests {
     async fn composer_root_modal_foreground_has_priority_over_acceptance() {
         let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
         model.loop_state.open_command_palette(&mut model.chat);
-        assert!(
-            !model
-                .handle_composer_interaction_key(bmux_keyboard::parse_key_stroke("enter").unwrap())
+        assert_eq!(
+            model.compose_focused_input_event(&bmux_tui::event::Event::Key(
+                bmux_keyboard::parse_key_stroke("enter").unwrap(),
+            )),
+            bmux_tui::event::EventOutcome::Ignored,
         );
         assert_eq!(model.chat.app.composer().text(), "#topic");
         assert!(model.chat.app.take_pending_submission().is_empty());
@@ -10806,15 +10965,18 @@ mod tests {
             .loop_state
             .composer_interaction
             .observe_focused_field(scope, field);
+        model.focused_input_owner = Some(super::FocusedInputOwner::InteractiveSurface);
         let request = super::super::composer_interaction::tests::begin_observed(
             &mut model.loop_state.composer_interaction,
         );
         model.loop_state.composer_interaction.complete(
             super::super::composer_interaction::tests::completion(&request),
         );
-        assert!(
-            model
-                .handle_composer_interaction_key(bmux_keyboard::parse_key_stroke("enter").unwrap())
+        assert_ne!(
+            model.compose_focused_input_event(&Event::Key(
+                bmux_keyboard::parse_key_stroke("enter").unwrap(),
+            )),
+            bmux_tui::event::EventOutcome::Ignored,
         );
         assert!(model.chat.app.take_pending_submission().is_empty());
         assert!(

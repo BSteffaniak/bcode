@@ -1,6 +1,7 @@
 //! Terminal-native graph editor projection for portable workflow authoring documents.
 
 use crate::keybindings::{self, Hints};
+use crate::prose_editor::ProseEditor;
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginStructuredGenerationRequest, PluginTuiAction, PluginTuiHost,
     PluginTuiSurface, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
@@ -9,6 +10,10 @@ use bcode_plugin_sdk::tui::{
     PluginWorkflowGeneratedCandidate, PluginWorkflowGeneratedCandidateAcceptance,
     PluginWorkflowGeneratedCandidateTarget, PluginWorkflowStartResponse,
     PluginWorkflowTemplateInstantiationRequest,
+};
+use bcode_plugin_sdk::tui::{
+    FocusedTextFieldEdit, FocusedTextFieldEditResult, FocusedTextFieldSnapshot,
+    PluginTuiEventResult, PluginTuiFocusedTextFieldEditResult,
 };
 use bcode_workflow::{
     EdgeDefinition, EdgeKind, NodeDefinition, NodeKind, WORKFLOW_AUTHORING_EDIT_VERSION,
@@ -27,6 +32,7 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
+use bmux_tui_components::text_input::TextInputOutcome;
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
@@ -97,10 +103,11 @@ enum InspectorSchemaSource {
     PluginInputDefaults,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct InspectorTextEdit {
     target: InspectorEditTarget,
     buffer: String,
+    prose: Option<ProseEditor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,7 +264,7 @@ struct WorkflowAuthorSurface {
     pending_edit_batch: Option<WorkflowAuthoringEditBatch>,
     pending_conflict: Option<PendingConflict>,
     inspector_edit: Option<InspectorTextEdit>,
-    prompt_edit: Option<String>,
+    prompt_edit: Option<ProseEditor>,
     pending_generation_prompt: Option<String>,
     generation_repair_attempts: u32,
     generation_diagnostics: Vec<WorkflowValidationDiagnostic>,
@@ -547,10 +554,37 @@ impl WorkflowAuthorSurface {
             self.status = "Select a concrete nested schema field".to_string();
             return;
         }
-        let Some((_, source)) = self.selected_schema() else {
+        let Some((schema, source)) = self.selected_schema() else {
             self.status = "No authoritative configuration schema is available".to_string();
             return;
         };
+        let mut property = &schema.schema;
+        for part in field.path.split('.') {
+            if crate::prose::is_secret_schema(property) {
+                self.status = "Secret fields are not exposed by this editor".into();
+                return;
+            }
+            let Some(next) = property
+                .get("properties")
+                .and_then(|properties| properties.get(part))
+            else {
+                break;
+            };
+            property = next;
+        }
+        if crate::prose::is_secret_schema(property) {
+            self.status = "Secret fields are not exposed by this editor".into();
+            return;
+        }
+        let prose = self
+            .selected_schema()
+            .filter(|(schema, _)| crate::prose::prose_field(&schema.schema, &field.path))
+            .map(|_| {
+                ProseEditor::new(
+                    format!("author:{}", field.path),
+                    self.selected_schema_value(&field.path, source),
+                )
+            });
         self.inspector_edit = Some(InspectorTextEdit {
             target: InspectorEditTarget::SchemaField {
                 path: field.path.clone(),
@@ -558,6 +592,7 @@ impl WorkflowAuthorSurface {
                 source,
             },
             buffer: self.selected_schema_value(&field.path, source),
+            prose,
         });
         self.status = "Editing bounded inspector value".to_string();
     }
@@ -598,7 +633,11 @@ impl WorkflowAuthorSurface {
             return;
         };
         let buffer = inspector_edit_value(node, &target);
-        self.inspector_edit = Some(InspectorTextEdit { target, buffer });
+        self.inspector_edit = Some(InspectorTextEdit {
+            target,
+            buffer,
+            prose: None,
+        });
         self.status = "Editing bounded inspector value".to_string();
     }
 
@@ -619,6 +658,9 @@ impl WorkflowAuthorSurface {
                     InspectorEditTarget::PredicatePath => PendingMutation::SetPredicatePath,
                     InspectorEditTarget::SchemaField { .. } => PendingMutation::SetSchemaField,
                 };
+                if let Some(prose) = edit.prose.as_mut() {
+                    prose.observe(false);
+                }
                 self.request_mutation(mutation);
             }
             KeyCode::Backspace => {
@@ -946,7 +988,7 @@ impl WorkflowAuthorSurface {
     }
 
     fn handle_prompt_edit(&mut self, event: &Event) -> bool {
-        let Some(buffer) = self.prompt_edit.as_mut() else {
+        let Some(editor) = self.prompt_edit.as_mut() else {
             return false;
         };
         match event {
@@ -954,8 +996,8 @@ impl WorkflowAuthorSurface {
                 self.prompt_edit = None;
                 self.status = "Prompt generation cancelled".to_string();
             }
-            Event::Key(key) if key.key == KeyCode::Enter => {
-                let prompt = buffer.trim().to_string();
+            Event::Key(key) if key.key == KeyCode::Enter && !key.modifiers.shift => {
+                let prompt = editor.text().trim().to_string();
                 if prompt.is_empty() {
                     self.status = "Workflow prompt cannot be empty".to_string();
                 } else {
@@ -967,15 +1009,7 @@ impl WorkflowAuthorSurface {
                     self.status = "Generating portable workflow candidate…".to_string();
                 }
             }
-            Event::Key(key) if key.key == KeyCode::Backspace => {
-                buffer.pop();
-            }
-            Event::Key(key) if let KeyCode::Char(character) = key.key => {
-                if buffer.len() < 8_192 {
-                    buffer.push(character);
-                }
-            }
-            _ => return false,
+            _ => return editor.event(event) != TextInputOutcome::Ignored,
         }
         true
     }
@@ -991,7 +1025,7 @@ impl WorkflowAuthorSurface {
             self.status = "Workflow generation is already in progress".to_string();
             return;
         }
-        self.prompt_edit = Some(String::new());
+        self.prompt_edit = Some(ProseEditor::new("author-prompt", ""));
         self.status = "Describe the workflow".to_string();
     }
 
@@ -1271,7 +1305,12 @@ impl WorkflowAuthorSurface {
         }
     }
 
-    fn render_inspector(&self, area: Rect, frame: &mut PaintCx<'_, '_>, theme: AuthorSurfaceTheme) {
+    fn render_inspector(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: AuthorSurfaceTheme,
+    ) {
         draw_pane(
             frame,
             area,
@@ -1295,7 +1334,9 @@ impl WorkflowAuthorSurface {
                 selected_field_path: selected_field.as_deref(),
             },
         );
-        if let Some(edit) = &self.inspector_edit {
+        if let Some(edit) = &self.inspector_edit
+            && edit.prose.is_none()
+        {
             lines.insert(0, format!("Editing {:?}: {}▏", edit.target, edit.buffer));
         }
         if let Some(candidate) = &self.generated_candidate {
@@ -1310,8 +1351,21 @@ impl WorkflowAuthorSurface {
             );
             lines.splice(1..1, generated_candidate_lines(candidate));
         }
-        if let Some(prompt) = &self.prompt_edit {
-            lines.insert(0, format!("Workflow prompt: {prompt}▏"));
+        let content = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2).min(4),
+        );
+        if self.prompt_edit.is_some()
+            || self
+                .inspector_edit
+                .as_ref()
+                .is_some_and(|edit| edit.prose.is_some())
+        {
+            for _ in 0..content.height {
+                lines.insert(0, String::new());
+            }
         }
         for (row, line) in lines
             .iter()
@@ -1326,6 +1380,17 @@ impl WorkflowAuthorSurface {
                 line,
                 theme.text,
             );
+        }
+        if let Some(editor) = self.prompt_edit.as_mut().or_else(|| {
+            self.inspector_edit
+                .as_mut()
+                .and_then(|edit| edit.prose.as_mut())
+        }) {
+            if self.pending_mutation.is_none() {
+                editor.paint(content, frame, theme.text, theme.focused);
+            } else {
+                editor.observe(false);
+            }
         }
     }
     fn render_themed(
@@ -1416,6 +1481,89 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
         self.render_themed(area, frame, theme);
     }
 
+    fn focused_text_field(&self) -> Option<FocusedTextFieldSnapshot> {
+        if self.pending_mutation.is_some() {
+            return None;
+        }
+        self.prompt_edit
+            .as_ref()
+            .or_else(|| {
+                self.inspector_edit
+                    .as_ref()
+                    .and_then(|edit| edit.prose.as_ref())
+            })
+            .and_then(ProseEditor::snapshot)
+    }
+
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        edit: &FocusedTextFieldEdit,
+        _host: &dyn PluginTuiHost,
+    ) -> PluginTuiFocusedTextFieldEditResult {
+        let result = if self.pending_mutation.is_some() {
+            let mut disabled = ProseEditor::new("disabled", "");
+            disabled.observe(false);
+            disabled.apply(edit)
+        } else if let Some(editor) = self.prompt_edit.as_mut() {
+            editor.apply(edit)
+        } else if let Some(inspector) = self.inspector_edit.as_mut()
+            && let Some(editor) = inspector.prose.as_mut()
+        {
+            let result = editor.apply(edit);
+            if result == FocusedTextFieldEditResult::Applied {
+                inspector.buffer = editor.text().to_string();
+            }
+            result
+        } else {
+            let mut disabled = ProseEditor::new("disabled", "");
+            disabled.observe(false);
+            return PluginTuiFocusedTextFieldEditResult {
+                edit_result: disabled.apply(edit),
+                event: PluginTuiEventResult::consumed(),
+            };
+        };
+        PluginTuiFocusedTextFieldEditResult {
+            edit_result: result,
+            event: if result == FocusedTextFieldEditResult::Applied {
+                PluginTuiEventResult::from_legacy(PluginTuiAction::Redraw)
+            } else {
+                PluginTuiEventResult::consumed()
+            },
+        }
+    }
+
+    fn focused_text_field_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        if self.prompt_edit.is_none() && self.inspector_edit.is_none() {
+            return PluginTuiEventResult::from_legacy(PluginTuiAction::None);
+        }
+        let Some(event) = keybindings::routed_event(host, keybindings::EDIT, event) else {
+            return PluginTuiEventResult::from_legacy(PluginTuiAction::None);
+        };
+        let handled = if self.prompt_edit.is_some() {
+            self.handle_prompt_edit(&event)
+        } else if let Some(edit) = self.inspector_edit.as_mut()
+            && let Some(editor) = edit.prose.as_mut()
+            && !matches!(&event, Event::Key(key) if matches!(key.key, KeyCode::Enter | KeyCode::Escape))
+        {
+            let handled = editor.event(&event) != TextInputOutcome::Ignored;
+            edit.buffer = editor.text().to_string();
+            handled
+        } else if let Event::Key(key) = event {
+            self.handle_inspector_text_input(key.key)
+        } else {
+            false
+        };
+        PluginTuiEventResult::from_legacy(if handled {
+            PluginTuiAction::Redraw
+        } else {
+            PluginTuiAction::None
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         let scope = if self.prompt_edit.is_some() || self.inspector_edit.is_some() {
@@ -1427,22 +1575,6 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             return PluginTuiAction::None;
         };
         let event = &event;
-        if self.prompt_edit.is_some() {
-            return if self.handle_prompt_edit(event) {
-                PluginTuiAction::Redraw
-            } else {
-                PluginTuiAction::None
-            };
-        }
-        if let Event::Key(key) = event
-            && self.inspector_edit.is_some()
-        {
-            return if self.handle_inspector_text_input(key.key) {
-                PluginTuiAction::Redraw
-            } else {
-                PluginTuiAction::None
-            };
-        }
         let changed = match event {
             Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
                 return PluginTuiAction::Close { outcome: None };
@@ -3496,6 +3628,245 @@ mod tests {
     use bmux_tui::geometry::Point;
     use bmux_tui::terminal::Terminal;
     use std::collections::{BTreeMap, BTreeSet};
+
+    struct EditorHost;
+    impl PluginTuiHost for EditorHost {
+        fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+            bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
+                keybindings::declarations(),
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .action_for_key(scope, stroke)
+            .map(str::to_string)
+        }
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+    }
+
+    fn assert_author_hide_reveal_rejects_old_snapshot(surface: &mut WorkflowAuthorSurface) {
+        use bcode_plugin_sdk::composer::{ComposerEdit, ComposerTextRange};
+        let expected = surface
+            .focused_text_field()
+            .expect("painted prose before hide");
+        let cursor = expected.document.cursor;
+        let stale = FocusedTextFieldEdit {
+            edit: ComposerEdit {
+                document_id: expected.document.document_id.clone(),
+                revision: expected.document.revision,
+                range: ComposerTextRange {
+                    start: cursor,
+                    end: cursor,
+                },
+                expected_text: String::new(),
+                replacement: "x".into(),
+                cursor: cursor + 1,
+            },
+            expected: expected.clone(),
+        };
+        render_surface(surface, 1, 1);
+        assert!(surface.focused_text_field().is_none());
+        render_surface(surface, 100, 20);
+        let revealed = surface.focused_text_field().expect("same prose revealed");
+        assert_eq!(revealed.identity, expected.identity);
+        assert_ne!(revealed.generation, expected.generation);
+        assert_eq!(revealed.document.text, expected.document.text);
+        assert_eq!(revealed.document.cursor, expected.document.cursor);
+        assert_eq!(revealed.document.selection, expected.document.selection);
+        let result = surface.apply_focused_text_field_edit_result(&stale, &EditorHost);
+        assert!(matches!(
+            result.edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+        assert_eq!(result.event, PluginTuiEventResult::consumed());
+        assert_eq!(surface.focused_text_field(), Some(revealed));
+        assert!(surface.pending_mutation.is_none());
+        assert!(surface.pending_generation_prompt.is_none());
+    }
+
+    #[test]
+    fn prompt_completion_preserves_history_and_submission_is_separate() {
+        use bcode_plugin_sdk::composer::{ComposerEdit, ComposerTextRange};
+        let mut surface = WorkflowAuthorSurface::new(&serde_json::json!({}));
+        surface.prompt_edit = Some(ProseEditor::new("author-prompt", "hello"));
+        render_surface(&mut surface, 100, 20);
+        assert_author_hide_reveal_rejects_old_snapshot(&mut surface);
+        bcode_plugin_sdk::tui::focused_input::test_support::assert_noop_and_stale_preserve_field(
+            &mut surface,
+            PluginTuiSurface::focused_text_field,
+            |surface, edit| {
+                surface
+                    .apply_focused_text_field_edit_result(edit, &EditorHost)
+                    .edit_result
+            },
+        );
+        let expected = surface.focused_text_field().unwrap();
+        let edit = FocusedTextFieldEdit {
+            edit: ComposerEdit {
+                document_id: expected.document.document_id.clone(),
+                revision: expected.document.revision,
+                range: ComposerTextRange { start: 0, end: 5 },
+                expected_text: "hello".into(),
+                replacement: "review changes".into(),
+                cursor: 14,
+            },
+            expected,
+        };
+        assert_eq!(
+            surface
+                .apply_focused_text_field_edit_result(&edit, &EditorHost)
+                .edit_result,
+            FocusedTextFieldEditResult::Applied
+        );
+        assert!(surface.pending_generation_prompt.is_none());
+        assert!(!surface.operations.contains(&AuthoringOperation::Generate));
+        assert!(surface.focused_text_field().is_none());
+        let editor = surface.prompt_edit.as_mut().unwrap();
+        assert!(editor.state.buffer_mut().undo());
+        assert_eq!(editor.text(), "hello");
+        assert!(editor.state.buffer_mut().redo());
+        assert_eq!(editor.text(), "review changes");
+        editor.observe(true);
+        let enter = Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Enter));
+        assert!(surface.handle_prompt_edit(&enter));
+        assert_eq!(
+            surface.pending_generation_prompt.as_deref(),
+            Some("review changes")
+        );
+        assert!(surface.operations.contains(&AuthoringOperation::Generate));
+        assert!(surface.prompt_edit.is_none());
+    }
+
+    #[test]
+    fn prompt_visibility_selection_lifetime_and_ignored_event_are_fenced() {
+        let mut surface = WorkflowAuthorSurface::new(&serde_json::json!({}));
+        surface.prompt_edit = Some(ProseEditor::new("author-prompt", "é界"));
+        render_surface(&mut surface, 100, 20);
+        let original = surface.focused_text_field().unwrap();
+        let selected = Event::Key(bmux_keyboard::parse_key_stroke("shift+left").unwrap());
+        assert_ne!(
+            surface
+                .focused_text_field_event(&selected, &EditorHost)
+                .outcome,
+            bmux_tui::event::EventOutcome::Ignored
+        );
+        assert!(surface.focused_text_field().is_none());
+        render_surface(&mut surface, 100, 20);
+        assert!(
+            surface
+                .focused_text_field()
+                .unwrap()
+                .document
+                .selection
+                .is_some()
+        );
+        render_surface(&mut surface, 1, 1);
+        assert!(surface.focused_text_field().is_none());
+        surface.prompt_edit = Some(ProseEditor::new("author-prompt", "é界"));
+        render_surface(&mut surface, 100, 20);
+        assert_ne!(
+            original.identity.lifetime,
+            surface.focused_text_field().unwrap().identity.lifetime
+        );
+        let ignored = Event::Key(bmux_keyboard::parse_key_stroke("f12").unwrap());
+        assert_eq!(
+            surface
+                .focused_text_field_event(&ignored, &EditorHost)
+                .outcome,
+            bmux_tui::event::EventOutcome::Ignored
+        );
+        let before = surface.focused_text_field();
+        assert_eq!(
+            surface.handle_event(&ignored, &EditorHost),
+            PluginTuiAction::None
+        );
+        assert_eq!(surface.focused_text_field(), before);
+    }
+
+    #[test]
+    fn inspector_prose_completion_updates_live_semantic_buffer_before_explicit_submit() {
+        use bcode_plugin_sdk::composer::{ComposerEdit, ComposerTextRange};
+        let mut surface = WorkflowAuthorSurface::new(
+            &serde_json::json!({"draft":{"identity":{"workflow_id":"editor-test","draft_id":"draft-1"},"generation":1,"document":document(),"producer":editor_producer()}}),
+        );
+        let mut schemas = bcode_workflow::workflow_node_configuration_schemas();
+        schemas.get_mut("approval").unwrap().schema = serde_json::json!({"type":"object","properties":{"message":{"type":"string","contentMediaType":"text/plain"}}});
+        surface.catalog = Some(WorkflowAuthoringCatalogSnapshot {
+            version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                &bcode_workflow::WorkflowProductionCapabilities::current(),
+            ),
+            plugins: BTreeSet::new(),
+            blocks: BTreeMap::new(),
+            node_configuration_schemas: schemas,
+            workflow_definitions: BTreeMap::new(),
+            agent_profiles: BTreeSet::new(),
+            authoring_actions: BTreeMap::new(),
+        });
+        surface.selected_node = surface
+            .node_entries()
+            .iter()
+            .position(|(id, _)| *id == "second")
+            .expect("annotated approval node exists");
+        surface.focus = EditorPane::Inspector;
+        assert_eq!(surface.selected_node().unwrap().1.kind, NodeKind::Approval);
+        surface.selected_schema_field = surface
+            .schema_fields()
+            .iter()
+            .position(|field| field.path == "message")
+            .expect("annotated approval prose field exists");
+        surface.begin_selected_schema_edit();
+        assert!(surface.inspector_edit.as_ref().unwrap().prose.is_some());
+        render_surface(&mut surface, 100, 20);
+        assert_author_hide_reveal_rejects_old_snapshot(&mut surface);
+        bcode_plugin_sdk::tui::focused_input::test_support::assert_noop_and_stale_preserve_field(
+            &mut surface,
+            PluginTuiSurface::focused_text_field,
+            |surface, edit| {
+                surface
+                    .apply_focused_text_field_edit_result(edit, &EditorHost)
+                    .edit_result
+            },
+        );
+        let expected = surface.focused_text_field().unwrap();
+        let edit = FocusedTextFieldEdit {
+            edit: ComposerEdit {
+                document_id: expected.document.document_id.clone(),
+                revision: expected.document.revision,
+                range: ComposerTextRange {
+                    start: 0,
+                    end: expected.document.text.len(),
+                },
+                expected_text: expected.document.text.clone(),
+                replacement: "live answer".into(),
+                cursor: 11,
+            },
+            expected,
+        };
+        assert_eq!(
+            surface
+                .apply_focused_text_field_edit_result(&edit, &EditorHost)
+                .edit_result,
+            FocusedTextFieldEditResult::Applied
+        );
+        assert_eq!(
+            surface.inspector_edit.as_ref().unwrap().buffer,
+            "live answer"
+        );
+        assert!(surface.pending_mutation.is_none());
+        assert!(surface.handle_inspector_text_input(KeyCode::Enter));
+        assert_eq!(
+            surface.pending_mutation,
+            Some(PendingMutation::SetSchemaField)
+        );
+        let batch = surface
+            .mutation_batch(PendingMutation::SetSchemaField)
+            .unwrap();
+        assert!(
+            matches!(&batch.edits[0], WorkflowAuthoringEdit::UpdateNode { node } if node.configuration["message"] == "live answer")
+        );
+    }
 
     fn render_surface(surface: &mut WorkflowAuthorSurface, width: u16, height: u16) -> String {
         let mut output = Vec::new();

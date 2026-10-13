@@ -1,21 +1,20 @@
 //! Native TUI renderer for the interactive question tool.
 
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use bcode_plugin_sdk::composer::{
-    ComposerDocument, ComposerTextRange, MAX_COMPOSER_DOCUMENT_BYTES,
-};
-
+#[cfg(test)]
+use bcode_plugin_sdk::composer::ComposerTextRange;
+use bcode_plugin_sdk::composer::ComposerValidationError;
 use bcode_plugin_sdk::tui::{
-    FocusedTextFieldEdit, FocusedTextFieldIdentity, FocusedTextFieldSnapshot, PluginTuiTheme,
+    FocusedTextFieldAdapter, FocusedTextFieldEdit, FocusedTextFieldEditResult,
+    FocusedTextFieldSnapshot, PluginTuiTheme, TerminalFocusedTextFieldEditResult,
     TerminalInteractionInput, TerminalInteractionRenderer,
 };
 use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue};
 use bmux_keyboard::KeyCode;
-use bmux_text_edit::{TextEditBuffer, TextEditState};
+use bmux_text_edit::TextEditBuffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 #[cfg(test)]
@@ -42,15 +41,6 @@ use super::question_interaction::{
 use super::{QUESTION_INLINE_SURFACE, QuestionSelectionMode};
 
 const QUESTION_SCOPE: &str = "question";
-static NEXT_FIELD_LIFETIME: AtomicU64 = AtomicU64::new(1);
-
-fn next_field_lifetime() -> Option<u64> {
-    NEXT_FIELD_LIFETIME
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .ok()
-}
 
 pub fn register_keymap(registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry) {
     use bcode_plugin_sdk::tui::keymap::KeymapAction;
@@ -119,11 +109,9 @@ pub struct QuestionTerminalRenderer {
     controls: Vec<ControlRegion>,
     logical_origin: u16,
     custom_inputs: BTreeMap<usize, TextInputState>,
-    custom_lifetimes: BTreeMap<usize, u64>,
-    field_generation: Cell<u64>,
-    observed_field: RefCell<Option<ObservedQuestionField>>,
+    custom_fields: RefCell<BTreeMap<usize, FocusedTextFieldAdapter>>,
     custom_areas: BTreeMap<usize, Rect>,
-    custom_anchors: BTreeMap<usize, (TextEditState, Rect)>,
+    visible_custom_carets: BTreeSet<usize>,
     pending_custom_mouse_focus: Option<usize>,
     theme: QuestionSurfaceTheme,
     measurement: Option<QuestionMeasurement>,
@@ -132,14 +120,6 @@ pub struct QuestionTerminalRenderer {
     #[cfg(test)]
     visited_question_spans: usize,
     wrapped_rows_visited: std::cell::Cell<u64>,
-}
-
-#[derive(PartialEq, Eq)]
-struct ObservedQuestionField {
-    revision: u64,
-    focus: QuestionFocusTarget,
-    state: Option<TextEditState>,
-    visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,9 +224,17 @@ impl QuestionTerminalRenderer {
                 .buffer_mut()
                 .move_cursor(bmux_text_edit::TextMotion::End);
             self.custom_inputs.insert(question_index, state);
-            self.custom_lifetimes.remove(&question_index);
-            if let Some(lifetime) = next_field_lifetime() {
-                self.custom_lifetimes.insert(question_index, lifetime);
+            let fields = self.custom_fields.get_mut();
+            if let Some(field) = fields.get_mut(&question_index) {
+                field.reset();
+            } else {
+                fields.insert(
+                    question_index,
+                    FocusedTextFieldAdapter::new(
+                        QUESTION_INLINE_SURFACE,
+                        format!("answer.{question_index}"),
+                    ),
+                );
             }
         }
         self.custom_inputs
@@ -255,31 +243,23 @@ impl QuestionTerminalRenderer {
     }
 
     fn observe_field(&self, snapshot: &QuestionSnapshot) {
-        let state = match snapshot.focus {
-            QuestionFocusTarget::Custom { question_index } => self
-                .custom_inputs
-                .get(&question_index)
-                .filter(|state| state.buffer().text().len() <= MAX_COMPOSER_DOCUMENT_BYTES)
-                .map(|state| state.buffer().edit_state()),
-            _ => None,
-        };
-        let visible = match snapshot.focus {
-            QuestionFocusTarget::Custom { question_index } => {
-                self.custom_areas.contains_key(&question_index)
-                    && self.custom_anchors.contains_key(&question_index)
+        for (question_index, field) in self.custom_fields.borrow_mut().iter_mut() {
+            if let Some(state) = self.custom_inputs.get(question_index) {
+                let eligible = snapshot.focus
+                    == (QuestionFocusTarget::Custom {
+                        question_index: *question_index,
+                    })
+                    && snapshot
+                        .request
+                        .questions
+                        .get(*question_index)
+                        .is_some_and(|question| question.options.is_empty() || question.custom)
+                    && self.visible_custom_carets.contains(question_index)
+                    && snapshot.answers.get(*question_index).is_some_and(|answer| {
+                        answer.custom.as_deref().unwrap_or_default() == state.buffer().text()
+                    });
+                field.observe_input(state, eligible);
             }
-            _ => false,
-        };
-        let current = ObservedQuestionField {
-            revision: snapshot.revision,
-            focus: snapshot.focus,
-            state,
-            visible,
-        };
-        if self.observed_field.borrow().as_ref() != Some(&current) {
-            self.field_generation
-                .set(self.field_generation.get().saturating_add(1));
-            *self.observed_field.borrow_mut() = Some(current);
         }
     }
 
@@ -532,6 +512,21 @@ impl QuestionTerminalRenderer {
         self.render_line(frame, content_y, &Line::from(""));
     }
 
+    fn custom_answer_height(&self, question_index: usize) -> u16 {
+        self.measurement
+            .as_ref()
+            .and_then(|measurement| measurement.questions.get(question_index))
+            .and_then(|geometry| geometry.custom_rows.as_ref())
+            .map_or_else(
+                || {
+                    self.custom_inputs
+                        .get(&question_index)
+                        .map_or(3, |state| custom_input_height(state, self.last_area.width))
+                },
+                range_height,
+            )
+    }
+
     fn render_custom_answer(
         &mut self,
         frame: &mut PaintCx<'_, '_>,
@@ -553,19 +548,7 @@ impl QuestionTerminalRenderer {
             .as_deref()
             .unwrap_or_default();
         let start_y = *content_y;
-        let input_height = self
-            .measurement
-            .as_ref()
-            .and_then(|measurement| measurement.questions.get(question_index))
-            .and_then(|geometry| geometry.custom_rows.as_ref())
-            .map_or_else(
-                || {
-                    self.custom_inputs
-                        .get(&question_index)
-                        .map_or(3, |state| custom_input_height(state, self.last_area.width))
-                },
-                range_height,
-            );
+        let input_height = self.custom_answer_height(question_index);
         self.sync_custom_input(question_index, value);
         *content_y = content_y.saturating_add(input_height);
         let control_id = custom_control_id(question_index);
@@ -624,11 +607,17 @@ impl QuestionTerminalRenderer {
             if matches!(snapshot.focus, QuestionFocusTarget::Custom { question_index: focused } if focused == question_index)
                 && let Some((x, y)) = frame.logical_cursor()
                 && let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y))
+                && let Some(field) = self.custom_fields.get_mut().get_mut(&question_index)
             {
-                self.custom_anchors.insert(
-                    question_index,
-                    (state.buffer().edit_state(), Rect::new(x, y, 1, 1)),
+                field.observe_input(state, true);
+                field.painted_input(
+                    state,
+                    state.content_area().intersection(area),
+                    Rect::new(x, y, 1, 1),
                 );
+                if field.snapshot_input(state).is_some() {
+                    self.visible_custom_carets.insert(question_index);
+                }
             }
             self.custom_areas.insert(question_index, area);
             self.controls.push(ControlRegion { area, control_id });
@@ -709,7 +698,13 @@ impl QuestionTerminalRenderer {
         self.wrapped_rows_visited.set(0);
         self.controls.clear();
         self.custom_areas.clear();
-        self.custom_anchors.clear();
+        self.visible_custom_carets.clear();
+        for (question_index, field) in self.custom_fields.get_mut().iter_mut() {
+            // Invalidate the previous presentation before a possibly hidden/clipped paint.
+            if let Some(state) = self.custom_inputs.get(question_index) {
+                field.painted_input(state, Rect::default(), Rect::default());
+            }
+        }
         #[cfg(test)]
         {
             self.rendered_questions = 0;
@@ -1079,7 +1074,22 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> TerminalInteractionInput {
         self.observe_field(snapshot);
-        let result = self.route_input(event, snapshot, host);
+        let result = self.route_input(event, snapshot, host, false);
+        self.observe_field(snapshot);
+        result
+    }
+
+    fn focused_text_field_event(
+        &mut self,
+        event: &Event,
+        snapshot: &QuestionSnapshot,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> TerminalInteractionInput {
+        self.observe_field(snapshot);
+        if !matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
+            return TerminalInteractionInput::Ignored;
+        }
+        let result = self.route_input(event, snapshot, host, true);
         self.observe_field(snapshot);
         result
     }
@@ -1089,108 +1099,53 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         let QuestionFocusTarget::Custom { question_index } = snapshot.focus else {
             return None;
         };
-        let question = snapshot.request.questions.get(question_index)?;
-        if !question.options.is_empty() && !question.custom {
-            return None;
-        }
-        let state = self.custom_inputs.get(&question_index)?;
-        if snapshot
-            .answers
-            .get(question_index)?
-            .custom
-            .as_deref()
-            .unwrap_or_default()
-            != state.buffer().text()
-        {
-            return None;
-        }
-        let lifetime = *self.custom_lifetimes.get(&question_index)?;
-        let generation = self.field_generation.get();
-        if generation == u64::MAX || state.buffer().text().len() > MAX_COMPOSER_DOCUMENT_BYTES {
-            return None;
-        }
-        let area = *self.custom_areas.get(&question_index)?;
-        let content_rect = state.content_area();
-        if content_rect.width == 0 || content_rect.height == 0 {
-            return None;
-        }
-        let (painted_state, anchor) = self.custom_anchors.get(&question_index)?;
-        let edit_state = state.buffer().edit_state();
-        if *painted_state != edit_state {
-            return None;
-        }
-        let anchor = *anchor;
-        let contains_caret = |rect: Rect| {
-            anchor.x >= rect.x
-                && u32::from(anchor.x) <= u32::from(rect.x) + u32::from(rect.width)
-                && anchor.y >= rect.y
-                && u32::from(anchor.y) < u32::from(rect.y) + u32::from(rect.height)
-        };
-        if !contains_caret(area) || !contains_caret(content_rect) {
-            return None;
-        }
-
-        let document = ComposerDocument {
-            document_id: format!("question-{lifetime}-{question_index}"),
-            revision: generation,
-            text: edit_state.text,
-            cursor: edit_state.cursor,
-            selection: edit_state.selection_anchor.map(|anchor| ComposerTextRange {
-                start: anchor.min(edit_state.cursor),
-                end: anchor.max(edit_state.cursor),
-            }),
-        };
-        document.validate().ok()?;
-        Some(FocusedTextFieldSnapshot {
-            identity: FocusedTextFieldIdentity {
-                owner_id: "question-inline".into(),
-                field_id: custom_control_id(question_index).as_str().into(),
-                lifetime,
-            },
-            generation,
-            document,
-            eligible: true,
-            content_rect,
-            anchor,
-        })
+        self.custom_fields
+            .borrow()
+            .get(&question_index)?
+            .snapshot_input(self.custom_inputs.get(&question_index)?)
     }
 
     fn apply_focused_text_field_edit(
         &mut self,
         edit: &FocusedTextFieldEdit,
         snapshot: &QuestionSnapshot,
-        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
     ) -> TerminalInteractionInput {
-        let Some(current) = self.focused_text_field(snapshot) else {
-            return TerminalInteractionInput::Consumed;
-        };
-        let Ok(Some(document)) = edit.validate(&current) else {
-            return TerminalInteractionInput::Consumed;
+        self.apply_focused_text_field_edit_result(edit, snapshot, host)
+            .input
+    }
+
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        edit: &FocusedTextFieldEdit,
+        snapshot: &QuestionSnapshot,
+        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> TerminalFocusedTextFieldEditResult {
+        self.observe_field(snapshot);
+        let rejected = || TerminalFocusedTextFieldEditResult {
+            edit_result: FocusedTextFieldEditResult::Rejected(ComposerValidationError::Stale),
+            input: TerminalInteractionInput::Consumed,
         };
         let QuestionFocusTarget::Custom { question_index } = snapshot.focus else {
-            return TerminalInteractionInput::Consumed;
+            return rejected();
         };
-        let state = self
-            .custom_inputs
-            .get_mut(&question_index)
-            .expect("focused live editor");
-        let expected = state.buffer().edit_state();
-        if state.buffer_mut().replace_byte_range(
-            &expected,
-            edit.edit.range.start..edit.edit.range.end,
-            &edit.edit.replacement,
-            document.cursor,
-            None,
-        ) != Ok(true)
-        {
-            return TerminalInteractionInput::Consumed;
-        }
-        state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
-        self.observe_field(snapshot);
-        TerminalInteractionInput::Semantic(InteractionInput::Change {
-            control_id: custom_control_id(question_index),
-            value: InteractionValue::String(document.text),
-        })
+        let Some(state) = self.custom_inputs.get_mut(&question_index) else {
+            return rejected();
+        };
+        let Some(field) = self.custom_fields.get_mut().get_mut(&question_index) else {
+            return rejected();
+        };
+        let edit_result = field.apply_input(state, edit);
+        let input = if edit_result == FocusedTextFieldEditResult::Applied {
+            state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
+            TerminalInteractionInput::Semantic(InteractionInput::Change {
+                control_id: custom_control_id(question_index),
+                value: InteractionValue::String(state.buffer().text().to_owned()),
+            })
+        } else {
+            TerminalInteractionInput::Consumed
+        };
+        TerminalFocusedTextFieldEditResult { edit_result, input }
     }
 }
 
@@ -1200,8 +1155,12 @@ impl QuestionTerminalRenderer {
         event: &Event,
         snapshot: &QuestionSnapshot,
         host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        route_editor: bool,
     ) -> TerminalInteractionInput {
         self.refresh_keymap(host);
+        if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) && !route_editor {
+            return TerminalInteractionInput::Ignored;
+        }
         if let Event::Mouse(mouse) = event
             && let Some(question_index) =
                 self.custom_areas.iter().find_map(|(question_index, area)| {
@@ -1386,6 +1345,32 @@ const fn question_input_styles(
 
 #[cfg(test)]
 mod tests {
+    fn routed_surface_input(
+        surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+        event: &Event,
+    ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+        let result = surface.focused_text_field_event(event, &TEST_HOST);
+        if result.outcome == bmux_tui::event::EventOutcome::Ignored {
+            surface.handle_event_result(event, &TEST_HOST)
+        } else {
+            result
+        }
+    }
+
+    fn routed_input(
+        renderer: &mut QuestionTerminalRenderer,
+        event: &Event,
+        snapshot: &QuestionSnapshot,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> TerminalInteractionInput {
+        let input = renderer.focused_text_field_event(event, snapshot, host);
+        if matches!(input, TerminalInteractionInput::Ignored) {
+            renderer.input(event, snapshot, host)
+        } else {
+            input
+        }
+    }
+
     use super::*;
     use bcode_plugin_sdk::interaction::PluginInteraction;
     use bcode_plugin_sdk::tui::keymap::{KeymapRegistry, controls::ControlAction};
@@ -1466,26 +1451,26 @@ mod tests {
         let snapshot = controller.snapshot();
         let mut renderer = QuestionTerminalRenderer::default();
         assert!(matches!(
-            renderer.input(&key(KeyCode::Down), &snapshot, &host),
+            routed_input(&mut renderer, &key(KeyCode::Down), &snapshot, &host),
             TerminalInteractionInput::Ignored
         ));
         assert!(matches!(
-            renderer.input(&key(KeyCode::Escape), &snapshot, &host),
+            routed_input(&mut renderer, &key(KeyCode::Escape), &snapshot, &host),
             TerminalInteractionInput::Ignored
         ));
         let event = Event::Key(bmux_keyboard::parse_key_stroke("ctrl+j").unwrap());
         assert!(matches!(
-            renderer.input(&event, &snapshot, &host),
+            routed_input(&mut renderer, &event, &snapshot, &host),
             TerminalInteractionInput::Semantic(InteractionInput::Navigate {
                 direction: InteractionNavigation::Next
             })
         ));
         assert!(matches!(
-            renderer.input(&key(KeyCode::Char('1')), &snapshot, &host),
+            routed_input(&mut renderer, &key(KeyCode::Char('1')), &snapshot, &host),
             TerminalInteractionInput::Ignored
         ));
         assert!(matches!(
-            renderer.input(&key(KeyCode::Char('x')), &snapshot, &host),
+            routed_input(&mut renderer, &key(KeyCode::Char('x')), &snapshot, &host),
             TerminalInteractionInput::Semantic(InteractionInput::Activate { .. })
         ));
         assert_eq!(renderer.option_shortcut_label(0), "x");
@@ -1676,7 +1661,7 @@ mod tests {
         event: &Event,
     ) -> InteractionOutput {
         let snapshot = controller.snapshot();
-        match renderer.input(event, &snapshot, &TEST_HOST) {
+        match routed_input(renderer, event, &snapshot, &TEST_HOST) {
             TerminalInteractionInput::Ignored => InteractionOutput::None,
             TerminalInteractionInput::Consumed => InteractionOutput::Redraw,
             TerminalInteractionInput::Semantic(input) => controller.handle_input(input),
@@ -1690,7 +1675,7 @@ mod tests {
     ) -> InteractionOutput {
         let snapshot = controller.snapshot();
         let _ = render_snapshot(renderer, &snapshot, Rect::new(0, 0, 48, 12));
-        match renderer.input(event, &snapshot, &TEST_HOST) {
+        match routed_input(renderer, event, &snapshot, &TEST_HOST) {
             TerminalInteractionInput::Ignored => InteractionOutput::None,
             TerminalInteractionInput::Consumed => InteractionOutput::Redraw,
             TerminalInteractionInput::Semantic(input) => controller.handle_input(input),
@@ -1740,7 +1725,7 @@ mod tests {
             panic!("typed question factory opens synchronously");
         };
         let mut surface = result.unwrap();
-        surface.handle_event_result(&Event::Paste("@sr".into()), &TEST_HOST);
+        routed_surface_input(surface.as_mut(), &Event::Paste("@sr".into()));
         let area = Rect::new(0, 0, 48, 12);
         let mut buffer = Buffer::empty(area);
         let mut frame = Frame::new(&mut buffer);
@@ -1750,7 +1735,7 @@ mod tests {
             .apply_focused_text_field_edit(&completion_edit(field, "src/main.rs"), &TEST_HOST);
         assert_ne!(result.outcome, EventOutcome::Ignored);
         assert!(matches!(result.action, PluginTuiAction::Redraw));
-        let result = surface.handle_event_result(&key(KeyCode::Enter), &TEST_HOST);
+        let result = routed_surface_input(surface.as_mut(), &key(KeyCode::Enter));
         assert_ne!(result.outcome, EventOutcome::Ignored);
         let PluginTuiAction::Close {
             outcome: Some(payload),
@@ -1786,7 +1771,7 @@ mod tests {
             panic!("typed question factory opens synchronously");
         };
         let mut surface = result.unwrap();
-        surface.handle_event_result(&Event::Paste("@src".into()), &TEST_HOST);
+        routed_surface_input(surface.as_mut(), &Event::Paste("@src".into()));
         let extent = surface.preferred_height(48);
         let destination = Rect::new(0, 2, 48, 12);
         let mut baseline = Buffer::empty(Rect::new(0, 0, 80, 30));
@@ -1981,12 +1966,25 @@ mod tests {
         render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 48, 20));
         let field = renderer.focused_text_field(&snapshot).unwrap();
         let editor = renderer.custom_inputs[&0].clone();
+        bcode_plugin_sdk::tui::focused_input::test_support::assert_noop_and_stale_preserve_field(
+            &mut renderer,
+            |renderer| renderer.focused_text_field(&snapshot),
+            |renderer, edit| {
+                let result =
+                    renderer.apply_focused_text_field_edit_result(edit, &snapshot, &TEST_HOST);
+                assert!(matches!(result.input, TerminalInteractionInput::Consumed));
+                assert_eq!(renderer.custom_inputs[&0], editor);
+                result.edit_result
+            },
+        );
         let mut noop = completion_edit(field.clone(), "@é");
         noop.edit.cursor = 0;
-        assert!(matches!(
-            renderer.apply_focused_text_field_edit(&noop, &snapshot, &TEST_HOST),
-            TerminalInteractionInput::Consumed
-        ));
+        assert_eq!(
+            renderer
+                .apply_focused_text_field_edit_result(&noop, &snapshot, &TEST_HOST)
+                .edit_result,
+            FocusedTextFieldEditResult::Noop
+        );
         assert_eq!(renderer.custom_inputs[&0], editor);
         let mut invalid = completion_edit(field.clone(), "path");
         invalid.edit.range.end = 2;
@@ -2055,7 +2053,8 @@ mod tests {
         let before = renderer.custom_inputs[&0].clone();
         for binding in ["ctrl+z", "ctrl+y", "ctrl+shift+z"] {
             assert!(matches!(
-                renderer.input(
+                routed_input(
+                    &mut renderer,
                     &Event::Key(bmux_keyboard::parse_key_stroke(binding).unwrap()),
                     &snapshot,
                     &host
@@ -2065,7 +2064,8 @@ mod tests {
             assert_eq!(renderer.custom_inputs[&0], before);
         }
         assert!(matches!(
-            renderer.input(
+            routed_input(
+                &mut renderer,
                 &Event::Key(bmux_keyboard::parse_key_stroke("alt+u").unwrap()),
                 &snapshot,
                 &host
@@ -2180,7 +2180,8 @@ mod tests {
             KeyCode::Delete,
         ] {
             assert_eq!(
-                renderer.input(
+                routed_input(
+                    &mut renderer,
                     &Event::Key(KeyStroke {
                         key,
                         modifiers: Modifiers::NONE,
@@ -2633,21 +2634,21 @@ mod tests {
             .move_cursor(bmux_text_edit::TextMotion::Start);
 
         assert_eq!(
-            renderer.input(&key(KeyCode::Up), &snapshot, &TEST_HOST),
+            routed_input(&mut renderer, &key(KeyCode::Up), &snapshot, &TEST_HOST),
             TerminalInteractionInput::Semantic(InteractionInput::Navigate {
                 direction: InteractionNavigation::Previous,
             })
         );
         assert_eq!(
-            renderer.input(&key(KeyCode::Down), &snapshot, &TEST_HOST),
+            routed_input(&mut renderer, &key(KeyCode::Down), &snapshot, &TEST_HOST),
             TerminalInteractionInput::Consumed
         );
         assert_eq!(
-            renderer.input(&key(KeyCode::Down), &snapshot, &TEST_HOST),
+            routed_input(&mut renderer, &key(KeyCode::Down), &snapshot, &TEST_HOST),
             TerminalInteractionInput::Consumed
         );
         assert_eq!(
-            renderer.input(&key(KeyCode::Down), &snapshot, &TEST_HOST),
+            routed_input(&mut renderer, &key(KeyCode::Down), &snapshot, &TEST_HOST),
             TerminalInteractionInput::Semantic(InteractionInput::Navigate {
                 direction: InteractionNavigation::Next,
             })
@@ -2717,7 +2718,8 @@ mod tests {
         let snapshot = controller.snapshot();
         let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 40, 30));
         let area = renderer.custom_inputs[&1].content_area();
-        let input = renderer.input(
+        let input = routed_input(
+            &mut renderer,
             &Event::Mouse(bmux_tui::event::MouseEvent::new(
                 MouseEventKind::Down(MouseButton::Left),
                 Point::new(area.x, area.y),
@@ -2765,7 +2767,8 @@ mod tests {
         let snapshot = controller.snapshot();
         let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 40, 30));
         let area = renderer.custom_inputs[&1].content_area();
-        let focus = renderer.input(
+        let focus = routed_input(
+            &mut renderer,
             &Event::Mouse(bmux_tui::event::MouseEvent::new(
                 MouseEventKind::Down(MouseButton::Left),
                 Point::new(area.x, area.y),
@@ -2780,7 +2783,8 @@ mod tests {
         let focused = controller.snapshot();
         let _buffer = render_snapshot(&mut renderer, &focused, Rect::new(0, 0, 40, 30));
         assert_eq!(
-            renderer.input(
+            routed_input(
+                &mut renderer,
                 &Event::Mouse(bmux_tui::event::MouseEvent::new(
                     MouseEventKind::Drag(MouseButton::Left),
                     Point::new(area.x.saturating_add(3), area.y),
@@ -2811,7 +2815,8 @@ mod tests {
         let snapshot = controller.snapshot();
         let _buffer = render_snapshot(&mut renderer, &snapshot, Rect::new(0, 0, 32, 10));
         let second = renderer.controls[1].area;
-        let input = renderer.input(
+        let input = routed_input(
+            &mut renderer,
             &Event::Mouse(bmux_tui::event::MouseEvent::new(
                 MouseEventKind::Down(MouseButton::Left),
                 Point::new(second.x, second.y),

@@ -488,19 +488,36 @@ impl InteractiveSurfaceState {
     pub fn apply_focused_text_field_edit(
         &mut self,
         edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
-    ) -> InteractiveSurfaceEventOutcome {
+    ) -> (
+        bcode_plugin_sdk::tui::FocusedTextFieldEditResult,
+        InteractiveSurfaceEventOutcome,
+    ) {
         if self.pending_resolution.is_some() {
-            return InteractiveSurfaceEventOutcome::Consumed;
+            return (
+                bcode_plugin_sdk::tui::FocusedTextFieldEditResult::Rejected(
+                    bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+                ),
+                InteractiveSurfaceEventOutcome::Consumed,
+            );
         }
-        let result = self.surface.apply_focused_text_field_edit(edit, &self.host);
-        self.reconcile_event_result(result)
+        let result = self
+            .surface
+            .apply_focused_text_field_edit_result(edit, &self.host);
+        (
+            result.edit_result,
+            self.reconcile_event_result(result.event),
+        )
     }
 
     pub fn handle_event_outcome(&mut self, event: &Event) -> InteractiveSurfaceEventOutcome {
         if let Some(resolution) = &self.pending_resolution {
             return InteractiveSurfaceEventOutcome::Resolved(resolution.clone());
         }
-        let result = self.surface.handle_event_result(event, &self.host);
+        let result = super::plugin_surface_host::compose_surface_input(
+            self.surface.as_mut(),
+            event,
+            &self.host,
+        );
         self.reconcile_event_result(result)
     }
 

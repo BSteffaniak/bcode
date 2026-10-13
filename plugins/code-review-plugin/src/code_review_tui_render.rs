@@ -128,7 +128,14 @@ pub fn render(
 ) {
     let area = Rect::new(0, 0, frame.area().width, frame.area().height);
     app.clear_mouse_regions();
+    app.comment_input_visible = false;
+    if let Some(editor) = &mut app.comment_editor {
+        editor
+            .focused_input
+            .painted(&editor.buffer, Rect::default(), Rect::default());
+    }
     if area.is_empty() {
+        app.observe_comment_input();
         return;
     }
 
@@ -138,6 +145,7 @@ pub fn render(
     let diff_area = render_body(app, area, frame, review_theme);
     render_main_content(app, diff_area, frame, theme, review_theme);
     render_overlays(app, area, frame, review_theme);
+    app.observe_comment_input();
     app.confine_mouse_regions(area);
 }
 
@@ -2951,7 +2959,7 @@ fn render_comment_editor(
     );
     render_comment_editor_header(editor, popup, frame, theme);
     let text_height = usize::from(height.saturating_sub(4));
-    render_comment_editor_body(editor, popup, text_height, frame, theme);
+    let geometry = render_comment_editor_body(editor, popup, text_height, frame, theme);
     if editor.buffer.text().is_empty() {
         frame.write_line(
             LocalRect::terminal(Rect::new(
@@ -2967,6 +2975,15 @@ fn render_comment_editor(
         );
     }
     render_comment_editor_footer(app, editor, popup, frame, theme);
+    if let Some((content_rect, anchor)) = geometry {
+        app.comment_input_visible = true;
+        app.observe_comment_input();
+        if let Some(live_editor) = &mut app.comment_editor {
+            live_editor
+                .focused_input
+                .painted(&live_editor.buffer, content_rect, anchor);
+        }
+    }
 }
 
 fn comment_editor_title(editor: &crate::code_review_tui::ReviewCommentEditor) -> String {
@@ -3195,11 +3212,12 @@ fn render_comment_editor_body(
     text_height: usize,
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
-) {
+) -> Option<(Rect, Rect)> {
     if editor.preview {
         render_comment_editor_preview(editor, popup, text_height, frame, theme);
+        None
     } else {
-        render_comment_editor_text(editor, popup, text_height, frame, theme);
+        render_comment_editor_text(editor, popup, text_height, frame, theme)
     }
 }
 
@@ -3245,24 +3263,47 @@ fn render_comment_editor_text(
     text_height: usize,
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
-) {
-    for (index, line) in editor.buffer.text().lines().take(text_height).enumerate() {
-        frame.write_line(
-            LocalRect::terminal(Rect::new(
-                popup.x.saturating_add(1),
-                popup
-                    .y
-                    .saturating_add(2)
-                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
-                popup.width.saturating_sub(2),
-                1,
-            )),
-            &Line::from_spans(vec![Span::styled(
-                truncate_to_display_width(line, usize::from(popup.width.saturating_sub(2))),
-                theme.overlay,
-            )]),
-        );
+) -> Option<(Rect, Rect)> {
+    let content = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(2),
+        popup.width.saturating_sub(2),
+        u16::try_from(text_height).unwrap_or(u16::MAX),
+    );
+    if content.is_empty() {
+        return None;
     }
+    let wrapped = editor.buffer.wrapped_layout(usize::from(content.width));
+    let input = bmux_tui::input::TextInput::new(&editor.buffer)
+        .wrapped_layout(&wrapped)
+        .style(theme.overlay);
+    let layout = input.layout(Constraints::tight(content.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(content.x),
+        i64::from(content.y),
+        LocalRect::new(0, 0, content.width, content.height),
+        |cx| input.paint(&layout, cx),
+    );
+    // The same retained BMUX projection drives painting and completion geometry.
+    // An offscreen or right-edge caret is deliberately ineligible.
+    if wrapped.cursor.row >= usize::from(content.height)
+        || wrapped.cursor.col >= usize::from(content.width)
+    {
+        return None;
+    }
+    Some((
+        content,
+        Rect::new(
+            content
+                .x
+                .saturating_add(u16::try_from(wrapped.cursor.col).ok()?),
+            content
+                .y
+                .saturating_add(u16::try_from(wrapped.cursor.row).ok()?),
+            1,
+            1,
+        ),
+    ))
 }
 
 fn prompt_popup_height(kind: &ReviewPromptKind, area: Rect) -> u16 {
