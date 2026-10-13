@@ -41,7 +41,7 @@ enum RefreshOperation {
 }
 
 impl RetainedAuthRequestCustody {
-    fn refresh_lifecycle(
+    pub(super) fn refresh_lifecycle(
         &self,
         resolved: &ResolvedAuthProfile,
     ) -> Result<AuthVaultLifecycle<'_>, AuthVaultLifecycleError> {
@@ -190,10 +190,11 @@ impl RetainedAuthRequestCustody {
             return Err(AuthVaultLifecycleError::InvalidCredential);
         }
         *self.active_refresh.lock().map_err(|_| unavailable())? = None;
+        *self.active_enrollment.lock().map_err(|_| unavailable())? = None;
         self.publish_refresh_record(&lifecycle, storage.as_mut(), &intent, credentials)
     }
 
-    fn publish_refresh_record(
+    pub(super) fn publish_refresh_record(
         &self,
         lifecycle: &AuthVaultLifecycle<'_>,
         storage: &mut dyn AuthCustodyStorage,

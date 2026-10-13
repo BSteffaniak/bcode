@@ -134,6 +134,10 @@ struct LeaseResponse {
     expires_at: u64,
 }
 
+fn lease_expiry(time: u64, ttl: u64, jwt_expiry: u64) -> u64 {
+    jwt_expiry.min(time.saturating_add(ttl))
+}
+
 async fn exchange(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -147,7 +151,7 @@ async fn exchange(
         .await
         .map_err(|_| error(StatusCode::UNAUTHORIZED, "identity_not_allowed"))?;
     let time = now();
-    let expires_at = expiry.min(time.saturating_add(state.ttl));
+    let expires_at = lease_expiry(time, state.ttl, expiry);
     let mut leases = state.leases.lock().await;
     let issued = leases.issue(time, expires_at);
     drop(leases);
@@ -303,6 +307,14 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn jwt_expiry_shortens_the_bounded_lease_without_renewal() {
+        assert_eq!(lease_expiry(100, 900, 500), 500);
+        assert_eq!(lease_expiry(100, 900, 2000), 1000);
+        assert_eq!(lease_expiry(100, 900, 100), 100);
+        assert_eq!(lease_expiry(u64::MAX - 5, 900, u64::MAX), u64::MAX);
+    }
+
     #[test]
     fn gateway_and_identity_futures_are_send() {
         fn require_send(_: impl Send) {}

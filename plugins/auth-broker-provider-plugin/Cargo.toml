@@ -17,9 +17,15 @@ crate-type = ["cdylib", "rlib"]
 bcode_model                  = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
+clap                         = { workspace = true, features = ["derive", "std"] }
+libc                         = { workspace = true }
 reqwest                      = { workspace = true, features = ["json"] }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }
+toml                         = { workspace = true, features = ["display"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default          = []

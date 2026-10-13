@@ -23,7 +23,8 @@ pub struct Admission {
     pub supported_account_use: bool,
     /// Maximum retained turns, including idempotency tombstones.
     pub max_turns: usize,
-    /// Maximum scope lifetime in seconds.
+    /// Maximum scope lifetime in seconds (default 900, hard maximum 900).
+    #[serde(default = "default_scope_seconds")]
     pub max_scope_seconds: u64,
     /// Optional retained Linux age custody. No fallback to native/ambient custody.
     #[serde(default)]
@@ -99,6 +100,10 @@ impl std::fmt::Debug for ModelHostOperations {
             .debug_struct("ModelHostOperations")
             .finish_non_exhaustive()
     }
+}
+
+const fn default_scope_seconds() -> u64 {
+    900
 }
 
 const MAX_EVENTS: usize = 256;
@@ -254,6 +259,11 @@ impl ModelHostOperations {
             return failed("invalid_request");
         }
         let mut turns = self.turns.lock().await;
+        // Serialize shutdown admission with reservation. An invocation that waited for
+        // this lock must not spawn work after shutdown took its worker snapshot.
+        if self.stopping.load(Ordering::Acquire) {
+            return failed("model_host_stopping");
+        }
         for (id, turn) in turns.iter() {
             if let Some(result) = reserve_match(turn, caller, invocation, &input) {
                 return match result {
@@ -340,7 +350,7 @@ impl ModelHostOperations {
         responded(&wire::PollResponse {
             events,
             next_sequence,
-            terminal: inner.terminal,
+            terminal: inner.terminal && next_sequence == inner.sequence,
         })
     }
 
@@ -348,7 +358,11 @@ impl ModelHostOperations {
         let result = self.run_provider(&state, id, &turn).await;
         let mut inner = turn.inner.lock().await;
         if let Err(code) = result {
-            inner.failure = Some(code);
+            if code == "turn_cancelled" {
+                retain_event(&mut inner, bcode_model::ProviderTurnEvent::Cancelled);
+            } else {
+                inner.failure = Some(code);
+            }
         }
         inner.terminal = true;
         inner.completed = true;
@@ -585,6 +599,15 @@ impl ModelHostOperations {
             route,
             credential_custody,
         } = self.prepare_turn(state, id, turn).await?;
+        // Resolution/authentication can await services. Do not start provider work
+        // when the lease or owning invocation ended during preparation.
+        if turn.cancel.load(Ordering::Acquire) || turn.expires_at <= now() {
+            retain_event(
+                &mut *turn.inner.lock().await,
+                bcode_model::ProviderTurnEvent::Cancelled,
+            );
+            return Ok(());
+        }
         let scope = PluginInvocationScope::Global;
         let started = tokio::time::timeout(
             Duration::from_mins(1),
@@ -793,8 +816,8 @@ async fn poll_provider_turn(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if cancelled || polling_failed {
-        let _: Result<bcode_model::AckResponse, String> = provider_call(
+    let cancellation = if cancelled || polling_failed {
+        let cancellation: Result<bcode_model::AckResponse, String> = provider_call(
             state,
             Some(route.clone()),
             OP_CANCEL_TURN,
@@ -804,7 +827,10 @@ async fn poll_provider_turn(
             scope.clone(),
         )
         .await;
-    }
+        cancellation
+    } else {
+        Ok(bcode_model::AckResponse::default())
+    };
     let finish: Result<bcode_model::AckResponse, String> = provider_call(
         state,
         Some(route),
@@ -815,7 +841,9 @@ async fn poll_provider_turn(
         scope,
     )
     .await;
-    finish.map_err(|_| "cleanup_failed")?;
+    // Finish acknowledgement alone does not prove a failed cancellation stopped
+    // provider work. Keep unresolved cleanup capacity-accounted on either failure.
+    acknowledge_cleanup(cancellation, finish)?;
     if polling_failed {
         return Err("provider_poll_failed");
     }
@@ -823,6 +851,15 @@ async fn poll_provider_turn(
         let mut inner = turn.inner.lock().await;
         retain_event(&mut inner, bcode_model::ProviderTurnEvent::Cancelled);
     }
+    Ok(())
+}
+
+fn acknowledge_cleanup(
+    cancellation: Result<bcode_model::AckResponse, String>,
+    finish: Result<bcode_model::AckResponse, String>,
+) -> Result<(), &'static str> {
+    cancellation.map_err(|_| "cleanup_failed")?;
+    finish.map_err(|_| "cleanup_failed")?;
     Ok(())
 }
 
@@ -1001,6 +1038,404 @@ fn retain_event(inner: &mut TurnState, event: bcode_model::ProviderTurnEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fake_host(
+        settings: BTreeMap<String, String>,
+    ) -> (Arc<ModelHostOperations>, Arc<ServerState>) {
+        let state = Arc::new(crate::tests::test_server_state_with_fake_provider(
+            bcode_session::SessionManager::default(),
+        ));
+        let mut config = bcode_config::BcodeConfig::default();
+        config.model.profiles.insert(
+            "fixed".into(),
+            bcode_config::ModelProfileConfig {
+                provider_plugin_id: "bcode.fake-provider".into(),
+                model_id: Some("fake-echo".into()),
+                settings,
+                ..Default::default()
+            },
+        );
+        let host = Arc::new(ModelHostOperations::new(
+            config,
+            Admission {
+                allowed_plugin_id: "plugin".into(),
+                model_profile: "fixed".into(),
+                supported_account_use: true,
+                max_turns: 8,
+                max_scope_seconds: 900,
+                custody: None,
+            },
+        ));
+        host.bind_server(&state);
+        (host, state)
+    }
+
+    async fn call_host(
+        host: &Arc<ModelHostOperations>,
+        caller: &str,
+        invocation: &str,
+        operation: &str,
+        payload: impl serde::Serialize,
+    ) -> ToolInvocationServiceResolution {
+        Arc::clone(host)
+            .dispatch(
+                caller,
+                bcode_tool::ToolInvocationServiceRequest {
+                    invocation_id: invocation.into(),
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    route_id: None,
+                    interface_id: wire::INTERFACE_ID.into(),
+                    operation: operation.into(),
+                    payload: serde_json::to_value(payload).unwrap(),
+                },
+            )
+            .await
+    }
+
+    async fn start_host(host: &Arc<ModelHostOperations>, request: &wire::StartRequest) -> String {
+        let ToolInvocationServiceResolution::Responded { payload } =
+            call_host(host, "plugin", "serve", wire::OP_START, request).await
+        else {
+            panic!("start reservation must succeed");
+        };
+        serde_json::from_value::<wire::StartResponse>(payload)
+            .unwrap()
+            .turn_id
+    }
+
+    async fn settled(host: &ModelHostOperations, id: &str) -> Arc<Turn> {
+        let turn = host.turns.lock().await.get(id).unwrap().clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if turn.inner.lock().await.completed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host lifecycle must settle");
+        turn
+    }
+
+    async fn host_page(
+        host: &Arc<ModelHostOperations>,
+        scope: &str,
+        id: &str,
+    ) -> wire::PollResponse {
+        let ToolInvocationServiceResolution::Responded { payload } = call_host(
+            host,
+            "plugin",
+            "serve",
+            wire::OP_POLL,
+            wire::PollRequest {
+                scope_id: scope.into(),
+                turn_id: id.into(),
+                after_sequence: 0,
+            },
+        )
+        .await
+        else {
+            panic!("settled normalized host poll must succeed");
+        };
+        serde_json::from_value(payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn real_host_authorization_and_reservation() {
+        let (host, _state) = fake_host(BTreeMap::new());
+        let request = retained_test_turn().request.clone();
+        let mut injected = serde_json::to_value(&request).unwrap();
+        injected["provider_context"] = serde_json::json!({"auth":{"token":"secret"},"settings":{}});
+        assert!(
+            matches!(call_host(&host, "plugin", "serve", wire::OP_START, injected).await,
+            ToolInvocationServiceResolution::Failed { code, .. } if code == "invalid_request")
+        );
+        let id = start_host(&host, &request).await;
+        assert_eq!(start_host(&host, &request).await, id);
+        let mut conflict = request.clone();
+        conflict.max_output_tokens = Some(42);
+        assert!(
+            matches!(call_host(&host, "plugin", "serve", wire::OP_START, &conflict).await,
+            ToolInvocationServiceResolution::Failed { code, .. } if code == "request_conflict")
+        );
+        for (caller, invocation, scope) in [
+            ("other", "serve", "scope"),
+            ("plugin", "other", "scope"),
+            ("plugin", "serve", "other-lease"),
+        ] {
+            for operation in [wire::OP_CANCEL, wire::OP_FINISH] {
+                let forbidden = wire::TurnRequest {
+                    scope_id: scope.into(),
+                    turn_id: id.clone(),
+                };
+                assert!(matches!(
+                    call_host(&host, caller, invocation, operation, forbidden).await,
+                    ToolInvocationServiceResolution::Failed { .. }
+                ));
+            }
+            assert!(matches!(
+                call_host(
+                    &host,
+                    caller,
+                    invocation,
+                    wire::OP_POLL,
+                    wire::PollRequest {
+                        scope_id: scope.into(),
+                        turn_id: id.clone(),
+                        after_sequence: 0
+                    }
+                )
+                .await,
+                ToolInvocationServiceResolution::Failed { .. }
+            ));
+        }
+        let turn = settled(&host, &id).await;
+        assert!(turn.inner.lock().await.cleaned);
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn real_host_normalized_tool_continuation() {
+        use bcode_model::{ContentBlock, MessageRole, ModelMessage, ProviderTurnEvent, ToolChoice};
+        let (host, _state) = fake_host(BTreeMap::new());
+        let mut request = retained_test_turn().request.clone();
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "read_file".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
+        }];
+        request.tool_call_policy.choice = ToolChoice::Required;
+        let id = start_host(&host, &request).await;
+        let turn_request = wire::TurnRequest {
+            scope_id: request.scope_id.clone(),
+            turn_id: id.clone(),
+        };
+        let first = settled(&host, &id).await;
+        let inner = first.inner.lock().await;
+        assert!(inner.cleaned);
+        assert_eq!(inner.failure, None);
+        drop(inner);
+        let page = host_page(&host, &request.scope_id, &id).await;
+        assert!(page.terminal);
+        let call = page
+            .events
+            .iter()
+            .find_map(|event| match &event.event {
+                ProviderTurnEvent::ToolCallFinished { call }
+                | ProviderTurnEvent::Output {
+                    event: bcode_model::ProviderOutputEvent::ToolCallFinished { call },
+                    ..
+                } => Some(call.clone()),
+                _ => None,
+            })
+            .expect("actual fake provider must emit a normalized tool call");
+        assert_eq!(call.name, "read_file");
+        assert!(matches!(
+            call_host(&host, "plugin", "serve", wire::OP_FINISH, turn_request).await,
+            ToolInvocationServiceResolution::Responded { .. }
+        ));
+        request.request_id = "continuation".into();
+        request.tool_call_policy.choice = ToolChoice::Auto;
+        request.messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolCall { call: call.clone() }],
+        });
+        request.messages.push(ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: call.id,
+                    output: "local tool output".into(),
+                    is_error: false,
+                    content: vec![],
+                },
+            }],
+        });
+        let continuation = start_host(&host, &request).await;
+        assert_ne!(continuation, id);
+        let second = settled(&host, &continuation).await;
+        let inner = second.inner.lock().await;
+        assert!(inner.cleaned);
+        assert_eq!(inner.failure, None);
+        drop(inner);
+        let page = host_page(&host, &request.scope_id, &continuation).await;
+        assert!(page.terminal);
+        let text: String = page
+            .events
+            .iter()
+            .filter_map(|event| match &event.event {
+                ProviderTurnEvent::TextDelta { text }
+                | ProviderTurnEvent::Output {
+                    event: bcode_model::ProviderOutputEvent::TextDelta { text },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "fake tool result: local tool output");
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn real_host_disconnect_expiry_and_shutdown_settle_cleanup() {
+        for ending in ["cancel", "disconnect", "expiry", "shutdown"] {
+            let (host, _state) = fake_host(BTreeMap::from([(
+                "fake_stream_delta_delay_ms".into(),
+                "2000".into(),
+            )]));
+            let mut request = retained_test_turn().request.clone();
+            request.messages[0].content = vec![bcode_model::ContentBlock::Text {
+                text: format!("stream-text {}", "long output ".repeat(1000)),
+            }];
+            if ending == "expiry" {
+                request.expires_at = now() + 2;
+            }
+            let id = start_host(&host, &request).await;
+            // Wait for real provider start/poll, not just the local reservation.
+            let turn = host.turns.lock().await.get(&id).unwrap().clone();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if !turn.inner.lock().await.events.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            match ending {
+                "cancel" => {
+                    let input = wire::TurnRequest {
+                        scope_id: request.scope_id.clone(),
+                        turn_id: id.clone(),
+                    };
+                    assert!(
+                        matches!(call_host(&host, "plugin", "serve", wire::OP_FINISH, &input).await,
+                        ToolInvocationServiceResolution::Failed { code, .. } if code == "cleanup_pending")
+                    );
+                    assert!(matches!(
+                        call_host(&host, "plugin", "serve", wire::OP_CANCEL, &input).await,
+                        ToolInvocationServiceResolution::Responded { .. }
+                    ));
+                }
+                "disconnect" => host.cancel_owner("plugin", "serve").await,
+                "expiry" => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    host.reap().await;
+                    assert!(host.owned("plugin", "serve", "scope", &id).await.is_none());
+                }
+                _ => host.shutdown().await,
+            }
+            let turn = settled(&host, &id).await;
+            let inner = turn.inner.lock().await;
+            assert!(inner.cleaned, "{ending}: cleanup must acknowledge");
+            assert_eq!(inner.failure, None);
+            assert!(
+                inner
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.event, bcode_model::ProviderTurnEvent::Cancelled))
+            );
+            drop(inner);
+            if ending != "expiry" {
+                assert!(matches!(
+                    call_host(
+                        &host,
+                        "plugin",
+                        "serve",
+                        wire::OP_FINISH,
+                        wire::TurnRequest {
+                            scope_id: request.scope_id.clone(),
+                            turn_id: id.clone()
+                        }
+                    )
+                    .await,
+                    ToolInvocationServiceResolution::Responded { .. }
+                ));
+            }
+            host.shutdown().await;
+            assert!(matches!(
+                call_host(&host, "plugin", "serve", wire::OP_START, request).await,
+                ToolInvocationServiceResolution::Failed { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn real_host_ambiguous_provider_start_keeps_same_reservation() {
+        let (host, _state) = fake_host(BTreeMap::from([(
+            "fake_event_script".into(),
+            "not-json".into(),
+        )]));
+        let request = retained_test_turn().request.clone();
+        let id = start_host(&host, &request).await;
+        let turn = settled(&host, &id).await;
+        let inner = turn.inner.lock().await;
+        assert_eq!(inner.failure, Some("start_failed_no_retry"));
+        assert!(!inner.cleaned);
+        drop(inner);
+        assert_eq!(start_host(&host, &request).await, id);
+        assert_eq!(host.turns.lock().await.len(), 1);
+        assert!(
+            matches!(call_host(&host, "plugin", "serve", wire::OP_FINISH,
+            wire::TurnRequest { scope_id: request.scope_id, turn_id: id }).await,
+            ToolInvocationServiceResolution::Failed { code, .. } if code == "cleanup_pending")
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_reservation_and_failed_cleanup_are_never_evicted() {
+        let host = ModelHostOperations::new(
+            bcode_config::BcodeConfig::default(),
+            Admission {
+                allowed_plugin_id: "plugin".into(),
+                model_profile: "fixed".into(),
+                supported_account_use: true,
+                max_turns: 2,
+                max_scope_seconds: 900,
+                custody: None,
+            },
+        );
+        for failure in ["start_failed_no_retry", "cleanup_failed"] {
+            let mut turn = retained_test_turn();
+            {
+                let turn = Arc::get_mut(&mut turn).unwrap();
+                turn.expires_at = now().saturating_sub(RETENTION_SECONDS + 1);
+                turn.request.expires_at = turn.expires_at;
+            }
+            {
+                let mut inner = turn.inner.lock().await;
+                inner.failure = Some(failure);
+                inner.completed = true;
+                inner.terminal = true;
+            }
+            assert_eq!(
+                reserve_match(&turn, "plugin", "serve", &turn.request),
+                Some(Ok(()))
+            );
+            host.turns.lock().await.insert(failure.into(), turn);
+        }
+        host.reap().await;
+        assert_eq!(host.turns.lock().await.len(), 2);
+        host.shutdown().await;
+        drop(host);
+    }
+
+    #[test]
+    fn cleanup_requires_both_provider_acknowledgements() {
+        let ack = || Ok(bcode_model::AckResponse::default());
+        assert!(acknowledge_cleanup(ack(), ack()).is_ok());
+        assert_eq!(
+            acknowledge_cleanup(Err("private cancel failure".into()), ack()),
+            Err("cleanup_failed")
+        );
+        assert_eq!(
+            acknowledge_cleanup(ack(), Err("private finish failure".into())),
+            Err("cleanup_failed")
+        );
+    }
+
     #[test]
     fn admission_is_opt_in_and_never_inherits_active_selection() {
         let config = bcode_config::BcodeConfig::default();
@@ -1018,6 +1453,23 @@ mod tests {
         assert!(!host.admits("other"));
         assert_eq!(host.admission.model_profile, "fixed");
         drop(host);
+    }
+
+    #[test]
+    fn scope_default_is_bounded_without_renewal() {
+        let admission: Admission = serde_json::from_value(serde_json::json!({
+            "allowed_plugin_id":"plugin", "model_profile":"fixed", "supported_account_use":true,
+            "max_turns":1,
+        }))
+        .unwrap();
+        assert_eq!(admission.max_scope_seconds, 900);
+        let mut input = retained_test_turn().request.clone();
+        input.expires_at = 1000;
+        assert!(valid_start(&input, &admission, 100));
+        input.expires_at = 1001;
+        assert!(!valid_start(&input, &admission, 100));
+        input.expires_at = 86500;
+        assert!(!valid_start(&input, &admission, 100));
     }
 
     #[test]
@@ -1143,6 +1595,7 @@ mod tests {
             for _ in 0..300 {
                 retain_event(&mut inner, bcode_model::ProviderTurnEvent::TurnStarted);
             }
+            inner.terminal = true;
             drop(inner);
         }
         let result = host
@@ -1177,6 +1630,30 @@ mod tests {
         assert_eq!(page.events.len(), 64);
         assert_eq!(page.events[0].sequence, 45);
         assert_eq!(page.next_sequence, 108);
+        assert!(
+            !page.terminal,
+            "terminal must not hide retained events on later pages"
+        );
+        assert!(matches!(host.poll("plugin", "serve", wire::PollRequest {
+            scope_id: "scope".into(), turn_id: "turn".into(), after_sequence: 301,
+        }).await, ToolInvocationServiceResolution::Failed { code, .. } if code == "cursor_gap"));
+        let ToolInvocationServiceResolution::Responded { payload } = host
+            .poll(
+                "plugin",
+                "serve",
+                wire::PollRequest {
+                    scope_id: "scope".into(),
+                    turn_id: "turn".into(),
+                    after_sequence: 299,
+                },
+            )
+            .await
+        else {
+            panic!("final retained page must succeed");
+        };
+        let final_page: wire::PollResponse = serde_json::from_value(payload).unwrap();
+        assert!(final_page.terminal);
+        assert_eq!(final_page.next_sequence, 300);
         host.cancel_owner("plugin", "serve").await;
         drop(host);
         assert!(turn.cancel.load(Ordering::Acquire));

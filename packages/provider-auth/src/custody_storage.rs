@@ -189,6 +189,11 @@ impl CredentialCustodyStorage {
             .map_err(CustodyStorageError::Io)?;
         let store = Self::acquire(path, true)?;
         store.publish(ciphertext)?;
+        // The directory entry itself must survive a crash before remote enrollment is admitted.
+        let parent = path.parent().ok_or(CustodyStorageError::Ownership)?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(CustodyStorageError::Io)?;
         Ok(store)
     }
 

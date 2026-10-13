@@ -36,8 +36,13 @@ pub struct ServeRequest {
     pub allow: Vec<TrustedWorkflow>,
     /// Maximum simultaneously retained leases.
     pub max_leases: usize,
-    /// Lease TTL in seconds, bounded to at most fifteen minutes and JWT expiry.
+    /// Lease TTL in seconds, at most 900 seconds and shortened by JWT expiry.
+    #[serde(default = "default_lease_seconds")]
     pub lease_seconds: u64,
+}
+
+const fn default_lease_seconds() -> u64 {
+    900
 }
 
 impl ServeRequest {
@@ -46,6 +51,9 @@ impl ServeRequest {
     /// # Errors
     /// Rejects blank/broad policy, invalid limits, and unprotected public listeners.
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=900).contains(&self.lease_seconds) {
+            return Err("broker lease_seconds must be between 1 and 900; renewal is unsupported");
+        }
         if self.invocation_id.is_empty()
             || self.invocation_id.len() > 128
             || self.audience.is_empty()
@@ -53,7 +61,6 @@ impl ServeRequest {
             || self.allow.is_empty()
             || self.allow.len() > 64
             || !(1..=4096).contains(&self.max_leases)
-            || !(1..=900).contains(&self.lease_seconds)
             || (!self.bind.ip().is_loopback() && !self.trusted_tls_ingress)
         {
             return Err("invalid broker configuration");
@@ -84,5 +91,43 @@ impl ServeRequest {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configuration() -> serde_json::Value {
+        serde_json::json!({
+            "invocation_id":"serve", "bind":"127.0.0.1:8080", "trusted_tls_ingress":false,
+            "audience":"https://broker.example/actions", "max_leases":1,
+            "allow":[{"repository_id":"1", "repository":"owner/repo",
+                "workflow_ref":"owner/repo/.github/workflows/agent.yml@refs/heads/main",
+                "git_ref":"refs/heads/main", "subject":"repo:owner/repo:ref:refs/heads/main"}]
+        })
+    }
+
+    #[test]
+    fn lease_default_and_hard_limit_are_explicit() {
+        let mut value = configuration();
+        let config: ServeRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.lease_seconds, 900);
+        assert!(config.validate().is_ok());
+        for seconds in [0, 901, 86400] {
+            value["lease_seconds"] = seconds.into();
+            let config: ServeRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                config.validate(),
+                Err("broker lease_seconds must be between 1 and 900; renewal is unsupported")
+            );
+        }
+        value["lease_seconds"] = 900.into();
+        assert!(
+            serde_json::from_value::<ServeRequest>(value)
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
     }
 }

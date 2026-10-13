@@ -827,6 +827,14 @@ fn auth_flow_failure(message: &str) -> AuthFlowResponse {
 }
 
 fn auth_flow_success(token: OpenAiAuthTokenResponse, _profile: &str) -> AuthFlowResponse {
+    // Subscription enrollment must produce usable durable custody, not a transient access-only
+    // login. Optional ID-token/account fields remain provider-owned; missing refresh authority
+    // cannot be repaired by reusing another enrollment's credential record.
+    if token.access_token.is_empty() || token.refresh_token.as_deref().is_none_or(str::is_empty) {
+        return auth_flow_failure(
+            "Subscription enrollment returned incomplete credentials; reconnect required",
+        );
+    }
     let expires_at =
         unix_timestamp_secs().saturating_add(token.expires_in.unwrap_or(3_600).saturating_sub(60));
     let account_id = token
@@ -9758,6 +9766,36 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_enrollment_requires_new_refresh_authority() {
+        for refresh_token in [None, Some(String::new())] {
+            let response = auth_flow_success(
+                OpenAiAuthTokenResponse {
+                    access_token: "synthetic-access".into(),
+                    refresh_token,
+                    id_token: None,
+                    expires_in: Some(3600),
+                },
+                "test-profile",
+            );
+            assert_eq!(response.status, AuthFlowStatus::Failed);
+            assert!(response.credentials.is_empty());
+            assert!(!format!("{:?}", response.diagnostics).contains("synthetic-access"));
+        }
+        let response = auth_flow_success(
+            OpenAiAuthTokenResponse {
+                access_token: "synthetic-access".into(),
+                refresh_token: Some("synthetic-refresh".into()),
+                id_token: None,
+                expires_in: Some(3600),
+            },
+            "test-profile",
+        );
+        assert_eq!(response.status, AuthFlowStatus::Succeeded);
+        assert_eq!(response.credentials["auth_mode"], "chatgpt");
+        assert_eq!(response.credentials["refresh_token"], "synthetic-refresh");
+    }
 
     #[test]
     fn provider_runtime_survives_host_overlap_and_reopens_after_discovery() {

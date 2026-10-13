@@ -1,7 +1,6 @@
 # GitHub Actions and headless automation
 
-Bcode accepts arbitrary prompts through the Rust `run` command. The setup and direct run adapters are thin Bash wrappers; the optional broker OIDC
-exchange additionally uses Python 3's standard library (no third-party packages).
+Bcode accepts arbitrary prompts through the Rust `run` command. The setup and run adapters are thin Bash wrappers; the optional broker OIDC exchange and private configuration preparation are owned by the Rust broker-provider plugin.
 This initial profile is **trusted code only**, not an OS sandbox.
 Do not run fork-controlled code, workflows, configuration, or prompts with credentials.
 
@@ -82,6 +81,25 @@ service, multi-tenant broker and GitHub App are not prerequisites for this initi
 trusted direct-API integration. The optional single-owner broker client is described
 below; no hosted service, external TLS deployment or live acceptance is claimed.
 
+## Operator custody setup status
+
+The explicit local command is `bcode auth broker-setup <initialize|reconnect|readiness>`
+with `--provider`, `--profile`, `--directory`, and `--identity-file`; initialization
+also requires `--recipient`. The directory and identity file must be absolute,
+operator-controlled paths. The identity file contains one owner-only age identity;
+never pass its value on the command line. The profile must pin the enabled provider
+plugin, subscription method, sshenv backend, and explicit `device_seal = "off"`.
+Initialization requires Linux and interactive `CONNECT` confirmation; reconnect
+requires stopping the broker, settling prior work, and `RECONNECT` confirmation.
+Readiness is local and non-mutating, not proof of remote provider support.
+
+**Initialization is currently blocked:** the locked sshenv vault rejects the plain-age
+recipient required by this custody profile. The command reports failure rather than
+copying legacy vault ciphertext or substituting another custody policy. A typed upstream
+vault capability and verified dependency update are required before connect-once
+subscription setup can be accepted. Existing custody tests do not establish successful
+fresh operator enrollment. Direct API mode does not close this subscription acceptance gate.
+
 ## Optional scoped broker OIDC mode
 
 Use a distribution bundling `bcode.auth-broker-provider` and a trusted deployed HTTPS
@@ -109,12 +127,17 @@ Omit `config` and `profile` in this mode: the Action writes an exclusive non-sec
 `github-broker` profile selecting `bcode.auth-broker-provider` / `broker-scoped`.
 It obtains the GitHub issuer token from runner OIDC request environment as data,
 adds the audience via URL encoding, and exchanges it at `POST /v1/leases` with
-no redirects. Only the opaque lease reaches the provider environment. JWTs,
+no redirects. Only the opaque lease is stored in owner-only private files read by the provider;
+tool subprocesses do not inherit a lease environment variable. JWTs,
 lease responses, diagnostics and generated model text are never printed to CI logs.
 Private token files are removed on exit; broker expiry reaps remote turns after
 runner loss. Execution budget must fit inside the returned lease minus ten seconds;
-the broker currently caps leases at 300 seconds. A 600-second default must therefore
-be overridden. Use ephemeral trusted runners; inherited secrets are not sandboxed.
+the broker defaults to 900 seconds and rejects configured leases above 900 seconds.
+Verified GitHub JWT expiry can shorten the actual lease. A 600-second execution budget
+requires at least 610 seconds remaining; otherwise preparation fails before model start.
+Broker mode rejects longer budgets instead of renewing or replaying model/tool effects.
+Direct mode retains the separate bounded execution budget. Use ephemeral trusted runners;
+inherited secrets are not sandboxed.
 
 The client now forwards bounded normalized tool definitions, selection/schema policy,
 assistant tool calls and text-only tool results. The broker negotiates them against its
@@ -124,8 +147,9 @@ OIDC does not grant tool authorization. Images, provider extensions and reasonin
 unsupported, and no live general-agent/deployment acceptance is claimed.
 Direct mode remains unchanged
 and retains explicit API-key billing. Neither mode silently falls back to the other.
-Python 3 is required only for broker mode. Offline broker client/exchange tests are
-not evidence of real GitHub OIDC deployment or provider permission/support.
+Broker mode requires a distribution bundling the broker-provider plugin's
+`auth-broker prepare` Rust command; Python is not required. Offline Rust exchange and
+shell adapter tests are not evidence of real GitHub OIDC deployment or provider permission/support.
 
 ## Verification status
 

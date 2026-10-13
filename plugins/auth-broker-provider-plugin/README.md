@@ -1,5 +1,43 @@
 # Scoped auth broker provider
 
+## GitHub OIDC bootstrap (version one)
+
+```sh
+bcode --no-credential-discovery --json-errors auth-broker prepare \
+  --directory /private/runner/scratch --broker-url https://broker.example \
+  --audience bcode --timeout-secs 600
+```
+
+`static_cli_registration()` contributes this local-only CLI without a daemon.
+The manifest also advertises `bcode.auth-broker-setup/v1`, operation `prepare`, with
+`PrepareRequest { directory, broker_url, audience, timeout_secs }` and
+`PrepareResponse { profile }`. Unknown request fields fail closed. Both entry
+points share the Rust implementation. OIDC request URL/token are environment-only;
+credentials are never arguments, service payloads, config values or output.
+
+The exchange uses bounded HTTPS requests without redirects or automatic retry.
+Returned lifetime cannot exceed 900 seconds; execution must fit actual remaining
+lease minus ten seconds. The 600-second default requires at least 610 seconds.
+Too-long budgets return `execution_budget_exceeds_lease` before model start.
+The broker owns JWT verification, configured TTL and expiry reaping. There is no
+renewal or effect replay.
+
+An existing canonical absolute owner-only directory is required, outside
+`GITHUB_WORKSPACE` when present. Descriptor-relative exclusive 0600 creation writes
+`broker-token`, `broker-expiry`, and typed TOML `broker.toml`. Failure rollback
+removes only files created by the invocation. Existing files are never overwritten.
+Settings `broker_lease_file` and `broker_expiry_file` must appear together; mixing
+these with context lease environment values fails closed. The Action does not
+export the lease into tool subprocess environments and removes these three files
+on exit. Same-user trusted tools can still read files: this is not a sandbox.
+Direct mode remains separate and keeps its 86400-second maximum.
+
+Rust behavioral tests cover endpoint/credential/response bounds, redirects, lease
+budget edges, TOML roundtrip, exclusive private files and narrow collision rollback.
+`.github/actions/run-bcode/test.sh` covers Action wiring and environment/cleanup
+using a mock binary. These tests are not evidence of live OIDC/provider acceptance.
+
+
 `bcode.auth-broker-provider` implements actual normalized start/poll/cancel/finish HTTP
 operations over the admitted broker gateway. It has native dynamic and `static-bundled`
 entry points. Workspace registration and distribution bundling are required by the host.

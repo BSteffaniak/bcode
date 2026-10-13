@@ -17,12 +17,16 @@ scratch=$(mktemp -d "$parent/bcode-run.XXXXXXXX")
 cleanup() {
   # A lease is not a refresh credential. Remove private copies on every exit;
   # broker TTL reaps remote work after cancellation/unknown runner loss.
-  rm -f -- "$scratch/broker-token" "$scratch/broker-expiry"
+  rm -f -- "$scratch/broker-token" "$scratch/broker-expiry" "$scratch/broker.toml"
   unset BCODE_AUTH_BROKER_TOKEN BCODE_AUTH_BROKER_EXPIRES_AT
 }
 trap cleanup EXIT
+mkdir "$scratch/home"
+export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/home/config" XDG_DATA_HOME="$scratch/home/data" XDG_STATE_HOME="$scratch/home/state" CI=true BCODE_NO_ONBOARD=1
+unset BCODE_CONFIG BCODE_CONTEXT BCODE_PROFILE GITHUB_TOKEN GH_TOKEN
 case "${BCODE_ACTION_AUTH_MODE:-direct}" in
   direct)
+    [[ -z "${BCODE_ACTION_BROKER_URL:-}" && -z "${BCODE_ACTION_BROKER_AUDIENCE:-}" && -z "${BCODE_AUTH_BROKER_TOKEN:-}" && -z "${BCODE_AUTH_BROKER_EXPIRES_AT:-}" ]] || fail
     [[ "${BCODE_ACTION_CONFIG:-}" = /* && -f "$BCODE_ACTION_CONFIG" && ! -L "$BCODE_ACTION_CONFIG" && -n "${BCODE_ACTION_PROFILE:-}" ]] || fail
     path=$(cd -- "$(dirname -- "$BCODE_ACTION_CONFIG")" && pwd -P)
     [[ "$path" != "$workspace" && "$path" != "$workspace/"* && "$path" != *$'\n'* && "$path" != *$'\r'* ]] || fail
@@ -30,12 +34,16 @@ case "${BCODE_ACTION_AUTH_MODE:-direct}" in
   broker-oidc)
     # Never mix caller auth/config with the sole broker-selected profile.
     [[ -z "${BCODE_ACTION_CONFIG:-}" && -z "${BCODE_ACTION_PROFILE:-}" ]] || fail
-    command -v python3 >/dev/null || fail
-    python3 "$BCODE_ACTION_PATH/broker.py" "$scratch" || fail
-    IFS= read -r BCODE_AUTH_BROKER_TOKEN < "$scratch/broker-token"
-    IFS= read -r BCODE_AUTH_BROKER_EXPIRES_AT < "$scratch/broker-expiry"
-    export BCODE_AUTH_BROKER_TOKEN BCODE_AUTH_BROKER_EXPIRES_AT
-    rm -f -- "$scratch/broker-token" "$scratch/broker-expiry"
+    [[ -n "${BCODE_ACTION_BROKER_URL:-}" && -n "${BCODE_ACTION_BROKER_AUDIENCE:-}" ]] || fail
+    unset BCODE_AUTH_BROKER_TOKEN BCODE_AUTH_BROKER_EXPIRES_AT
+    # Local plugin-owned command: trusted empty bootstrap config, no daemon or secret argv.
+    ( set -o noclobber; : > "$scratch/bootstrap.toml" ) || fail
+    "$BCODE_ACTION_BINARY" --config-only "$scratch/bootstrap.toml" \
+      --state-root "$scratch/bootstrap-state" --no-credential-discovery --json-errors auth-broker prepare \
+      --directory "$scratch" --broker-url "$BCODE_ACTION_BROKER_URL" \
+      --audience "$BCODE_ACTION_BROKER_AUDIENCE" --timeout-secs "$BCODE_ACTION_TIMEOUT" \
+      > /dev/null 2> "$scratch/setup-diagnostics.json" || fail
+    # The provider reads private lease files; tool subprocesses never inherit the lease.
     BCODE_ACTION_CONFIG="$scratch/broker.toml"
     BCODE_ACTION_PROFILE=github-broker
     unset BCODE_ACTION_API_KEY OPENAI_API_KEY OPENAI_ACCESS_TOKEN OPENAI_REFRESH_TOKEN
@@ -44,9 +52,7 @@ case "${BCODE_ACTION_AUTH_MODE:-direct}" in
 esac
 printf '%s' "$BCODE_ACTION_PROMPT" > "$scratch/prompt.txt"
 unset BCODE_ACTION_PROMPT
-mkdir "$scratch/home"
-export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/home/config" XDG_DATA_HOME="$scratch/home/data" XDG_STATE_HOME="$scratch/home/state" CI=true BCODE_NO_ONBOARD=1
-unset BCODE_CONFIG BCODE_CONTEXT BCODE_PROFILE GITHUB_TOKEN GH_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
 args=()
 set +e
 "$BCODE_ACTION_BINARY" --config-only "$BCODE_ACTION_CONFIG" --profile "$BCODE_ACTION_PROFILE" \

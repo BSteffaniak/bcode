@@ -639,6 +639,64 @@ impl<'a> AuthVaultLifecycle<'a> {
         Ok(())
     }
 
+    /// Validate the supported age-only enrollment policy before any remote effect.
+    /// Existing factors are rejected, never removed or invoked.
+    #[cfg(unix)]
+    pub(crate) fn validate_enrollment_custody(
+        &self,
+        custody: &dyn crate::custody_storage::AuthCustodyStorage,
+        identities: &[&str],
+    ) -> Result<(), AuthVaultLifecycleError> {
+        let failure = || AuthVaultLifecycleError::InvalidCredential;
+        let bytes = custody.read().map_err(|_| failure())?;
+        let ciphertext = sshenv_vault::Vault::decode_ciphertext(&bytes).map_err(|_| failure())?;
+        let metadata = ciphertext.policy_metadata.as_ref().ok_or_else(failure)?;
+        if !metadata.profile_keys_enabled
+            || !metadata.remote_factors.is_empty()
+            || !metadata.recovery_share_sets.is_empty()
+            || metadata
+                .policies
+                .iter()
+                .flat_map(|policy| &policy.factors)
+                .any(|factor| factor.kind != sshenv_vault::models::UnlockFactorKindV2::SshRecipient)
+            || metadata
+                .recipients
+                .iter()
+                .any(|recipient| !recipient.public_descriptor.starts_with("age1"))
+        {
+            return Err(failure());
+        }
+        let key = sshenv_vault::recipient::unwrap_data_key_with_strings(
+            &ciphertext.recipients,
+            identities,
+        )
+        .map_err(|_| failure())?;
+        let (mut vault, _) = sshenv_vault::Vault::unlock_metadata_with_data_key_and_device_factor(
+            ciphertext,
+            key,
+            None,
+            |_| Err(std::io::Error::other("unsupported enrollment factor").into()),
+        )
+        .map_err(|_| failure())?;
+        let supported = vault
+            .profiles
+            .profile_policies
+            .get(self.storage_profile())
+            .is_none_or(|policy| {
+                policy.required_factors.is_empty() && policy.factor_metadata.is_empty()
+            })
+            && (vault.profiles.profiles.contains_key(self.storage_profile())
+                || vault
+                    .profiles
+                    .profile_entries
+                    .contains_key(self.storage_profile()));
+        zeroize_vault_values(&mut vault);
+        if !supported {
+            return Err(failure());
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn enforce_custody_policy(
         &self,

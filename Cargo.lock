@@ -1533,9 +1533,13 @@ dependencies = [
  "bcode_model",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
+ "clap",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
+ "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]

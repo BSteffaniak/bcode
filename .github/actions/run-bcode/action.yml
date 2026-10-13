@@ -21,7 +21,7 @@ inputs:
     description: Arbitrary UTF-8 prompt, passed as data rather than shell code
     required: true
   timeout-secs:
-    description: Execution budget in seconds (1–86400)
+    description: Execution budget; direct 1–86400, broker must fit actual lease (maximum 900) minus 10 seconds; 600 requires at least 610 seconds remaining
     default: '600'
 outputs:
   result:

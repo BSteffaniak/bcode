@@ -7,11 +7,16 @@ description  = "Normalized text/tool model turns using an opaque broker lease; n
 interface_id = "bcode.model-provider/v1"
 name         = "Scoped text model gateway"
 
+[[services]]
+description  = "Local GitHub OIDC exchange and private runner configuration; credentials never cross the service payload"
+interface_id = "bcode.auth-broker-setup/v1"
+name         = "GitHub broker lease preparation"
+
 [concurrency]
 type = "concurrent"
 
 [runtime]
 abi_version  = 5
 event_symbol = "bcode_plugin_handle_event_v1"
-library      = "libbcode_auth_broker_provider_plugin.dylib"
+library      = "libbcode_auth_broker_provider_plugin.so"
 type         = "native"

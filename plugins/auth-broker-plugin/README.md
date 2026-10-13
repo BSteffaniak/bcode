@@ -17,7 +17,7 @@ allowed_plugin_id = "bcode.auth-broker"
 model_profile = "broker"
 supported_account_use = true
 max_turns = 128
-max_scope_seconds = 300
+max_scope_seconds = 900
 
 [plugins.config."bcode.auth-broker".model_host.custody]
 provider_id = "openai"
@@ -29,7 +29,7 @@ bind = "127.0.0.1:8080"
 trusted_tls_ingress = false
 audience = "https://broker.example/actions"
 max_leases = 128
-lease_seconds = 300
+lease_seconds = 900
 
 [[plugins.config."bcode.auth-broker".serve.allow]]
 repository_id = "123456"
@@ -90,7 +90,7 @@ Operator responsibility for permitted use does not imply that arbitrary accounts
     "subject": "repo:owner/repository:ref:refs/heads/main"
   }],
   "max_leases": 128,
-  "lease_seconds": 300
+  "lease_seconds": 900
 }
 ```
 
@@ -98,6 +98,24 @@ Public binding requires `trusted_tls_ingress = true` and operator-provided TLS i
 expose the plaintext listener directly. Ingress must also impose connection, header, request-rate
 and idle time limits. Do not log Authorization headers, JWTs, lease exchange responses, bodies,
 or provider material. There are no browser routes and no general platform/tenant management.
+
+## Lease/run lifetime
+
+The default lease TTL is 900 seconds; explicit values must be in `1..=900`. The host
+also rejects scopes exceeding its configured maximum (at most 900 seconds). Configure
+`max_scope_seconds` to match `lease_seconds`. There is no renewal, effect replay, or
+credential fallback. Exchange returns `expires_at = min(exchange_time + lease_seconds,
+verified GitHub JWT exp)`: JWT expiry can shorten even the default lease substantially.
+The runner must reject a budget that exceeds the returned remaining lifetime minus ten
+seconds **before starting model work**. A 600-second default run can therefore fail with
+a short-lived JWT; an explicit 86400-second budget is unsupported in broker mode. Such
+failure must not switch to API-key mode or replay tool effects. Obtain a fresh OIDC JWT
+only before a new explicit run, never as automatic renewal of admitted work.
+
+Expiry, invocation exit/disconnect and shutdown request cancellation and finish independently
+of HTTP connectivity. Cancellation acknowledgement means a request was admitted, not that
+remote work stopped. Finish acknowledgement requires observed successful cleanup; failed or
+ambiguous cleanup remains capacity-accounted until restart.
 
 ## HTTP contract
 
@@ -139,5 +157,9 @@ cannot prove remote work stopped. Shutdown waits for admitted lifecycle workers.
 ## Validation
 
 Behavioral tests cover strict wire decoding, bearer ambiguity, exact workflow/repository claims,
-algorithm rejection before key fetch, lease capacity/expiry, host ownership/idempotency, and event
-retention. Coordinator owns formatting/build/test runs and integrated provider/HTTP verification.
+algorithm rejection before key fetch, lease capacity/expiry/JWT shortening, host ownership/idempotency,
+cursor gaps and terminal page draining. Direct host integration tests load the real bundled fake
+provider and exercise normalized tool continuation, cancel/finish acknowledgement, invocation loss,
+expiry, shutdown and failed-start reservation retention. These offline tests do not establish real
+provider or GitHub deployment acceptance. Coordinator owns formatting/build/test runs and integrated
+provider/HTTP verification.

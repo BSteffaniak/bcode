@@ -3,6 +3,10 @@
 #![allow(clippy::multiple_crate_versions)]
 //! Scoped normalized text/tool model gateway client. Never handles upstream auth.
 
+#[cfg(feature = "static-bundled")]
+mod cli;
+pub mod setup;
+
 use bcode_model::{self as model, host_operation as wire};
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
@@ -57,6 +61,30 @@ impl Broker {
             || url.path() != "/"
         {
             return Err("invalid_broker_url");
+        }
+        if let (Some(lease_file), Some(expiry_file)) = (
+            context.settings.get("broker_lease_file"),
+            context.settings.get("broker_expiry_file"),
+        ) {
+            if context.env.contains_key(TOKEN_ENV)
+                || context.env.contains_key("BCODE_AUTH_BROKER_EXPIRES_AT")
+            {
+                return Err("ambiguous_broker_lease");
+            }
+            let (token, expires_at) = setup::read_lease(lease_file, expiry_file)?;
+            if expires_at <= now() {
+                return Err("broker_lease_expired");
+            }
+            return Ok(Self {
+                url,
+                token,
+                expires_at,
+            });
+        }
+        if context.settings.contains_key("broker_lease_file")
+            || context.settings.contains_key("broker_expiry_file")
+        {
+            return Err("invalid_private_file");
         }
         let token = context
             .env
@@ -358,7 +386,11 @@ fn json(value: &impl Serialize) -> ServiceResponse {
 fn failed(code: Failure) -> ServiceResponse {
     ServiceResponse::error(
         code,
-        "Scoped broker request failed; verify lease and gateway policy; remote cleanup may remain pending",
+        if code == "execution_budget_exceeds_lease" {
+            "Execution budget exceeds actual broker lease minus ten seconds; shorten the budget; no model turn was started"
+        } else {
+            "Scoped broker request failed; verify lease and gateway policy; remote cleanup may remain pending"
+        },
     )
 }
 impl AuthBrokerProviderPlugin {
@@ -370,6 +402,22 @@ impl AuthBrokerProviderPlugin {
     }
     fn handle(&self, context: &NativeServiceContext) -> Result<ServiceResponse, Failure> {
         let request = &context.request;
+        if request.interface_id == setup::INTERFACE {
+            if request.operation != "prepare" {
+                return Err("unsupported_operation");
+            }
+            let input: setup::PrepareRequest =
+                request.payload_json().map_err(|_| "invalid_request")?;
+            let runtime = self
+                .runtime
+                .as_ref()
+                .map_err(|_| "broker_runtime_unavailable")?;
+            return runtime
+                .block_on(
+                    async move { setup::prepare(&input).await.map(|response| json(&response)) },
+                )
+                .map_err(|_| "broker_runtime_unavailable")?;
+        }
         if request.interface_id != model::MODEL_PROVIDER_INTERFACE_ID {
             return Err("unsupported_interface");
         }
@@ -533,13 +581,22 @@ impl ConcurrentRustPlugin for AuthBrokerProviderPlugin {
         self.invoke(&context)
     }
 }
+/// Local-only OIDC bootstrap CLI contribution.
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn static_cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
+
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
+    let mut vtable = bcode_plugin_sdk::static_concurrent_plugin_vtable!(
         AuthBrokerProviderPlugin,
         include_str!("../bcode-plugin.toml")
-    )
+    );
+    vtable.cli_registration = Some(static_cli_registration);
+    vtable
 }
 #[cfg(not(feature = "static-bundled"))]
 bcode_plugin_sdk::export_concurrent_plugin!(
@@ -553,6 +610,35 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "static-bundled")]
+    #[test]
+    fn bundled_vtable_exposes_local_bootstrap_cli() {
+        let vtable = static_plugin();
+        let registration = vtable.cli_registration.expect("bundled CLI registration")();
+        assert!(!registration.requires_daemon);
+        let matches = (registration.command)()
+            .try_get_matches_from([
+                "auth-broker",
+                "prepare",
+                "--directory",
+                "relative-invalid-directory",
+                "--broker-url",
+                "https://broker.example",
+                "--audience",
+                "bcode",
+                "--timeout-secs",
+                "600",
+            ])
+            .expect("public command syntax");
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let result = runtime
+            .block_on((registration.invoke)(matches))
+            .expect("invoke local CLI");
+        assert_eq!(
+            result.expect_err("unsafe directory rejected before network"),
+            "invalid_private_directory"
+        );
+    }
     fn context(url: &str) -> model::ProviderRequestContext {
         model::ProviderRequestContext {
             settings: BTreeMap::from([("broker_url".into(), url.into())]),
@@ -565,6 +651,47 @@ mod tests {
             ]),
             ..Default::default()
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn provider_reads_private_lease_without_inherited_secret_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("private fixture");
+        let path = std::fs::canonicalize(directory.path()).expect("canonical");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("permissions");
+        for (name, contents) in [
+            ("broker-token", "synthetic-file-lease".to_owned()),
+            ("broker-expiry", (now() + 900).to_string()),
+        ] {
+            std::fs::write(path.join(name), contents).expect("fixture");
+            std::fs::set_permissions(path.join(name), std::fs::Permissions::from_mode(0o600))
+                .expect("permissions");
+        }
+        let mut context = context("https://broker.example");
+        context.env.clear();
+        context.settings.insert(
+            "broker_lease_file".into(),
+            path.join("broker-token").to_str().expect("path").into(),
+        );
+        context.settings.insert(
+            "broker_expiry_file".into(),
+            path.join("broker-expiry").to_str().expect("path").into(),
+        );
+        let broker = Broker::from_context(&context).expect("file-backed lease");
+        assert_eq!(broker.token, "synthetic-file-lease");
+        assert!(!format!("{broker:?}").contains("synthetic-file-lease"));
+        context.env.insert(TOKEN_ENV.into(), "other-lease".into());
+        assert_eq!(
+            Broker::from_context(&context).expect_err("ambiguous selection"),
+            "ambiguous_broker_lease"
+        );
+        context.env.clear();
+        context.settings.remove("broker_expiry_file");
+        assert_eq!(
+            Broker::from_context(&context).expect_err("partial selection"),
+            "invalid_private_file"
+        );
     }
     #[test]
     fn endpoint_and_lease_fail_closed_and_debug_redacts() {

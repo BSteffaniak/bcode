@@ -4,6 +4,7 @@
 
 //! Command-line interface for Bcode.
 
+mod auth_broker_setup;
 pub mod clierror;
 mod plugin_cli;
 pub mod retired_catalogs;
@@ -6904,6 +6905,21 @@ struct VerifyCacheArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Initialize, reconnect, or inspect retained broker credential custody.
+    BrokerSetup {
+        #[arg(value_enum)]
+        operation: auth_broker_setup::SetupOperation,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        identity_file: PathBuf,
+        #[arg(long)]
+        recipient: Option<String>,
+    },
     /// Discover provider-declared external API keys without displaying their values.
     Discover,
     /// Review and copy one provider-declared external API key into an owned sshenv profile.
@@ -9421,36 +9437,27 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             AuthProfileCommand::List => auth_profile_list(),
             AuthProfileCommand::Show { profile } => auth_profile_show(&profile),
         },
-        AuthCommand::Pool { command } => match command {
-            AuthPoolCommand::List => auth_pool_list(),
-            AuthPoolCommand::DaemonStatus => {
-                let pools = Box::pin(BcodeClient::default_endpoint().auth_pool_list()).await?;
-                print_json(&pools)
-            }
-            AuthPoolCommand::Profiles { pool } | AuthPoolCommand::Status { pool } => {
-                auth_pool_status(&pool)
-            }
-            AuthPoolCommand::ResetCooldown { pool, profile } => {
-                auth_pool_reset_cooldown(&pool, profile.as_deref());
-                Ok(())
-            }
-            AuthPoolCommand::Promote { pool, profile } => {
-                let path = bcode_provider_auth::set_auth_pool_preference(&pool, Some(&profile))?;
-                println!(
-                    "Preferred auth profile for '{pool}' is now '{profile}' ({}).",
-                    display_from_current_dir(&path)
-                );
-                Ok(())
-            }
-            AuthPoolCommand::ClearPreference { pool } => {
-                let path = bcode_provider_auth::set_auth_pool_preference(&pool, None)?;
-                println!(
-                    "Cleared interactive auth preference for '{pool}' ({}).",
-                    display_from_current_dir(&path)
-                );
-                Ok(())
-            }
-        },
+        AuthCommand::Pool { command } => handle_auth_pool_command(command).await,
+        AuthCommand::BrokerSetup {
+            operation,
+            provider,
+            profile,
+            directory,
+            identity_file,
+            recipient,
+        } => {
+            auth_broker_setup::run(
+                operation,
+                auth_broker_setup::SetupOptions {
+                    provider_id: provider,
+                    profile,
+                    directory,
+                    identity_file,
+                    recipient,
+                },
+            )
+            .await
+        }
         AuthCommand::Prime { command } => handle_auth_prime_command(command),
         AuthCommand::Resets { command } => handle_auth_resets_command(command),
         AuthCommand::Usage { command } => handle_auth_usage_command(command),
@@ -9498,6 +9505,39 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             profile,
             revoke,
         } => auth_provider_logout(&provider, profile.as_deref(), revoke).await,
+    }
+}
+
+async fn handle_auth_pool_command(command: AuthPoolCommand) -> Result<(), CliError> {
+    match command {
+        AuthPoolCommand::List => auth_pool_list(),
+        AuthPoolCommand::DaemonStatus => {
+            let pools = Box::pin(BcodeClient::default_endpoint().auth_pool_list()).await?;
+            print_json(&pools)
+        }
+        AuthPoolCommand::Profiles { pool } | AuthPoolCommand::Status { pool } => {
+            auth_pool_status(&pool)
+        }
+        AuthPoolCommand::ResetCooldown { pool, profile } => {
+            auth_pool_reset_cooldown(&pool, profile.as_deref());
+            Ok(())
+        }
+        AuthPoolCommand::Promote { pool, profile } => {
+            let path = bcode_provider_auth::set_auth_pool_preference(&pool, Some(&profile))?;
+            println!(
+                "Preferred auth profile for '{pool}' is now '{profile}' ({}).",
+                display_from_current_dir(&path)
+            );
+            Ok(())
+        }
+        AuthPoolCommand::ClearPreference { pool } => {
+            let path = bcode_provider_auth::set_auth_pool_preference(&pool, None)?;
+            println!(
+                "Cleared interactive auth preference for '{pool}' ({}).",
+                display_from_current_dir(&path)
+            );
+            Ok(())
+        }
     }
 }
 

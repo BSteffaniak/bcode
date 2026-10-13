@@ -2,6 +2,12 @@
 
 use crate::{AuthProfileResolutionError, ResolvedAuthProfile, lifecycle::AuthVaultLifecycle};
 #[cfg(unix)]
+mod enrollment;
+#[cfg(unix)]
+pub use enrollment::{
+    CustodyEnrollment, CustodyEnrollmentMode, CustodyEnrollmentReadiness, read_custody_identity,
+};
+#[cfg(unix)]
 mod refresh;
 use bcode_provider_auth_models::{
     AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION, AUTH_SECURITY_INSPECTION_SCHEMA_VERSION,
@@ -230,6 +236,7 @@ pub struct RetainedAuthRequestCustody {
     key_source: Option<std::sync::Arc<dyn AuthCustodyKeySource>>,
     device_source: Option<std::sync::Arc<dyn AuthDeviceFactorSource>>,
     active_refresh: std::sync::Mutex<Option<String>>,
+    active_enrollment: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(unix)]
@@ -339,6 +346,7 @@ impl RetainedAuthRequestCustody {
             key_source: None,
             device_source: None,
             active_refresh: std::sync::Mutex::new(None),
+            active_enrollment: std::sync::Mutex::new(None),
         })
     }
 }
