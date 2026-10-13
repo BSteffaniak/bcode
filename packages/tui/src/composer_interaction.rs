@@ -18,8 +18,8 @@ use bmux_tui_components::selectable_list::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposerScope {
     pub session: Option<bcode_session_models::SessionId>,
-    pub agent_id: String,
-    pub workspace: PathBuf,
+    pub agent_id: Option<String>,
+    pub workspace: Option<PathBuf>,
     pub registry_identity: u64,
     pub registry_revision: u64,
 }
@@ -42,6 +42,7 @@ enum SearchStatus {
 }
 
 pub struct ComposerInteraction {
+    focused_field: Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot>,
     scope: Option<ComposerScope>,
     document: Option<ComposerDocument>,
     selection: Option<ComposerTextRange>,
@@ -53,6 +54,7 @@ pub struct ComposerInteraction {
     client: Option<bcode_client::BcodeClient>,
     dismissed: bool,
     status: SearchStatus,
+    pub completion_control: bmux_tui_components::completion::CompletionState,
     pub list: SelectableListState,
     pub items: Vec<SelectableListItem>,
     /// Geometry from the latest paint, never a separately guessed hit rectangle.
@@ -63,6 +65,7 @@ pub struct ComposerInteraction {
 impl Default for ComposerInteraction {
     fn default() -> Self {
         Self {
+            focused_field: None,
             scope: None,
             document: None,
             selection: None,
@@ -74,6 +77,7 @@ impl Default for ComposerInteraction {
             client: None,
             dismissed: false,
             status: SearchStatus::default(),
+            completion_control: bmux_tui_components::completion::CompletionState::new(),
             list: SelectableListState::new(None),
             items: Vec::new(),
             painted_list: None,
@@ -96,7 +100,8 @@ impl ComposerInteraction {
             start: range.start,
             end: range.end,
         });
-        let new_scope = self.scope.as_ref() != Some(&scope);
+        let new_scope = self.scope.as_ref() != Some(&scope) || self.focused_field.is_some();
+        self.focused_field = None;
         let changed = new_scope
             || self.selection != selection
             || self.document.as_ref().is_none_or(|document| {
@@ -141,6 +146,89 @@ impl ComposerInteraction {
             .filter(|document| document.validate().is_ok())
     }
 
+    /// Observe the opted-in active owner's field, retaining its exact stale-edit fences.
+    pub fn observe_focused_field(
+        &mut self,
+        scope: ComposerScope,
+        field: bcode_plugin_sdk::tui::FocusedTextFieldSnapshot,
+    ) -> bool {
+        if !field.eligible
+            || field.document.validate().is_err()
+            || field.content_rect.is_empty()
+            || field.anchor.is_empty()
+        {
+            self.cancel();
+            self.focused_field = None;
+            self.document = None;
+            self.dismissed = true;
+            return true;
+        }
+        let changed = self.scope.as_ref() != Some(&scope)
+            || self.focused_field.as_ref().is_none_or(|previous| {
+                previous.identity != field.identity
+                    || previous.generation != field.generation
+                    || previous.document != field.document
+                    || previous.eligible != field.eligible
+            });
+        if changed {
+            let same_owner = self.scope.as_ref() == Some(&scope)
+                && self
+                    .focused_field
+                    .as_ref()
+                    .is_some_and(|previous| previous.identity == field.identity);
+            let finished = same_owner
+                && self.dismissed
+                && self.document.as_ref().is_some_and(|document| {
+                    document.text == field.document.text
+                        && document.cursor == field.document.cursor
+                        && document.selection == field.document.selection
+                });
+            let reactivation = same_owner.then(|| self.reactivate_route.take()).flatten();
+            self.cancel();
+            self.reactivate_route = reactivation;
+            self.document = Some(field.document.clone());
+            self.selection = field.document.selection;
+            self.scope = Some(scope);
+            self.dismissed = finished;
+        }
+        self.focused_field = Some(field);
+        changed
+    }
+
+    pub const fn focused_field(&self) -> Option<&bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        self.focused_field.as_ref()
+    }
+
+    pub fn focused_edit(&self) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldEdit> {
+        Some(bcode_plugin_sdk::tui::FocusedTextFieldEdit {
+            expected: self.focused_field.clone()?,
+            edit: self.selected_edit()?,
+        })
+    }
+
+    /// Settle an owner-applied edit; semantic synchronization belongs to the owner.
+    pub fn finish_focused_edit(&mut self, result: ComposerDocument) {
+        let continuation = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .candidates
+                    .get(self.list.focused().or_else(|| self.list.selected())?)
+            })
+            .map_or(ComposerContinuation::Finish, |candidate| {
+                candidate.continuation
+            });
+        let route = self.route.clone();
+        self.cancel();
+        if continuation == ComposerContinuation::Finish {
+            self.document = Some(result);
+            self.dismissed = true;
+        } else {
+            self.reactivate_route = route;
+        }
+    }
+
     pub fn start(
         &mut self,
         route: PluginOwnedComposerContribution,
@@ -161,6 +249,7 @@ impl ComposerInteraction {
         self.route = Some(route);
         self.request = Some(request.clone());
         self.status = SearchStatus::Loading;
+        self.completion_control.activate();
         Some(request)
     }
 
@@ -193,6 +282,7 @@ impl ComposerInteraction {
         self.snapshot = None;
         self.status = SearchStatus::Idle;
         self.items.clear();
+        self.completion_control.dismiss();
         self.painted_list = None;
         self.painted_layout = None;
         self.list = SelectableListState::new(None);
@@ -241,13 +331,9 @@ impl ComposerInteraction {
                 SelectableListItem::new(&candidate.id, label)
             })
             .collect();
-        // Candidate focus is not a committed value: BMUX emits Selected only when
-        // selection changes. Keep selection empty so clicking the initially focused
-        // first candidate produces an acceptance outcome, including after redraw.
-        self.list = SelectableListState::new(None);
-        if !self.items.is_empty() {
-            self.list.set_focused(Some(0));
-        }
+        // BMUX reconciles candidate identity, focus and pointer state.
+        self.completion_control.reconcile(&self.items);
+        self.list = self.completion_control.list_state().get();
         self.snapshot = Some(snapshot);
         true
     }
@@ -266,6 +352,45 @@ impl ComposerInteraction {
             SearchStatus::Error => " Suggestions unavailable ",
             SearchStatus::Incomplete => " Suggestions · more results omitted ",
         }
+    }
+
+    /// BMUX owns nested interaction arbitration, including loading/error/no-op consumption.
+    pub fn command(
+        &mut self,
+        command: bmux_tui_components::completion::CompletionCommand,
+    ) -> (bmux_tui::event::EventOutcome, bool) {
+        use bmux_tui_components::completion::{CompletionInteraction, CompletionStatus};
+        let status = match self.status {
+            SearchStatus::Ready | SearchStatus::Incomplete => CompletionStatus::Candidates,
+            SearchStatus::Loading => CompletionStatus::Loading,
+            SearchStatus::Empty | SearchStatus::Idle => CompletionStatus::Empty,
+            SearchStatus::Error => CompletionStatus::Error,
+        };
+        let mut accept = false;
+        let outcome = CompletionInteraction::new(&self.items, status).handle_command(
+            command,
+            &mut self.completion_control,
+            |_| {
+                accept = true;
+                false
+            },
+        );
+        self.completion_control.reconcile(&self.items);
+        if matches!(
+            command,
+            bmux_tui_components::completion::CompletionCommand::Next
+                | bmux_tui_components::completion::CompletionCommand::Previous
+        ) && let Some(layout) = &self.painted_layout
+        {
+            bmux_tui_components::selectable_list::SelectableListComponent::new(
+                layout.id.clone(),
+                &self.items,
+                self.completion_control.list_state(),
+            )
+            .reveal_focus(layout);
+        }
+        self.list = self.completion_control.list_state().get();
+        (outcome, accept)
     }
 
     pub fn selected_edit(&self) -> Option<ComposerEdit> {
@@ -345,24 +470,44 @@ impl ComposerInteraction {
     }
 
     pub fn list_event(&mut self, event: &Event) -> SelectableListOutcome {
+        use bmux_tui_components::completion::{CompletionInteraction, CompletionStatus};
         let Some(area) = self.painted_list.filter(|area| !area.is_empty()) else {
             return SelectableListOutcome::Ignored;
         };
         let Some(layout) = &self.painted_layout else {
             return SelectableListOutcome::Ignored;
         };
-        let list_state = std::cell::Cell::new(self.list);
-        let component = bmux_tui_components::selectable_list::SelectableListComponent::new(
-            "composer.list",
-            &self.items,
-            &list_state,
-        );
+        let status = match self.status {
+            SearchStatus::Ready | SearchStatus::Incomplete => CompletionStatus::Candidates,
+            SearchStatus::Loading => CompletionStatus::Loading,
+            SearchStatus::Error => CompletionStatus::Error,
+            SearchStatus::Empty | SearchStatus::Idle => CompletionStatus::Empty,
+        };
+        let mut accepted = None;
         let mut cx = bmux_tui::component::EventCx::with_clip(layout, area);
         let outcome = cx.with_transform(0, 0, i32::from(area.x), i64::from(area.y), area, |cx| {
-            component.handle_event(event, layout, cx)
+            CompletionInteraction::new(&self.items, status).handle_pointer(
+                event,
+                layout,
+                cx,
+                &mut self.completion_control,
+                |id| {
+                    accepted = self.items.iter().position(|item| item.id == id);
+                    false
+                },
+            )
         });
-        self.list = list_state.get();
-        outcome
+        self.list = self.completion_control.list_state().get();
+        accepted.map_or_else(
+            || {
+                if outcome == bmux_tui::event::EventOutcome::Ignored {
+                    SelectableListOutcome::Ignored
+                } else {
+                    SelectableListOutcome::Redraw
+                }
+            },
+            SelectableListOutcome::Selected,
+        )
     }
 }
 
@@ -376,8 +521,8 @@ pub mod tests {
     fn scope() -> ComposerScope {
         ComposerScope {
             session: None,
-            agent_id: "build".into(),
-            workspace: PathBuf::from("/workspace"),
+            agent_id: Some("build".into()),
+            workspace: Some(PathBuf::from("/workspace")),
             registry_identity: 1,
             registry_revision: 0,
         }
@@ -404,6 +549,10 @@ pub mod tests {
         buffer: &TextEditBuffer,
     ) -> ComposerSearchRequest {
         state.observe(scope(), buffer);
+        begin_observed(state)
+    }
+
+    pub fn begin_observed(state: &mut ComposerInteraction) -> ComposerSearchRequest {
         state.dismissed = false; // Fixture explicitly starts a new admitted search.
         let mut registry = bcode_plugin_sdk::composer::PluginComposerRegistry::default();
         registry.register(Box::new(Topics)).unwrap();
@@ -451,6 +600,64 @@ pub mod tests {
                 }],
                 incomplete: false,
             }),
+        }
+    }
+
+    #[test]
+    fn focused_owner_generation_fences_identical_text_and_geometry_does_not_restart() {
+        use bcode_plugin_sdk::tui::{FocusedTextFieldIdentity, FocusedTextFieldSnapshot};
+        let mut state = ComposerInteraction::default();
+        let field = FocusedTextFieldSnapshot {
+            identity: FocusedTextFieldIdentity {
+                owner_id: "owner".into(),
+                field_id: "answer".into(),
+                lifetime: 1,
+            },
+            generation: 1,
+            document: ComposerDocument {
+                document_id: "answer".into(),
+                revision: 0,
+                text: "@topic".into(),
+                cursor: 6,
+                selection: None,
+            },
+            eligible: true,
+            content_rect: Rect::new(1, 1, 20, 1),
+            anchor: Rect::new(7, 1, 1, 1),
+        };
+        assert!(state.observe_focused_field(scope(), field.clone()));
+        let request = begin_observed(&mut state);
+        let mut moved = field;
+        moved.anchor.x += 1;
+        assert!(!state.observe_focused_field(scope(), moved.clone()));
+        assert!(state.complete(completion(&request)));
+        moved.generation += 1;
+        assert!(state.observe_focused_field(scope(), moved.clone()));
+        assert!(!state.complete(completion(&request)));
+        let request = begin_observed(&mut state);
+        moved.identity.field_id = "other".into();
+        assert!(state.observe_focused_field(scope(), moved.clone()));
+        assert!(!state.complete(completion(&request)));
+        moved.eligible = false;
+        assert!(state.observe_focused_field(scope(), moved));
+        assert!(!state.visible());
+        assert!(state.document().is_none());
+    }
+
+    #[test]
+    fn loading_commands_consume_without_presentation_or_candidate_effect() {
+        use bmux_tui_components::completion::CompletionCommand;
+        let mut state = ComposerInteraction::default();
+        let buffer = TextEditBuffer::from_text("@topic");
+        begin(&mut state, &buffer);
+        for command in [
+            CompletionCommand::Accept,
+            CompletionCommand::Next,
+            CompletionCommand::Previous,
+        ] {
+            let (outcome, accept) = state.command(command);
+            assert_eq!(outcome, bmux_tui::event::EventOutcome::Handled);
+            assert!(!accept);
         }
     }
 
@@ -616,12 +823,12 @@ pub mod tests {
         assert!(!state.complete(completion(&request)));
         let request = begin(&mut state, &buffer);
         let mut changed = scope();
-        changed.workspace = PathBuf::from("/other");
+        changed.workspace = Some(PathBuf::from("/other"));
         state.observe(changed, &buffer);
         assert!(!state.complete(completion(&request)));
         let request = begin(&mut state, &buffer);
         let mut changed = scope();
-        changed.agent_id = "review".into();
+        changed.agent_id = Some("review".into());
         state.observe(changed, &buffer);
         assert!(!state.complete(completion(&request)));
         let request = begin(&mut state, &buffer);

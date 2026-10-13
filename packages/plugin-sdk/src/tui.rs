@@ -1,6 +1,9 @@
 //! Native Tokio-backed TUI surface host APIs for plugins.
 
+pub mod focused_input;
 pub mod keymap;
+
+pub use focused_input::{FocusedTextFieldEdit, FocusedTextFieldIdentity, FocusedTextFieldSnapshot};
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -16,7 +19,7 @@ use bcode_session_models::{ProjectionWindowRequest, SessionId};
 use bcode_session_view_models::{ReasoningPresentationPolicy, SessionViewSnapshot};
 use bmux_keyboard::KeyStroke;
 use bmux_text_edit::{TextEditCommand, TextMotion};
-use bmux_tui::event::Event;
+use bmux_tui::event::{Event, EventOutcome};
 #[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
@@ -1912,6 +1915,37 @@ pub struct PluginTuiWorkShape {
     pub wrapped_rows_visited: u64,
 }
 
+/// Explicit terminal consumption, independent of the plugin's resulting effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginTuiEventResult {
+    /// Whether routing stops, and whether terminal presentation needs redraw.
+    pub outcome: EventOutcome,
+    /// Plugin-owned effect; `None` does not imply that input was ignored.
+    pub action: PluginTuiAction,
+}
+
+impl PluginTuiEventResult {
+    /// Adapt a legacy effect-only result. A legacy `None` remains ignored.
+    #[must_use]
+    pub const fn from_legacy(action: PluginTuiAction) -> Self {
+        let outcome = match &action {
+            PluginTuiAction::None => EventOutcome::Ignored,
+            PluginTuiAction::Redraw => EventOutcome::Redraw,
+            _ => EventOutcome::Handled,
+        };
+        Self { outcome, action }
+    }
+
+    /// Consume input without a plugin effect, including rejected/no-op completion edits.
+    #[must_use]
+    pub const fn consumed() -> Self {
+        Self {
+            outcome: EventOutcome::Handled,
+            action: PluginTuiAction::None,
+        }
+    }
+}
+
 /// Native Rust plugin surface rendered directly with `bmux_tui`.
 pub trait PluginTuiSurface: Send {
     /// Stable surface identifier.
@@ -1993,6 +2027,34 @@ pub trait PluginTuiSurface: Send {
 
     /// Handle routed terminal input.
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction;
+
+    /// Handle input with explicit consumption. Legacy `None` remains ignored;
+    /// surfaces handling no-op input should override this hook.
+    fn handle_event_result(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        PluginTuiEventResult::from_legacy(self.handle_event(event, host))
+    }
+
+    /// Opt in to completion for one currently focused, visible, non-secret field.
+    /// The bounded snapshot is immutable; absence disables the capability.
+    #[must_use]
+    fn focused_text_field(&self) -> Option<FocusedTextFieldSnapshot> {
+        None
+    }
+
+    /// Synchronously apply a completion to the live owner-managed editor.
+    /// Owners validate current focus/state and preserve editor history. Rejections
+    /// and no-ops are consumed, never submission. The default is disabled.
+    fn apply_focused_text_field_edit(
+        &mut self,
+        _edit: &FocusedTextFieldEdit,
+        _host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        PluginTuiEventResult::consumed()
+    }
 
     /// Attach a renderer-neutral update stream to this retained surface.
     ///
@@ -2148,6 +2210,26 @@ where
         PluginTuiWorkShape::default()
     }
 
+    /// Opt in to exposing a bounded live focused-field snapshot. Never expose secrets.
+    /// Geometry must come from the latest measured visible presentation.
+    #[must_use]
+    fn focused_text_field(&self, _snapshot: &C::Snapshot) -> Option<FocusedTextFieldSnapshot> {
+        None
+    }
+
+    /// Validate against the live editor and apply one history-preserving completion.
+    /// Return the existing semantic `Change` input only for an actual change;
+    /// rejected/no-op requests return `Consumed`, never submit. Do not retain a
+    /// mutable editor reference. The default disables completion application.
+    fn apply_focused_text_field_edit(
+        &mut self,
+        _edit: &FocusedTextFieldEdit,
+        _snapshot: &C::Snapshot,
+        _host: &dyn PluginTuiHost,
+    ) -> TerminalInteractionInput {
+        TerminalInteractionInput::Consumed
+    }
+
     /// Translate terminal input and report whether it was consumed.
     fn input(
         &mut self,
@@ -2197,13 +2279,36 @@ where
 
     fn apply_input(&mut self, input: InteractionInput) -> PluginTuiAction {
         let output = self.controller.handle_input(input);
-        if !matches!(output, InteractionOutput::None) {
-            self.snapshot = self.controller.snapshot();
-            self.work_shape.snapshot_materializations =
-                self.work_shape.snapshot_materializations.saturating_add(1);
-            self.invalidate_measurement();
-        }
+        self.snapshot = self.controller.snapshot();
+        self.work_shape.snapshot_materializations =
+            self.work_shape.snapshot_materializations.saturating_add(1);
+        self.invalidate_measurement();
         plugin_tui_action_from_interaction_output(output)
+    }
+
+    fn apply_terminal_input(&mut self, input: TerminalInteractionInput) -> PluginTuiEventResult {
+        match input {
+            TerminalInteractionInput::Ignored => PluginTuiEventResult {
+                outcome: EventOutcome::Ignored,
+                action: PluginTuiAction::None,
+            },
+            TerminalInteractionInput::Consumed => {
+                self.invalidate_measurement();
+                PluginTuiEventResult {
+                    outcome: EventOutcome::Redraw,
+                    action: PluginTuiAction::Redraw,
+                }
+            }
+            TerminalInteractionInput::Semantic(input) => {
+                let action = self.apply_input(input);
+                let outcome = if matches!(action, PluginTuiAction::Redraw) {
+                    EventOutcome::Redraw
+                } else {
+                    EventOutcome::Handled
+                };
+                PluginTuiEventResult { outcome, action }
+            }
+        }
     }
 }
 
@@ -2320,14 +2425,44 @@ where
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        match self.renderer.input(event, &self.snapshot, host) {
-            TerminalInteractionInput::Ignored => PluginTuiAction::None,
-            TerminalInteractionInput::Consumed => {
-                self.invalidate_measurement();
-                PluginTuiAction::Redraw
-            }
-            TerminalInteractionInput::Semantic(input) => self.apply_input(input),
+        self.handle_event_result(event, host).action
+    }
+
+    fn handle_event_result(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        let input = self.renderer.input(event, &self.snapshot, host);
+        self.apply_terminal_input(input)
+    }
+
+    fn focused_text_field(&self) -> Option<FocusedTextFieldSnapshot> {
+        let field = self.renderer.focused_text_field(&self.snapshot)?;
+        field.document.validate().ok()?;
+        Some(field)
+    }
+
+    fn apply_focused_text_field_edit(
+        &mut self,
+        edit: &FocusedTextFieldEdit,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiEventResult {
+        let Some(current) = self.focused_text_field() else {
+            return PluginTuiEventResult::consumed();
+        };
+        if !matches!(edit.validate(&current), Ok(Some(_))) {
+            return PluginTuiEventResult::consumed();
         }
+        let input = self
+            .renderer
+            .apply_focused_text_field_edit(edit, &self.snapshot, host);
+        // Completion acceptance never falls through to host submission, even when
+        // the owner rejects after a fresh live-editor check.
+        if matches!(input, TerminalInteractionInput::Ignored) {
+            return PluginTuiEventResult::consumed();
+        }
+        self.apply_terminal_input(input)
     }
 }
 
@@ -2527,6 +2662,120 @@ mod typed_interaction_surface_tests {
         ) -> TerminalInteractionInput {
             TerminalInteractionInput::Ignored
         }
+    }
+
+    #[test]
+    fn legacy_none_remains_ignored_but_explicit_no_effect_is_consumed() {
+        assert_eq!(
+            PluginTuiEventResult::from_legacy(PluginTuiAction::None).outcome,
+            EventOutcome::Ignored
+        );
+        assert_eq!(
+            PluginTuiEventResult::consumed().outcome,
+            EventOutcome::Handled
+        );
+    }
+
+    struct NoEffectController(usize);
+
+    impl PluginInteraction for NoEffectController {
+        const KIND: &'static str = "test.no-effect";
+        type Request = ();
+        type Snapshot = usize;
+
+        fn new((): Self::Request) -> Self {
+            Self(0)
+        }
+
+        fn snapshot(&self) -> Self::Snapshot {
+            self.0
+        }
+
+        fn handle_input(&mut self, _input: InteractionInput) -> InteractionOutput {
+            self.0 += 1;
+            InteractionOutput::None
+        }
+    }
+
+    #[derive(Default)]
+    struct NoEffectRenderer;
+
+    impl TerminalInteractionRenderer<NoEffectController> for NoEffectRenderer {
+        const SURFACE_KIND: &'static str = "test.no-effect.surface";
+
+        fn id(&self) -> &'static str {
+            "no-effect"
+        }
+
+        fn title(&self) -> &'static str {
+            "No effect"
+        }
+
+        fn preferred_height(&mut self, _snapshot: &usize, _width: u16) -> u16 {
+            1
+        }
+
+        fn render(&mut self, _snapshot: &usize, _area: Rect, _frame: &mut PaintCx<'_, '_>) {}
+
+        fn input(
+            &mut self,
+            _event: &Event,
+            _snapshot: &usize,
+            _host: &dyn PluginTuiHost,
+        ) -> TerminalInteractionInput {
+            TerminalInteractionInput::Ignored
+        }
+    }
+
+    #[test]
+    fn semantic_no_effect_stays_consumed_and_synchronizes_snapshot() {
+        let mut surface =
+            TypedTerminalInteractionSurface::new(NoEffectController::new(()), NoEffectRenderer);
+        let result = surface.apply_terminal_input(TerminalInteractionInput::Semantic(
+            InteractionInput::Navigate {
+                direction: bcode_tool::InteractionNavigation::Next,
+            },
+        ));
+        assert_eq!(result.outcome, EventOutcome::Handled);
+        assert_eq!(result.action, PluginTuiAction::None);
+        assert_eq!(surface.snapshot, 1);
+        assert_eq!(surface.work_shape().snapshot_materializations, 2);
+        assert!(surface.focused_text_field().is_none());
+
+        // Disabled fields consume acceptance without changing or submitting state,
+        // including malformed/stale edits.
+        let edit = FocusedTextFieldEdit {
+            expected: FocusedTextFieldSnapshot {
+                identity: FocusedTextFieldIdentity {
+                    owner_id: "disabled-owner".into(),
+                    field_id: "disabled-field".into(),
+                    lifetime: 0,
+                },
+                generation: 0,
+                document: bcode_plugin_models::composer::ComposerDocument {
+                    document_id: "disabled-document".into(),
+                    revision: 0,
+                    text: String::new(),
+                    cursor: 0,
+                    selection: None,
+                },
+                eligible: false,
+                content_rect: Rect::new(0, 0, 0, 0),
+                anchor: Rect::new(0, 0, 0, 0),
+            },
+            edit: bcode_plugin_models::composer::ComposerEdit {
+                document_id: "wrong-document".into(),
+                revision: 1,
+                range: bcode_plugin_models::composer::ComposerTextRange { start: 0, end: 1 },
+                expected_text: String::new(),
+                replacement: "not submitted".into(),
+                cursor: 13,
+            },
+        };
+        let result = surface.apply_focused_text_field_edit(&edit, &TestHost);
+        assert_eq!(result, PluginTuiEventResult::consumed());
+        assert_eq!(surface.snapshot, 1);
+        assert_eq!(surface.work_shape().snapshot_materializations, 2);
     }
 
     #[test]

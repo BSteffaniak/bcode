@@ -1227,15 +1227,59 @@ impl ChatLoopState {
             .and_then(|surface| surface.surface.as_ref().map(|surface| surface.id()))
     }
 
+    /// Materialize only the active, unsuspended standalone owner's opt-in field.
+    pub fn root_focused_text_field(
+        &self,
+    ) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        if self.root_plugin_surface_is_suspended() {
+            return None;
+        }
+        self.plugin_surface
+            .as_ref()?
+            .surface
+            .as_ref()?
+            .focused_text_field()
+            .filter(|field| {
+                field.eligible && !field.content_rect.is_empty() && !field.anchor.is_empty()
+            })
+    }
+
+    /// Apply a fenced edit through the standalone plugin's semantic owner.
+    pub fn apply_root_focused_text_field_edit(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+        client: &BcodeClient,
+        launch: super::plugin_surface_host::FreshSessionSettings,
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiEventResult> {
+        if self.root_plugin_surface_is_suspended() {
+            return None;
+        }
+        let surface = self.plugin_surface.as_mut()?;
+        let active = surface.surface.as_mut()?;
+        let host = super::plugin_surface_host::root_host(
+            surface.invalidation.clone(),
+            client.clone(),
+            launch,
+            std::sync::Arc::clone(&surface.active_tasks),
+        );
+        let result = active.apply_focused_text_field_edit(edit, &host);
+        surface.effects_pending = true;
+        surface.invalidation.request();
+        Some(result)
+    }
+
     pub fn handle_root_plugin_surface_event(
         &mut self,
         event: &Event,
         client: &BcodeClient,
         launch: super::plugin_surface_host::FreshSessionSettings,
-    ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiEventResult> {
         let surface = self.plugin_surface.as_mut()?;
         if surface.pending_session_navigation.is_some() {
-            return Some(bcode_plugin_sdk::tui::PluginTuiAction::None);
+            return Some(bcode_plugin_sdk::tui::PluginTuiEventResult {
+                outcome: bmux_tui::event::EventOutcome::Handled,
+                action: bcode_plugin_sdk::tui::PluginTuiAction::None,
+            });
         }
         let host = super::plugin_surface_host::root_host(
             surface.invalidation.clone(),
@@ -1262,11 +1306,13 @@ impl ChatLoopState {
                     surface.invalidation.request();
                 }
             }
-            return Some(bcode_plugin_sdk::tui::PluginTuiAction::Redraw);
+            return Some(bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw,
+            ));
         };
         surface.effects_pending = true;
         surface.invalidation.request();
-        Some(active.handle_event(event, &host))
+        Some(active.handle_event_result(event, &host))
     }
 
     pub fn root_plugin_surface_invalidation(&self) -> Option<bmux_tui_runtime::InvalidationSignal> {
@@ -2020,6 +2066,44 @@ impl ChatLoopState {
         &self,
     ) -> Option<InteractiveSurfaceGeometry> {
         self.interactive_surface_geometry
+    }
+
+    /// Project only a currently visible owner field through the retained interaction geometry.
+    pub fn interactive_focused_text_field(
+        &self,
+    ) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        let geometry = self.interactive_surface_geometry?;
+        if geometry.destination.is_empty() {
+            return None;
+        }
+        let mut field = self.interactive_surface.as_ref()?.focused_text_field()?;
+        // Owners report retained visible geometry in host coordinates, including sliced
+        // presentation. Clip to the actual destination; reprojecting would translate twice.
+        let content = field.content_rect.intersection(geometry.destination);
+        let anchor = field.anchor.intersection(content);
+        if content.is_empty() || anchor.is_empty() || !field.eligible {
+            return None;
+        }
+        field.content_rect = content;
+        field.anchor = anchor;
+        Some(field)
+    }
+
+    pub fn apply_interactive_focused_text_field_edit(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+    ) -> InteractiveSurfaceEventOutcome {
+        if self
+            .interactive_focused_text_field()
+            .is_none_or(|current| edit.validate(&current).is_err())
+        {
+            return InteractiveSurfaceEventOutcome::Consumed;
+        }
+        self.interactive_surface
+            .as_mut()
+            .map_or(InteractiveSurfaceEventOutcome::Consumed, |surface| {
+                surface.apply_focused_text_field_edit(edit)
+            })
     }
 
     pub(super) fn routes_non_mouse_event_to_interactive_surface(
@@ -5888,6 +5972,26 @@ fn paint_plugin_foreground(
     }
 }
 
+fn paint_owner_completion_overlay(
+    chat: &ActiveChat,
+    state: &mut ChatLoopState,
+    foreground: Option<super::foreground::Foreground>,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    theme: render::TuiTheme,
+) {
+    if foreground.is_none() || foreground == Some(super::foreground::Foreground::Plugin) {
+        super::composer_interaction_render::paint(
+            &mut state.composer_interaction,
+            chat.app.composer_panel_area(),
+            frame,
+            theme,
+        );
+    } else {
+        state.composer_interaction.painted_list = None;
+        state.composer_interaction.painted_layout = None;
+    }
+}
+
 /// Compose every foreground surface in the same order for full and temporal frames.
 /// Preparation may be skipped; composition must never be skipped.
 fn paint_foreground(
@@ -5903,17 +6007,7 @@ fn paint_foreground(
         frame.set_focus_scope(Some(bmux_tui::hit::HitId::new("bcode.foreground")));
     }
     let theme = render::TuiTheme::for_app(&chat.app);
-    if foreground.is_none() {
-        super::composer_interaction_render::paint(
-            &mut loop_state.composer_interaction,
-            chat.app.composer_panel_area(),
-            frame,
-            theme,
-        );
-    } else {
-        loop_state.composer_interaction.painted_list = None;
-        loop_state.composer_interaction.painted_layout = None;
-    }
+    paint_owner_completion_overlay(chat, loop_state, foreground, frame, theme);
     if let Some(slash_palette) = &loop_state.slash_palette
         && foreground == Some(super::foreground::Foreground::Slash)
     {
@@ -5962,6 +6056,14 @@ fn paint_foreground(
         super::session_picker_render::render_picker_with_keymap(picker, frame, theme, &effective);
     }
     paint_plugin_foreground(chat, loop_state, foreground, frame);
+    if foreground == Some(super::foreground::Foreground::Plugin) {
+        super::composer_interaction_render::paint(
+            &mut loop_state.composer_interaction,
+            chat.app.composer_panel_area(),
+            frame,
+            theme,
+        );
+    }
     if let Some(picker) = &mut loop_state.provider_picker
         && foreground == Some(super::foreground::Foreground::Model)
     {

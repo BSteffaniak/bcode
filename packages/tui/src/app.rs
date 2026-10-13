@@ -2329,6 +2329,11 @@ impl BmuxApp {
             .unwrap_or("build")
     }
 
+    /// Return the hydrated owning agent without a permissive presentation default.
+    pub fn owning_agent_id(&self) -> Option<&str> {
+        self.session_view.snapshot().runtime.agent_id.as_deref()
+    }
+
     /// Return the pending agent id for the next submission, if one is staged.
     #[must_use]
     pub fn pending_agent_id(&self) -> Option<&str> {

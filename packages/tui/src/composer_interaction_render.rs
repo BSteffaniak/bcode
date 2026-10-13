@@ -1,7 +1,5 @@
 //! BMUX-owned measured picker chrome, clipping and item interaction for composer contributors.
 
-use std::cell::Cell;
-
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -26,17 +24,20 @@ pub fn paint(
     }
     // Responsive presentation policy only; all chrome, list geometry and clipping are measured.
     let bounds = cx.clip();
-    let available = Rect::new(
-        bounds.x,
-        bounds.y,
-        bounds.width,
-        composer.y.saturating_sub(bounds.y).min(bounds.height),
+    let available = bounds;
+    let field = state.focused_field().map_or(composer, |field| field.anchor);
+    let field = Rect::new(
+        field.x.saturating_sub(bounds.x),
+        field.y.saturating_sub(bounds.y),
+        field.width,
+        field.height,
     );
     if available.is_empty() {
         return;
     }
-    let list_state = Cell::new(state.list);
-    let list = SelectableListComponent::new("composer.list", &state.items, &list_state).styles(
+    state.completion_control.reconcile(&state.items);
+    let list_state = state.completion_control.list_state();
+    let list = SelectableListComponent::new("composer.list", &state.items, list_state).styles(
         SelectableListStyles {
             background: theme.raised,
             normal: theme.raised,
@@ -57,12 +58,10 @@ pub fn paint(
             padding: Insets::new(0, 1, 0, 1),
             min_size: Size::new(0, 0),
             max_size: Size::new(available.width.min(88), available.height.min(8)),
-            placement: bmux_tui_components::picker_frame::PickerFramePlacement::Anchored(
-                bmux_tui::geometry::Point::new(
-                    composer.x.saturating_sub(available.x),
-                    available.height,
-                ),
-            ),
+            placement: bmux_tui_components::picker_frame::PickerFramePlacement::FieldAnchored {
+                field,
+                prefer_below: false,
+            },
         })
         .styles(PickerFrameStyles {
             border: theme.raised.patch(theme.focused),
@@ -92,13 +91,17 @@ pub fn paint(
             u16::try_from(panel.y.saturating_add(slot.y)),
         )
     {
-        state.painted_layout = Some(slot.node.clone());
-        state.painted_list = Some(Rect::new(
+        let list_area = Rect::new(
             available.x.saturating_add(x),
             available.y.saturating_add(y),
             u16::try_from(slot.node.size.width).unwrap_or(u16::MAX),
             u16::try_from(slot.node.size.height).unwrap_or(u16::MAX),
-        ));
+        )
+        .intersection(available);
+        if !list_area.is_empty() {
+            state.painted_layout = Some(slot.node.clone());
+            state.painted_list = Some(list_area);
+        }
     }
     state.list = list_state.get();
 }
@@ -171,12 +174,10 @@ mod tests {
             &mut PaintCx::new(&mut frame),
             TuiTheme::for_theme_id("terminal-native"),
         );
-        assert_eq!(
-            state.list_event(&Event::Key(
-                bmux_keyboard::parse_key_stroke("down").unwrap()
-            )),
-            SelectableListOutcome::Focused(1)
-        );
+        let (outcome, accept) =
+            state.command(bmux_tui_components::completion::CompletionCommand::Next);
+        assert_eq!(outcome, bmux_tui::event::EventOutcome::Redraw);
+        assert!(!accept);
         assert_eq!(state.list.focused(), Some(1));
         assert_eq!(
             state.list_event(&Event::Key(bmux_keyboard::parse_key_stroke("x").unwrap())),

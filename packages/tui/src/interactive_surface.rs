@@ -476,14 +476,47 @@ impl InteractiveSurfaceState {
         self.surface.work_shape()
     }
 
+    /// Return only the opted-in field from an unresolved owner.
+    pub fn focused_text_field(&self) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        if self.pending_resolution.is_some() {
+            return None;
+        }
+        self.surface.focused_text_field()
+    }
+
+    /// Apply through the actual owner so plugin semantics and editor history stay synchronized.
+    pub fn apply_focused_text_field_edit(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+    ) -> InteractiveSurfaceEventOutcome {
+        if self.pending_resolution.is_some() {
+            return InteractiveSurfaceEventOutcome::Consumed;
+        }
+        let result = self.surface.apply_focused_text_field_edit(edit, &self.host);
+        self.reconcile_event_result(result)
+    }
+
     pub fn handle_event_outcome(&mut self, event: &Event) -> InteractiveSurfaceEventOutcome {
         if let Some(resolution) = &self.pending_resolution {
             return InteractiveSurfaceEventOutcome::Resolved(resolution.clone());
         }
+        let result = self.surface.handle_event_result(event, &self.host);
+        self.reconcile_event_result(result)
+    }
+
+    fn reconcile_event_result(
+        &mut self,
+        result: bcode_plugin_sdk::tui::PluginTuiEventResult,
+    ) -> InteractiveSurfaceEventOutcome {
         let before_height = self.last_preferred_height;
-        let action = self.surface.handle_event(event, &self.host);
-        let outcome = match action {
-            PluginTuiAction::None => InteractiveSurfaceEventOutcome::Ignored,
+        let outcome = match result.action {
+            PluginTuiAction::None => {
+                if result.outcome == bmux_tui::event::EventOutcome::Ignored {
+                    InteractiveSurfaceEventOutcome::Ignored
+                } else {
+                    InteractiveSurfaceEventOutcome::Consumed
+                }
+            }
             PluginTuiAction::Redraw => {
                 let after_height = self.preferred_height_for_event();
                 self.last_preferred_height = after_height;
@@ -675,6 +708,48 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (text, cursor)
+    }
+
+    struct ConsumedSurface;
+
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for ConsumedSurface {
+        fn id(&self) -> &'static str {
+            "consumed"
+        }
+        fn title(&self) -> &'static str {
+            "Consumed"
+        }
+        fn render(&mut self, _area: Rect, _frame: &mut PaintCx<'_, '_>) {}
+        fn handle_event(
+            &mut self,
+            _event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> PluginTuiAction {
+            PluginTuiAction::None
+        }
+        fn handle_event_result(
+            &mut self,
+            _event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+            bcode_plugin_sdk::tui::PluginTuiEventResult {
+                outcome: bmux_tui::event::EventOutcome::Handled,
+                action: PluginTuiAction::None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_consumption_without_effect_survives_host_routing() {
+        let mut surface = InteractiveSurfaceState::from_surface_for_test(
+            "consumed",
+            Box::new(ConsumedSurface),
+            &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        );
+        assert_eq!(
+            surface.handle_event_outcome(&Event::Tick),
+            InteractiveSurfaceEventOutcome::Consumed
+        );
     }
 
     #[derive(Default)]

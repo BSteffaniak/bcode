@@ -1452,28 +1452,37 @@ pub fn load_default_host_with_static_bundled(
     static_plugins: &[StaticBundledPlugin],
     extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
 ) -> Result<PluginHost, PluginLoadError> {
-    if let Ok(host) = PluginHost::load_defaults_with_static_bundled(selection, static_plugins) {
-        Ok(host)
-    } else {
-        let selected = bcode_plugin::filter_selected_static_plugins(static_plugins, selection)?;
-        let visual_plugins = selected
-            .into_iter()
-            .filter(|(manifest, _)| {
-                extensions
-                    .iter()
-                    .find(|extension| extension.plugin_id() == manifest.id)
-                    .is_some_and(|extension| {
-                        let registry = extension.registry();
-                        manifest.visual_adapters.iter().any(|adapter| {
-                            (adapter.surfaces.is_empty()
-                                || adapter.surfaces.iter().any(|surface| surface == "tui"))
-                                && registry.supports_visual_adapter(&adapter.id, &adapter.schema)
-                        })
+    PluginHost::load_defaults_with_static_bundled(selection, static_plugins)
+        .or_else(|_| load_presentation_fallback(selection, static_plugins, extensions))
+}
+
+fn load_presentation_fallback(
+    selection: &bcode_plugin::PluginSelection,
+    static_plugins: &[StaticBundledPlugin],
+    extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
+) -> Result<PluginHost, PluginLoadError> {
+    let selected = bcode_plugin::filter_selected_static_plugins(static_plugins, selection)?;
+    let visual_plugins = selected
+        .into_iter()
+        .filter(|(manifest, _)| {
+            extensions
+                .iter()
+                .find(|extension| extension.plugin_id() == manifest.id)
+                .is_some_and(|extension| {
+                    let registry = extension.registry();
+                    manifest.composer_contributions.iter().any(|contribution| {
+                        registry
+                            .composer_registry()
+                            .supports(&contribution.activation_kind)
+                    }) || manifest.visual_adapters.iter().any(|adapter| {
+                        (adapter.surfaces.is_empty()
+                            || adapter.surfaces.iter().any(|surface| surface == "tui"))
+                            && registry.supports_visual_adapter(&adapter.id, &adapter.schema)
                     })
-            })
-            .collect::<Vec<_>>();
-        Ok(PluginHost::load_static_plugins_best_effort(&visual_plugins))
-    }
+                })
+        })
+        .collect::<Vec<_>>();
+    Ok(PluginHost::load_static_plugins_best_effort(&visual_plugins))
 }
 
 /// Load persistent presentation state for TUI client-side visual adapters.
@@ -1735,6 +1744,139 @@ library = "libdynamic_visual_test.dylib"
             DYNAMIC_TEST_MANIFEST,
             bcode_plugin_sdk::static_plugin_vtable!(DynamicVisualTestPlugin, DYNAMIC_TEST_MANIFEST),
         )
+    }
+
+    const COMPOSER_FALLBACK_MANIFEST: &str = r#"
+id = "test.composer-fallback"
+name = "Composer fallback fixture"
+version = "0.0.1"
+[[services]]
+class = "service"
+name = "Suggestions"
+interface_id = "bcode.composer/v1"
+[[composer_contributions]]
+id = "generic"
+activation_kind = "test.generic"
+service_interface_id = "bcode.composer/v1"
+priority = 1
+[runtime]
+type = "native"
+abi_version = 5
+library = "libcomposer_fixture.dylib"
+"#;
+
+    fn composer_fallback_registry() -> PluginTuiRegistry {
+        struct Contributor;
+        impl bcode_plugin_sdk::composer::PluginComposerContributor for Contributor {
+            fn kind(&self) -> &'static str {
+                "test.generic"
+            }
+            fn activate(
+                &self,
+                document: &bcode_plugin_sdk::composer::ComposerDocument,
+            ) -> Option<bcode_plugin_sdk::composer::ComposerActivation> {
+                document.allows_activation().then(|| {
+                    bcode_plugin_sdk::composer::ComposerActivation {
+                        range: bcode_plugin_sdk::composer::ComposerTextRange {
+                            start: 0,
+                            end: document.text.len(),
+                        },
+                        query: document.text.clone(),
+                    }
+                })
+            }
+        }
+        let mut registry = PluginTuiRegistry::default();
+        registry
+            .register_composer_contributor(Box::new(Contributor))
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn presentation_fallback_retains_composer_only_activation() {
+        let bundled = [StaticBundledPlugin::new(
+            COMPOSER_FALLBACK_MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(
+                DynamicVisualTestPlugin,
+                COMPOSER_FALLBACK_MANIFEST
+            ),
+        )];
+        let extensions = [bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+            "test.composer-fallback",
+            composer_fallback_registry,
+        )];
+        let host = load_presentation_fallback(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &bundled,
+            &extensions,
+        )
+        .unwrap();
+        let presentation = PluginTuiPresentation::with_runtime_config_and_extensions(
+            host.into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            &extensions,
+        );
+        let document = bcode_plugin_sdk::composer::ComposerDocument {
+            document_id: "fixture".into(),
+            revision: 0,
+            text: "generic".into(),
+            cursor: 7,
+            selection: None,
+        };
+        let (route, activation) = presentation
+            .activate_composer(&document)
+            .expect("retained contributor activation");
+        drop(presentation);
+        assert_eq!(route.plugin_id, "test.composer-fallback");
+        assert_eq!(activation.query, "generic");
+        let unsupported = load_presentation_fallback(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &bundled,
+            &[],
+        )
+        .unwrap();
+        let unsupported = PluginTuiPresentation::with_runtime_config_and_extensions(
+            unsupported.into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            &extensions,
+        );
+        assert!(unsupported.activate_composer(&document).is_none());
+        drop(unsupported);
+    }
+
+    #[test]
+    fn presentation_fallback_retains_compatible_native_adapters() {
+        let bundled = [StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        )];
+        let host = load_presentation_fallback(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &bundled,
+            test_tui_extensions(),
+        )
+        .unwrap();
+        assert!(
+            host.loaded_plugins()
+                .iter()
+                .any(|plugin| plugin.manifest().id == "bcode.shell")
+        );
+        let presentation = PluginTuiPresentation::from_shared(Arc::new(host));
+        assert!(presentation.registry("bcode.shell").is_some());
+        drop(presentation);
+    }
+
+    #[test]
+    fn presentation_fallback_does_not_admit_plugins_without_compatible_registry() {
+        let bundled = [dynamic_visual_test_plugin()];
+        let host = load_presentation_fallback(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &bundled,
+            &[],
+        )
+        .unwrap();
+        assert!(host.loaded_plugins().is_empty());
     }
 
     fn dynamic_test_presentation(
