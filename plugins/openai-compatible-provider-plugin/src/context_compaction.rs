@@ -126,6 +126,7 @@ pub async fn compact_context_inner(
         ));
     };
     let turn_request = ModelTurnRequest {
+        context_lineage: None,
         session_id: request.session_id,
         turn_id: "context-compaction".to_string(),
         model_id: request.model_id.clone(),

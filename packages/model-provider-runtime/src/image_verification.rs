@@ -516,6 +516,7 @@ fn image_messages(
 fn base_request(options: &ImageVerificationOptions) -> ModelTurnRequest {
     let session_id = bcode_session_models::SessionId::new();
     ModelTurnRequest {
+        context_lineage: None,
         session_id,
         turn_id: format!("verify-images-{session_id}"),
         model_id: options.model.model_id.clone(),
@@ -868,6 +869,7 @@ mod tests {
                         ProviderTurnEvent::TurnStarted,
                         ProviderTurnEvent::RequestProjection {
                             projection: ProviderRequestProjection {
+                                context_representation: None,
                                 serialized_body_bytes: Some(if continued { 100 } else { 1000 }),
                                 used_previous_response_id: continued,
                                 original_message_count: Some(request.messages.len()),
@@ -1194,6 +1196,7 @@ mod tests {
     #[test]
     fn encoded_measurements_are_independent_complete_and_overflow_checked() {
         let projection = ProviderRequestProjection {
+            context_representation: None,
             serialized_body_bytes: Some(1000),
             encoded_body_bytes: Some(100),
             ..Default::default()
@@ -1203,6 +1206,7 @@ mod tests {
         assert_eq!(measured_encoded_bytes(&projections), Some(200));
         assert_eq!(measured_encoded_bytes(&[]), None);
         let missing = ProviderRequestProjection {
+            context_representation: None,
             serialized_body_bytes: Some(1000),
             ..Default::default()
         };
@@ -1211,6 +1215,7 @@ mod tests {
             None
         );
         let overflow = ProviderRequestProjection {
+            context_representation: None,
             encoded_body_bytes: Some(u64::MAX),
             ..Default::default()
         };
@@ -1275,6 +1280,7 @@ mod tests {
     fn missing_measurements_are_not_zero_and_attempts_are_summed() {
         assert_eq!(measured_bytes(&[]), None);
         let measured = ProviderRequestProjection {
+            context_representation: None,
             serialized_body_bytes: Some(42),
             ..Default::default()
         };

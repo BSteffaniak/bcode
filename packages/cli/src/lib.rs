@@ -5666,6 +5666,14 @@ enum WorkflowPresetCommand {
 
 #[derive(Debug, Subcommand)]
 enum RuntimeWorkCommand {
+    /// Read one bounded content-free live-observation page as JSON.
+    Observations {
+        session_id: SessionId,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     List {
         session_id: SessionId,
         #[arg(long)]
@@ -19124,6 +19132,20 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
 async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     match command {
+        RuntimeWorkCommand::Observations {
+            session_id,
+            after,
+            limit,
+        } => {
+            let page = client
+                .runtime_work_observations(
+                    session_id,
+                    after.map(bcode_session_models::WorkId::new),
+                    limit,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&page)?);
+        }
         RuntimeWorkCommand::List { session_id, json } => {
             let work = client.list_runtime_work(session_id).await?;
             write_runtime_work_list(&mut std::io::stdout().lock(), &work, json)?;

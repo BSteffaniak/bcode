@@ -947,6 +947,7 @@ fn openai_request_projection(
     let serialized_body_bytes = Some(serialized_body_bytes);
     match settings.dialect {
         OpenAiCompatibleDialect::ChatCompletions => ProviderRequestProjection {
+            context_representation: None,
             provider: Some("bcode.openai-compatible".to_string()),
             serialized_body_bytes,
             api_shape: Some("chat_completions".to_string()),
@@ -967,6 +968,7 @@ fn openai_request_projection(
             let had_provider_reasoning_state = has_provider_reasoning_state(dialect, request);
             let sent = responses_projected_message_count(request, project_reused_history);
             ProviderRequestProjection {
+                context_representation: None,
                 provider: Some("bcode.openai-compatible".to_string()),
                 serialized_body_bytes,
                 api_shape: Some("responses".to_string()),
@@ -2088,6 +2090,8 @@ fn sha256_prefix(bytes: &[u8], len: usize) -> String {
 
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest {
+    #[serde(skip)]
+    context_representation: Option<bcode_model::lineage::RequestContextRepresentation>,
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
@@ -4246,6 +4250,7 @@ async fn verify_stream_completion(
 
 fn verification_turn_request(request: &bcode_model::VerifyModelRequest) -> ModelTurnRequest {
     ModelTurnRequest {
+        context_lineage: None,
         session_id: bcode_session_models::SessionId::new(),
         turn_id: format!("model-verify-{}", request.model_id),
         model_id: request.model_id.clone(),
@@ -4760,9 +4765,15 @@ fn build_chat_completion_request(
     request: &ModelTurnRequest,
     model_id: &str,
 ) -> Result<ChatCompletionRequest, ProviderError> {
+    validate_context_lineage(request)?;
+    let (messages, mut context_representation) = chat_messages_with_representation(request);
+    if settings.dialect != OpenAiCompatibleDialect::ChatCompletions {
+        context_representation = unknown_context_representation(request);
+    }
     Ok(ChatCompletionRequest {
+        context_representation,
         model: model_id.to_string(),
-        messages: model_messages_to_chat_messages(request),
+        messages,
         stream: true,
         stream_options: Some(ChatStreamOptions {
             include_usage: true,
@@ -4797,6 +4808,10 @@ fn prepare_http_body(
     mut projection: ProviderRequestProjection,
     turn: Option<&TurnState>,
 ) -> Result<reqwest::RequestBuilder, ProviderError> {
+    validate_context_lineage(request)?;
+    if projection.context_representation.is_none() {
+        projection.context_representation = unknown_context_representation(request);
+    }
     let encoded = request_compression::encode(
         bytes,
         request
@@ -4837,12 +4852,13 @@ async fn send_chat_completion_request(
     );
     let request_body = build_chat_completion_request(settings, request, model_id)?;
     let bytes = encode_request_body(&request_body)?;
-    let projection = openai_request_projection(
+    let mut projection = openai_request_projection(
         settings,
         request,
         bytes.len() as u64,
         request_body.messages.len(),
     );
+    projection.context_representation = request_body.context_representation;
     let builder = prepare_http_body(
         client.post(url).bearer_auth(api_key),
         bytes,
@@ -5990,6 +6006,7 @@ fn build_responses_request(
     request: &ModelTurnRequest,
     model_id: &str,
 ) -> Result<serde_json::Value, ProviderError> {
+    validate_context_lineage(request)?;
     let previous_response_id = responses_previous_response_id(settings, request);
     let capabilities = settings.dialect.responses_request_capabilities();
     let mut projection = responses_projection(
@@ -6524,7 +6541,56 @@ fn model_messages_to_responses_input(
     })
 }
 
-fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessage> {
+fn validate_context_lineage(request: &ModelTurnRequest) -> Result<(), ProviderError> {
+    if request
+        .context_lineage
+        .as_ref()
+        .is_some_and(|lineage| lineage.validate(&request.messages).is_err())
+    {
+        return Err(provider_error(
+            "invalid_context_lineage",
+            ProviderErrorCategory::InvalidRequest,
+            "Unsupported or invalid request context lineage",
+        ));
+    }
+    Ok(())
+}
+
+fn unknown_context_representation(
+    request: &ModelTurnRequest,
+) -> Option<bcode_model::lineage::RequestContextRepresentation> {
+    use bcode_model::lineage::{
+        ContextRepresentationDisposition, ContextRepresentationEntry, RequestContextRepresentation,
+    };
+    request
+        .context_lineage
+        .as_ref()
+        .map(|lineage| RequestContextRepresentation {
+            version: 1,
+            request_ordinal: lineage.request_ordinal,
+            omitted: 0,
+            entries: lineage
+                .entries
+                .iter()
+                .map(|entry| ContextRepresentationEntry {
+                    source_ordinal: entry.source_ordinal,
+                    disposition: ContextRepresentationDisposition::Unknown,
+                })
+                .collect(),
+        })
+}
+
+// Receipt indices travel alongside the exact converted messages. No content matching or
+// reconstruction of sanitizer decisions is used. Unsupported block shapes stay Unknown.
+fn chat_messages_with_representation(
+    request: &ModelTurnRequest,
+) -> (
+    Vec<ChatMessage>,
+    Option<bcode_model::lineage::RequestContextRepresentation>,
+) {
+    use bcode_model::lineage::ContextRepresentationDisposition as Disposition;
+    let mut receipt = unknown_context_representation(request);
+    let mut mappings = Vec::new();
     let mut messages = Vec::new();
     if let Some(system_prompt) = &request.system_prompt {
         messages.push(ChatMessage {
@@ -6534,21 +6600,72 @@ fn model_messages_to_chat_messages(request: &ModelTurnRequest) -> Vec<ChatMessag
             tool_call_id: None,
         });
     }
-    messages.extend(
-        request
-            .messages
-            .iter()
-            .filter_map(model_message_to_chat_message),
-    );
-    sanitize_chat_tool_protocol(messages)
+    for (message_index, message) in request.messages.iter().enumerate() {
+        let converted = model_message_to_chat_message(message);
+        if let (Some(lineage), Some(receipt)) = (&request.context_lineage, &mut receipt) {
+            for (index, entry) in lineage
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.message_index == message_index)
+            {
+                let block = &message.content[entry.block_index];
+                let disposition = match (message.role, block) {
+                    (
+                        MessageRole::System | MessageRole::User | MessageRole::Assistant,
+                        ContentBlock::Text { text },
+                    ) if !text.is_empty() => Disposition::Represented,
+                    (MessageRole::Tool, ContentBlock::ToolResult { result })
+                        if result.content.is_empty() =>
+                    {
+                        if message
+                            .content
+                            .iter()
+                            .position(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                            == Some(entry.block_index)
+                        {
+                            Disposition::Represented
+                        } else {
+                            Disposition::Dropped
+                        }
+                    }
+                    _ => Disposition::Unknown,
+                };
+                receipt.entries[index].disposition = disposition;
+                if converted.is_some() {
+                    mappings.push((messages.len(), index));
+                } else if disposition == Disposition::Represented {
+                    receipt.entries[index].disposition = Disposition::Dropped;
+                }
+            }
+        }
+        if let Some(converted) = converted {
+            messages.push(converted);
+        }
+    }
+    let messages = sanitize_chat_tool_protocol_observed(messages, |input_index, retained| {
+        if !retained && let Some(receipt) = &mut receipt {
+            for (_, entry_index) in mappings.iter().filter(|(index, _)| *index == input_index) {
+                // Sanitized orphan output is plain historical context, not the source's
+                // structured tool representation, even if its text remains present.
+                if receipt.entries[*entry_index].disposition == Disposition::Represented {
+                    receipt.entries[*entry_index].disposition = Disposition::Dropped;
+                }
+            }
+        }
+    });
+    (messages, receipt)
 }
 
-fn sanitize_chat_tool_protocol(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+fn sanitize_chat_tool_protocol_observed(
+    messages: Vec<ChatMessage>,
+    mut observe: impl FnMut(usize, bool),
+) -> Vec<ChatMessage> {
     let mut sanitized = Vec::with_capacity(messages.len());
     let mut seen_tool_call_ids = BTreeSet::new();
     let mut pending_tool_call_ids = BTreeSet::new();
 
-    for mut message in messages {
+    for (input_index, mut message) in messages.into_iter().enumerate() {
         match message.role {
             "assistant" if !message.tool_calls.is_empty() => {
                 let mut valid_tool_calls = Vec::new();
@@ -6577,8 +6694,10 @@ fn sanitize_chat_tool_protocol(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 if let Some(call_id) = message.tool_call_id.as_ref()
                     && pending_tool_call_ids.remove(call_id)
                 {
+                    observe(input_index, true);
                     sanitized.push(message);
                 } else {
+                    observe(input_index, false);
                     append_missing_chat_tool_outputs(&mut sanitized, &mut pending_tool_call_ids);
                     sanitized.push(chat_plain_user_message(format!(
                         "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {}; result: {}",
@@ -12328,6 +12447,7 @@ mod tests {
             original.clone(),
             &request,
             ProviderRequestProjection {
+                context_representation: None,
                 serialized_body_bytes: Some(original.len() as u64),
                 ..Default::default()
             },
@@ -12867,8 +12987,131 @@ mod tests {
         }
     }
 
+    fn attach_lineage(request: &mut ModelTurnRequest, references: &[(usize, usize)]) {
+        use bcode_model::lineage::{ContextLineageEntry, RequestContextLineage};
+        request.context_lineage = Some(RequestContextLineage {
+            version: 1,
+            request_ordinal: 19,
+            omitted: 0,
+            entries: references
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, &(message_index, block_index))| ContextLineageEntry {
+                        source_ordinal: index as u64,
+                        operation_ordinal: 8,
+                        mandatory: true,
+                        message_index,
+                        block_index,
+                    },
+                )
+                .collect(),
+        });
+    }
+
+    #[test]
+    fn chat_conversion_lineage_tracks_text_tool_output_and_orphan_demotion() {
+        use bcode_model::lineage::ContextRepresentationDisposition as D;
+        let tool_output = ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "call-1".into(),
+                    output: "output".into(),
+                    is_error: false,
+                    content: Vec::new(),
+                },
+            }],
+        };
+        let mut request = test_request(vec![
+            text_message(MessageRole::User, "identical"),
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: ToolCall {
+                        id: "call-1".into(),
+                        name: "lookup".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                }],
+            },
+            tool_output.clone(),
+        ]);
+        attach_lineage(&mut request, &[(0, 0), (2, 0)]);
+        let settings = test_settings(
+            test_chatgpt_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+        let body = build_chat_completion_request(&settings, &request, "model").unwrap();
+        let receipt = body.context_representation.as_ref().unwrap();
+        assert_eq!(receipt.entries[0].disposition, D::Represented);
+        assert_eq!(receipt.entries[1].disposition, D::Represented);
+        assert!(
+            receipt
+                .validate(request.context_lineage.as_ref().unwrap())
+                .is_ok()
+        );
+        assert_eq!(body.messages[2].role, "tool");
+        let wire = serde_json::to_value(&body).unwrap();
+        assert!(wire.get("context_representation").is_none());
+        assert!(wire.get("context_lineage").is_none());
+        request.messages = vec![tool_output];
+        attach_lineage(&mut request, &[(0, 0)]);
+        let body = build_chat_completion_request(&settings, &request, "model").unwrap();
+        assert_eq!(body.messages[0].role, "user");
+        assert_eq!(
+            body.context_representation.unwrap().entries[0].disposition,
+            D::Dropped
+        );
+    }
+
+    #[test]
+    fn lineage_unsupported_conversion_is_unknown_and_future_input_is_rejected() {
+        use bcode_model::lineage::ContextRepresentationDisposition as D;
+        let mut request = test_request(vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ProviderExtension {
+                value: serde_json::json!({"opaque": true}),
+            }],
+        }]);
+        attach_lineage(&mut request, &[(0, 0)]);
+        let settings = test_settings(
+            test_chatgpt_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+        let body = build_chat_completion_request(&settings, &request, "model").unwrap();
+        assert!(body.messages.is_empty());
+        assert_eq!(
+            body.context_representation.unwrap().entries[0].disposition,
+            D::Unknown
+        );
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        request.messages = vec![text_message(MessageRole::User, "mandatory input")];
+        let unsupported = build_chat_completion_request(&settings, &request, "model").unwrap();
+        assert_eq!(
+            unsupported.context_representation.unwrap().entries[0].disposition,
+            D::Unknown
+        );
+        assert!(build_responses_request(&settings, &request, "model").is_ok());
+        assert_eq!(
+            unknown_context_representation(&request).unwrap().entries[0].disposition,
+            D::Unknown
+        );
+        request.context_lineage.as_mut().unwrap().version = 2;
+        let error = build_chat_completion_request(&settings, &request, "model").unwrap_err();
+        assert_eq!(
+            error.message,
+            "Unsupported or invalid request context lineage"
+        );
+        assert!(build_responses_request(&settings, &request, "model").is_err());
+        request.context_lineage.as_mut().unwrap().version = 1;
+        request.context_lineage.as_mut().unwrap().entries[0].block_index = 99;
+        assert!(build_chat_completion_request(&settings, &request, "model").is_err());
+    }
+
     fn test_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {
         ModelTurnRequest {
+            context_lineage: None,
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
                 .expect("static nil UUID should parse"),
@@ -13845,6 +14088,7 @@ mod tests {
     #[test]
     fn responses_top_level_strategy_omits_system_messages_and_uses_instructions() {
         let request = ModelTurnRequest {
+            context_lineage: None,
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
                 .expect("static nil UUID should parse"),
@@ -13898,6 +14142,7 @@ mod tests {
     #[test]
     fn final_responses_request_has_required_instructions_without_system_input() {
         let request = ModelTurnRequest {
+            context_lineage: None,
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
                 .expect("static nil UUID should parse"),
@@ -14017,6 +14262,7 @@ mod tests {
     #[test]
     fn responses_reuse_sends_only_new_messages() {
         let request = ModelTurnRequest {
+            context_lineage: None,
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
                 .expect("static nil UUID should parse"),

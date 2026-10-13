@@ -531,6 +531,29 @@ impl RuntimeWorkManager {
             .collect()
     }
 
+    /// Retire only the registration generation captured by this token.
+    ///
+    /// Stage revisions do not affect retirement authority: an older-stage token
+    /// may retire its same owner, but can never remove a replacement owner.
+    /// Missing or stale generations return `None` without changing live work.
+    pub(super) async fn take_observed(
+        &self,
+        token: &WorkObservationToken,
+    ) -> Option<RuntimeWorkSpec> {
+        let mut active = self.active.lock().await;
+        let key = (token.session_id, token.work_id.clone());
+        let matches_owner = active
+            .get(&key)
+            .is_some_and(|work| Arc::ptr_eq(&token.owner, &work.observation_owner));
+        let owned = if matches_owner {
+            active.remove(&key).map(|work| work.spec)
+        } else {
+            None
+        };
+        drop(active);
+        owned
+    }
+
     /// Remove active work and return the owned registration, if present.
     pub async fn take(&self, session_id: SessionId, work_id: &WorkId) -> Option<RuntimeWorkSpec> {
         self.active
@@ -754,6 +777,45 @@ mod tests {
             manager.observation_page(session, None, 1).await.entries[0].stage,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn observed_retirement_rejects_replaced_owner_without_removing_replacement() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        let id = WorkId::new("retirement-generation");
+        start_observation_fixture(&manager, session, &id).await;
+        let original = manager.observation_token(session, &id).await.unwrap();
+        start_observation_fixture(&manager, session, &id).await;
+        let replacement = manager.observation_token(session, &id).await.unwrap();
+        assert!(manager.take_observed(&original).await.is_none());
+        assert_eq!(manager.active_for_session(session).await.len(), 1);
+        assert!(manager.take_observed(&replacement).await.is_some());
+        assert!(manager.take_observed(&original).await.is_none());
+        assert!(manager.take_observed(&replacement).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn observed_retirement_accepts_same_owner_with_expired_stage_revision() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        let id = WorkId::new("retirement-revision");
+        start_observation_fixture(&manager, session, &id).await;
+        let original = manager.observation_token(session, &id).await.unwrap();
+        let current = manager
+            .observe_stage(&original, ObservedWorkStage::Retirement)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .observe_stage(&original, ObservedWorkStage::Dispatch)
+                .await
+                .is_none()
+        );
+        let retired = manager.take_observed(&original).await.unwrap();
+        assert_eq!(retired.work_id, id);
+        assert!(manager.take_observed(&current).await.is_none());
+        assert!(manager.active_for_session(session).await.is_empty());
     }
 
     #[tokio::test]

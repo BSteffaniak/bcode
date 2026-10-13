@@ -3701,6 +3701,7 @@ fn bedrock_request_projection(
         .filter(|message| message.role != MessageRole::System)
         .count();
     ProviderRequestProjection {
+        context_representation: None,
         provider: Some("bcode.bedrock".to_string()),
         api_shape: Some(
             match route {
@@ -10673,6 +10674,7 @@ mod tests {
     #[test]
     fn cache_hints_emit_bedrock_cache_points() {
         let request = ModelTurnRequest {
+            context_lineage: None,
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
                 .expect("static nil UUID should parse"),
@@ -11489,6 +11491,7 @@ mod tests {
 
     fn test_model_turn_request() -> ModelTurnRequest {
         ModelTurnRequest {
+            context_lineage: None,
             session_id: "00000000-0000-0000-0000-000000000000"
                 .parse()
                 .expect("static nil UUID should parse"),

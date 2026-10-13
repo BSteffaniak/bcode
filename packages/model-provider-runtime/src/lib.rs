@@ -1943,6 +1943,7 @@ where
     let start = Instant::now();
     let session_id = bcode_session_models::SessionId::new();
     let turn_request = bcode_model::ModelTurnRequest {
+        context_lineage: None,
         session_id,
         turn_id: format!("single-turn-{session_id}"),
         model_id: request.model_id,

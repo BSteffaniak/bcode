@@ -488,6 +488,7 @@ mod tests {
 
     fn request() -> ModelTurnRequest {
         ModelTurnRequest {
+            context_lineage: None,
             session_id: bcode_session_models::SessionId::new(),
             turn_id: "cache-test".into(),
             model_id: FAKE_CACHE_PREFIX_MODEL_ID.into(),

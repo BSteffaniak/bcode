@@ -796,6 +796,11 @@ pub enum RuntimeAndModelRequest {
 /// Requests owned by core session runtime, model selection, and auth configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreRuntimeRequest {
+    RuntimeWorkObservations {
+        session_id: SessionId,
+        after: Option<WorkId>,
+        limit: usize,
+    },
     ListRuntimeWork {
         session_id: SessionId,
     },
@@ -2067,6 +2072,15 @@ impl RoutedRequest {
                 working_directory,
                 sources,
             }),
+            Request::RuntimeWorkObservations {
+                session_id,
+                after,
+                limit,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::RuntimeWorkObservations {
+                session_id,
+                after,
+                limit,
+            })),
             Request::ListRuntimeWork { session_id } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::ListRuntimeWork { session_id }))
             }

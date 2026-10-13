@@ -129,6 +129,7 @@ fn success_events() -> Vec<ProviderTurnEvent> {
         },
         ProviderTurnEvent::RequestProjection {
             projection: ProviderRequestProjection {
+                context_representation: None,
                 provider: Some("test-provider".to_string()),
                 api_shape: Some("test-api".to_string()),
                 sent_message_count: Some(2),

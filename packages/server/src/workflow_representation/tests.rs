@@ -1,3 +1,5 @@
+use bcode_session_models::SessionId;
+
 #[path = "tests/child.rs"]
 mod child;
 #[path = "tests/fanout.rs"]
@@ -623,7 +625,7 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
         .unwrap()
         .parent_session_id
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+    fixture_observed_timeout(&state, std::time::Duration::from_secs(6), async {
         loop {
             crate::drive_workflow_run(&state, "new").await.unwrap();
             if status(&state, "new").await.unwrap().unwrap().status
@@ -815,21 +817,22 @@ async fn typed_agent_test_harness_uses_real_prompt_owner_and_fake_provider() {
         .await
         .expect("actual provider admission");
     assert!(receipt.get("turn_id").is_some());
-    if let Err(error) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            if status(&state, "new")
-                .await
-                .expect("status")
-                .expect("run")
-                .status
-                == bcode_workflow::RunStatus::Completed
-            {
-                break;
+    if let Err(error) =
+        fixture_observed_timeout(&state, std::time::Duration::from_secs(15), async {
+            loop {
+                if status(&state, "new")
+                    .await
+                    .expect("status")
+                    .expect("run")
+                    .status
+                    == bcode_workflow::RunStatus::Completed
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
+        })
+        .await
     {
         let session_id = receipt["session_id"]
             .as_str()
@@ -905,7 +908,7 @@ async fn normal_start_uses_typed_family_and_rescans_two_running_agents_without_d
     crate::drive_workflow_run(&state, "parallel-provider")
         .await
         .expect("second scan");
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    fixture_observed_timeout(&state, std::time::Duration::from_secs(15), async {
         loop {
             crate::drive_workflow_run(&state, "parallel-provider")
                 .await
@@ -1017,7 +1020,7 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
     .await
     .expect("normal plugin start");
     assert_eq!(response.run.run_id, run_id);
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+    fixture_observed_timeout(&state, std::time::Duration::from_secs(20), async {
         loop {
             crate::drive_workflow_run(&state, &run_id)
                 .await
@@ -1313,9 +1316,12 @@ fn configure_delegation_fixture(state: &mut ServerState) {
 
 #[tokio::test]
 async fn typed_coordinator_stages_and_publishes_delegation_through_normal_tool() {
-    tokio::time::timeout(std::time::Duration::from_secs(30), run_typed_delegation())
-        .await
-        .expect("whole delegation fixture deadline");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        Box::pin(run_typed_delegation()),
+    )
+    .await
+    .expect("whole delegation fixture deadline");
 }
 
 async fn run_typed_delegation() {
@@ -1363,7 +1369,7 @@ async fn run_typed_delegation() {
             "reconciliation":[]
         }),
     };
-    let staged = invoke_delegation_tool(&state, child.id, &call).await;
+    let staged = Box::pin(invoke_delegation_tool(&state, child.id, &call)).await;
     assert!(!staged.is_error, "{}", staged.output);
     let staged: serde_json::Value = serde_json::from_str(&staged.output).expect("stage response");
     let publish = staged
@@ -1375,12 +1381,12 @@ async fn run_typed_delegation() {
         name: "workflow.publish_run_graph_edit".into(),
         arguments: publish,
     };
-    let published = invoke_delegation_tool(&state, child.id, &publication).await;
+    let published = Box::pin(invoke_delegation_tool(&state, child.id, &publication)).await;
     assert!(!published.is_error, "{}", published.output);
     bcode_fake_provider_plugin::release_fake_event_script_gate(
         &state.selected_provider_context.settings["delegation_fixture_gate"],
     );
-    let finished = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+    let finished = fixture_observed_timeout(&state, std::time::Duration::from_secs(20), async {
         loop {
             crate::drive_workflow_run(&state, "new")
                 .await
@@ -1445,7 +1451,7 @@ async fn invoke_delegation_tool(
         &cancellation,
     );
     tokio::pin!(invocation);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    fixture_observed_timeout(state, std::time::Duration::from_secs(5), async {
         loop {
             tokio::select! {
                 result = &mut invocation => return result.unwrap_or_else(|error| panic!("tool invocation {}: {error}", call.name)),
@@ -1922,51 +1928,243 @@ async fn fixture_supervisor_reports_failed_join_without_claiming_cleanup() {
     drop(cleanup);
 }
 
+type FixtureMetricSelection<'a> =
+    std::collections::BTreeMap<(&'a str, Option<&'a str>), Vec<&'a bcode_metrics::MetricEvent>>;
+
+fn fixture_selected_metrics<'a>(
+    report: &'a bcode_metrics::MetricsReport,
+    dispatch: &str,
+    session: Option<SessionId>,
+) -> (usize, FixtureMetricSelection<'a>) {
+    let session = session.map(|id| id.to_string());
+    let mut selected = std::collections::BTreeMap::<_, Vec<_>>::new();
+    let mut matched = 0;
+    for event in report.events.iter().rev().filter(|event| {
+        event
+            .labels
+            .get("dispatch_identity")
+            .is_some_and(|id| id == dispatch)
+            || event.labels.get("work_id").is_some_and(|id| id == dispatch)
+            || session.as_ref().is_some_and(|id| {
+                event.labels.get("session_id") == Some(id)
+                    && !event.labels.contains_key("dispatch_identity")
+                    && !event.labels.contains_key("work_id")
+                    && (event.name.starts_with("workflow.") || event.name.starts_with("model."))
+            })
+    }) {
+        matched += 1;
+        let key = (
+            event.name.as_str(),
+            event.labels.get("operation").map(String::as_str),
+        );
+        let samples = selected.entry(key).or_default();
+        if samples.len() < 2 {
+            samples.push(event);
+        }
+    }
+    (matched, selected)
+}
+
+fn fixture_dispatch_metrics(
+    report: &bcode_metrics::MetricsReport,
+    checkpoint: &str,
+    dispatch: &str,
+    session: Option<SessionId>,
+) {
+    let (matched, selected) = fixture_selected_metrics(report, dispatch, session);
+    eprintln!(
+        "fixture-stage={checkpoint} dispatch={dispatch} telemetry-retained={} matching-events={matched} matching-operations={} operation-limit=16 samples-per-operation=2 coverage=bounded-retained-not-complete absence=unknown",
+        report.events.len(),
+        selected.len()
+    );
+    for (_, samples) in selected
+        .iter()
+        .filter(|((name, _), _)| name.starts_with("workflow."))
+        .chain(
+            selected
+                .iter()
+                .filter(|((name, _), _)| !name.starts_with("workflow.")),
+        )
+        .take(16)
+    {
+        for event in samples.iter().rev() {
+            eprintln!(
+                "fixture-stage={checkpoint} dispatch={dispatch} metric={} timestamp_ms={} value={} match-scope={} labels={:?}",
+                event.name,
+                event.unix_ms,
+                event.value,
+                if event
+                    .labels
+                    .get("dispatch_identity")
+                    .is_some_and(|id| id == dispatch)
+                    || event.labels.get("work_id").is_some_and(|id| id == dispatch)
+                {
+                    "exact-dispatch"
+                } else {
+                    "session-only-not-exact-dispatch"
+                },
+                event.labels
+            );
+        }
+    }
+}
+
+#[test]
+fn pending_metric_selection_survives_unrelated_recent_crowding() {
+    let event = |dispatch: &str, operation: &str, value| bcode_metrics::MetricEvent {
+        unix_ms: 1,
+        name: "workflow.writer_queue.wait.duration_ms".into(),
+        kind: bcode_metrics::MetricKind::Histogram,
+        value,
+        labels: std::collections::BTreeMap::from([
+            ("dispatch_identity".into(), dispatch.into()),
+            ("operation".into(), operation.into()),
+        ]),
+    };
+    let mut report = bcode_metrics::MetricsReport::default();
+    for value in 0..4 {
+        report.events.push(event("pending", "publication", value));
+    }
+    report.events.push(event("pending", "settlement", 9));
+    report
+        .events
+        .extend((0..100).map(|value| event("other", "publication", value)));
+    let (matched, selected) = fixture_selected_metrics(&report, "pending", None);
+    assert_eq!(matched, 5);
+    assert_eq!(selected.len(), 2);
+    let values: Vec<_> = selected
+        .values()
+        .flatten()
+        .map(|event| event.value)
+        .collect();
+    assert_eq!(values, [3, 2, 9]);
+    let (matched, selected) = fixture_selected_metrics(&report, "unretained", None);
+    assert_eq!(matched, 0);
+    assert!(selected.is_empty());
+}
+
+async fn fixture_pending_diagnostic(
+    state: &ServerState,
+    report: &bcode_metrics::MetricsReport,
+    checkpoint: &str,
+    run: &str,
+    attempt: &representation::attempts::PendingAttempt,
+    associated_session: Option<SessionId>,
+) {
+    let dispatch = &attempt.dispatch_identity;
+    let receipt_session = attempt.receipt.as_ref().and_then(|receipt| {
+        receipt
+            .receipt
+            .get("session_id")?
+            .as_str()?
+            .parse::<SessionId>()
+            .ok()
+    });
+    let session = receipt_session.or(associated_session);
+    eprintln!(
+        "fixture-stage={checkpoint} run={run} pending-dispatch={dispatch} activation={} attempt={} receipt-present={} selected-session={session:?} session-source={}",
+        attempt.prepared.activation_id,
+        attempt.prepared.attempt,
+        attempt.receipt.is_some(),
+        if receipt_session.is_some() {
+            "receipt"
+        } else {
+            "run-association-fallback-not-exact-child"
+        }
+    );
+    fixture_dispatch_metrics(report, checkpoint, dispatch, session);
+    if let Some(session) = session {
+        let mut after = None;
+        for page_index in 0..4 {
+            let page =
+                crate::runtime_work_operations::observations(state, session, after.as_ref(), 32)
+                    .await;
+            let observation = page
+                .entries
+                .iter()
+                .find(|entry| entry.work_id.0 == *dispatch);
+            eprintln!(
+                "fixture-stage={checkpoint} dispatch={dispatch} session={session} pending-observation={observation:?} page={page_index} entries={} next-after={:?} coverage=bounded-live-owner-page absence=unknown",
+                page.entries.len(),
+                page.next_after
+            );
+            if observation.is_some() || page.next_after.is_none() {
+                return;
+            }
+            after = page.next_after;
+        }
+        eprintln!(
+            "fixture-stage={checkpoint} dispatch={dispatch} coverage=live-owner-page-budget-exhausted limit=128 absence=unknown"
+        );
+    } else {
+        eprintln!(
+            "fixture-stage={checkpoint} dispatch={dispatch} pending-observation=unavailable coverage=no-valid-receipt-session absence=unknown"
+        );
+    }
+}
+
 async fn fixture_stage_diagnostic(
     state: &ServerState,
     checkpoint: &str,
     started: std::time::Instant,
 ) {
-    // Read the same bounded production telemetry used by normal diagnostics,
-    // rather than maintaining a parallel fixture lifecycle inventory.
     let report = state.metrics.report();
-    eprintln!(
-        "fixture-stage={checkpoint} telemetry-retained={} coverage=bounded-recent-not-complete",
-        report.events.len(),
-    );
-    for event in report.events.iter().rev().take(24).rev() {
-        eprintln!(
-            "fixture-stage={checkpoint} metric={} timestamp_ms={} value={} labels={:?}",
-            event.name, event.unix_ms, event.value, event.labels,
-        );
-    }
     let observed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
-        for (session, work) in state.runtime_work.active_all().await.into_iter().take(100) {
-            eprintln!("fixture-stage={checkpoint} elapsed={:?} session={session} work={} kind={:?} status={:?} origin=runtime-registration-not-classified-synthetic", started.elapsed(), work.work_id, work.kind, work.status);
-        }
-        let Ok(db) = open(&crate::workflow_store_path(state), false) else { return; };
-        let Ok(page) = representation::runs::catalog(&db, None, 8).await else { return; };
+        let Ok(db) = open(&crate::workflow_store_path(state), false) else {
+            eprintln!("fixture-stage={checkpoint} coverage=store-open-unavailable");
+            return;
+        };
+        let Ok(page) = representation::runs::catalog(&db, None, 8).await else {
+            eprintln!("fixture-stage={checkpoint} coverage=run-page-unavailable");
+            return;
+        };
+        eprintln!("fixture-stage={checkpoint} runs={} next-after={:?} supported={} coverage=bounded-run-page", page.entries.len(), page.next_after, page.representation_supported);
+        let mut remaining = 32;
         for (run, _) in page.entries {
-            if let Ok(pending) = representation::attempts::pending(&db, &run, None, 32).await {
-                for attempt in pending {
-                    eprintln!("fixture-stage={checkpoint} elapsed={:?} run={run} pending-dispatch={} activation={} attempt={} receipt-present={}", started.elapsed(), attempt.dispatch_identity, attempt.prepared.activation_id, attempt.prepared.attempt, attempt.receipt.is_some());
+            if remaining == 0 {
+                eprintln!("fixture-stage={checkpoint} coverage=dispatch-budget-exhausted limit=32");
+                break;
+            }
+            match representation::attempts::pending(&db, &run, None, remaining).await {
+                Ok(pending) => {
+                    eprintln!("fixture-stage={checkpoint} run={run} pending-returned={} requested={remaining} coverage=bounded-pending-page may-have-more={}", pending.len(), pending.len() == usize::from(remaining));
+                    remaining -= u16::try_from(pending.len()).expect("bounded pending page");
+                    let associated_session = representation::runs::association(&db, &run)
+                        .await.ok().flatten().and_then(|id| id.parse::<SessionId>().ok());
+                    for attempt in pending {
+                        fixture_pending_diagnostic(state, &report, checkpoint, &run, &attempt, associated_session).await;
+                    }
                 }
+                Err(error) => eprintln!("fixture-stage={checkpoint} run={run} coverage=pending-read-failed error={error}"),
             }
             if let Ok(snapshot) = representation::scheduling::snapshot(&db, &run, None, None, 32).await {
                 eprintln!("fixture-stage={checkpoint} elapsed={:?} scheduling={snapshot:?}", started.elapsed());
-                if let Ok(ready) = representation::graph::ready(&db, &run, snapshot.revision, None, 32).await {
-                    for activation in ready {
-                        eprintln!("fixture-stage={checkpoint} elapsed={:?} run={run} ready-activation={} node={} generation={}", started.elapsed(), activation.activation_id, activation.node_id, activation.generation);
-                    }
-                }
             }
         }
     }).await;
     if observed.is_err() {
         eprintln!(
-            "fixture-stage={checkpoint} elapsed={:?} diagnostic=observation-timeout",
+            "fixture-stage={checkpoint} elapsed={:?} coverage=observation-timeout partial=true absence=unknown",
             started.elapsed()
         );
+    }
+}
+
+fn fixture_observed_timeout<'a, F: std::future::Future + 'a>(
+    state: &'a ServerState,
+    duration: std::time::Duration,
+    future: F,
+) -> impl std::future::Future<Output = Result<F::Output, tokio::time::error::Elapsed>> + 'a {
+    // Allocate before constructing the wrapper future, so its initial state also
+    // stays small instead of retaining the unpolled fixture future inline.
+    let future = Box::pin(future);
+    async move {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(duration, future).await;
+        if result.is_err() {
+            fixture_stage_diagnostic(state, "deadline-before-cleanup", started).await;
+        }
+        result
     }
 }
 
@@ -2725,7 +2923,7 @@ async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
             .await
             .expect("resume")
     );
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    fixture_observed_timeout(&state, std::time::Duration::from_secs(10), async {
         loop {
             if status(&state, "new")
                 .await

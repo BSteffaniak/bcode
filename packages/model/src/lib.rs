@@ -25,6 +25,8 @@ use std::fmt;
 pub mod history;
 pub mod image_upload;
 pub mod judgement;
+/// Content-free lineage for normalized requests and provider conversion observations.
+pub mod lineage;
 
 mod usage;
 pub use usage::{UsageCaptureSpec, UsageDecoder};
@@ -3069,6 +3071,10 @@ pub enum ProviderAttemptOutcome {
 /// Start a provider model turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
+    /// Optional content-free host lineage. Absence means representation evidence is unavailable.
+    /// Validate against `messages` before use; never serialize this metadata into provider input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_lineage: Option<lineage::RequestContextLineage>,
     pub session_id: SessionId,
     pub turn_id: String,
     /// Selected model ID. Empty means the provider should use its configured default.
@@ -3574,6 +3580,10 @@ fn provider_metadata_debug_value<'a>(key: &str, value: &'a str) -> &'a str {
 /// Provider-reported request projection metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequestProjection {
+    /// Optional observation of actual source representation during conversion, not delivery.
+    /// Validate against the exact request lineage; absence or missing entries remain unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_representation: Option<lineage::RequestContextRepresentation>,
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]

@@ -4419,6 +4419,7 @@ async fn run_invariant_selector(
         ..ModelParameters::default()
     };
     let request = ModelTurnRequest {
+        context_lineage: None,
         session_id,
         turn_id: format!("invariant-selector-{session_id}-{source_sequence}"),
         model_id: runtime.model.model_id.clone(),
@@ -6498,6 +6499,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::ActiveSkills { session_id }
         | Request::SetSessionAgent { session_id, .. }
         | Request::ChangeSessionWorkingDirectory { session_id, .. }
+        | Request::RuntimeWorkObservations { session_id, .. }
         | Request::ListRuntimeWork { session_id }
         | Request::RuntimeWorkHistory { session_id, .. }
         | Request::SubscribeRuntimeWork { session_id }
@@ -6621,6 +6623,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListPendingToolExchanges => "list_pending_tool_exchanges",
         Request::ResolveToolExchange { .. } => "resolve_tool_exchange",
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
+        Request::RuntimeWorkObservations { .. } => "runtime_work_observations",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
         Request::ApplyWorkflowSource(_) => "apply_workflow_source",
@@ -9374,6 +9377,21 @@ async fn handle_core_runtime_request(
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
+        CoreRuntimeRequest::RuntimeWorkObservations {
+            session_id,
+            after,
+            limit,
+        } => {
+            let page =
+                runtime_work_operations::observations(state, session_id, after.as_ref(), limit)
+                    .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RuntimeWorkObservations { page }),
+            )
+            .await
+        }
         CoreRuntimeRequest::ListRuntimeWork { session_id } => {
             let work = runtime_work_operations::list(state, session_id).await;
             send_response(
@@ -19326,11 +19344,30 @@ async fn retry_prepared_workflow_dispatches(
 
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
     let gate = workflow_drive_gate(state, run_id);
-    let Ok(_guard) = gate.try_lock() else {
+    let Ok(guard) = gate.try_lock() else {
+        state.metrics.add_counter_with_labels(
+            "workflow.driver.gate_deferred",
+            1,
+            MetricLabels::from([("run_id".to_owned(), run_id.to_owned())]),
+        );
         // The active driver or bounded periodic discovery will observe the durable successor.
         return Ok(());
     };
-    drive_workflow_run_exclusive(state, run_id).await
+    let labels = MetricLabels::from([
+        ("run_id".to_owned(), run_id.to_owned()),
+        ("operation".to_owned(), "drive".to_owned()),
+    ]);
+    state
+        .metrics
+        .add_counter_with_labels("workflow.driver.gate_acquired", 1, labels.clone());
+    let held = state
+        .metrics
+        .span("workflow.driver.gate_held")
+        .labels(labels);
+    let result = drive_workflow_run_exclusive(state, run_id).await;
+    drop(guard);
+    held.finish_result(&result);
+    result
 }
 
 // Internal work quantum, deliberately independent of configured run concurrency.
@@ -27949,6 +27986,7 @@ async fn build_model_turn_request(
         desired_structured_output
     };
     let mut request = ModelTurnRequest {
+        context_lineage: None,
         session_id,
         turn_id: format!("{}-{round}", execution_turn_id(trigger_event)),
         model_id,
@@ -39114,14 +39152,15 @@ async fn complete_workflow_prompt_dispatch(
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     receipt: &serde_json::Value,
     session_id: SessionId,
-    shared_permit: Option<bcode_session::SharedExecutionSessionPermit>,
+    owner: (
+        Option<bcode_session::SharedExecutionSessionPermit>,
+        Option<runtime_work::WorkObservationToken>,
+    ),
     observation: Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError>,
 ) {
+    let (shared_permit, observation_token) = owner;
     let work_id = WorkId::new(request.dispatch_identity.clone());
-    let observation_token = state
-        .runtime_work
-        .observation_token(session_id, &work_id)
-        .await;
+    let retirement_token = observation_token.clone();
     let observation_token = if let Some(token) = observation_token {
         state
             .runtime_work
@@ -39175,7 +39214,11 @@ async fn complete_workflow_prompt_dispatch(
             .await;
     }
     drop(shared_permit);
-    finish_registered_runtime_work(state, session_id, work_id, status, message).await;
+    if let Some(token) = retirement_token
+        && let Some(owned_work) = state.runtime_work.take_observed(&token).await
+    {
+        finish_owned_runtime_work(state, session_id, work_id, status, message, owned_work).await;
+    }
     if let Ok((summary, _)) = result {
         continue_settled_workflow_prompt(state, request, summary).await;
     }
@@ -39945,6 +39988,13 @@ where
     // Install completion ownership before any publication await or test hook.
     // Sender loss means publication ownership was lost, not that the turn was cancelled.
     let (publication_finished, publication_gate) = oneshot::channel::<()>();
+    let observation_token = state
+        .runtime_work
+        .observation_token(
+            target_session_id,
+            &WorkId::new(request.dispatch_identity.clone()),
+        )
+        .await;
     let execution_session_id = target_session_id;
     let request_for_completion = request.clone();
     let state_for_completion = Arc::clone(state);
@@ -39987,7 +40037,7 @@ where
                 &authority_for_completion,
                 &receipt_for_completion,
                 execution_session_id,
-                shared_permit,
+                (shared_permit, observation_token),
                 observation,
             )
             .await;
@@ -40014,7 +40064,7 @@ where
                 &authority_for_completion,
                 &receipt_for_completion,
                 execution_session_id,
-                shared_permit,
+                (shared_permit, observation_token),
                 observation,
             )
             .await;
@@ -41145,6 +41195,17 @@ async fn finish_registered_runtime_work(
         tracing::debug!(%session_id, work_id = %work_id, "runtime work already reached a terminal state");
         return;
     };
+    finish_owned_runtime_work(state, session_id, work_id, status, message, owned_work).await;
+}
+
+async fn finish_owned_runtime_work(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: WorkId,
+    status: RuntimeWorkStatus,
+    message: Option<String>,
+    owned_work: RuntimeWorkSpec,
+) {
     if owned_work.kind == RuntimeWorkKind::Workflow && status.is_terminal() {
         let outcome = match status {
             RuntimeWorkStatus::Completed => "Workflow completed",
@@ -43015,6 +43076,7 @@ const fn response_payload_kind(response: &Response) -> &'static str {
                 "plugin_service_invocation_cancelled"
             }
             ResponsePayload::PluginServiceResult { .. } => "plugin_service_result",
+            ResponsePayload::RuntimeWorkObservations { .. } => "runtime_work_observations",
             ResponsePayload::RuntimeWorkList { .. } => "runtime_work_list",
             ResponsePayload::SkillList { .. } => "skill_list",
             ResponsePayload::ActiveSkills { .. } => "active_skills",
@@ -53022,6 +53084,7 @@ library = "test"
 
     fn request_for_accounting_tests() -> ModelTurnRequest {
         ModelTurnRequest {
+            context_lineage: None,
             session_id: SessionId::new(),
             turn_id: "turn".to_string(),
             model_id: "model".to_string(),
@@ -53914,6 +53977,7 @@ library = "test"
 
     fn test_model_turn_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {
         ModelTurnRequest {
+            context_lineage: None,
             session_id: SessionId::new(),
             turn_id: "turn-test".to_string(),
             model_id: "model-test".to_string(),
@@ -79439,6 +79503,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn bundled_v2_provider_route_emits_positioned_output() {
         let state = test_server_state_with_fake_provider(SessionManager::default());
         let request = ModelTurnRequest {
+            context_lineage: None,
             session_id: SessionId::new(),
             turn_id: "turn-v2".to_owned(),
             model_id: "fake-model".to_owned(),
@@ -91576,6 +91641,26 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    async fn assert_runtime_observations_match_local_owner(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+    ) {
+        let direct = runtime_work_operations::observations(state, session_id, None, 1).await;
+        let remote = client
+            .runtime_work_observations(session_id, None, 1)
+            .await
+            .expect("IPC bounded observations");
+        assert_eq!(remote.local_owner_only, Some(true));
+        assert_eq!(remote.entries.len(), direct.entries.len());
+        assert_eq!(remote.next_after, direct.next_after);
+        assert_eq!(remote.entries[0].work_id, direct.entries[0].work_id);
+        assert_eq!(
+            remote.entries[0].observation, None,
+            "uninstrumented stage stays unknown"
+        );
+    }
+
     async fn serve_runtime_test_clients(
         listener: LocalIpcListener,
         state: Arc<ServerState>,
@@ -91662,6 +91747,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         work_id: &WorkId,
         cancellations: &std::sync::atomic::AtomicUsize,
     ) {
+        assert_runtime_observations_match_local_owner(state, client, session_id).await;
         let before = runtime_work_operations::list(state, session_id).await;
         let history = runtime_work_operations::history(state, session_id, 10)
             .await
@@ -92654,6 +92740,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
 
         let request = ModelTurnRequest {
+            context_lineage: None,
             session_id: SessionId::new(),
             turn_id: "invariant-selector-test".to_owned(),
             model_id: "fake-echo".to_owned(),

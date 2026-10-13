@@ -1273,6 +1273,7 @@ pub fn build_compaction_request(
     turn_id: String,
 ) -> ModelTurnRequest {
     ModelTurnRequest {
+        context_lineage: None,
         session_id,
         turn_id,
         model_id,

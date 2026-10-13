@@ -83,7 +83,7 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
         name: "workflow.stage_run_graph_edit".into(),
         arguments: serde_json::json!({"edit_json":serde_json::to_string(&batch).expect("batch")}),
     };
-    let staged = invoke_delegation_tool(&state, source.id, &staging_call).await;
+    let staged = Box::pin(invoke_delegation_tool(&state, source.id, &staging_call)).await;
     assert!(!staged.is_error, "{}", staged.output);
     let accept = bcode_model::ToolCall {
         id: "accept-cancel".into(),
@@ -91,7 +91,7 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
         arguments: staging_call.arguments.clone(),
     };
     state.start_workflow_driver().await;
-    let pending = invoke_delegation_tool(&state, source.id, &accept).await;
+    let pending = Box::pin(invoke_delegation_tool(&state, source.id, &accept)).await;
     assert!(!pending.is_error, "{}", pending.output);
     assert_eq!(
         representation::graph_pages::revision(&db, "cancel-edit")
@@ -119,7 +119,7 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
     })
     .await;
     finished.expect("receipt acknowledged cancellation");
-    let committed = invoke_delegation_tool(&state, source.id, &accept).await;
+    let committed = Box::pin(invoke_delegation_tool(&state, source.id, &accept)).await;
     assert!(!committed.is_error, "{}", committed.output);
     assert_eq!(
         representation::graph_pages::revision(&db, "cancel-edit")

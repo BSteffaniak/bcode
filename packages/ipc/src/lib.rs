@@ -1265,6 +1265,12 @@ pub enum Request {
         #[serde(default)]
         sources: Option<Vec<String>>,
     },
+    /// Read a bounded page of locally owned runtime observations.
+    RuntimeWorkObservations {
+        session_id: SessionId,
+        after: Option<WorkId>,
+        limit: usize,
+    },
     ListRuntimeWork {
         session_id: SessionId,
     },
@@ -2406,6 +2412,9 @@ pub enum ResponsePayload {
         catalog_revision: u64,
     },
     CatalogUpdatesSubscribed,
+    RuntimeWorkObservations {
+        page: bcode_session_models::RuntimeWorkObservationPage,
+    },
     RuntimeWorkList {
         work: Vec<RuntimeWorkSnapshot>,
     },

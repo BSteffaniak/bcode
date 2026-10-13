@@ -1648,6 +1648,7 @@ fn turn_request(
 ) -> ModelTurnRequest {
     let session_id = bcode_session_models::SessionId::new();
     ModelTurnRequest {
+        context_lineage: None,
         session_id,
         turn_id: format!("provider-conformance-{session_id}"),
         model_id: model_id.to_string(),

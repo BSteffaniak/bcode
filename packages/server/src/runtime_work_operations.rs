@@ -111,6 +111,7 @@ pub async fn observations(
             })
             .collect(),
         next_after: page.next_after,
+        local_owner_only: Some(true),
     }
 }
 

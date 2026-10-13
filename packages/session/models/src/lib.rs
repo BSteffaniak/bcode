@@ -2561,6 +2561,10 @@ pub struct RuntimeWorkObservationPage {
     pub entries: Vec<RuntimeWorkObservationEntry>,
     /// Exclusive cursor for the next live page; absence means this scan reached its end.
     pub next_after: Option<WorkId>,
+    /// Coverage is limited to this serving daemon's local runtime-work owner.
+    /// Absence on older peers is unknown; an empty local page never proves global idleness.
+    #[serde(default)]
+    pub local_owner_only: Option<bool>,
 }
 
 /// Current runtime-work state exposed by application operations.

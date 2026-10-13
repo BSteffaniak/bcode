@@ -161,6 +161,7 @@ impl PromptCacheSimulator {
             },
         );
         let projection = ProviderRequestProjection {
+            context_representation: None,
             provider: Some(profile.provider_id.clone()),
             api_shape: Some(profile.api_shape.clone()),
             message_count: Some(request.messages.len()),
@@ -451,6 +452,7 @@ mod tests {
     fn request(messages: Vec<ModelMessage>, hints: PromptCacheHints) -> ModelTurnRequest {
         let session_id = bcode_session_models::SessionId::new();
         ModelTurnRequest {
+            context_lineage: None,
             session_id,
             turn_id: "t".into(),
             model_id: "sim".into(),

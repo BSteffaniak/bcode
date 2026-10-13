@@ -4388,6 +4388,7 @@ fn model_turn_request(
         });
     }
     Ok(ModelTurnRequest {
+        context_lineage: None,
         session_id: identity.session_id,
         turn_id: identity.turn_id,
         model_id: request.model_id.clone(),
@@ -8474,6 +8475,7 @@ mod tests {
         let provider = FakeProvider::new([
             ProviderTurnEvent::RequestProjection {
                 projection: ProviderRequestProjection {
+                    context_representation: None,
                     provider: Some("example-provider".to_string()),
                     ..ProviderRequestProjection::default()
                 },

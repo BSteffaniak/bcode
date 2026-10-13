@@ -239,6 +239,53 @@ fn shared_test_provenance(
     }
 }
 
+async fn shared_completion_observation_link(
+    state: &ServerState,
+    session_id: crate::SessionId,
+    run_id: &str,
+    pending: &WorkflowActivityAttempt,
+    dispatch: &str,
+    permit: &bcode_session::SharedExecutionSessionPermit,
+) -> bcode_workflow_store::WorkflowExecutionSessionLink {
+    crate::register_workflow_node_runtime_work(
+        state,
+        session_id,
+        &crate::WorkId::new(format!("workflow:{run_id}")),
+        dispatch,
+        "shared prompt".into(),
+        crate::CancellationHandle::WorkflowNode(std::sync::Arc::new(
+            crate::TurnCancelState::default(),
+        )),
+    )
+    .await;
+    assert!(
+        state
+            .runtime_work
+            .bind_shared_execution(session_id, &crate::WorkId::new(dispatch.to_owned()), permit,)
+            .await
+    );
+    bcode_workflow_store::WorkflowExecutionSessionLink::new(
+        run_id.to_owned(),
+        pending.node_id.clone(),
+        pending.activation_id.clone(),
+        1,
+        session_id.to_string(),
+        "fixture".into(),
+        11,
+    )
+}
+
+async fn completion_observation_token(
+    state: &ServerState,
+    session_id: crate::SessionId,
+    dispatch: &str,
+) -> Option<crate::runtime_work::WorkObservationToken> {
+    state
+        .runtime_work
+        .observation_token(session_id, &crate::WorkId::new(dispatch.to_owned()))
+        .await
+}
+
 #[tokio::test]
 async fn shared_completion_waits_for_durable_settlement_before_releasing_guards() {
     let (_root, state, run_id, dispatch) =
@@ -268,36 +315,15 @@ async fn shared_completion_waits_for_durable_settlement_before_releasing_guards(
             .unwrap(),
     );
     let proof = permit.as_ref().unwrap().observation();
-    let link = bcode_workflow_store::WorkflowExecutionSessionLink::new(
-        run_id.clone(),
-        pending.node_id,
-        pending.activation_id,
-        1,
-        parent.id.to_string(),
-        "fixture".into(),
-        11,
-    );
-    crate::register_workflow_node_runtime_work(
+    let link = shared_completion_observation_link(
         &state,
         parent.id,
-        &crate::WorkId::new(format!("workflow:{run_id}")),
+        &run_id,
+        &pending,
         &dispatch,
-        "shared prompt".into(),
-        crate::CancellationHandle::WorkflowNode(std::sync::Arc::new(
-            crate::TurnCancelState::default(),
-        )),
+        permit.as_ref().unwrap(),
     )
     .await;
-    assert!(
-        state
-            .runtime_work
-            .bind_shared_execution(
-                parent.id,
-                &crate::WorkId::new(dispatch.clone()),
-                permit.as_ref().unwrap()
-            )
-            .await
-    );
     let finished = state
         .sessions
         .append_model_turn_finished(
@@ -318,7 +344,11 @@ async fn shared_completion_waits_for_durable_settlement_before_releasing_guards(
         &authority,
         &receipt,
         parent.id,
-        permit.take(),
+        (
+            permit.take(),
+            completion_observation_token(&state, parent.id, &dispatch_request.dispatch_identity)
+                .await,
+        ),
         Ok(bcode_workflow_store::AttemptObservation::Cancelled),
     ));
     assert!(futures::poll!(&mut completion).is_pending());
@@ -397,7 +427,11 @@ async fn failed_shared_settlement_releases_guards_without_terminalizing_attempt(
         &stale_authority,
         &receipt,
         parent.id,
-        permit.take(),
+        (
+            permit.take(),
+            completion_observation_token(&state, parent.id, &dispatch_request.dispatch_identity)
+                .await,
+        ),
         Ok(bcode_workflow_store::AttemptObservation::Cancelled),
     )
     .await;

@@ -137,6 +137,7 @@ fn prepare_request(
     target: &ResolvedModelRequestTarget,
 ) -> ModelTurnRequest {
     ModelTurnRequest {
+        context_lineage: None,
         session_id: input.session_id,
         turn_id: format!("{}-auxiliary-{}", input.session_id, uuid::Uuid::new_v4()),
         model_id: target.model_id.clone(),

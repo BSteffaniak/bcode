@@ -2063,6 +2063,7 @@ mod tests {
 
     fn model_request(turn_id: &str) -> ModelTurnRequest {
         ModelTurnRequest {
+            context_lineage: None,
             session_id: bcode_session_models::SessionId::new(),
             turn_id: turn_id.to_string(),
             model_id: "model".to_string(),

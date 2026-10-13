@@ -273,6 +273,7 @@ where
     fn base_request(&self, mode: PromptCacheMode, with_tools: bool) -> ModelTurnRequest {
         let session_id = bcode_session_models::SessionId::new();
         ModelTurnRequest {
+            context_lineage: None,
             session_id,
             turn_id: format!("prompt-cache-{session_id}"),
             model_id: self.model.model_id.clone(),

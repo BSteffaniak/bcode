@@ -7058,6 +7058,32 @@ impl BcodeClient {
         }
     }
 
+    /// Read bounded, ephemeral stages observed by this daemon's runtime-work owner.
+    ///
+    /// Missing stages remain unknown. The exclusive cursor is best effort, not
+    /// durable resume evidence; rescan to discover arrivals behind the cursor.
+    ///
+    /// # Errors
+    /// Returns an error if the daemon is unavailable or rejects the operation.
+    pub async fn runtime_work_observations(
+        &self,
+        session_id: SessionId,
+        after: Option<bcode_session_models::WorkId>,
+        limit: usize,
+    ) -> Result<bcode_session_models::RuntimeWorkObservationPage, ClientError> {
+        match self
+            .send_request(Request::RuntimeWorkObservations {
+                session_id,
+                after,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::RuntimeWorkObservations { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return recent runtime-work lifecycle events reconstructed from the bounded read model.
     ///
     /// The daemon clamps `limit` to 1 through

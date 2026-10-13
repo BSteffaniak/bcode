@@ -410,6 +410,7 @@ mod tests {
             reasoning_tokens: None,
         };
         let projection = ProviderRequestProjection {
+            context_representation: None,
             cache_point_count: Some(3),
             emitted_cache_point_count: Some(3),
             dropped_cache_point_count: Some(0),

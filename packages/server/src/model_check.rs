@@ -171,6 +171,7 @@ fn check_request(
         .and_then(|model| model.api_surface)
         .or(context.api_surface);
     ModelTurnRequest {
+        context_lineage: None,
         session_id: SessionId::new(),
         turn_id: uuid::Uuid::new_v4().to_string(),
         model_id: id.to_owned(),
