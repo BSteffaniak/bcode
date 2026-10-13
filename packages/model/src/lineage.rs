@@ -22,6 +22,7 @@ pub struct RequestContextLineage {
     /// Host-issued request ordinal; allocate anew after any representation change or retry.
     pub request_ordinal: u64,
     /// Entries whose presence in the normalized request was actually observed by the host.
+    #[serde(deserialize_with = "bounded_entries")]
     pub entries: Vec<ContextLineageEntry>,
     /// Number of entries omitted by the observation bound; not evidence of content omission.
     pub omitted: u64,
@@ -52,6 +53,7 @@ pub struct RequestContextRepresentation {
     /// Must equal the host lineage's exact request ordinal.
     pub request_ordinal: u64,
     /// At most one observation per source; missing observations remain unknown.
+    #[serde(deserialize_with = "bounded_entries")]
     pub entries: Vec<ContextRepresentationEntry>,
     /// Number of lineage entries omitted from this bounded observation.
     pub omitted: u64,
@@ -77,6 +79,41 @@ pub enum ContextRepresentationDisposition {
     Dropped,
     /// Conversion cannot establish the source contribution's representation.
     Unknown,
+}
+
+fn bounded_entries<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Entries<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Entries<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded context observation array")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = Vec::new();
+            while entries.len() < MAX_CONTEXT_LINEAGE_ENTRIES {
+                let Some(entry) = sequence.next_element()? else {
+                    return Ok(entries);
+                };
+                entries.push(entry);
+            }
+            // Probe one excess element without constructing another domain entry or
+            // allocating from the untrusted sequence size hint.
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("oversized context observation"));
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_seq(Entries(std::marker::PhantomData))
 }
 
 impl RequestContextLineage {
@@ -157,6 +194,52 @@ mod tests {
                 block_index: 0,
             }],
         }
+    }
+
+    #[test]
+    fn wire_entry_limits_apply_during_deserialization() {
+        let mut request = lineage();
+        request.entries = (0..MAX_CONTEXT_LINEAGE_ENTRIES)
+            .map(|index| {
+                let mut entry = request.entries[0].clone();
+                entry.source_ordinal = u64::try_from(index).unwrap();
+                entry
+            })
+            .collect();
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(serde_json::from_str::<RequestContextLineage>(&encoded).is_ok());
+        request.entries.push(request.entries[0].clone());
+        assert!(
+            serde_json::from_str::<RequestContextLineage>(
+                &serde_json::to_string(&request).unwrap()
+            )
+            .is_err()
+        );
+        let mut receipt = RequestContextRepresentation {
+            version: 1,
+            request_ordinal: 7,
+            entries: vec![
+                ContextRepresentationEntry {
+                    source_ordinal: 1,
+                    disposition: ContextRepresentationDisposition::Unknown
+                };
+                MAX_CONTEXT_LINEAGE_ENTRIES
+            ],
+            omitted: 0,
+        };
+        assert!(
+            serde_json::from_str::<RequestContextRepresentation>(
+                &serde_json::to_string(&receipt).unwrap()
+            )
+            .is_ok()
+        );
+        receipt.entries.push(receipt.entries[0].clone());
+        assert!(
+            serde_json::from_str::<RequestContextRepresentation>(
+                &serde_json::to_string(&receipt).unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]

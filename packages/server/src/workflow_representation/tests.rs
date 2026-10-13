@@ -1965,6 +1965,34 @@ fn fixture_selected_metrics<'a>(
     (matched, selected)
 }
 
+fn fixture_metric_coverage(selected: &FixtureMetricSelection<'_>) -> (usize, usize, bool, bool) {
+    let groups = selected.len();
+    let samples = selected.values().map(Vec::len).sum();
+    (
+        groups,
+        samples,
+        groups > 16,
+        selected.values().any(|events| events.len() == 2),
+    )
+}
+
+fn fixture_safe_metric_label<'a>(event: &'a bcode_metrics::MetricEvent, key: &str) -> &'a str {
+    match event.labels.get(key).map(String::as_str) {
+        Some(
+            value @ ("owner_admission"
+            | "receipt_publication"
+            | "settlement"
+            | "drive"
+            | "ok"
+            | "error"
+            | "cancelled"
+            | "unfinished"),
+        ) => value,
+        None => "absent",
+        Some(_) => "unrecognized",
+    }
+}
+
 fn fixture_dispatch_metrics(
     report: &bcode_metrics::MetricsReport,
     checkpoint: &str,
@@ -1972,10 +2000,11 @@ fn fixture_dispatch_metrics(
     session: Option<SessionId>,
 ) {
     let (matched, selected) = fixture_selected_metrics(report, dispatch, session);
+    let (groups, samples, groups_omitted, samples_may_be_capped) =
+        fixture_metric_coverage(&selected);
     eprintln!(
-        "fixture-stage={checkpoint} dispatch={dispatch} telemetry-retained={} matching-events={matched} matching-operations={} operation-limit=16 samples-per-operation=2 coverage=bounded-retained-not-complete absence=unknown",
+        "fixture-stage={checkpoint} dispatch={dispatch} telemetry-retained={} matching-events={matched} matching-operations={groups} selected-samples={samples} operation-limit=16 operations-omitted={groups_omitted} samples-per-operation=2 samples-may-be-capped={samples_may_be_capped} coverage=bounded-retained-not-complete absence=unknown",
         report.events.len(),
-        selected.len()
     );
     for (_, samples) in selected
         .iter()
@@ -1989,7 +2018,7 @@ fn fixture_dispatch_metrics(
     {
         for event in samples.iter().rev() {
             eprintln!(
-                "fixture-stage={checkpoint} dispatch={dispatch} metric={} timestamp_ms={} value={} match-scope={} labels={:?}",
+                "fixture-stage={checkpoint} dispatch={dispatch} metric={} timestamp_ms={} value={} match-scope={} operation={} outcome={}",
                 event.name,
                 event.unix_ms,
                 event.value,
@@ -2003,7 +2032,8 @@ fn fixture_dispatch_metrics(
                 } else {
                     "session-only-not-exact-dispatch"
                 },
-                event.labels
+                fixture_safe_metric_label(event, "operation"),
+                fixture_safe_metric_label(event, "outcome")
             );
         }
     }
@@ -2041,6 +2071,76 @@ fn pending_metric_selection_survives_unrelated_recent_crowding() {
     let (matched, selected) = fixture_selected_metrics(&report, "unretained", None);
     assert_eq!(matched, 0);
     assert!(selected.is_empty());
+}
+
+#[test]
+fn pending_metric_matching_rejects_other_dispatch_in_same_session() {
+    let session = SessionId::new();
+    let event = |name: &str, labels| bcode_metrics::MetricEvent {
+        unix_ms: 1,
+        name: name.into(),
+        kind: bcode_metrics::MetricKind::Event,
+        value: 1,
+        labels,
+    };
+    let session_labels =
+        std::collections::BTreeMap::from([("session_id".into(), session.to_string())]);
+    let mut other_labels = session_labels.clone();
+    other_labels.insert("dispatch_identity".into(), "other".into());
+    let report = bcode_metrics::MetricsReport {
+        events: vec![
+            event("workflow.owner.admission.started", other_labels),
+            event("model.provider.service.duration_ms", session_labels),
+            event(
+                "workflow.owner.settlement.started",
+                std::collections::BTreeMap::from([("work_id".into(), "pending".into())]),
+            ),
+        ],
+        ..Default::default()
+    };
+    let (matched, selected) = fixture_selected_metrics(&report, "pending", Some(session));
+    assert_eq!(matched, 2);
+    assert!(
+        !selected
+            .keys()
+            .any(|(name, _)| *name == "workflow.owner.admission.started")
+    );
+    assert_eq!(fixture_metric_coverage(&selected), (2, 2, false, false));
+}
+
+#[test]
+fn pending_metric_coverage_reports_caps_and_redacts_content_labels() {
+    let report = bcode_metrics::MetricsReport {
+        events: (0..17)
+            .flat_map(|operation| {
+                (0..3).map(move |value| bcode_metrics::MetricEvent {
+                    unix_ms: 1,
+                    name: "workflow.writer_queue.wait.duration_ms".into(),
+                    kind: bcode_metrics::MetricKind::Histogram,
+                    value,
+                    labels: std::collections::BTreeMap::from([
+                        ("dispatch_identity".into(), "pending".into()),
+                        ("operation".into(), format!("untrusted-content-{operation}")),
+                        ("outcome".into(), "untrusted-message".into()),
+                    ]),
+                })
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let (matched, selected) = fixture_selected_metrics(&report, "pending", None);
+    assert_eq!(matched, 51);
+    assert_eq!(fixture_metric_coverage(&selected), (17, 34, true, true));
+    assert_eq!(
+        fixture_safe_metric_label(&report.events[0], "operation"),
+        "unrecognized"
+    );
+    assert_eq!(
+        fixture_safe_metric_label(&report.events[0], "outcome"),
+        "unrecognized"
+    );
+    let (_, missing) = fixture_selected_metrics(&report, "unretained", None);
+    assert_eq!(fixture_metric_coverage(&missing), (0, 0, false, false));
 }
 
 async fn fixture_pending_diagnostic(

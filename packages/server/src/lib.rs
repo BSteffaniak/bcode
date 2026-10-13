@@ -15,6 +15,7 @@ mod auxiliary_generation;
 mod child_session_ipc_tests;
 mod context_accounting;
 pub(crate) mod context_compaction;
+mod context_lineage;
 mod image_input;
 mod interaction_operations;
 mod invariant_guidance;
@@ -397,6 +398,7 @@ pub struct ServerState {
     optional_judgement: judgement::OptionalJudgementAccess,
     progress_windows: StdMutex<BTreeMap<SessionId, judgement::ProgressWindow>>,
     workflow_progress_windows: StdMutex<BTreeMap<String, judgement::ProgressWindow>>,
+    context_lineage_captures: StdMutex<context_lineage::Captures>,
     optional_context: StdMutex<
         BTreeMap<SessionId, Vec<(String, bcode_session_models::JudgementContextCandidate)>>,
     >,
@@ -2521,6 +2523,7 @@ impl ServerState {
             optional_judgement: judgement::OptionalJudgementAccess::new(),
             progress_windows: StdMutex::new(BTreeMap::new()),
             workflow_progress_windows: StdMutex::new(BTreeMap::new()),
+            context_lineage_captures: StdMutex::new(context_lineage::Captures::default()),
             optional_context: StdMutex::new(BTreeMap::new()),
             advisory_categorizations: StdMutex::new(BTreeMap::new()),
             tool_catalog: tool_catalog::ToolCatalogCache::default(),
@@ -17685,6 +17688,38 @@ async fn lock_turn_marker_commit(
     Ok(guard)
 }
 
+async fn observe_turn_admission_phase<F, T>(
+    state: &ServerState,
+    labels: &MetricLabels,
+    phase: &'static str,
+    future: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    state
+        .metrics
+        .add_counter_with_labels(format!("{phase}.started"), 1, labels.clone());
+    // Reaching the return boundary is not a claim that a Result succeeded.
+    let mut span = state.metrics.span(phase).labels(labels.clone());
+    let result = future.await;
+    span.finish_with_outcome(&"returned");
+    result
+}
+
+fn turn_admission_diagnostic_labels(
+    session_id: SessionId,
+    metadata: &bcode_session_models::TurnAdmissionMetadata,
+) -> MetricLabels {
+    let mut labels = MetricLabels::from([("session_id".to_owned(), session_id.to_string())]);
+    if let Some(correlation) = metadata.execution.correlation.as_ref() {
+        labels.insert("run_id".to_owned(), correlation.execution_id.clone());
+        labels.insert("activation_id".to_owned(), correlation.unit_id.clone());
+        labels.insert("attempt".to_owned(), correlation.attempt.to_string());
+    }
+    labels
+}
+
 async fn submit_session_model_turn_admission_inner(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -17694,34 +17729,36 @@ async fn submit_session_model_turn_admission_inner(
     cancel_state: Option<Arc<TurnCancelState>>,
 ) -> Result<SubmittedModelTurn, ServerError> {
     let (sender, receiver) = oneshot::channel();
-    #[cfg(test)]
-    let probe_correlation = admission_metadata.execution.correlation.clone();
-    #[cfg(test)]
-    let probe_timer = |stage| {
-        probe_correlation.as_ref().map(|correlation| {
-            workflow_representation::fanout_stages::turn_stage_timer(correlation, session_id, stage)
-        })
-    };
-    #[cfg(test)]
-    let stage_timer = probe_timer(
-        workflow_representation::fanout_stages::FanoutAdmissionStage::TurnAdmissionLock,
-    );
+    let diagnostic_labels = turn_admission_diagnostic_labels(session_id, &admission_metadata);
     let client_id = ClientId::new();
-    let admission_lock = turn_admission_lock(state, session_id).await;
-    let admission_guard = lock_turn_admission(&admission_lock, cancel_state.as_deref()).await?;
-    #[cfg(test)]
-    drop(stage_timer);
-    #[cfg(test)]
-    let stage_timer = probe_timer(
-        workflow_representation::fanout_stages::FanoutAdmissionStage::BeginTurnAdmission,
-    );
-    let ownership = queued_turn_ownership(state, session_id).await?;
-    let admission_commit = lock_turn_marker_commit(cancel_state.as_deref()).await?;
-    #[cfg(test)]
-    drop(stage_timer);
-    #[cfg(test)]
-    let stage_timer =
-        probe_timer(workflow_representation::fanout_stages::FanoutAdmissionStage::AdmitTurn);
+    let admission_lock = observe_turn_admission_phase(
+        state,
+        &diagnostic_labels,
+        "model.admission.lock_lookup",
+        turn_admission_lock(state, session_id),
+    )
+    .await;
+    let admission_guard = observe_turn_admission_phase(
+        state,
+        &diagnostic_labels,
+        "model.admission.lock_wait",
+        lock_turn_admission(&admission_lock, cancel_state.as_deref()),
+    )
+    .await?;
+    let ownership = observe_turn_admission_phase(
+        state,
+        &diagnostic_labels,
+        "model.admission.queued_ownership",
+        queued_turn_ownership(state, session_id),
+    )
+    .await?;
+    let admission_commit = observe_turn_admission_phase(
+        state,
+        &diagnostic_labels,
+        "model.admission.marker_commit",
+        lock_turn_marker_commit(cancel_state.as_deref()),
+    )
+    .await?;
     let (admission, user_event) = Box::pin(admit_turn_inner(
         state,
         session_id,
@@ -17756,11 +17793,6 @@ async fn submit_session_model_turn_admission_inner(
         return Ok(SubmittedModelTurn::Existing(receipt));
     }
     let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
-    #[cfg(test)]
-    drop(stage_timer);
-    #[cfg(test)]
-    let stage_timer =
-        probe_timer(workflow_representation::fanout_stages::FanoutAdmissionStage::Enqueue);
     drop(admission_commit);
     drop(admission_guard);
     Box::pin(enqueue_followup_command(
@@ -17778,8 +17810,6 @@ async fn submit_session_model_turn_admission_inner(
         },
     ))
     .await?;
-    #[cfg(test)]
-    drop(stage_timer);
     Ok(SubmittedModelTurn::Started {
         receipt,
         completion: receiver,
@@ -23073,6 +23103,30 @@ async fn run_model_turn_round(
         streaming,
         config,
     } = round;
+    let mut dispatch_request = request.clone();
+    if let Some(lineage) = &mut dispatch_request.context_lineage {
+        if lineage.validate(&dispatch_request.messages).is_ok() {
+            if let Some(ordinal) = context_lineage::fresh_request_ordinal() {
+                lineage.request_ordinal = ordinal;
+                if (state.observability.persist_model_requests
+                    || state.observability.debug_enabled())
+                    && let Ok(mut captures) = state.context_lineage_captures.lock()
+                {
+                    captures.insert(session_id, &dispatch_request.turn_id, lineage);
+                }
+            } else {
+                dispatch_request.context_lineage = None;
+            }
+        } else {
+            dispatch_request.context_lineage = None;
+        }
+    }
+    let request = &dispatch_request;
+    let _capture_lease = context_lineage::CaptureLease {
+        captures: &state.context_lineage_captures,
+        session: session_id,
+        turn: &request.turn_id,
+    };
     let round_start = Instant::now();
     let provider_label = provider_plugin_id.unwrap_or("<auto>").to_string();
     let provider_labels = provider_lifecycle_metric_labels(
@@ -25043,7 +25097,14 @@ async fn handle_provider_turn_event(
             .await;
         }
         ProviderTurnEvent::RequestProjection { projection } => {
-            handle_provider_request_projection_event(state, session_id, turn_id, projection).await;
+            handle_provider_request_projection_event(
+                state,
+                session_id,
+                provider_turn_id,
+                turn_id,
+                projection,
+            )
+            .await;
         }
         ProviderTurnEvent::ProviderMetadata { key, value } => {
             handle_provider_metadata_event(state, session_id, turn_id, key, value, outcome).await;
@@ -25366,9 +25427,20 @@ async fn handle_provider_usage_event(
 async fn handle_provider_request_projection_event(
     state: &ServerState,
     session_id: SessionId,
+    provider_turn_id: &str,
     turn_id: &str,
-    projection: bcode_model::ProviderRequestProjection,
+    mut projection: bcode_model::ProviderRequestProjection,
 ) {
+    if let Some(receipt) = &projection.context_representation {
+        let accepted = state
+            .context_lineage_captures
+            .lock()
+            .is_ok_and(|mut captures| captures.observe(session_id, provider_turn_id, receipt));
+        if !accepted {
+            // Ignore unverified request-only metadata without suppressing unrelated projection telemetry.
+            projection.context_representation = None;
+        }
+    }
     append_provider_event_trace(
         state,
         session_id,
@@ -27739,6 +27811,7 @@ async fn build_model_turn_request(
             });
         }
     }
+    let mut incorporated_lineage = context_lineage::Incorporated::default();
     // Optional evidence is request-local; canonical messages remain in their original order.
     if let Some((token, observation)) = &static_context.optional_context_owner {
         let cancel = TurnCancelState {
@@ -27746,8 +27819,15 @@ async fn build_model_turn_request(
             judgement_observation: StdMutex::new(observation.clone()),
             ..TurnCancelState::default()
         };
-        append_turn_optional_context(state, session_id, execution, &mut messages, config, &cancel)
-            .await;
+        incorporated_lineage = append_turn_optional_context(
+            state,
+            session_id,
+            execution,
+            &mut messages,
+            config,
+            &cancel,
+        )
+        .await;
         judgement_history::append(
             state,
             session_id,
@@ -28072,6 +28152,8 @@ async fn build_model_turn_request(
         &mut request,
     ))
     .await;
+    request.context_lineage =
+        context_lineage::final_lineage(&request.messages, &incorporated_lineage);
     Box::pin(append_negotiated_feature_fidelity_events(
         state,
         session_id,
@@ -30964,16 +31046,16 @@ async fn append_turn_optional_context(
     messages: &mut [ModelMessage],
     config: &bcode_config::BcodeConfig,
     cancel: &TurnCancelState,
-) {
+) -> context_lineage::Incorporated {
     if !execution.historical_context.is_empty()
         && state
             .optional_context
             .lock()
             .is_ok_and(|registry| registry.get(&session_id).is_none_or(Vec::is_empty))
     {
-        return;
+        return context_lineage::Incorporated::default();
     }
-    append_optional_context(state, session_id, messages, config, cancel).await;
+    append_optional_context(state, session_id, messages, config, cancel).await
 }
 
 async fn append_optional_context(
@@ -30982,7 +31064,7 @@ async fn append_optional_context(
     messages: &mut [ModelMessage],
     config: &bcode_config::BcodeConfig,
     cancel: &TurnCancelState,
-) {
+) -> context_lineage::Incorporated {
     let captured = state
         .optional_context
         .lock()
@@ -31001,7 +31083,7 @@ async fn append_optional_context(
         !candidates.is_empty(),
     );
     if candidates.is_empty() || cancel.is_cancelled() {
-        return;
+        return context_lineage::Incorporated::default();
     }
     let task = optional_context_task(messages);
     let selection =
@@ -31009,7 +31091,7 @@ async fn append_optional_context(
     let judgement =
         prepare_context_judgement(state, &selection, config, cancel, &observation).await;
     if cancel.is_cancelled() {
-        return;
+        return context_lineage::Incorporated::default();
     }
     let baseline = || {
         let mut remaining = budget_bytes;
@@ -31060,14 +31142,16 @@ async fn append_optional_context(
         baseline()
     };
     if cancel.is_cancelled() {
-        return;
+        return context_lineage::Incorporated::default();
     }
-    let incorporated = incorporate_optional_context(messages, &captured, &included);
+    let (incorporated, lineage) =
+        incorporate_optional_context_tracked(messages, &captured, &included);
     let final_selection = selection_observation(&originals, &order, &incorporated);
     observation.finish(
         advisory_applied && incorporated == included,
         final_selection,
     );
+    lineage
 }
 
 fn optional_context_task(messages: &[ModelMessage]) -> String {
@@ -31151,11 +31235,21 @@ fn validated_context_admission(
         .then_some(admitted)
 }
 
+#[cfg(test)]
 fn incorporate_optional_context(
     messages: &mut [ModelMessage],
     captured: &[(String, bcode_session_models::JudgementContextCandidate)],
     included: &[String],
 ) -> Vec<String> {
+    incorporate_optional_context_tracked(messages, captured, included).0
+}
+
+fn incorporate_optional_context_tracked(
+    messages: &mut [ModelMessage],
+    captured: &[(String, bcode_session_models::JudgementContextCandidate)],
+    included: &[String],
+) -> (Vec<String>, context_lineage::Incorporated) {
+    let mut lineage = context_lineage::Incorporated::default();
     let mut incorporated = Vec::new();
     for id in included {
         if let Some((invocation_id, candidate)) =
@@ -31179,12 +31273,16 @@ fn incorporate_optional_context(
                 );
                 if !result.output.contains(&candidate.snippet) {
                     result.output.push_str(&evidence);
+                    if lineage.calls.len() < bcode_model::lineage::MAX_CONTEXT_LINEAGE_ENTRIES {
+                        let _ = lineage.record_incorporation();
+                    }
                 }
                 incorporated.push(id.clone());
             }
         }
     }
-    incorporated
+    lineage.omitted = included.len().saturating_sub(lineage.calls.len()) as u64;
+    (incorporated, lineage)
 }
 
 /// Invoke one uniquely discovered advisory service without granting tool or artifact authority.
@@ -49430,6 +49528,39 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 std::slice::from_ref(&candidate.id)
             )
             .is_empty()
+        );
+        let (included, lineage) = incorporate_optional_context_tracked(
+            &mut absent,
+            &captured,
+            std::slice::from_ref(&candidate.id),
+        );
+        assert!(included.is_empty());
+        assert!(lineage.calls.is_empty());
+        assert_eq!(lineage.omitted, 1);
+        let mut retained = vec![original.clone()];
+        let (_, lineage) = incorporate_optional_context_tracked(
+            &mut retained,
+            &captured,
+            std::slice::from_ref(&candidate.id),
+        );
+        let final_lineage = context_lineage::final_lineage(&retained, &lineage).unwrap();
+        assert!(final_lineage.validate(&retained).is_ok());
+        assert!(final_lineage.entries.iter().any(|entry| entry.mandatory));
+        if !lineage.calls.is_empty() {
+            assert!(final_lineage.entries.iter().any(|entry| !entry.mandatory));
+        }
+        let mut final_request = test_model_turn_request(retained.clone());
+        final_request.context_lineage = Some(final_lineage.clone());
+        let wire = serde_json::to_value(&final_request).unwrap();
+        let decoded: ModelTurnRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.context_lineage, Some(final_lineage));
+        assert!(
+            decoded
+                .context_lineage
+                .as_ref()
+                .unwrap()
+                .validate(&decoded.messages)
+                .is_ok()
         );
         assert_eq!(
             absent, unchanged,

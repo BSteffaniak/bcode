@@ -20,10 +20,6 @@ pub enum FanoutAdmissionStage {
     SessionLink,
     Submit,
     OwnerPersistence,
-    TurnAdmissionLock,
-    BeginTurnAdmission,
-    AdmitTurn,
-    Enqueue,
     Catalog,
     RepositoryDiscovery,
     DynamicContext,
@@ -147,14 +143,6 @@ pub fn child_creation_observer(
             append(active, Observation::ChildCreation(observation));
         }
     })
-}
-
-pub fn turn_stage_timer(
-    correlation: &bcode_session_models::TurnExecutionCorrelation,
-    session_id: crate::SessionId,
-    stage: FanoutAdmissionStage,
-) -> StageTimer {
-    StageTimer::new(&correlation.execution_id, Some(session_id), None, stage)
 }
 
 pub struct StageTimer {
