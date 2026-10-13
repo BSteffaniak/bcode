@@ -63,12 +63,14 @@ pub enum Category {
 impl Category {
     const fn message(self) -> &'static str {
         match self {
-            Self::Code => "Diagnostic advisory: inspect the reported code or input defect.",
+            Self::Code => {
+                "Diagnostic advisory: compare the failing operation's reported inputs with the documented contract before changing code; rerun only after inspecting the mismatch."
+            }
             Self::Environment => {
-                "Diagnostic advisory: inspect the operation's environment prerequisites."
+                "Diagnostic advisory: verify the missing prerequisite's documented preparation and configured location before retrying; do not substitute or fabricate required data."
             }
             Self::Auth => {
-                "Diagnostic advisory: inspect authentication or authorization; permissions are unchanged."
+                "Diagnostic advisory: check the denied operation's required authorization; do not retry with broader access or change permissions without approval."
             }
             Self::Transient => {
                 "Diagnostic advisory: the failure may be temporary; no operation was retried."
@@ -157,10 +159,39 @@ pub fn diagnostic_indicators(excerpt: &str) -> BTreeSet<&'static str> {
     if excerpt.len() > MAX_EXCERPT_BYTES {
         return BTreeSet::new();
     }
+    // Terminal tool output is a structured envelope. Decode its output text before
+    // matching boundaries: JSON's literal `\\nKeyError` otherwise looks like a word.
+    // Metadata, command and cwd are never diagnostic evidence.
+    if let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(excerpt) {
+        if envelope.get("mode").and_then(serde_json::Value::as_str) == Some("terminal")
+            && envelope
+                .get("exit_code")
+                .is_some_and(|value| value.is_null() || value.as_i64().is_some())
+            && envelope
+                .get("timed_out")
+                .is_some_and(serde_json::Value::is_boolean)
+            && envelope
+                .get("cancelled")
+                .is_some_and(serde_json::Value::is_boolean)
+        {
+            return envelope
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(BTreeSet::new, text_diagnostic_indicators);
+        }
+        return BTreeSet::new();
+    }
+    text_diagnostic_indicators(excerpt)
+}
+
+fn text_diagnostic_indicators(excerpt: &str) -> BTreeSet<&'static str> {
     let lower = excerpt.to_ascii_lowercase();
     [
         ("syntax_error", &["syntax error", "syntaxerror"][..]),
         ("type_error", &["type error", "typeerror"][..]),
+        ("key_error", &["keyerror"][..]),
+        ("index_error", &["indexerror"][..]),
+        ("value_error", &["valueerror"][..]),
         (
             "compilation_failed",
             &["compilation failed", "could not compile"][..],
@@ -352,9 +383,17 @@ fn apply(request: &OptionalRequest, response: &judgement::Response) -> Option<Ad
         "inconclusive" => Category::Inconclusive,
         _ => return None,
     };
+    let key_error = matches!(&request.request.state, State::Structured(facts)
+        if facts.get("diagnostic_indicators").and_then(serde_json::Value::as_array)
+            .is_some_and(|indicators| indicators.iter().any(|indicator| indicator.as_str() == Some("key_error"))));
+    let message = if category == Category::Code && key_error {
+        "Diagnostic advisory: the operation reported a missing mapping key. Compare the selected schema/configuration with the actual input fields before editing code; a KeyError alone does not establish a missing environment prerequisite."
+    } else {
+        category.message()
+    };
     Some(Advisory {
         category,
-        message: category.message().into(),
+        message: message.into(),
     })
 }
 
@@ -434,6 +473,115 @@ mod tests {
             std::ptr::from_ref(fixture).cast_mut().cast(),
             bcode_plugin_sdk::ServiceCancellation::default(),
         )
+    }
+
+    #[test]
+    fn terminal_envelope_decodes_error_boundaries_and_ignores_metadata() {
+        let mut request = input();
+        request.output_excerpt = serde_json::json!({
+            "mode":"terminal", "exit_code":1, "timed_out":false, "cancelled":false,
+            "command":"python3 report.py", "cwd":"/private/workspace",
+            "output":"Traceback (most recent call last):\n  row[fields[\"id\"]]\nKeyError: 'id'\n"
+        })
+        .to_string();
+        let query = judgement_request(&request).unwrap();
+        assert_eq!(
+            diagnostic_indicators(&request.output_excerpt),
+            BTreeSet::from(["key_error"])
+        );
+        let State::Structured(facts) = query.request.state else {
+            panic!("bounded facts required")
+        };
+        assert_eq!(
+            facts["diagnostic_indicators"],
+            serde_json::json!(["key_error"])
+        );
+        request.is_error = false;
+        assert!(judgement_request(&request).is_none());
+        request.is_error = true;
+        for envelope in [
+            serde_json::json!({"mode":"terminal", "exit_code":1, "timed_out":false, "cancelled":false,
+                "command":"KeyError", "cwd":"FileNotFoundError", "output":"no diagnostic text"}),
+            serde_json::json!({"mode":"terminal", "exit_code":1, "timed_out":"false", "cancelled":false,
+                "output":"KeyError"}),
+            serde_json::json!({"output":"KeyError"}),
+        ] {
+            request.output_excerpt = envelope.to_string();
+            assert!(judgement_request(&request).is_none());
+        }
+    }
+
+    #[test]
+    fn recognized_python_mapping_failure_retains_bounded_actionable_facts() {
+        let mut request = input();
+        request.output_excerpt = "Traceback (most recent call last):\n  File \"report.py\", line 7, in <module>\nKeyError: 'order_id'\n\n[Source bytes: 494; SHA-256: omitted]".into();
+        let original = request.clone();
+        let query = judgement_request(&request).unwrap();
+        assert_eq!(
+            query.request.state,
+            State::Structured(serde_json::json!({
+                "diagnostic_indicators": ["key_error"],
+                "is_error": true, "partial": false, "excerpt_truncated": false,
+            }))
+        );
+        let response: judgement::Response = serde_json::from_value(serde_json::json!({
+            "answers": {QUESTION_ID: {"kind":"choice", "selected":"code",
+                "probabilities":null, "confidence":null}}, "usage":null
+        }))
+        .unwrap();
+        let advisory = apply(&query, &response).unwrap();
+        assert_eq!(advisory.category, Category::Code);
+        assert!(advisory.message.contains("selected schema/configuration"));
+        assert!(advisory.message.contains("does not establish"));
+        assert!(!advisory.message.contains("order_id"));
+        assert!(advisory.message.len() <= 512);
+        assert_eq!(request, original);
+        let unavailable = classify(&ServiceBridge::default(), &request).unwrap();
+        assert!(unavailable.advisory.is_none());
+        assert_eq!(
+            unavailable.trigger,
+            Some(judgement::TriggerDisposition::Triggered)
+        );
+    }
+
+    #[test]
+    fn recognized_errors_do_not_invent_truncated_or_successful_evidence() {
+        let mut request = input();
+        for text in [
+            "KeyError: 'id'",
+            "IndexError: list index out of range",
+            "ValueError: invalid literal",
+        ] {
+            request.output_excerpt = text.into();
+            assert!(judgement_request(&request).is_some());
+            request.is_error = false;
+            assert!(judgement_request(&request).is_none());
+            request.is_error = true;
+        }
+        // Projection framing proves omitted content, not a particular failure cause.
+        request.output_excerpt = "[tool output truncated for model context: original 742 chars / 742 bytes. No readable artifact locator is available]".into();
+        request.excerpt_truncated = true;
+        assert!(judgement_request(&request).is_none());
+        request.output_excerpt = "notakeyerror keyerror_suffix".into();
+        assert!(judgement_request(&request).is_none());
+        request.output_excerpt = "KeyError: 'id'".repeat(MAX_EXCERPT_BYTES);
+        assert!(judgement_request(&request).is_none());
+    }
+
+    #[test]
+    fn cancelled_recognized_failure_never_dispatches_or_advises() {
+        let mut request = input();
+        request.output_excerpt = "KeyError: 'id'".into();
+        let fixture = Fixture {
+            calls: AtomicUsize::new(0),
+            response: serde_json::json!({"response":null}),
+        };
+        let context = context(&request, bridge(&fixture));
+        context.cancellation.cancel();
+        let reply = invoke(&context);
+        let response: TriageResponse = serde_json::from_slice(&reply.payload).unwrap();
+        assert!(response.advisory.is_none());
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -719,7 +867,15 @@ mod tests {
                     "probabilities": null, "confidence": null}}, "usage": null,
             }))
             .unwrap();
-            assert_eq!(apply(&request, &response).unwrap().category, expected);
+            let advisory = apply(&request, &response).unwrap();
+            assert_eq!(advisory.category, expected);
+            assert!(advisory.message.len() <= 512);
+            assert!(!advisory.message.contains("private"));
+            if expected == Category::Auth {
+                assert!(advisory.message.contains("without approval"));
+            } else {
+                assert!(advisory.message.contains("configured location"));
+            }
             assert_eq!(input, before);
 
             // The same words in a successful operation are not a failure trigger.

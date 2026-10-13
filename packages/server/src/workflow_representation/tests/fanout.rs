@@ -44,6 +44,7 @@ async fn fanout_real_provider_members_overlap_at_32_and_100() {
 
 async fn fanout_overlap(count: u32) {
     let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+    let mut cleanup = FixtureCleanup::new(&state);
     let _release =
         ReleaseGate(state.selected_provider_context.settings["delegation_fixture_gate"].clone());
     let leaf = parallel_provider_definition().nodes["left"].clone();
@@ -68,24 +69,38 @@ async fn fanout_overlap(count: u32) {
     representation::admit(&db, &run, &definition)
         .await
         .expect("fixture typed admission");
+    let started = std::time::Instant::now();
+    let drive_state = std::sync::Arc::clone(&state);
+    let mut initial_drive = OwnedFixtureTask::new(
+        &state,
+        tokio::spawn(async move {
+            driver::drive(&drive_state, "fanout")
+                .await
+                .expect("fixture drive");
+        }),
+    );
     let initial = tokio::time::timeout(
         std::time::Duration::from_secs(u64::from(count) * 2),
-        driver::drive(&state, "fanout"),
+        initial_drive.handle_mut(),
     )
     .await;
     if initial.is_err() {
+        diagnose_fanout_before_failure_cleanup(&state, count, started).await;
         let pending = representation::attempts::pending(&db, "fanout", None, 100).await;
         bcode_fake_provider_plugin::release_fake_event_script_gate(
             &state.selected_provider_context.settings["delegation_fixture_gate"],
         );
+        let diagnostic = finish_overdue_fanout_drive(&state, &mut initial_drive).await;
         panic!(
-            "initial drive did not return at external wait; pending_count={:?}",
-            pending.map(|rows| rows.len())
+            "initial drive overdue; pending_count={:?}; {diagnostic}",
+            pending.map(|rows| rows.len()),
         );
     }
     initial
         .expect("bounded drive")
         .expect("materialize and dispatch");
+    initial_drive.disarm_joined();
+    drop(initial_drive);
     let pending = representation::attempts::pending(&db, "fanout", None, 100)
         .await
         .expect("overlap");
@@ -107,6 +122,7 @@ async fn fanout_overlap(count: u32) {
                     .expect("run")
                     .status
                     == bcode_workflow::RunStatus::Completed
+                    && state.runtime_work.active_count().await == 0
                 {
                     break;
                 }
@@ -121,6 +137,52 @@ async fn fanout_overlap(count: u32) {
             .await
             .map(|v| v.len())
     );
+    cleanup.finish_run("fanout").await;
+    drop(cleanup);
+}
+
+async fn diagnose_fanout_before_failure_cleanup(
+    state: &ServerState,
+    count: u32,
+    started: std::time::Instant,
+) {
+    // This observation precedes gate release and cleanup's shutdown request.
+    eprintln!(
+        "fanout-initial-deadline count={count} elapsed={:?} shutdown_requested={} before_failure_cleanup=true",
+        started.elapsed(),
+        state
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
+    let observed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        let run = status(state, "fanout").await;
+        let canonical = match run {
+            Ok(Some(run)) => format!("{:?}", run.status),
+            Ok(None) => "missing".into(),
+            Err(_) => "unavailable".into(),
+        };
+        eprintln!("fanout-initial-deadline count={count} elapsed={:?} canonical_status={canonical} active_registrations={} before_failure_cleanup=true", started.elapsed(), state.runtime_work.active_count().await);
+    }).await;
+    if observed.is_err() {
+        eprintln!(
+            "fanout-initial-deadline count={count} elapsed={:?} observation=timeout before_failure_cleanup=true",
+            started.elapsed()
+        );
+    }
+}
+
+async fn finish_overdue_fanout_drive(
+    state: &std::sync::Arc<ServerState>,
+    task: &mut OwnedFixtureTask,
+) -> String {
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(2), task.handle_mut()).await;
+    if let Ok(result) = joined {
+        result.expect("overdue fixture drive task");
+        task.disarm_joined();
+    }
+    let diagnostic = bounded_run_diagnostic(state, "fanout").await;
+    shutdown_fixture_driver(state, true).await;
+    diagnostic
 }
 
 pub(super) struct ReleaseGate(pub(super) String);
@@ -135,6 +197,7 @@ impl Drop for ReleaseGate {
 async fn normal_start_fanout_respects_cap8_and_uncapped32() {
     for cap in [Some(8), None] {
         let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+        let mut cleanup = FixtureCleanup::new(&state);
         let gate = ReleaseGate(
             state.selected_provider_context.settings["delegation_fixture_gate"].clone(),
         );
@@ -190,7 +253,6 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
         } else {
             String::new()
         };
-        stop_fixture_driver(&state).await;
         assert!(
             result.is_ok(),
             "normal scheduler completion cap={cap:?}: {diagnostic}"
@@ -208,6 +270,8 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
             assert_eq!(member["index"], serde_json::json!(index));
             assert_eq!(member["value"], serde_json::json!(9));
         }
+        cleanup.finish_run("normal-fanout").await;
+        drop(cleanup);
     }
 }
 
@@ -384,6 +448,7 @@ async fn start_public_in_workspace(
     workspace: std::path::PathBuf,
     observe_timeout: bool,
 ) {
+    let started = std::time::Instant::now();
     let parent = state
         .sessions
         .create_session(None, workspace)
@@ -402,44 +467,69 @@ async fn start_public_in_workspace(
         )
         .expect("definition");
     eprintln!("bounded provider delivery diagnosis run={run_id} cap={cap:?} starting");
-    let admission = crate::workflow_operations::start_run(
+    let admission_state = std::sync::Arc::clone(state);
+    let admission_run = run_id.to_owned();
+    let mut admission = OwnedFixtureTask::new(
         state,
-        bcode_workflow::WorkflowRunStartRequest {
-            definition_id: identity.definition_id,
-            definition_version: identity.definition_version,
-            run_id: Some(run_id.into()),
-            workspace_snapshot: "fixture".into(),
-            parent_session_id: parent.id,
-            parent_session_generation: None,
-            binding: None,
-            input: Some(input),
-            limits: bcode_workflow::WorkflowRunLimits {
-                concurrency_cap: cap,
-                ..Default::default()
-            },
-        },
-        None,
+        tokio::spawn(async move {
+            crate::workflow_operations::start_run(
+                &admission_state,
+                bcode_workflow::WorkflowRunStartRequest {
+                    definition_id: identity.definition_id,
+                    definition_version: identity.definition_version,
+                    run_id: Some(admission_run),
+                    workspace_snapshot: "fixture".into(),
+                    parent_session_id: parent.id,
+                    parent_session_generation: None,
+                    binding: None,
+                    input: Some(input),
+                    limits: bcode_workflow::WorkflowRunLimits {
+                        concurrency_cap: cap,
+                        ..Default::default()
+                    },
+                },
+                None,
+            )
+            .await
+            .expect("fixture admission application");
+        }),
     );
-    tokio::pin!(admission);
-    // The observation deadline must not drop an authoritative admission future.
+    // The observation deadline must not drop an authoritative admission task.
     let overdue = if observe_timeout {
         if let Ok(result) =
-            tokio::time::timeout(std::time::Duration::from_secs(40), &mut admission).await
+            tokio::time::timeout(std::time::Duration::from_secs(40), admission.handle_mut()).await
         {
             result.expect("normal start");
             false
         } else {
+            // Unblock only this fixture's gate before waiting for the retained admission.
+            if let Some(gate) = state
+                .selected_provider_context
+                .settings
+                .get("delegation_fixture_gate")
+            {
+                bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
+            }
+            fixture_stage_diagnostic(state, "admission-timeout-after-gate-release", started).await;
             eprintln!(
                 "normal start observation overdue: {}",
                 bounded_run_diagnostic(state, run_id).await
             );
-            admission.await.expect("overdue admission settled");
+            tokio::time::timeout(std::time::Duration::from_secs(2), admission.handle_mut())
+                .await
+                .expect("admission unresolved after owned gate release; join handle retained")
+                .expect("overdue admission task");
             true
         }
     } else {
-        admission.await.expect("probe admission settled");
+        tokio::time::timeout(std::time::Duration::from_secs(40), admission.handle_mut())
+            .await
+            .expect("probe admission unresolved; join handle retained")
+            .expect("probe admission task");
         false
     };
+    admission.disarm_joined();
+    drop(admission);
     if overdue {
         // Release the fixture provider gate before reporting a failure, after admission settled.
         if let Some(gate) = state
@@ -450,7 +540,7 @@ async fn start_public_in_workspace(
             bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
         }
         let _ = wait_public(state, run_id).await;
-        stop_fixture_driver(state).await;
+        shutdown_fixture_driver(state, true).await;
         panic!(
             "bounded normal start observation exceeded 40s cap={cap:?}; admission retained to settlement"
         );

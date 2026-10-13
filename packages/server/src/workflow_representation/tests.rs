@@ -616,6 +616,7 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
         bcode_workflow::PromptContextTarget::SharedParentSequential,
     )
     .await;
+    let mut cleanup = FixtureCleanup::new(&state);
     let parent = status(&state, "new")
         .await
         .unwrap()
@@ -670,6 +671,8 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
             .await
             .unwrap()
     );
+    cleanup.finish().await;
+    drop(cleanup);
 }
 
 #[tokio::test]
@@ -985,6 +988,7 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
     let store = bcode_workflow_store::WorkflowStore::create_coexistence_baseline(root.path())
         .expect("baseline");
     let state = authentic_loop_server(sessions, store);
+    let mut cleanup = FixtureCleanup::new(&state);
     let request = bcode_loop_plugin::test_loop_start_request(parent.id, 2).expect("authentic loop");
     let run_id = request.run_id.clone().expect("run identity");
     let response = crate::workflow_operations::start(
@@ -1048,6 +1052,8 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
             .expect("legacy lookup")
             .is_none()
     );
+    cleanup.finish().await;
+    drop(cleanup);
     drop(state);
 }
 
@@ -1314,6 +1320,10 @@ async fn typed_coordinator_stages_and_publishes_delegation_through_normal_tool()
 
 async fn run_typed_delegation() {
     let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+    let mut cleanup = FixtureCleanup::new(&state);
+    let _gate = fanout::ReleaseGate(
+        state.selected_provider_context.settings["delegation_fixture_gate"].clone(),
+    );
     state.start_workflow_driver().await;
     crate::drive_workflow_run(&state, "new")
         .await
@@ -1389,6 +1399,12 @@ async fn run_typed_delegation() {
     })
     .await;
     finished.expect("delegated completion");
+    assert_delegation_sessions_are_unique(&state).await;
+    cleanup.finish().await;
+    drop(cleanup);
+}
+
+async fn assert_delegation_sessions_are_unique(state: &ServerState) {
     let children = state.sessions.all_session_summaries().await;
     for node in ["agent", "left", "right", "final"] {
         assert_eq!(
@@ -1405,7 +1421,6 @@ async fn run_typed_delegation() {
             1
         );
     }
-    stop_fixture_driver(&state).await;
 }
 
 async fn invoke_delegation_tool(
@@ -1642,18 +1657,381 @@ async fn takeover_receipt_fixture_inner(with_receipt: bool) {
     drop(state);
 }
 
-async fn stop_fixture_driver(state: &ServerState) {
+struct FixtureCleanup {
+    state: std::sync::Arc<ServerState>,
+    completed: bool,
+}
+
+impl FixtureCleanup {
+    fn new(state: &std::sync::Arc<ServerState>) -> Self {
+        Self {
+            state: std::sync::Arc::clone(state),
+            completed: false,
+        }
+    }
+
+    async fn finish_run(&mut self, run_id: &str) {
+        let run = status(&self.state, run_id)
+            .await
+            .expect("cleanup canonical status")
+            .expect("cleanup run");
+        assert!(
+            matches!(
+                run.status,
+                bcode_workflow::RunStatus::Completed
+                    | bcode_workflow::RunStatus::Failed
+                    | bcode_workflow::RunStatus::Cancelled
+            ),
+            "whole canonical run must settle before successful cleanup"
+        );
+        self.finish().await;
+    }
+
+    async fn finish(&mut self) {
+        drain_fixture_supervisor(&self.state)
+            .await
+            .expect("fixture supervisor settlement");
+        stop_fixture_driver(&self.state).await;
+        self.completed = true;
+    }
+}
+
+impl Drop for FixtureCleanup {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Some(gate) = self
+            .state
+            .selected_provider_context
+            .settings
+            .get("delegation_fixture_gate")
+        {
+            bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
+        }
+        // Synchronous panic fallback requests normal shutdown, never retires live work.
+        self.state
+            .shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.state.shutdown.send(());
+        let state = std::sync::Arc::clone(&self.state);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let cleanup_state = std::sync::Arc::clone(&state);
+            let handle = runtime.spawn(async move {
+                shutdown_fixture_driver(&cleanup_state, true).await;
+            });
+            // Keep the cleanup join handle even during panic unwinding. It has bounded waits.
+            UNRESOLVED_FIXTURE_TASKS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(OwnedFixtureTask {
+                    state,
+                    handle: Some(handle),
+                });
+        } else {
+            eprintln!("fixture cleanup unresolved: no runtime available; no drainage claimed");
+        }
+    }
+}
+
+// A task stays fixture-owned even when observation expires or its caller unwinds.
+struct OwnedFixtureTask {
+    state: std::sync::Arc<ServerState>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OwnedFixtureTask {
+    fn new(state: &std::sync::Arc<ServerState>, handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            state: std::sync::Arc::clone(state),
+            handle: Some(handle),
+        }
+    }
+
+    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<()> {
+        self.handle.as_mut().expect("owned fixture task")
+    }
+
+    // Call only after awaiting the join result; finished alone is not proof of a successful join.
+    fn disarm_joined(&mut self) {
+        let handle = self.handle.take().expect("joined fixture task");
+        assert!(
+            handle.is_finished(),
+            "cannot disarm unresolved fixture work"
+        );
+        drop(handle);
+    }
+}
+
+static UNRESOLVED_FIXTURE_TASKS: std::sync::Mutex<Vec<OwnedFixtureTask>> =
+    std::sync::Mutex::new(Vec::new());
+
+// Extract only this fixture's handles under the mutex, then join outside it.
+async fn drain_fixture_supervisor(state: &std::sync::Arc<ServerState>) -> Result<(), &'static str> {
+    let tasks = {
+        let mut retained = UNRESOLVED_FIXTURE_TASKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut owned = Vec::new();
+        let mut index = 0;
+        while index < retained.len() {
+            if std::sync::Arc::ptr_eq(&retained[index].state, state) {
+                owned.push(retained.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        owned
+    };
+    let mut failed = false;
+    for mut task in tasks {
+        let joined =
+            tokio::time::timeout(std::time::Duration::from_secs(2), task.handle_mut()).await;
+        match joined {
+            Ok(result) => {
+                task.disarm_joined();
+                failed |= result.is_err();
+            }
+            Err(_) => failed = true,
+        }
+        // A timed-out handle is re-retained by Drop; even a finished task must be joined.
+        drop(task);
+    }
+    if failed {
+        Err("fixture task join failed or remains unresolved")
+    } else {
+        Ok(())
+    }
+}
+
+impl Drop for OwnedFixtureTask {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if let Some(gate) = self
+            .state
+            .selected_provider_context
+            .settings
+            .get("delegation_fixture_gate")
+        {
+            bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
+        }
+        eprintln!(
+            "fixture task unresolved; retaining state and join handle (no settlement claimed)"
+        );
+        UNRESOLVED_FIXTURE_TASKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Self {
+                state: std::sync::Arc::clone(&self.state),
+                handle: Some(handle),
+            });
+    }
+}
+
+#[tokio::test]
+async fn fixture_task_observation_timeout_does_not_drop_owned_work() {
+    let state = std::sync::Arc::new(crate::tests::test_server_state(
+        crate::SessionManager::default(),
+    ));
+    let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+    let mut task = OwnedFixtureTask::new(
+        &state,
+        tokio::spawn(async move {
+            waiting.await.expect("owned fixture release");
+        }),
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::ZERO, task.handle_mut())
+            .await
+            .is_err()
+    );
+    assert!(!task.handle_mut().is_finished());
+    release.send(()).expect("fixture still owns waiting task");
+    tokio::time::timeout(std::time::Duration::from_secs(2), task.handle_mut())
+        .await
+        .expect("fixture physical settlement")
+        .expect("fixture joined");
+    task.disarm_joined();
+    drop(task);
+}
+
+#[tokio::test]
+async fn fixture_supervisor_joins_and_reclaims_only_its_owned_tasks() {
+    let state = std::sync::Arc::new(crate::tests::test_server_state(
+        crate::SessionManager::default(),
+    ));
+    let weak = std::sync::Arc::downgrade(&state);
+    let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+    let task = OwnedFixtureTask::new(
+        &state,
+        tokio::spawn(async move {
+            waiting.await.expect("fixture release");
+        }),
+    );
+    drop(task);
+    release.send(()).expect("retained receiver");
+    drain_fixture_supervisor(&state)
+        .await
+        .expect("join retained task");
+    assert!(
+        !UNRESOLVED_FIXTURE_TASKS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|task| std::sync::Arc::ptr_eq(&task.state, &state))
+    );
+    let mut cleanup = FixtureCleanup::new(&state);
+    let mut shutdown = state.subscribe_shutdown();
+    let (joined, driver_exited) = tokio::sync::oneshot::channel();
+    *state.workflow_driver_task.lock().await = Some(tokio::spawn(async move {
+        shutdown.recv().await.expect("successful cleanup shutdown");
+        joined.send(()).expect("driver exit observed");
+    }));
+    state
+        .shutdown_requested
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(!cleanup.completed, "shutdown request is not drainage");
+    cleanup.finish().await;
+    driver_exited
+        .await
+        .expect("real driver exited before guard disarm");
+    assert!(state.workflow_driver_task.lock().await.is_none());
+    assert!(state.runtime_work.active_all().await.is_empty());
+    assert!(cleanup.completed);
+    drop(cleanup);
+    drop(state);
+    assert!(weak.upgrade().is_none(), "joined fixture state reclaimed");
+}
+
+#[tokio::test]
+async fn fixture_supervisor_reports_failed_join_without_claiming_cleanup() {
+    let state = std::sync::Arc::new(crate::tests::test_server_state(
+        crate::SessionManager::default(),
+    ));
+    let task = OwnedFixtureTask::new(
+        &state,
+        tokio::spawn(async { panic!("fixture task failure") }),
+    );
+    drop(task);
+    assert!(drain_fixture_supervisor(&state).await.is_err());
+    let mut cleanup = FixtureCleanup::new(&state);
+    assert!(!cleanup.completed);
+    cleanup.finish().await;
+    drop(cleanup);
+}
+
+async fn fixture_stage_diagnostic(
+    state: &ServerState,
+    checkpoint: &str,
+    started: std::time::Instant,
+) {
+    let observed = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        for (session, work) in state.runtime_work.active_all().await.into_iter().take(100) {
+            eprintln!("fixture-stage={checkpoint} elapsed={:?} session={session} work={} kind={:?} status={:?} origin=runtime-registration-not-classified-synthetic", started.elapsed(), work.work_id, work.kind, work.status);
+        }
+        let Ok(db) = open(&crate::workflow_store_path(state), false) else { return; };
+        let Ok(page) = representation::runs::catalog(&db, None, 8).await else { return; };
+        for (run, _) in page.entries {
+            if let Ok(pending) = representation::attempts::pending(&db, &run, None, 32).await {
+                for attempt in pending {
+                    eprintln!("fixture-stage={checkpoint} elapsed={:?} run={run} pending-dispatch={} activation={} attempt={} receipt-present={}", started.elapsed(), attempt.dispatch_identity, attempt.prepared.activation_id, attempt.prepared.attempt, attempt.receipt.is_some());
+                }
+            }
+            if let Ok(snapshot) = representation::scheduling::snapshot(&db, &run, None, None, 32).await {
+                eprintln!("fixture-stage={checkpoint} elapsed={:?} scheduling={snapshot:?}", started.elapsed());
+                if let Ok(ready) = representation::graph::ready(&db, &run, snapshot.revision, None, 32).await {
+                    for activation in ready {
+                        eprintln!("fixture-stage={checkpoint} elapsed={:?} run={run} ready-activation={} node={} generation={}", started.elapsed(), activation.activation_id, activation.node_id, activation.generation);
+                    }
+                }
+            }
+        }
+    }).await;
+    if observed.is_err() {
+        eprintln!(
+            "fixture-stage={checkpoint} elapsed={:?} diagnostic=observation-timeout",
+            started.elapsed()
+        );
+    }
+}
+
+async fn stop_fixture_driver(state: &std::sync::Arc<ServerState>) {
+    // Successful callers must first establish whole-run canonical completion, not
+    // an empty registry between predecessor retirement and successor admission.
+    let started = std::time::Instant::now();
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !state.runtime_work.active_all().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if drained.is_err() {
+        fixture_stage_diagnostic(state, "registry-drain-before-shutdown-timeout", started).await;
+        // Caller guard remains armed; its panic fallback retains cleanup ownership.
+        panic!("fixture callback registrations unresolved before shutdown; no settlement claimed");
+    }
+    shutdown_fixture_driver(state, false).await;
+}
+
+async fn shutdown_fixture_driver(state: &std::sync::Arc<ServerState>, failed_cleanup: bool) {
+    let started = std::time::Instant::now();
+    // Only the uniquely configured gate belongs to this fixture; never reset global gates.
+    if let Some(gate) = state
+        .selected_provider_context
+        .settings
+        .get("delegation_fixture_gate")
+    {
+        bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
+    }
+    fixture_stage_diagnostic(state, "gate-released-before-shutdown", started).await;
     state
         .shutdown_requested
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = state.shutdown.send(());
-    let task = state.workflow_driver_task.lock().await.take();
+    let task = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.workflow_driver_task.lock(),
+    )
+    .await
+    .expect("fixture driver handle lock unresolved")
+    .take();
     if let Some(task) = task {
-        tokio::time::timeout(std::time::Duration::from_secs(2), task)
-            .await
-            .expect("driver teardown")
-            .expect("driver task");
+        let mut task = OwnedFixtureTask::new(state, task);
+        let joined =
+            tokio::time::timeout(std::time::Duration::from_secs(2), task.handle_mut()).await;
+        if let Ok(result) = joined {
+            result.expect("driver task");
+            task.disarm_joined();
+            drop(task);
+        } else {
+            // Drop retains this exact live task; neither abort nor event retirement proves settlement.
+            fixture_stage_diagnostic(state, "driver-join-timeout", started).await;
+            panic!("driver teardown unresolved; live join handle retained");
+        }
     }
+    fixture_stage_diagnostic(state, "after-driver-join", started).await;
+    if !failed_cleanup {
+        assert!(
+            state.runtime_work.active_all().await.is_empty(),
+            "work registered during successful driver join; no settlement claimed"
+        );
+        return;
+    }
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !state.runtime_work.active_all().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if drained.is_err() {
+        fixture_stage_diagnostic(state, "registry-drain-timeout", started).await;
+    }
+    assert!(
+        drained.is_ok(),
+        "fixture runtime effects remain unresolved; bounded registry drain expired"
+    );
 }
 
 fn replacement_lifetime_record(
@@ -1796,10 +2174,358 @@ async fn represented_acceptance_recovery_is_exact_idempotent_and_never_redispatc
     stop_fixture_driver(&state).await;
 }
 
+#[tokio::test]
+async fn pending_receipt_publication_cancellation_retains_accepted_turn_observer() {
+    // Keep the existing agent leaf, without delegation's downstream final activation.
+    let (_root, _sessions, mut state, definition) = typed_provider_fixture().await;
+    configure_delegation_fixture(
+        std::sync::Arc::get_mut(&mut state).expect("exclusive fixture configuration"),
+    );
+    assert_eq!(definition.nodes.len(), 1);
+    let mut cleanup = FixtureCleanup::new(&state);
+    let gate = state.selected_provider_context.settings["delegation_fixture_gate"].clone();
+    let _provider_release = fanout::ReleaseGate(gate.clone());
+    let path = crate::workflow_store_path(&state);
+    let db = open(&path, true).expect("db");
+    let authority = owner::local_authority(&state, "new")
+        .await
+        .expect("owner")
+        .expect("local");
+    let (unrelated, unchanged) =
+        publication_unrelated_fixture(&db, &definition, &authority.authority).await;
+    let dispatch = prepare_acceptance_recovery_fixture(&state, &db, &authority.authority).await;
+    let (notification, pending) = tokio::sync::oneshot::channel();
+    let _observation =
+        owner::observe_receipt_publication_wait(&path, &dispatch.dispatch_identity, notification)
+            .expect("observe exact receipt write");
+    let (transfer, acquired) = tokio::sync::oneshot::channel();
+    let owned_state = std::sync::Arc::clone(&state);
+    let owned_dispatch = dispatch.clone();
+    let mut outer = tokio::spawn(async move {
+        crate::dispatch_workflow_prompt_turn_with_publication_hook(
+            &owned_state,
+            &owned_dispatch,
+            || async move {
+                let queue = backpressure::write_queue(&path).expect("canonical fixture queue");
+                let held = queue.lock_owned().await;
+                transfer
+                    .send(held)
+                    .expect("transfer fixture-owned write guard");
+                Ok(())
+            },
+        )
+        .await
+    });
+    let held = tokio::time::timeout(std::time::Duration::from_secs(10), acquired)
+        .await
+        .expect("write guard bound")
+        .expect("write guard acquired");
+    tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+        .await
+        .expect("actual publication pending bound")
+        .expect("actual lock future polled Pending");
+    outer.abort();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut outer)
+            .await
+            .expect("outer joined")
+            .expect_err("outer cancelled")
+            .is_cancelled()
+    );
+    let (session, accepted) =
+        publication_accepted_receipt(&state, &db, &dispatch.dispatch_identity).await;
+    wait_publication_provider_gate(&gate).await;
+    assert_single_publication_acceptance(
+        &state,
+        session,
+        &dispatch.dispatch_identity,
+        &accepted,
+        false,
+    )
+    .await;
+    assert!(
+        representation::attempts::owner_boundary::receipt(&db, &dispatch.dispatch_identity)
+            .await
+            .expect("workflow receipt absent")
+            .is_none()
+    );
+    drop(held);
+    bcode_fake_provider_plugin::release_fake_event_script_gate(&gate);
+    wait_publication_observer_settlement(&state, &db, &dispatch.dispatch_identity).await;
+    assert_single_publication_acceptance(
+        &state,
+        session,
+        &dispatch.dispatch_identity,
+        &accepted,
+        true,
+    )
+    .await;
+    assert_eq!(
+        representation::scheduling::snapshot(&db, &unrelated.run_id, None, None, 10)
+            .await
+            .expect("unrelated unchanged"),
+        unchanged
+    );
+    cleanup.finish_run("new").await;
+    drop(cleanup);
+}
+
+async fn publication_accepted_receipt(
+    state: &ServerState,
+    db: &dyn Database,
+    dispatch_identity: &str,
+) -> (crate::SessionId, bcode_session_models::TurnReceipt) {
+    let prepared = representation::attempts::owner_boundary::prepared(db, "new", dispatch_identity)
+        .await
+        .expect("prepared")
+        .expect("attempt");
+    let session = acceptance_recovery_session(state, &prepared).await;
+    let accepted = state
+        .sessions
+        .turn_receipt(session, "bcode.workflow", dispatch_identity)
+        .await
+        .expect("canonical receipt")
+        .expect("accepted");
+    (session, accepted)
+}
+
+async fn wait_publication_provider_gate(gate: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !bcode_fake_provider_plugin::fake_event_script_gate_ready(gate) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted provider remains gated");
+}
+
+#[tokio::test]
+async fn publication_cancellation_retains_accepted_turn_observer() {
+    let (_root, _sessions, state, definition) = typed_provider_fixture_with_delegation(true).await;
+    let mut cleanup = FixtureCleanup::new(&state);
+    let gate = state.selected_provider_context.settings["delegation_fixture_gate"].clone();
+    let _provider_release = fanout::ReleaseGate(gate.clone());
+    let db = open(&crate::workflow_store_path(&state), true).expect("db");
+    let authority = owner::local_authority(&state, "new")
+        .await
+        .expect("owner")
+        .expect("local");
+    let (unrelated, unchanged) =
+        publication_unrelated_fixture(&db, &definition, &authority.authority).await;
+    let dispatch = prepare_acceptance_recovery_fixture(&state, &db, &authority.authority).await;
+    let (announced, reached) = tokio::sync::oneshot::channel();
+    let (_publication_release, waiting) = tokio::sync::oneshot::channel::<()>();
+    let owned_state = std::sync::Arc::clone(&state);
+    let owned_dispatch = dispatch.clone();
+    let mut outer = tokio::spawn(async move {
+        crate::dispatch_workflow_prompt_turn_with_publication_hook(
+            &owned_state,
+            &owned_dispatch,
+            || async move {
+                announced.send(()).expect("hook announcement");
+                waiting.await.expect("publication release");
+                Ok(())
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+        .await
+        .expect("acceptance hook bound")
+        .expect("hook reached");
+    outer.abort();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut outer)
+            .await
+            .expect("outer joined")
+            .expect_err("outer cancelled")
+            .is_cancelled()
+    );
+    let prepared =
+        representation::attempts::owner_boundary::prepared(&db, "new", &dispatch.dispatch_identity)
+            .await
+            .expect("prepared")
+            .expect("attempt");
+    let session = acceptance_recovery_session(&state, &prepared).await;
+    let accepted = state
+        .sessions
+        .turn_receipt(session, "bcode.workflow", &dispatch.dispatch_identity)
+        .await
+        .expect("canonical receipt")
+        .expect("accepted");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !bcode_fake_provider_plugin::fake_event_script_gate_ready(&gate) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted provider reaches owned gate");
+    assert!(
+        representation::attempts::owner_boundary::receipt(&db, &dispatch.dispatch_identity)
+            .await
+            .expect("workflow receipt")
+            .is_none()
+    );
+    assert_single_publication_acceptance(
+        &state,
+        session,
+        &dispatch.dispatch_identity,
+        &accepted,
+        false,
+    )
+    .await;
+    bcode_fake_provider_plugin::release_fake_event_script_gate(&gate);
+    wait_publication_observer_settlement(&state, &db, &dispatch.dispatch_identity).await;
+    assert_single_publication_acceptance(
+        &state,
+        session,
+        &dispatch.dispatch_identity,
+        &accepted,
+        true,
+    )
+    .await;
+    assert_eq!(
+        state
+            .sessions
+            .turn_receipt(session, "bcode.workflow", &dispatch.dispatch_identity)
+            .await
+            .expect("unchanged acceptance"),
+        Some(accepted)
+    );
+    assert_eq!(
+        representation::scheduling::snapshot(&db, &unrelated.run_id, None, None, 10)
+            .await
+            .expect("unrelated after"),
+        unchanged
+    );
+    cleanup.finish_run("new").await;
+    drop(cleanup);
+}
+
+async fn wait_publication_observer_settlement(
+    state: &ServerState,
+    db: &dyn Database,
+    dispatch_identity: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let terminal = representation::attempts::owner_boundary::terminal_outcome(
+                db,
+                "new",
+                dispatch_identity,
+            )
+            .await
+            .expect("settlement")
+            .is_some();
+            let completed = status(state, "new")
+                .await
+                .expect("whole-run status")
+                .expect("run")
+                .status
+                == bcode_workflow::RunStatus::Completed;
+            // Empty between agent retirement and successor admission is not settlement.
+            if terminal && completed && state.runtime_work.active_all().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retained observer settles and drains accepted work");
+}
+
+async fn publication_unrelated_fixture(
+    db: &dyn Database,
+    definition: &bcode_workflow::WorkflowDefinition,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> (
+    bcode_workflow_store::NewWorkflowRun,
+    representation::scheduling::SchedulingSnapshot,
+) {
+    let identity =
+        bcode_workflow::WorkflowDefinitionIdentity::for_definition("typed-agent", definition)
+            .expect("identity");
+    let mut unrelated = request("unrelated-publication");
+    unrelated.definition_id = identity.definition_id;
+    unrelated.definition_version = identity.definition_version;
+    unrelated.execution_authority = Some(authority.clone());
+    representation::admit(db, &unrelated, definition)
+        .await
+        .expect("unrelated admission");
+    let unchanged = representation::scheduling::snapshot(db, &unrelated.run_id, None, None, 10)
+        .await
+        .expect("unrelated before");
+    (unrelated, unchanged)
+}
+
+async fn assert_single_publication_acceptance(
+    state: &ServerState,
+    session: crate::SessionId,
+    dispatch_identity: &str,
+    accepted: &bcode_session_models::TurnReceipt,
+    terminal: bool,
+) {
+    assert_eq!(
+        state
+            .sessions
+            .turn_receipt(session, "bcode.workflow", dispatch_identity)
+            .await
+            .expect("canonical idempotent acceptance"),
+        Some(accepted.clone())
+    );
+    assert_eq!(
+        *accepted,
+        bcode_session_models::TurnReceipt::from_accepted_event(
+            session,
+            accepted.accepted_event_sequence
+        )
+    );
+    let page = state
+        .sessions
+        .session_history_around(
+            session,
+            bcode_session_models::SessionHistoryAroundQuery {
+                sequence: accepted.accepted_event_sequence,
+                before: 0,
+                after: 0,
+            },
+        )
+        .await
+        .expect("bounded canonical acceptance event");
+    assert_eq!(page.events.len(), 1);
+    let event = &page.events[0];
+    assert_eq!(event.sequence, accepted.accepted_event_sequence);
+    let admission = match &event.kind {
+        bcode_session_models::SessionEventKind::UserMessage { admission, .. } => admission,
+        bcode_session_models::SessionEventKind::SubmissionAccepted { submission } => {
+            &submission.admission
+        }
+        _ => panic!("receipt sequence must identify canonical admission"),
+    };
+    assert_eq!(
+        admission.idempotency_identity(),
+        Some(("bcode.workflow", dispatch_identity))
+    );
+    let evidence = state
+        .sessions
+        .session_turn_evidence(session, &accepted.turn_id.to_string())
+        .await
+        .expect("canonical terminal evidence");
+    assert_eq!(
+        evidence.iter().any(|event| matches!(
+            event.kind,
+            bcode_session_models::SessionEventKind::ModelTurnFinished { .. }
+        )),
+        terminal
+    );
+}
+
 async fn interrupt_after_canonical_acceptance(
     state: &std::sync::Arc<ServerState>,
     dispatch: &bcode_workflow_store::PreparedActivationDispatch,
 ) {
+    let started = std::time::Instant::now();
+    fixture_stage_diagnostic(state, "before-real-acceptance-interruption", started).await;
     assert!(
         crate::dispatch_workflow_prompt_turn_after_admission(state, dispatch, || {
             Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
@@ -1809,6 +2535,7 @@ async fn interrupt_after_canonical_acceptance(
         .await
         .is_err()
     );
+    fixture_stage_diagnostic(state, "after-real-acceptance-interruption", started).await;
 }
 
 async fn acceptance_recovery_session(
@@ -1957,6 +2684,7 @@ async fn prepare_acceptance_recovery_fixture(
 #[tokio::test]
 async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
+    let mut cleanup = FixtureCleanup::new(&state);
     state.start_workflow_driver().await;
     assert!(
         crate::workflow_operations::pause_run(&state, "new")
@@ -2000,7 +2728,8 @@ async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
     })
     .await
     .expect("normal scheduled resume completes");
-    stop_fixture_driver(&state).await;
+    cleanup.finish().await;
+    drop(cleanup);
 }
 
 #[tokio::test]

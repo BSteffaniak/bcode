@@ -3,6 +3,7 @@ use super::*;
 #[tokio::test]
 async fn definition_child_uses_common_owner_and_returns_provider_output() {
     let (_root, _sessions, state, definition) = typed_provider_fixture().await;
+    let mut cleanup = FixtureCleanup::new(&state);
     let db = open(&crate::workflow_store_path(&state), true).expect("db");
     let guard = owner::local_authority(&state, "new")
         .await
@@ -79,11 +80,14 @@ async fn definition_child_uses_common_owner_and_returns_provider_output() {
         .expect("children");
     assert_eq!(children.children.len(), 1);
     assert_eq!(children.children[0].depth, 2);
+    cleanup.finish().await;
+    drop(cleanup);
 }
 
 #[tokio::test]
 async fn normal_definition_child_completion_wakes_parent() {
     let (_root, _sessions, state, definition) = typed_provider_fixture().await;
+    let mut cleanup = FixtureCleanup::new(&state);
     let identity =
         bcode_workflow::WorkflowDefinitionIdentity::for_definition("normal-child", &definition)
             .expect("identity");
@@ -110,13 +114,15 @@ async fn normal_definition_child_completion_wakes_parent() {
     state.start_workflow_driver().await;
     super::fanout::start_public(&state, "normal-parent", parent, serde_json::json!(1), None).await;
     let result = super::fanout::wait_public(&state, "normal-parent").await;
-    stop_fixture_driver(&state).await;
     result.expect("child result reaches parent through ordinary scheduler");
+    cleanup.finish().await;
+    drop(cleanup);
 }
 
 #[tokio::test]
 async fn public_allowance_grant_is_atomic_and_exact_retry_is_unchanged() {
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
+    let mut cleanup = FixtureCleanup::new(&state);
     let db = open(&crate::workflow_store_path(&state), false).expect("db");
     let guard = owner::local_authority(&state, "new")
         .await
@@ -136,7 +142,6 @@ async fn public_allowance_grant_is_atomic_and_exact_retry_is_unchanged() {
     let duplicate = crate::workflow_operations::control_exact_run(&state, "new", action)
         .await
         .expect("duplicate");
-    stop_fixture_driver(&state).await;
     assert!(first.1);
     assert!(!duplicate.1);
     let after = representation::hierarchy::parent_context(&db, &guard.authority, "new")
@@ -147,4 +152,6 @@ async fn public_allowance_grant_is_atomic_and_exact_retry_is_unchanged() {
         after.effective_limits.retry_cap,
         before.effective_limits.retry_cap
     );
+    cleanup.finish().await;
+    drop(cleanup);
 }

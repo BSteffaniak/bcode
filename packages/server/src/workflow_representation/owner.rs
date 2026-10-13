@@ -118,6 +118,65 @@ pub async fn link_shared_execution_session(
     }
 }
 
+#[cfg(test)]
+type ReceiptPublicationWaitKey = (std::path::PathBuf, String);
+
+#[cfg(test)]
+static RECEIPT_PUBLICATION_WAITERS: std::sync::Mutex<
+    std::collections::BTreeMap<ReceiptPublicationWaitKey, Option<tokio::sync::oneshot::Sender<()>>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Fixture-owned registration for observing an actual pending receipt write lock.
+#[cfg(test)]
+pub(super) struct ReceiptPublicationWaitGuard {
+    key: ReceiptPublicationWaitKey,
+}
+
+#[cfg(test)]
+impl Drop for ReceiptPublicationWaitGuard {
+    fn drop(&mut self) {
+        RECEIPT_PUBLICATION_WAITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+/// Register one notification scoped to a canonical fixture store and exact dispatch.
+/// Duplicate registrations fail without replacing the existing fixture owner.
+#[cfg(test)]
+pub(super) fn observe_receipt_publication_wait(
+    path: &std::path::Path,
+    dispatch_identity: &str,
+    pending: tokio::sync::oneshot::Sender<()>,
+) -> std::io::Result<ReceiptPublicationWaitGuard> {
+    let key = (path.canonicalize()?, dispatch_identity.to_owned());
+    let mut waiters = RECEIPT_PUBLICATION_WAITERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if waiters.contains_key(&key) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "receipt publication wait already observed",
+        ));
+    }
+    waiters.insert(key.clone(), Some(pending));
+    drop(waiters);
+    Ok(ReceiptPublicationWaitGuard { key })
+}
+
+#[cfg(test)]
+fn notify_receipt_publication_pending(key: &ReceiptPublicationWaitKey) {
+    let pending = RECEIPT_PUBLICATION_WAITERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(key)
+        .and_then(Option::take);
+    if let Some(pending) = pending {
+        let _ = pending.send(());
+    }
+}
+
 /// Commit the owner receipt without switching canonical representations on failure.
 pub async fn persist_receipt(
     state: &ServerState,
@@ -132,7 +191,26 @@ pub async fn persist_receipt(
         RunLookup::Legacy => retained.persist_owned_dispatch_receipt(receipt, authority),
         RunLookup::Available(_) => {
             let queue = super::backpressure::write_queue(retained.path()).map_err(store_error)?;
+            #[cfg(not(test))]
             let _write = queue.lock().await;
+            #[cfg(test)]
+            let _write = {
+                use std::future::Future as _;
+                let key = (
+                    retained.path().canonicalize().map_err(store_error)?,
+                    receipt.dispatch_identity.clone(),
+                );
+                let lock = queue.lock();
+                tokio::pin!(lock);
+                std::future::poll_fn(|cx| {
+                    let result = lock.as_mut().poll(cx);
+                    if result.is_pending() {
+                        notify_receipt_publication_pending(&key);
+                    }
+                    result
+                })
+                .await
+            };
             let db = open(retained.path(), true).map_err(store_error)?;
             if let Some(existing) = super::backpressure::retry(|| {
                 owner_boundary::receipt(&db, &receipt.dispatch_identity)

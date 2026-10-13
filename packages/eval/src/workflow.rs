@@ -12,6 +12,7 @@ use std::time::Duration;
 
 #[path = "workflow_capture/mod.rs"]
 mod workflow_capture;
+pub use workflow_capture::ModelCoverageFailure;
 
 /// Optional evidence cannot invalidate an independently settled execution result.
 fn retain_attempt_evidence(
@@ -806,6 +807,132 @@ struct CliReadDiagnostic {
     message: String,
 }
 
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct NormalizedCliReadDiagnostic {
+    schema_version: u32,
+    code: &'static str,
+    phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codec_subtype: Option<&'static str>,
+}
+
+fn normalized_cli_read_diagnostic(stderr: &[u8]) -> NormalizedCliReadDiagnostic {
+    let unclassified = NormalizedCliReadDiagnostic {
+        schema_version: 1,
+        code: "unclassified",
+        phase: "operation",
+        codec_subtype: None,
+    };
+    if stderr.len() > 4096 {
+        return unclassified;
+    }
+    let Ok(error) = serde_json::from_slice::<CliReadDiagnostic>(stderr) else {
+        return unclassified;
+    };
+    if error.schema_version != 1 {
+        return unclassified;
+    }
+    if error.code == "workflow_inspection_decode_failure" && error.phase == "workflow_inspection" {
+        let subtype = error
+            .message
+            .strip_prefix("Workflow inspection codec: ")
+            .and_then(|message| message.strip_suffix('.'));
+        let subtype = match subtype {
+            Some("payload_too_large") => Some("payload_too_large"),
+            Some("invalid_chunk") => Some("invalid_chunk"),
+            Some("serialize") => Some("serialize"),
+            Some("deserialize") => Some("deserialize"),
+            Some("event_conversion") => Some("event_conversion"),
+            Some("unsupported_version") => Some("unsupported_version"),
+            Some("io_not_found") => Some("io_not_found"),
+            Some("io_permission_denied") => Some("io_permission_denied"),
+            Some("io_connection_reset") => Some("io_connection_reset"),
+            Some("io_broken_pipe") => Some("io_broken_pipe"),
+            Some("io_timed_out") => Some("io_timed_out"),
+            Some("io_unexpected_eof") => Some("io_unexpected_eof"),
+            Some("io_invalid_data") => Some("io_invalid_data"),
+            Some("io_interrupted") => Some("io_interrupted"),
+            Some("io_other") => Some("io_other"),
+            _ => None,
+        };
+        if subtype.is_some()
+            || error.message == "Workflow inspection response could not be decoded."
+        {
+            return NormalizedCliReadDiagnostic {
+                schema_version: 1,
+                code: "workflow_inspection_decode_failure",
+                phase: "workflow_inspection",
+                codec_subtype: subtype,
+            };
+        }
+        return unclassified;
+    }
+    normalized_noncodec_cli_read_diagnostic(&error).unwrap_or(unclassified)
+}
+
+fn normalized_noncodec_cli_read_diagnostic(
+    error: &CliReadDiagnostic,
+) -> Option<NormalizedCliReadDiagnostic> {
+    let (code, phase) = match (
+        error.code.as_str(),
+        error.phase.as_str(),
+        error.message.as_str(),
+    ) {
+        ("connection_timeout", "connect", "Verified daemon connection timed out.") => {
+            ("connection_timeout", "connect")
+        }
+        (
+            "workflow_inspection_request_timeout",
+            "workflow_inspection",
+            "Workflow inspection request timed out.",
+        ) => ("workflow_inspection_request_timeout", "workflow_inspection"),
+        (
+            "workflow_inspection_transport_failure",
+            "workflow_inspection",
+            "Workflow inspection transport failed.",
+        ) => (
+            "workflow_inspection_transport_failure",
+            "workflow_inspection",
+        ),
+        (
+            "workflow_inspection_protocol_failure",
+            "workflow_inspection",
+            "Workflow inspection protocol failed.",
+        ) => (
+            "workflow_inspection_protocol_failure",
+            "workflow_inspection",
+        ),
+        (
+            "workflow_inspection_incompatible_daemon",
+            "workflow_inspection",
+            "Workflow inspection daemon is incompatible.",
+        ) => (
+            "workflow_inspection_incompatible_daemon",
+            "workflow_inspection",
+        ),
+        (
+            "workflow_inspection_rejected",
+            "workflow_inspection",
+            "Daemon rejected workflow inspection; cause is unavailable.",
+        ) => ("workflow_inspection_rejected", "workflow_inspection"),
+        _ => return None,
+    };
+    Some(NormalizedCliReadDiagnostic {
+        schema_version: 1,
+        code,
+        phase,
+        codec_subtype: None,
+    })
+}
+
+fn cli_read_failure(label: &str, code: Option<i32>, expired: bool, stderr: &[u8]) -> EvalError {
+    let diagnostic = normalized_cli_read_diagnostic(stderr);
+    EvalError::Client(format!(
+        "{label} failed (exit={code:?}, timeout={expired}): {}",
+        serde_json::to_string(&diagnostic).expect("fixed diagnostic serializes")
+    ))
+}
+
 fn readonly_connection_timeout(stderr: &[u8]) -> bool {
     stderr.len() <= 4096
         && serde_json::from_slice::<CliReadDiagnostic>(stderr).is_ok_and(|error| {
@@ -1202,10 +1329,7 @@ pub fn execute(
                     continue;
                 }
                 if expired || code != Some(0) {
-                    return Err(EvalError::Client(format!(
-                        "{label} failed (exit={code:?}, timeout={expired}): {}",
-                        String::from_utf8_lossy(&err)
-                    )));
+                    return Err(cli_read_failure(label, code, expired, &err));
                 }
                 return Ok(serde_json::from_slice(&out)?);
             }
@@ -1875,7 +1999,8 @@ pub fn execute(
         "sessions_complete":model_coverage.complete_sessions,
         "non_model_sessions":model_coverage.non_model_sessions,
         "sessions_unknown_applicability":model_coverage.unknown_sessions,
-        "sessions_missing_request_boundaries":model_coverage.missing_boundaries
+        "sessions_missing_request_boundaries":model_coverage.missing_boundaries,
+        "failure_reasons":model_coverage.failure_reasons()
     });
     let judgement_status = if diagnostic_receipts.is_empty() {
         "not_observed"
@@ -2521,6 +2646,133 @@ mod observation_tests {
             inspection_allowance(false, Some(Duration::from_mins(3))),
             Duration::from_mins(3)
         );
+    }
+
+    #[test]
+    fn cli_read_codec_diagnostics_retain_only_allowlisted_subtypes() {
+        for subtype in [
+            "payload_too_large",
+            "invalid_chunk",
+            "serialize",
+            "deserialize",
+            "event_conversion",
+            "unsupported_version",
+            "io_not_found",
+            "io_permission_denied",
+            "io_connection_reset",
+            "io_broken_pipe",
+            "io_timed_out",
+            "io_unexpected_eof",
+            "io_invalid_data",
+            "io_interrupted",
+            "io_other",
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1, "code": "workflow_inspection_decode_failure",
+                "phase": "workflow_inspection",
+                "message": format!("Workflow inspection codec: {subtype}.")
+            }))
+            .unwrap();
+            let normalized = normalized_cli_read_diagnostic(&bytes);
+            assert_eq!(normalized.code, "workflow_inspection_decode_failure");
+            assert_eq!(normalized.phase, "workflow_inspection");
+            assert_eq!(normalized.codec_subtype, Some(subtype));
+            assert!(!readonly_connection_timeout(&bytes));
+            let receipt = cli_read_failure("inspection", Some(1), false, &bytes).to_string();
+            assert!(receipt.contains("workflow_inspection_decode_failure"));
+            assert!(receipt.contains(subtype));
+        }
+        let old = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "code": "workflow_inspection_decode_failure",
+            "phase": "workflow_inspection",
+            "message": "Workflow inspection response could not be decoded."
+        }))
+        .unwrap();
+        assert_eq!(normalized_cli_read_diagnostic(&old).codec_subtype, None);
+        assert_eq!(
+            normalized_cli_read_diagnostic(&old).code,
+            "workflow_inspection_decode_failure"
+        );
+    }
+
+    #[test]
+    fn cli_read_diagnostics_reject_untrusted_and_future_facts_without_leaking() {
+        let valid = serde_json::json!({"schema_version":1,
+            "code":"workflow_inspection_decode_failure", "phase":"workflow_inspection",
+            "message":"Workflow inspection codec: deserialize."});
+        let mut rejected = vec![
+            b"SECRET_FIXTURE_MARKER".to_vec(),
+            b"{broken".to_vec(),
+            vec![b'x'; 4097],
+        ];
+        for (key, value) in [
+            ("schema_version", serde_json::json!(2)),
+            ("code", serde_json::json!("SECRET_FIXTURE_MARKER")),
+            ("phase", serde_json::json!("SECRET_FIXTURE_MARKER")),
+            (
+                "message",
+                serde_json::json!("Workflow inspection codec: SECRET_FIXTURE_MARKER."),
+            ),
+            ("extra", serde_json::json!("SECRET_FIXTURE_MARKER")),
+        ] {
+            let mut document = valid.clone();
+            document[key] = value;
+            rejected.push(serde_json::to_vec(&document).unwrap());
+        }
+        for bytes in rejected {
+            let normalized = normalized_cli_read_diagnostic(&bytes);
+            assert_eq!(normalized.code, "unclassified");
+            assert_eq!(normalized.codec_subtype, None);
+            assert!(!readonly_connection_timeout(&bytes));
+            let receipt = cli_read_failure("inspection", Some(1), false, &bytes).to_string();
+            assert!(!receipt.contains("SECRET_FIXTURE_MARKER"));
+            assert!(!receipt.contains("{broken"));
+            assert!(receipt.len() < 256);
+        }
+    }
+
+    #[test]
+    fn cli_read_noncodec_diagnostics_require_exact_safe_contract() {
+        for (code, phase, message) in [
+            (
+                "connection_timeout",
+                "connect",
+                "Verified daemon connection timed out.",
+            ),
+            (
+                "workflow_inspection_request_timeout",
+                "workflow_inspection",
+                "Workflow inspection request timed out.",
+            ),
+            (
+                "workflow_inspection_transport_failure",
+                "workflow_inspection",
+                "Workflow inspection transport failed.",
+            ),
+            (
+                "workflow_inspection_protocol_failure",
+                "workflow_inspection",
+                "Workflow inspection protocol failed.",
+            ),
+            (
+                "workflow_inspection_incompatible_daemon",
+                "workflow_inspection",
+                "Workflow inspection daemon is incompatible.",
+            ),
+            (
+                "workflow_inspection_rejected",
+                "workflow_inspection",
+                "Daemon rejected workflow inspection; cause is unavailable.",
+            ),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({"schema_version":1,
+                "code":code,"phase":phase,"message":message}))
+            .unwrap();
+            let diagnostic = normalized_cli_read_diagnostic(&bytes);
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.phase, phase);
+            assert_eq!(diagnostic.codec_subtype, None);
+        }
     }
 
     #[test]

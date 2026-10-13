@@ -1005,16 +1005,61 @@ library = "libtest_wait_second.dylib"
                         payload: serde_json::json!({}),
                     },
                 );
-                return bcode_plugin_sdk::ServiceResponse::json(
-                    &context.bridge.request(&request).unwrap(),
-                )
-                .unwrap();
+                return match context.bridge.request(&request) {
+                    Ok(reply) => {
+                        bcode_plugin_sdk::ServiceResponse::json(&reply).unwrap_or_else(|error| {
+                            bcode_plugin_sdk::ServiceResponse::error(
+                                "encode_failed",
+                                error.to_string(),
+                            )
+                        })
+                    }
+                    Err(error) => {
+                        bcode_plugin_sdk::ServiceResponse::error("bridge_failed", error.to_string())
+                    }
+                };
             }
             while !context.cancellation.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(5));
             }
             bcode_plugin_sdk::ServiceResponse::error("cancelled", "cancelled")
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_nested_bridge_does_not_poison_static_wait_fixture() {
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        cancellation.cancel();
+        let context = bcode_plugin_sdk::NativeServiceContext {
+            plugin_id: "test.composer-wait".into(),
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: bcode_plugin_sdk::ServiceEventEmitter::default(),
+            transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            request: bcode_plugin_sdk::ServiceRequest {
+                interface_id: "bcode.composer/v1".into(),
+                operation: "search".into(),
+                payload: Vec::new(),
+            },
+            bridge: bcode_plugin_sdk::ServiceBridge::new(
+                None,
+                std::ptr::null_mut(),
+                cancellation.clone(),
+            ),
+            cancellation,
+        };
+        let fixture = std::sync::Mutex::new(WaitPlugin);
+        let response =
+            bcode_plugin_sdk::RustPlugin::invoke_service(&mut *fixture.lock().unwrap(), context);
+        assert_eq!(response.error.unwrap().code, "bridge_failed");
+        assert!(
+            fixture.lock().is_ok(),
+            "bridge cancellation must not poison plugin lifecycle state"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _, stop, server) = start_wait_service(temp.path());
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        drop(state);
     }
 
     fn start_wait_service(
@@ -1207,8 +1252,12 @@ library = "libtest_wait_second.dylib"
         server.await.unwrap();
         drop(state);
         accepted.unwrap();
+        let terminal_result = terminal
+            .expect("early cancellation invocation must settle")
+            .unwrap();
         assert!(
-            matches!(terminal.unwrap().unwrap(), Err(bcode_client::ClientError::Server { code, .. }) if code == "plugin_cancelled")
+            matches!(&terminal_result, Err(bcode_client::ClientError::Server { code, .. }) if code == "plugin_cancelled"),
+            "early cancellation returned {terminal_result:?}"
         );
     }
 
@@ -1244,7 +1293,8 @@ library = "libtest_wait_second.dylib"
         server.await.unwrap();
         drop(state);
         assert!(
-            matches!(result, Err(bcode_client::ClientError::Server { code, .. }) if code == "plugin_deadline")
+            matches!(&result, Err(bcode_client::ClientError::Server { code, .. }) if code == "plugin_deadline"),
+            "nested deadline returned {result:?}"
         );
     }
 

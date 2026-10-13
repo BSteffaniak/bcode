@@ -252,9 +252,41 @@ impl CliDiagnosticError {
         }
     }
 
+    // Keep subtype diagnostics finite: never format codec errors or their payloads.
+    fn inspection_codec_message(error: &bcode_ipc::CodecError) -> &'static str {
+        use bcode_ipc::CodecError;
+        match error {
+            CodecError::PayloadTooLarge { .. } => "Workflow inspection codec: payload_too_large.",
+            CodecError::InvalidChunk(_) => "Workflow inspection codec: invalid_chunk.",
+            CodecError::Serialize(_) => "Workflow inspection codec: serialize.",
+            CodecError::Deserialize(_) => "Workflow inspection codec: deserialize.",
+            CodecError::EventConversion(_) => "Workflow inspection codec: event_conversion.",
+            CodecError::UnsupportedVersion { .. } => {
+                "Workflow inspection codec: unsupported_version."
+            }
+            CodecError::Io(error) => match error.kind() {
+                std::io::ErrorKind::NotFound => "Workflow inspection codec: io_not_found.",
+                std::io::ErrorKind::PermissionDenied => {
+                    "Workflow inspection codec: io_permission_denied."
+                }
+                std::io::ErrorKind::ConnectionReset => {
+                    "Workflow inspection codec: io_connection_reset."
+                }
+                std::io::ErrorKind::BrokenPipe => "Workflow inspection codec: io_broken_pipe.",
+                std::io::ErrorKind::TimedOut => "Workflow inspection codec: io_timed_out.",
+                std::io::ErrorKind::UnexpectedEof => {
+                    "Workflow inspection codec: io_unexpected_eof."
+                }
+                std::io::ErrorKind::InvalidData => "Workflow inspection codec: io_invalid_data.",
+                std::io::ErrorKind::Interrupted => "Workflow inspection codec: io_interrupted.",
+                _ => "Workflow inspection codec: io_other.",
+            },
+        }
+    }
+
     // The reader exposes ClientError, not typed collection/revision context. Do not
     // infer such context from server codes, messages, or the current run state.
-    const fn from_inspection_error(error: &bcode_client::ClientError) -> Self {
+    fn from_inspection_error(error: &bcode_client::ClientError) -> Self {
         use bcode_client::ClientError;
         let (code, phase, message) = match error {
             ClientError::ConnectTimeout { .. } => (
@@ -272,10 +304,10 @@ impl CliDiagnosticError {
                 "workflow_inspection",
                 "Workflow inspection transport failed.",
             ),
-            ClientError::Codec(_) => (
+            ClientError::Codec(error) => (
                 "workflow_inspection_decode_failure",
                 "workflow_inspection",
-                "Workflow inspection response could not be decoded.",
+                Self::inspection_codec_message(error),
             ),
             ClientError::Protocol(_)
             | ClientError::UnexpectedResponse
@@ -308,6 +340,104 @@ impl CliDiagnosticError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspection_codec_subtypes_withhold_payloads() {
+        use bcode_ipc::CodecError;
+        const SECRET: &str = "SECRET_FIXTURE_MARKER";
+
+        struct SecretSerialization;
+        impl serde::Serialize for SecretSerialization {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom(SECRET))
+            }
+        }
+        struct SecretDeserialization;
+        impl<'de> serde::Deserialize<'de> for SecretDeserialization {
+            fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+                Err(serde::de::Error::custom(SECRET))
+            }
+        }
+        let serialize = bcode_ipc::encode_typed_stable(&SecretSerialization).unwrap_err();
+        let bytes = bcode_ipc::encode_typed_stable(&SECRET).unwrap();
+        let Err(deserialize) = bcode_ipc::decode_typed_stable::<SecretDeserialization>(&bytes)
+        else {
+            panic!("expected decoder rejection");
+        };
+        assert!(matches!(serialize, CodecError::Serialize(_)));
+        assert!(matches!(deserialize, CodecError::Deserialize(_)));
+        let cases = [
+            (
+                CodecError::PayloadTooLarge {
+                    actual: usize::MAX,
+                    max: 1,
+                },
+                "payload_too_large",
+            ),
+            (CodecError::InvalidChunk(SECRET.into()), "invalid_chunk"),
+            (serialize, "serialize"),
+            (deserialize, "deserialize"),
+            (
+                CodecError::EventConversion(SECRET.into()),
+                "event_conversion",
+            ),
+            (
+                CodecError::UnsupportedVersion {
+                    actual: u16::MAX,
+                    expected: 1,
+                },
+                "unsupported_version",
+            ),
+        ];
+        for (codec, subtype) in cases {
+            let error = CliError::WorkflowInspection {
+                source: bcode_client::ClientError::Codec(codec),
+            };
+            let diagnostic = CliDiagnosticError::from_error(&error);
+            assert_eq!(diagnostic.schema_version, 1);
+            assert_eq!(diagnostic.code, "workflow_inspection_decode_failure");
+            assert_eq!(diagnostic.phase, "workflow_inspection");
+            assert_eq!(
+                diagnostic.message,
+                format!("Workflow inspection codec: {subtype}.")
+            );
+            let json = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!json.contains(SECRET));
+            assert!(json.len() < 256);
+        }
+    }
+
+    #[test]
+    fn inspection_codec_io_kinds_are_finite_and_secret_safe() {
+        use std::io::ErrorKind;
+        for (kind, subtype) in [
+            (ErrorKind::NotFound, "not_found"),
+            (ErrorKind::PermissionDenied, "permission_denied"),
+            (ErrorKind::ConnectionReset, "connection_reset"),
+            (ErrorKind::BrokenPipe, "broken_pipe"),
+            (ErrorKind::TimedOut, "timed_out"),
+            (ErrorKind::UnexpectedEof, "unexpected_eof"),
+            (ErrorKind::InvalidData, "invalid_data"),
+            (ErrorKind::Interrupted, "interrupted"),
+            (ErrorKind::Other, "other"),
+            (ErrorKind::WouldBlock, "other"),
+        ] {
+            let error = CliError::WorkflowInspection {
+                source: bcode_client::ClientError::Codec(bcode_ipc::CodecError::Io(
+                    std::io::Error::new(kind, "SECRET_FIXTURE_MARKER"),
+                )),
+            };
+            let diagnostic = CliDiagnosticError::from_error(&error);
+            assert_eq!(diagnostic.code, "workflow_inspection_decode_failure");
+            assert_eq!(
+                diagnostic.message,
+                format!("Workflow inspection codec: io_{subtype}.")
+            );
+            let json = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!json.contains("SECRET_FIXTURE_MARKER"));
+            assert!(json.len() < 256);
+        }
+    }
 
     #[test]
     fn notification_timeout_is_distinct_and_secret_safe_for_both_cli_paths() {

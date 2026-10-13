@@ -193,7 +193,14 @@ fn recommendation_output(
                     || !operation.inference.is_empty()
                     || operation.application != Some(Application::BaselineRetained)))
             || (arm == crate::judgement_benchmark::Arm::On
-                && operation.trigger != Trigger::Triggered)
+                && operation.trigger != Trigger::Triggered
+                && !(operation.trigger == Trigger::NotApplicable
+                    && operation.application == Some(Application::BaselineRetained)
+                    && operation.inference.is_empty()
+                    && recommendation.selection.ordered
+                        == (0..recommendation.candidate_ids.len()).collect::<Vec<_>>()
+                    && recommendation.selection.admitted
+                        == (0..recommendation.candidate_ids.len()).collect::<Vec<_>>()))
         {
             return Err(());
         }
@@ -269,6 +276,7 @@ enum ObservationFailureStage {
     Validation,
     Coverage,
     Telemetry,
+    UnsupportedRepresentation,
 }
 
 impl ObservationFailureStage {
@@ -279,12 +287,61 @@ impl ObservationFailureStage {
             Self::Validation => "normal_turn.observation_validation_failed",
             Self::Coverage => "normal_turn.observation_coverage_failed",
             Self::Telemetry => "normal_turn.observation_telemetry_failed",
+            Self::UnsupportedRepresentation => "normal_turn.unsupported_output_representation",
         }
     }
 
     fn retain(self, capture: &mut ConsumerCapture) {
         capture.operation = self.operation().into();
     }
+}
+
+// Capture closed product evidence independently of the legacy output's expressiveness.
+fn retain_observation_and_convert(
+    observation: &bcode_model::judgement::TurnJudgementObservation,
+    identity: (&str, &str),
+    outcome: TerminalOutcome,
+    feature: Feature,
+    arm: crate::judgement_benchmark::Arm,
+    source_ids: &[String],
+    telemetry: &mut super::CaptureTelemetry,
+) -> Result<Option<ConsumerOutput>, ObservationFailureStage> {
+    use bcode_model::judgement::{ObservationScope, ObservationTerminal};
+    observation
+        .validate()
+        .map_err(|_| ObservationFailureStage::Validation)?;
+    let terminal = match outcome {
+        TerminalOutcome::Succeeded => ObservationTerminal::Completed,
+        TerminalOutcome::Cancelled => ObservationTerminal::Cancelled,
+        TerminalOutcome::Failed => ObservationTerminal::Failed,
+        _ => return Err(ObservationFailureStage::Coverage),
+    };
+    if observation.session_id != identity.0
+        || observation.turn_id != identity.1
+        || observation.scope != ObservationScope::NormalTurn
+        || observation.terminal != Some(terminal)
+        || !observation.complete
+        || observation.omitted != 0
+        || !observation.covered_features.contains(&feature)
+    {
+        return Err(ObservationFailureStage::Coverage);
+    }
+    telemetry
+        .retain_turn_observation(observation)
+        .map_err(|()| ObservationFailureStage::Telemetry)?;
+    match feature {
+        Feature::ContextReranking => context_output(
+            observation,
+            identity.0,
+            identity.1,
+            outcome,
+            arm,
+            source_ids,
+        ),
+        Feature::Recommendations => recommendation_output(observation, arm),
+        _ => Ok(None),
+    }
+    .map_err(|()| ObservationFailureStage::UnsupportedRepresentation)
 }
 
 pub(super) async fn execute(
@@ -470,54 +527,23 @@ pub(super) async fn execute(
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                     if let Some(observation) = product_observation {
-                        if capture.request.feature == Feature::ContextReranking {
-                            capture.output = context_output(
-                                &observation,
-                                &input.session_id.to_string(),
-                                &receipt.turn_id.0,
-                                capture.outcome,
-                                capture.request.arm,
-                                &context_ids,
-                            )?;
+                        let output = retain_observation_and_convert(
+                            &observation,
+                            (&input.session_id.to_string(), &receipt.turn_id.0),
+                            capture.outcome,
+                            capture.request.feature,
+                            capture.request.arm,
+                            &context_ids,
+                            &mut capture.telemetry,
+                        )
+                        .map_err(|stage| stage.retain(capture))?;
+                        if matches!(
+                            capture.request.feature,
+                            Feature::ContextReranking | Feature::Recommendations
+                        ) {
+                            capture.output = output;
                             capture.consumer_executed = capture.output.is_some();
                         }
-                        observation.validate().map_err(|_| {
-                            ObservationFailureStage::Validation.retain(capture);
-                        })?;
-                        let expected_terminal = match capture.outcome {
-                            TerminalOutcome::Succeeded => {
-                                bcode_model::judgement::ObservationTerminal::Completed
-                            }
-                            TerminalOutcome::Cancelled => {
-                                bcode_model::judgement::ObservationTerminal::Cancelled
-                            }
-                            _ => bcode_model::judgement::ObservationTerminal::Failed,
-                        };
-                        if observation.session_id != input.session_id.to_string()
-                            || observation.turn_id != receipt.turn_id.0
-                            || observation.scope
-                                != bcode_model::judgement::ObservationScope::NormalTurn
-                            || observation.terminal != Some(expected_terminal)
-                            || !observation.complete
-                            || observation.omitted != 0
-                            || !observation
-                                .covered_features
-                                .contains(&capture.request.feature)
-                        {
-                            ObservationFailureStage::Coverage.retain(capture);
-                            return Err(());
-                        }
-                        if capture.request.feature == Feature::Recommendations {
-                            capture.output =
-                                recommendation_output(&observation, capture.request.arm)?;
-                            capture.consumer_executed = capture.output.is_some();
-                        }
-                        capture
-                            .telemetry
-                            .retain_turn_observation(&observation)
-                            .map_err(|()| {
-                                ObservationFailureStage::Telemetry.retain(capture);
-                            })?;
                         // A closed disabled baseline application is observable control execution,
                         // not inference or evidence of on-arm benefit.
                         if capture.request.arm == crate::judgement_benchmark::Arm::Off {
@@ -615,6 +641,95 @@ mod tests {
             arm,
             &["history:session:2".into(), "history:session:7".into()],
         )
+    }
+
+    #[test]
+    fn changed_context_rounds_reject_ranking_but_retain_all_inference() {
+        let mut observation = snapshot();
+        observation
+            .operations
+            .retain(|operation| operation.feature != Feature::ContextReranking);
+        for index in 0_usize..5 {
+            observation.operations.push(ConsumerOperationObservation {
+                operation_id: 0,
+                feature: Feature::ContextReranking,
+                trigger: Trigger::Triggered,
+                inference: vec![bcode_model::judgement::OptionalOperationObservation {
+                    outcome: bcode_model::judgement::OptionalOperationOutcome::Advice,
+                    inference_invocations: 1,
+                    ..bcode_model::judgement::OptionalOperationObservation::default()
+                }],
+                inference_complete: true,
+                application: Some(Application::Applied),
+                recommendation: None,
+                selection: Some(SelectionObservation {
+                    candidate_count: 2,
+                    ordered: if index % 2 == 0 {
+                        vec![0, 1]
+                    } else {
+                        vec![1, 0]
+                    },
+                    admitted: vec![index % 2],
+                }),
+            });
+        }
+        for (ordinal, operation) in observation.operations.iter_mut().enumerate() {
+            operation.operation_id = u64::try_from(ordinal).expect("bounded fixture ordinal");
+        }
+        observation
+            .validate()
+            .expect("complete multi-round fixture");
+        assert!(convert(&observation, Arm::On).is_err());
+        let mut telemetry = super::super::CaptureTelemetry::default();
+        let result = retain_observation_and_convert(
+            &observation,
+            ("session", "turn"),
+            TerminalOutcome::Succeeded,
+            Feature::ContextReranking,
+            Arm::On,
+            &["history:session:2".into(), "history:session:7".into()],
+            &mut telemetry,
+        );
+        assert!(matches!(
+            result,
+            Err(ObservationFailureStage::UnsupportedRepresentation)
+        ));
+        assert_eq!(telemetry.inference_calls, Some(5));
+        assert!(telemetry.optional_operations_complete);
+        assert_eq!(telemetry.optional_operations.len(), 5);
+        let invalidations: [fn(&mut TurnJudgementObservation); 5] = [
+            |value: &mut TurnJudgementObservation| value.session_id = "foreign".into(),
+            |value: &mut TurnJudgementObservation| value.turn_id = "foreign".into(),
+            |value: &mut TurnJudgementObservation| {
+                value.terminal = Some(ObservationTerminal::Failed);
+            },
+            |value: &mut TurnJudgementObservation| value.complete = false,
+            |value: &mut TurnJudgementObservation| {
+                value
+                    .covered_features
+                    .retain(|feature| *feature != Feature::ContextReranking);
+            },
+        ];
+        for invalidate in invalidations {
+            let mut invalid = observation.clone();
+            invalidate(&mut invalid);
+            let mut rejected = super::super::CaptureTelemetry::default();
+            assert!(
+                retain_observation_and_convert(
+                    &invalid,
+                    ("session", "turn"),
+                    TerminalOutcome::Succeeded,
+                    Feature::ContextReranking,
+                    Arm::On,
+                    &[],
+                    &mut rejected,
+                )
+                .is_err()
+            );
+            assert!(rejected.optional_operations.is_empty());
+            assert!(!rejected.optional_operations_complete);
+            assert_eq!(rejected.inference_calls, None);
+        }
     }
 
     #[test]
@@ -723,6 +838,58 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn no_work_tool_identity_is_observable_without_erasing_other_inference() {
+        use bcode_model::judgement::{RecommendationDomain, RecommendationSelectionObservation};
+        let mut observation = snapshot();
+        let identity = SelectionObservation {
+            candidate_count: 2,
+            ordered: vec![0, 1],
+            admitted: vec![0, 1],
+        };
+        let operation = &mut observation.operations[2];
+        operation.trigger = Trigger::NotApplicable;
+        operation.application = Some(Application::BaselineRetained);
+        operation.inference.clear();
+        operation.selection = Some(identity.clone());
+        operation.recommendation = Some(RecommendationSelectionObservation {
+            domain: RecommendationDomain::Tools,
+            candidate_ids: vec!["filesystem.read".into(), "filesystem.write".into()],
+            selection: identity,
+        });
+        let Some(ConsumerOutput::Ranking { order, admitted }) =
+            recommendation_output(&observation, Arm::On).unwrap()
+        else {
+            panic!("proven no-work identity must remain observable");
+        };
+        assert_eq!(order, ["filesystem.read", "filesystem.write"]);
+        assert_eq!(admitted, order);
+        let mut skills = observation.operations[2].clone();
+        skills.operation_id = observation.operations.len() as u64;
+        skills.trigger = Trigger::Triggered;
+        skills.recommendation.as_mut().unwrap().domain = RecommendationDomain::Skills;
+        skills
+            .inference
+            .push(bcode_model::judgement::OptionalOperationObservation {
+                outcome: bcode_model::judgement::OptionalOperationOutcome::Advice,
+                inference_invocations: 1,
+                ..bcode_model::judgement::OptionalOperationObservation::default()
+            });
+        observation.operations.push(skills);
+        let mut telemetry = crate::judgement_capture::CaptureTelemetry::default();
+        telemetry.retain_turn_observation(&observation).unwrap();
+        assert!(telemetry.optional_operations_complete);
+        assert_eq!(telemetry.inference_calls, Some(1));
+        let mut nonidentity = observation.clone();
+        let operation = &mut nonidentity.operations[2];
+        operation.selection.as_mut().unwrap().ordered = vec![1, 0];
+        operation.recommendation.as_mut().unwrap().selection.ordered = vec![1, 0];
+        assert!(recommendation_output(&nonidentity, Arm::On).is_err());
+        let mut unavailable = observation.clone();
+        unavailable.operations[2].application = Some(Application::Unavailable);
+        assert!(recommendation_output(&unavailable, Arm::On).is_err());
     }
 
     #[test]

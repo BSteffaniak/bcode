@@ -274,6 +274,48 @@ def hook_summary(observation, session_id, turn_id, required):
             'all_required_satisfied': all(v['satisfied'] for v in summary.values())}
 
 
+def retain_navigation_observations(job, report, root, events, session_id, turn_id, workspace):
+    """Retain first exact public facts; never refresh an existing receipt."""
+    activated = [e for e in events if 'submission_activated' in e['kind']]
+    cli.require(len(activated) == 1 and activated[0]['session_id'] == session_id,
+                'exact navigation activation unavailable')
+    source = activated[0]['sequence']
+    cli.require(type(source) is int and source >= 0, 'invalid navigation activation sequence')
+    identity = {'session_id': session_id, 'turn_id': turn_id, 'source_sequence': source}
+    required = {'session_categorization': 'applied' if 'session_categorization' in report['enabled_features'] else 'disabled'}
+    retained = {}
+    for name in ('hook', 'labels'):
+        path = root / ('navigation-' + name + '.json')
+        key = 'navigation_' + name + '_receipt'
+        if key in report:
+            receipt = report[key]
+            cli.require(all(receipt.get(k) == v for k, v in identity.items())
+                        and receipt.get('file') == str(path) and not path.is_symlink()
+                        and path.stat().st_size <= cli.MAX_BYTES
+                        and cli.digest(path) == receipt.get('sha256'), 'navigation receipt integrity mismatch')
+            value = cli.read_json(path)
+        else:
+            value = cli.json_command(job, job['arm'],
+                ['judgement', 'observe-turn', session_id, turn_id] if name == 'hook' else
+                ['session', 'categorization', session_id, '--json'], workspace)
+        if name == 'hook':
+            summary = hook_summary(value, session_id, turn_id, required)
+            cli.require(summary['all_required_satisfied'], 'navigation hooks incomplete')
+            report['hook_evidence'] = summary
+        elif 'session_categorization' in report['enabled_features']:
+            cli.require(isinstance(value, dict) and value.get('source_sequence') == source
+                        and all(isinstance(value.get(k), str) and 0 < len(value[k]) <= 128
+                                for k in ('task', 'domain')), 'navigation label identity unavailable')
+        else:
+            cli.require(value is None, 'disabled navigation labels unexpectedly present')
+        cli.require(len(json.dumps(value).encode()) <= cli.MAX_BYTES, 'navigation observation oversized')
+        if key not in report:
+            cli.write_json(path, value)
+            report[key] = dict(identity, file=str(path), sha256=cli.digest(path))
+        retained[name] = value
+    return retained
+
+
 def observe_hooks(job, session_id, turn_id, workspace):
     observation = cli.json_command(job, job['arm'],
         ['judgement', 'observe-turn', session_id, turn_id], workspace)
@@ -388,13 +430,16 @@ def run(job):
         turn_id, start, end = exact_terminal(events)
         report['turn_id'] = turn_id
         require_available_terminal(events, end)
-        report['oracle'] = grade(job, workspace)
         primary_observation = None
-        if treatment in ('all_on', 'leave_out') or job.get('required_hooks'):
+        if feature == 'session_categorization':
+            primary_observation = retain_navigation_observations(
+                job, report, root, events, session_id, turn_id, workspace)['hook']
+        elif treatment in ('all_on', 'leave_out') or job.get('required_hooks'):
             primary_observation = cli.json_command(job, job['arm'],
                 ['judgement', 'observe-turn', session_id, turn_id], workspace)
             report['hook_evidence'] = hook_summary(primary_observation, session_id, turn_id,
                                                   job.get('required_hooks', {}))
+        report['oracle'] = grade(job, workspace)
         validate_capture(report['capture'], feature, template['request']['arm'],
                          enabled if primary_observation is not None else None, primary_observation,
                          job.get('control', 'positive'))

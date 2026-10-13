@@ -4042,17 +4042,20 @@ pub fn finish_runtime<P>(
 
 /// Run a constructed root runtime, map failures, record final statistics, and stop owned work.
 #[allow(dead_code)]
-pub async fn run<W: std::io::Write>(
+pub fn run<W: std::io::Write>(
     runtime: bmux_tui_runtime::Runtime<BcodeRuntimeModel, BcodeRuntimePresenter<'_, '_, W>>,
     handle: bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
-) -> Result<BcodeRuntimeModel, TuiError> {
-    let mut input = bmux_tui_runtime::TerminalInput::start::<BcodeRuntimeModel>(
-        handle,
-        BcodeRuntimeMessage::TerminalInputFailed,
-    );
-    let outcome = Box::pin(runtime.run()).await;
-    input.shutdown().await;
-    Box::pin(finish_runtime_result(outcome)).await
+) -> impl std::future::Future<Output = Result<BcodeRuntimeModel, TuiError>> {
+    let runtime = Box::pin(runtime.run());
+    async move {
+        let mut input = bmux_tui_runtime::TerminalInput::start::<BcodeRuntimeModel>(
+            handle,
+            BcodeRuntimeMessage::TerminalInputFailed,
+        );
+        let outcome = runtime.await;
+        input.shutdown().await;
+        Box::pin(finish_runtime_result(outcome)).await
+    }
 }
 
 type RootRuntimeResult<P> = Result<

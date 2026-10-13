@@ -172,6 +172,24 @@ async fn owned_terminal_fixture(
     (state, id, ownership)
 }
 
+async fn wait_for_settled_ownership(
+    state: &crate::ServerState,
+    id: bcode_session_models::SessionId,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let ownership = state.sessions.session_ownership_snapshot(id).await.unwrap();
+            let work = state.runtime_work.active_for_session(id).await;
+            if ownership.guards.is_empty() && work.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual runtime work and queued ownership releases must settle");
+}
+
 #[tokio::test]
 async fn terminal_scheduler_removal_preserves_evidence_until_explicit_ownership_release() {
     let root = tempfile::tempdir().unwrap();
@@ -206,6 +224,7 @@ async fn terminal_scheduler_removal_preserves_evidence_until_explicit_ownership_
         (0, 0, 0, 0)
     );
     drop(ownership);
+    wait_for_settled_ownership(&state, id).await;
     let outcome = crate::explicit_session_ownership_release_outcome(&state, id)
         .await
         .unwrap();
@@ -223,6 +242,85 @@ async fn terminal_scheduler_removal_preserves_evidence_until_explicit_ownership_
     assert!(!observations.states(id).1);
     drop(observations);
     drop(state);
+}
+
+#[tokio::test]
+async fn terminal_evidence_does_not_release_registered_unsettled_work() {
+    use crate::runtime_work::{CancellationHandle, RuntimeWorkSpec};
+    use bcode_session_models::{RuntimeWorkKind, WorkId};
+    let root = tempfile::tempdir().unwrap();
+    let (state, id, ownership) = owned_terminal_fixture(root.path()).await;
+    let page = activity(
+        &state,
+        id,
+        SessionActivityQuery {
+            scope: SessionActivityScope::Own,
+            after: None,
+            limit: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.coverage, SessionActivityCoverage::Complete);
+    let work_id = WorkId::new("terminal-work");
+    let mut spec = RuntimeWorkSpec::new(
+        work_id.clone(),
+        RuntimeWorkKind::Tool,
+        "controlled fixture work".into(),
+        CancellationHandle::Test(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+    );
+    spec.ownership = Some(ownership);
+    assert!(state.runtime_work.start(id, spec).await.1);
+    let (complete, pending) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        pending.await.expect("fixture work completion signal");
+    });
+    let outcome = crate::explicit_session_ownership_release_outcome(&state, id)
+        .await
+        .unwrap();
+    let bcode_ipc::SessionOwnershipReleaseOutcome::Blocked { blockers } = outcome else {
+        panic!("terminal history must not release physically pending work: {outcome:?}");
+    };
+    assert!(blockers.contains(&bcode_ipc::SessionOwnershipBlocker::RuntimeWork));
+    assert_eq!(state.runtime_work.active_for_session(id).await.len(), 1);
+    assert!(!task.is_finished());
+    assert!(
+        state
+            .activity_observations
+            .lock()
+            .await
+            .evidence(id)
+            .counts_complete
+    );
+    complete.send(()).unwrap();
+    task.await.expect("actual fixture work settled");
+    // Retirement is justified by the joined task, not by its earlier terminal history.
+    assert!(state.runtime_work.finish(id, &work_id).await);
+    wait_for_settled_ownership(&state, id).await;
+    assert!(
+        state
+            .activity_observations
+            .lock()
+            .await
+            .evidence(id)
+            .counts_complete
+    );
+    let outcome = crate::explicit_session_ownership_release_outcome(&state, id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        bcode_ipc::SessionOwnershipReleaseOutcome::Released
+            | bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned
+    ));
+    assert!(
+        !state
+            .activity_observations
+            .lock()
+            .await
+            .evidence(id)
+            .counts_complete
+    );
 }
 
 #[tokio::test]

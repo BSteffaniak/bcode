@@ -219,11 +219,79 @@ def verify_subject(job, arm, workspace):
             'state_id': daemon['state_location_id']}
 
 
+def retain_hook_observation(result, path, job, arm, workspace, session_id, turn_id, normal_driver):
+    """Export first verified public evidence exclusively; later disposal never replaces it."""
+    required = {'context_reranking': 'applied' if arm['arm'] == 'on' else 'disabled'}
+    if 'hook_observation_receipt' in result:
+        receipt = result['hook_observation_receipt']
+        require(receipt['file'] == str(path) and digest(path) == receipt['sha256'],
+                'retained hook observation identity changed')
+        observation = read_json(path)
+        normal_driver.hook_summary(observation, session_id, turn_id, required)
+        return observation
+    observation = json_command(job, arm, ['judgement', 'observe-turn', session_id, turn_id], workspace)
+    summary = normal_driver.hook_summary(observation, session_id, turn_id, required)
+    require(len(json.dumps(observation).encode()) <= MAX_BYTES, 'bounded hook observation required')
+    write_json(path, observation)
+    result['hook_observation_receipt'] = {'file': str(path), 'sha256': digest(path),
+                                        'session_id': session_id, 'turn_id': turn_id}
+    result['hook_evidence'] = summary
+    return observation
+
+
+def capture_failure(result):
+    """Classify only normalized receipt facts, never elapsed time or private errors."""
+    capture = result['capture']
+    status, outcome = capture.get('status'), capture.get('outcome')
+    if status == 'public_operation_failed':
+        result['capture_failure'] = {'status': status,
+                                     'outcome': outcome if outcome in ('infrastructure_failure', 'timeout', 'cancelled') else 'unknown'}
+        raise PilotError('capture public operation failed; terminal and oracle not assessed')
+
+
+def record_failure(result, error, normal_driver=None):
+    """Retain owned/imported normalized classifications; arbitrary exception text is private."""
+    types = (PilotError,)
+    if normal_driver is not None:
+        types += (normal_driver.cli.PilotError,)
+    result['failure_stage'] = result['stage']
+    if isinstance(error, types):
+        if hasattr(error, 'diagnostic'):
+            result['public_failure'] = error.diagnostic
+        result['gap'] = str(error)
+    else:
+        result['gap'] = result['stage'] + ' unavailable; malformed response or local failure'
+
+
+def arm_order(job):
+    """Validate an explicit paired schedule, defaulting to baseline first."""
+    order = job.get('arm_order', ['off', 'on'])
+    require(isinstance(order, list) and order in (['off', 'on'], ['on', 'off']),
+            'arm_order must be an exact off/on permutation')
+    return order
+
+
+def initial_report(job):
+    """Retain authored study scope and distinguish snippet allowance from delivery."""
+    return {'schema_version': 1, 'scope': job.get('scope', 'development_pilot_not_accuracy_or_promotion'),
+            'arm_order': arm_order(job), 'configuration_complete': False,
+            'mandatory_omission': 'public_compaction_boundary_plus_runtime_hydration_not_raw_request_capture',
+            'framed_installation_bytes': None, 'source_order': job['source_order'],
+            'snippet_budget_bytes': job['context_budget_bytes'],
+            'budget_scope': 'optional_snippet_bytes_not_total_delivered_bytes',
+            'judgement_selection_declared': job['judgement_selection'],
+            'oracle_sha256': job['oracle_sha256'], 'scenarios_sha256': job['scenarios_sha256'], 'arms': []}
+
+
 def bind_subject(template, job, arm, identity):
     """Bind only explicitly deferred state identity from verified public diagnosis."""
     declared = template['request']['subject']
     if arm.get('state_binding') == 'verified_public_diagnose':
-        require(declared.get('state_id') is None, 'deferred state binding requires null state_id')
+        require(declared.get('state_id') == 'unknown', 'deferred state binding requires exact unknown state_id')
+        require(isinstance(identity.get('state_id'), str) and identity['state_id'] not in ('', 'unknown'),
+                'verified concrete state identity required')
+        require(all(declared.get(key) == identity.get(key) for key in ('artifact_id', 'executable_sha256'))
+                and declared.get('executable') == job['subject_binary'], 'declared artifact scope mismatch')
         declared['state_id'] = identity['state_id']
     mismatches = [key for key in identity if declared.get(key) != identity[key]]
     if declared.get('executable') != job['subject_binary']:
@@ -301,15 +369,37 @@ def verify_selection(job, arm, workspace, session_id):
     return actual
 
 
+FEATURES = ('tool_result_triage', 'context_reranking', 'progress_monitoring',
+            'recommendations', 'session_categorization', 'eval_categorization')
+
+
+def context_treatment(job, arm):
+    """Explicit enabled-set contract; legacy jobs remain isolated context pairs."""
+    declared = arm.get('enabled_features')
+    if declared is None:
+        return {'context_reranking'} if arm['arm'] == 'on' else set()
+    require(isinstance(declared, list) and len(declared) == len(set(declared))
+            and all(f in FEATURES for f in declared), 'invalid explicit context treatment')
+    return set(declared)
+
+
+def delivery_proof(request_selection=None):
+    """Selection/hydration evidence is not proof of actual provider request content."""
+    return {'normal_request_identity': request_selection,
+            'solver_content_delivery': {'status': 'unsupported',
+                'reason': 'public_capture_does_not_expose_normal_model_request_content'},
+            'mandatory_context_retention': {'status': 'unsupported',
+                'reason': 'compaction_boundary_and_admission_are_not_request_content_proof'}}
+
+
 def validate_overlay(job, arm):
     """Require explicit treatment/root/budget declarations, not resolved-config claims."""
     overlay = tomllib.loads(arm['overlay_toml'])
     judgement = overlay['judgement']
     require(judgement.get('mode') == 'auto', 'explicit global auto required')
-    features = ('tool_result_triage', 'context_reranking', 'progress_monitoring',
-                'recommendations', 'session_categorization', 'eval_categorization')
-    require(all(judgement.get(f) == ('auto' if f == 'context_reranking' and arm['arm'] == 'on' else 'off')
-                for f in features), 'explicit isolated context treatment required')
+    enabled = context_treatment(job, arm)
+    require(all(judgement.get(f) == ('auto' if f in enabled else 'off')
+                for f in FEATURES), 'explicit context treatment required')
     require(judgement['selection'] == job['judgement_selection'], 'exact Jev overlay pin required')
     pi = overlay['session_import']['pi']
     require(overlay['session_import']['enabled'] and pi['enabled']
@@ -328,7 +418,7 @@ def verify_capture_isolation(job, arm, request):
     validate_overlay(job, arm)
     require(request['arm'] == arm['arm'] and request['feature'] == 'context_reranking',
             'capture treatment mismatch')
-    request['isolated_feature'] = True
+    request['isolated_feature'] = context_treatment(job, arm) <= {'context_reranking'}
 
 
 def run(job):
@@ -369,7 +459,7 @@ def run(job):
     require(sum(len(c['content'].encode()) for c in candidates) > job['context_budget_bytes']
             and all(len(c['content'].encode()) <= job['context_budget_bytes'] for c in candidates),
             'real optional snippet byte pressure required')
-    policy = next(c['content'] for c in item['candidates'] if c['required'])
+    policy = item.get('current_policy', next((c['content'] for c in item['candidates'] if c['required']), ''))
     require(0 < len(candidates) <= 16, 'bounded producer candidates required')
     pin = job['judgement_selection']
     require(pin['provider_plugin_id'] == 'bcode.jev' and pin['model_id'].startswith('jev-')
@@ -380,6 +470,12 @@ def run(job):
     require(job['arms'][0]['config_file'] == job['arms'][1]['config_file'],
             'same explicit base configuration required')
     overlays = [tomllib.loads(a['overlay_toml']) for a in job['arms']]
+    for arm in job['arms']:
+        require(('context_reranking' in context_treatment(job, arm)) == (arm['arm'] == 'on'),
+                'context pair must differ on measured feature')
+    require(context_treatment(job, job['arms'][0]) ==
+            context_treatment(job, job['arms'][1]) - {'context_reranking'},
+            'paired enabled sets differ beyond context')
     for overlay in overlays:
         overlay['judgement'].pop('context_reranking')
     require(overlays[0] == overlays[1], 'paired overlays differ beyond treatment')
@@ -394,19 +490,17 @@ def run(job):
     for admission in admissions:
         admission['execution'].pop('historical_context', None)
     require(admissions[0] == admissions[1], 'paired execution allowances differ')
-    report = {'schema_version': 1, 'scope': 'development_pilot_not_accuracy_or_promotion',
-              'configuration_complete': False,
-              'mandatory_omission': 'public_compaction_boundary_plus_runtime_hydration_not_raw_request_capture',
-              'framed_installation_bytes': None, 'source_order': order,
-              'judgement_selection_declared': pin,
-              'oracle_sha256': job['oracle_sha256'], 'scenarios_sha256': job['scenarios_sha256'], 'arms': []}
+    report = initial_report(job)
     sessions = set()
-    for arm, template in zip(job['arms'], templates):
+    paired = {arm['arm']: (arm, template) for arm, template in zip(job['arms'], templates)}
+    for label in arm_order(job):
+        arm, template = paired[label]
         if report['arms'] and report['arms'][-1]['gap'] is not None:
             report['arms'].append({'arm': arm['arm'], 'gap': 'not started after prior arm gap',
                                    'capture': None, 'oracle': None})
             continue
-        result = {'arm': arm['arm'], 'gap': None, 'capture': None, 'oracle': None}
+        result = {'arm': arm['arm'], 'gap': None, 'capture': None, 'oracle': None, 'stage': 'preflight'}
+        normal_driver = None
         report['arms'].append(result)
         session_id = None
         capture_started = False
@@ -466,7 +560,7 @@ def run(job):
                                       auth_profile=job['expected_selection']['auth_profile'], model_profile=job['profile'])
             consumer = capture['consumer']
             require(consumer['kind'] == 'normal_turn', 'normal-turn capture required')
-            consumer['request'].update(session_id=session_id, prompt=item['prompt'] + '\n' + policy)
+            consumer['request'].update(session_id=session_id, prompt=item['prompt'] + ('\n' + policy if policy else ''))
             execution = consumer['request']['admission']['execution']
             require(execution.get('permission_mode', 'enforce') == 'enforce', 'normal permissions required')
             execution.update(schema_version=8, historical_context=references,
@@ -475,11 +569,14 @@ def run(job):
             capture_path = workspace.parent / (arm['arm'] + '-capture-job.json')
             write_json(capture_path, capture)
             result['capture_job_sha256'] = digest(capture_path)
+            result['stage'] = 'capture'
             capture_started = True
             result['capture'] = json.loads(command(job, arm, ['judgement', 'benchmark-capture', '--file',
                                                               str(capture_path)], workspace, timeout=330))
             # Preserve the completed response before independent artifact/coverage reads.
             write_json(workspace.parent / (arm['arm'] + '-retained-capture.json'), result['capture'])
+            capture_failure(result)
+            result['stage'] = 'terminal'
             normal_spec = importlib.util.spec_from_file_location('context_terminal', Path(__file__).with_name('judgement-normal-live.py'))
             normal_driver = importlib.util.module_from_spec(normal_spec)
             normal_spec.loader.exec_module(normal_driver)
@@ -489,11 +586,13 @@ def run(job):
             result['terminal_proof'] = {'verified': True, 'session_id': session_id, 'turn_id': turn_id,
                                         'start_sequence': start, 'end_sequence': end,
                                         'history_sha256': normal_driver.sha(terminal_history)}
+            result['stage'] = 'observation'
+            retain_hook_observation(result, workspace.parent / (arm['arm'] + '-hook-observation.json'),
+                                    job, arm, workspace, session_id, turn_id, normal_driver)
             if 'expected_request_auth_profile' in job:
                 result['request_selection'] = verify_request_identity(job, terminal_events, session_id, turn_id, start, end)
-            observation = json_command(job, arm, ['judgement', 'observe-turn', session_id, turn_id], workspace)
-            result['hook_evidence'] = normal_driver.hook_summary(observation, session_id, turn_id,
-                {'context_reranking': 'applied' if arm['arm'] == 'on' else 'disabled'})
+            result['delivery_proof'] = delivery_proof(result.get('request_selection'))
+            result['stage'] = 'oracle'
             # No submitted Python is executed: the independent oracle interprets a bounded AST.
             require(digest(oracle) == job['oracle_sha256']
                     and digest(scenarios_path) == job['scenarios_sha256'], 'oracle identity changed')
@@ -507,22 +606,20 @@ def run(job):
             artifact = workspace / item['artifact']
             require(not artifact.is_symlink(), 'unsafe generated artifact')
             result['artifact_sha256'] = digest(artifact) if artifact.is_file() else None
+            result['stage'] = 'capture_validation'
             captured = result['capture']
             require(captured['scope'] == 'normal_turn' and captured['consumer_executed']
                     and captured.get('output') and captured.get('outcome') in ('succeeded', 'failed'), 'application capture missing; outcome remains unknown')
             selection = captured['output']
             require(selection.get('kind') == 'ranking' and 0 < len(selection['admitted']) < len(candidates),
                     'actual constrained history admission missing')
-            if arm['arm'] == 'off':
+            if not context_treatment(job, arm):
                 telemetry = captured['telemetry']
                 require(all(telemetry.get(k) == 0 for k in ('discovery_calls', 'verification_calls', 'inference_calls')),
                         'off optional calls not verified zero')
+            result['stage'] = 'complete'
         except (ValueError, KeyError, OSError, TypeError, subprocess.TimeoutExpired) as error:
-            # Keep diagnostics content-free; errors from provider/CLI/module are untrusted.
-            if isinstance(error, PilotError) and hasattr(error, 'diagnostic'):
-                result['public_failure'] = error.diagnostic
-            result['gap'] = (str(error) if isinstance(error, PilotError) else
-                             'pilot unavailable; public response or oracle malformed')
+            record_failure(result, error, normal_driver)
             if session_id and capture_started and not result.get('terminal_proof', {}).get('verified'):
                 try:
                     command(job, arm, ['cancel', session_id, '--json'], workspace)
@@ -611,9 +708,9 @@ class OfflineTests(unittest.TestCase):
         template = {'request': {'subject': dict(identity, executable='/subject', state_id='old-state')}}
         with self.assertRaisesRegex(PilotError, 'state_id'):
             bind_subject(template, job, {}, identity)
-        with self.assertRaisesRegex(PilotError, 'null state_id'):
+        with self.assertRaisesRegex(PilotError, 'exact unknown state_id'):
             bind_subject(template, job, {'state_binding': 'verified_public_diagnose'}, identity)
-        template['request']['subject']['state_id'] = None
+        template['request']['subject']['state_id'] = 'unknown'
         result = {}
         bind_subject_report(result, template, job, {'state_binding': 'verified_public_diagnose'}, identity)
         self.assertEqual(result['subject_mismatch_fields'], [])

@@ -64,6 +64,19 @@ pub fn history_page(value: &Value, identity: &str, after: u64) -> Option<History
     })
 }
 
+/// Finite, secret-safe reasons why retained model evidence is incomplete.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCoverageFailure {
+    MissingRequestBoundary,
+    IncompleteHistory,
+    MissingOrUnverifiedModelInputExport,
+    UnknownModelApplicability,
+    NoObservedModelSession,
+}
+
 #[derive(Default)]
 pub struct ModelCoverage {
     pub applicable_sessions: usize,
@@ -71,6 +84,7 @@ pub struct ModelCoverage {
     pub non_model_sessions: usize,
     pub unknown_sessions: usize,
     pub missing_boundaries: usize,
+    failures: std::collections::BTreeSet<ModelCoverageFailure>,
 }
 
 impl ModelCoverage {
@@ -97,16 +111,37 @@ impl ModelCoverage {
             .any(|event| matches!(event.kind, SessionEventKind::SessionCreated { .. }));
         if requests > 0 || execution {
             self.applicable_sessions += 1;
+            if !history_complete {
+                self.failures
+                    .insert(ModelCoverageFailure::IncompleteHistory);
+            }
             if requests == 0 {
                 self.missing_boundaries += 1;
+                self.failures
+                    .insert(ModelCoverageFailure::MissingRequestBoundary);
             } else if history_complete && summary["complete_model_inputs_exported"] == true {
                 self.complete_sessions += 1;
+            } else if summary["complete_model_inputs_exported"] != true {
+                self.failures
+                    .insert(ModelCoverageFailure::MissingOrUnverifiedModelInputExport);
             }
         } else if unknown_child || execution_identity || !history_complete || !parent_observed {
             self.unknown_sessions += 1;
+            self.failures
+                .insert(ModelCoverageFailure::UnknownModelApplicability);
         } else {
             self.non_model_sessions += 1;
         }
+    }
+
+    /// Return bounded reason categories, never request content or provider diagnostics.
+    #[must_use]
+    pub fn failure_reasons(&self) -> Vec<ModelCoverageFailure> {
+        let mut reasons = self.failures.clone();
+        if self.applicable_sessions == 0 {
+            reasons.insert(ModelCoverageFailure::NoObservedModelSession);
+        }
+        reasons.into_iter().collect()
     }
 
     #[must_use]

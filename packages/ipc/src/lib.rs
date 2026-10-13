@@ -6496,6 +6496,202 @@ mod tests {
         }
     }
 
+    fn chunked_inspection_definition() -> bcode_workflow::WorkflowDefinitionSnapshot {
+        use bcode_workflow::{
+            ValueSchema, WorkflowDefinition, WorkflowDefinitionRepresentation,
+            WorkflowDefinitionSnapshot,
+        };
+        let schema = ValueSchema {
+            type_name: "inspection-test".into(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let definition = WorkflowDefinition {
+            schema_version: 1,
+            name: "inspection-test".into(),
+            input: schema.clone(),
+            output: schema,
+            nodes: BTreeMap::new(),
+            entries: Vec::new(),
+            exits: Vec::new(),
+            edges: Vec::new(),
+        };
+        WorkflowDefinitionSnapshot {
+            definition_id: "inspection-test".into(),
+            version: 1,
+            checksum_sha256: "a".repeat(64),
+            definition: WorkflowDefinitionRepresentation::parse(
+                serde_json::to_string(&definition).expect("encode definition"),
+            )
+            .expect("parse definition"),
+        }
+    }
+
+    fn chunked_inspection_run(
+        status: bcode_workflow::RunStatus,
+    ) -> bcode_workflow::WorkflowRunSummary {
+        use bcode_workflow::{RunStatus, WorkflowRunSummary};
+        let completed = status == RunStatus::Completed;
+        WorkflowRunSummary {
+            run_id: "inspection-run".into(),
+            definition_id: "inspection-test".into(),
+            definition_version: 1,
+            workspace_snapshot: "snapshot".into(),
+            parent_session_id: None,
+            parent_session_generation: None,
+            binding: None,
+            authored_provenance: None,
+            terminal_output_id: completed.then(|| "output".into()),
+            terminal_output_checksum_sha256: completed.then(|| "a".repeat(64)),
+            authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                version: 1,
+                provider_id: "test-policy".into(),
+                profile_id: "build".into(),
+                policy_digest_sha256: "a".repeat(64),
+            },
+            authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+            status,
+            cancellation_requested_at_ms: (status == RunStatus::Cancelled).then_some(2),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    fn chunked_workflow_inspection(status: bcode_workflow::RunStatus) -> Response {
+        use bcode_workflow::{
+            RunStatus, WaitingActivation, WorkflowActivationInputSummary,
+            WorkflowActivationSummary, WorkflowOutputSummary, WorkflowRunInspection,
+            WorkflowTerminalOutputInspection, WorkflowWaitKind,
+        };
+        // Physical framing chunks only after LZ4 compression. A repeated string
+        // tests compression, not chunking; use bounded deterministic varied data.
+        let mut varied = String::with_capacity(4 * MAX_FRAME_PAYLOAD_SIZE);
+        for index in 0..(4 * MAX_FRAME_PAYLOAD_SIZE / 64) {
+            for byte in Sha256::digest(index.to_le_bytes()) {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                varied.push(char::from(HEX[usize::from(byte >> 4)]));
+                varied.push(char::from(HEX[usize::from(byte & 15)]));
+            }
+        }
+        let nested = serde_json::json!({"result": {"rows": [varied]}});
+        let completed = status == RunStatus::Completed;
+        let inspection = WorkflowRunInspection {
+            canonical_eval_coverage: None,
+            admission_observations: Vec::new(),
+            admission_observations_complete: Some(true),
+            unavailable_collections: Vec::new(),
+            execution_allowance: None,
+            continuation: None,
+            replacement_readiness: None,
+            run: chunked_inspection_run(status),
+            graph: None,
+            definition: chunked_inspection_definition(),
+            terminal_output: completed.then(|| WorkflowTerminalOutputInspection {
+                version: 1,
+                output_id: "output".into(),
+                node_id: "result".into(),
+                activation_id: "activation".into(),
+                schema_id: "inspection-test".into(),
+                schema_version: 1,
+                checksum_sha256: "a".repeat(64),
+                value: nested.clone(),
+                artifact_reference: None,
+                created_at_ms: 2,
+            }),
+            activations: ["running", "waiting", "unresolved"]
+                .into_iter()
+                .map(|state| WorkflowActivationSummary {
+                    run_id: "inspection-run".into(),
+                    node_id: state.into(),
+                    activation_id: state.into(),
+                    dependency_generation: 0,
+                    status: state.into(),
+                    has_output: false,
+                    input_summary: WorkflowActivationInputSummary::Inline {
+                        value: nested.clone(),
+                    },
+                    created_at_ms: 1,
+                })
+                .collect(),
+            waits: vec![WaitingActivation {
+                run_id: "inspection-run".into(),
+                node_id: "waiting".into(),
+                activation_id: "waiting".into(),
+                kind: WorkflowWaitKind::Input,
+                input: Some(serde_json::json!({"prompt": "continue?"})),
+                requested_at_ms: 1,
+            }],
+            mutation_approvals: Vec::new(),
+            attempts: Vec::new(),
+            events: Vec::new(),
+            decisions: Vec::new(),
+            grants: Vec::new(),
+            resource_leases: Vec::new(),
+            outputs: vec![WorkflowOutputSummary {
+                output_id: "output".into(),
+                run_id: "inspection-run".into(),
+                node_id: "result".into(),
+                activation_id: "activation".into(),
+                schema_id: "inspection-test".into(),
+                schema_version: 1,
+                artifact_reference: None,
+                checksum_sha256: "a".repeat(64),
+                created_at_ms: 2,
+            }],
+            child_run_links: Vec::new(),
+            descendant_runs: Vec::new(),
+            repeat_outcomes: Vec::new(),
+            child_sessions: Vec::new(),
+            coordinator: None,
+        };
+        Response::Ok(ResponsePayload::WorkflowRunInspection {
+            inspection: Box::new(inspection),
+        })
+    }
+
+    #[tokio::test]
+    async fn chunked_workflow_inspection_round_trips_complete_typed_states() {
+        use bcode_workflow::RunStatus;
+        for status in [
+            RunStatus::Running,
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            let response = chunked_workflow_inspection(status);
+            let envelope = response_envelope(42, &response).expect("encode inspection");
+            assert!(envelope_frame_count(&envelope).expect("count frames") > 1);
+            let received = round_trip_envelope(envelope.clone()).await;
+            assert_eq!(received, envelope);
+            assert_eq!(
+                decode_response(&received.payload).expect("decode inspection"),
+                response
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_workflow_inspection_rejects_malformed_sequence_without_partial_response() {
+        let response = chunked_workflow_inspection(bcode_workflow::RunStatus::Running);
+        let envelope = response_envelope(42, &response).expect("encode inspection");
+        let frames = encode_envelope_frames(&envelope).expect("encode frames");
+        assert!(frames.len() > 1);
+        // Duplicate the first chunk in place of its continuation. The receiver must
+        // reject the whole logical response rather than expose the assembled prefix.
+        let mut bytes = frames[0].clone();
+        bytes.extend_from_slice(&frames[0]);
+        let mut reader = bytes.as_slice();
+        assert!(matches!(
+            recv_envelope(&mut reader).await,
+            Err(CodecError::InvalidChunk(_))
+        ));
+
+        let mut reader = frames[0].as_slice();
+        assert!(matches!(
+            recv_envelope(&mut reader).await,
+            Err(CodecError::Io(_))
+        ));
+    }
+
     #[tokio::test]
     async fn oversized_response_envelope_round_trips_across_chunked_frames() {
         let payload = vec![b'x'; MAX_FRAME_PAYLOAD_SIZE + 100_000];

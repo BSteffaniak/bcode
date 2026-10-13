@@ -29733,7 +29733,25 @@ fn project_tool_result_for_model_context(
         format!("\n\n[... omitted {omitted_chars} chars from tool output ...]\n\n");
     let fixed_chars = omission_marker.chars().count() + footer.chars().count();
     if fixed_chars >= max_context_chars {
-        return footer.chars().take(max_context_chars).collect();
+        // Recovery instructions must not displace all source evidence at small limits.
+        let notice = "\n[truncated; recovery instructions exceed context limit]\n";
+        let compact_footer = if notice.chars().count() <= max_context_chars / 2 {
+            notice
+        } else {
+            "…"
+        };
+        let budget = max_context_chars.saturating_sub(compact_footer.chars().count());
+        let head_chars = budget / 2;
+        let head = result.chars().take(head_chars).collect::<String>();
+        let tail = result
+            .chars()
+            .rev()
+            .take(budget.saturating_sub(head_chars))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        return format!("{head}{compact_footer}{tail}");
     }
 
     let budget = max_context_chars.saturating_sub(fixed_chars);
@@ -38199,9 +38217,31 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
             );
             let result = tokio::select! {
                 biased;
-                _ = shutdown.recv() => Err(WorkflowStoreError::InvalidData(
-                    "workflow admission interrupted; owner acceptance requires reconciliation".into(),
-                )),
+                shutdown_result = shutdown.recv() => {
+                    #[cfg(test)]
+                    if std::env::var("BCODE_TEST_WORKFLOW_OWNER_TRACE").as_deref()
+                        == Ok(request.dispatch_identity.as_str())
+                    {
+                        let category = match &shutdown_result {
+                            Ok(()) => "ok",
+                            Err(broadcast::error::RecvError::Closed) => "closed",
+                            Err(broadcast::error::RecvError::Lagged(_)) => "lagged",
+                        };
+                        let path = self.state.workflow_store.try_lock().ok()
+                            .map(|store| store.path().to_path_buf());
+                        eprintln!(
+                            "workflow-dispatch-shutdown recv={category} shutdown_requested={} state={:p} path={path:?} dispatch={}",
+                            self.state.shutdown_requested.load(Ordering::SeqCst),
+                            std::ptr::from_ref(self.state.as_ref()),
+                            request.dispatch_identity,
+                        );
+                    }
+                    #[cfg(not(test))]
+                    let _ = shutdown_result;
+                    Err(WorkflowStoreError::InvalidData(
+                        "workflow admission interrupted; owner acceptance requires reconciliation".into(),
+                    ))
+                },
                 result = tokio::time::timeout(timeout, async {
                     match request.activation.node.kind {
                         bcode_workflow::NodeKind::Agent => dispatch_workflow_prompt_turn(self.state, request).await,
@@ -38974,8 +39014,36 @@ async fn commit_workflow_prompt_observation(
     observation: bcode_workflow_store::AttemptObservation,
 ) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
     let completion_gate = workflow_drive_gate(state, &request.activation.run_id);
+    #[cfg(test)]
+    let trace_session = receipt["session_id"]
+        .as_str()
+        .and_then(|value| value.parse::<SessionId>().ok());
+    #[cfg(test)]
+    if let Some(session_id) = trace_session {
+        trace_workflow_owner_lifecycle(
+            state,
+            session_id,
+            &request.dispatch_identity,
+            "drive-gate-wait",
+        );
+    }
     let completion_guard = completion_gate.lock().await;
-    workflow_representation::owner::persist_receipt(
+    #[cfg(test)]
+    if let Some(session_id) = trace_session {
+        trace_workflow_owner_lifecycle(
+            state,
+            session_id,
+            &request.dispatch_identity,
+            "drive-gate-acquired",
+        );
+        trace_workflow_owner_lifecycle(
+            state,
+            session_id,
+            &request.dispatch_identity,
+            "receipt-persist-enter",
+        );
+    }
+    let receipt_result = workflow_representation::owner::persist_receipt(
         state,
         &bcode_workflow_store::DispatchReceipt {
             run_id: request.activation.run_id.clone(),
@@ -38988,10 +39056,39 @@ async fn commit_workflow_prompt_observation(
         },
         authority,
     )
-    .await?;
-    let summary =
+    .await;
+    #[cfg(test)]
+    if let Some(session_id) = trace_session {
+        trace_workflow_owner_lifecycle(
+            state,
+            session_id,
+            &request.dispatch_identity,
+            "receipt-persist-return",
+        );
+    }
+    receipt_result?;
+    #[cfg(test)]
+    if let Some(session_id) = trace_session {
+        trace_workflow_owner_lifecycle(
+            state,
+            session_id,
+            &request.dispatch_identity,
+            "observation-settle-enter",
+        );
+    }
+    let settlement_result =
         workflow_representation::owner::settle_observation(state, request, authority, observation)
-            .await?;
+            .await;
+    #[cfg(test)]
+    if let Some(session_id) = trace_session {
+        trace_workflow_owner_lifecycle(
+            state,
+            session_id,
+            &request.dispatch_identity,
+            "observation-settle-return",
+        );
+    }
+    let summary = settlement_result?;
     drop(completion_guard);
     Ok(summary)
 }
@@ -39011,6 +39108,30 @@ async fn continue_settled_workflow_prompt(
     }
 }
 
+#[cfg(test)]
+fn trace_workflow_owner_lifecycle(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: &str,
+    lifecycle_event: &'static str,
+) {
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // Exact opt-in dispatch/work identity; no global per-fixture inventory or payloads.
+    if std::env::var("BCODE_TEST_WORKFLOW_OWNER_TRACE").as_deref() != Ok(work_id) {
+        return;
+    }
+    let elapsed = STARTED.get_or_init(std::time::Instant::now).elapsed();
+    let path = state
+        .workflow_store
+        .try_lock()
+        .ok()
+        .map(|store| store.path().to_path_buf());
+    eprintln!(
+        "workflow-owner-stage={lifecycle_event} elapsed={elapsed:?} state={:p} path={path:?} session={session_id} work={work_id}",
+        std::ptr::from_ref(state)
+    );
+}
+
 async fn complete_workflow_prompt_dispatch(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
@@ -39020,6 +39141,13 @@ async fn complete_workflow_prompt_dispatch(
     shared_permit: Option<bcode_session::SharedExecutionSessionPermit>,
     observation: Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError>,
 ) {
+    #[cfg(test)]
+    trace_workflow_owner_lifecycle(
+        state,
+        session_id,
+        &request.dispatch_identity,
+        "settlement-enter",
+    );
     let result = match observation {
         Ok(
             observation @ (bcode_workflow_store::AttemptObservation::Succeeded { .. }
@@ -39034,6 +39162,13 @@ async fn complete_workflow_prompt_dispatch(
         Ok(_) => Err(WorkflowStoreError::OwnerAccessDeferred),
         Err(error) => Err(error),
     };
+    #[cfg(test)]
+    trace_workflow_owner_lifecycle(
+        state,
+        session_id,
+        &request.dispatch_identity,
+        "settlement-return",
+    );
     // Keep both verification guards until durable settlement. On failure suspend only
     // disposable runtime work: the admitted receipt remains unresolved and recoverable.
     let (status, message) = match &result {
@@ -39419,6 +39554,22 @@ async fn dispatch_workflow_prompt_turn_after_admission(
     request: &bcode_workflow_store::PreparedActivationDispatch,
     after_admission: impl FnOnce() -> Result<(), WorkflowStoreError> + Send,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
+    dispatch_workflow_prompt_turn_with_publication_hook(state, request, || {
+        std::future::ready(after_admission())
+    })
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn dispatch_workflow_prompt_turn_with_publication_hook<F, Fut>(
+    state: &Arc<ServerState>,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    before_publication: F,
+) -> Result<serde_json::Value, WorkflowStoreError>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<(), WorkflowStoreError>> + Send,
+{
     let admission = workflow_prompt_admission(state, &request.dispatch_identity);
     #[cfg(test)]
     let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
@@ -39793,7 +39944,6 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         } => (receipt, Some(completion), false),
         SubmittedModelTurn::Existing(receipt) => (receipt, None, true),
     };
-    after_admission()?;
     let owner_receipt = serde_json::json!({
         "owner": "bcode.server.agent-turn/v1",
         "owner_artifact_id": state.daemon_status.artifact_id.as_ref().map(ToString::to_string),
@@ -39804,39 +39954,25 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         "accepted_event_sequence": receipt.accepted_event_sequence,
         "output_schema_id": request.activation.node.output.type_name,
     });
-    #[cfg(test)]
-    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
-        &request.activation.run_id,
-        Some(target_session_id),
-        Some(&request.dispatch_identity),
-        workflow_representation::fanout_stages::FanoutAdmissionStage::OwnerPersistence,
-    );
-    let receipt_commit = workflow_representation::owner::persist_receipt(
-        state,
-        &bcode_workflow_store::DispatchReceipt {
-            run_id: request.activation.run_id.clone(),
-            node_id: request.activation.node_id.clone(),
-            activation_id: request.activation.activation_id.clone(),
-            attempt: request.attempt,
-            dispatch_identity: request.dispatch_identity.clone(),
-            receipt: owner_receipt.clone(),
-            admitted_at_ms: admission_started_at_ms,
-        },
-        &dispatch_authority,
-    )
-    .await;
-    #[cfg(test)]
-    drop(stage_timer);
-    // Admission has already committed in the session domain. Even when its workflow
-    // receipt write fails, keep observing the admitted turn and retain its shared permit.
-    // The caller still receives the persistence failure; observation cannot bypass fencing.
+    // Install completion ownership before any publication await or test hook.
+    // Sender loss means publication ownership was lost, not that the turn was cancelled.
+    let (publication_finished, publication_gate) = oneshot::channel::<()>();
     let execution_session_id = target_session_id;
     let request_for_completion = request.clone();
     let state_for_completion = Arc::clone(state);
     let receipt_for_completion = owner_receipt.clone();
+    let authority_for_completion = dispatch_authority.clone();
     if let Some(completion_receiver) = completion_receiver {
         tokio::spawn(async move {
             let shared_permit = shared_permit;
+            let _ = publication_gate.await;
+            #[cfg(test)]
+            trace_workflow_owner_lifecycle(
+                &state_for_completion,
+                execution_session_id,
+                &request_for_completion.dispatch_identity,
+                "completion-await",
+            );
             let completion = match completion_receiver.await {
                 Ok(completion) => completion,
                 Err(error) => ModelTurnCompletion::with_message(
@@ -39844,6 +39980,13 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                     format!("workflow model turn completion channel closed: {error}"),
                 ),
             };
+            #[cfg(test)]
+            trace_workflow_owner_lifecycle(
+                &state_for_completion,
+                execution_session_id,
+                &request_for_completion.dispatch_identity,
+                "completion-received",
+            );
             let observation = workflow_representation::owner::completion_observation(
                 &state_for_completion,
                 &request_for_completion,
@@ -39853,7 +39996,7 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             complete_workflow_prompt_dispatch(
                 &state_for_completion,
                 &request_for_completion,
-                &dispatch_authority,
+                &authority_for_completion,
                 &receipt_for_completion,
                 execution_session_id,
                 shared_permit,
@@ -39867,6 +40010,7 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         let timeout_ms = configuration.timeout_ms;
         tokio::spawn(async move {
             let shared_permit = shared_permit;
+            let _ = publication_gate.await;
             let observation = observe_existing_workflow_agent_turn(
                 &state_for_completion,
                 &request_for_completion,
@@ -39879,7 +40023,7 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             complete_workflow_prompt_dispatch(
                 &state_for_completion,
                 &request_for_completion,
-                &dispatch_authority,
+                &authority_for_completion,
                 &receipt_for_completion,
                 execution_session_id,
                 shared_permit,
@@ -39888,6 +40032,37 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             .await;
         });
     }
+    #[cfg(test)]
+    let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        Some(target_session_id),
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::OwnerPersistence,
+    );
+    let receipt_commit = match before_publication().await {
+        Ok(()) => {
+            workflow_representation::owner::persist_receipt(
+                state,
+                &bcode_workflow_store::DispatchReceipt {
+                    run_id: request.activation.run_id.clone(),
+                    node_id: request.activation.node_id.clone(),
+                    activation_id: request.activation.activation_id.clone(),
+                    attempt: request.attempt,
+                    dispatch_identity: request.dispatch_identity.clone(),
+                    receipt: owner_receipt.clone(),
+                    admitted_at_ms: admission_started_at_ms,
+                },
+                &dispatch_authority,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    #[cfg(test)]
+    drop(stage_timer);
+    // Release observation even on publication failure; actual completion and authority
+    // checks, not this notification, determine receipt reconstruction and settlement.
+    let _ = publication_finished.send(());
     receipt_commit?;
     Ok(owner_receipt)
 }
@@ -40456,6 +40631,8 @@ async fn register_workflow_node_runtime_work(
     label: String,
     cancellation: CancellationHandle,
 ) -> WorkId {
+    #[cfg(test)]
+    trace_workflow_owner_lifecycle(state, session_id, dispatch_identity, "register-enter");
     let work_id = WorkId::new(dispatch_identity.to_string());
     register_runtime_work(
         state,
@@ -40469,6 +40646,8 @@ async fn register_workflow_node_runtime_work(
         .with_parent_work_id(Some(run_work_id.clone())),
     )
     .await;
+    #[cfg(test)]
+    trace_workflow_owner_lifecycle(state, session_id, dispatch_identity, "register-return");
     work_id
 }
 
@@ -40950,7 +41129,21 @@ async fn finish_registered_runtime_work(
     status: RuntimeWorkStatus,
     message: Option<String>,
 ) {
-    let Some(owned_work) = state.runtime_work.take(session_id, &work_id).await else {
+    #[cfg(test)]
+    trace_workflow_owner_lifecycle(state, session_id, &work_id.0, "take-enter");
+    let owned_work = state.runtime_work.take(session_id, &work_id).await;
+    #[cfg(test)]
+    trace_workflow_owner_lifecycle(
+        state,
+        session_id,
+        &work_id.0,
+        if owned_work.is_some() {
+            "take-return-owned"
+        } else {
+            "take-return-absent"
+        },
+    );
+    let Some(owned_work) = owned_work else {
         tracing::debug!(%session_id, work_id = %work_id, "runtime work already reached a terminal state");
         return;
     };
@@ -60417,6 +60610,23 @@ library = "test"
         assert!(truncated.contains("/tmp/full-output.txt"));
         assert!(truncated.ends_with("necessary.]\n\n") || truncated.contains('z'));
         assert!(truncated.contains('z'));
+    }
+
+    #[test]
+    fn small_tool_context_limits_retain_unicode_source_evidence() {
+        let output = format!(
+            "KeyError: missing field {} exit code 1",
+            "界🙂e\u{301}".repeat(400)
+        );
+        for limit in [1, 2, 8, 32, 64, 128, 256, 512] {
+            let projected = project_tool_result_for_model_context(&output, None, limit);
+            assert!(projected.chars().count() <= limit, "limit {limit}");
+            assert!(projected.contains('…') || projected.contains("truncated"));
+            if limit >= 64 {
+                assert!(projected.starts_with("KeyError:"), "limit {limit}");
+                assert!(projected.ends_with("exit code 1"), "limit {limit}");
+            }
+        }
     }
 
     #[test]

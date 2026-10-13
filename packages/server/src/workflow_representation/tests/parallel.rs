@@ -70,6 +70,7 @@ fn collected_definition() -> bcode_workflow::WorkflowDefinition {
 #[tokio::test]
 async fn normal_collect_outcomes_preserves_failed_worker_and_runs_integrator() {
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
+    let mut cleanup = FixtureCleanup::new(&state);
     state.start_workflow_driver().await;
     super::fanout::start_public(
         &state,
@@ -80,7 +81,6 @@ async fn normal_collect_outcomes_preserves_failed_worker_and_runs_integrator() {
     )
     .await;
     let completed = super::fanout::wait_public(&state, "collect").await;
-    stop_fixture_driver(&state).await;
     completed.expect("integrator completes despite failed worker");
     let outputs = super::super::outputs::run_outputs(&state, "collect", 100)
         .await
@@ -95,6 +95,8 @@ async fn normal_collect_outcomes_preserves_failed_worker_and_runs_integrator() {
         serde_json::json!("completed")
     );
     assert!(outputs.iter().any(|output| output.node_id == "integrate"));
+    cleanup.finish().await;
+    drop(cleanup);
 }
 
 #[tokio::test]
@@ -133,6 +135,7 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
             )]))
             .expect("selectors"),
         );
+    let mut cleanup = FixtureCleanup::new(&state);
     let mut definition = parallel_provider_definition();
     definition
         .nodes
@@ -166,7 +169,6 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
         }
     })
     .await;
-    stop_fixture_driver(&state).await;
     result.expect("failfast settles owner cancellation");
     assert!(
         representation::safety::cancellation_requested_at(&db, "failfast")
@@ -193,11 +195,14 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
         1
     );
     drop(gate);
+    cleanup.finish().await;
+    drop(cleanup);
 }
 
 #[tokio::test]
 async fn public_retry_dispatches_exact_next_attempt_without_replaying_first() {
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
+    let mut cleanup = FixtureCleanup::new(&state);
     let failed = collected_definition().nodes["left"].clone();
     let definition = bcode_workflow::WorkflowDefinition {
         schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
@@ -245,7 +250,6 @@ async fn public_retry_dispatches_exact_next_attempt_without_replaying_first() {
     assert_eq!(grant.next_attempt, 2);
     let second = bcode_workflow_store::dispatch_identity("retry", "left", &activation, 2);
     wait_failed_attempt(&db, &second).await;
-    stop_fixture_driver(&state).await;
     let first_receipt = representation::attempts::owner_boundary::receipt(&db, &first)
         .await
         .expect("receipt")
@@ -258,6 +262,8 @@ async fn public_retry_dispatches_exact_next_attempt_without_replaying_first() {
         first_receipt.receipt["turn_id"],
         second_receipt.receipt["turn_id"]
     );
+    cleanup.finish().await;
+    drop(cleanup);
 }
 
 async fn wait_failed_attempt(db: &dyn switchy_database::Database, dispatch: &str) {

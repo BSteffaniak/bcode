@@ -41,6 +41,52 @@ fn bounded_json(path: &Path) -> Result<serde_json::Value, ()> {
     serde_json::from_slice(&bytes).map_err(|_| ())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptCoverageFailure {
+    ModelEvidence(crate::workflow::ModelCoverageFailure),
+    CanonicalAttemptIncomplete,
+}
+
+impl AttemptCoverageFailure {
+    const fn operation(self) -> &'static str {
+        use crate::workflow::ModelCoverageFailure;
+        match self {
+            Self::ModelEvidence(ModelCoverageFailure::MissingRequestBoundary) => {
+                "eval.coverage.missing_request_boundary"
+            }
+            Self::ModelEvidence(ModelCoverageFailure::IncompleteHistory) => {
+                "eval.coverage.incomplete_session_history"
+            }
+            Self::ModelEvidence(ModelCoverageFailure::MissingOrUnverifiedModelInputExport) => {
+                "eval.coverage.missing_or_unverified_model_input_export"
+            }
+            Self::ModelEvidence(ModelCoverageFailure::UnknownModelApplicability) => {
+                "eval.coverage.unknown_model_applicability"
+            }
+            Self::ModelEvidence(ModelCoverageFailure::NoObservedModelSession) => {
+                "eval.coverage.no_observed_model_session"
+            }
+            Self::CanonicalAttemptIncomplete => "eval.canonical_attempt_coverage",
+        }
+    }
+}
+
+fn attempt_coverage_failure(completeness: &serde_json::Value) -> AttemptCoverageFailure {
+    // New producers retain a finite typed reason set. Old/unknown representations stay
+    // generic and incomplete; diagnostics never confer evidence authority.
+    completeness
+        .pointer("/boundaries/model_exports/failure_reasons")
+        .and_then(|value| {
+            serde_json::from_value::<Vec<crate::workflow::ModelCoverageFailure>>(value.clone()).ok()
+        })
+        .filter(|reasons| reasons.len() <= 5)
+        .and_then(|reasons| reasons.first().copied())
+        .map_or(
+            AttemptCoverageFailure::CanonicalAttemptIncomplete,
+            AttemptCoverageFailure::ModelEvidence,
+        )
+}
+
 fn canonical_attempt_complete(completeness: &serde_json::Value) -> Result<(), ()> {
     if completeness.pointer("/boundaries/canonical_attempt/complete")
         == Some(&serde_json::Value::Bool(true))
@@ -296,7 +342,9 @@ fn load_attempt_artifacts(
     }
     capture.operation = "eval.canonical_attempt_coverage".into();
     let completeness = bounded_json(&rep_dir.join("capture-completeness.json"))?;
-    canonical_attempt_complete(&completeness)?;
+    canonical_attempt_complete(&completeness).map_err(|()| {
+        capture.operation = attempt_coverage_failure(&completeness).operation().into();
+    })?;
     capture.operation = "eval.observation_decode".into();
     let observation: EvalAttemptJudgementObservation = serde_json::from_value(bounded_json(
         &rep_dir.join("eval-judgement-observation.json"),
@@ -323,6 +371,28 @@ fn load_attempt_artifacts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_coverage_reason_never_overrides_incomplete_attempt() {
+        let incomplete = serde_json::json!({"boundaries": {
+            "canonical_attempt": {"complete": false},
+            "model_exports": {"failure_reasons": ["missing_or_unverified_model_input_export"]}
+        }});
+        assert!(super::canonical_attempt_complete(&incomplete).is_err());
+        assert_eq!(
+            super::attempt_coverage_failure(&incomplete).operation(),
+            "eval.coverage.missing_or_unverified_model_input_export"
+        );
+        let future = serde_json::json!({"boundaries": {
+            "canonical_attempt": {"complete": false},
+            "model_exports": {"failure_reasons": ["future_reason"]}
+        }});
+        assert!(super::canonical_attempt_complete(&future).is_err());
+        assert_eq!(
+            super::attempt_coverage_failure(&future),
+            super::AttemptCoverageFailure::CanonicalAttemptIncomplete
+        );
+    }
+
     use super::*;
 
     #[test]

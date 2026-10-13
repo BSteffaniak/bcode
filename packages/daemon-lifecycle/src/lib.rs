@@ -3643,6 +3643,375 @@ mod startup_lock_tests {
     }
 
     #[cfg(unix)]
+    struct HandshakeChild {
+        release: Option<std::io::PipeWriter>,
+        spawning: Option<std::thread::JoinHandle<std::io::Result<std::process::Child>>>,
+        child: Option<std::process::Child>,
+        readers: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    static INCOMPLETE_HANDSHAKE_CLEANUP: std::sync::Mutex<Vec<HandshakeChild>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[cfg(unix)]
+    impl HandshakeChild {
+        fn release_preexec(&mut self) {
+            // At most two one-byte releases are written to a fresh pipe, so
+            // this cannot fill its buffer. EOF alone cannot release the child:
+            // it inherited a copy of the parent's write end too.
+            if let Some(mut release) = self.release.take() {
+                use std::io::Write as _;
+                let _ = release.write_all(b"G");
+            }
+        }
+
+        fn collect_spawn_if_finished(&mut self) {
+            if self
+                .spawning
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+                && let Some(spawning) = self.spawning.take()
+                && let Ok(Ok(child)) = spawning.join()
+            {
+                self.child = Some(child);
+            }
+        }
+
+        fn cleanup_until(&mut self, deadline: std::time::Instant) -> bool {
+            self.release_preexec();
+            loop {
+                self.collect_spawn_if_finished();
+                if let Some(child) = self.child.as_mut() {
+                    let _ = child.kill();
+                    // try_wait reaps an exited child without blocking. Keep
+                    // ownership on errors as well as a still-running result.
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        self.child = None;
+                    }
+                }
+                let mut index = 0;
+                while index < self.readers.len() {
+                    if self.readers[index].is_finished() {
+                        let _ = self.readers.swap_remove(index).join();
+                    } else {
+                        index += 1;
+                    }
+                }
+                if self.spawning.is_none() && self.child.is_none() && self.readers.is_empty() {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for HandshakeChild {
+        fn drop(&mut self) {
+            if !self.cleanup_until(std::time::Instant::now() + Duration::from_secs(1)) {
+                eprintln!(
+                    "handshake_cleanup_timeout: budget_ms=1000, spawn_pending={}, child_pid={:?}, readers_pending={}, ownership=retained",
+                    self.spawning.is_some(),
+                    self.child.as_ref().map(std::process::Child::id),
+                    self.readers.len()
+                );
+                // Static storage deliberately retains all unfinished ownership
+                // until test-process exit. Never detach join handles, discard
+                // an unreaped child, or falsely report cleanup completion.
+                let retained = Self {
+                    release: self.release.take(),
+                    spawning: self.spawning.take(),
+                    child: self.child.take(),
+                    readers: std::mem::take(&mut self.readers),
+                };
+                match INCOMPLETE_HANDSHAKE_CLEANUP.try_lock() {
+                    Ok(mut retained_cleanup) => retained_cleanup.push(retained),
+                    Err(std::sync::TryLockError::Poisoned(error)) => {
+                        error.into_inner().push(retained);
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        // Even the retention registry must not block Drop.
+                        // Preserve an addressable owner rather than dropping
+                        // its child or detaching its join handles.
+                        let retained = Box::leak(Box::new(retained));
+                        eprintln!("handshake_cleanup_retained_owner: address={retained:p}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn handshake_marker(
+        reader: impl std::io::Read + Send + 'static,
+        owner: &mut HandshakeChild,
+    ) -> std::sync::mpsc::Receiver<std::io::Result<u8>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        owner.readers.push(std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut marker = [0_u8];
+            let result = reader.read_exact(&mut marker).map(|()| marker[0]);
+            let _ = sender.send(result);
+        }));
+        receiver
+    }
+
+    #[cfg(unix)]
+    fn spawn_handshake_child(
+        ready_write: std::io::PipeWriter,
+        release_read: std::io::PipeReader,
+        emit_ready: bool,
+    ) -> std::thread::JoinHandle<std::io::Result<std::process::Child>> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let ready_fd = ready_write.as_raw_fd();
+        let release_fd = release_read.as_raw_fd();
+        std::thread::spawn(move || {
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", "printf E; exec sleep 30"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            // SAFETY: the child closure only uses async-signal-safe pipe write,
+            // read and _exit, stack bytes, and returns Ok after release. No
+            // allocation, locks, logging, or runtime callbacks occur after fork.
+            // The spawning thread owns both descriptors until spawn returns;
+            // the parent guard sends release, observes finished spawn, then
+            // kills and polls reaping within its deadline. On timeout it retains
+            // every unfinished owner, including during assertion unwinding.
+            unsafe {
+                command.pre_exec(move || {
+                    let ready = b'R';
+                    if emit_ready
+                        && libc::write(ready_fd, std::ptr::from_ref(&ready).cast(), 1) != 1
+                    {
+                        libc::_exit(125);
+                    }
+                    let mut release = 0_u8;
+                    if libc::read(release_fd, std::ptr::from_mut(&mut release).cast(), 1) != 1
+                        || release != b'G'
+                    {
+                        libc::_exit(126);
+                    }
+                    Ok(())
+                });
+            }
+            let result = command.spawn();
+            drop(command);
+            drop((ready_write, release_read));
+            result
+        })
+    }
+
+    #[cfg(unix)]
+    fn release_child_and_observe_exec(owner: &mut HandshakeChild) {
+        use std::io::Write as _;
+
+        owner
+            .release
+            .as_mut()
+            .expect("release writer")
+            .write_all(b"G")
+            .expect("release child to exec");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while owner.spawning.is_some() {
+            owner.collect_spawn_if_finished();
+            assert!(
+                owner.spawning.is_none() || std::time::Instant::now() < deadline,
+                "exec_spawn_timeout: budget_ms=1000, ownership=retained"
+            );
+            std::thread::yield_now();
+        }
+        let stdout = owner
+            .child
+            .as_mut()
+            .expect("owned child")
+            .stdout
+            .take()
+            .expect("post-exec readiness pipe");
+        let postexec_ready = handshake_marker(stdout, owner);
+        assert_eq!(
+            postexec_ready
+                .recv_timeout(Duration::from_secs(1))
+                .expect("post-exec readiness deadline")
+                .expect("post-exec readiness byte"),
+            b'E'
+        );
+    }
+
+    #[cfg(unix)]
+    async fn observe_lock_release(
+        contender: &fs::File,
+        path: &Path,
+        deadline: tokio::time::Instant,
+    ) {
+        // Local close need not release a description copied by another test's
+        // pre-exec child. Reuse the existing 75 ms observation budget; never
+        // delete the file, unlock another description, or wait for child exit.
+        loop {
+            match contender.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "lock_release_timeout: fixture={}, budget_ms=75, holder=unknown",
+                        path.display()
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!(
+                    "unexpected lock release error: fixture={}, error={error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_lock_missing_preexec_readiness_has_bounded_owned_cleanup() {
+        let (ready_read, ready_write) = std::io::pipe().expect("ready pipe");
+        let (release_read, release_write) = std::io::pipe().expect("release pipe");
+        let mut owner = HandshakeChild {
+            release: Some(release_write),
+            spawning: None,
+            child: None,
+            readers: Vec::new(),
+        };
+        let readiness = handshake_marker(ready_read, &mut owner);
+        owner.spawning = Some(spawn_handshake_child(ready_write, release_read, false));
+        assert!(matches!(
+            readiness.recv_timeout(Duration::from_millis(75)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(owner.cleanup_until(std::time::Instant::now() + Duration::from_secs(1)));
+        assert!(owner.spawning.is_none() && owner.child.is_none() && owner.readers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_lock_cleanup_expiry_preserves_unfinished_reader_ownership() {
+        let (reader, writer) = std::io::pipe().expect("held readiness pipe");
+        let mut owner = HandshakeChild {
+            release: None,
+            spawning: None,
+            child: None,
+            readers: Vec::new(),
+        };
+        let readiness = handshake_marker(reader, &mut owner);
+        assert!(matches!(
+            readiness.recv_timeout(Duration::from_millis(75)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!owner.cleanup_until(std::time::Instant::now()));
+        assert_eq!(owner.readers.len(), 1);
+        drop(writer);
+        assert!(owner.cleanup_until(std::time::Instant::now() + Duration::from_secs(1)));
+        assert!(owner.readers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_lock_preexec_listener_retention_ends_at_exec() {
+        use std::os::fd::AsRawFd as _;
+
+        let directory = tempfile::tempdir().expect("handshake directory");
+        let lock_path = directory.path().join("startup.lock");
+        let lock = StartupLock::acquire_at(lock_path.clone(), Duration::from_secs(1))
+            .await
+            .expect("fixture startup lock");
+        let contender = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("independent fixture contender");
+        // SAFETY: F_GETFD only inspects this live, owned fixture description.
+        let lock_flags = unsafe { libc::fcntl(lock.file.as_raw_fd(), libc::F_GETFD) };
+        assert!(lock_flags >= 0 && lock_flags & libc::FD_CLOEXEC != 0);
+        let socket = directory.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("listener");
+        // SAFETY: F_GETFD only inspects this live, owned listener descriptor.
+        let flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        let (ready_read, ready_write) = std::io::pipe().expect("pre-exec ready pipe");
+        let (release_read, release_write) = std::io::pipe().expect("pre-exec release pipe");
+        let mut owner = HandshakeChild {
+            release: Some(release_write),
+            spawning: None,
+            child: None,
+            readers: Vec::new(),
+        };
+        let preexec_ready = handshake_marker(ready_read, &mut owner);
+        owner.spawning = Some(spawn_handshake_child(ready_write, release_read, true));
+        assert_eq!(
+            preexec_ready
+                .recv_timeout(Duration::from_secs(1))
+                .expect("pre-exec readiness deadline")
+                .expect("pre-exec readiness byte"),
+            b'R'
+        );
+        drop(listener);
+        drop(lock);
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        // This unique fixture's owned descriptions were closed in the parent;
+        // the acknowledged child retains both socket and lock until exec.
+        // The acknowledged child is still before exec and genuinely retains
+        // the parent's CLOEXEC socket, despite the parent's local drop.
+        let retained = tokio::time::timeout(
+            Duration::from_millis(75),
+            tokio::net::UnixStream::connect(&socket),
+        )
+        .await
+        .expect("pre-exec connection deadline")
+        .expect("pre-exec child retains listener");
+        drop(retained);
+        release_child_and_observe_exec(&mut owner);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(75);
+        loop {
+            let connection =
+                tokio::time::timeout_at(deadline, tokio::net::UnixStream::connect(&socket))
+                    .await
+                    .expect("post-exec connection deadline");
+            match connection {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                Err(error) => panic!("unexpected post-exec connection error: {error}"),
+                Ok(stream) => {
+                    drop(stream);
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "listener retained after acknowledged exec"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        observe_lock_release(&contender, &lock_path, deadline).await;
+        assert!(
+            owner
+                .child
+                .as_mut()
+                .expect("owned child")
+                .try_wait()
+                .expect("child status")
+                .is_none(),
+            "listener refusal and lock release must precede child exit"
+        );
+        assert!(
+            owner.cleanup_until(std::time::Instant::now() + Duration::from_secs(1)),
+            "handshake_cleanup_timeout: budget_ms=1000, ownership=retained"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn listener_release_during_gated_cleanup_retains_inherited_startup_fence() {
         let directory = tempfile::tempdir().expect("temporary daemon directory");
@@ -3672,14 +4041,40 @@ mod startup_lock_tests {
             std::task::Poll::Ready(())
         })
         .await;
-        assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
+        // A concurrent spawn can briefly retain the listener until exec. Local
+        // drop is not proof that every process has released its description.
+        // Keep cleanup gated and require the startup fence on every observation;
+        // a persistent inherited listener must fail, not be hidden by cleanup.
+        let refusal_deadline = tokio::time::Instant::now() + Duration::from_millis(75);
+        loop {
+            assert!(matches!(
+                contender.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            let connection =
+                tokio::time::timeout_at(refusal_deadline, tokio::net::UnixStream::connect(&socket))
+                    .await
+                    .expect("listener connection did not settle within the refusal budget");
+            match connection {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                Err(error) => panic!("unexpected stale-listener connection error: {error}"),
+                Ok(stream) => {
+                    drop(stream);
+                    assert!(
+                        tokio::time::Instant::now() < refusal_deadline,
+                        "listener still accepts connections while cleanup is gated"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
         assert!(matches!(
             contender.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)
         ));
         release.send(()).expect("cleanup still owns lifetime fence");
         cleanup.await;
-        contender.try_lock().expect("fence released after cleanup");
+        observe_lock_release(&contender, &path, refusal_deadline).await;
     }
 
     #[tokio::test]

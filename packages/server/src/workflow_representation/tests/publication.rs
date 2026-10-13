@@ -38,6 +38,7 @@ fn workflow_operation_failures_distinguish_busy_and_unknown_without_private_payl
 #[tokio::test]
 async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_candidate() {
     let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+    let mut cleanup = FixtureCleanup::new(&state);
     let _gate = super::fanout::ReleaseGate(
         state.selected_provider_context.settings["delegation_fixture_gate"].clone(),
     );
@@ -119,7 +120,6 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
     .await;
     finished.expect("receipt acknowledged cancellation");
     let committed = invoke_delegation_tool(&state, source.id, &accept).await;
-    stop_fixture_driver(&state).await;
     assert!(!committed.is_error, "{}", committed.output);
     assert_eq!(
         representation::graph_pages::revision(&db, "cancel-edit")
@@ -127,6 +127,8 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
             .expect("revision"),
         2
     );
+    cleanup.finish().await;
+    drop(cleanup);
 }
 
 fn cancellation_batch(

@@ -21,6 +21,40 @@ fn page(id: SessionId, sequences: &[u64], next: Option<u64>) -> Value {
 }
 
 #[test]
+fn missing_exports_retain_typed_reason_without_promoting_identity_to_content() {
+    let mut started = event(SessionId::new(), 0);
+    started.kind = SessionEventKind::ModelTurnStarted {
+        turn_id: "actual-turn".into(),
+    };
+    let mut coverage = ModelCoverage::default();
+    coverage.observe(
+        &[started],
+        &json!({"model_requests_observed":1,"complete_model_inputs_exported":false}),
+        false,
+        true,
+    );
+    assert!(!coverage.complete());
+    assert_eq!(
+        coverage.failure_reasons(),
+        [ModelCoverageFailure::MissingOrUnverifiedModelInputExport]
+    );
+}
+
+#[test]
+fn missing_boundaries_and_unknown_sessions_remain_distinct_failures() {
+    let mut coverage = ModelCoverage::default();
+    coverage.observe(&[], &json!({}), true, true);
+    assert!(!coverage.complete());
+    assert_eq!(
+        coverage.failure_reasons(),
+        [
+            ModelCoverageFailure::UnknownModelApplicability,
+            ModelCoverageFailure::NoObservedModelSession,
+        ]
+    );
+}
+
+#[test]
 fn verified_non_model_parent_does_not_hide_missing_execution_boundaries() {
     let complete = json!({"model_requests_observed":2,"complete_model_inputs_exported":true});
     let empty = json!({"model_requests_observed":0,"complete_model_inputs_exported":false});
