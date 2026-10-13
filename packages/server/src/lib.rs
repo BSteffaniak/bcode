@@ -6856,9 +6856,9 @@ async fn handle_request(
 ) -> Result<(), ServerError> {
     let labels = request_metric_labels(&request);
     let context = request_metrics_context(&request, request_id, client_id, *attached_session);
-    let span = state.metrics.span("ipc.request").labels(labels);
-    let result = Box::pin(state.metrics.in_context(context, async {
-        Box::pin(dispatch_routed_request(
+    Box::pin(state.metrics.in_context(context, async {
+        let span = state.metrics.span("ipc.request").labels(labels);
+        let result = Box::pin(dispatch_routed_request(
             RoutedRequest::from_request(request),
             request_id,
             client_id,
@@ -6866,11 +6866,11 @@ async fn handle_request(
             writer,
             attached_session,
         ))
-        .await
+        .await;
+        span.finish_result(&result);
+        result
     }))
-    .await;
-    span.finish_result(&result);
-    result
+    .await
 }
 
 #[allow(clippy::too_many_lines)]

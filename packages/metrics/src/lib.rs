@@ -899,12 +899,15 @@ impl MetricsRegistry {
     }
 
     /// Start a named metrics span that records duration and count when finished or dropped.
+    ///
+    /// Correlation context is captured at creation. An explicit finish records its outcome;
+    /// dropping without finishing records `unfinished`, not success or inferred cancellation.
     #[must_use]
     pub fn span(&self, name: impl Into<String>) -> MetricsSpan {
         MetricsSpan {
             metrics: self.clone(),
             name: name.into(),
-            labels: MetricLabels::new(),
+            labels: current_metrics_context().labels,
             started_at: Instant::now(),
             finished: false,
         }
@@ -1097,27 +1100,11 @@ impl MetricsRegistry {
         value: u64,
         labels: MetricLabels,
     ) {
-        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
-            return;
-        };
-        let key = key.into();
-        let labels = current_metrics_context().merged_labels(labels);
-        let Ok(mut state) = inner.lock() else {
-            return;
-        };
-        state
-            .histograms
-            .entry(key.clone())
-            .or_default()
-            .record(value);
-        state.observe_descriptor(&key, MetricKind::Histogram, &labels);
-        state.push_event(MetricEvent {
-            unix_ms: current_unix_millis(),
-            name: key,
-            kind: MetricKind::Histogram,
-            value: i64::try_from(value).unwrap_or(i64::MAX),
-            labels,
-        });
+        self.record_histogram_with_exact_labels(
+            key,
+            value,
+            current_metrics_context().merged_labels(labels),
+        );
     }
 
     /// Record a histogram sample using exactly the supplied labels, without ambient context.
@@ -1469,9 +1456,12 @@ impl MetricsSpan {
         self.finished = true;
         let mut labels = self.labels.clone();
         labels.insert("outcome".to_owned(), outcome.to_string());
-        self.metrics
-            .increment_counter_with_name_and_labels(format!("{}.total", self.name), labels.clone());
-        self.metrics.record_histogram_with_labels(
+        self.metrics.add_counter_with_exact_labels(
+            format!("{}.total", self.name),
+            1,
+            labels.clone(),
+        );
+        self.metrics.record_histogram_with_exact_labels(
             format!("{}.duration_ms", self.name),
             u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
             labels,
@@ -1481,13 +1471,7 @@ impl MetricsSpan {
 
 impl Drop for MetricsSpan {
     fn drop(&mut self) {
-        self.finish_with_outcome(&"ok");
-    }
-}
-
-impl MetricsRegistry {
-    fn increment_counter_with_name_and_labels(&self, key: String, labels: MetricLabels) {
-        self.add_counter_with_labels(key, 1, labels);
+        self.finish_with_outcome(&"unfinished");
     }
 }
 
@@ -2725,6 +2709,81 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.counters.get("test.span.total"), Some(&1));
         assert!(snapshot.histograms.contains_key("test.span.duration_ms"));
+        assert!(metrics.report().events.iter().all(|event| {
+            event.labels.get("outcome").map(String::as_str) == Some("unfinished")
+        }));
+    }
+
+    #[tokio::test]
+    async fn unfinished_future_preserves_originating_span_context() {
+        let metrics = MetricsRegistry::default();
+        let span = metrics
+            .in_context(MetricsContext::new().with_session_id(&"origin"), async {
+                metrics.span("test.interrupted")
+            })
+            .await;
+        metrics
+            .in_context(
+                MetricsContext::new()
+                    .with_session_id(&"cleanup")
+                    .with_turn_id(&"unrelated-cleanup-turn"),
+                async {
+                    drop(span);
+                },
+            )
+            .await;
+        for event in metrics.report().events {
+            assert!(!event.labels.contains_key("turn_id"));
+            assert_eq!(
+                event.labels.get("session_id").map(String::as_str),
+                Some("origin")
+            );
+            assert_eq!(
+                event.labels.get("outcome").map(String::as_str),
+                Some("unfinished")
+            );
+        }
+
+        let mut future = Box::pin(metrics.time_async(
+            "test.dropped_future",
+            MetricLabels::new(),
+            std::future::pending::<()>(),
+        ));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(future.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        drop(future);
+        let report = metrics.report();
+        let events: Vec<_> = report
+            .events
+            .iter()
+            .filter(|event| event.name.starts_with("test.dropped_future."))
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| {
+            event.labels.get("outcome").map(String::as_str) == Some("unfinished")
+        }));
+    }
+
+    #[test]
+    fn explicit_span_outcomes_are_recorded_once() {
+        let metrics = MetricsRegistry::default();
+        let mut span = metrics.span("test.completed");
+        span.finish_with_outcome(&"cancelled");
+        span.finish_with_outcome(&"ok");
+        drop(span);
+        assert_eq!(
+            metrics.snapshot().counters.get("test.completed.total"),
+            Some(&1)
+        );
+        assert!(
+            metrics.report().events.iter().all(|event| {
+                event.labels.get("outcome").map(String::as_str) == Some("cancelled")
+            })
+        );
     }
 
     #[test]

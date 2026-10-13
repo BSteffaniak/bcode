@@ -38,7 +38,7 @@ fn fanout_definition(
 #[tokio::test]
 async fn fanout_real_provider_members_overlap_at_32_and_100() {
     for count in [32, 100] {
-        fanout_overlap(count).await;
+        Box::pin(fanout_overlap(count)).await;
     }
 }
 

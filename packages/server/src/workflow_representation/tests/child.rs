@@ -48,31 +48,34 @@ async fn definition_child_uses_common_owner_and_returns_provider_output() {
     representation::admit(&db, &parent, &parent_definition)
         .await
         .expect("fixture admission; capability remains gated");
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            driver::drive(&state, "child-parent")
-                .await
-                .expect("parent drive");
-            let page = representation::hierarchy::children(&db, "child-parent", None, 32)
-                .await
-                .expect("children");
-            for link in page.children {
-                driver::drive(&state, &link.child_run_id)
+    Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            loop {
+                driver::drive(&state, "child-parent")
                     .await
-                    .expect("child drive");
+                    .expect("parent drive");
+                let page = representation::hierarchy::children(&db, "child-parent", None, 32)
+                    .await
+                    .expect("children");
+                for link in page.children {
+                    driver::drive(&state, &link.child_run_id)
+                        .await
+                        .expect("child drive");
+                }
+                if status(&state, "child-parent")
+                    .await
+                    .expect("status")
+                    .expect("parent")
+                    .status
+                    == bcode_workflow::RunStatus::Completed
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            if status(&state, "child-parent")
-                .await
-                .expect("status")
-                .expect("parent")
-                .status
-                == bcode_workflow::RunStatus::Completed
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+        },
+    ))
     .await
     .expect("child completes without recursive parent lock");
     let children = representation::hierarchy::children(&db, "child-parent", None, 32)

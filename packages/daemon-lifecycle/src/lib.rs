@@ -3050,6 +3050,25 @@ pub fn default_daemon_log_path() -> PathBuf {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupLockObservation {
+    Waiting,
+    Acquired,
+    ConcurrentReady,
+    Timeout,
+}
+
+impl StartupLockObservation {
+    const fn phase_name(self) -> &'static str {
+        match self {
+            Self::Waiting => "launcher.lock_wait",
+            Self::Acquired => "launcher.lock_acquired",
+            Self::ConcurrentReady => "launcher.lock_concurrent_ready",
+            Self::Timeout => "launcher.lock_timeout",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StartupLock {
     file: fs::File,
@@ -3065,10 +3084,55 @@ impl StartupLock {
             &daemon_namespace(),
             &bcode_ipc::state_location_id(),
         );
+        let artifact = bcode_ipc::ArtifactId::current().to_string();
+        let state = bcode_ipc::state_location_id();
+        let scope = format!("{artifact}.{state}");
+        Self::acquire_observed(
+            path,
+            Self::ACQUIRE_TIMEOUT,
+            &scope,
+            || ping_ready(endpoint),
+            |observation, elapsed| {
+                if observation != StartupLockObservation::Waiting {
+                    let phase = bcode_metrics::startup::phase_for(observation.phase_name(), &scope);
+                    if observation == StartupLockObservation::Timeout {
+                        phase.fail();
+                    } else {
+                        phase.finish();
+                    }
+                }
+                tracing::debug!(
+                    target: "bcode_daemon_lifecycle::startup",
+                    artifact_id = %artifact,
+                    state_location_id = %state,
+                    phase = observation.phase_name(),
+                    elapsed_us = elapsed.as_micros(),
+                    holder_identity = "unknown",
+                    lock_pid_evidence = "unverified_hint_not_read",
+                    "startup coordination observation"
+                );
+            },
+        )
+        .await
+    }
+
+    async fn acquire_observed<F, Fut>(
+        path: PathBuf,
+        timeout: Duration,
+        scope: &str,
+        mut ready: F,
+        mut observe: impl FnMut(StartupLockObservation, Duration),
+    ) -> Result<Option<Self>, DaemonStartError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let started = std::time::Instant::now();
+        let wait_phase = bcode_metrics::startup::phase_for("launcher.lock_wait", scope);
+        let mut waiting = false;
         loop {
             let file = fs::OpenOptions::new()
                 .read(true)
@@ -3081,23 +3145,23 @@ impl StartupLock {
                     file.set_len(0)?;
                     writeln!(&file, "pid={}", std::process::id())?;
                     file.sync_data()?;
-                    tracing::debug!(
-                        target: "bcode_daemon_lifecycle::startup",
-                        elapsed_us = started.elapsed().as_micros(),
-                        "startup coordination acquired"
-                    );
+                    observe(StartupLockObservation::Acquired, started.elapsed());
+                    wait_phase.finish();
                     return Ok(Some(Self { file }));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    if ping_ready(endpoint).await {
-                        tracing::debug!(
-                            target: "bcode_daemon_lifecycle::startup",
-                            elapsed_us = started.elapsed().as_micros(),
-                            "concurrent launcher supplied ready daemon"
-                        );
+                    if !waiting {
+                        observe(StartupLockObservation::Waiting, started.elapsed());
+                        waiting = true;
+                    }
+                    if ready().await {
+                        observe(StartupLockObservation::ConcurrentReady, started.elapsed());
+                        wait_phase.finish();
                         return Ok(None);
                     }
-                    if started.elapsed() >= Self::ACQUIRE_TIMEOUT {
+                    if started.elapsed() >= timeout {
+                        observe(StartupLockObservation::Timeout, started.elapsed());
+                        wait_phase.fail();
                         return Err(DaemonStartError::StartupCoordinationTimeout {
                             lock_path: path,
                         });
@@ -3431,6 +3495,96 @@ fn unix_socket_has_listener(path: &Path) -> bool {
 #[cfg(test)]
 mod startup_lock_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_lock_observations_timeout_preserve_held_file() {
+        let directory = tempfile::tempdir().expect("lock directory");
+        let path = directory.path().join("startup.lock");
+        let owner = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+            .await
+            .expect("owner");
+        let original = fs::read(&path).expect("owner hint");
+        let mut observations = Vec::new();
+        let result = StartupLock::acquire_observed(
+            path.clone(),
+            Duration::from_millis(50),
+            "test-artifact.test-state",
+            || std::future::ready(false),
+            |event, elapsed| observations.push((event, elapsed)),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(DaemonStartError::StartupCoordinationTimeout { .. })
+        ));
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].0, StartupLockObservation::Waiting);
+        assert_eq!(observations[1].0, StartupLockObservation::Timeout);
+        assert!(observations[1].1 >= Duration::from_millis(50));
+        assert_eq!(fs::read(&path).expect("preserved hint"), original);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn startup_lock_observations_concurrent_ready_does_not_acquire() {
+        let directory = tempfile::tempdir().expect("lock directory");
+        let path = directory.path().join("startup.lock");
+        let owner = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+            .await
+            .expect("owner");
+        let mut observations = Vec::new();
+        let result = StartupLock::acquire_observed(
+            path,
+            Duration::from_millis(50),
+            "test-artifact.test-state",
+            || std::future::ready(true),
+            |event, _| observations.push(event),
+        )
+        .await
+        .expect("ready observation");
+        assert!(result.is_none());
+        assert_eq!(
+            observations,
+            [
+                StartupLockObservation::Waiting,
+                StartupLockObservation::ConcurrentReady
+            ]
+        );
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn startup_lock_observations_acquired_after_contention() {
+        let directory = tempfile::tempdir().expect("lock directory");
+        let path = directory.path().join("startup.lock");
+        let mut owner = Some(
+            StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+                .await
+                .expect("owner"),
+        );
+        let mut observations = Vec::new();
+        let replacement = StartupLock::acquire_observed(
+            path,
+            Duration::from_secs(1),
+            "test-artifact.test-state",
+            || {
+                drop(owner.take());
+                std::future::ready(false)
+            },
+            |event, _| observations.push(event),
+        )
+        .await
+        .expect("replacement")
+        .expect("acquired lock");
+        assert_eq!(
+            observations,
+            [
+                StartupLockObservation::Waiting,
+                StartupLockObservation::Acquired
+            ]
+        );
+        drop(replacement);
+    }
 
     fn lock_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

@@ -9,12 +9,60 @@ use bcode_workflow_store::{
 };
 use representation::attempts::owner_boundary;
 
+fn owner_stage_span(
+    metrics: &bcode_metrics::MetricsRegistry,
+    name: &'static str,
+    run_id: &str,
+    activation_id: &str,
+    dispatch_identity: &str,
+) -> bcode_metrics::MetricsSpan {
+    let labels = std::collections::BTreeMap::from([
+        ("run_id".into(), run_id.into()),
+        ("activation_id".into(), activation_id.into()),
+        ("dispatch_identity".into(), dispatch_identity.into()),
+    ]);
+    metrics.add_counter_with_labels(format!("{name}.started"), 1, labels.clone());
+    metrics.span(name).labels(labels)
+}
+
+async fn observe_owner_stage<T>(
+    state: &ServerState,
+    name: &'static str,
+    request: &PreparedActivationDispatch,
+    operation: impl std::future::Future<Output = Result<T, WorkflowStoreError>>,
+) -> Result<T, WorkflowStoreError> {
+    let span = owner_stage_span(
+        &state.metrics,
+        name,
+        &request.activation.run_id,
+        &request.activation.activation_id,
+        &request.dispatch_identity,
+    );
+    let result = operation.await;
+    span.finish_result(&result);
+    result
+}
+
 fn store_error(_: impl std::fmt::Display) -> WorkflowStoreError {
     WorkflowStoreError::InvalidData("workflow owner storage is unavailable or inconsistent".into())
 }
 
 /// Check a prepared handoff in its canonical representation before external effects.
 pub async fn check_owner_admission(
+    state: &ServerState,
+    request: &PreparedActivationDispatch,
+    authority: &WorkflowExecutionAuthority,
+) -> Result<Option<serde_json::Value>, WorkflowStoreError> {
+    observe_owner_stage(
+        state,
+        "workflow.owner.admission",
+        request,
+        check_owner_admission_inner(state, request, authority),
+    )
+    .await
+}
+
+async fn check_owner_admission_inner(
     state: &ServerState,
     request: &PreparedActivationDispatch,
     authority: &WorkflowExecutionAuthority,
@@ -183,6 +231,23 @@ pub async fn persist_receipt(
     receipt: &bcode_workflow_store::DispatchReceipt,
     authority: &WorkflowExecutionAuthority,
 ) -> Result<(), WorkflowStoreError> {
+    let span = owner_stage_span(
+        &state.metrics,
+        "workflow.owner.receipt_publication",
+        &receipt.run_id,
+        &receipt.activation_id,
+        &receipt.dispatch_identity,
+    );
+    let result = persist_receipt_inner(state, receipt, authority).await;
+    span.finish_result(&result);
+    result
+}
+
+async fn persist_receipt_inner(
+    state: &ServerState,
+    receipt: &bcode_workflow_store::DispatchReceipt,
+    authority: &WorkflowExecutionAuthority,
+) -> Result<(), WorkflowStoreError> {
     let retained = retained_store(state).await.map_err(store_error)?;
     match lookup_at(retained.path(), &receipt.run_id)
         .await
@@ -320,6 +385,21 @@ async fn recorded_authority(
 /// Persist an existing owner's observation. Success uses the atomic output/attempt commit.
 /// Ambiguous and unsupported observations never fabricate terminal state or repeat effects.
 pub async fn settle_observation(
+    state: &ServerState,
+    request: &PreparedActivationDispatch,
+    authority: &WorkflowExecutionAuthority,
+    observation: bcode_workflow_store::AttemptObservation,
+) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
+    observe_owner_stage(
+        state,
+        "workflow.owner.settlement",
+        request,
+        settle_observation_inner(state, request, authority, observation),
+    )
+    .await
+}
+
+async fn settle_observation_inner(
     state: &ServerState,
     request: &PreparedActivationDispatch,
     authority: &WorkflowExecutionAuthority,
@@ -575,4 +655,102 @@ pub async fn completion_observation(
         };
     }
     crate::workflow_attempt_observation_from_completion(state, request, completion)
+}
+
+#[cfg(test)]
+mod instrumentation_tests {
+    use super::owner_stage_span;
+    use std::future::Future as _;
+
+    #[tokio::test]
+    async fn held_owner_queue_records_start_then_unfinished_on_drop() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let path = root.path().join("workflow.db");
+        std::fs::write(&path, []).expect("queue identity");
+        let queue = super::super::backpressure::write_queue(&path).expect("canonical queue");
+        let held = queue.lock().await;
+        let metrics = bcode_metrics::MetricsRegistry::default();
+        let mut waiting = Box::pin(async {
+            let span = owner_stage_span(
+                &metrics,
+                "workflow.owner.receipt_publication",
+                "opaque-run",
+                "opaque-activation",
+                "opaque-dispatch",
+            );
+            let _guard = queue.lock().await;
+            span.finish_ok();
+        });
+        assert!(
+            std::future::poll_fn(|context| {
+                std::task::Poll::Ready(waiting.as_mut().poll(context).is_pending())
+            })
+            .await
+        );
+        let before = metrics.report();
+        assert_eq!(before.events.len(), 1);
+        assert_eq!(
+            before.events[0].name,
+            "workflow.owner.receipt_publication.started"
+        );
+        drop(waiting);
+        drop(held);
+        let events = metrics.report().events;
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            assert_eq!(
+                event.labels.get("run_id").map(String::as_str),
+                Some("opaque-run")
+            );
+            assert_eq!(
+                event.labels.get("activation_id").map(String::as_str),
+                Some("opaque-activation")
+            );
+            assert_eq!(
+                event.labels.get("dispatch_identity").map(String::as_str),
+                Some("opaque-dispatch")
+            );
+            assert!(!event.labels.contains_key("path"));
+        }
+        assert!(
+            events
+                .iter()
+                .skip(1)
+                .all(|event| event.labels.get("outcome").map(String::as_str) == Some("unfinished"))
+        );
+    }
+
+    #[tokio::test]
+    async fn released_owner_queue_records_success_only_after_acquisition() {
+        let queue = tokio::sync::Mutex::new(());
+        let held = queue.lock().await;
+        let metrics = bcode_metrics::MetricsRegistry::default();
+        let mut waiting = Box::pin(async {
+            let span = owner_stage_span(
+                &metrics,
+                "workflow.owner.admission",
+                "run",
+                "activation",
+                "dispatch",
+            );
+            let _guard = queue.lock().await;
+            span.finish_ok();
+        });
+        assert!(
+            std::future::poll_fn(|context| std::task::Poll::Ready(
+                waiting.as_mut().poll(context).is_pending()
+            ))
+            .await
+        );
+        assert_eq!(metrics.report().events.len(), 1);
+        drop(held);
+        waiting.await;
+        assert!(
+            metrics.report().events.iter().skip(1).all(|event| event
+                .labels
+                .get("outcome")
+                .map(String::as_str)
+                == Some("ok"))
+        );
+    }
 }
