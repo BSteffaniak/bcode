@@ -238,6 +238,221 @@ async fn public_unmapped_capture_is_unavailable_not_empty_complete() {
     assert!(result.next_cursor.is_none());
 }
 
+async fn registered_inventory_fixture() -> (
+    tempfile::TempDir,
+    Box<dyn Database>,
+    crate::NewWorkflowRun,
+    bcode_workflow::WorkflowDefinition,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let definition = bcode_workflow::WorkflowBuilder::new(
+        "registered-inventory",
+        bcode_workflow::Step::task("work", |value: u32, _| async move { Ok(value) }),
+    )
+    .build()
+    .unwrap()
+    .definition()
+    .clone();
+    let mut run = crate::representation::tests::run("registered", false);
+    let identity =
+        bcode_workflow::WorkflowDefinitionIdentity::for_definition("test", &definition).unwrap();
+    run.definition_id = identity.definition_id;
+    run.definition_version = identity.definition_version;
+    let mut store = crate::WorkflowStore::create_coexistence_baseline(root.path()).unwrap();
+    store
+        .persist_definition(&run.definition_id, run.definition_version, &definition)
+        .unwrap();
+    let path = store.path().to_path_buf();
+    drop(store);
+    let db = switchy_database_connection::init_sqlite_rusqlite(Some(&path)).unwrap();
+    crate::representation::install(&*db).await.unwrap();
+    // Deliberately no manual inventory setup: registered admission owns installation.
+    (root, db, run, definition)
+}
+
+fn registered_query(run: &crate::NewWorkflowRun, source: Source) -> Query {
+    Query {
+        version: 1,
+        run_id: run.run_id.clone(),
+        source,
+        cursor: None,
+        limit: 100,
+    }
+}
+
+#[tokio::test]
+async fn registered_admission_installs_current_inventory_without_history_backfill() {
+    let (_root, db, run, definition) = registered_inventory_fixture().await;
+    Box::pin(crate::representation::admit_registered(
+        &*db,
+        &run,
+        &definition,
+    ))
+    .await
+    .unwrap();
+    for source in [
+        Source::Outputs,
+        Source::AttemptContributors,
+        Source::ChildRuns,
+    ] {
+        let query = registered_query(&run, source);
+        let current = page(&*db, &query).await.unwrap();
+        query.validate_page(&current).unwrap();
+        assert_eq!(current.coverage, Coverage::CurrentInventoryComplete);
+        assert!(current.entries.is_empty());
+        assert!(current.next_cursor.is_none());
+    }
+    assert_eq!(
+        crate::representation::journal::page(&*db, &run.run_id, 0, None, 100)
+            .await
+            .unwrap()
+            .origin,
+        crate::representation::journal::CoverageOrigin::NotEnabled
+    );
+    assert!(
+        Box::pin(crate::representation::admit_registered(
+            &*db,
+            &run,
+            &definition
+        ))
+        .await
+        .unwrap()
+        .already_present
+    );
+    let mut query = registered_query(&run, Source::Outputs);
+    query.cursor = Some(page(&*db, &query).await.unwrap().cursor);
+    let output = crate::ValidatedOutput {
+        output_id: "registered-output".into(),
+        run_id: run.run_id.clone(),
+        node_id: "work".into(),
+        activation_id: "activation".into(),
+        schema_id: "json".into(),
+        schema_version: 1,
+        value: serde_json::json!(7),
+        artifact_reference: None,
+        created_at_ms: 2,
+    };
+    let checksum = bcode_workflow::workflow_canonical_value_sha256(&output.value).unwrap();
+    let mut encoded = serde_json::to_value(&output).unwrap();
+    encoded["capture_proof"] = serde_json::json!({"version":1,"checksum_sha256":checksum});
+    db.insert("workflow_outputs_v2")
+        .value("output_id", output.output_id.as_str())
+        .value("run_id", run.run_id.as_str())
+        .value("activation_id", "activation")
+        .value("output_json", serde_json::to_string(&encoded).unwrap())
+        .execute(&*db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        page(&*db, &query).await,
+        Err(RepresentationError::InventoryStalePage)
+    ));
+    query.cursor = None;
+    let current = page(&*db, &query).await.unwrap();
+    assert_eq!(current.coverage, Coverage::CurrentInventoryComplete);
+    assert!(
+        matches!(&current.entries[0], Entry::Output { output: fact } if fact.value == output.value)
+    );
+}
+
+#[tokio::test]
+async fn registered_admission_observes_real_contributor_and_rejects_stale_generation() {
+    let (_root, db, run, definition) = registered_inventory_fixture().await;
+    Box::pin(crate::representation::admit_registered(
+        &*db,
+        &run,
+        &definition,
+    ))
+    .await
+    .unwrap();
+    let mut query = registered_query(&run, Source::AttemptContributors);
+    query.cursor = Some(page(&*db, &query).await.unwrap().cursor);
+    let prepared = crate::PreparedAttempt {
+        run_id: run.run_id.clone(),
+        node_id: "work".into(),
+        activation_id: "activation".into(),
+        attempt: 1,
+        side_effect: crate::DispatchSideEffect::ReadOnly,
+        intent: serde_json::json!({}),
+        prepared_at_ms: 2,
+    };
+    let identity = prepared.dispatch_identity();
+    db.insert("workflow_attempts_v2")
+        .value("dispatch_identity", identity.as_str())
+        .value("run_id", run.run_id.as_str())
+        .value("node_id", "work")
+        .value("activation_id", "activation")
+        .value("attempt_number", 1_i64)
+        .value("prepared_json", serde_json::to_string(&prepared).unwrap())
+        .execute(&*db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        page(&*db, &query).await,
+        Err(RepresentationError::InventoryStalePage)
+    ));
+    query.cursor = None;
+    let current = page(&*db, &query).await.unwrap();
+    assert_eq!(current.coverage, Coverage::CurrentInventoryComplete);
+    assert_eq!(current.entries.len(), 1);
+    assert!(
+        matches!(&current.entries[0], Entry::AttemptContributor { attempt, .. }
+        if attempt.dispatch_identity == identity)
+    );
+}
+
+#[tokio::test]
+async fn registered_admission_preserves_existing_unattributed_inventory_gap() {
+    let (_root, db, run, definition) = registered_inventory_fixture().await;
+    // Existing session attribution cannot be retroactively proven by enabling observers.
+    db.insert("workflow_execution_sessions_v2")
+        .value("dispatch_identity", "older-unattributed")
+        .value("link_json", "{}")
+        .execute(&*db)
+        .await
+        .unwrap();
+    Box::pin(crate::representation::admit_registered(
+        &*db,
+        &run,
+        &definition,
+    ))
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        let current = page(&*db, &registered_query(&run, Source::Outputs))
+            .await
+            .unwrap();
+        assert!(matches!(current.coverage, Coverage::Unavailable { .. }));
+        assert!(current.entries.is_empty());
+        assert!(
+            Box::pin(crate::representation::admit_registered(
+                &*db,
+                &run,
+                &definition
+            ))
+            .await
+            .unwrap()
+            .already_present
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_registered_admission_rolls_back_observer_installation() {
+    let (_root, db, mut run, definition) = registered_inventory_fixture().await;
+    run.input = Some(serde_json::json!("invalid u32"));
+    assert!(
+        Box::pin(crate::representation::admit_registered(
+            &*db,
+            &run,
+            &definition
+        ))
+        .await
+        .is_err()
+    );
+    assert!(db.get_table_info(CONTRACT).await.unwrap().is_none());
+}
+
 async fn contributor_fixture() -> (Box<dyn Database>, String) {
     let db = crate::representation::tests::database().await;
     crate::representation::install(&*db).await.unwrap();

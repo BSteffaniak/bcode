@@ -19522,7 +19522,7 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         .metrics
         .span("workflow.driver.gate_held")
         .labels(labels);
-    let result = drive_workflow_run_exclusive(state, run_id).await;
+    let result = Box::pin(drive_workflow_run_exclusive(state, run_id)).await;
     drop(guard);
     held.finish_result(&result);
     result
@@ -39497,19 +39497,39 @@ async fn persist_workflow_prompt_completion(
     unreachable!("the bounded receipt retry loop returns on its final attempt")
 }
 
-#[cfg(test)]
-async fn settle_workflow_prompt_observation(
-    state: &Arc<ServerState>,
-    request: &bcode_workflow_store::PreparedActivationDispatch,
-    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
-    receipt: &serde_json::Value,
-    observation: bcode_workflow_store::AttemptObservation,
-) {
-    match commit_workflow_prompt_observation(state, request, authority, receipt, observation).await
-    {
-        Ok(summary) => continue_settled_workflow_prompt(state, request, summary).await,
-        Err(error) => tracing::warn!(%error, "workflow prompt settlement remains unresolved"),
+#[derive(Clone, Copy, Debug)]
+enum WorkflowPromptSettlementPhase {
+    AcceptanceEvidence,
+    ReceiptPersistence,
+    ObservationSettlement,
+    CompletionObservation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkflowPromptSettlementFailure {
+    OwnershipDeferred,
+    UnavailableOrInconsistent,
+}
+
+const fn workflow_prompt_settlement_failure(
+    error: &WorkflowStoreError,
+) -> WorkflowPromptSettlementFailure {
+    if matches!(error, WorkflowStoreError::OwnerAccessDeferred) {
+        WorkflowPromptSettlementFailure::OwnershipDeferred
+    } else {
+        WorkflowPromptSettlementFailure::UnavailableOrInconsistent
     }
+}
+
+fn diagnose_workflow_prompt_settlement(
+    phase: WorkflowPromptSettlementPhase,
+    error: &WorkflowStoreError,
+) {
+    // The existing background workflow-start hook is enabled without broad server logging.
+    // Never forward storage/provider error text or output payloads to this diagnostic.
+    tracing::warn!(target: "bcode_server::workflow_start",
+        ?phase, category = ?workflow_prompt_settlement_failure(error),
+        "workflow prompt settlement unresolved; retained receipt requires reconciliation");
 }
 
 async fn commit_workflow_prompt_observation(
@@ -39546,19 +39566,37 @@ async fn commit_workflow_prompt_observation(
         .metrics
         .span("workflow.owner.drive_gate_held")
         .labels(labels);
-    let receipt_result = workflow_representation::owner::persist_receipt(
-        state,
-        &bcode_workflow_store::DispatchReceipt {
-            run_id: request.activation.run_id.clone(),
-            node_id: request.activation.node_id.clone(),
-            activation_id: request.activation.activation_id.clone(),
-            attempt: request.attempt,
-            dispatch_identity: request.dispatch_identity.clone(),
-            receipt: receipt.clone(),
-            admitted_at_ms: current_unix_millis(),
-        },
-        authority,
-    )
+    let receipt_result = async {
+        let admitted_at_ms =
+            workflow_representation::owner::prompt_acceptance_time(state, request, receipt)
+                .await
+                .inspect_err(|error| {
+                    diagnose_workflow_prompt_settlement(
+                        WorkflowPromptSettlementPhase::AcceptanceEvidence,
+                        error,
+                    );
+                })?;
+        workflow_representation::owner::persist_receipt(
+            state,
+            &bcode_workflow_store::DispatchReceipt {
+                run_id: request.activation.run_id.clone(),
+                node_id: request.activation.node_id.clone(),
+                activation_id: request.activation.activation_id.clone(),
+                attempt: request.attempt,
+                dispatch_identity: request.dispatch_identity.clone(),
+                receipt: receipt.clone(),
+                admitted_at_ms,
+            },
+            authority,
+        )
+        .await
+        .inspect_err(|error| {
+            diagnose_workflow_prompt_settlement(
+                WorkflowPromptSettlementPhase::ReceiptPersistence,
+                error,
+            );
+        })
+    }
     .await;
     if let Err(error) = receipt_result {
         drop(completion_guard);
@@ -39567,7 +39605,13 @@ async fn commit_workflow_prompt_observation(
     }
     let settlement_result =
         workflow_representation::owner::settle_observation(state, request, authority, observation)
-            .await;
+            .await
+            .inspect_err(|error| {
+                diagnose_workflow_prompt_settlement(
+                    WorkflowPromptSettlementPhase::ObservationSettlement,
+                    error,
+                );
+            });
     drop(completion_guard);
     held_span.finish_result(&settlement_result);
     let summary = settlement_result?;
@@ -39654,8 +39698,21 @@ async fn complete_workflow_prompt_dispatch(
                 .await
                 .map(|summary| (summary, outcome))
         }
-        Ok(_) => Err(WorkflowStoreError::OwnerAccessDeferred),
-        Err(error) => Err(error),
+        Ok(_) => {
+            let error = WorkflowStoreError::OwnerAccessDeferred;
+            diagnose_workflow_prompt_settlement(
+                WorkflowPromptSettlementPhase::CompletionObservation,
+                &error,
+            );
+            Err(error)
+        }
+        Err(error) => {
+            diagnose_workflow_prompt_settlement(
+                WorkflowPromptSettlementPhase::CompletionObservation,
+                &error,
+            );
+            Err(error)
+        }
     };
     #[cfg(test)]
     trace_workflow_owner_lifecycle(
@@ -40415,7 +40472,6 @@ where
         Some(&request.dispatch_identity),
         workflow_representation::fanout_stages::FanoutAdmissionStage::Submit,
     );
-    let admission_started_at_ms = current_unix_millis();
     let submitted = tokio::time::timeout(
         Duration::from_millis(configuration.timeout_ms),
         submit_session_model_turn_with_admission(
@@ -40550,19 +40606,28 @@ where
     );
     let receipt_commit = match before_publication().await {
         Ok(()) => {
-            workflow_representation::owner::persist_receipt(
-                state,
-                &bcode_workflow_store::DispatchReceipt {
-                    run_id: request.activation.run_id.clone(),
-                    node_id: request.activation.node_id.clone(),
-                    activation_id: request.activation.activation_id.clone(),
-                    attempt: request.attempt,
-                    dispatch_identity: request.dispatch_identity.clone(),
-                    receipt: owner_receipt.clone(),
-                    admitted_at_ms: admission_started_at_ms,
-                },
-                &dispatch_authority,
-            )
+            async {
+                let admitted_at_ms = workflow_representation::owner::prompt_acceptance_time(
+                    state,
+                    request,
+                    &owner_receipt,
+                )
+                .await?;
+                workflow_representation::owner::persist_receipt(
+                    state,
+                    &bcode_workflow_store::DispatchReceipt {
+                        run_id: request.activation.run_id.clone(),
+                        node_id: request.activation.node_id.clone(),
+                        activation_id: request.activation.activation_id.clone(),
+                        attempt: request.attempt,
+                        dispatch_identity: request.dispatch_identity.clone(),
+                        receipt: owner_receipt.clone(),
+                        admitted_at_ms,
+                    },
+                    &dispatch_authority,
+                )
+                .await
+            }
             .await
         }
         Err(error) => Err(error),
@@ -64708,7 +64773,7 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn prompt_completion_restores_uncommitted_admission_receipt() {
+    async fn prompt_completion_rejects_unverified_admission_receipt() {
         let (state, _, _root) = active_edit_execution_fixture_with_graph(
             bcode_workflow_store::DispatchSideEffect::ReadOnly,
             true,
@@ -64732,21 +64797,24 @@ library = "test"
                 .dispatch_receipt_committed(&request.dispatch_identity)
                 .expect("receipt")
         );
-        settle_workflow_prompt_observation(
-            &state,
-            &request,
-            &authority,
-            &receipt,
-            bcode_workflow_store::AttemptObservation::Cancelled,
-        )
-        .await;
         assert!(
-            state
+            commit_workflow_prompt_observation(
+                &state,
+                &request,
+                &authority,
+                &receipt,
+                bcode_workflow_store::AttemptObservation::Cancelled,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !state
                 .workflow_store
                 .lock()
                 .expect("store")
                 .dispatch_receipt_committed(&request.dispatch_identity)
-                .expect("recovered receipt")
+                .expect("unverified receipt remains absent")
         );
         drop(state);
     }
@@ -91484,6 +91552,135 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("terminal cancellation");
+    }
+
+    fn observed_template_test_state(root: &Path, sessions_root: &Path) -> Arc<ServerState> {
+        let mut state = external_template_test_state(root);
+        let configured = Arc::get_mut(&mut state).expect("exclusive fixture");
+        configured.sessions = SessionManager::persistent_lazy(sessions_root);
+        configured.workflow_store = Arc::new(StdMutex::new(
+            bcode_workflow_store::WorkflowStore::create_coexistence_baseline(root)
+                .expect("canonical coexistence baseline"),
+        ));
+        configured.observability.persist_model_requests = true;
+        configured.observability.persist_tool_io = true;
+        configured
+            .selected_provider_context
+            .settings
+            .insert("fake_structured_output_json".into(), "{}".into());
+        state
+    }
+
+    async fn observed_template_test_parent(state: &ServerState, root: &Path) -> SessionId {
+        state
+            .sessions
+            .create_session(Some("observed template parent".into()), root.to_path_buf())
+            .await
+            .expect("parent")
+            .id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observed_template_launch_dispatches_over_real_ipc_on_default_workers() {
+        let root = tempfile::tempdir().expect("plugin and workflow root");
+        let sessions_root = tempfile::tempdir().expect("sessions root");
+        let state = observed_template_test_state(root.path(), sessions_root.path());
+        let parent = observed_template_test_parent(&state, root.path()).await;
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(root.path().join("observed.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        // No direct admission/installation call: the production IPC handler compiles the plugin
+        // template, installs observed storage, admits the run and performs its first dispatch.
+        let started = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.start_workflow_template(bcode_workflow::WorkflowTemplateStartRequest {
+                owner_plugin_id: "bcode.shell".into(),
+                template_id: "external".into(),
+                template_version: 1,
+                run_id: Some("observed-template-ipc".into()),
+                workspace_snapshot: None,
+                parent_session_id: parent,
+                configuration: serde_json::json!({}),
+                limits: bcode_workflow::WorkflowRunLimits::default(),
+            }),
+        )
+        .await
+        .expect("launch deadline")
+        .expect("production template admission");
+        assert_eq!(started.run.run_id, "observed-template-ipc");
+        let query = bcode_workflow::WorkflowSemanticHistoryQuery {
+            version: bcode_workflow::WORKFLOW_SEMANTIC_HISTORY_VERSION,
+            run_id: started.run.run_id.clone(),
+            scope: bcode_workflow::WorkflowSemanticHistoryScope::AttemptsV1,
+            cursor: None,
+            limit: 100,
+        };
+        let dispatched = client
+            .workflow_semantic_history(query.clone())
+            .await
+            .expect("IPC history");
+        assert_eq!(
+            dispatched.cursor.coverage,
+            bcode_workflow::WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+        );
+        assert!(
+            dispatched.events.iter().any(|event| matches!(
+                event.payload,
+                bcode_workflow::WorkflowSemanticHistoryPayload::ReceiptCommitted {}
+            )),
+            "initial dispatch must commit before launch returns"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let run = client
+                    .workflow_run_status(started.run.run_id.clone())
+                    .await
+                    .expect("IPC status")
+                    .expect("run");
+                if run.status == bcode_workflow::RunStatus::Completed {
+                    break;
+                }
+                // Canonical runs remain Paused while an externally owned prompt is in flight;
+                // the committed receipt above, not a Running label, proves actual dispatch.
+                assert!(
+                    matches!(
+                        run.status,
+                        bcode_workflow::RunStatus::Running | bcode_workflow::RunStatus::Paused
+                    ),
+                    "unexpected outcome after committed dispatch: {run:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Box::pin(drive_workflow_run(&state, &started.run.run_id))
+                    .await
+                    .expect("drive completion");
+            }
+        })
+        .await
+        .expect("fake provider completion deadline");
+        let settled = client
+            .workflow_semantic_history(query)
+            .await
+            .expect("terminal IPC history");
+        assert!(
+            settled.events.iter().any(|event| matches!(
+                event.payload,
+                bcode_workflow::WorkflowSemanticHistoryPayload::AttemptTerminal {
+                    outcome: bcode_workflow::WorkflowSemanticAttemptOutcome::Succeeded
+                }
+            )),
+            "real prompt owner must settle successfully"
+        );
+        client.ping().await.expect("daemon remains responsive");
+        shutdown.send(()).expect("shutdown");
+        server.await.expect("server task");
+        drop(client);
+        drop(state);
     }
 
     #[tokio::test]

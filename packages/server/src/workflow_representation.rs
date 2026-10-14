@@ -211,16 +211,23 @@ pub async fn admit_prepared(
     }
     drop(db);
     let db = open(retained.path(), true)?;
-    backpressure::retry(|| representation::install(&db))
+    // Keep independently large store futures out of the admission driver's inline state.
+    // Boxing preserves the caller's retry and source-transaction ownership.
+    backpressure::retry(|| Box::pin(representation::install(&db)))
         .await
         .map_err(|_| unavailable())?;
-    backpressure::retry(|| representation::journal::install(&db))
+    backpressure::retry(|| Box::pin(representation::journal::install(&db)))
         .await
         .map_err(|_| unavailable())?;
     let capture_observations =
         state.observability.persist_model_requests || state.observability.persist_tool_io;
     backpressure::retry(|| {
-        representation::admit_registered_observed(&db, run, &definition, capture_observations)
+        Box::pin(representation::admit_registered_observed(
+            &db,
+            run,
+            &definition,
+            capture_observations,
+        ))
     })
     .await
     .map_err(|_| unavailable())?;

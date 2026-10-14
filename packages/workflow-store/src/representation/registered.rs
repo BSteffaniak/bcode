@@ -19,6 +19,8 @@ pub async fn admit_registered(
 /// Admit an exact registered definition with explicit new-run observation consent.
 ///
 /// Capture is enabled atomically before admission; existing runs are never backfilled or enabled.
+/// Current-inventory observers are installed or verified in that same writer transaction,
+/// preserving conservative installation gaps without claiming historical completeness.
 /// Authorization and executable capability validation remain application responsibilities.
 /// # Errors
 /// Rejects registry mismatches, unavailable journal state when capture is requested, and admission failures.
@@ -62,6 +64,9 @@ pub async fn admit_registered_observed(
     {
         super::journal::enable_admission(&*tx, &run.run_id).await?;
     }
+    // Install/verify membership observers under the same writer transaction before any
+    // admission facts. This is current-inventory fencing, not historical backfill.
+    Box::pin(super::inventory::install_in(&*tx)).await?;
     let result = admit_in(&*tx, run, definition).await?;
     if !result.already_present {
         hierarchy::register_root(&*tx, run).await?;

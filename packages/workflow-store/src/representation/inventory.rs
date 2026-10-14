@@ -73,9 +73,15 @@ pub async fn install(db: &dyn Database) -> Result<(), Error> {
         .begin_transaction_with_mode(TransactionMode::Immediate)
         .await?;
     super::verified(&*tx).await?;
-    installation::install(&*tx).await?;
+    install_in(&*tx).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Install fresh observers or verify the maintained boundary in the caller's writer transaction.
+/// Existing unattributed sources retain the installation's conservative gap; no history is replayed.
+pub(super) async fn install_in(db: &dyn Database) -> Result<(), RepresentationError> {
+    installation::install(db).await
 }
 fn text(row: &switchy_database::Row, field: &str) -> Result<String, RepresentationError> {
     match row.get(field) {

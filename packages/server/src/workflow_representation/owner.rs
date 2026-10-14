@@ -343,6 +343,80 @@ async fn persist_receipt_inner(
     }
 }
 
+/// Resolve admission time from the exact session-owned acceptance, never recovery time.
+///
+/// # Errors
+/// Rejects missing, mismatched or unavailable canonical acceptance evidence.
+pub async fn prompt_acceptance_time(
+    state: &ServerState,
+    request: &PreparedActivationDispatch,
+    receipt: &serde_json::Value,
+) -> Result<u64, WorkflowStoreError> {
+    let decoded = crate::workflow_receipts::AgentTurnReceipt::decode(receipt)
+        .map_err(|_| store_error("invalid acceptance receipt"))?;
+    crate::verify_workflow_observation_session(
+        state,
+        decoded.session_id,
+        &bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: request.activation.run_id.clone(),
+            node_id: request.activation.node_id.clone(),
+            activation_id: request.activation.activation_id.clone(),
+            attempt: request.attempt,
+            dispatch_identity: request.dispatch_identity.clone(),
+            side_effect: bcode_workflow::DispatchSideEffect::ReadOnly,
+            receipt: receipt.clone(),
+        },
+    )
+    .await?;
+    let accepted = state
+        .sessions
+        .turn_receipt(
+            decoded.session_id,
+            "bcode.workflow",
+            &request.dispatch_identity,
+        )
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| store_error("missing acceptance"))?;
+    if decoded.turn_id != accepted.turn_id.0
+        || receipt
+            .get("accepted_event_sequence")
+            .is_some_and(|sequence| sequence.as_u64() != Some(accepted.accepted_event_sequence))
+        || receipt
+            .get("work_id")
+            .is_some_and(|work| work.as_str() != Some(accepted.work_id.0.as_str()))
+    {
+        return Err(store_error("mismatched acceptance"));
+    }
+    let window = state
+        .sessions
+        .session_history_around(
+            decoded.session_id,
+            bcode_session_models::SessionHistoryAroundQuery {
+                sequence: accepted.accepted_event_sequence,
+                before: 0,
+                after: 0,
+            },
+        )
+        .await
+        .map_err(store_error)?;
+    let acceptance_sequence = accepted.accepted_event_sequence;
+    window
+        .events
+        .into_iter()
+        .find_map(|event| {
+            (event.session_id == decoded.session_id
+                && event.sequence == acceptance_sequence
+                && matches!(
+                    event.kind,
+                    bcode_session_models::SessionEventKind::UserMessage { .. }
+                        | bcode_session_models::SessionEventKind::SubmissionAccepted { .. }
+                ))
+            .then_some(event.timestamp_ms)
+        })
+        .ok_or_else(|| store_error("canonical acceptance event unavailable"))
+}
+
 /// Resolve only an already-recorded local owner; foreign/unclaimed extension work fails closed.
 /// Returns `None` for the legacy authority resolver, never as permission to claim new work.
 pub async fn local_authority(
@@ -1119,6 +1193,177 @@ mod cancellation_tests {
             dispatch_identity: receipt.dispatch_identity.clone(),
             receipt: Some(receipt.receipt.clone()),
         }
+    }
+
+    async fn completed_shared_turn_evidence(
+        state: &ServerState,
+        parent: crate::SessionId,
+        accepted: &bcode_session_models::TurnReceipt,
+    ) -> (Vec<bcode_session_models::SessionEvent>, u64) {
+        let events = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let events = state
+                    .sessions
+                    .session_turn_evidence(parent, &accepted.turn_id.0)
+                    .await
+                    .unwrap();
+                if events.iter().any(|event| matches!(
+                    &event.kind,
+                    bcode_session_models::SessionEventKind::ModelTurnFinished { turn_id, outcome, .. }
+                    if turn_id == &accepted.turn_id.0 && *outcome == bcode_session_models::ModelTurnOutcome::Completed
+                )) {
+                    break events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("offline evaluator completes before receipt recovery");
+        let acceptance = state
+            .sessions
+            .session_history_around(
+                parent,
+                bcode_session_models::SessionHistoryAroundQuery {
+                    sequence: accepted.accepted_event_sequence,
+                    before: 0,
+                    after: 0,
+                },
+            )
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .find(|event| event.sequence == accepted.accepted_event_sequence)
+            .unwrap();
+        (events, acceptance.timestamp_ms)
+    }
+
+    async fn assert_unreceipted_completion_rejects_foreign_authority(
+        state: &std::sync::Arc<ServerState>,
+        db: &dyn switchy_database::Database,
+        dispatch: &PreparedActivationDispatch,
+        authority: &WorkflowExecutionAuthority,
+        receipt: &serde_json::Value,
+        observation: bcode_workflow_store::AttemptObservation,
+    ) {
+        let mut rejected_authority = authority.clone();
+        rejected_authority.generation += 1;
+        assert!(
+            crate::commit_workflow_prompt_observation(
+                state,
+                dispatch,
+                &rejected_authority,
+                receipt,
+                observation,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            owner_boundary::receipt(db, &dispatch.dispatch_identity)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_shared_turn_recovers_receipt_with_original_acceptance_time() {
+        let (_root, _sessions, state, _) = super::super::tests::typed_provider_fixture_with_target(
+            false,
+            bcode_workflow::PromptContextTarget::SharedParentSequential,
+        )
+        .await;
+        let db = open(&crate::workflow_store_path(&state), true).unwrap();
+        let guard = local_authority(&state, "new").await.unwrap().unwrap();
+        let dispatch =
+            super::super::tests::prepare_acceptance_recovery_fixture(&state, &db, &guard.authority)
+                .await;
+        let parent: crate::SessionId = representation::runs::association(&db, "new")
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let failure =
+            crate::dispatch_workflow_prompt_turn_after_admission(&state, &dispatch, || {
+                Err(WorkflowStoreError::InvalidData(
+                    "injected initial receipt failure".into(),
+                ))
+            })
+            .await;
+        assert!(failure.is_err());
+        assert!(
+            owner_boundary::receipt(&db, &dispatch.dispatch_identity)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let accepted = state
+            .sessions
+            .turn_receipt(parent, "bcode.workflow", &dispatch.dispatch_identity)
+            .await
+            .unwrap()
+            .unwrap();
+        let (events, acceptance_time) =
+            completed_shared_turn_evidence(&state, parent, &accepted).await;
+        let observation = completion_observation(
+            &state,
+            &dispatch,
+            crate::ModelTurnCompletion::completed()
+                .with_output(crate::workflow_turn_output(&events, &accepted.turn_id.0).unwrap()),
+        )
+        .await
+        .unwrap();
+        let bcode_workflow_store::AttemptObservation::Succeeded { output } = &observation else {
+            panic!("completed evaluator must have a validated output");
+        };
+        let terminal_at_ms = output.created_at_ms;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(crate::current_unix_millis() > terminal_at_ms);
+        let receipt = crate::recovered_workflow_receipt(parent, &accepted, &output.schema_id);
+        assert_unreceipted_completion_rejects_foreign_authority(
+            &state,
+            &db,
+            &dispatch,
+            &guard.authority,
+            &receipt,
+            observation.clone(),
+        )
+        .await;
+        let summary = crate::commit_workflow_prompt_observation(
+            &state,
+            &dispatch,
+            &guard.authority,
+            &receipt,
+            observation.clone(),
+        )
+        .await
+        .expect("delayed receipt recovery must not move acceptance past completion");
+        let retained = owner_boundary::receipt(&db, &dispatch.dispatch_identity)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.admitted_at_ms, acceptance_time);
+        assert!(retained.admitted_at_ms <= terminal_at_ms);
+        assert_eq!(
+            owner_boundary::terminal_outcome(&db, "new", &dispatch.dispatch_identity)
+                .await
+                .unwrap(),
+            Some(representation::attempts::TerminalOutcome::Succeeded)
+        );
+        crate::commit_workflow_prompt_observation(
+            &state,
+            &dispatch,
+            &guard.authority,
+            &receipt,
+            observation,
+        )
+        .await
+        .expect("duplicate completion is idempotent");
+        crate::continue_settled_workflow_prompt(&state, &dispatch, summary).await;
+        let run = super::super::status(&state, "new").await.unwrap().unwrap();
+        assert_eq!(run.status, bcode_workflow::RunStatus::Completed);
     }
 
     #[tokio::test]

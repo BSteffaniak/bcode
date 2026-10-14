@@ -508,6 +508,88 @@ async fn admission_family_selection_never_installs_or_dispatches_unsupported_lif
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_admission_installs_and_commits_on_default_runtime_workers() {
+    let (_root, mut state) = fixture_with_store(true);
+    state.observability.persist_model_requests = true;
+    state.observability.persist_tool_io = true;
+    let config = bcode_workflow::WorkflowPromptConfiguration::preserve_input("build", "observe");
+    let definition = bcode_workflow::WorkflowBuilder::new(
+        "observed-admission",
+        bcode_workflow::Step::<u32, u32>::agent("first", &config)
+            .expect("first agent")
+            .then(bcode_workflow::Step::<u32, u32>::agent("last", &config).expect("last agent")),
+    )
+    .build()
+    .expect("definition")
+    .definition()
+    .clone();
+    let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+        "observed-admission",
+        &definition,
+    )
+    .expect("identity");
+    state
+        .workflow_store
+        .lock()
+        .expect("store")
+        .persist_definition(
+            &identity.definition_id,
+            identity.definition_version,
+            &definition,
+        )
+        .expect("definition registration");
+    let mut run = request("observed-admission");
+    run.definition_id = identity.definition_id;
+    run.definition_version = identity.definition_version;
+    run.limits.concurrency_cap = None;
+    // Size is a runtime resource property, not an assertion about implementation spelling.
+    let future = admit_prepared(&state, &run);
+    assert!(
+        std::mem::size_of_val(&future) < 128 * 1024,
+        "admission future must not inline the store installation/admission state machines"
+    );
+    drop(future);
+    let state = std::sync::Arc::new(state);
+    let admitted = std::sync::Arc::clone(&state);
+    let run_id = run.run_id.clone();
+    let summary = tokio::spawn(async move {
+        let summary = Box::pin(admit_prepared(&admitted, &run))
+            .await
+            .expect("first observed admission");
+        let duplicate = Box::pin(admit_prepared(&admitted, &run))
+            .await
+            .expect("duplicate observed admission");
+        assert_eq!(summary, duplicate);
+        summary.expect("canonical admission")
+    })
+    .await
+    .expect("default runtime worker completes admission");
+    assert_eq!(summary.run_id, run_id);
+    let db = open(&crate::workflow_store_path(&state), false).expect("read snapshot");
+    drop(state);
+    let page = representation::journal::public_events::page(&db, 1, &run_id, 0, None, 100)
+        .await
+        .expect("committed public facts");
+    assert!(page.from_admission);
+    assert_eq!(
+        page.lifecycle_coverage,
+        bcode_workflow::WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+    );
+    assert_eq!(
+        representation::journal::public_events::repeat::coverage(&db, &run_id)
+            .await
+            .expect("repeat origin"),
+        bcode_workflow::WorkflowSemanticHistoryCoverage::CompleteFromAdmission
+    );
+    assert_eq!(
+        representation::journal::public_events::exclusions::coverage(&db, &run_id)
+            .await
+            .expect("legacy collection exclusions"),
+        representation::journal::public_events::exclusions::Coverage::VerifiedExcludedV1
+    );
+}
+
 pub(super) async fn typed_provider_fixture() -> (
     tempfile::TempDir,
     tempfile::TempDir,

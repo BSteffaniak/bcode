@@ -7407,7 +7407,7 @@ async fn start_run_with_stage(
     )
     .await;
     *phase = "initial_execution";
-    if let Err(error) = super::drive_workflow_run(state, &run_id).await {
+    if let Err(error) = Box::pin(super::drive_workflow_run(state, &run_id)).await {
         // Admission can commit a receipt before the first driver call fails. Only
         // verified terminal evidence permits releasing its runtime registration.
         if let Err(reconciliation) =
@@ -7555,7 +7555,7 @@ pub async fn start(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowStartRequest,
 ) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
-    start_with_stage(state, request, &mut "validate_definition").await
+    Box::pin(start_with_stage(state, request, &mut "validate_definition")).await
 }
 
 async fn start_with_stage(
@@ -7603,7 +7603,7 @@ async fn start_with_stage(
         .into());
     }
     *phase = "start_run";
-    let result = start_run_with_stage(
+    let result = Box::pin(start_run_with_stage(
         state,
         bcode_workflow::WorkflowRunStartRequest {
             definition_id: request.identity.definition_id,
@@ -7619,7 +7619,7 @@ async fn start_with_stage(
         None,
         None,
         phase,
-    )
+    ))
     .await;
     state.metrics.record_histogram_with_labels(
         "workflow.admission.duration_ms",
