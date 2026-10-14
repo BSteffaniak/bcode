@@ -169,6 +169,10 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
         }
     })
     .await;
+    if result.is_err() {
+        let snapshot = representation::scheduling::snapshot(&db, "failfast", None, None, 100).await;
+        eprintln!("failfast timeout snapshot: {snapshot:?}");
+    }
     result.expect("failfast settles owner cancellation");
     assert!(
         representation::safety::cancellation_requested_at(&db, "failfast")

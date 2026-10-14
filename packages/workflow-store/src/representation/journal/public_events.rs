@@ -13,7 +13,11 @@ use switchy_database::{
 pub mod control;
 #[cfg(test)]
 mod control_tests;
+/// Verified version-one exclusion of legacy permission-storage collections.
+pub mod exclusions;
 mod installation;
+/// Independently opted-in, guarded repeat emission facts; not complete workflow history.
+pub mod repeat;
 #[cfg(test)]
 mod tests;
 const CONTRACT: &str = "workflow_public_events_contract_v1";
@@ -113,6 +117,17 @@ async fn append_in(
         return Err(Error::MaintenanceRequired);
     }
     let json = serde_json::to_string(&fact).map_err(|_| Error::InvalidAdmission)?;
+    append_encoded(tx, run, identity, time, "committed_fact_v1", &json).await
+}
+
+async fn append_encoded(
+    tx: &dyn Database,
+    run: &str,
+    identity: &str,
+    time: u64,
+    event_type: &str,
+    json: &str,
+) -> Result<(), Error> {
     if json.len() > 8192 {
         return Err(Error::InvalidAdmission);
     }
@@ -124,10 +139,10 @@ async fn append_in(
         .await?;
     let time = i64::try_from(time).map_err(|_| Error::InvalidAdmission)?;
     if let Some(row) = existing.first() {
-        if row.get("event_type") != Some(DatabaseValue::String("committed_fact_v1".into())) {
+        if row.get("event_type") != Some(DatabaseValue::String(event_type.into())) {
             return Err(Error::MaintenanceRequired);
         }
-        if row.get("payload") != Some(DatabaseValue::String(json))
+        if row.get("payload") != Some(DatabaseValue::String(json.into()))
             || row.get("run_id") != Some(DatabaseValue::String(run.into()))
             || row.get("recorded_at_ms") != Some(DatabaseValue::Int64(time))
         {
@@ -139,7 +154,7 @@ async fn append_in(
         .value("identity", identity)
         .value("run_id", run)
         .value("payload", json)
-        .value("event_type", "committed_fact_v1")
+        .value("event_type", event_type)
         .value("recorded_at_ms", time)
         .execute(tx)
         .await?;
@@ -171,6 +186,16 @@ fn decode_event(row: &switchy_database::Row, run: &str) -> Result<WorkflowHistor
     let public_payload = if event_type == "committed_fact_v1" {
         let fact: Fact = serde_json::from_str(&payload).map_err(|_| Error::MaintenanceRequired)?;
         serde_json::json!({"operation_id":operation_id,"fact":fact})
+    } else if event_type == "repeat_emission_v1" {
+        let summary: bcode_workflow::WorkflowRepeatOutcomeSummary =
+            serde_json::from_str(&payload).map_err(|_| Error::MaintenanceRequired)?;
+        repeat::validate_retained(
+            &summary,
+            run,
+            &operation_id,
+            super::integer(row, "recorded_at_ms")?,
+        )?;
+        serde_json::json!({"operation_id":operation_id,"repeat_emission":summary})
     } else {
         serde_json::json!({"unavailable":"unreviewed_event_payload"})
     };
@@ -198,12 +223,28 @@ pub async fn page(
         return Err(Error::InvalidAdmission);
     }
     let tx = db.begin_transaction().await?;
-    installation::verify(&*tx).await?;
+    let result = page_in(&*tx, version, run, after, through, limit).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+async fn page_in(
+    tx: &dyn Database,
+    version: u32,
+    run: &str,
+    after: u64,
+    through: Option<u64>,
+    limit: u16,
+) -> Result<Page, Error> {
+    if version != 1 || !(1..=100).contains(&limit) {
+        return Err(Error::InvalidAdmission);
+    }
+    installation::verify(tx).await?;
     let origins = tx
         .select(ORIGINS)
         .where_eq("run_id", run)
         .limit(1)
-        .execute(&*tx)
+        .execute(tx)
         .await?;
     let from_admission = if let Some(row) = origins.first() {
         if super::integer(row, "version")? != 1 {
@@ -213,15 +254,15 @@ pub async fn page(
     } else {
         false
     };
-    let attempt_coverage = super::super::semantic_history::coverage(&*tx, run).await?;
-    let lifecycle_coverage = super::super::semantic_history::lifecycle::coverage(&*tx, run).await?;
-    let control_coverage = control::coverage(&*tx, run).await?;
+    let attempt_coverage = super::super::semantic_history::coverage(tx, run).await?;
+    let lifecycle_coverage = super::super::semantic_history::lifecycle::coverage(tx, run).await?;
+    let control_coverage = control::coverage(tx, run).await?;
     let latest = tx
         .select(EVENTS)
         .where_eq("run_id", run)
         .sort("sequence", SortDirection::Desc)
         .limit(1)
-        .execute(&*tx)
+        .execute(tx)
         .await?;
     let high = latest
         .first()
@@ -245,7 +286,7 @@ pub async fn page(
         )
         .sort("sequence", SortDirection::Asc)
         .limit(usize::from(limit) + 1)
-        .execute(&*tx)
+        .execute(tx)
         .await?;
     if !from_admission && !rows.is_empty() {
         return Err(Error::MaintenanceRequired);
@@ -261,7 +302,6 @@ pub async fn page(
     } else {
         None
     };
-    tx.commit().await?;
     Ok(Page {
         version: 1,
         run_id: run.into(),

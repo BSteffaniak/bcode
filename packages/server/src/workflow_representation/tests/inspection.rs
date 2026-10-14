@@ -38,6 +38,52 @@ async fn current_public_capabilities_drive_eval_capture_without_legacy_events() 
                         .unwrap(),
                 )
                 .unwrap()),
+                "semantic-history-run" => Ok(serde_json::to_value(
+                    handle
+                        .block_on(discovery::semantic_history(
+                            &state,
+                            &bcode_workflow::WorkflowSemanticHistoryQuery {
+                                version: bcode_workflow::WORKFLOW_SEMANTIC_HISTORY_VERSION,
+                                scope: bcode_workflow::WorkflowSemanticHistoryScope::AttemptsV1,
+                                run_id: "new".into(),
+                                cursor: None,
+                                limit: 100,
+                            },
+                        ))
+                        .unwrap(),
+                )
+                .unwrap()),
+                "lifecycle-history-run" => Ok(serde_json::to_value(
+                    handle
+                        .block_on(discovery::lifecycle_history(
+                            &state,
+                            &bcode_workflow::WorkflowLifecycleHistoryQuery {
+                                version: bcode_workflow::WORKFLOW_LIFECYCLE_HISTORY_VERSION,
+                                scope:
+                                    bcode_workflow::WorkflowLifecycleHistoryScope::RunLifecycleV1,
+                                run_id: "new".into(),
+                                cursor: None,
+                                limit: 100,
+                            },
+                        ))
+                        .unwrap(),
+                )
+                .unwrap()),
+                "public-events" => Ok(serde_json::to_value(
+                    handle
+                        .block_on(discovery::committed_history(
+                            &state,
+                            &bcode_workflow::WorkflowCommittedHistoryQuery {
+                                version: bcode_workflow::WORKFLOW_COMMITTED_HISTORY_VERSION,
+                                run_id: "new".into(),
+                                after_sequence: after.unwrap_or(0),
+                                through_sequence: through,
+                                limit: 100,
+                            },
+                        ))
+                        .unwrap(),
+                )
+                .unwrap()),
                 other => panic!("unsupported collection requested: {other}"),
             }
         })

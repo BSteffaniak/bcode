@@ -165,7 +165,11 @@ pub async fn enable_admission(
         }
     }
     public_events::install(tx).await?;
+    public_events::repeat::install_in(tx).await?;
+    public_events::exclusions::install_in(tx).await?;
     public_events::enable(tx, run_id).await?;
+    public_events::repeat::enable_in(tx, run_id).await?;
+    public_events::exclusions::enable_in(tx, run_id).await?;
     tx.insert(COVERAGE)
         .value("run_id", run_id)
         .value("version", VERSION)

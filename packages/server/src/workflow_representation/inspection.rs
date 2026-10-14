@@ -48,16 +48,12 @@ struct CollectionCompleteness {
     descendant_runs: Option<bool>,
     waits: Option<bool>,
     resource_leases: Option<bool>,
+    repeat_outcomes: Option<bool>,
+    excluded_permission_collections: Option<bool>,
 }
 
 fn unavailable_collections(complete: CollectionCompleteness) -> Vec<String> {
-    let unsupported = [
-        "events",
-        "mutation_approvals",
-        "decisions",
-        "grants",
-        "repeat_outcomes",
-    ];
+    let unsupported = ["events"];
     unsupported
         .into_iter()
         .chain(
@@ -69,6 +65,13 @@ fn unavailable_collections(complete: CollectionCompleteness) -> Vec<String> {
                 ("descendant_runs", complete.descendant_runs),
                 ("waits", complete.waits),
                 ("resource_leases", complete.resource_leases),
+                ("repeat_outcomes", complete.repeat_outcomes),
+                (
+                    "mutation_approvals",
+                    complete.excluded_permission_collections,
+                ),
+                ("decisions", complete.excluded_permission_collections),
+                ("grants", complete.excluded_permission_collections),
             ]
             .into_iter()
             .filter_map(|(name, completeness)| (completeness != Some(true)).then_some(name)),
@@ -128,7 +131,9 @@ async fn inspect_canonical(
         .map_err(|_| stage("activations"))?;
     let attempts = canonical_attempts(&*tx, run_id, bound).await?;
     let (resource_leases, leases_complete) = leases::inspect(&*tx, run_id, bound).await;
-    let repeat_outcomes = repeats::inspect(&*tx, run_id, bound).await;
+    let (repeat_outcomes, repeats_complete) = repeats::inspect(&*tx, run_id, bound).await;
+    let excluded_permission_collections = representation::journal::public_events::exclusions::coverage_in(&*tx, run_id)
+        .await.ok().map(|coverage| coverage == representation::journal::public_events::exclusions::Coverage::VerifiedExcludedV1);
     let outputs = output_summaries(&*tx, run_id, bound).await?;
     let child_sessions = sessions(state, &*tx, run_id, bound)
         .await
@@ -175,6 +180,8 @@ async fn inspect_canonical(
             descendant_runs: Some(descendants_complete),
             waits: waits_complete,
             resource_leases: leases_complete,
+            repeat_outcomes: repeats_complete,
+            excluded_permission_collections,
         }),
         execution_allowance: None,
         continuation: None,
@@ -449,6 +456,8 @@ mod tests {
                 descendant_runs: status,
                 waits: status,
                 resource_leases: status,
+                repeat_outcomes: status,
+                excluded_permission_collections: status,
             });
             for name in [
                 "admission_observations",
@@ -458,6 +467,10 @@ mod tests {
                 "descendant_runs",
                 "waits",
                 "resource_leases",
+                "repeat_outcomes",
+                "mutation_approvals",
+                "decisions",
+                "grants",
             ] {
                 assert_eq!(
                     names.iter().any(|value| value == name),
@@ -495,6 +508,34 @@ mod tests {
                     .unavailable_collections
                     .iter()
                     .any(|name| name == unsupported)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeat_absence_requires_independent_admission_proof() {
+        let (_root, state) = super::super::tests::fixture_with_store(true);
+        super::super::tests::admit_extension_with_observations(&state, true).await;
+        let inspection = super::inspect(&state, "new", 100).await.unwrap().unwrap();
+        assert!(inspection.repeat_outcomes.is_empty());
+        assert!(
+            !inspection
+                .unavailable_collections
+                .iter()
+                .any(|name| name == "repeat_outcomes")
+        );
+        assert!(
+            inspection
+                .unavailable_collections
+                .iter()
+                .any(|name| name == "events")
+        );
+        for name in ["mutation_approvals", "decisions", "grants"] {
+            assert!(
+                !inspection
+                    .unavailable_collections
+                    .iter()
+                    .any(|unavailable| unavailable == name)
             );
         }
     }

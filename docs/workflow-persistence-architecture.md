@@ -28,6 +28,22 @@ Attempt, lifecycle, and control-source coverage remain independent; admission
 opt-in and page exhaustion do not certify complete workflow history. Unknown event
 kinds retain identity and time while their unreviewed payloads are withheld.
 
+Repeat emissions have a separate admission-time origin and immutable source/proof/event
+binding. They retain the validated output's recorded timestamp, not an observation clock.
+Inspection reports repeat-outcome completeness only when that independent origin and
+its guards verify and the bounded source page is exhausted. Historical or unavailable
+repeat coverage stays explicit; this does not certify full workflow event history.
+Pinned capture also rejects changes to independent coverage between continuation pages.
+
+Newly observed canonical runs also retain a version-one permission-storage exclusion
+origin. Typed guards prevent the legacy mutation-approval, decision, and grant tables
+from acquiring rows for those runs, including moving historical rows into them. A
+snapshot verifies the origin, guard contract, indexed bounded absence, and source
+schema before inspection reports these collections empty and available. This excludes
+only the legacy storage collections: it does not exclude canonical approval gates,
+session/tool authorization, dynamic graph revisions, or their separately recorded facts.
+Historical runs keep their gaps, and unexpected rows or missing guards remain unavailable.
+
 The evaluation harness retains these pages alongside canonical inventory and
 session evidence without relaxing its full-capture acceptance gate. Unsupported
 decision, grant, repeat-history, or other required collections remain visible.

@@ -107,15 +107,17 @@ pub async fn settle_with_policy(
         tx.commit().await?;
         return Ok(false);
     };
-    if failed && policy == ParallelFailurePolicy::FailFast {
-        cancel_pending(&*tx, run, &pending).await?;
-    }
+    let cancellation_progress = if failed && policy == ParallelFailurePolicy::FailFast {
+        cancel_pending(&*tx, run, &pending).await?
+    } else {
+        false
+    };
     if !pending.is_empty() {
         tx.commit().await?;
-        return Ok(false);
+        return Ok(cancellation_progress);
     }
     if failed && policy != ParallelFailurePolicy::CollectOutcomes {
-        super::control_state::fail(&*tx, run, &format!("parallel:{join}")).await?;
+        retain_parallel_failure(&*tx, run, join).await?;
         tx.commit().await?;
         return Ok(true);
     }
@@ -260,15 +262,36 @@ pub(super) async fn members_state(
     }))
 }
 
+async fn retain_parallel_failure(db: &dyn Database, run: &str, join: &str) -> Result<(), Error> {
+    use super::super::journal::public_events::control::{Commitment, Operation, Outcome, record};
+    let identity = format!("parallel:{join}");
+    record(
+        db,
+        Commitment {
+            run,
+            node: join,
+            activation: &identity,
+            operation: Operation::ParallelFailed,
+            outcome: Outcome::Failed,
+            time: u64::try_from(super::super::runs::timestamp()?)
+                .map_err(|_| Error::InvalidAdmission)?,
+            source: Some(("workflow_control_failures_v2", &identity, 1)),
+        },
+    )
+    .await?;
+    super::control_state::fail(db, run, &identity).await
+}
+
 async fn cancel_pending(
     db: &dyn switchy_database::DatabaseTransaction,
     run: &str,
     pending: &[String],
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
+    let mut progressed = false;
     for id in pending {
-        super::cancellation::cancel_in(db, run, id).await?;
+        progressed |= super::cancellation::cancel_in(db, run, id).await?;
     }
-    Ok(())
+    Ok(progressed)
 }
 
 async fn record_collected(db: &dyn Database, run: &str, records: Vec<String>) -> Result<(), Error> {

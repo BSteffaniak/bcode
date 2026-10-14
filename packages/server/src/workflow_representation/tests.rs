@@ -43,7 +43,7 @@ fn request(id: &str) -> bcode_workflow_store::NewWorkflowRun {
     }
 }
 
-fn fixture_with_store(coexistence: bool) -> (tempfile::TempDir, ServerState) {
+pub(super) fn fixture_with_store(coexistence: bool) -> (tempfile::TempDir, ServerState) {
     let root = tempfile::tempdir().expect("root");
     let mut store = if coexistence {
         bcode_workflow_store::WorkflowStore::create_coexistence_baseline(root.path())
@@ -93,7 +93,7 @@ async fn admit_extension(state: &ServerState) {
     admit_extension_with_observations(state, false).await;
 }
 
-async fn admit_extension_with_observations(state: &ServerState, observed: bool) {
+pub(super) async fn admit_extension_with_observations(state: &ServerState, observed: bool) {
     let db = open(&crate::workflow_store_path(state), true).expect("typed store");
     representation::install(&db)
         .await

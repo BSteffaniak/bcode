@@ -21,6 +21,7 @@ pub enum Operation {
     GateDenied,
     RepeatAdvanced,
     RepeatFailed,
+    ParallelFailed,
     ChildReconciled,
 }
 /// Normalized result from the committing producer.

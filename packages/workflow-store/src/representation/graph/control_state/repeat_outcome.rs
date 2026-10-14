@@ -110,6 +110,7 @@ pub async fn record_in(
         }
         return Ok(());
     }
+    super::super::super::journal::public_events::repeat::record_in(tx, &summary).await?;
     tx.insert(TABLE)
         .value("output_id", output.output_id.as_str())
         .value("run_id", output.run_id.as_str())

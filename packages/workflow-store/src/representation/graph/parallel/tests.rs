@@ -162,7 +162,9 @@ async fn collect_outcomes_emits_named_map_without_inventing_failed_values() {
 async fn fail_fast_commits_cancellation_without_releasing_or_terminalizing_sibling() {
     let (db, owner) = admitted(&definition(ParallelFailurePolicy::FailFast)).await;
     fail(&*db, &owner, "left", attempts::TerminalOutcome::Failed).await;
-    assert!(!settle(&*db, &owner, "graph", "join", 1).await.unwrap());
+    assert!(settle(&*db, &owner, "graph", "join", 1).await.unwrap());
+    // The first pass records intent; the next observes the never-prepared sibling's skip.
+    assert!(settle(&*db, &owner, "graph", "join", 1).await.unwrap());
     let intents = cancellations(&*db, "graph", None, 1).await.unwrap();
     assert_eq!(intents.len(), 1);
     assert!(

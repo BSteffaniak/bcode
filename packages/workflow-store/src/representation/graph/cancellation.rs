@@ -24,7 +24,7 @@ pub(super) async fn cancel_in(
     if row.get("output_json") != Some(DatabaseValue::Null) {
         return Ok(false);
     }
-    if tx
+    let intent_created = if tx
         .select("workflow_parallel_cancellations_v2")
         .where_eq("activation_id", id)
         .limit(1)
@@ -37,7 +37,10 @@ pub(super) async fn cancel_in(
             .value("run_id", run)
             .execute(tx)
             .await?;
-    }
+        true
+    } else {
+        false
+    };
     let attempts = tx
         .select("workflow_attempts_v2")
         .columns(&["dispatch_identity"])
@@ -47,10 +50,10 @@ pub(super) async fn cancel_in(
         .execute(tx)
         .await?;
     if !attempts.is_empty() {
-        return Ok(false);
+        return Ok(intent_created);
     }
     if row.get("skipped") == Some(DatabaseValue::Int64(1)) {
-        return Ok(false);
+        return Ok(intent_created);
     }
     super::terminal_scan::invalidate(tx, run).await?;
     tx.update(super::ACTIVATIONS)
