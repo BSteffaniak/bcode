@@ -64,8 +64,15 @@ pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<
             let next = page
                 .last()
                 .map(|(activation, _)| activation.node_id.clone());
-            let progressed =
-                drive_page(state, &db, &guard.authority, run_id, revision, page).await?;
+            let progressed = Box::pin(drive_page(
+                state,
+                &db,
+                &guard.authority,
+                run_id,
+                revision,
+                page,
+            ))
+            .await?;
             leaves.finish_page(next, progressed);
         }
         let (fanout_progress, fanout_pending) = fanouts
