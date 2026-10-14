@@ -294,7 +294,7 @@ impl RootTimer {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum FocusedInputOwner {
     Composer,
     RootSurface,
@@ -500,6 +500,11 @@ impl BcodeRuntimeModel {
 
     /// Reconcile the complete composer observation before replies/input and after every root update.
     fn synchronize_composer_interaction(&mut self) {
+        self.synchronize_composer_interaction_with_paint(false);
+    }
+
+    fn synchronize_composer_interaction_with_paint(&mut self, after_paint: bool) {
+        let previous_owner = self.focused_input_owner;
         let standalone =
             self.loop_state.foreground() == Some(super::foreground::Foreground::Plugin);
         let interactive_owner = standalone
@@ -528,7 +533,7 @@ impl BcodeRuntimeModel {
         if self.chat.app.plugin_presentation().is_none()
             || (!matches!(self.screen, BcodeRuntimeScreen::Chat) && !interactive_owner)
             || (self.loop_state.foreground().is_some() && !standalone)
-            || (interactive_owner && field.is_none())
+            || (interactive_owner && field.is_none() && after_paint)
             || self.runtime_handle.is_none()
         {
             // Tool-owned input does not observe the composer or upgrade its damage.
@@ -546,14 +551,20 @@ impl BcodeRuntimeModel {
             return;
         };
         let Some(field) = field else {
-            // Observe ordinary edits immediately, but do not activate or accept until
-            // the adapter has geometry committed for that exact editor state.
-            if matches!(self.focused_input_owner, Some(FocusedInputOwner::Composer)) {
+            // Owners invalidate measured snapshots on edits. Keep presentation through
+            // that gap, but revoke pending replies/edits immediately. A committed paint
+            // with no snapshot (or a changed owner) is authoritative loss of eligibility.
+            if after_paint || previous_owner != self.focused_input_owner {
+                self.loop_state.composer_interaction.cancel();
+            } else if matches!(self.focused_input_owner, Some(FocusedInputOwner::Composer)) {
                 self.loop_state
                     .composer_interaction
-                    .observe(scope, self.chat.app.composer());
+                    .observe_unpainted_composer(scope, self.chat.app.composer());
+            } else {
+                self.loop_state
+                    .composer_interaction
+                    .await_field_paint(&scope);
             }
-            self.loop_state.composer_interaction.cancel();
             return;
         };
         let changed = self
@@ -2961,7 +2972,7 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
             program.committed_layout,
             &program.transcript_selection,
         )?;
-        program.synchronize_composer_interaction();
+        program.synchronize_composer_interaction_with_paint(true);
         program.committed_hits = self.terminal.hits().clone();
         program.committed_selection = self.terminal.selection().clone();
         program.committed_visual_text.clear();
@@ -9047,6 +9058,61 @@ mod tests {
         drop(model);
         drop(runtime);
         assert_eq!(observed, "@r");
+    }
+
+    #[tokio::test]
+    async fn composer_root_retains_popup_until_edited_owner_has_painted() {
+        let mut model = root_test_model();
+        model.settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::env::current_dir().unwrap(),
+            &[],
+        );
+        model.chat.app.set_plugin_presentation(std::sync::Arc::new(
+            super::super::plugin_tui::PluginTuiPresentation::new(
+                bcode_plugin::PluginHost::default(),
+            ),
+        ));
+        let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+            root_test_model(),
+            bmux_tui_runtime::HeadlessPresenter::default(),
+            bmux_tui_runtime::RuntimeConfig::default(),
+        );
+        model.runtime_handle = Some(handle);
+        model.synchronize_composer_interaction();
+        model.chat.app.replace_composer_with("#topic");
+        let scope = model.composer_completion_scope(false).unwrap();
+        model
+            .loop_state
+            .composer_interaction
+            .observe(scope, model.chat.app.composer());
+        let request = super::super::composer_interaction::tests::begin_observed(
+            &mut model.loop_state.composer_interaction,
+        );
+        assert!(model.loop_state.composer_interaction.complete(
+            super::super::composer_interaction::tests::completion(&request),
+        ));
+        paint_composer_root_fixture(&mut model, 90, 18);
+        let geometry = model.loop_state.composer_interaction.painted_list;
+        model.chat.app.replace_composer_with("#topics");
+        model.synchronize_composer_interaction();
+        assert!(model.loop_state.composer_interaction.visible());
+        assert!(
+            model
+                .loop_state
+                .composer_interaction
+                .selected_edit()
+                .is_none()
+        );
+        assert!(!model.loop_state.composer_interaction.complete(
+            super::super::composer_interaction::tests::completion(&request),
+        ));
+        paint_composer_root_fixture(&mut model, 90, 18);
+        assert_eq!(model.loop_state.composer_interaction.painted_list, geometry);
+        // A committed frame still lacking an eligible field really dismisses it.
+        model.synchronize_composer_interaction_with_paint(true);
+        assert!(!model.loop_state.composer_interaction.visible());
+        drop(model);
+        drop(runtime);
     }
 
     #[tokio::test]

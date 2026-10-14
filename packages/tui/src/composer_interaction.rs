@@ -115,7 +115,11 @@ impl ComposerInteraction {
         } else {
             self.reactivate_route.take()
         };
-        self.cancel();
+        if new_scope {
+            self.cancel();
+        } else {
+            self.invalidate_search();
+        }
         self.reactivate_route = reactivate_route;
         let (document_id, revision) = if new_scope {
             (uuid::Uuid::new_v4().to_string(), 0)
@@ -185,7 +189,11 @@ impl ComposerInteraction {
                         && document.selection == field.document.selection
                 });
             let reactivation = same_owner.then(|| self.reactivate_route.take()).flatten();
-            self.cancel();
+            if same_owner {
+                self.invalidate_search();
+            } else {
+                self.cancel();
+            }
             self.reactivate_route = reactivation;
             self.document = Some(field.document.clone());
             self.selection = field.document.selection;
@@ -246,7 +254,11 @@ impl ComposerInteraction {
             max_results: MAX_COMPOSER_CANDIDATES,
         };
         request.validate().ok()?;
-        self.cancel();
+        if self.route.as_ref() == Some(&route) {
+            self.invalidate_search();
+        } else {
+            self.cancel();
+        }
         self.route = Some(route);
         self.request = Some(request.clone());
         self.status = SearchStatus::Loading;
@@ -263,8 +275,35 @@ impl ComposerInteraction {
         self.client = Some(client);
     }
 
+    /// Invalidate edits and late replies without tearing down retained presentation.
+    pub fn invalidate_search(&mut self) {
+        self.cancel_request();
+        self.snapshot = None;
+        if self.visible() {
+            self.status = SearchStatus::Loading;
+        }
+    }
+
+    /// Observe a live composer edit while retaining only its last painted anchor.
+    pub fn observe_unpainted_composer(&mut self, scope: ComposerScope, buffer: &TextEditBuffer) {
+        let anchor = (self.scope.as_ref() == Some(&scope))
+            .then(|| self.focused_field.clone())
+            .flatten();
+        self.observe(scope, buffer);
+        self.focused_field = anchor;
+    }
+
+    /// A missing pre-paint snapshot is not yet proof that the field lost eligibility.
+    pub fn await_field_paint(&mut self, scope: &ComposerScope) {
+        if self.scope.as_ref() == Some(scope) {
+            self.invalidate_search();
+        } else {
+            self.cancel();
+        }
+    }
+
     /// Cancellation is best effort; request identity is the authoritative late-reply fence.
-    pub fn cancel(&mut self) {
+    fn cancel_request(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
             if let (Some(client), Some(request)) = (self.client.take(), self.request.as_ref()) {
@@ -278,6 +317,10 @@ impl ComposerInteraction {
         }
         self.client = None;
         self.request = None;
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancel_request();
         self.route = None;
         self.reactivate_route = None;
         self.snapshot = None;
@@ -310,6 +353,8 @@ impl ComposerInteraction {
             .snapshot
             .filter(|snapshot| snapshot.validate_for(request).is_ok())
         else {
+            self.items.clear();
+            self.snapshot = None;
             self.status = SearchStatus::Error;
             return true;
         };
@@ -603,6 +648,58 @@ pub mod tests {
                 incomplete: false,
             }),
         }
+    }
+
+    #[test]
+    fn focused_query_refresh_retains_presentation_and_revokes_stale_edits() {
+        use bcode_plugin_sdk::tui::{FocusedTextFieldIdentity, FocusedTextFieldSnapshot};
+        let mut state = ComposerInteraction::default();
+        let mut field = FocusedTextFieldSnapshot {
+            identity: FocusedTextFieldIdentity {
+                owner_id: "owner".into(),
+                field_id: "answer".into(),
+                lifetime: 1,
+            },
+            generation: 1,
+            document: ComposerDocument {
+                document_id: "answer".into(),
+                revision: 0,
+                text: "#topic".into(),
+                cursor: 6,
+                selection: None,
+            },
+            eligible: true,
+            content_rect: Rect::new(1, 1, 20, 1),
+            anchor: Rect::new(7, 1, 1, 1),
+        };
+        state.observe_focused_field(scope(), field.clone());
+        let old = begin_observed(&mut state);
+        state.complete(completion(&old));
+        let item_count = state.items.len();
+        state.await_field_paint(&scope());
+        assert!(state.visible());
+        assert!(state.focused_edit().is_none());
+        assert_eq!(state.focused_field().unwrap().anchor, field.anchor);
+        assert!(!state.complete(completion(&old)));
+        field.generation += 1;
+        field.document.revision += 1;
+        field.document.text.push('s');
+        field.document.cursor += 1;
+        field.anchor.x += 1;
+        state.observe_focused_field(scope(), field.clone());
+        let current = begin_observed(&mut state);
+        assert!(state.visible());
+        assert_eq!(state.items.len(), item_count);
+        assert!(state.focused_edit().is_none());
+        assert_eq!(state.focused_field().unwrap().anchor, field.anchor);
+        assert!(!state.complete(completion(&old)));
+        assert!(state.complete(completion(&current)));
+        assert!(state.focused_edit().is_some());
+        field.identity.lifetime += 1;
+        state.observe_focused_field(scope(), field);
+        assert!(!state.visible());
+        assert!(state.items.is_empty());
+        assert!(state.focused_edit().is_none());
     }
 
     #[test]

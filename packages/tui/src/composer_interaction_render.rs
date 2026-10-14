@@ -118,6 +118,56 @@ mod tests {
     use bmux_tui_components::selectable_list::SelectableListOutcome;
 
     #[test]
+    fn query_refresh_keeps_measured_popup_and_blocks_stale_acceptance() {
+        use bmux_tui_components::completion::CompletionCommand;
+        let mut state = ComposerInteraction::default();
+        let mut editor = TextEditBuffer::from_text("#topic");
+        let mut request = begin(&mut state, &editor);
+        assert!(state.complete(completion(&request)));
+        let scope = state_scope();
+        for text in ["#topics", "#topics🦀", "#topic", "#"] {
+            let previous = completion(&request);
+            let area = Rect::new(0, 0, 90, 18);
+            let mut pixels = Buffer::empty(area);
+            let mut frame = Frame::new(&mut pixels);
+            paint(
+                &mut state,
+                Rect::new(0, 16, 90, 2),
+                &mut PaintCx::new(&mut frame),
+                TuiTheme::for_theme_id("terminal-native"),
+            );
+            let geometry = state.painted_list.unwrap();
+            // The live owner temporarily lacks current measured geometry after an edit.
+            state.await_field_paint(&scope);
+            assert!(state.visible());
+            assert!(state.selected_edit().is_none());
+            assert!(!state.complete(previous));
+            let (_, accept) = state.command(CompletionCommand::Accept);
+            assert!(!accept);
+            editor = TextEditBuffer::from_text(text);
+            request = begin(&mut state, &editor);
+            assert!(state.visible());
+            assert!(state.selected_edit().is_none());
+            paint(
+                &mut state,
+                Rect::new(0, 16, 90, 2),
+                &mut PaintCx::new(&mut frame),
+                TuiTheme::for_theme_id("terminal-native"),
+            );
+            assert_eq!(state.painted_list, Some(geometry));
+            assert!(state.complete(completion(&request)));
+            assert!(state.selected_edit().is_some());
+        }
+        state.dismiss();
+        assert!(!state.visible());
+        assert!(state.selected_edit().is_none());
+    }
+
+    fn state_scope() -> super::super::composer_interaction::ComposerScope {
+        super::super::composer_interaction::tests::scope()
+    }
+
+    #[test]
     fn unicode_picker_resize_clips_hits_and_clears_old_geometry() {
         let mut state = ComposerInteraction::default();
         let buffer = TextEditBuffer::from_text("#主题👩‍💻a\u{301}");
