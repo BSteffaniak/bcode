@@ -74,6 +74,8 @@ export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
 export BCODE_STATE_DIR="${workdir}/state"
 export BCODE_NO_ONBOARD=1
+# This acceptance owns isolated state; never contact the caller's resurrection host.
+export BCODE_NO_SESSION_RESURRECTION=1
 python3 - "${root}/plugins/fake-provider-plugin/bcode-plugin.toml" \
     "${workdir}/config/bcode/plugins/fake-provider/bcode-plugin.toml" "${fake_dylib}" <<'PY'
 from pathlib import Path
@@ -136,31 +138,47 @@ idle_shutdown = true
 idle_shutdown_after_secs = 1
 EOF
 
-"${bcode_binary}" server run >"${workdir}/server.log" 2>&1 &
-server_pid="$!"
-for _ in {1..600}; do
-    if [[ -s "${workdir}/server.log" ]] && grep -q "server ready; accepting clients" "${workdir}/server.log"; then
-        break
-    fi
-    sleep 0.1
-done
-if ! grep -q "server ready; accepting clients" "${workdir}/server.log"; then
+# Seed the session without an idle deadline: debug-build session creation can take
+# longer than one second. The lifecycle test below uses a fresh one-second daemon,
+# not this fixture daemon, and still requires retirement and cold TUI auto-start.
+python3 - "${BCODE_CONFIG}" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace("idle_shutdown = true", "idle_shutdown = false"))
+PY
+
+start_server() {
+    "${bcode_binary}" server run >"${workdir}/server.log" 2>&1 &
+    server_pid="$!"
+    for _ in {1..600}; do
+        if grep -q "server ready; accepting clients" "${workdir}/server.log"; then
+            return
+        fi
+        if ! kill -0 "${server_pid}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
     echo "isolated daemon did not become ready" >&2
     cat "${workdir}/server.log" >&2 || true
     exit 1
-fi
-
+}
+start_server
 session_id="$(trap - EXIT; cd "${workdir}" && "${bcode_binary}" session create tui-pty-smoke)"
-initial_pid="$(python3 - "${BCODE_STATE_DIR}/daemons" <<'PY'
-import glob
-import json
-import os
+"${bcode_binary}" server stop
+wait "${server_pid}"
+server_pid=""
+python3 - "${BCODE_CONFIG}" <<'PY'
+from pathlib import Path
 import sys
-records = glob.glob(os.path.join(sys.argv[1], "*.json"))
-with open(records[0], "r", encoding="utf-8") as record_file:
-    print(json.load(record_file)["pid"])
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace("idle_shutdown = false", "idle_shutdown = true"))
 PY
-)"
+start_server
+# This exact unreaped child is the lifecycle fixture; do not infer a PID from
+# registry ordering (retired fixture records may coexist with live records).
+initial_pid="${server_pid}"
 wait "${server_pid}"
 server_pid=""
 for _ in {1..100}; do
@@ -176,6 +194,14 @@ fi
 
 expected_artifact_id="$("${bcode_binary}" artifact-id)"
 
+# Retirement above proves the one-second idle lifecycle. Cold auto-start must not
+# race that deadline while a debug client loads plugins and verifies its Hello.
+python3 - "${BCODE_CONFIG}" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace("idle_shutdown = true", "idle_shutdown = false"))
+PY
 python3 - "${bcode_binary}" "${session_id}" "${initial_pid}" "${expected_artifact_id}" <<'PY'
 import fcntl
 import glob

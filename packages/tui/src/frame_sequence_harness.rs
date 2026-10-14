@@ -87,6 +87,8 @@ pub enum TranscriptFrameInput {
     ReasoningDisplayMode(bcode_config::TuiThinkingMode),
     ThinkingConfig(bcode_config::TuiThinkingConfig),
     AdvanceStreaming(std::time::Duration),
+    /// Advance only scroll-animation time; ordinary observations share one frozen instant.
+    AdvanceScrollAnimation(std::time::Duration),
     AssertNoPendingStreaming,
     Observe,
 }
@@ -132,6 +134,9 @@ impl<'a> TranscriptFrameSequence<'a> {
         mut self,
         steps: impl IntoIterator<Item = TranscriptFrameStep>,
     ) -> Vec<TranscriptFrameSnapshot> {
+        // Rendering samples animation time more than once. Keep both samples and consecutive
+        // observations stable regardless of wall-clock delays or parallel suite scheduling.
+        self.app.freeze_transcript_scroll_animation_for_test();
         for step in steps {
             match step.input {
                 TranscriptFrameInput::EphemeralPlain(text) => {
@@ -201,6 +206,10 @@ impl<'a> TranscriptFrameSequence<'a> {
                 }
                 TranscriptFrameInput::ThinkingConfig(config) => {
                     self.app.apply_thinking_config(config);
+                }
+                TranscriptFrameInput::AdvanceScrollAnimation(duration) => {
+                    self.app
+                        .advance_transcript_scroll_animation_for_test(duration);
                 }
                 TranscriptFrameInput::Observe => {}
             }
@@ -578,6 +587,60 @@ mod tests {
             tail[1].observation.semantic_items.len() > tail[0].observation.semantic_items.len()
         );
         assert!(tail[1].observation.viewport_top >= tail[0].observation.viewport_top);
+    }
+
+    #[test]
+    fn scroll_animation_moves_only_when_frame_time_advances() {
+        let session_id = SessionId::new();
+        let events = (1..31)
+            .map(|sequence| {
+                durable(
+                    session_id,
+                    sequence,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("message {sequence}"),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+        TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "reader at top",
+            input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+        }]);
+        assert!(app.transition_transcript_to_bottom());
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "transition started",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "same animation instant",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "transition completed",
+                input: TranscriptFrameInput::AdvanceScrollAnimation(
+                    std::time::Duration::from_secs(1),
+                ),
+            },
+            TranscriptFrameStep {
+                // Completion removes the latest bar. The next preparation accepts the newly
+                // available body row before subsequent observations have stable geometry.
+                label: "tail geometry settled after latest bar removal",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "settled tail observed again",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(frames[0].observation, frames[1].observation);
+        assert!(frames[2].observation.viewport_top > frames[1].observation.viewport_top);
+        assert_eq!(frames[2].observation.scroll_mode, "bottom_follow");
+        assert_eq!(frames[3].observation.scroll_mode, "bottom_follow");
+        assert_eq!(frames[3].observation, frames[4].observation);
+        assert_eq!(app.scroll_offset(), 0);
     }
 
     #[test]

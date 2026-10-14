@@ -527,14 +527,14 @@ impl InteractiveSurfaceState {
     ) -> InteractiveSurfaceEventOutcome {
         let before_height = self.last_preferred_height;
         let outcome = match result.action {
-            PluginTuiAction::None => {
+            PluginTuiAction::None if result.outcome != bmux_tui::event::EventOutcome::Redraw => {
                 if result.outcome == bmux_tui::event::EventOutcome::Ignored {
                     InteractiveSurfaceEventOutcome::Ignored
                 } else {
                     InteractiveSurfaceEventOutcome::Consumed
                 }
             }
-            PluginTuiAction::Redraw => {
+            PluginTuiAction::None | PluginTuiAction::Redraw => {
                 let after_height = self.preferred_height_for_event();
                 self.last_preferred_height = after_height;
                 if before_height == 0 || after_height == before_height {
@@ -769,6 +769,91 @@ mod tests {
         );
     }
 
+    struct RoutedSurface {
+        editor_outcome: bmux_tui::event::EventOutcome,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for RoutedSurface {
+        fn id(&self) -> &'static str {
+            "routing"
+        }
+        fn title(&self) -> &'static str {
+            "Routing"
+        }
+        fn render(&mut self, _area: Rect, _frame: &mut PaintCx<'_, '_>) {}
+        fn focused_text_field_event(
+            &mut self,
+            _event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+            self.calls.lock().unwrap().push("editor");
+            bcode_plugin_sdk::tui::PluginTuiEventResult {
+                outcome: self.editor_outcome,
+                action: PluginTuiAction::None,
+            }
+        }
+        fn handle_event(
+            &mut self,
+            _event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> PluginTuiAction {
+            self.calls.lock().unwrap().push("fallback");
+            PluginTuiAction::None
+        }
+    }
+
+    #[tokio::test]
+    async fn only_ignored_editor_events_reach_surface_fallback_once() {
+        use bmux_tui::event::EventOutcome;
+        for event in [
+            key(KeyCode::Enter),
+            key(KeyCode::Tab),
+            key(KeyCode::Escape),
+            key(KeyCode::Char('x')),
+            Event::Paste("text".into()),
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(1, 1),
+            )),
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::ScrollDown,
+                bmux_tui::geometry::Point::new(1, 1),
+            )),
+            Event::Tick,
+        ] {
+            for (editor_outcome, expected_outcome, expected_calls) in [
+                (
+                    EventOutcome::Ignored,
+                    InteractiveSurfaceEventOutcome::Ignored,
+                    vec!["editor", "fallback"],
+                ),
+                (
+                    EventOutcome::Handled,
+                    InteractiveSurfaceEventOutcome::Consumed,
+                    vec!["editor"],
+                ),
+                (
+                    EventOutcome::Redraw,
+                    InteractiveSurfaceEventOutcome::Redraw,
+                    vec!["editor"],
+                ),
+            ] {
+                let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut surface = InteractiveSurfaceState::from_surface_for_test(
+                    "routing",
+                    Box::new(RoutedSurface {
+                        editor_outcome,
+                        calls: std::sync::Arc::clone(&calls),
+                    }),
+                    &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+                );
+                assert_eq!(surface.handle_event_outcome(&event), expected_outcome);
+                assert_eq!(*calls.lock().unwrap(), expected_calls);
+            }
+        }
+    }
+
     #[derive(Default)]
     struct GrowingSurface {
         height: u16,
@@ -797,6 +882,32 @@ mod tests {
             self.height = self.height.saturating_add(1);
             PluginTuiAction::Redraw
         }
+    }
+
+    #[tokio::test]
+    async fn event_outcome_redraw_without_plugin_effect_preserves_relayout() {
+        let mut surface = InteractiveSurfaceState::from_surface_for_test(
+            "growing",
+            Box::new(GrowingSurface { height: 1 }),
+            &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        );
+        assert_eq!(surface.preferred_height(80), 1);
+        assert_eq!(
+            surface.reconcile_event_result(bcode_plugin_sdk::tui::PluginTuiEventResult {
+                outcome: bmux_tui::event::EventOutcome::Redraw,
+                action: PluginTuiAction::None,
+            }),
+            InteractiveSurfaceEventOutcome::Redraw,
+        );
+        // Mutate through the owner, then reconcile an independent redraw request.
+        let _ = surface.surface.handle_event(&Event::Tick, &surface.host);
+        assert_eq!(
+            surface.reconcile_event_result(bcode_plugin_sdk::tui::PluginTuiEventResult {
+                outcome: bmux_tui::event::EventOutcome::Redraw,
+                action: PluginTuiAction::None,
+            }),
+            InteractiveSurfaceEventOutcome::Relayout,
+        );
     }
 
     #[tokio::test]

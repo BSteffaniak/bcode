@@ -105,6 +105,25 @@ enum TranscriptAnimationTarget {
     Row,
 }
 
+/// Scroll animation uses real time unless a frame harness explicitly freezes it.
+#[derive(Debug, Clone, Default)]
+enum TranscriptScrollClock {
+    #[default]
+    Realtime,
+    #[cfg(test)]
+    Fixed(Instant),
+}
+
+impl TranscriptScrollClock {
+    fn now(&self) -> Instant {
+        match self {
+            Self::Realtime => Instant::now(),
+            #[cfg(test)]
+            Self::Fixed(now) => *now,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriptScrollAnimation {
     start_top_row: usize,
@@ -431,6 +450,7 @@ pub struct BmuxApp {
     viewport: TranscriptViewport,
     manual_transcript_scroll_until: Option<Instant>,
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
+    transcript_scroll_clock: TranscriptScrollClock,
     pending_visual_overflow_bottom: Option<usize>,
     pending_stable_transcript_anchor: Option<StableTranscriptAnchor>,
     presented_transcript_anchor: Option<StableTranscriptAnchor>,
@@ -580,6 +600,22 @@ impl BmuxApp {
         older_history: OlderHistoryState,
     ) -> Self {
         let (now, initial_theme) = Self::initial_presentation();
+        Self::initial_session_state_with_presentation(
+            session_id,
+            input_history,
+            older_history,
+            now,
+            &initial_theme,
+        )
+    }
+
+    fn initial_session_state_with_presentation(
+        session_id: Option<SessionId>,
+        input_history: &[SessionInputHistoryEntry],
+        older_history: OlderHistoryState,
+        now: Instant,
+        initial_theme: &ResolvedTheme,
+    ) -> Self {
         Self {
             pending_session_link: None,
             child_request_fence: crate::child_request_fence::ChildRequestFence::default(),
@@ -600,8 +636,8 @@ impl BmuxApp {
             pending_agent_id: None,
             pending_agent_accent: None,
             agent_metadata_hydration: AgentMetadataHydration::Pending,
-            target_theme: initial_theme,
-            presented_theme: initial_theme.into(),
+            target_theme: *initial_theme,
+            presented_theme: (*initial_theme).into(),
             theme_catalog: None,
             #[cfg(test)]
             theme_catalog_discovery_count: 0,
@@ -635,6 +671,7 @@ impl BmuxApp {
             viewport: TranscriptViewport::default(),
             manual_transcript_scroll_until: None,
             transcript_scroll_animation: None,
+            transcript_scroll_clock: TranscriptScrollClock::default(),
             pending_visual_overflow_bottom: None,
             pending_stable_transcript_anchor: None,
             presented_transcript_anchor: None,
@@ -3136,11 +3173,37 @@ impl BmuxApp {
         self.viewport.height()
     }
 
+    fn transcript_scroll_animation_now(&self) -> Instant {
+        self.transcript_scroll_clock.now()
+    }
+
+    /// Freeze scroll-animation time until explicitly advanced by the frame harness.
+    #[cfg(test)]
+    pub(crate) fn freeze_transcript_scroll_animation_for_test(&mut self) {
+        if matches!(
+            self.transcript_scroll_clock,
+            TranscriptScrollClock::Realtime
+        ) {
+            self.transcript_scroll_clock = TranscriptScrollClock::Fixed(Instant::now());
+        }
+    }
+
+    /// Advance the frozen scroll-animation clock without sleeping or changing scroll intent.
+    #[cfg(test)]
+    pub(crate) fn advance_transcript_scroll_animation_for_test(&mut self, duration: Duration) {
+        self.freeze_transcript_scroll_animation_for_test();
+        self.transcript_scroll_clock = TranscriptScrollClock::Fixed(
+            self.transcript_scroll_animation_now()
+                .checked_add(duration)
+                .expect("frame harness scroll-animation time must fit in Instant"),
+        );
+    }
+
     /// Return the transcript row that should render at the top of the viewport.
     #[must_use]
     pub fn transcript_top_row(&self, viewport_height: u16) -> usize {
         if let Some(animation) = self.transcript_scroll_animation {
-            return animation.top_row_at(Instant::now());
+            return animation.top_row_at(self.transcript_scroll_animation_now());
         }
         self.viewport
             .top_row(self.transcript_layout.total_rows(), viewport_height)
@@ -3978,8 +4041,11 @@ impl BmuxApp {
         if start_top_row == target_top_row {
             return self.scroll_transcript_to_bottom();
         }
-        let mut animation =
-            TranscriptScrollAnimation::new(start_top_row, target_top_row, Instant::now());
+        let mut animation = TranscriptScrollAnimation::new(
+            start_top_row,
+            target_top_row,
+            self.transcript_scroll_animation_now(),
+        );
         animation.target = TranscriptAnimationTarget::LatestBottom;
         self.transcript_scroll_animation = Some(animation);
         true
@@ -3993,7 +4059,7 @@ impl BmuxApp {
         let Some(animation) = self.transcript_scroll_animation.take() else {
             return;
         };
-        let top_row = animation.top_row_at(Instant::now());
+        let top_row = animation.top_row_at(self.transcript_scroll_animation_now());
         self.viewport.materialize_top_row(top_row);
     }
 
@@ -4037,6 +4103,7 @@ impl BmuxApp {
         let now = Instant::now();
         let mut animated_top = None;
         if let Some(mut animation) = self.transcript_scroll_animation {
+            let animation_now = self.transcript_scroll_animation_now();
             if let TranscriptAnimationTarget::ItemTop(id) = animation.target
                 && let Some(index) = self.transcript.presentation_index(id)
                 && let Some(row) = self
@@ -4047,8 +4114,8 @@ impl BmuxApp {
             } else if animation.target == TranscriptAnimationTarget::LatestBottom {
                 animation.target_top_row = total_rows.saturating_sub(usize::from(viewport_height));
             }
-            let top_row = animation.top_row_at(now);
-            if animation.finished(now) {
+            let top_row = animation.top_row_at(animation_now);
+            if animation.finished(animation_now) {
                 self.transcript_scroll_animation = None;
                 let follows_tail = animation.target == TranscriptAnimationTarget::LatestBottom;
                 if follows_tail {
@@ -4399,8 +4466,11 @@ impl BmuxApp {
         if let Some((start_top_row, target_top_row)) =
             self.viewport.start_follow_anchor_animation(top_row)
         {
-            let mut animation =
-                TranscriptScrollAnimation::new(start_top_row, target_top_row, Instant::now());
+            let mut animation = TranscriptScrollAnimation::new(
+                start_top_row,
+                target_top_row,
+                self.transcript_scroll_animation_now(),
+            );
             animation.target = self
                 .transcript_layout
                 .line_at_row(target_top_row)

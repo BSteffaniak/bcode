@@ -24,7 +24,10 @@ blims-service-timeout creates company/world with public CLI, suspends only an
 unreaped direct daemon child, checks visible unknown-outcome recovery and resumes
 that child before cleanup. It never retries ambiguous changes.
 Every step must expect
-visible content; use distinctive labels to avoid matching the previous screen.
+visible content; reject:[...] fails immediately on forbidden side effects, whereas
+forbid:[...] waits for stale transition content to disappear. Completion cases
+exercise plugin-owned path discovery and keep parents open after accept/Escape;
+they do not claim submission or workflow execution acceptance.
 Custom plans use fake-only fixtures. The dedicated xai-model-chat case enables
 bundled compatible local recommendation with a fake XAI_API_KEY, disables remote
 catalogs and sends no prompt. Darwin sandbox-exec denies IP networking for both
@@ -62,7 +65,46 @@ MAX_CAPTURE = 8 * 1024 * 1024
 MODE = re.compile(rb"\x1b\[\?([0-9;]+)([hl])")
 ALT_MODES = {47, 1047, 1049}
 MARKER = b"BCODE_CONTINUOUS_PTY_SHELL_SENTINEL"
+def completion_steps(parent, exit_steps):
+    """Keep the focused parent open through accept, Escape, and ordinary edits."""
+    guard = ["COMPLETION_PARENT_SUBMITTED"]
+    return [
+        {"expect": [parent], "hold": 2, "send": "@completion-t"},
+        {"expect": ["Suggestions", "completion-target.txt"], "send": "\r"},
+        {"expect": [parent, "@completion-target.txt"], "forbid": ["Suggestions"],
+         "reject": guard, "hold": 1, "send": " ordinary"},
+        {"expect": [parent, "@completion-target.txt ordinary"], "reject": guard,
+         "send": "\x15@completion-t"},
+        {"expect": ["Suggestions", "completion-target.txt"], "reject": guard,
+         "send": "\x1b"},
+        {"expect": [parent, "@completion-t"],
+         "forbid": ["Suggestions", "completion-target.txt"], "reject": guard,
+         "send": " ordinary"},
+        {"expect": [parent, "@completion-t ordinary"], "reject": guard,
+         "send": "\x1b"},
+    ] + exit_steps
+
+
 CASES = {
+    "completion-chat": {"fixture": "completion", "model": True,
+        "steps": completion_steps("Message", [
+            {"expect": ["Message"], "send": "\x04"},
+            {"expect": ["input cleared", "Message"], "send": "\x04"}])},
+    "completion-loop-goal": {"fixture": "completion", "model": True,
+        "steps": [{"expect": ["Message"], "send": "/goal\r"},
+                  {"expect": ["Message", "/goal"], "send": "\r"}] +
+        completion_steps("Goal (required)", [
+            {"expect": ["Ask Bcode"], "send": "\x04"}])},
+    "completion-question": {"fixture": "completion", "model": True,
+        "steps": [{"expect": ["Message", "ready"], "hold": 2, "send": 'tool-call question {"questions":[{"header":"Completion","question":"COMPLETION_QUESTION","options":[],"custom":true,"control":"radio","selection_mode":"single","required":true}]}\r'}] +
+        completion_steps("COMPLETION_QUESTION", [
+            {"expect": ["Ask Bcode"], "send": "\x04"}])},
+    "completion-review": {"fixture": "completion-review", "model": True, "args": ["review"],
+        "steps": [{"expect": ["Bcode Reviews"], "send": "s"},
+                  {"expect": ["Staged", "CONTINUOUS_REVIEW_FILE"], "send": "ja"}] +
+        completion_steps("ask Bcode", [
+            {"expect": ["Staged", "CONTINUOUS_REVIEW_FILE"], "send": "\x04"}])},
+
     "blims-service-timeout": {"fixture": "blims", "model": True,
         "args": ["blims", "enter"], "steps": [
         {"expect": ["Pixel office"], "daemon_signal": "suspend", "send": "r"},
@@ -243,6 +285,9 @@ def run_pty(command, env, work, steps, probe, timeout, exit_code=0, daemon=None,
                     if not raw(slave):
                         raise AssertionError("raw input released before final exit")
                     grid = screen()
+                    rejected = [value for value in step.get("reject", []) if value.lower() in grid]
+                    if rejected:
+                        raise AssertionError(f"step {index + 1} forbidden side effect: {rejected}")
                     forbidden = any(value.lower() in grid for value in step.get("forbid", []))
                     # Prior-screen text may legitimately remain until the next paint.
                     # Do not treat it as a match or advance the journey prematurely.
@@ -260,6 +305,7 @@ def run_pty(command, env, work, steps, probe, timeout, exit_code=0, daemon=None,
                 raise AssertionError(f"timeout waiting for rendered step {index + 1}: {step['expect']}")
             (work / f"step-{index + 1:02d}-grid.txt").write_text(last_grid)
             evidence.append({"step": index + 1, "expect": step["expect"], "raw": True,
+                             "reject": step.get("reject", []),
                              "daemon_signal": step.get("daemon_signal"),
                              "alternate_screen_enters": interval.enters})
             if step.get("daemon_signal"):
@@ -356,6 +402,14 @@ mode = "off"
 [daemon]
 idle_shutdown = false
 '''
+    if fixture in ("completion", "completion-review"):
+        text = text.replace('"bcode.code_review"',
+                            '"bcode.code_review", "bcode.file-references", "bcode.filesystem", '
+                            '"bcode.question", "bcode.loop", "bcode.workflow"')
+        text += '[tui.interactions]\nplacement = "pinned"\n'
+        # Debug nested IPC needs headroom; keep the production search budget bounded.
+        text += '[file_references]\ntimeout_ms = 1000\n'
+        (work / "completion-target.txt").write_text("offline path completion fixture\n")
     if fixture == "blims":
         text = text.replace('"bcode.code_review"', '"bcode.code_review", "bcode.blims"')
         text += '[client]\nrequest_timeout_secs = 2\n'
@@ -368,13 +422,24 @@ idle_shutdown = false
 provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 '''
-    if fixture == "review":
-        # Review prompts contain assembled domain context. Fake echo repeats it
-        # verbatim; use its supported event script to keep output deterministic.
+    if fixture in ("completion", "completion-review"):
+        text += '''
+[model.profiles.pty-completion]
+provider_plugin_id = "bcode.fake-provider"
+model_id = "fake-echo"
+'''
+    if fixture in ("review", "completion", "completion-review"):
+        # A submitted parent emits a visible sentinel in completion fixtures.
+        # Initial question tool requests still use the normal fake tool directive.
+        answer = "CONTINUOUS_REVIEW_ANSWER" if fixture == "review" else "COMPLETION_PARENT_SUBMITTED"
         script = {"steps": [
-            {"event": {"type": "text_delta", "text": "CONTINUOUS_REVIEW_ANSWER"}},
+            {"event": {"type": "text_delta", "text": answer}},
             {"event": {"type": "turn_finished", "stop_reason": "end_turn"}}]}
-        text += "[model.settings]\nfake_event_script = " + json.dumps(json.dumps(script)) + "\n"
+        if fixture == "review":
+            text += "[model.settings]\nfake_event_script = " + json.dumps(json.dumps(script)) + "\n"
+        else:
+            scripts = {"@completion": script}
+            text += "[model.profiles.pty-completion.settings]\nfake_prompt_tool_directives = \"true\"\nfake_event_scripts_by_prompt_marker = " + json.dumps(json.dumps(scripts)) + "\n"
     config.write_text(text)
     # Allowlist, not an inherited environment with an incomplete secret blacklist.
     env = {"HOME": str(home), "XDG_CONFIG_HOME": str(config_dir),
@@ -386,14 +451,16 @@ model_id = "fake-echo"
         env["XAI_API_KEY"] = "bcode-pty-fake-not-a-real-credential"
         env.update({"HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1",
                     "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": "localhost,127.0.0.1"})
-    if fixture == "review":
-        # Repository mode needs no commit. No user Git configuration or remote.
+    if fixture in ("review", "completion", "completion-review"):
+        # Keep search workspace separate from harness state/config and build artifacts.
         git_env = {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
         repo = work / "repo"
         repo.mkdir()
         subprocess.run(["/usr/bin/git", "init", "--quiet", str(repo)], env=git_env,
                        check=True, timeout=5, capture_output=True)
         (repo / "continuous-review-fixture.txt").write_text("CONTINUOUS_REVIEW_FILE\n")
+        if fixture in ("completion", "completion-review"):
+            (repo / "completion-target.txt").write_text("offline path completion fixture\n")
         subprocess.run(["/usr/bin/git", "-C", str(repo), "add", "--", "continuous-review-fixture.txt"],
                        env=git_env, check=True, timeout=5, capture_output=True)
     return env, config, state
@@ -402,7 +469,7 @@ model_id = "fake-echo"
 def plan_checked(plan):
     if not isinstance(plan, dict) or set(plan) - {"name", "fixture", "model", "args", "steps", "exit_code"}:
         raise ValueError("unknown plan fields")
-    if plan.get("fixture", "fake") not in ("fake", "review", "xai", "blims"):
+    if plan.get("fixture", "fake") not in ("fake", "review", "xai", "blims", "completion", "completion-review"):
         raise ValueError("unsupported fixture")
     if plan.get("fixture") == "xai" and plan != CASES["xai-model-chat"]:
         raise ValueError("xAI fixture restricted to fixed no-prompt model-choice journey")
@@ -413,9 +480,9 @@ def plan_checked(plan):
     if not steps or len(steps) > 32:
         raise ValueError("plan requires 1..32 steps")
     for step in steps:
-        if not isinstance(step, dict) or set(step) - {"expect", "forbid", "send", "resize", "timeout", "hold", "daemon_signal"}:
+        if not isinstance(step, dict) or set(step) - {"expect", "forbid", "reject", "send", "resize", "timeout", "hold", "daemon_signal"}:
             raise ValueError("unknown step fields")
-        for field in ("expect", "forbid"):
+        for field in ("expect", "forbid", "reject"):
             values = step.get(field, [])
             if not isinstance(values, list) or any(not isinstance(v, str) or not v or len(v) > 256 for v in values):
                 raise ValueError("expect/forbid must contain bounded nonempty strings")
@@ -482,6 +549,17 @@ def self_test():
                 raise AssertionError(f"wrong {name} failure: {error}") from error
         else:
             raise AssertionError(f"self-test failed to reject {name}")
+    reject_work = work / "rejected-side-effect"
+    reject_work.mkdir()
+    try:
+        run_pty([sys.executable, "-c", fixture], os.environ.copy(), reject_work,
+                [{"expect": ["HARNESS_READY"], "reject": ["HARNESS_READY"],
+                  "hold": 0, "send": "q"}], None, 2)
+    except AssertionError as error:
+        if "forbidden side effect" not in str(error):
+            raise AssertionError(f"wrong reject failure: {error}") from error
+    else:
+        raise AssertionError("self-test failed to reject a forbidden side effect")
     error_work = work / "initializer-error"
     error_work.mkdir()
     run_pty([sys.executable, "-c", fixture + "; raise SystemExit(1)"],
@@ -539,6 +617,8 @@ def main():
     env, config, state = isolated_fixture(work, options.fake_library, plan.get("model", False),
                                           plan.get("fixture", "fake"))
     base = [options.binary, "--config-only", str(config), "--state-root", str(state)]
+    if plan.get("fixture") in ("completion", "completion-review"):
+        base += ["--profile", "pty-completion"]
     if plan.get("fixture") != "xai":
         base.append("--no-credential-discovery")
     identity = subprocess.run(sandbox + base + ["artifact-id"], env=env, cwd=work,
@@ -585,6 +665,16 @@ def main():
                 # operation deadline is selected only after isolated creation.
                 config.write_text(config.read_text().replace("request_timeout_secs = 2", "request_timeout_secs = 5"))
             command = sandbox + base + plan.get("args", [])
+            if plan.get("fixture") == "completion":
+                status = subprocess.run(sandbox + base + ["model", "status"], env=env, cwd=work,
+                                        check=True, capture_output=True, timeout=60)
+                (work / "model-status.txt").write_bytes(status.stdout)
+                if b"bcode.fake-provider" not in status.stdout or b"fake-echo" not in status.stdout:
+                    raise AssertionError("completion fixture did not select the offline fake provider")
+                created = subprocess.run(sandbox + base + ["session", "create", "completion-pty"],
+                                         env=env, cwd=work / "repo", check=True, capture_output=True, timeout=60)
+                session_id = created.stdout.decode().strip()
+                command = sandbox + base + ["tui", session_id]
             run_pty(command, env, work, plan["steps"], options.grid_probe,
                     options.timeout, plan.get("exit_code", 0), daemon,
                     sandbox + base + ["--request-timeout-secs", "10", "session", "list",
