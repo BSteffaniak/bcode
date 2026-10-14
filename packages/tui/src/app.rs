@@ -5684,21 +5684,35 @@ impl BmuxApp {
         }
     }
 
+    fn apply_provider_trace_event(&mut self, event_type: &str, detail: Option<&str>) {
+        if event_type == bcode_session_models::REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE {
+            let valid = detail.is_some_and(|detail| {
+                bcode_session_models::RequestContextObservationReference::parse(event_type, detail)
+                    .is_ok()
+            });
+            let summary = if valid {
+                "Request context observation: normalized metadata retained"
+            } else {
+                "Request context observation: invalid reference"
+            };
+            summary.clone_into(&mut self.status);
+        } else if matches!(event_type, "warning" | "error") {
+            let detail =
+                detail.map_or_else(|| format!("provider event: {event_type}"), str::to_owned);
+            self.set_activity(ActivityState::ProviderStream {
+                detail: detail.clone(),
+            });
+            self.status = detail;
+        }
+    }
+
     fn apply_trace_event(&mut self, trace: &SessionTraceEvent) {
         match &trace.payload {
             SessionTracePayload::ProviderStreamEvent(event) => {
                 self.apply_provider_stream_event(event);
             }
             SessionTracePayload::ProviderEvent { event_type, detail } => {
-                if matches!(event_type.as_str(), "warning" | "error") {
-                    let detail = detail
-                        .clone()
-                        .unwrap_or_else(|| format!("provider event: {event_type}"));
-                    self.set_activity(ActivityState::ProviderStream {
-                        detail: detail.clone(),
-                    });
-                    self.status = detail;
-                }
+                self.apply_provider_trace_event(event_type, detail.as_deref());
             }
             SessionTracePayload::ContextCompaction { message, .. } => {
                 self.apply_compaction_trace(trace.phase, message.as_deref());

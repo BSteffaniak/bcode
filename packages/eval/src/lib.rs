@@ -51,6 +51,25 @@ mod schedule;
 mod sdk;
 mod statistics;
 mod timing;
+
+/// Explicitly export and validate a bounded retained event window's context observations.
+///
+/// Retains sensitive captures under `output_directory`; returned JSON contains metadata only.
+/// Caller must authorize export and select a safe output directory. This does not read session
+/// databases, prove window completeness, or claim delivery/quality. Unavailable exports are results.
+///
+/// # Errors
+/// Rejects more than 3200 events, foreign sessions, duplicate sequences, unsupported event schemas,
+/// or failures writing explicitly requested artifacts. Validation happens before export side effects.
+pub async fn inspect_session_context_observations(
+    client: &bcode_client::BcodeClient,
+    session_id: bcode_session_models::SessionId,
+    events: &[bcode_session_models::SessionEvent],
+    output_directory: &std::path::Path,
+) -> Result<serde_json::Value, EvalError> {
+    trace_exports::inspect_context_observations(client, session_id, events, output_directory).await
+}
+
 mod trace_exports;
 mod workflow;
 mod workflow_correlations;
@@ -384,8 +403,126 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
     run_loaded_suite(options, load_suite(&options.suite_path)?)
 }
 
-/// Execute the caller's already-loaded suite snapshot without rereading its source file.
-/// Relative resources still resolve against the explicit suite locator in `options`.
+use std::cell::Cell;
+use std::time::Duration;
+
+/// One synchronous eval execution budget, including reserved settlement inspection time.
+#[derive(Debug, Clone, Copy)]
+pub struct EvalExecutionBudget {
+    execution_deadline: Instant,
+    deadline: Instant,
+}
+
+impl EvalExecutionBudget {
+    /// Start a positive total budget now, reserving up to 30 seconds for reconciliation.
+    ///
+    /// # Errors
+    /// Rejects zero or unrepresentable durations.
+    pub fn new(total: Duration) -> Result<Self, EvalError> {
+        if total.is_zero() {
+            return Err(EvalError::Validation(
+                "execution budget must be positive".into(),
+            ));
+        }
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(total)
+            .ok_or_else(|| EvalError::Validation("execution budget is unrepresentable".into()))?;
+        let reserve = (total / 4).min(Duration::from_secs(30));
+        let execution_deadline = deadline.checked_sub(reserve).ok_or_else(|| {
+            EvalError::Validation("execution budget reserve is unrepresentable".into())
+        })?;
+        Ok(Self {
+            execution_deadline,
+            deadline,
+        })
+    }
+}
+
+thread_local! {
+    // The suite runner is synchronous. Scoped propagation never crosses async tasks or threads.
+    static EXECUTION_BUDGET: Cell<Option<EvalExecutionBudget>> = const { Cell::new(None) };
+}
+
+fn remaining_execution_budget(reconciliation: bool) -> Option<Duration> {
+    EXECUTION_BUDGET.with(|slot| {
+        slot.get().map(|budget| {
+            let deadline = if reconciliation {
+                budget.deadline
+            } else {
+                budget.execution_deadline
+            };
+            deadline.saturating_duration_since(Instant::now())
+        })
+    })
+}
+
+#[must_use]
+fn budget_allowance(allowance: Duration, reconciliation: bool) -> Duration {
+    remaining_execution_budget(reconciliation)
+        .map_or(allowance, |remaining| allowance.min(remaining))
+}
+
+/// Run a suite with one end-to-end deadline; no background execution is abandoned.
+///
+/// # Errors
+/// Returns normal suite errors or rejects nested execution and unsupported executors.
+/// Budgeted execution supports synchronous workflow and command executors only.
+/// Exhaustion preserves partial evidence; cancellation verification does not imply absence of effects.
+pub fn run_loaded_suite_with_execution_budget(
+    options: &EvalRunOptions,
+    suite: EvalSuite,
+    budget: EvalExecutionBudget,
+) -> Result<EvalRunResult, EvalError> {
+    if suite.variants.iter().any(|variant| {
+        !matches!(
+            variant.executor,
+            EvalExecutorKind::Workflow | EvalExecutorKind::Command
+        )
+    }) {
+        return Err(EvalError::Validation(
+            "budgeted execution supports workflow and command executors only".into(),
+        ));
+    }
+    with_execution_budget(budget, || {
+        if remaining_execution_budget(false).is_some_and(|remaining| remaining.is_zero()) {
+            return Err(EvalError::Validation(
+                "execution deadline expired before suite admission".into(),
+            ));
+        }
+        run_loaded_suite(options, suite)
+    })
+}
+
+fn with_execution_budget<T>(
+    budget: EvalExecutionBudget,
+    execute: impl FnOnce() -> Result<T, EvalError>,
+) -> Result<T, EvalError> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXECUTION_BUDGET.with(|slot| slot.set(None));
+        }
+    }
+    let occupied = EXECUTION_BUDGET.with(|slot| {
+        if slot.get().is_some() {
+            true
+        } else {
+            slot.set(Some(budget));
+            false
+        }
+    });
+    if occupied {
+        return Err(EvalError::Validation(
+            "nested execution budget unsupported".into(),
+        ));
+    }
+    let _reset = Reset;
+    execute()
+}
+
+/// Execute an already-loaded suite without an additional caller execution budget.
+/// Relative resources resolve against the explicit suite locator; configured suite limits remain.
 ///
 /// # Errors
 /// Returns validation, execution, judging, or report-writing errors.
@@ -584,6 +721,11 @@ fn run_case_variant(
 ) -> Result<EvalCaseRunResult, EvalError> {
     let mut repetitions = Vec::new();
     for repetition in 1..=suite.run.repetitions {
+        if remaining_execution_budget(false).is_some_and(|remaining| remaining.is_zero()) {
+            return Err(EvalError::Validation(
+                "execution budget exhausted; no further repetition admitted".into(),
+            ));
+        }
         let rep_dir = output_dir
             .join("cases")
             .join(&case.id)
@@ -674,17 +816,30 @@ fn run_repetition(
     measurements.extend(execution.measurements);
     diagnostics.extend(execution.diagnostics);
     artifacts.extend(execution.artifacts);
-    let diff = git_diff(&workspace)?;
-    let diff_path = rep_dir.join("diff.patch");
-    fs::write(&diff_path, &diff)?;
-    measurements.insert("diff_bytes".into(), diff.len() as f64);
-    let stats = diff_stats(&diff);
-    measurements.insert("diff_files_changed".into(), stats.files_changed as f64);
-    measurements.insert("diff_additions".into(), stats.additions as f64);
-    measurements.insert("diff_deletions".into(), stats.deletions as f64);
-    artifacts.push(relative_artifact(run_dir, "diff", &diff_path));
+    let diff = match git_diff(&workspace, rep_dir) {
+        Ok(diff) => Some(diff),
+        Err(error) => {
+            diagnostics.push(EvalDiagnostic {
+                severity: EvalDiagnosticSeverity::Warning,
+                message: format!("post-execution diff unavailable: {error}"),
+            });
+            measurements.insert("eval.diff_unavailable".into(), 1.0);
+            None
+        }
+    };
+    if let Some(diff) = &diff {
+        let diff_path = rep_dir.join("diff.patch");
+        fs::write(&diff_path, diff)?;
+        measurements.insert("diff_bytes".into(), diff.len() as f64);
+        let stats = diff_stats(diff);
+        measurements.insert("diff_files_changed".into(), stats.files_changed as f64);
+        measurements.insert("diff_additions".into(), stats.additions as f64);
+        measurements.insert("diff_deletions".into(), stats.deletions as f64);
+        artifacts.push(relative_artifact(run_dir, "diff", &diff_path));
+    }
 
     let mut judges = Vec::new();
+    let mut judge_unavailable = false;
     progress(format!(
         "judging: variant={} case={} rep={} judges={}",
         variant.id,
@@ -693,15 +848,33 @@ fn run_repetition(
         case.judges.len()
     ));
     for judge in &case.judges {
-        let judge_result = run_judge(
+        let Some(diff) = diff.as_deref() else {
+            diagnostics.push(EvalDiagnostic {
+                severity: EvalDiagnosticSeverity::Warning,
+                message: "judge unavailable: post-execution diff was not observed".into(),
+            });
+            continue;
+        };
+        let judge_result = match run_judge(
             judge,
             suite_dir,
             rep_dir,
             &workspace,
-            &diff,
+            diff,
             &measurements,
             &variant.id,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) if remaining_execution_budget(true).is_some() => {
+                judge_unavailable = true;
+                diagnostics.push(EvalDiagnostic {
+                    severity: EvalDiagnosticSeverity::Warning,
+                    message: format!("post-execution judge unavailable: {error}"),
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         progress(format!(
             "judge finished: variant={} case={} rep={} kind={} passed={} required={}",
             variant.id,
@@ -718,10 +891,12 @@ fn run_repetition(
             measurements.insert(key.clone(), *value);
         }
     }
-    let required_judges_pass = judges
-        .iter()
-        .filter(|judge| judge.required)
-        .all(|judge| judge.passed);
+    let required_judges_pass = diff.is_some()
+        && !judge_unavailable
+        && judges
+            .iter()
+            .filter(|judge| judge.required)
+            .all(|judge| judge.passed);
     let execution_passed = execution.exit_code.is_none_or(|code| code == 0);
     let wall_time_ms = start.elapsed().as_millis();
     measurements.insert("wall_time_ms".into(), wall_time_ms as f64);
@@ -830,7 +1005,7 @@ fn execute_command_variant(
     let policy = suite.run.resolved_timeout(case);
     let (exit_code, timed_out, stdout, stderr) = process::bounded_command_policy(
         process,
-        std::time::Duration::from_millis(policy.timeout_ms),
+        budget_allowance(std::time::Duration::from_millis(policy.timeout_ms), false),
         policy.max_duration_ms.map(std::time::Duration::from_millis),
         policy.timeout_mode == bcode_eval_models::EvalTimeoutMode::Idle,
         rep_dir,
@@ -2214,6 +2389,9 @@ fn run_judge(
             child
                 .current_dir(workspace)
                 .env("BCODE_EVAL_WORKSPACE", workspace);
+            // Independent judges are post-execution diagnostic evidence, not ordinary task
+            // execution. They may consume the reserved evidence/reconciliation allowance,
+            // but the process boundary still clamps them to the caller's total deadline.
             let (exit_code, timed_out, stdout, stderr) = process::bounded_command(
                 child,
                 std::time::Duration::from_millis(*timeout_ms),
@@ -3644,7 +3822,7 @@ fn prepare_workspace(
         EvalIsolation::TempCopy => {
             if let Some(fixture) = &case.fixture {
                 copy_dir_all(&suite_dir.join(fixture), &workspace)?;
-                initialize_workspace_git(&workspace);
+                initialize_workspace_git(&workspace, rep_dir);
             }
         }
         EvalIsolation::InPlace => {
@@ -3671,7 +3849,44 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), EvalError> {
     Ok(())
 }
 
-fn initialize_workspace_git(workspace: &Path) {
+fn initialize_workspace_git(workspace: &Path, rep_dir: &Path) {
+    if workspace.join(".git").exists() {
+        return;
+    }
+    if remaining_execution_budget(true).is_some() {
+        for (label, args) in [
+            ("git-init", vec!["init", "--quiet"]),
+            ("git-add", vec!["add", "."]),
+            (
+                "git-commit",
+                vec![
+                    "-c",
+                    "user.name=Bcode Eval",
+                    "-c",
+                    "user.email=eval@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "--message",
+                    "eval fixture baseline",
+                ],
+            ),
+        ] {
+            let mut command = Command::new("git");
+            command.args(args).current_dir(workspace);
+            if !matches!(
+                process::bounded_command(
+                    command,
+                    budget_allowance(Duration::from_secs(15), false),
+                    rep_dir,
+                    label
+                ),
+                Ok((Some(0), false, _, _))
+            ) {
+                return;
+            }
+        }
+        return;
+    }
     if workspace.join(".git").exists() {
         return;
     }
@@ -3699,7 +3914,21 @@ fn initialize_workspace_git(workspace: &Path) {
         .status();
 }
 
-fn git_diff(workspace: &Path) -> Result<String, EvalError> {
+fn git_diff(workspace: &Path, rep_dir: &Path) -> Result<String, EvalError> {
+    if remaining_execution_budget(true).is_some() {
+        let mut command = Command::new("git");
+        command
+            .args(["diff", "--no-ext-diff", "--"])
+            .current_dir(workspace);
+        let (code, expired, stdout, _) =
+            process::bounded_command(command, Duration::from_secs(15), rep_dir, "git-diff")?;
+        if code == Some(0) && !expired {
+            return Ok(String::from_utf8_lossy(&stdout).into_owned());
+        }
+        return Err(EvalError::Validation(
+            "budgeted diff unavailable; artifacts retained".into(),
+        ));
+    }
     let output = Command::new("git")
         .arg("diff")
         .arg("--no-ext-diff")
@@ -4592,6 +4821,149 @@ min = 1
         let suite: EvalSuite = toml::from_str(&format!("{base}\n{extra}"))?;
         validate_suite(&suite)?;
         Ok(suite)
+    }
+
+    #[test]
+    fn ordinary_command_stops_at_execution_deadline_and_preserves_reconciliation_reserve() {
+        let root = tempfile::tempdir().unwrap();
+        let mut suite = minimal_suite("").unwrap();
+        let variant = &mut suite.variants[0];
+        variant.executor = EvalExecutorKind::Command;
+        variant.command = Some("printf admitted; sleep 10".into());
+        let started = Instant::now();
+        with_execution_budget(
+            EvalExecutionBudget::new(Duration::from_secs(4)).unwrap(),
+            || {
+                let output = execute_command_variant(
+                    &suite,
+                    &suite.cases[0],
+                    &suite.variants[0],
+                    1,
+                    root.path(),
+                    root.path(),
+                )?;
+                assert_eq!(output.measurements.get("command.timed_out"), Some(&1.0));
+                let elapsed = started.elapsed();
+                assert!(elapsed >= Duration::from_millis(2500));
+                assert!(elapsed < Duration::from_millis(3700));
+                assert!(
+                    remaining_execution_budget(true)
+                        .is_some_and(|remaining| remaining > Duration::ZERO)
+                );
+                assert_eq!(remaining_execution_budget(false), Some(Duration::ZERO));
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn execution_budget_restores_after_panic_and_rejects_nesting_without_replacing_outer() {
+        let budget = EvalExecutionBudget::new(Duration::from_secs(10)).unwrap();
+        let panicked = std::panic::catch_unwind(|| {
+            let _: Result<(), EvalError> = with_execution_budget(budget, || {
+                let outer = EXECUTION_BUDGET.with(Cell::get);
+                assert!(with_execution_budget(budget, || Ok(())).is_err());
+                let retained = EXECUTION_BUDGET.with(Cell::get).unwrap();
+                assert_eq!(retained.deadline, outer.unwrap().deadline);
+                panic!("controlled guard unwind");
+            });
+        });
+        assert!(panicked.is_err());
+        assert!(remaining_execution_budget(true).is_none());
+        with_execution_budget(budget, || {
+            assert!(
+                std::thread::spawn(|| remaining_execution_budget(true))
+                    .join()
+                    .unwrap()
+                    .is_none()
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(remaining_execution_budget(true).is_none());
+    }
+
+    #[test]
+    fn expired_budget_rejects_loaded_suite_before_output_or_workspace_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut suite = minimal_suite("").unwrap();
+        for variant in &mut suite.variants {
+            variant.executor = EvalExecutorKind::Command;
+            variant.command = Some("touch must-not-exist".into());
+        }
+        let options = EvalRunOptions {
+            suite_path: root.path().join("absent-suite.toml"),
+            output_root: root.path().join("not-created"),
+            run_id: Some("expired".into()),
+        };
+        let now = Instant::now();
+        assert!(
+            run_loaded_suite_with_execution_budget(
+                &options,
+                suite,
+                EvalExecutionBudget {
+                    execution_deadline: now,
+                    deadline: now
+                }
+            )
+            .is_err()
+        );
+        assert!(!options.output_root.exists());
+        assert!(remaining_execution_budget(true).is_none());
+    }
+
+    #[test]
+    fn loaded_command_suite_obeys_shared_budget_and_retains_expired_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let suite_path = root.path().join("suite.toml");
+        fs::write(
+            &suite_path,
+            r#"
+schema_version = 1
+id = "budget-command"
+name = "Budget command"
+[run]
+repetitions = 1
+timeout_ms = 10000
+isolation = "empty_temp"
+randomize_case_order = false
+fail_fast = false
+[[variants]]
+id = "held"
+executor = "command"
+command = "printf admitted; sleep 10"
+[[cases]]
+id = "held"
+prompt = "bounded command"
+[[cases.judges]]
+type = "metric_threshold"
+metric = "wall_time_ms"
+max = 10000
+"#,
+        )
+        .unwrap();
+        let suite = load_suite(&suite_path).unwrap();
+        let options = EvalRunOptions {
+            suite_path,
+            output_root: root.path().join("output"),
+            run_id: Some("budget".into()),
+        };
+        let started = Instant::now();
+        let result = run_loaded_suite_with_execution_budget(
+            &options,
+            suite,
+            EvalExecutionBudget::new(Duration::from_millis(100)).unwrap(),
+        );
+        // Deadline exhaustion degrades evidence without dropping the execution result.
+        let result = result.unwrap();
+        assert!(!result.variants[0].cases[0].repetitions[0].passed);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(remaining_execution_budget(true).is_none());
+        let repetition = root
+            .path()
+            .join("output/budget/cases/held/variants/held/repetitions/0001");
+        assert!(repetition.join("command.stdout").exists());
     }
 
     #[test]

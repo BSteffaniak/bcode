@@ -2,6 +2,8 @@
 """Offline behavior tests; never invoke a subject, daemon, provider, or oracle."""
 import importlib.util
 from pathlib import Path
+import tempfile
+import json
 import unittest
 from unittest import mock
 
@@ -14,7 +16,207 @@ def event(sequence, kind):
     return {'sequence': sequence, 'session_id': 's', 'kind': kind}
 
 
+def capture_job_fixture():
+    """CaptureJob v1 input, including the typed normal-turn admission envelope."""
+    return {
+        'schema_version': 1, 'allow_live': True,
+        'request': {
+            'preregistration_id': 'synthetic-pair', 'task_id': 'synthetic-task',
+            'repetition': 0, 'feature': 'context_reranking', 'arm': 'off',
+            'source': 'live_consumer', 'capture_id': 'synthetic-off',
+            'pairing_id': 'synthetic-pair', 'isolated_feature': True,
+            'subject': {
+                'executable': '/synthetic/bcode', 'executable_sha256': '0' * 64,
+                'artifact_id': 'synthetic-artifact', 'configuration_sha256': 'unknown',
+                'configuration_complete': False, 'provider': 'synthetic-provider',
+                'model': 'synthetic-model', 'auth_profile': 'synthetic-account',
+                'model_profile': 'synthetic-profile', 'state_id': 'synthetic-state',
+            },
+            'cache_condition': 'unknown', 'timeout_ms': 240000,
+        },
+        'consumer': {'kind': 'normal_turn', 'request': {
+            'session_id': '00000000-0000-4000-8000-000000000001',
+            'prompt': 'Implement a pure numeric function in solution.py.',
+            'admission': {'execution': {
+                'schema_version': 8, 'permission_mode': 'enforce',
+                'allow_user_questions': False, 'agent_profile': 'build',
+                'provider_plugin_id': 'synthetic-provider', 'model_id': 'synthetic-model',
+                'tool_allowlist': ['filesystem.read', 'filesystem.write'],
+            }},
+            'max_events': 1200, 'categorization_dimension': 'task',
+        }},
+    }
+
+
 class NormalPilotTests(unittest.TestCase):
+    def test_no_hook_option_routes_primary_trigger_through_closed_ledger_not_total_calls(self):
+        observation = {'schema_version': 1, 'scope': 'normal_turn', 'session_id': 's',
+                       'turn_id': 't', 'complete': True, 'omitted': 0, 'terminal': 'completed',
+                       'covered_features': ['tool_result_triage'], 'operations': [{
+                           'feature': 'tool_result_triage', 'operation_id': 0,
+                           'trigger': 'triggered', 'inference_complete': True,
+                           'inference': [{}], 'application': 'applied'}]}
+        capture = {'scope': 'normal_turn', 'request': {'feature': 'tool_result_triage', 'arm': 'on'},
+                   'consumer_executed': True, 'output': {'kind': 'classification', 'label': None},
+                   'telemetry': {'optional_operations_complete': True,
+                                 'decisions': {'omitted_stages': 0}, 'inference_calls': 2}}
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(pilot.cli, 'json_command', return_value=observation):
+                retained = pilot.retain_primary_observation({'arm': {}}, {}, Path(directory),
+                    's', 't', Path(directory), 'tool_result_triage')
+            pilot.validate_capture(capture, 'tool_result_triage', 'on',
+                                   {'tool_result_triage'}, retained)
+            retained['operations'][0]['trigger'] = 'not_triggered'
+            with self.assertRaises(pilot.cli.PilotError):
+                pilot.validate_capture(capture, 'tool_result_triage', 'on',
+                                       {'tool_result_triage'}, retained)
+
+    def test_primary_observation_is_fetched_without_required_hooks_and_retained(self):
+        observation = {'schema_version': 1, 'scope': 'normal_turn', 'session_id': 's',
+                       'turn_id': 't', 'complete': True, 'omitted': 0, 'terminal': 'completed',
+                       'covered_features': ['tool_result_triage'], 'operations': []}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = {}
+            with mock.patch.object(pilot.cli, 'json_command', return_value=observation) as public:
+                retained = pilot.retain_primary_observation({'arm': {}}, report, root,
+                    's', 't', root, 'tool_result_triage')
+                self.assertEqual(retained, observation)
+                self.assertEqual(public.call_args.args[2], ['judgement', 'observe-turn', 's', 't'])
+            with mock.patch.object(pilot.cli, 'json_command') as public:
+                self.assertEqual(pilot.retain_primary_observation({'arm': {}}, report, root,
+                    's', 't', root, 'tool_result_triage'), observation)
+                public.assert_not_called()
+            with self.assertRaises(pilot.cli.PilotError):
+                pilot.retain_primary_observation({'arm': {}}, report, root,
+                    's', 'foreign', root, 'tool_result_triage')
+
+    def test_capture_template_strips_only_legacy_metadata_and_rejects_drift(self):
+        fixture = capture_job_fixture()
+        legacy = dict(fixture, output_path='private/legacy-output')
+        self.assertEqual(pilot.normalize_capture_template(legacy), fixture)
+        self.assertIn('output_path', legacy)
+        for invalid in [dict(fixture, private_secret_field='secret'),
+                        {key: value for key, value in fixture.items() if key != 'consumer'}]:
+            with self.assertRaisesRegex(ValueError, 'requires only') as error:
+                pilot.normalize_capture_template(invalid)
+            self.assertNotIn('private_secret_field', str(error.exception))
+            self.assertNotIn('secret', str(error.exception))
+
+    def test_capture_preflight_writes_normalized_typed_job_and_never_admits(self):
+        fixture = capture_job_fixture()
+        fixture['consumer']['request']['session_id'] = 'unbound'
+        job = {'arm': {}, 'expected_selection': {
+            'provider': 'synthetic-provider', 'model': 'synthetic-model'}}
+        receipt = {'schema_version': 1, 'decoded': True, 'execution_attempted': False}
+        with tempfile.TemporaryDirectory() as directory:
+            def validate(_job, _arm, arguments, workspace):
+                self.assertEqual(arguments[:3], ['judgement', 'benchmark-validate', '--file'])
+                candidate = json.loads(Path(arguments[3]).read_text())
+                expected = capture_job_fixture()
+                self.assertEqual(candidate, expected)
+                return receipt
+            with mock.patch.object(pilot.cli, 'json_command', side_effect=validate) as command:
+                result = pilot.preflight_capture_job(job, fixture, Path(directory), directory)
+                self.assertEqual(result, receipt)
+                command.assert_called_once()
+            self.assertEqual(fixture['consumer']['request']['session_id'], 'unbound')
+            rejected = Path(directory) / 'rejected'
+            rejected.mkdir()
+            with mock.patch.object(pilot.cli, 'json_command', return_value=dict(receipt, execution_attempted=True)):
+                with self.assertRaisesRegex(ValueError, 'not verified'):
+                    pilot.preflight_capture_job(job, fixture, rejected, directory)
+
+    def test_reconcile_replaces_stale_diagnostic_with_exact_public_observation(self):
+        session = '00000000-0000-4000-8000-000000000001'
+        events = [event(1, {'model_turn_started': {'turn_id': 't'}}),
+                  event(2, {'tool_call_requested': {'tool_call_id': 'c', 'tool_name': 'shell.run'}}),
+                  event(3, {'tool_invocation_result_recorded': {'record': {'invocation_id': 'c', 'is_error': True}}}),
+                  event(4, {'model_turn_finished': {'turn_id': 't', 'outcome': 'completed'}})]
+        for item in events:
+            item['session_id'] = session
+        for arm in ('off', 'on', 'foreign', 'incomplete', 'missing'):
+            with self.subTest(arm=arm), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'workspace').mkdir()
+                job = {'run_directory': directory, 'subject_binary': '/synthetic/bcode',
+                       'subject_sha256': 'hash', 'arm': {}, 'artifact': 'solution.py'}
+                capture = capture_job_fixture()
+                capture['request']['feature'] = 'tool_result_triage'
+                capture['request']['subject'].update(executable='/synthetic/bcode', executable_sha256='hash')
+                prior = {'stage': 'admission_unknown'}
+                retained = {'capture': capture, 'session_id': session,
+                            'history_before': {'events': [{'event_sha256': 'prefix'}]},
+                            'trigger_diagnostic': prior}
+                observation = {'schema_version': 1, 'scope': 'normal_turn', 'session_id': session, 'turn_id': 't',
+                               'terminal': 'completed', 'complete': True, 'omitted': 0,
+                               'operations': [{'feature': 'tool_result_triage',
+                                               'trigger': 'triggered' if arm == 'on' else 'disabled',
+                                               'application': 'applied' if arm == 'on' else 'baseline_retained'}],
+                               'aggregates': [], 'covered_features': ['tool_result_triage']}
+                if arm == 'foreign':
+                    observation['turn_id'] = 'foreign'
+                if arm == 'incomplete':
+                    observation['complete'] = False
+                from contextlib import ExitStack
+                with ExitStack() as stack:
+                    for name, value in [('external_path', lambda path: Path(path)),
+                                        ('read_json', lambda path: retained),
+                                        ('digest', lambda path: 'hash')]:
+                        stack.enter_context(mock.patch.object(pilot.cli, name, side_effect=value))
+                    command = stack.enter_context(mock.patch.object(pilot.cli, 'json_command',
+                        **({'side_effect': ValueError('unavailable')} if arm == 'missing' else {'return_value': observation})))
+                    stack.enter_context(mock.patch.object(pilot, 'read_history', return_value=(events, {'events': [{'event_sha256': 'prefix'}]})))
+                    stack.enter_context(mock.patch.object(pilot, 'validate_capture'))
+                    stack.enter_context(mock.patch.object(pilot, 'settled_writes', return_value=[]))
+                    stack.enter_context(mock.patch.object(pilot, 'grade', return_value={'status': 'pass'}))
+                    output = root / 'reconciled.json'
+                    status = pilot.reconcile(job, root / 'report.json', output)
+                    result = json.loads(output.read_text())
+                    self.assertEqual(result['prior_trigger_diagnostic'], prior)
+                    diagnostic = result['trigger_diagnostic']
+                    self.assertTrue(diagnostic['admission_verified'])
+                    self.assertTrue(diagnostic['terminal_verified'])
+                    self.assertEqual(diagnostic['stage'],
+                        'applied_quality_gain_unproven' if arm == 'on' else
+                        'trigger_not_observed' if arm == 'off' else 'observation_unavailable_or_incomplete')
+                    self.assertEqual(status, 0 if arm in ('off', 'on') else 1)
+                    self.assertFalse(result['admission_replayed'])
+                    command.assert_called_once_with(job, job['arm'],
+                        ['judgement', 'observe-turn', session, 't'], root / 'workspace')
+
+    def test_natural_trigger_gap_stages_do_not_claim_quality_gain(self):
+        started = event(1, {'model_turn_started': {'turn_id': 't'}})
+        finished = event(4, {'model_turn_finished': {'turn_id': 't', 'outcome': 'completed'}})
+        requested = event(2, {'tool_call_requested': {'tool_call_id': 'c', 'tool_name': 'shell.run'}})
+        result = event(3, {'tool_invocation_result_recorded': {'record': {'invocation_id': 'c', 'is_error': True}}})
+        feature = 'tool_result_triage'
+        diagnostic = lambda events, observation=None: pilot.trigger_diagnostic(events, 's', feature, observation, {'status': 'pass'})
+        self.assertEqual(diagnostic([])['stage'], 'admission_unknown')
+        self.assertEqual(diagnostic([started])['stage'], 'settlement_unknown')
+        self.assertEqual(diagnostic([started, finished])['stage'], 'no_observed_tool_call_eligibility_unknown')
+        events = [started, requested, result, finished]
+        observation = {'session_id': 's', 'turn_id': 't', 'complete': True, 'omitted': 0, 'operations': []}
+        self.assertEqual(diagnostic(events)['stage'], 'observation_unavailable_or_incomplete')
+        self.assertEqual(diagnostic(events, observation)['stage'], 'feature_evidence_empty')
+        observation['operations'] = [{'feature': feature, 'trigger': 'triggered', 'application': 'baseline_retained'}]
+        self.assertEqual(diagnostic(events, observation)['stage'], 'observed_not_applied')
+        observation['operations'][0]['application'] = 'applied'
+        value = diagnostic(events, observation)
+        self.assertEqual(value['stage'], 'applied_quality_gain_unproven')
+        self.assertEqual(value['exact_tool_settlements'], 1)
+        self.assertEqual(value['tool_error_settlements'], 1)
+        self.assertFalse(value['quality_gain_claimed'])
+        observation['turn_id'] = 'foreign'
+        self.assertEqual(diagnostic(events, observation)['stage'], 'observation_unavailable_or_incomplete')
+
+    def test_diagnostic_fixture_checks_allowlist_without_authorization_bypass(self):
+        with self.assertRaises(pilot.cli.PilotError):
+            pilot.diagnostic_tool_contract({'tool_allowlist': ['filesystem.read']}, ['shell.run'])
+        value = pilot.diagnostic_tool_contract({'tool_allowlist': ['shell.run']}, ['shell.run'])
+        self.assertEqual(value['authorization'], 'normal_policy_required')
+        self.assertEqual(value['availability'], 'not_verified_by_prompt')
+
     def test_deferred_subject_requires_typed_unknown_and_exact_verified_identity(self):
         identity = {'artifact_id': 'artifact', 'executable_sha256': 'digest', 'state_id': 'verified'}
         job = {'resolve_state_identity': True, 'subject_binary': '/subject'}

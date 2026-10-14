@@ -58,6 +58,19 @@ impl Drop for ExecutionLifetime {
 pub struct ExecutionMaintenance {
     file: File,
     root: PathBuf,
+    owner_pid: u32,
+}
+
+impl Drop for ExecutionMaintenance {
+    fn drop(&mut self) {
+        // Only the acquiring process relinquishes maintenance authority. A
+        // fork descendant closing its inherited handle must not unlock the
+        // parent's shared open file description. Owner release must not wait
+        // for unrelated descendants to exec or exit.
+        if self.owner_pid == std::process::id() {
+            let _ = self.file.unlock();
+        }
+    }
 }
 
 fn admission_file(root: &Path) -> io::Result<File> {
@@ -128,6 +141,7 @@ impl ExecutionMaintenance {
         Ok(Self {
             file,
             root: root.canonicalize()?,
+            owner_pid: std::process::id(),
         })
     }
 }

@@ -30,6 +30,12 @@ pub fn bounded_command_policy(
             "opaque command idle timeout unsupported: no typed substantive progress channel".into(),
         ));
     }
+    let timeout = super::budget_allowance(timeout, true);
+    if timeout.is_zero() {
+        return Err(EvalError::Validation(
+            "execution deadline exhausted before child admission".into(),
+        ));
+    }
     let stdout = directory.join(format!("{label}.stdout"));
     let stderr = directory.join(format!("{label}.stderr"));
     command
@@ -85,7 +91,10 @@ pub fn bounded_command_policy(
 #[cfg(test)]
 mod tests {
     use super::bounded_command;
-    use std::{process::Command, time::Duration};
+    use std::{
+        process::Command,
+        time::{Duration, Instant},
+    };
     #[test]
     fn opaque_idle_policy_is_rejected_before_spawn_or_capture() {
         let directory = tempfile::tempdir().unwrap();
@@ -107,6 +116,50 @@ mod tests {
             assert!(!directory.path().join("unsupported.stdout").exists());
             assert!(!directory.path().join("unsupported.stderr").exists());
         }
+    }
+
+    #[test]
+    fn scoped_budget_kills_and_joins_held_child_without_background_abandonment() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = crate::EvalExecutionBudget::new(Duration::from_millis(100)).unwrap();
+        let started = Instant::now();
+        let result = crate::with_execution_budget(budget, || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf admitted; sleep 10"]);
+            bounded_command(command, Duration::from_secs(10), directory.path(), "held")
+        })
+        .unwrap();
+        assert!(result.1);
+        assert!(result.0.is_none());
+        assert_eq!(result.2, b"admitted");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(crate::remaining_execution_budget(true).is_none());
+    }
+
+    #[test]
+    fn exhausted_budget_rejects_child_before_side_effects_and_resets_after_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let expired = crate::EvalExecutionBudget {
+            execution_deadline: now,
+            deadline: now,
+        };
+        assert!(
+            crate::with_execution_budget(expired, || {
+                let mut command = Command::new("sh");
+                command.args(["-c", "touch unauthorized"]);
+                bounded_command(
+                    command,
+                    Duration::from_secs(1),
+                    directory.path(),
+                    "rejected",
+                )
+            })
+            .is_err()
+        );
+        assert!(!directory.path().join("rejected.stdout").exists());
+        assert!(crate::remaining_execution_budget(true).is_none());
+        assert!(crate::EvalExecutionBudget::new(Duration::ZERO).is_err());
     }
 
     #[test]

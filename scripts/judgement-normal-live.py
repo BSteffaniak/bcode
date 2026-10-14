@@ -164,6 +164,39 @@ def validate_capture(capture, feature, arm, enabled=None, primary_observation=No
                     'on judgement trigger not observed')
 
 
+def normalize_capture_template(template):
+    """Drop known legacy report metadata; reject other top-level schema drift safely."""
+    cli.require(isinstance(template, dict), 'capture template must be an object')
+    normalized = dict(template)
+    normalized.pop('output_path', None)
+    fields = {'schema_version', 'request', 'consumer', 'allow_live'}
+    cli.require(set(normalized) == fields,
+                'capture template requires only schema_version, request, consumer, allow_live')
+    cli.require(type(normalized['schema_version']) is int and normalized['schema_version'] == 1,
+                'unsupported capture template schema_version')
+    cli.require(type(normalized['allow_live']) is bool,
+                'capture template allow_live must be boolean')
+    cli.require(isinstance(normalized['request'], dict) and isinstance(normalized['consumer'], dict),
+                'capture template request and consumer must be objects')
+    return normalized
+
+
+def preflight_capture_job(job, template, root, workspace):
+    """Use the subject's typed decoder without admitting a session or consumer."""
+    candidate = json.loads(json.dumps(normalize_capture_template(template)))
+    candidate['consumer']['request']['session_id'] = '00000000-0000-4000-8000-000000000001'
+    candidate['consumer']['request']['admission']['execution'].update(
+        provider_plugin_id=job['expected_selection']['provider'],
+        model_id=job['expected_selection']['model'])
+    path = root / 'capture-preflight.json'
+    cli.write_json(path, candidate)
+    receipt = cli.json_command(job, job['arm'],
+        ['judgement', 'benchmark-validate', '--file', str(path)], workspace)
+    cli.require(receipt == {'schema_version': 1, 'decoded': True, 'execution_attempted': False},
+                'capture job typed validation not verified')
+    return receipt
+
+
 def treatment_features(job, template, judgement):
     """Explicit six-feature configurations; primary capture arm describes only its feature."""
     feature = template['request']['feature']
@@ -316,6 +349,29 @@ def retain_navigation_observations(job, report, root, events, session_id, turn_i
     return retained
 
 
+def retain_primary_observation(job, report, root, session_id, turn_id, workspace, feature):
+    """Always read the closed exact-turn primary ledger, independent of optional hook requests."""
+    path = root / 'primary-observation.json'
+    receipt = report.get('primary_observation_receipt')
+    if receipt is not None:
+        cli.require(receipt.get('session_id') == session_id and receipt.get('turn_id') == turn_id
+                    and receipt.get('file') == str(path) and not path.is_symlink()
+                    and path.stat().st_size <= cli.MAX_BYTES and cli.digest(path) == receipt.get('sha256'),
+                    'primary observation receipt mismatch')
+        observation = cli.read_json(path)
+    else:
+        observation = cli.json_command(job, job['arm'],
+            ['judgement', 'observe-turn', session_id, turn_id], workspace)
+    summary = hook_summary(observation, session_id, turn_id, job.get('required_hooks', {}))
+    cli.require(feature in observation['covered_features'], 'primary feature coverage unavailable')
+    if receipt is None:
+        cli.write_json(path, observation)
+        report['primary_observation_receipt'] = {'file': str(path), 'sha256': cli.digest(path),
+                                                'session_id': session_id, 'turn_id': turn_id}
+    report['hook_evidence'] = summary
+    return observation
+
+
 def observe_hooks(job, session_id, turn_id, workspace):
     observation = cli.json_command(job, job['arm'],
         ['judgement', 'observe-turn', session_id, turn_id], workspace)
@@ -355,6 +411,81 @@ def bind_normal_subject(job, template, identity):
                 'declared subject identity mismatch')
 
 
+def trigger_diagnostic(events, session_id, feature, observation=None, oracle=None):
+    """Bounded public facts, not inferred benefit or inferred absence of effects."""
+    cli.require(len(events) <= 3200, 'diagnostic history budget exceeded')
+    scoped = [e for e in events if e.get('session_id') == session_id]
+    starts = [e for e in scoped if 'model_turn_started' in e['kind']]
+    terminals = [e for e in scoped if 'model_turn_finished' in e['kind']]
+    exact = len(starts) == 1
+    turn = starts[0]['kind']['model_turn_started']['turn_id'] if exact else None
+    finished = [e for e in terminals if exact and
+                e['kind']['model_turn_finished']['turn_id'] == turn]
+    start = starts[0]['sequence'] if exact else None
+    end = finished[0]['sequence'] if len(finished) == 1 else None
+    if end is not None and end <= start:
+        finished, end = [], None
+    requests = [(e, value) for e in scoped for name, value in e['kind'].items()
+                if name in ('positioned_tool_call_requested', 'tool_call_requested')
+                and exact and e['sequence'] > start and (end is None or e['sequence'] < end)]
+    results = [e for e in scoped if 'tool_invocation_result_recorded' in e['kind']]
+    pairs, errors = 0, 0
+    for request, value in requests:
+        matches = [e for e in results if e['sequence'] > request['sequence']
+                   and (end is None or e['sequence'] < end)
+                   and e['kind']['tool_invocation_result_recorded']['record'].get('invocation_id')
+                       == value.get('tool_call_id')]
+        if len(matches) == 1:
+            status = matches[0]['kind']['tool_invocation_result_recorded']['record'].get('is_error')
+            if type(status) is bool:
+                pairs += 1
+                errors += int(status)
+    ops = [op for op in (observation or {}).get('operations', []) if op.get('feature') == feature]
+    identity_matches = bool(exact and observation and observation.get('session_id') == session_id
+                            and observation.get('turn_id') == turn)
+    if not identity_matches:
+        ops = []
+    triggered = sum(op.get('trigger') == 'triggered' for op in ops)
+    applied = sum(op.get('application') == 'applied' for op in ops)
+    evidence_complete = identity_matches and (observation or {}).get('complete') is True and (observation or {}).get('omitted') == 0
+    if not exact:
+        stage = 'admission_unknown'
+    elif len(finished) != 1:
+        stage = 'settlement_unknown'
+    elif not requests:
+        stage = 'no_observed_tool_call_eligibility_unknown'
+    elif not evidence_complete:
+        stage = 'observation_unavailable_or_incomplete'
+    elif not ops:
+        stage = 'feature_evidence_empty'
+    elif not triggered:
+        stage = 'trigger_not_observed'
+    elif not applied:
+        stage = 'observed_not_applied'
+    else:
+        stage = 'applied_quality_gain_unproven'
+    return {'stage': stage, 'history_coverage': 'bounded_public_history',
+            'admission_verified': exact, 'terminal_verified': len(finished) == 1,
+            'turn_id': turn, 'tool_requests': len(requests), 'exact_tool_settlements': pairs,
+            'tool_error_settlements': errors, 'tool_success_settlements': pairs - errors,
+            'unsettled_or_ambiguous_requests': len(requests) - pairs,
+            'feature_operations': len(ops), 'triggered_operations': triggered,
+            'applied_operations': applied, 'observation_complete': evidence_complete,
+            'task_truth': (oracle or {}).get('status'), 'quality_gain_claimed': False}
+
+
+def diagnostic_tool_contract(execution, required):
+    """An explicit ordinary-tool fixture checks selection, never bypasses authorization."""
+    cli.require(isinstance(required, list) and len(required) <= 16
+                and all(isinstance(tool, str) and tool for tool in required),
+                'bounded required diagnostic tools expected')
+    allowlist = execution.get('tool_allowlist')
+    excluded = [tool for tool in required if allowlist and tool not in allowlist]
+    cli.require(not excluded, 'required ordinary diagnostic tool excluded by admission allowlist')
+    return {'required_tool_count': len(required), 'allowlist_checked': bool(allowlist),
+            'authorization': 'normal_policy_required', 'availability': 'not_verified_by_prompt'}
+
+
 def run(job):
     cli.require(job['schema_version'] == 1, 'unsupported normal pilot schema')
     root = cli.external_path(job['run_directory'])
@@ -364,7 +495,7 @@ def run(job):
     cli.external_path(str(cli.EXTERNAL / 'tmp'))
     cli.require(type(job['max_history_pages']) is int and 1 <= job['max_history_pages'] <= 32,
                 'bounded history allowance required')
-    template = cli.read_json(job['capture_template'])
+    template = normalize_capture_template(cli.read_json(job['capture_template']))
     overlay = cli.tomllib.loads(job['arm']['overlay_toml'])
     judgement = overlay['judgement']
     arm = template['request']['arm']
@@ -405,12 +536,22 @@ def run(job):
               'starter_files_sha256': cli.digest(job['starter_files']), 'oracle_pins': pins,
               'history_before': None, 'history_after': None, 'capture': None, 'oracle': None}
     session_id = None
+    events, primary_observation = [], None
+    report['capture_stage'] = 'diagnostic_tool_contract'
     try:
+        required_tools = job.get('required_diagnostic_tools',
+                                 ['shell.run'] if feature == 'tool_result_triage' else [])
+        report['diagnostic_tool_contract'] = diagnostic_tool_contract(execution, required_tools)
+        report['capture_stage'] = 'subject_verification'
         identity = cli.verify_subject(job, job['arm'], workspace)
         bind_normal_subject(job, template, identity)
+        report['capture_stage'] = 'capture_schema_validation'
+        report['capture_preflight'] = preflight_capture_job(job, template, root, workspace)
+        report['capture_stage'] = 'session_creation'
         created = cli.json_command(job, job['arm'], ['session', 'create', '--cwd', str(workspace), '--json'], workspace)
         session_id = str(uuid.UUID(created['id']))
         report['session_id'] = session_id
+        report['capture_stage'] = 'selection_verification'
         report['selection'] = cli.verify_selection(job, job['arm'], workspace, session_id)
         before, report['history_before'] = read_history(job, session_id, workspace)
         cli.require(not any('model_turn_started' in e['kind'] or 'user_message' in e['kind'] for e in before),
@@ -421,27 +562,29 @@ def run(job):
         job_path = root / 'capture-job.json'
         cli.write_json(job_path, template)
         report['capture_job_sha256'] = cli.digest(job_path)
+        report['capture_stage'] = 'normal_turn_capture'
         raw = cli.command(job, job['arm'], ['judgement', 'benchmark-capture', '--file', str(job_path)], workspace, timeout=330)
         report['capture'] = json.loads(raw)
         # Persist completed capture BEFORE any downstream history/oracle read can fail.
         cli.write_json(root / 'capture-result.json', report['capture'])
+        report['capture_stage'] = 'public_history'
         events, report['history_after'] = read_history(job, session_id, workspace)
         cli.require([sha(e) for e in events[:len(before)]] == [sha(e) for e in before], 'canonical prefix changed')
         turn_id, start, end = exact_terminal(events)
         report['turn_id'] = turn_id
         require_available_terminal(events, end)
-        primary_observation = None
+        report['capture_stage'] = 'hook_observation'
+        primary_observation = retain_primary_observation(
+            job, report, root, session_id, turn_id, workspace, feature)
         if feature == 'session_categorization':
-            primary_observation = retain_navigation_observations(
+            navigation = retain_navigation_observations(
                 job, report, root, events, session_id, turn_id, workspace)['hook']
-        elif treatment in ('all_on', 'leave_out') or job.get('required_hooks'):
-            primary_observation = cli.json_command(job, job['arm'],
-                ['judgement', 'observe-turn', session_id, turn_id], workspace)
-            report['hook_evidence'] = hook_summary(primary_observation, session_id, turn_id,
-                                                  job.get('required_hooks', {}))
+            cli.require(navigation == primary_observation, 'conflicting closed primary observation')
+        report['capture_stage'] = 'independent_oracle'
         report['oracle'] = grade(job, workspace)
+        report['capture_stage'] = 'capture_validation'
         validate_capture(report['capture'], feature, template['request']['arm'],
-                         enabled if primary_observation is not None else None, primary_observation,
+                         enabled, primary_observation,
                          job.get('control', 'positive'))
         if job.get('control', 'positive') != 'negative':
             report['filesystem_write_receipts'] = settled_writes(events, start, end)
@@ -457,6 +600,22 @@ def run(job):
     except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
         report['gap'] = str(error) if isinstance(error, cli.PilotError) else 'public evidence/oracle unavailable'
         report['effects_reconciled'] = False
+        if session_id is not None and not events:
+            try:
+                events, report['history_after'] = read_history(job, session_id, workspace)
+                report['gap_history_observation'] = 'bounded_public_read'
+            except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+                report['gap_history_observation'] = 'unavailable'
+        if events and primary_observation is None:
+            try:
+                observed_turn, _, _ = exact_terminal(events)
+                primary_observation = cli.json_command(job, job['arm'],
+                    ['judgement', 'observe-turn', session_id, observed_turn], workspace)
+                report['gap_hook_observation'] = 'bounded_public_read'
+            except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+                report['gap_hook_observation'] = 'unavailable'
+    report['trigger_diagnostic'] = trigger_diagnostic(
+        events, session_id, feature, primary_observation, report.get('oracle'))
     cli.write_json(root / 'normal-pilot.json', report)
     return 1 if report['gap'] else 0
 
@@ -473,6 +632,10 @@ def reconcile(job, report_path, output_path):
     workspace = root / 'workspace'
     cli.require(cli.digest(job['subject_binary']) == job['subject_sha256'], 'subject hash changed')
     report = dict(retained)
+    if 'trigger_diagnostic' in retained:
+        report['prior_trigger_diagnostic'] = retained['trigger_diagnostic']
+    events, observation = [], None
+    report.pop('hook_evidence', None)
     report.update(gap=None, reconciliation_source_sha256=cli.digest(report_path),
                   admission_replayed=False)
     try:
@@ -486,6 +649,9 @@ def reconcile(job, report_path, output_path):
         report['turn_id'] = turn_id
         require_available_terminal(events, end)
         capture = retained['capture']
+        current_observation = retain_primary_observation(
+            job, report, root, session_id, turn_id, workspace, capture['request']['feature'])
+        observation = current_observation
         subject = capture['request']['subject']
         cli.require(subject['executable_sha256'] == job['subject_sha256']
                     and subject['executable'] == job['subject_binary'], 'retained capture subject mismatch')
@@ -500,6 +666,9 @@ def reconcile(job, report_path, output_path):
         report['artifact_sha256'] = cli.digest(path) if path.is_file() else None
     except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
         report['gap'] = str(error) if isinstance(error, cli.PilotError) else 'reconciliation evidence unavailable'
+    report['trigger_diagnostic'] = trigger_diagnostic(
+        events, retained['session_id'], retained['capture']['request']['feature'],
+        observation, report.get('oracle'))
     cli.write_json(output_path, report)
     return 1 if report['gap'] else 0
 

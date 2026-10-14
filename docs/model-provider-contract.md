@@ -18,6 +18,24 @@ The contract applies equally to bundled providers, third-party native plugins, i
 adapters, and proxies that expose the same typed operations. A provider must not advertise a
 capability that it cannot satisfy through this contract.
 
+## Normalized request-context observation artifacts
+
+`bcode_model::lineage::ContextRepresentationObservation` version 1 is a content-free
+artifact containing canonical session UUID, canonical turn ID, exact provider-round request ID,
+originating `ModelRequestBuilt` sequence, host request ordinal, normalized lineage and conversion
+receipt. It contains no provider-native metadata, credentials or contribution content. Its
+`new`, `validate`, `encode` and `parse` APIs require the exact originating `ModelTurnRequest`;
+validation also requires independently verified canonical turn and producer sequence. Matching
+an ordinal alone does not establish provenance. Parsing is bounded to 131072 bytes before JSON
+allocation. Unknown versions/fields, truncated JSON, invalid references and foreign identities
+fail closed. Missing or conflicting evidence remains unavailable, never inferred from selection.
+
+The session-owned reference envelope uses only the reserved `request_context_observation`
+provider-event type. Persistence requires explicit observability opt-in; these contracts perform
+no writes and do not enable capture. Export requires the authorized bounded trace operation,
+canonical event correlation and complete integrity-verified artifacts. Conversion observations
+are not delivery, remote acceptance, mandatory-source compliance or quality evidence.
+
 ## Version and compatibility
 
 `bcode.model-provider/v1` identifies the legacy flat-output JSON family.

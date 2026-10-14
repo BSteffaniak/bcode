@@ -231,6 +231,10 @@ pub(super) fn execute(
 ) -> Result<(), ()> {
     capture.scope = CaptureScope::NormalEvalAttempt;
     capture.operation = "eval.precondition".into();
+    let budget = crate::EvalExecutionBudget::new(std::time::Duration::from_millis(
+        capture.request.timeout_ms,
+    ))
+    .map_err(|_| ())?;
     if capture.request.feature != Feature::EvalCategorization
         || subject_binary != Path::new(&capture.request.subject.executable)
         || !subject_binary.is_absolute()
@@ -295,16 +299,21 @@ pub(super) fn execute(
     confined(Path::new(&variant.env["TMPDIR"]), authorized_root)?;
     let started = Instant::now();
     capture.operation = "eval.execution".into();
-    let result = crate::run_loaded_suite(
+    let result = crate::run_loaded_suite_with_execution_budget(
         &EvalRunOptions {
             suite_path,
             output_root: output,
             run_id: Some("normal-eval-attempt".into()),
         },
         suite,
-    )
-    .map_err(|_| ())?;
+        budget,
+    );
     capture.trial_latency_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+    let result = result.map_err(|_| {
+        if started.elapsed() >= std::time::Duration::from_millis(capture.request.timeout_ms) {
+            capture.operation = "eval.execution_deadline".into();
+        }
+    })?;
     capture.operation = "eval.attempt_artifacts".into();
     let repetition = result
         .variants
@@ -340,22 +349,11 @@ fn load_attempt_artifacts(
     }) {
         return Err(());
     }
-    capture.operation = "eval.canonical_attempt_coverage".into();
-    let completeness = bounded_json(&rep_dir.join("capture-completeness.json"))?;
-    canonical_attempt_complete(&completeness).map_err(|()| {
-        capture.operation = attempt_coverage_failure(&completeness).operation().into();
-    })?;
     capture.operation = "eval.observation_decode".into();
     let observation: EvalAttemptJudgementObservation = serde_json::from_value(bounded_json(
         &rep_dir.join("eval-judgement-observation.json"),
     )?)
     .map_err(|_| ())?;
-    capture.operation = "eval.observation_contract".into();
-    // Retain valid inference facts immediately, before later artifact/correlation reads.
-    capture
-        .telemetry
-        .retain_eval_observation(&observation)
-        .map_err(|_| ())?;
     capture.operation = "eval.admission_correlation".into();
     let admission = bounded_json(&rep_dir.join("admission.json"))?;
     if admission.get("run_id").and_then(serde_json::Value::as_str)
@@ -363,6 +361,18 @@ fn load_attempt_artifacts(
     {
         return Err(());
     }
+    capture.operation = "eval.observation_contract".into();
+    // Correlated observation facts survive incomplete attempt coverage, but do not establish
+    // consumer execution, full capture, or task outcome.
+    capture
+        .telemetry
+        .retain_eval_observation(&observation)
+        .map_err(|_| ())?;
+    capture.operation = "eval.canonical_attempt_coverage".into();
+    let completeness = bounded_json(&rep_dir.join("capture-completeness.json"))?;
+    canonical_attempt_complete(&completeness).map_err(|()| {
+        capture.operation = attempt_coverage_failure(&completeness).operation().into();
+    })?;
     capture.operation = "eval.diagnosis_artifact".into();
     let diagnosis = bounded_json(&rep_dir.join("diagnosis.json"))?;
     capture.request.subject.configuration_complete = false;
@@ -394,6 +404,84 @@ mod tests {
     }
 
     use super::*;
+
+    fn assert_incomplete_attempt_retains_inference(
+        rep_dir: &Path,
+        root: &Path,
+        artifacts: &[bcode_eval_models::EvalArtifactRef],
+        initial: &ConsumerCapture,
+    ) {
+        use bcode_model::judgement::{
+            ConsumerOperationObservation, OptionalOperationObservation, OptionalOperationOutcome,
+        };
+        let observation = EvalAttemptJudgementObservation::new(
+            "actual-run".into(),
+            "failed",
+            ConsumerOperationObservation {
+                operation_id: 0,
+                feature: Feature::EvalCategorization,
+                trigger: TriggerDisposition::Triggered,
+                inference: vec![OptionalOperationObservation {
+                    outcome: OptionalOperationOutcome::Advice,
+                    inference_invocations: 1,
+                    effective_provider: Some("bcode.jev".into()),
+                    effective_model: Some("jev-1.13.0".into()),
+                    ..OptionalOperationObservation::default()
+                }],
+                inference_complete: true,
+                application: Some(ApplicationDisposition::Applied),
+                selection: None,
+                recommendation: None,
+            },
+        );
+        let names = [
+            "capture-completeness.json",
+            "eval-judgement-observation.json",
+        ];
+        let originals = names.map(|name| fs::read(rep_dir.join(name)).unwrap());
+        fs::write(
+            rep_dir.join(names[0]),
+            br#"{"boundaries":{"canonical_attempt":{"complete":false}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            rep_dir.join(names[1]),
+            serde_json::to_vec(&observation).unwrap(),
+        )
+        .unwrap();
+        let mut rejected = initial.clone();
+        assert!(load_attempt_artifacts(rep_dir, root, artifacts, &mut rejected).is_err());
+        // Mirror the public capture wrapper's failure disposition without executing a run.
+        rejected.status = CaptureStatus::PublicOperationFailed;
+        assert_eq!(rejected.operation, "eval.canonical_attempt_coverage");
+        assert_eq!(rejected.telemetry.inference_calls, Some(1));
+        assert!(rejected.telemetry.optional_operations_complete);
+        assert!(!rejected.consumer_executed);
+        assert_eq!(rejected.status, CaptureStatus::PublicOperationFailed);
+        assert_eq!(
+            rejected.outcome,
+            crate::judgement_benchmark::TerminalOutcome::InfrastructureFailure
+        );
+        assert!(rejected.output.is_none());
+        assert_eq!(rejected.request.subject, initial.request.subject);
+        // A valid but foreign observation must not contribute even partial inference evidence.
+        fs::write(
+            rep_dir.join("admission.json"),
+            br#"{"run_id":"foreign-run"}"#,
+        )
+        .unwrap();
+        let mut foreign = initial.clone();
+        assert!(load_attempt_artifacts(rep_dir, root, artifacts, &mut foreign).is_err());
+        assert_eq!(foreign.telemetry.inference_calls, None);
+        fs::write(
+            rep_dir.join("admission.json"),
+            br#"{"run_id":"actual-run"}"#,
+        )
+        .unwrap();
+        for (name, bytes) in names.into_iter().zip(originals) {
+            fs::write(rep_dir.join(name), bytes).unwrap();
+        }
+    }
 
     #[test]
     fn unknown_or_unbounded_attempt_json_is_not_evidence() {
@@ -574,6 +662,12 @@ mod tests {
         let original_subject = capture.request.subject.clone();
         assert!(load_attempt_artifacts(&rep_dir, root.path(), &artifacts, &mut capture).is_ok());
         assert_eq!(capture.request.subject, original_subject);
+        assert_incomplete_attempt_retains_inference(
+            &rep_dir,
+            root.path(),
+            &artifacts,
+            &initial_capture,
+        );
         // Exercise the same file-loading/correlation path execute calls, without launching a run.
         for (name, malformed) in [
             ("capture-completeness.json", serde_json::json!({})),

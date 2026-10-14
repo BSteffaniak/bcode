@@ -2763,36 +2763,22 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         &format!("{launcher_pid}-{startup_id}"),
     );
     let result = ensure_daemon_running_with_start(options, |options, startup_lock| {
+        #[cfg(unix)]
+        let handoff = format!("{}-{startup_id}", std::process::id());
         let inherited_startup_lock = startup_lock.file.try_clone();
+        #[cfg(unix)]
+        let descriptor_file = startup_lock.file.try_clone();
         let endpoint = options.endpoint.clone();
         let log_path = options.log_path.clone();
         async move {
-            if let Some(parent) = log_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            // Truncate before opening append-only handles: parent tracing and child
-            // stderr share this path, so positional writes would overwrite trace records.
-            fs::File::create(&log_path)?;
-            let mut log_file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)?;
-            writeln!(log_file, "--- bcode daemon start ---")?;
+            let log_file = open_startup_log(&log_path)?;
             let stderr_log = log_file.try_clone()?;
 
             let spawn_started_at = std::time::Instant::now();
             let phase = bcode_metrics::startup::phase("launcher.artifact_prepare");
             let cached_exe = ensure_current_executable_cached()?;
             phase.finish();
-            let executable_digest = cached_executable_digest(&cached_exe)
-                .ok_or_else(|| DaemonLifecycleError::Io {
-                    path: cached_exe.clone(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "cached daemon executable path has no digest component",
-                    ),
-                })?
-                .to_owned();
+            let executable_digest = require_cached_executable_digest(&cached_exe)?;
             // Always spawn from the immutable content-addressed image. Spawning from the
             // bootstrap source path would pin the daemon to a mutable pathname (for example
             // `target/<triple>/release/bcode`), so rebuilding that path would later make the
@@ -2807,7 +2793,14 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             let (endpoint_env_name, endpoint_env_value) =
                 bcode_ipc::endpoint_env_pair(&endpoint)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
+            #[cfg(unix)]
+            write_startup_owner(
+                &descriptor_file?,
+                &StartupOwnerDescriptor::current("handoff_pending", handoff.clone())?,
+            )?;
             let mut command = daemon_command(&exe);
+            #[cfg(unix)]
+            command.env("BCODE_STARTUP_HANDOFF_V1", handoff);
             let spawn_phase = bcode_metrics::startup::phase("launcher.process_spawn");
             let mut child = command
                 .args(["server", "run"])
@@ -2850,6 +2843,9 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::from(stderr_log))
                 .spawn()?;
+            // Release Command's configured stdin duplicate; the child and scoped
+            // StartupLock are now the only intentional owners of this OFD.
+            drop(command);
             spawn_phase.finish();
             tracing::debug!(
                 target: "bcode_daemon_lifecycle::startup",
@@ -2864,6 +2860,33 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
     .await;
     acquisition_phase.finish_result(&result);
     result
+}
+
+fn require_cached_executable_digest(path: &Path) -> Result<String, DaemonLifecycleError> {
+    cached_executable_digest(path)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| DaemonLifecycleError::Io {
+            path: path.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cached daemon executable path has no digest component",
+            ),
+        })
+}
+
+fn open_startup_log(path: &Path) -> std::io::Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Truncate before opening append-only handles: launcher and child stderr
+    // share this path, so positional writes would overwrite trace records.
+    fs::File::create(path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "--- bcode daemon start ---")?;
+    Ok(file)
 }
 
 /// Detach the child from the launching terminal, not merely its stdio handles.
@@ -3050,6 +3073,169 @@ pub fn default_daemon_log_path() -> PathBuf {
     )
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartupOwnerDescriptor {
+    version: u32,
+    artifact: String,
+    state: String,
+    executable_digest: String,
+    pid: u32,
+    process_start_seconds: u64,
+    phase: String,
+    handoff: String,
+}
+
+#[cfg(unix)]
+impl StartupOwnerDescriptor {
+    fn current(phase: &str, handoff: String) -> std::io::Result<Self> {
+        let pid = std::process::id();
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+        let process_start_seconds = system
+            .process(Pid::from_u32(pid))
+            .ok_or_else(|| std::io::Error::other("startup process identity unavailable"))?
+            .start_time();
+        Ok(Self {
+            version: 1,
+            artifact: bcode_ipc::ArtifactId::current().to_string(),
+            state: bcode_ipc::state_location_id(),
+            executable_digest: initialize_artifact_bootstrap()
+                .and_then(ArtifactBootstrap::digest)
+                .map_err(std::io::Error::other)?,
+            pid,
+            process_start_seconds,
+            phase: phase.to_owned(),
+            handoff,
+        })
+    }
+
+    fn matches_scope(&self) -> bool {
+        self.version == 1
+            && matches!(
+                self.phase.as_str(),
+                "preparing" | "handoff_pending" | "daemon_ready"
+            )
+            && !self.handoff.is_empty()
+            && self.handoff.len() <= 128
+            && self.artifact == bcode_ipc::ArtifactId::current().to_string()
+            && self.state == bcode_ipc::state_location_id()
+            && initialize_artifact_bootstrap()
+                .and_then(ArtifactBootstrap::digest)
+                .is_ok_and(|digest| digest == self.executable_digest)
+    }
+
+    fn process_verified(&self) -> bool {
+        let pid = Pid::from_u32(self.pid);
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        system.process(pid).is_some_and(|process| {
+            process.start_time() == self.process_start_seconds
+                && process.exe().is_some_and(|exe| {
+                    executable_path_matches_digest(exe, &self.executable_digest)
+                        && executable_sha256(exe)
+                            .is_ok_and(|digest| digest == self.executable_digest)
+                })
+        })
+    }
+}
+
+// Positional access avoids the shared OFD cursor. Partial concurrent snapshots are
+// explicitly unknown; they never authorize takeover or a second spawn.
+#[cfg(unix)]
+fn read_startup_owner(file: &fs::File) -> std::io::Result<Option<StartupOwnerDescriptor>> {
+    use std::os::unix::fs::FileExt as _;
+    let mut bytes = [0_u8; 8193];
+    let size = file.read_at(&mut bytes, 0)?;
+    if size == 0 || bytes[..size].starts_with(b"pid=") {
+        return Ok(None);
+    }
+    if size > 8192 {
+        return Err(std::io::Error::other("startup descriptor exceeds bound"));
+    }
+    serde_json::from_slice(&bytes[..size])
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+#[cfg(unix)]
+fn write_startup_owner(file: &fs::File, owner: &StartupOwnerDescriptor) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let bytes = serde_json::to_vec(owner).map_err(std::io::Error::other)?;
+    if bytes.len() > 8192 {
+        return Err(std::io::Error::other("startup descriptor exceeds bound"));
+    }
+    file.write_all_at(&bytes, 0)?;
+    file.set_len(u64::try_from(bytes.len()).map_err(std::io::Error::other)?)?;
+    file.sync_data()
+}
+
+#[cfg(unix)]
+fn publish_daemon_startup_owner() -> std::io::Result<()> {
+    use std::os::fd::BorrowedFd;
+    let handoff = std::env::var("BCODE_STARTUP_HANDOFF_V1").map_err(std::io::Error::other)?;
+    // SAFETY: duplicate process-owned stdin without taking ownership of it.
+    let file = fs::File::from(unsafe { BorrowedFd::borrow_raw(0) }.try_clone_to_owned()?);
+    let path = startup_lock_path(
+        &bcode_config::default_state_dir(),
+        &daemon_namespace(),
+        &bcode_ipc::state_location_id(),
+    );
+    publish_startup_owner_at(&file, &path, &handoff)?;
+    close_startup_stdin_on_exec()
+}
+
+#[cfg(unix)]
+fn close_startup_stdin_on_exec() -> std::io::Result<()> {
+    // Keep stdin open for this daemon's lifetime, but never transfer its fence
+    // through a subsequent exec. F_GETFD/F_SETFD affect this process's fd only.
+    let flags = unsafe { libc::fcntl(0, libc::F_GETFD) };
+    if flags == -1 || unsafe { libc::fcntl(0, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn publish_startup_owner_at(file: &fs::File, path: &Path, handoff: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let expected = fs::symlink_metadata(path)?;
+    let actual = file.metadata()?;
+    if !expected.is_file() || expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+        return Err(std::io::Error::other(
+            "startup descriptor path identity mismatch",
+        ));
+    }
+    let owner = read_startup_owner(file)?
+        .ok_or_else(|| std::io::Error::other("startup descriptor unavailable"))?;
+    if !owner.matches_scope() || owner.phase != "handoff_pending" || owner.handoff != handoff {
+        return Err(std::io::Error::other("startup descriptor handoff mismatch"));
+    }
+    write_startup_owner(
+        file,
+        &StartupOwnerDescriptor::current("daemon_ready", handoff.to_owned())?,
+    )
+}
+
+#[cfg(unix)]
+fn observe_startup_owner(file: &fs::File) {
+    let owner = read_startup_owner(file)
+        .ok()
+        .flatten()
+        .filter(StartupOwnerDescriptor::matches_scope);
+    tracing::debug!(target: "bcode_daemon_lifecycle::startup",
+        claimed_pid = ?owner.as_ref().map(|value| value.pid),
+        claimed_process_start_seconds = ?owner.as_ref().map(|value| value.process_start_seconds),
+        artifact = ?owner.as_ref().map(|value| value.artifact.as_str()),
+        state = ?owner.as_ref().map(|value| value.state.as_str()),
+        executable_digest = ?owner.as_ref().map(|value| value.executable_digest.as_str()),
+        phase = ?owner.as_ref().map(|value| value.phase.as_str()),
+        verified_process = owner.as_ref().is_some_and(StartupOwnerDescriptor::process_verified),
+        kernel_lock_owner = "unknown",
+        "fresh startup descriptor observation");
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupLockObservation {
     Waiting,
@@ -3075,7 +3261,8 @@ struct StartupLock {
 }
 
 impl StartupLock {
-    const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(25);
+    // Covers the bounded 30s explicit image probe plus scheduling/verification.
+    const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(35);
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
     async fn acquire(endpoint: &IpcEndpoint) -> Result<Option<Self>, DaemonStartError> {
@@ -3087,7 +3274,7 @@ impl StartupLock {
         let artifact = bcode_ipc::ArtifactId::current().to_string();
         let state = bcode_ipc::state_location_id();
         let scope = format!("{artifact}.{state}");
-        Self::acquire_observed(
+        let acquired = Self::acquire_observed(
             path,
             Self::ACQUIRE_TIMEOUT,
             &scope,
@@ -3107,7 +3294,23 @@ impl StartupLock {
                 );
             },
         )
-        .await
+        .await?;
+        #[cfg(unix)]
+        if let Some(lock) = &acquired {
+            if read_startup_owner(&lock.file)?.is_some_and(|owner| !owner.matches_scope()) {
+                return Err(
+                    std::io::Error::other("unsupported or foreign startup descriptor").into(),
+                );
+            }
+            write_startup_owner(
+                &lock.file,
+                &StartupOwnerDescriptor::current(
+                    "preparing",
+                    format!("{}-{}", std::process::id(), diagnostic_startup_id()),
+                )?,
+            )?;
+        }
+        Ok(acquired)
     }
 
     async fn acquire_observed<F, Fut>(
@@ -3128,17 +3331,28 @@ impl StartupLock {
         let wait_phase = bcode_metrics::startup::phase_for("launcher.lock_wait", scope);
         let mut waiting = false;
         loop {
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
+            let mut open = fs::OpenOptions::new();
+            open.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .mode(0o600);
+            }
+            let file = open.open(&path)?;
+            if !file.metadata()?.is_file() {
+                return Err(
+                    std::io::Error::other("startup descriptor is not a regular file").into(),
+                );
+            }
             match file.try_lock() {
                 Ok(()) => {
-                    file.set_len(0)?;
-                    writeln!(&file, "pid={}", std::process::id())?;
-                    file.sync_data()?;
+                    #[cfg(not(unix))]
+                    {
+                        file.set_len(0)?;
+                        writeln!(&file, "pid={}", std::process::id())?;
+                        file.sync_data()?;
+                    }
                     observe(StartupLockObservation::Acquired, started.elapsed());
                     wait_phase.finish();
                     return Ok(Some(Self { file }));
@@ -3148,19 +3362,28 @@ impl StartupLock {
                         observe(StartupLockObservation::Waiting, started.elapsed());
                         waiting = true;
                     }
-                    if ready().await {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if tokio::time::timeout(remaining, ready())
+                        .await
+                        .unwrap_or(false)
+                    {
                         observe(StartupLockObservation::ConcurrentReady, started.elapsed());
                         wait_phase.finish();
                         return Ok(None);
                     }
                     if started.elapsed() >= timeout {
+                        #[cfg(unix)]
+                        observe_startup_owner(&file);
                         observe(StartupLockObservation::Timeout, started.elapsed());
                         wait_phase.fail();
                         return Err(DaemonStartError::StartupCoordinationTimeout {
                             lock_path: path,
                         });
                     }
-                    tokio::time::sleep(Self::POLL_INTERVAL).await;
+                    tokio::time::sleep(
+                        Self::POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
+                    )
+                    .await;
                 }
                 Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
@@ -3234,6 +3457,12 @@ const READINESS_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// A departed launcher must not prevent the daemon from serving other clients.
 pub fn notify_launcher_ready() {
     if std::env::var("BCODE_DAEMON_READY_STDOUT").as_deref() == Ok("v1") {
+        #[cfg(unix)]
+        if publish_daemon_startup_owner().is_err() {
+            tracing::error!(target: "bcode_daemon_lifecycle::startup",
+                "startup descriptor publication failed; readiness notification withheld");
+            return;
+        }
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(b"BCODE_READY_V1\n");
         let _ = stdout.flush();
@@ -3299,14 +3528,19 @@ async fn wait_for_child_notification_with_timeout(
         elapsed_us = started.elapsed().as_micros(),
         "daemon readiness notification received"
     );
-    if ping_ready(endpoint).await {
-        Ok(())
-    } else {
-        Err(DaemonStartError::HealthCheckFailed {
-            log_path: display_from_current_dir(log_path).to_string(),
-            recent_log: recent_log_excerpt(log_path),
-        })
-    }
+    // A notification is only a wakeup, not verified readiness.
+    let remaining = timeout.saturating_sub(started.elapsed());
+    let phase = bcode_metrics::startup::phase("launcher.verified_handshake");
+    let result = tokio::time::timeout(remaining, wait_for_daemon_ready(endpoint, log_path))
+        .await
+        .unwrap_or_else(|_| {
+            Err(DaemonStartError::HealthCheckFailed {
+                log_path: display_from_current_dir(log_path).to_string(),
+                recent_log: recent_log_excerpt(log_path),
+            })
+        });
+    phase.finish_result(&result);
+    result
 }
 
 async fn wait_for_daemon_ready(
@@ -3484,6 +3718,39 @@ fn is_bcode_socket_path(path: &Path) -> bool {
 #[cfg(unix)]
 fn unix_socket_has_listener(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(test)]
+fn run_isolated_fork_fixture(test_name: &str) -> bool {
+    const ENV: &str = "BCODE_ISOLATED_FORK_FIXTURE";
+    if std::env::var(ENV).as_deref() == Ok(test_name) {
+        return false;
+    }
+    // A gated pre-exec/fork child copies every live OFD in its process, not
+    // merely this fixture's handles. Execute the owning test alone so that its
+    // intentional gate cannot retain unrelated parallel-test fences.
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test_name, "--exact", "--nocapture"])
+        .env(ENV, test_name)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("isolated fork fixture spawn");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().expect("isolated fixture status") {
+            assert!(
+                status.success(),
+                "isolated fixture failed: {test_name}: {status}"
+            );
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("terminate timed-out fixture");
+            child.wait().expect("reap timed-out fixture");
+            panic!("isolated fixture deadline exceeded: {test_name}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]
@@ -3701,23 +3968,40 @@ mod startup_lock_tests {
     async fn readiness_notification_does_not_substitute_for_identity_verification() {
         let directory = tempfile::tempdir().expect("notification directory");
         let endpoint = IpcEndpoint::unix_socket(directory.path().join("absent.sock"));
+        let published = directory.path().join("notification-published");
         let mut child = tokio::process::Command::new("sh")
-            .args(["-c", "printf 'BCODE_READY_V1\\n'; exec sleep 30"])
+            .args([
+                "-c",
+                "printf 'BCODE_READY_V1\\n'; printf ready > \"$1\"; exec sleep 30",
+                "notification",
+            ])
+            .arg(&published)
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("notification child");
-        let result = super::wait_for_child_notification(
+        // This test targets identity verification after notification, not shell
+        // scheduling within the 100ms handshake budget. Gate that boundary.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !published.exists() {
+                assert!(child.try_wait().expect("fixture status").is_none());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture did not publish readiness notification");
+        let result = super::wait_for_child_notification_with_timeout(
             &endpoint,
             &mut child,
             &directory.path().join("daemon.log"),
+            Duration::from_millis(100),
         )
         .await;
         child.kill().await.expect("stop child");
-        assert!(matches!(
-            result,
-            Err(DaemonStartError::HealthCheckFailed { .. })
-        ));
+        assert!(
+            matches!(&result, Err(DaemonStartError::HealthCheckFailed { .. })),
+            "expected verified-handshake failure after published notification; actual={result:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -3760,6 +4044,245 @@ mod startup_lock_tests {
             Err(DaemonStartError::StartupCoordinationTimeout { .. })
         ));
         drop((first, second));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_lock_probe_timeout_is_bounded_and_preserves_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup.lock");
+        let owner = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let descriptor =
+            super::StartupOwnerDescriptor::current("handoff_pending", "test".to_owned()).unwrap();
+        super::write_startup_owner(&owner.file, &descriptor).unwrap();
+        let original = fs::read(&path).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            StartupLock::acquire_observed(
+                path.clone(),
+                Duration::from_millis(40),
+                "test",
+                std::future::pending::<bool>,
+                |_, _| {},
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(DaemonStartError::StartupCoordinationTimeout { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_descriptor_symlink_is_rejected_without_modifying_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let path = directory.path().join("startup.lock");
+        fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(
+            StartupLock::acquire_observed(
+                path,
+                Duration::from_millis(40),
+                "test",
+                || std::future::ready(false),
+                |_, _| {}
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_descriptor_handoff_child() {
+        use std::os::fd::BorrowedFd;
+
+        let Ok(path) = std::env::var("BCODE_TEST_STARTUP_DESCRIPTOR") else {
+            return;
+        };
+        let file = fs::File::from(
+            unsafe { BorrowedFd::borrow_raw(0) }
+                .try_clone_to_owned()
+                .unwrap(),
+        );
+        super::publish_startup_owner_at(&file, Path::new(&path), "test-handoff").unwrap();
+        super::close_startup_stdin_on_exec().unwrap();
+        // A surviving exec descendant must not retain the daemon's lifetime fence.
+        let mut grandchild_command = std::process::Command::new("sh");
+        let grandchild_release = format!("{path}.grandchild-release");
+        let mut grandchild = grandchild_command
+            .args([
+                "-c",
+                "n=0; while [ ! -f \"$1\" ] && [ \"$n\" -lt 500 ]; do sleep 0.01; n=$((n+1)); done",
+                "grandchild",
+            ])
+            .arg(&grandchild_release)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(grandchild_command);
+        fs::write(
+            format!("{path}.grandchild-pid"),
+            grandchild.id().to_string(),
+        )
+        .unwrap();
+        // Own the wait while this fixture process lives. On deliberate daemon
+        // exit its surviving descendant is reparented to the OS reaper.
+        std::thread::spawn(move || grandchild.wait().expect("grandchild wait"));
+        println!("descriptor-published");
+        std::io::stdout().flush().unwrap();
+        // Separate release channel: never read the descriptor through shared stdin.
+        let release = format!("{path}.release");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !Path::new(&release).exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_descriptor_detached_child_replaces_launcher_claim_and_retains_fence() {
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+        const FIXTURE: &str = "BCODE_TEST_DESCRIPTOR_ISOLATED";
+        if std::env::var_os(FIXTURE).is_none() {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["startup_lock_tests::startup_descriptor_detached_child_replaces_launcher_claim_and_retains_fence", "--exact", "--nocapture"])
+                .env(FIXTURE, "1")
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn().unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup.lock");
+        let owner = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let pending =
+            super::StartupOwnerDescriptor::current("handoff_pending", "test-handoff".to_owned())
+                .unwrap();
+        super::write_startup_owner(&owner.file, &pending).unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        super::detach_daemon_process(&mut command);
+        let mut child = command
+            .args([
+                "startup_lock_tests::startup_descriptor_handoff_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("BCODE_TEST_STARTUP_DESCRIPTOR", &path)
+            .stdin(super::startup_lock_stdio(owner.file.try_clone().unwrap()))
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        // Command retains its configured Stdio even after spawn; it must not
+        // remain a second launcher-side owner during the release assertion.
+        drop(command);
+        let child_pid = child.id().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut published = false;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("descriptor-published") {
+                    published = true;
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(published);
+        drop(owner);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let actual = super::read_startup_owner(&file).unwrap().unwrap();
+        assert_eq!(actual.pid, child_pid);
+        assert_ne!(actual.pid, pending.pid);
+        assert_eq!(actual.phase, "daemon_ready");
+        assert!(matches!(
+            file.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert!(super::publish_startup_owner_at(&file, &path, "test-handoff").is_err());
+        assert_eq!(
+            super::read_startup_owner(&file).unwrap().unwrap().pid,
+            child_pid
+        );
+        fs::write(path.with_extension("lock.release"), b"release").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let grandchild_pid: u32 = fs::read_to_string(format!("{}.grandchild-pid", path.display()))
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero only observes the isolated fixture descendant.
+        assert_eq!(
+            unsafe { libc::kill(i32::try_from(grandchild_pid).unwrap(), 0) },
+            0
+        );
+        let release_result = file.try_lock();
+        // Release the fixture descendant even if the lock assertion fails.
+        fs::write(format!("{}.grandchild-release", path.display()), b"release").unwrap();
+        release_result.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_descriptor_rejects_foreign_future_legacy_and_reused_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.lock().unwrap();
+        let mut owner =
+            super::StartupOwnerDescriptor::current("handoff_pending", "test".to_owned()).unwrap();
+        owner.process_start_seconds = owner.process_start_seconds.saturating_add(1);
+        assert!(!owner.process_verified());
+        for (version, state) in [(2, owner.state.clone()), (1, "foreign".to_owned())] {
+            owner.version = version;
+            owner.state = state;
+            super::write_startup_owner(&file, &owner).unwrap();
+            let before = fs::read(&path).unwrap();
+            assert!(super::publish_startup_owner_at(&file, &path, "test").is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        fs::write(&path, b"pid=123\n").unwrap();
+        assert!(super::read_startup_owner(&file).unwrap().is_none());
+        assert!(super::publish_startup_owner_at(&file, &path, "test").is_err());
+        let other = directory.path().join("other.lock");
+        fs::write(&other, b"").unwrap();
+        assert!(super::publish_startup_owner_at(&file, &other, "test").is_err());
     }
 
     #[cfg(unix)]
@@ -4024,6 +4547,11 @@ mod startup_lock_tests {
     #[cfg(unix)]
     #[test]
     fn startup_lock_missing_preexec_readiness_has_bounded_owned_cleanup() {
+        if super::run_isolated_fork_fixture(
+            "startup_lock_tests::startup_lock_missing_preexec_readiness_has_bounded_owned_cleanup",
+        ) {
+            return;
+        }
         let (ready_read, ready_write) = std::io::pipe().expect("ready pipe");
         let (release_read, release_write) = std::io::pipe().expect("release pipe");
         let mut owner = HandshakeChild {
@@ -4069,6 +4597,11 @@ mod startup_lock_tests {
     async fn startup_lock_preexec_listener_retention_ends_at_exec() {
         use std::os::fd::AsRawFd as _;
 
+        if super::run_isolated_fork_fixture(
+            "startup_lock_tests::startup_lock_preexec_listener_retention_ends_at_exec",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().expect("handshake directory");
         let lock_path = directory.path().join("startup.lock");
         let lock = StartupLock::acquire_at(lock_path.clone(), Duration::from_secs(1))
@@ -4162,6 +4695,26 @@ mod startup_lock_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn listener_release_during_gated_cleanup_retains_inherited_startup_fence() {
+        // Parallel pre-exec fixtures deliberately retain every open description
+        // until their gate opens. Isolate this lifetime test instead of guessing
+        // that another fixture has exec'd within the 75ms observation budget.
+        const FIXTURE: &str = "BCODE_TEST_GATED_FENCE_ISOLATED";
+        if std::env::var_os(FIXTURE).is_none() {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["startup_lock_tests::listener_release_during_gated_cleanup_retains_inherited_startup_fence", "--exact", "--nocapture"])
+                .env(FIXTURE, "1")
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn().unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
         let directory = tempfile::tempdir().expect("temporary daemon directory");
         let path = directory.path().join("startup.lock");
         let owner = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))

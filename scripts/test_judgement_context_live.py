@@ -9,6 +9,119 @@ spec.loader.exec_module(context)
 
 
 class ContextComparisonTests(unittest.TestCase):
+    def test_context_overlay_requires_explicit_request_persistence_before_import(self):
+        arm = {'overlay_toml': '[observability]\npersist_model_requests=false\n'}
+        with self.assertRaisesRegex(context.PilotError, 'persistence required'):
+            context.validate_overlay({}, arm)
+        arm['overlay_toml'] = ''
+        with self.assertRaisesRegex(context.PilotError, 'persistence required'):
+            context.validate_overlay({}, arm)
+        arm['overlay_toml'] = '[observability]\npersist_model_requests=true\n'
+        with self.assertRaisesRegex(context.PilotError, 'debug observability required'):
+            context.validate_overlay({}, arm)
+
+    def test_context_report_requires_explicit_bounded_tail_metadata_not_snapshot_claim(self):
+        import tempfile
+        from unittest import mock
+        for field, value in [('source', 'future'), ('from_sequence', True),
+                             ('events_read', 2), ('pages_read', 0),
+                             ('current_tail_reached', False), ('closed_snapshot_verified', True)]:
+            report = self.context_report()
+            report['history_coverage'][field] = value
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                with mock.patch.object(context, 'json_command', return_value=report):
+                    with self.assertRaises(context.PilotError):
+                        context.retain_context_observation_report({}, {}, {'arm': 'on'},
+                            Path(directory) / 'workspace', 'session', 'turn',
+                            self.context_events(), {'complete': True}, 1, 10)
+
+    def test_normalized_context_report_is_consumed_without_raw_receipt_accounting(self):
+        import tempfile
+        from unittest import mock
+        report = self.context_report()
+        with tempfile.TemporaryDirectory() as directory:
+            result = {}
+            with mock.patch.object(context, 'json_command', return_value=report) as public:
+                context.retain_context_observation_report(result, {}, {'arm': 'on'},
+                    Path(directory) / 'workspace', 'session', 'turn',
+                    self.context_events(), {'complete': True}, 1, 10)
+            self.assertEqual(public.call_args.args[2][:3],
+                             ['session', 'context-observation-report', 'session'])
+            self.assertEqual(result['context_observation_report'], report)
+            self.assertEqual(result['context_observation_report_receipt']['scope'], 'representation_only')
+
+    @staticmethod
+    def context_events():
+        return [{'session_id': 'session', 'sequence': 3, 'kind': {'trace_event': {'trace': {
+            'turn_id': 'turn', 'payload': {'model_request_built': {}}}}}}]
+
+    @staticmethod
+    def context_report():
+        return {'schema': 'bcode.eval.context_observations.v1', 'session_id': 'session',
+                'scope': 'caller_retained_event_window', 'export_completed': True,
+                'events_supplied': 1, 'delivery_claim': False, 'quality_claim': False,
+                'window_complete': False,
+                'history_coverage': {'source': 'public_session_history', 'from_sequence': 0,
+                    'events_read': 1, 'pages_read': 1, 'current_tail_reached': True,
+                    'closed_snapshot_verified': False},
+                'context_representation_reports': [{'session_id': 'session', 'turn_id': 'turn',
+                    'sequence': 5, 'validation': {'status': 'full_receipt_validated',
+                        'scope': 'representation_only', 'delivery_claim': False,
+                        'quality_claim': False, 'model_request_sequence': 3,
+                        'lineage_omitted': 0, 'receipt_omitted': 0,
+                        'mandatory': {'count': 1, 'represented': 1, 'dropped': 0, 'unknown': 0},
+                        'optional': {'count': 1, 'represented': 1, 'dropped': 0, 'unknown': 0},
+                        'optional_sources_certified': True, 'optional_representation': 'all_represented'}}]}
+
+    def test_missing_foreign_future_and_uncertified_reports_fail_closed(self):
+        import tempfile
+        from unittest import mock
+        reports = []
+        for field, value in [('schema', 'future'), ('session_id', 'foreign'),
+                             ('events_supplied', 0), ('context_representation_reports', [])]:
+            report = self.context_report()
+            report[field] = value
+            reports.append(report)
+        for field, value in [('status', 'artifact_not_validated'),
+                             ('optional_sources_certified', False),
+                             ('model_request_sequence', 5), ('lineage_omitted', 1),
+                             ('receipt_omitted', True)]:
+            report = self.context_report()
+            report['context_representation_reports'][0]['validation'][field] = value
+            reports.append(report)
+        duplicate = self.context_report()
+        duplicate['context_representation_reports'] *= 2
+        reports.append(duplicate)
+        with tempfile.TemporaryDirectory() as directory:
+            for report in reports:
+                with self.subTest(report=report), mock.patch.object(context, 'json_command', return_value=report):
+                    with self.assertRaises(context.PilotError):
+                        context.retain_context_observation_report({}, {}, {'arm': 'on'},
+                            Path(directory) / 'workspace', 'session', 'turn',
+                            self.context_events(), {'complete': True}, 1, 10)
+            with mock.patch.object(context, 'json_command') as public:
+                with self.assertRaises(context.PilotError):
+                    context.retain_context_observation_report({}, {}, {'arm': 'on'},
+                        Path(directory) / 'workspace', 'session', 'turn', [], {'complete': False}, 1, 10)
+                public.assert_not_called()
+
+    def test_every_actual_request_requires_an_exact_validated_observation(self):
+        import tempfile
+        from unittest import mock
+        events = self.context_events()
+        second = self.context_events()[0]
+        second['sequence'] = 4
+        events.append(second)
+        report = self.context_report()
+        report['events_supplied'] = 2
+        report['history_coverage']['events_read'] = 2
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(context, 'json_command', return_value=report):
+                with self.assertRaises(context.PilotError):
+                    context.retain_context_observation_report({}, {}, {'arm': 'on'},
+                        Path(directory) / 'workspace', 'session', 'turn',
+                        events, {'complete': True}, 1, 10)
+
     def test_first_public_observation_survives_disposal_and_rejects_foreign_turn(self):
         import tempfile
         from unittest import mock

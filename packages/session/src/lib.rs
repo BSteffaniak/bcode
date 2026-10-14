@@ -6305,6 +6305,67 @@ mod tests {
     }
 
     #[test]
+    fn reserved_observation_detail_is_bounded_typed_and_codec_neutral() {
+        use bcode_session_models::{
+            MAX_REQUEST_CONTEXT_OBSERVATION_DETAIL_BYTES,
+            REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE as EVENT,
+            RequestContextObservationReference as Reference,
+        };
+        let reference = Reference::new(
+            "round".into(),
+            7,
+            9,
+            TraceBlobRef {
+                sha256: "a".repeat(64),
+                path: "opaque/blob".into(),
+                content_type: "application/json".into(),
+                byte_len: 123,
+                redaction: bcode_session_models::TraceRedaction::None,
+                completeness: bcode_session_models::TraceBlobCompleteness::Complete,
+            },
+        )
+        .unwrap();
+        let detail = reference.encode().unwrap();
+        assert_eq!(Reference::parse(EVENT, &detail).unwrap(), reference);
+        assert!(Reference::parse("request_projection", &detail).is_err());
+        assert!(
+            Reference::parse(
+                EVENT,
+                &" ".repeat(MAX_REQUEST_CONTEXT_OBSERVATION_DETAIL_BYTES + 1)
+            )
+            .is_err()
+        );
+        assert!(Reference::parse(EVENT, &detail[..detail.len() - 1]).is_err());
+        let mut value = serde_json::to_value(&reference).unwrap();
+        value["version"] = serde_json::json!(2);
+        assert!(Reference::parse(EVENT, &value.to_string()).is_err());
+        value["version"] = serde_json::json!(1);
+        value["unexpected"] = serde_json::json!(true);
+        assert!(Reference::parse(EVENT, &value.to_string()).is_err());
+        let mut invalid = reference.clone();
+        invalid.blob.completeness = bcode_session_models::TraceBlobCompleteness::Truncated;
+        assert!(invalid.encode().is_err());
+        invalid = reference;
+        invalid.blob.sha256 = "x".repeat(64);
+        assert!(invalid.encode().is_err());
+        let old = PreObservationTracePayload::ProviderEvent {
+            event_type: EVENT.into(),
+            detail: Some(detail),
+        };
+        let bytes = bmux_codec::to_positional_vec(&(old.clone(), 91_u64)).unwrap();
+        let (current, tail): (SessionTracePayload, u64) =
+            bmux_codec::from_positional_bytes(&bytes).unwrap();
+        assert_eq!(tail, 91);
+        let (historical, tail): (PreObservationTracePayload, u64) =
+            bmux_codec::from_positional_bytes(
+                &bmux_codec::to_positional_vec(&(current, 91_u64)).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(historical, old);
+        assert_eq!(tail, 91);
+    }
+
+    #[test]
     fn all_trace_payload_variants_round_trip_through_bmux_codec() {
         let payloads = vec![
             SessionTracePayload::ProviderRound {

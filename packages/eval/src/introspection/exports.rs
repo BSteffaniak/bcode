@@ -9,6 +9,7 @@ pub(super) fn apply(events: &[SessionEvent], document: &Value) -> Value {
     let references = super::referenced_blobs(events);
     let mut outcomes = Vec::new();
     let mut complete_requests = 0;
+    let mut representation_reports = Vec::new();
     for reference in &references {
         let matching: Vec<_> = receipts
             .into_iter()
@@ -57,6 +58,21 @@ pub(super) fn apply(events: &[SessionEvent], document: &Value) -> Value {
         if reference.kind == "model_request" && status == "exported" && complete {
             complete_requests += 1;
         }
+        if reference.kind == "request_context_representation" {
+            let validation = if status == "exported" && complete {
+                matching
+                    .first()
+                    .and_then(|receipt| receipt.get("context_representation_validation"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"status":"artifact_not_validated"}))
+            } else {
+                json!({"status":status})
+            };
+            representation_reports.push(
+                json!({"session_id":reference.session_id,"sequence":reference.sequence,
+                "turn_id":reference.turn_id,"validation":validation,"scope":"representation_only"}),
+            );
+        }
         outcomes.push(
             json!({"session_id":reference.session_id,"sequence":reference.sequence,
             "turn_id":reference.turn_id,"tool_call_id":reference.tool_call_id,
@@ -70,6 +86,10 @@ pub(super) fn apply(events: &[SessionEvent], document: &Value) -> Value {
     summary["export_outcomes"] = json!(outcomes);
     summary["complete_model_inputs_exported"] =
         json!(requests > 0 && complete_requests == requests);
+    summary["context_representation_reports"] = json!(representation_reports);
+    summary["context_representation_scope"] = json!(
+        "exact validated exported artifacts only; optional certification means complete nonempty optional representation, never delivery or quality; omitted lineage remains unclassified"
+    );
     summary["export_scope"] = json!(
         "retained request-build observations only; redacted content and unobserved requests excluded"
     );

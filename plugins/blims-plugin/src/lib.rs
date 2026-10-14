@@ -4,6 +4,8 @@
 
 //! Blims AI company simulator plugin.
 
+pub mod memory;
+
 #[cfg(feature = "static-bundled")]
 mod cli;
 

@@ -61,6 +61,11 @@ impl Drop for ForkChild {
 #[cfg(unix)]
 #[test]
 fn release_is_not_delayed_by_unrelated_fork_child() {
+    if crate::run_isolated_fork_fixture(
+        "execution_lifetime::tests::release_is_not_delayed_by_unrelated_fork_child",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let record = record(root.path());
     let guard = ExecutionLifetime::begin(root.path(), &record).unwrap();
@@ -209,7 +214,107 @@ fn maintenance_excludes_execution_and_publishes_released_coordinator() {
     drop(maintenance);
     let mut daemon = record;
     daemon.instance_id = "new-daemon".into();
-    assert!(ExecutionLifetime::begin(root.path(), &daemon).is_ok());
+    ExecutionLifetime::begin(root.path(), &daemon)
+        .expect("released maintenance owner must permit new execution admission");
+}
+
+#[cfg(unix)]
+#[test]
+fn maintenance_owner_release_survives_fork_and_child_drop_preserves_parent_fence() {
+    if crate::run_isolated_fork_fixture(
+        "execution_lifetime::tests::maintenance_owner_release_survives_fork_and_child_drop_preserves_parent_fence",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let coordinator = record(root.path());
+    let maintenance = ExecutionMaintenance::acquire(root.path()).unwrap();
+    maintenance
+        .publish_coordinator(root.path(), &coordinator)
+        .unwrap();
+    // Retain a separate inherited descriptor after the child drops its guard.
+    // This makes owner release, rather than descendant exit, necessary.
+    let inherited = maintenance.file.try_clone().unwrap();
+    let mut ready = [0; 2];
+    let mut release = [0; 2];
+    // SAFETY: output buffers are valid. The child performs the specific guard
+    // drop under test (PID check and descriptor close), otherwise only libc
+    // descriptor operations, then _exit without unrelated Rust destructors.
+    unsafe {
+        assert_eq!(libc::pipe(ready.as_mut_ptr()), 0);
+        assert_eq!(libc::pipe(release.as_mut_ptr()), 0);
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            libc::close(ready[0]);
+            libc::close(release[1]);
+            libc::alarm(10);
+            drop(maintenance);
+            let byte = b'R';
+            if libc::write(ready[1], std::ptr::from_ref(&byte).cast(), 1) != 1 {
+                libc::_exit(125);
+            }
+            libc::close(ready[1]);
+            let mut byte = 0_u8;
+            let read = libc::read(release[0], std::ptr::from_mut(&mut byte).cast(), 1);
+            // inherited remains open until _exit.
+            libc::_exit(i32::from(read != 0));
+        }
+        libc::close(ready[1]);
+        libc::close(release[0]);
+        let mut child = ForkChild {
+            pid,
+            release_fd: release[1],
+        };
+        drop(inherited);
+        let mut poll = libc::pollfd {
+            fd: ready[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let notified = libc::poll(&raw mut poll, 1, 3_000);
+        let mut byte = 0_u8;
+        let read = if notified == 1 {
+            libc::read(ready[0], std::ptr::from_mut(&mut byte).cast(), 1)
+        } else {
+            -1
+        };
+        libc::close(ready[0]);
+        assert_eq!(read, 1, "child guard drop notification missing");
+        assert_eq!(byte, b'R');
+        let mut daemon = coordinator.clone();
+        daemon.instance_id = "post-maintenance-daemon".into();
+        assert!(
+            ExecutionMaintenance::acquire(root.path()).is_err(),
+            "child drop must not release parent maintenance fence"
+        );
+        assert!(
+            ExecutionLifetime::begin(root.path(), &daemon).is_err(),
+            "execution must remain fenced until owner release"
+        );
+        assert_eq!(
+            status(root.path(), &coordinator),
+            ExecutionLifetimeStatus::Released
+        );
+        let mut child_status = 0;
+        assert_eq!(
+            libc::waitpid(pid, &raw mut child_status, libc::WNOHANG),
+            0,
+            "gated descendant must survive observations"
+        );
+        drop(maintenance);
+        let execution = ExecutionLifetime::begin(root.path(), &daemon)
+            .expect("owner release must admit execution while inherited descendant survives");
+        assert_eq!(status(root.path(), &daemon), ExecutionLifetimeStatus::Live);
+        assert!(ExecutionMaintenance::acquire(root.path()).is_err());
+        drop(execution);
+        let next_maintenance = ExecutionMaintenance::acquire(root.path())
+            .expect("released execution must admit a new maintenance owner");
+        let child_status = child.reap().expect("reap gated descendant");
+        assert!(libc::WIFEXITED(child_status));
+        assert_eq!(libc::WEXITSTATUS(child_status), 0);
+        drop(next_maintenance);
+    }
 }
 
 #[test]

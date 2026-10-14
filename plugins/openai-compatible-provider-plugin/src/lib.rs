@@ -4930,7 +4930,8 @@ async fn send_responses_request_to(
     url: &str,
 ) -> Result<reqwest::Response, ProviderError> {
     let routing = turn.map(|turn| &turn.routing);
-    let request_body = build_responses_request(settings, request, model_id)?;
+    let (request_body, context_representation) =
+        build_responses_request_with_representation(settings, request, model_id)?;
     let mut builder = client
         .post(url)
         .bearer_auth(access_token)
@@ -4966,7 +4967,7 @@ async fn send_responses_request_to(
         builder = builder.header(turn_routing::HEADER, token);
     }
     let bytes = encode_request_body(&request_body)?;
-    let projection = openai_request_projection(
+    let mut projection = openai_request_projection(
         settings,
         request,
         bytes.len() as u64,
@@ -4975,6 +4976,7 @@ async fn send_responses_request_to(
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len),
     );
+    projection.context_representation = context_representation;
     let mut builder = prepare_http_body(builder, bytes, request, projection, turn)?;
     if let AuthSettings::ChatGpt {
         account_id: Some(account_id),
@@ -6009,13 +6011,29 @@ enum ResponsesInstructionStrategy {
 struct ResponsesProjection {
     instructions: Option<String>,
     input: Vec<ResponsesInputItem>,
+    context_representation: Option<bcode_model::lineage::RequestContextRepresentation>,
 }
 
+#[cfg(test)]
 fn build_responses_request(
     settings: &Settings,
     request: &ModelTurnRequest,
     model_id: &str,
 ) -> Result<serde_json::Value, ProviderError> {
+    build_responses_request_with_representation(settings, request, model_id).map(|(body, _)| body)
+}
+
+fn build_responses_request_with_representation(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+    model_id: &str,
+) -> Result<
+    (
+        serde_json::Value,
+        Option<bcode_model::lineage::RequestContextRepresentation>,
+    ),
+    ProviderError,
+> {
     validate_context_lineage(request)?;
     let previous_response_id = responses_previous_response_id(settings, request);
     let capabilities = settings.dialect.responses_request_capabilities();
@@ -6079,7 +6097,7 @@ fn build_responses_request(
     })?;
     apply_openai_typed_request_options(&mut body, &request.provider_context)?;
     merge_provider_request_options(&mut body, &request.provider_context.request)?;
-    Ok(body)
+    Ok((body, projection.context_representation))
 }
 
 fn apply_openai_typed_request_options(
@@ -6380,7 +6398,8 @@ fn responses_projection(
     } else {
         response_instruction_bundle(request.system_prompt.as_deref(), &request.messages)
     };
-    let input = model_messages_to_responses_input(request, project_reused_history, dialect);
+    let (input, context_representation) =
+        responses_input_with_representation(request, project_reused_history, dialect);
     // xAI (and public Responses API) forbid sending both `instructions` and `previous_response_id`.
     // When reusing a prior response, the instructions are already attached to it.
     let instructions = if previous_response_id.is_some() {
@@ -6393,6 +6412,7 @@ fn responses_projection(
     ResponsesProjection {
         instructions,
         input,
+        context_representation,
     }
 }
 
@@ -6501,54 +6521,120 @@ fn provider_reasoning_insert_index(input: &[ResponsesInputItem]) -> usize {
     input.len().saturating_sub(1)
 }
 
+#[cfg(test)]
 fn model_messages_to_responses_input(
     request: &ModelTurnRequest,
     project_reused_history: bool,
     dialect: OpenAiCompatibleDialect,
 ) -> Vec<ResponsesInputItem> {
-    let start = project_reused_history
-        .then(|| {
-            request
-                .conversation_reuse
-                .previous_provider_response_id
-                .as_ref()
-                .and(request.conversation_reuse.new_messages_start_index)
-        })
-        .flatten()
-        .unwrap_or_default();
-    if dialect == OpenAiCompatibleDialect::ChatGptCodex {
-        // Preserve application instruction positions while using the same tool
-        // protocol sanitizer as ordinary Responses projection.
-        let mut input = Vec::new();
-        let mut seen = BTreeSet::new();
-        let mut pending = BTreeSet::new();
-        for message in request
-            .messages
-            .iter()
-            .skip(start.min(request.messages.len()))
+    responses_input_with_representation(request, project_reused_history, dialect).0
+}
+
+// Ordinals follow converted items through the existing sanitizer. Only whole, supported
+// source blocks are certified; reused remote history and opaque/rich shapes remain unknown.
+fn responses_input_with_representation(
+    request: &ModelTurnRequest,
+    project_reused_history: bool,
+    dialect: OpenAiCompatibleDialect,
+) -> (
+    Vec<ResponsesInputItem>,
+    Option<bcode_model::lineage::RequestContextRepresentation>,
+) {
+    use bcode_model::lineage::ContextRepresentationDisposition as D;
+    let mut receipt = unknown_context_representation(request);
+    let start = if project_reused_history {
+        request
+            .conversation_reuse
+            .previous_provider_response_id
+            .as_ref()
+            .and(request.conversation_reuse.new_messages_start_index)
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    let mut input = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = BTreeSet::new();
+    for (message_index, message) in request
+        .messages
+        .iter()
+        .enumerate()
+        .skip(start.min(request.messages.len()))
+    {
+        let items = if dialect == OpenAiCompatibleDialect::ChatGptCodex
+            && message.role == MessageRole::System
         {
-            let items = if message.role == MessageRole::System {
-                bcode_openai_responses::responses_message("developer", message, true)
-            } else {
-                bcode_openai_responses::model_message_to_responses_input(message, &|name| {
-                    provider_tool_name(name, dialect)
-                })
-            };
-            for item in items {
-                bcode_openai_responses::push_sanitized_responses_input_item(
-                    &mut input,
-                    &mut seen,
-                    &mut pending,
-                    item,
-                );
+            bcode_openai_responses::responses_message("developer", message, true)
+        } else {
+            bcode_openai_responses::model_message_to_responses_input(message, &|name| {
+                provider_tool_name(name, dialect)
+            })
+        };
+        let opaque = message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ProviderExtension { .. }));
+        // Without a per-source rich conversion receipt, no entry in a mixed rich Tool
+        // message can be assigned a trustworthy item slot. Keep the entire message unknown.
+        let rich_tool_message = message.role == MessageRole::Tool
+            && message.content.iter().any(|block| {
+                matches!(block,
+                ContentBlock::ToolResult { result } if !result.content.is_empty())
+            });
+        // These bounded pairs identify source entries and their numeric converted input slots.
+        let mut mappings = Vec::new();
+        if !opaque
+            && !rich_tool_message
+            && let (Some(lineage), Some(receipt)) = (&request.context_lineage, &mut receipt)
+        {
+            let mut tool_slot = 0;
+            for (block_index, block) in message.content.iter().enumerate() {
+                let slot = match (message.role, block) {
+                    (MessageRole::User | MessageRole::Assistant, ContentBlock::Text { text }) if !text.is_empty() => {
+                        items.iter().position(|item| matches!(item, ResponsesInputItem::Message { role, .. }
+                            if role == if message.role == MessageRole::User { "user" } else { "assistant" }))
+                    }
+                    (MessageRole::Tool, ContentBlock::ToolResult { .. }) => {
+                        // The guarded simple-only converter emits exactly one structured
+                        // output per result, with no intervening rich-content messages.
+                        let slot = tool_slot;
+                        tool_slot += 1;
+                        Some(slot)
+                    }
+                    _ => None,
+                };
+                for (entry_index, _) in lineage.entries.iter().enumerate().filter(|(_, entry)| {
+                    entry.message_index == message_index && entry.block_index == block_index
+                }) {
+                    if let Some(slot) = slot.filter(|slot| *slot < items.len()) {
+                        mappings.push((slot, entry_index));
+                    } else if matches!(block, ContentBlock::Text { text } if text.is_empty()) {
+                        receipt.entries[entry_index].disposition = D::Dropped;
+                    }
+                }
             }
         }
-        bcode_openai_responses::append_missing_responses_tool_outputs(&mut input, &mut pending);
-        return input;
+        for (slot, item) in items.into_iter().enumerate() {
+            let retained = match &item {
+                ResponsesInputItem::FunctionCallOutput { call_id, .. } => pending.contains(call_id),
+                _ => true,
+            };
+            bcode_openai_responses::push_sanitized_responses_input_item(
+                &mut input,
+                &mut seen,
+                &mut pending,
+                item,
+            );
+            if let Some(receipt) = &mut receipt {
+                for (_, entry_index) in mappings.iter().filter(|(index, _)| *index == slot) {
+                    receipt.entries[*entry_index].disposition =
+                        if retained { D::Represented } else { D::Dropped };
+                }
+            }
+        }
     }
-    bcode_openai_responses::model_messages_to_responses_input(&request.messages, start, &|name| {
-        provider_tool_name(name, dialect)
-    })
+    bcode_openai_responses::append_missing_responses_tool_outputs(&mut input, &mut pending);
+    (input, receipt)
 }
 
 fn validate_context_lineage(request: &ModelTurnRequest) -> Result<(), ProviderError> {
@@ -12996,6 +13082,198 @@ mod tests {
                 )
                 .collect(),
         });
+    }
+
+    #[test]
+    fn responses_receipt_tracks_wire_text_and_structured_tool_outputs() {
+        use bcode_model::lineage::ContextRepresentationDisposition as D;
+        let output = ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "call-1".into(),
+                    output: "output".into(),
+                    is_error: false,
+                    content: Vec::new(),
+                },
+            }],
+        };
+        let mut request = test_request(vec![
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![
+                    ContentBlock::Text { text: "one".into() },
+                    ContentBlock::Text { text: "two".into() },
+                ],
+            },
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: ToolCall {
+                        id: "call-1".into(),
+                        name: "lookup".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                }],
+            },
+            output.clone(),
+        ]);
+        attach_lineage(&mut request, &[(0, 0), (0, 1), (2, 0)]);
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let (wire, receipt) =
+            build_responses_request_with_representation(&settings, &request, "model").unwrap();
+        let receipt = receipt.unwrap();
+        assert!(
+            receipt
+                .entries
+                .iter()
+                .all(|entry| entry.disposition == D::Represented)
+        );
+        assert!(
+            receipt
+                .validate(request.context_lineage.as_ref().unwrap())
+                .is_ok()
+        );
+        assert_eq!(wire["input"][0]["role"], "user");
+        assert_eq!(wire["input"][0]["content"][0]["text"], "one\ntwo");
+        assert_eq!(wire["input"][2]["type"], "function_call_output");
+        assert_eq!(wire["input"][2]["output"], "output");
+        assert!(wire.get("context_representation").is_none());
+        request.messages = vec![output];
+        attach_lineage(&mut request, &[(0, 0)]);
+        let (wire, receipt) =
+            build_responses_request_with_representation(&settings, &request, "model").unwrap();
+        assert_eq!(receipt.unwrap().entries[0].disposition, D::Dropped);
+        assert_eq!(wire["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn responses_receipt_mixed_rich_tool_message_never_certifies_later_orphan() {
+        use bcode_model::lineage::ContextRepresentationDisposition as D;
+        let mut request = test_request(vec![
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: ToolCall {
+                        id: "a".into(),
+                        name: "lookup".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                }],
+            },
+            ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        result: bcode_model::ToolResult {
+                            call_id: "a".into(),
+                            output: "a-output".into(),
+                            is_error: false,
+                            content: vec![bcode_model::ToolResultContent::Text {
+                                text: "a-rich".into(),
+                            }],
+                        },
+                    },
+                    ContentBlock::ToolResult {
+                        result: bcode_model::ToolResult {
+                            call_id: "b".into(),
+                            output: "b-output".into(),
+                            is_error: false,
+                            content: Vec::new(),
+                        },
+                    },
+                ],
+            },
+        ]);
+        attach_lineage(&mut request, &[(1, 0), (1, 1)]);
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let (wire, receipt) =
+            build_responses_request_with_representation(&settings, &request, "model").unwrap();
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.entries[0].disposition, D::Unknown);
+        assert_eq!(receipt.entries[1].disposition, D::Unknown);
+        assert_eq!(wire["input"][1]["type"], "function_call_output");
+        assert_eq!(wire["input"][1]["call_id"], "a");
+        assert_eq!(wire["input"][2]["role"], "user");
+        assert_eq!(wire["input"][2]["content"][0]["text"], "a-rich");
+        assert_eq!(wire["input"][3]["role"], "user");
+        assert!(
+            wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| !(item["type"] == "function_call_output" && item["call_id"] == "b"))
+        );
+        // Removing rich content permits exact simple slots: A is structured; B is demoted.
+        if let ContentBlock::ToolResult { result } = &mut request.messages[1].content[0] {
+            result.content.clear();
+        }
+        let (wire, receipt) =
+            build_responses_request_with_representation(&settings, &request, "model").unwrap();
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.entries[0].disposition, D::Represented);
+        assert_eq!(receipt.entries[1].disposition, D::Dropped);
+        assert_eq!(wire["input"][2]["role"], "user");
+    }
+
+    #[test]
+    fn responses_receipt_unknown_rich_and_skipped_continuation_sources() {
+        use bcode_model::lineage::ContextRepresentationDisposition as D;
+        let mut request = test_request(vec![
+            text_message(MessageRole::User, "retained history"),
+            text_message(MessageRole::User, "new input"),
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::ProviderExtension {
+                    value: serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"opaque"}]}),
+                }],
+            },
+            ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    result: bcode_model::ToolResult {
+                        call_id: "orphan".into(),
+                        output: "output".into(),
+                        is_error: false,
+                        content: vec![bcode_model::ToolResultContent::Text {
+                            text: "rich".into(),
+                        }],
+                    },
+                }],
+            },
+        ]);
+        attach_lineage(&mut request, &[(0, 0), (1, 0), (2, 0), (3, 0)]);
+        request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Auto;
+        request.conversation_reuse.previous_provider_response_id = Some("previous".into());
+        request.conversation_reuse.new_messages_start_index = Some(1);
+        let (items, receipt) = responses_input_with_representation(
+            &request,
+            true,
+            OpenAiCompatibleDialect::ResponsesApi,
+        );
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.entries[0].disposition, D::Unknown);
+        assert_eq!(receipt.entries[1].disposition, D::Represented);
+        assert_eq!(receipt.entries[2].disposition, D::Unknown);
+        assert_eq!(receipt.entries[3].disposition, D::Unknown);
+        assert!(matches!(&items[0], ResponsesInputItem::Message { role, .. } if role == "user"));
+        let (_, full) = responses_input_with_representation(
+            &request,
+            false,
+            OpenAiCompatibleDialect::ResponsesApi,
+        );
+        assert_eq!(full.unwrap().entries[0].disposition, D::Represented);
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let (wire, receipt) =
+            build_responses_request_with_representation(&settings, &request, "model").unwrap();
+        assert_eq!(wire["previous_response_id"], "previous");
+        assert_eq!(wire["input"][0]["content"][0]["text"], "new input");
+        assert_eq!(receipt.unwrap().entries[0].disposition, D::Unknown);
+        request
+            .provider_context
+            .request
+            .insert("input".into(), serde_json::json!([]).into());
+        assert!(build_responses_request_with_representation(&settings, &request, "model").is_err());
     }
 
     #[test]

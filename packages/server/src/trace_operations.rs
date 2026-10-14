@@ -80,7 +80,7 @@ pub async fn read_range(
             .await
             .map_err(|_| ReadTraceBlobError::Unavailable)?;
         let event = events.first().ok_or(ReadTraceBlobError::NotFound)?;
-        let reference = retained_reference(event, &request)?.clone();
+        let reference = retained_reference(event, &request)?;
         let root = state.trace_store.root.clone();
         let read_request = request.clone();
         // A cancelled future must not release storage admission while blocking IO still runs.
@@ -129,10 +129,10 @@ fn validate_request(request: &ReadSessionTraceBlobRequest) -> Result<(), ReadTra
     Ok(())
 }
 
-fn retained_reference<'a>(
-    event: &'a SessionEvent,
+fn retained_reference(
+    event: &SessionEvent,
     request: &ReadSessionTraceBlobRequest,
-) -> Result<&'a TraceBlobRef, ReadTraceBlobError> {
+) -> Result<TraceBlobRef, ReadTraceBlobError> {
     if event.session_id != request.session_id || event.sequence != request.sequence {
         return Err(ReadTraceBlobError::Damaged);
     }
@@ -142,12 +142,28 @@ fn retained_reference<'a>(
     let SessionEventKind::TraceEvent { trace } = &event.kind else {
         return Err(ReadTraceBlobError::NotFound);
     };
+    if let SessionTracePayload::ProviderEvent { event_type, detail } = &trace.payload
+        && event_type == bcode_session_models::REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE
+    {
+        let reference = bcode_session_models::RequestContextObservationReference::parse(
+            event_type,
+            detail.as_deref().ok_or(ReadTraceBlobError::Damaged)?,
+        )
+        .map_err(|_| ReadTraceBlobError::Unsupported)?;
+        if trace.turn_id.as_ref().is_none_or(String::is_empty)
+            || reference.model_request_sequence >= event.sequence
+        {
+            return Err(ReadTraceBlobError::Damaged);
+        }
+        return Ok(reference.blob);
+    }
     match &trace.payload {
         SessionTracePayload::ModelRequestBuilt { request, .. } => request.as_ref(),
         SessionTracePayload::ToolInvocationStarted { arguments, .. } => arguments.as_ref(),
         SessionTracePayload::ToolInvocationFinished { output, .. } => output.as_ref(),
         _ => None,
     }
+    .cloned()
     .ok_or(ReadTraceBlobError::NotFound)
 }
 

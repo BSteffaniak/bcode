@@ -3846,6 +3846,130 @@ pub struct TraceBlobRef {
     pub completeness: TraceBlobCompleteness,
 }
 
+/// Reserved host-produced event type; ordinary provider details are never parsed as observations.
+pub const REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE: &str = "request_context_observation";
+/// Maximum UTF-8 JSON detail bytes, checked before decoding.
+pub const MAX_REQUEST_CONTEXT_OBSERVATION_DETAIL_BYTES: usize = 4096;
+/// Maximum complete observation artifact bytes.
+pub const MAX_REQUEST_CONTEXT_OBSERVATION_BLOB_BYTES: u64 = 131_072;
+
+/// Versioned reference encoded inside the existing `ProviderEvent` detail string.
+/// This is not a new persisted field/variant and grants no path access authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestContextObservationReference {
+    /// Only version 1 is supported.
+    pub version: u32,
+    /// Exact host provider-round request identifier, not remote delivery identity.
+    pub provider_request_id: String,
+    /// Exact host request representation ordinal.
+    pub request_ordinal: u64,
+    /// Canonical sequence of the originating `ModelRequestBuilt` event.
+    pub model_request_sequence: u64,
+    /// Complete normalized artifact reference; locator remains opaque.
+    pub blob: TraceBlobRef,
+}
+
+impl RequestContextObservationReference {
+    /// Construct a validated version-1 reference.
+    /// # Errors
+    /// Rejects invalid identities, digest, size, content type or completeness.
+    pub fn new(
+        provider_request_id: String,
+        request_ordinal: u64,
+        model_request_sequence: u64,
+        blob: TraceBlobRef,
+    ) -> Result<Self, &'static str> {
+        let value = Self {
+            version: 1,
+            provider_request_id,
+            request_ordinal,
+            model_request_sequence,
+            blob,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validate representation only; does not verify blob bytes or authorize its locator.
+    /// # Errors
+    /// Rejects unsupported versions, invalid IDs, non-lowercase SHA-256, oversized/empty
+    /// artifacts or paths, non-JSON artifacts and incomplete retention.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.version != 1
+            || self.provider_request_id.is_empty()
+            || self.provider_request_id.len() > 1024
+            || self.provider_request_id.chars().any(char::is_control)
+            || self.request_ordinal == 0
+            || self.blob.path.is_empty()
+            || self.blob.path.len() > 512
+            || self.blob.path.chars().any(char::is_control)
+            || self.blob.sha256.len() != 64
+            || !self
+                .blob
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.blob.byte_len == 0
+            || self.blob.byte_len > MAX_REQUEST_CONTEXT_OBSERVATION_BLOB_BYTES
+            || self.blob.content_type != "application/json"
+            || self.blob.completeness != TraceBlobCompleteness::Complete
+        {
+            return Err("unsupported or invalid request context observation reference");
+        }
+        Ok(())
+    }
+
+    /// Encode compact bounded JSON for the reserved event type only.
+    /// # Errors
+    /// Rejects invalid values, serialization failures or an oversized detail.
+    pub fn encode(&self) -> Result<String, &'static str> {
+        self.validate()?;
+        let detail =
+            serde_json::to_string(self).map_err(|_| "observation reference encoding failed")?;
+        if detail.len() > MAX_REQUEST_CONTEXT_OBSERVATION_DETAIL_BYTES {
+            return Err("observation reference detail too large");
+        }
+        Ok(detail)
+    }
+
+    /// Parse only a reserved event's bounded detail; never parse ordinary diagnostic text.
+    /// # Errors
+    /// Rejects other event types, oversized/malformed JSON, unknown fields or invalid values.
+    pub fn parse(event_type: &str, detail: &str) -> Result<Self, &'static str> {
+        if event_type != REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE
+            || detail.len() > MAX_REQUEST_CONTEXT_OBSERVATION_DETAIL_BYTES
+        {
+            return Err("unsupported or oversized observation detail");
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(detail).map_err(|_| "invalid observation reference JSON")?;
+        if json
+            .get("blob")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|blob| {
+                blob.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "sha256"
+                            | "path"
+                            | "content_type"
+                            | "byte_len"
+                            | "redaction"
+                            | "completeness"
+                    )
+                })
+            })
+        {
+            return Err("invalid observation blob reference fields");
+        }
+        let value: Self =
+            serde_json::from_value(json).map_err(|_| "invalid observation reference JSON")?;
+        value.validate()?;
+        Ok(value)
+    }
+}
+
 /// Whether a trace blob represents complete or bounded retained content.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

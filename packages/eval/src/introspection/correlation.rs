@@ -28,6 +28,24 @@ pub fn referenced_blobs(events: &[SessionEvent]) -> Vec<CaptureReference> {
             let SessionEventKind::TraceEvent { trace } = &event.kind else {
                 return None;
             };
+            if let SessionTracePayload::ProviderEvent {
+                event_type,
+                detail: Some(detail),
+            } = &trace.payload
+                && let Ok(reference) =
+                    bcode_session_models::RequestContextObservationReference::parse(
+                        event_type, detail,
+                    )
+            {
+                return Some(CaptureReference {
+                    session_id: event.session_id,
+                    sequence: event.sequence,
+                    turn_id: trace.turn_id.clone(),
+                    tool_call_id: None,
+                    kind: "request_context_representation",
+                    blob: reference.blob,
+                });
+            }
             let (kind, tool_call_id, blob) = match &trace.payload {
                 SessionTracePayload::ModelRequestBuilt {
                     request: Some(blob),

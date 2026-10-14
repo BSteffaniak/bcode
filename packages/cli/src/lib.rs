@@ -5833,6 +5833,19 @@ enum SessionMilestonesCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Explicitly export sensitive captures and inspect normalized context observations.
+    ContextObservationReport {
+        session_id: SessionId,
+        /// Opt-in destination for sensitive artifacts; not printed in the summary.
+        #[arg(long)]
+        output_directory: PathBuf,
+        /// Maximum public history events inspected (never more than 3200).
+        #[arg(long, default_value_t = 3200, value_parser = clap::value_parser!(u32).range(1..=3200))]
+        max_events: u32,
+        /// Maximum public history pages fetched (never more than 32).
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=32))]
+        max_pages: u32,
+    },
     /// Read canonical milestones or explicitly request optional generation (JSON).
     Milestones {
         #[command(subcommand)]
@@ -7183,7 +7196,7 @@ enum LoginCommand {
         /// Store an `OpenAI` platform API key instead of using `ChatGPT` subscription OAuth.
         #[arg(long)]
         api_key: Option<String>,
-        /// Store an OpenAI-compatible API base URL for API-key mode.
+        /// Store an `OpenAI`-compatible API base URL for API-key mode.
         #[arg(long)]
         base_url: Option<String>,
         /// Force `ChatGPT` subscription OAuth mode.
@@ -8602,6 +8615,20 @@ async fn dispatch_non_ranking_session_command(
             limit,
             json,
         } => Box::pin(session_pending(session_id, after, limit, json)).await?,
+        SessionCommand::ContextObservationReport {
+            session_id,
+            output_directory,
+            max_events,
+            max_pages,
+        } => {
+            Box::pin(session_context_observation_report(
+                session_id,
+                &output_directory,
+                max_events,
+                max_pages,
+            ))
+            .await?;
+        }
         SessionCommand::History {
             session_id,
             after,
@@ -16654,6 +16681,174 @@ fn write_pending_submissions(
     Ok(())
 }
 
+async fn session_context_observation_report(
+    session_id: SessionId,
+    output_directory: &Path,
+    max_events: u32,
+    max_pages: u32,
+) -> Result<(), CliError> {
+    let client = session_read_client(session_id).await?;
+    let mut events = Vec::new();
+    let mut sequence = 0;
+    let mut exhausted = false;
+    let mut pages_read = 0;
+    for _ in 0..max_pages {
+        let remaining = usize::try_from(max_events).unwrap_or(3200) - events.len();
+        if remaining == 0 {
+            break;
+        }
+        let page = client
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: Some(SessionHistoryCursor { sequence }),
+                    limit: remaining.min(100),
+                    direction: SessionHistoryDirection::Forward,
+                },
+            )
+            .await?;
+        pages_read += 1;
+        validate_context_report_history_page(session_id, sequence, remaining.min(100), &page)?;
+        if let Some(last) = page.events.last() {
+            sequence = last.sequence.checked_add(1).ok_or_else(|| {
+                CliError::InvalidArguments("context report history sequence overflow".to_owned())
+            })?;
+        }
+        let has_more = page.has_more;
+        events.extend(page.events);
+        if !has_more {
+            exhausted = true;
+            break;
+        }
+    }
+    if !exhausted {
+        return Err(CliError::InvalidArguments(
+            "context report history budget exhausted; no artifacts exported".to_owned(),
+        ));
+    }
+    let mut report = bcode_eval::inspect_session_context_observations(
+        &client,
+        session_id,
+        &events,
+        output_directory,
+    )
+    .await
+    .map_err(|_| {
+        CliError::InvalidArguments(
+            "context observation inspection failed; requested exports may be partial".to_owned(),
+        )
+    })?;
+    let object = report.as_object_mut().ok_or_else(|| {
+        CliError::InvalidArguments("unsupported context observation report".to_owned())
+    })?;
+    // A bounded read reaches a current tail, not a closed snapshot immune to later events.
+    object.insert(
+        "history_coverage".to_owned(),
+        serde_json::json!({
+            "source": "public_session_history", "from_sequence": 0,
+            "events_read": events.len(), "pages_read": pages_read,
+            "current_tail_reached": true, "closed_snapshot_verified": false,
+        }),
+    );
+    print_json(&report)
+}
+
+fn validate_context_report_history_page(
+    session_id: SessionId,
+    expected_sequence: u64,
+    limit: usize,
+    page: &bcode_session_models::SessionHistoryPage,
+) -> Result<(), CliError> {
+    let mut next = expected_sequence;
+    let valid_events = page.events.iter().all(|event| {
+        let valid = event.session_id == session_id && event.sequence == next;
+        next = next.saturating_add(1);
+        valid
+    });
+    if page.session_id != session_id
+        || !page.compatibility_issues.is_empty()
+        || page.events.len() > limit
+        || !valid_events
+        || (page.has_more
+            && (page.events.is_empty()
+                || page.next_cursor != Some(SessionHistoryCursor { sequence: next })))
+    {
+        return Err(CliError::InvalidArguments(
+            "context report history is incomplete or unsupported; no artifacts exported".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod context_observation_report_cli_tests {
+    use super::*;
+
+    #[test]
+    fn export_requires_destination_and_enforces_history_budgets() {
+        let session = SessionId::new().to_string();
+        let base = [
+            "bcode",
+            "session",
+            "context-observation-report",
+            session.as_str(),
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        let mut args = base.to_vec();
+        args.extend(["--output-directory", "/explicit/export"]);
+        assert!(Cli::try_parse_from(&args).is_ok());
+        for (flag, invalid) in [
+            ("--max-events", "3201"),
+            ("--max-pages", "33"),
+            ("--max-events", "0"),
+            ("--max-pages", "0"),
+        ] {
+            let mut invalid_args = args.clone();
+            invalid_args.push(flag);
+            invalid_args.push(invalid);
+            assert!(Cli::try_parse_from(invalid_args).is_err());
+        }
+    }
+
+    #[test]
+    fn public_history_requires_contiguous_owner_scoped_pages() {
+        let session = SessionId::new();
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 0,
+            timestamp_ms: 0,
+            session_id: session,
+            provenance: None,
+            kind: SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "private".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        };
+        let mut page = bcode_session_models::SessionHistoryPage {
+            session_id: session,
+            events: vec![event],
+            compatibility_issues: Vec::new(),
+            next_cursor: Some(SessionHistoryCursor { sequence: 1 }),
+            has_more: true,
+        };
+        assert!(validate_context_report_history_page(session, 0, 100, &page).is_ok());
+        page.next_cursor = Some(SessionHistoryCursor { sequence: 0 });
+        assert!(validate_context_report_history_page(session, 0, 100, &page).is_err());
+        page.has_more = false;
+        page.events[0].sequence = 1;
+        assert!(validate_context_report_history_page(session, 0, 100, &page).is_err());
+        page.events[0].sequence = 0;
+        page.events[0].session_id = SessionId::new();
+        assert!(validate_context_report_history_page(session, 0, 100, &page).is_err());
+        page.events.clear();
+        page.has_more = true;
+        assert!(validate_context_report_history_page(session, 0, 100, &page).is_err());
+        page.has_more = false;
+        assert!(validate_context_report_history_page(session, 0, 100, &page).is_ok());
+    }
+}
+
 async fn session_history(
     session_id: SessionId,
     after: Option<u64>,
@@ -21144,6 +21339,49 @@ fn provider_stream_event_summary(event: &bcode_session_models::ProviderStreamEve
     }
 }
 
+#[cfg(test)]
+mod observation_summary_tests {
+    #[test]
+    fn reserved_observation_missing_or_future_reference_stays_content_free() {
+        for detail in [
+            None,
+            Some("{\"version\":999,\"locator\":\"private/path\"}".to_owned()),
+        ] {
+            let payload = bcode_session_models::SessionTracePayload::ProviderEvent {
+                event_type: bcode_session_models::REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE.to_owned(),
+                detail,
+            };
+            assert_eq!(
+                super::trace_payload_summary(&payload),
+                "request context observation (invalid reference)"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_observation_detail_is_never_displayed_as_diagnostic_text() {
+        let payload = bcode_session_models::SessionTracePayload::ProviderEvent {
+            event_type: bcode_session_models::REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE.to_owned(),
+            detail: Some("private/locator-and-untrusted-diagnostic".to_owned()),
+        };
+        assert_eq!(
+            super::trace_payload_summary(&payload),
+            "request context observation (invalid reference)"
+        );
+    }
+}
+
+fn observation_reference_summary(event_type: &str, detail: Option<&str>) -> String {
+    let valid = detail.is_some_and(|detail| {
+        bcode_session_models::RequestContextObservationReference::parse(event_type, detail).is_ok()
+    });
+    if valid {
+        "request context observation (normalized metadata retained)".to_owned()
+    } else {
+        "request context observation (invalid reference)".to_owned()
+    }
+}
+
 fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) -> String {
     match payload {
         bcode_session_models::SessionTracePayload::ModelRequestBuilt {
@@ -21172,6 +21410,11 @@ fn trace_payload_summary(payload: &bcode_session_models::SessionTracePayload) ->
                 .as_ref()
                 .map_or_else(String::new, |error| format!(" error={}", one_line(error)))
         ),
+        bcode_session_models::SessionTracePayload::ProviderEvent { event_type, detail }
+            if event_type == bcode_session_models::REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE =>
+        {
+            observation_reference_summary(event_type, detail.as_deref())
+        }
         bcode_session_models::SessionTracePayload::ProviderEvent { event_type, detail } => {
             format!(
                 "provider event {event_type}{}",

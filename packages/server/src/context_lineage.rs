@@ -7,6 +7,7 @@ use bcode_model::{
     },
 };
 use bcode_session_models::SessionId;
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,13 +26,79 @@ fn ordinal() -> Option<u64> {
 pub struct Incorporated {
     pub calls: Vec<u64>,
     pub omitted: u64,
+    whole_blocks: Vec<WholeBlock>,
+}
+
+// Private request-local guard; neither quotation bytes nor fingerprints enter lineage exports.
+struct WholeBlock {
+    entry: ContextLineageEntry,
+    fingerprint: [u8; 32],
+    message_count: usize,
+}
+
+fn user_text_fingerprint(message: &ModelMessage, block_index: usize) -> Option<[u8; 32]> {
+    if message.role != bcode_model::MessageRole::User || message.content.len() != 1 {
+        return None;
+    }
+    let ContentBlock::Text { text } = message.content.get(block_index)? else {
+        return None;
+    };
+    Some(Sha256::digest(text.as_bytes()).into())
 }
 
 impl Incorporated {
+    /// Record a dedicated whole User/Text block at its actual installed position.
+    /// Invalid shapes and exhausted observation capacity remain omissions.
+    pub fn record_whole_block(&mut self, messages: &[ModelMessage], message_index: usize) {
+        if self.calls.len() + self.whole_blocks.len() >= MAX_CONTEXT_LINEAGE_ENTRIES {
+            self.omitted = self.omitted.saturating_add(1);
+            return;
+        }
+        let fingerprint = messages
+            .get(message_index)
+            .and_then(|message| user_text_fingerprint(message, 0));
+        let identities = ordinal().zip(ordinal());
+        let (Some(fingerprint), Some((source_ordinal, operation_ordinal))) =
+            (fingerprint, identities)
+        else {
+            self.omitted = self.omitted.saturating_add(1);
+            return;
+        };
+        self.whole_blocks.push(WholeBlock {
+            entry: ContextLineageEntry {
+                source_ordinal,
+                operation_ordinal,
+                mandatory: false,
+                message_index,
+                block_index: 0,
+            },
+            fingerprint,
+            message_count: messages.len(),
+        });
+    }
+
+    /// Merge request-local producer records without weakening their original guards.
+    pub fn merge(&mut self, other: Self) {
+        self.omitted = self.omitted.saturating_add(other.omitted);
+        for call in other.calls {
+            if self.calls.len() + self.whole_blocks.len() < MAX_CONTEXT_LINEAGE_ENTRIES {
+                self.calls.push(call);
+            } else {
+                self.omitted = self.omitted.saturating_add(1);
+            }
+        }
+        for block in other.whole_blocks {
+            if self.calls.len() + self.whole_blocks.len() < MAX_CONTEXT_LINEAGE_ENTRIES {
+                self.whole_blocks.push(block);
+            } else {
+                self.omitted = self.omitted.saturating_add(1);
+            }
+        }
+    }
     /// Allocate a stable source identity at incorporation time. No block survival is certified.
     /// Returns None when the observation bound or ordinal space is exhausted.
     pub fn record_incorporation(&mut self) -> Option<u64> {
-        if self.calls.len() >= MAX_CONTEXT_LINEAGE_ENTRIES {
+        if self.calls.len() + self.whole_blocks.len() >= MAX_CONTEXT_LINEAGE_ENTRIES {
             self.omitted = self.omitted.saturating_add(1);
             return None;
         }
@@ -77,6 +144,18 @@ pub fn final_lineage(
             // alone cannot prove that hydration, triage or compaction preserved its bytes.
         }
     }
+    for block in &optional.whole_blocks {
+        let unchanged = messages.len() == block.message_count
+            && messages
+                .get(block.entry.message_index)
+                .and_then(|message| user_text_fingerprint(message, block.entry.block_index))
+                == Some(block.fingerprint);
+        if unchanged && lineage.entries.len() < MAX_CONTEXT_LINEAGE_ENTRIES {
+            lineage.entries.push(block.entry.clone());
+        } else {
+            lineage.omitted = lineage.omitted.saturating_add(1);
+        }
+    }
     lineage.validate(messages).ok()?;
     Some(lineage)
 }
@@ -102,12 +181,15 @@ fn append_entry(
     Some(())
 }
 
+type RetainedRequestCapture = (
+    RequestContextLineage,
+    Option<RequestContextRepresentation>,
+    Option<u64>,
+);
+
 #[derive(Debug, Default)]
 pub struct Captures {
-    requests: BTreeMap<
-        (SessionId, String, u64),
-        (RequestContextLineage, Option<RequestContextRepresentation>),
-    >,
+    requests: BTreeMap<(SessionId, String, u64), RetainedRequestCapture>,
 }
 
 const MAX_CAPTURED_REQUESTS: usize = 256;
@@ -119,6 +201,7 @@ const MAX_TURN_BYTES: usize = 1024;
 const MAX_REQUEST_CAPTURE_BYTES: usize = MAX_TURN_BYTES
     + std::mem::size_of::<RequestContextLineage>()
     + std::mem::size_of::<RequestContextRepresentation>()
+    + std::mem::size_of::<Option<u64>>()
     + MAX_CONTEXT_LINEAGE_ENTRIES
         * (std::mem::size_of::<ContextLineageEntry>()
             + std::mem::size_of::<bcode_model::lineage::ContextRepresentationEntry>());
@@ -161,7 +244,53 @@ impl Captures {
         {
             self.requests.pop_first();
         }
-        self.requests.insert(key, (lineage.clone(), None));
+        self.requests.insert(key, (lineage.clone(), None, None));
+    }
+
+    /// Bind the committed `ModelRequestBuilt` event supplied by the owning writer.
+    /// Zero, absent scopes and conflicting rebinding fail closed. Event-kind verification
+    /// belongs to the caller that appended the canonical event, not this ephemeral cache.
+    pub fn bind_request_event(
+        &mut self,
+        session: SessionId,
+        turn: &str,
+        request_ordinal: u64,
+        sequence: u64,
+    ) -> bool {
+        if sequence == 0 || turn.len() > MAX_TURN_BYTES {
+            return false;
+        }
+        let Some((_, _, bound)) =
+            self.requests
+                .get_mut(&(session, turn.to_owned(), request_ordinal))
+        else {
+            return false;
+        };
+        if let Some(previous) = bound {
+            return *previous == sequence;
+        }
+        *bound = Some(sequence);
+        true
+    }
+
+    /// Return validated content-free lineage and its exact committed request-event sequence.
+    /// Missing bindings, evictions, foreign scopes and conflicting receipts return `None`.
+    /// Accepting a receipt here uses the same immutable first-receipt policy as `observe`.
+    pub fn observation(
+        &mut self,
+        session: SessionId,
+        turn: &str,
+        receipt: &RequestContextRepresentation,
+    ) -> Option<(RequestContextLineage, u64)> {
+        if turn.len() > MAX_TURN_BYTES {
+            return None;
+        }
+        let key = (session, turn.to_owned(), receipt.request_ordinal);
+        let sequence = self.requests.get(&key)?.2?;
+        if !self.observe(session, turn, receipt) {
+            return None;
+        }
+        Some((self.requests.get(&key)?.0.clone(), sequence))
     }
 
     pub fn observe(
@@ -173,7 +302,7 @@ impl Captures {
         if turn.len() > MAX_TURN_BYTES {
             return false;
         }
-        let Some((lineage, retained)) =
+        let Some((lineage, retained, _)) =
             self.requests
                 .get_mut(&(session, turn.to_owned(), receipt.request_ordinal))
         else {
@@ -207,11 +336,33 @@ mod tests {
         }]
     }
     #[test]
+    fn merging_whole_blocks_respects_shared_observation_bound() {
+        let messages = vec![ModelMessage {
+            role: bcode_model::MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "quotation".to_owned(),
+            }],
+        }];
+        let mut first = Incorporated::default();
+        let mut second = Incorporated::default();
+        for _ in 0..MAX_CONTEXT_LINEAGE_ENTRIES {
+            first.record_whole_block(&messages, 0);
+            second.record_whole_block(&messages, 0);
+        }
+        first.merge(second);
+        let lineage = final_lineage(&messages, &first).unwrap();
+        assert_eq!(lineage.entries.len(), MAX_CONTEXT_LINEAGE_ENTRIES);
+        assert_eq!(lineage.omitted, MAX_CONTEXT_LINEAGE_ENTRIES as u64);
+        assert!(lineage.validate(&messages).is_ok());
+    }
+
+    #[test]
     fn final_builder_retains_mandatory_and_omits_unmatched_optional() {
         let messages = messages();
         let optional = Incorporated {
             calls: vec![11, 12],
             omitted: 0,
+            ..Incorporated::default()
         };
         let lineage = final_lineage(&messages, &optional).unwrap();
         assert!(lineage.validate(&messages).is_ok());
@@ -321,7 +472,7 @@ mod tests {
         captures.insert(session, "round", &changed);
         assert!(captures.observe(session, "round", &receipt));
         let retained = &captures.requests[&(session, "round".to_owned(), lineage.request_ordinal)];
-        assert_eq!(retained, &(lineage, Some(receipt)));
+        assert_eq!(retained, &(lineage, Some(receipt), None));
     }
 
     #[test]
@@ -374,6 +525,106 @@ mod tests {
                 .iter()
                 .all(|entry| !optional.calls.contains(&entry.source_ordinal))
         );
+    }
+
+    #[test]
+    fn request_event_binding_requires_exact_scope_and_is_immutable() {
+        let session = SessionId::new();
+        let lineage = final_lineage(&messages(), &Incorporated::default()).unwrap();
+        let mut captures = Captures::default();
+        captures.insert(session, "round", &lineage);
+        let ordinal = lineage.request_ordinal;
+        assert!(!captures.bind_request_event(session, "round", ordinal, 0));
+        assert!(!captures.bind_request_event(SessionId::new(), "round", ordinal, 7));
+        assert!(!captures.bind_request_event(session, "other", ordinal, 7));
+        assert!(!captures.bind_request_event(session, "round", ordinal + 1, 7));
+        assert!(captures.bind_request_event(session, "round", ordinal, 7));
+        assert!(captures.bind_request_event(session, "round", ordinal, 7));
+        assert!(!captures.bind_request_event(session, "round", ordinal, 8));
+        captures.insert(session, "round", &lineage);
+        assert!(!captures.bind_request_event(session, "round", ordinal, 8));
+        assert_eq!(
+            captures.requests[&(session, "round".to_owned(), ordinal)].2,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn observation_requires_bound_event_and_rejects_conflicting_receipts() {
+        let session = SessionId::new();
+        let lineage = final_lineage(&messages(), &Incorporated::default()).unwrap();
+        let mut captures = Captures::default();
+        captures.insert(session, "round", &lineage);
+        let receipt = RequestContextRepresentation {
+            version: 1,
+            request_ordinal: lineage.request_ordinal,
+            entries: Vec::new(),
+            omitted: 1,
+        };
+        assert!(captures.observation(session, "round", &receipt).is_none());
+        assert!(
+            captures.requests[&(session, "round".to_owned(), lineage.request_ordinal)]
+                .1
+                .is_none()
+        );
+        assert!(captures.bind_request_event(session, "round", lineage.request_ordinal, 9));
+        let mut unsupported = receipt.clone();
+        unsupported.version = 2;
+        assert!(
+            captures
+                .observation(session, "round", &unsupported)
+                .is_none()
+        );
+        assert!(
+            captures
+                .observation(SessionId::new(), "round", &receipt)
+                .is_none()
+        );
+        assert!(captures.observation(session, "other", &receipt).is_none());
+        assert_eq!(
+            captures.observation(session, "round", &receipt),
+            Some((lineage.clone(), 9))
+        );
+        let mut conflicting = receipt.clone();
+        conflicting.omitted = 0;
+        conflicting
+            .entries
+            .push(bcode_model::lineage::ContextRepresentationEntry {
+                source_ordinal: lineage.entries[0].source_ordinal,
+                disposition: bcode_model::lineage::ContextRepresentationDisposition::Unknown,
+            });
+        assert!(conflicting.validate(&lineage).is_ok());
+        assert!(
+            captures
+                .observation(session, "round", &conflicting)
+                .is_none()
+        );
+        assert_eq!(
+            captures.observation(session, "round", &receipt),
+            Some((lineage, 9))
+        );
+    }
+
+    #[test]
+    fn evicted_request_event_cannot_supply_an_observation() {
+        let session = SessionId::new();
+        let lineage = final_lineage(&messages(), &Incorporated::default()).unwrap();
+        let mut captures = Captures::default();
+        captures.insert(session, "round", &lineage);
+        assert!(captures.bind_request_event(session, "round", lineage.request_ordinal, 9));
+        for _ in 0..MAX_CAPTURED_REQUESTS {
+            let next = final_lineage(&messages(), &Incorporated::default()).unwrap();
+            captures.insert(session, "round", &next);
+        }
+        let receipt = RequestContextRepresentation {
+            version: 1,
+            request_ordinal: lineage.request_ordinal,
+            entries: Vec::new(),
+            omitted: 1,
+        };
+        assert!(!captures.bind_request_event(session, "round", lineage.request_ordinal, 9));
+        assert!(!captures.observe(session, "round", &receipt));
+        assert!(captures.observation(session, "round", &receipt).is_none());
     }
 
     #[test]

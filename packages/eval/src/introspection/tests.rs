@@ -226,3 +226,62 @@ fn provider_errors_and_retry_prose_are_not_portable() {
     assert_eq!(row["correlation"]["provider_turn_id"], "provider-turn");
     assert!(row["correlation"]["request_id"].is_null());
 }
+
+#[test]
+fn only_reserved_valid_observation_details_discover_artifacts() {
+    use bcode_session_models::{
+        REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE, RequestContextObservationReference,
+    };
+    let session = SessionId::new();
+    let reference = RequestContextObservationReference::new(
+        "round".into(),
+        7,
+        1,
+        TraceBlobRef {
+            sha256: "a".repeat(64),
+            path: "opaque".into(),
+            content_type: "application/json".into(),
+            byte_len: 12,
+            redaction: TraceRedaction::None,
+            completeness: TraceBlobCompleteness::Complete,
+        },
+    )
+    .unwrap();
+    let make = |event_type: &str, detail: String| {
+        event(
+            session,
+            2,
+            SessionEventKind::TraceEvent {
+                trace: Box::new(SessionTraceEvent {
+                    timestamp_ms: 1,
+                    turn_id: Some("turn".into()),
+                    phase: SessionTracePhase::ModelProviderEvent,
+                    payload: SessionTracePayload::ProviderEvent {
+                        event_type: event_type.into(),
+                        detail: Some(detail),
+                    },
+                }),
+            },
+        )
+    };
+    let valid = make(
+        REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE,
+        reference.encode().unwrap(),
+    );
+    let captures = super::referenced_blobs(&[valid]);
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures[0].kind, "request_context_representation");
+    assert!(
+        super::referenced_blobs(&[make("request_projection", reference.encode().unwrap())])
+            .is_empty()
+    );
+    let mut future = reference;
+    future.version = 2;
+    assert!(
+        super::referenced_blobs(&[make(
+            REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE,
+            serde_json::to_string(&future).unwrap()
+        )])
+        .is_empty()
+    );
+}

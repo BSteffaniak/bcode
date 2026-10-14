@@ -80,10 +80,112 @@ fn request_wire_contract_rejects_unknown_fields() {
 }
 
 #[test]
+fn observation_reference_requires_turn_and_earlier_request_event() {
+    use bcode_session_models::{
+        REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE, RequestContextObservationReference,
+    };
+    let (_root, request, mut reference) = fixture(b"payload");
+    reference.content_type = "application/json".to_owned();
+    let observation = RequestContextObservationReference::new(
+        "provider-round".to_owned(),
+        1,
+        6,
+        reference.clone(),
+    )
+    .unwrap();
+    let mut source = event(&request, reference.clone());
+    let SessionEventKind::TraceEvent { trace } = &mut source.kind else {
+        panic!("trace");
+    };
+    trace.turn_id = Some("turn".to_owned());
+    trace.payload = SessionTracePayload::ProviderEvent {
+        event_type: REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE.to_owned(),
+        detail: Some(observation.encode().unwrap()),
+    };
+    assert_eq!(retained_reference(&source, &request), Ok(reference));
+    for sequence in [7, 8] {
+        let mut future = observation.clone();
+        future.model_request_sequence = sequence;
+        let SessionEventKind::TraceEvent { trace } = &mut source.kind else {
+            panic!("trace");
+        };
+        trace.payload = SessionTracePayload::ProviderEvent {
+            event_type: REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE.to_owned(),
+            detail: Some(future.encode().unwrap()),
+        };
+        assert_eq!(
+            retained_reference(&source, &request),
+            Err(ReadTraceBlobError::Damaged)
+        );
+    }
+    let SessionEventKind::TraceEvent { trace } = &mut source.kind else {
+        panic!("trace");
+    };
+    trace.turn_id = None;
+    trace.payload = SessionTracePayload::ProviderEvent {
+        event_type: REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE.to_owned(),
+        detail: Some(observation.encode().unwrap()),
+    };
+    assert_eq!(
+        retained_reference(&source, &request),
+        Err(ReadTraceBlobError::Damaged)
+    );
+}
+
+#[test]
+fn malformed_future_and_nonreference_observations_are_not_exportable() {
+    use bcode_session_models::{
+        REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE, RequestContextObservationReference,
+    };
+    let (_root, request, mut reference) = fixture(b"payload");
+    reference.content_type = "application/json".to_owned();
+    let observation =
+        RequestContextObservationReference::new("round".to_owned(), 1, 6, reference.clone())
+            .unwrap();
+    let mut value = serde_json::to_value(&observation).unwrap();
+    value["version"] = serde_json::json!(2);
+    for (event_type, detail, expected) in [
+        (
+            REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE,
+            "{broken".to_owned(),
+            ReadTraceBlobError::Unsupported,
+        ),
+        (
+            REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE,
+            value.to_string(),
+            ReadTraceBlobError::Unsupported,
+        ),
+        (
+            "request_projection",
+            observation.encode().unwrap(),
+            ReadTraceBlobError::NotFound,
+        ),
+    ] {
+        let mut source = event(&request, reference.clone());
+        let SessionEventKind::TraceEvent { trace } = &mut source.kind else {
+            panic!("trace");
+        };
+        trace.turn_id = Some("turn".to_owned());
+        trace.payload = SessionTracePayload::ProviderEvent {
+            event_type: event_type.to_owned(),
+            detail: Some(detail),
+        };
+        assert_eq!(retained_reference(&source, &request), Err(expected));
+    }
+    reference.path = "../private.json".to_owned();
+    let foreign =
+        RequestContextObservationReference::new("round".to_owned(), 1, 6, reference).unwrap();
+    assert_eq!(
+        validate_reference(&request, &foreign.blob),
+        Err(ReadTraceBlobError::Damaged)
+    );
+}
+
+#[test]
 fn canonical_event_identity_and_version_are_required() {
     let (_root, request, reference) = fixture(b"payload");
     let mut source = event(&request, reference.clone());
-    assert_eq!(retained_reference(&source, &request), Ok(&reference));
+    assert_eq!(retained_reference(&source, &request), Ok(reference.clone()));
     source.session_id = SessionId::new();
     assert_eq!(
         retained_reference(&source, &request),
@@ -113,7 +215,7 @@ fn canonical_event_identity_and_version_are_required() {
         requires_permission: false,
         arguments: Some(reference.clone()),
     };
-    assert_eq!(retained_reference(&source, &request), Ok(&reference));
+    assert_eq!(retained_reference(&source, &request), Ok(reference));
     let SessionEventKind::TraceEvent { trace } = &mut source.kind else {
         panic!("trace fixture");
     };

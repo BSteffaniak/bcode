@@ -239,6 +239,101 @@ def retain_hook_observation(result, path, job, arm, workspace, session_id, turn_
     return observation
 
 
+def retain_context_observation_report(result, job, arm, workspace, session_id, turn_id,
+                                      events, history, start, end):
+    """Consume Rust-owned validation only; never read trace locators or recount receipts."""
+    require(history.get('complete') is True and events and len(events) <= 8192,
+            'context observation history empty or incomplete')
+    require(all(event.get('session_id') == session_id for event in events),
+            'foreign context observation history')
+    producers = set()
+    for event in events:
+        trace = event.get('kind', {}).get('trace_event', {}).get('trace', {})
+        if (trace.get('turn_id') == turn_id
+                and 'model_request_built' in trace.get('payload', {})):
+            sequence = event.get('sequence')
+            require(type(sequence) is int and start < sequence < end,
+                    'invalid exact-turn model request boundary')
+            producers.add(sequence)
+    require(producers, 'exact-turn model request events missing')
+    directory = Path(workspace).parent / (arm['arm'] + '-context-observations')
+    report = json_command(job, arm, ['session', 'context-observation-report', session_id,
+                                    '--output-directory', str(directory)], workspace)
+    # The endpoint exports a caller-retained window, not an assertion of whole-session coverage.
+    # Exact trial coverage comes from the independently paged terminal history above.
+    result['context_observation_report'] = report
+    require(report.get('schema') == 'bcode.eval.context_observations.v1'
+            and report.get('session_id') == session_id
+            and report.get('scope') == 'caller_retained_event_window'
+            and report.get('export_completed') is True
+            and report.get('delivery_claim') is False and report.get('quality_claim') is False,
+            'unsupported or foreign normalized context observation report')
+    coverage = report.get('history_coverage')
+    require(isinstance(coverage, dict)
+            and coverage.get('source') == 'public_session_history'
+            and type(coverage.get('from_sequence')) is int and coverage['from_sequence'] == 0
+            and coverage.get('current_tail_reached') is True
+            and coverage.get('closed_snapshot_verified') is False
+            and report.get('window_complete') is False
+            and type(coverage.get('events_read')) is int and coverage['events_read'] == len(events)
+            and type(coverage.get('pages_read')) is int and 0 < coverage['pages_read'] <= 32,
+            'context report history coverage missing, partial or unsupported')
+    # Matching cardinality is not snapshot identity. Exact selected-turn producer sets are
+    # checked below; neither independently read window is claimed to be a closed snapshot.
+    supplied = report.get('events_supplied')
+    require(type(supplied) is int and supplied == len(events),
+            'context observation event window differs from retained history')
+    reports = report.get('context_representation_reports')
+    require(isinstance(reports, list) and 0 < len(reports) <= 8192,
+            'normalized context observations missing or oversized')
+    scoped = []
+    seen = set()
+    observed_producers = set()
+    for item in reports:
+        require(isinstance(item, dict) and item.get('session_id') == session_id,
+                'foreign normalized context observation')
+        if item.get('turn_id') != turn_id:
+            continue
+        sequence = item.get('sequence')
+        require(type(sequence) is int and start < sequence < end and sequence not in seen,
+                'conflicting or out-of-window context observation')
+        seen.add(sequence)
+        validation = item.get('validation')
+        require(isinstance(validation, dict)
+                and validation.get('status') == 'full_receipt_validated'
+                and validation.get('scope') == 'representation_only'
+                and validation.get('delivery_claim') is False
+                and validation.get('quality_claim') is False,
+                'context observation artifact not fully validated')
+        producer = validation.get('model_request_sequence')
+        require(type(producer) is int and producer in producers and producer < sequence
+                and producer not in observed_producers,
+                'foreign or conflicting context observation producer boundary')
+        observed_producers.add(producer)
+        for key in ('lineage_omitted', 'receipt_omitted'):
+            require(type(validation.get(key)) is int and validation[key] == 0,
+                    'context observation omission remains an evidence gap')
+        for name in ('mandatory', 'optional'):
+            counts = validation.get(name)
+            require(isinstance(counts, dict) and all(type(counts.get(key)) is int
+                    and counts[key] >= 0 for key in ('count', 'represented', 'dropped', 'unknown')),
+                    'unsupported context observation counts')
+        require(validation['mandatory']['dropped'] == 0
+                and validation['mandatory']['unknown'] == 0,
+                'mandatory representation not certified')
+        scoped.append(validation)
+    require(scoped and observed_producers == producers,
+            'exact-turn context observations missing for actual model requests')
+    require(any(value.get('optional_sources_certified') is True
+                and value.get('optional_representation') == 'all_represented'
+                and value['optional']['count'] > 0 for value in scoped),
+            'history optional source representation not certified')
+    path = Path(workspace).parent / (arm['arm'] + '-context-observation-report.json')
+    write_json(path, report)
+    result['context_observation_report_receipt'] = {'file': str(path), 'sha256': digest(path),
+                                                    'scope': 'representation_only'}
+
+
 def capture_failure(result):
     """Classify only normalized receipt facts, never elapsed time or private errors."""
     capture = result['capture']
@@ -395,6 +490,10 @@ def delivery_proof(request_selection=None):
 def validate_overlay(job, arm):
     """Require explicit treatment/root/budget declarations, not resolved-config claims."""
     overlay = tomllib.loads(arm['overlay_toml'])
+    require(overlay.get('observability', {}).get('persist_model_requests') is True,
+            'explicit model request persistence required before context import')
+    require(overlay.get('observability', {}).get('level') == 'debug',
+            'explicit debug observability required before context import')
     judgement = overlay['judgement']
     require(judgement.get('mode') == 'auto', 'explicit global auto required')
     enabled = context_treatment(job, arm)
@@ -586,6 +685,9 @@ def run(job):
             result['terminal_proof'] = {'verified': True, 'session_id': session_id, 'turn_id': turn_id,
                                         'start_sequence': start, 'end_sequence': end,
                                         'history_sha256': normal_driver.sha(terminal_history)}
+            result['stage'] = 'context_representation'
+            retain_context_observation_report(result, job, arm, workspace, session_id, turn_id,
+                                              terminal_events, terminal_history, start, end)
             result['stage'] = 'observation'
             retain_hook_observation(result, workspace.parent / (arm['arm'] + '-hook-observation.json'),
                                     job, arm, workspace, session_id, turn_id, normal_driver)
@@ -804,7 +906,10 @@ class OfflineTests(unittest.TestCase):
         job = {'pi_root': '/external/pi', 'context_budget_bytes': 256,
                'judgement_selection': {'provider_plugin_id': 'bcode.jev',
                                       'model_id': 'jev-1.13.0', 'auth_profile': 'jev'}}
-        overlay = '''[judgement]
+        overlay = '''[observability]
+level="debug"
+persist_model_requests=true
+[judgement]
 mode="auto"
 tool_result_triage="off"
 context_reranking="auto"

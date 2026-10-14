@@ -137,6 +137,32 @@ The default production session root is resolved only by
 tests, imports, and isolated stores, but all production default paths use the same canonical root.
 `bcode_session::db::session_dir_path` and `session_db_path` own per-session path construction.
 
+### Reserved request-context observation detail
+
+`SessionTracePayload::ProviderEvent` retains its existing fields and positional variant layout.
+Only host-produced `event_type = "request_context_observation"` assigns typed meaning to `detail`:
+`RequestContextObservationReference` version 1 carries provider request ID, host request ordinal,
+originating model-request event sequence and a `TraceBlobRef`. Ordinary provider details are never
+parsed as references. Older readers may display the unknown event as opaque diagnostics; they do
+not acquire observation semantics. No canonical schema/writer epoch change or migration is needed
+for this string-value extension. Historical JSON and named/positional BMUX compatibility tests
+exercise the unchanged payload shape, including trailing-field alignment.
+
+The parser rejects details over 4096 UTF-8 bytes before JSON decoding, unknown versions/fields,
+invalid identities/digests, non-JSON artifacts and incomplete or oversized artifacts (131072 bytes).
+The envelope does not grant locator authority: supported trace export must resolve its canonical
+event, validate confined storage and verify complete bytes. Unknown future envelopes remain opaque
+canonical content and unsupported observation evidence; normal reads never repair or reinterpret
+them. Renderers and search must use locator-safe summaries for this reserved event, not display or
+index its detail. This requirement must be wired before enabling production capture.
+
+Capture remains explicitly opted in through model-request observability settings, with bounded
+exact-request bookkeeping and terminal cleanup. Reference/envelope APIs perform no writes. A
+producer holding a validated content-free lineage may assemble the model-owned artifact without
+retaining request bodies; consumers must validate it against the independently exported exact
+request and producer event. Missing, truncated, foreign or conflicting captures are unavailable
+and cannot prove delivery or quality.
+
 ### Turn execution options
 
 Each admitted user turn persists its provider-neutral `TurnExecutionOptions` inside the canonical

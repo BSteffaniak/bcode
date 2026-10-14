@@ -20256,6 +20256,8 @@ struct ModelPollOutcome {
     provider_error: Option<bcode_model::ProviderError>,
     pending_managed_compaction: Option<PendingManagedCompaction>,
     pending_provider_response_id: Option<String>,
+    context_representation_observed: bool,
+    originating_request_id: String,
     pending_tool_calls: Vec<bcode_model::ToolCall>,
     /// Tool calls the provider started streaming but never completed.
     ///
@@ -21801,14 +21803,6 @@ async fn run_model_turn_inner(
             );
         }
         append_estimated_request_context(state, session_id, context_projection.clone()).await;
-        append_model_request_trace(
-            state,
-            session_id,
-            &request,
-            provider_plugin_id.as_deref(),
-            rounds.provider_round(),
-        )
-        .await;
         let outcome = match Box::pin(run_model_turn_round(
             state,
             session_id,
@@ -23231,23 +23225,7 @@ async fn run_model_turn_round(
         config,
     } = round;
     let mut dispatch_request = request.clone();
-    if let Some(lineage) = &mut dispatch_request.context_lineage {
-        if lineage.validate(&dispatch_request.messages).is_ok() {
-            if let Some(ordinal) = context_lineage::fresh_request_ordinal() {
-                lineage.request_ordinal = ordinal;
-                if (state.observability.persist_model_requests
-                    || state.observability.debug_enabled())
-                    && let Ok(mut captures) = state.context_lineage_captures.lock()
-                {
-                    captures.insert(session_id, &dispatch_request.turn_id, lineage);
-                }
-            } else {
-                dispatch_request.context_lineage = None;
-            }
-        } else {
-            dispatch_request.context_lineage = None;
-        }
-    }
+    prepare_dispatch_context_lineage(state, session_id, &mut dispatch_request);
     let request = &dispatch_request;
     let _capture_lease = context_lineage::CaptureLease {
         captures: &state.context_lineage_captures,
@@ -23267,6 +23245,25 @@ async fn run_model_turn_round(
             ModelTurnOutcome::Cancelled,
             "model turn cancelled",
         ));
+    }
+    let request_sequence = append_model_request_trace(
+        state,
+        session_id,
+        turn_id,
+        request,
+        provider_plugin_id,
+        context_projection.request.round,
+    )
+    .await;
+    if let (Some(sequence), Some(lineage)) = (request_sequence, &request.context_lineage)
+        && let Ok(mut captures) = state.context_lineage_captures.lock()
+    {
+        captures.bind_request_event(
+            session_id,
+            &request.turn_id,
+            lineage.request_ordinal,
+            sequence,
+        );
     }
     service_runtime_priority_commands(state, session_id, command_context).await;
     let scope = active_plugin_scope_for_session(state, session_id).await;
@@ -23440,6 +23437,7 @@ async fn run_model_turn_round(
         next_output_position,
         provider_plugin_id,
         provider_turn_id: &provider_turn_id,
+        originating_request_id: &request.turn_id,
         structured_output: request.structured_output.is_some(),
         streaming,
     };
@@ -23970,6 +23968,7 @@ struct ModelPollContext<'a> {
     next_output_position: &'a mut u64,
     provider_plugin_id: Option<&'a str>,
     provider_turn_id: &'a str,
+    originating_request_id: &'a str,
     structured_output: bool,
     streaming: &'a bcode_config::StreamingConfig,
 }
@@ -24038,6 +24037,7 @@ async fn stream_model_turn_events(
         next_output_position,
         provider_plugin_id,
         provider_turn_id,
+        originating_request_id: _,
         structured_output,
         streaming,
     } = poll;
@@ -24050,6 +24050,7 @@ async fn stream_model_turn_events(
     );
     let mut outcome = ModelPollOutcome {
         tool_catalog: poll.tool_catalog.clone(),
+        originating_request_id: poll.originating_request_id.to_owned(),
         ..ModelPollOutcome::default()
     };
     outcome.stream.delivery = ProviderStreamDelivery::Push;
@@ -24408,6 +24409,7 @@ async fn poll_model_turn_events(
         next_output_position,
         provider_plugin_id,
         provider_turn_id,
+        originating_request_id: _,
         structured_output,
         streaming,
     } = poll;
@@ -24420,6 +24422,7 @@ async fn poll_model_turn_events(
     );
     let mut outcome = ModelPollOutcome {
         tool_catalog: poll.tool_catalog.clone(),
+        originating_request_id: poll.originating_request_id.to_owned(),
         ..ModelPollOutcome::default()
     };
     outcome.stream.delivery = ProviderStreamDelivery::Poll;
@@ -25227,9 +25230,10 @@ async fn handle_provider_turn_event(
             handle_provider_request_projection_event(
                 state,
                 session_id,
-                provider_turn_id,
+                &outcome.originating_request_id,
                 turn_id,
                 projection,
+                &mut outcome.context_representation_observed,
             )
             .await;
         }
@@ -25551,19 +25555,62 @@ async fn handle_provider_usage_event(
     }
 }
 
+fn prepare_dispatch_context_lineage(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &mut ModelTurnRequest,
+) {
+    let Some(lineage) = &mut request.context_lineage else {
+        return;
+    };
+    if lineage.validate(&request.messages).is_err() {
+        request.context_lineage = None;
+        return;
+    }
+    let Some(ordinal) = context_lineage::fresh_request_ordinal() else {
+        request.context_lineage = None;
+        return;
+    };
+    lineage.request_ordinal = ordinal;
+    if state.observability.enabled()
+        && (state.observability.persist_model_requests || state.observability.debug_enabled())
+        && let Ok(mut captures) = state.context_lineage_captures.lock()
+    {
+        captures.insert(session_id, &request.turn_id, lineage);
+    }
+}
+
 async fn handle_provider_request_projection_event(
     state: &ServerState,
     session_id: SessionId,
-    provider_turn_id: &str,
+    originating_request_id: &str,
     turn_id: &str,
     mut projection: bcode_model::ProviderRequestProjection,
+    already_observed: &mut bool,
 ) {
     if let Some(receipt) = &projection.context_representation {
-        let accepted = state
+        let observation = state
             .context_lineage_captures
             .lock()
-            .is_ok_and(|mut captures| captures.observe(session_id, provider_turn_id, receipt));
-        if !accepted {
+            .ok()
+            .and_then(|mut captures| {
+                captures.observation(session_id, originating_request_id, receipt)
+            });
+        if let Some((lineage, sequence)) = observation {
+            if !*already_observed {
+                *already_observed = true;
+                append_context_representation_observation(
+                    state,
+                    session_id,
+                    turn_id,
+                    originating_request_id,
+                    sequence,
+                    lineage,
+                    receipt.clone(),
+                )
+                .await;
+            }
+        } else {
             // Ignore unverified request-only metadata without suppressing unrelated projection telemetry.
             projection.context_representation = None;
         }
@@ -25574,6 +25621,76 @@ async fn handle_provider_request_projection_event(
         turn_id,
         "request_projection",
         Some(provider_request_projection_detail(&projection)),
+    )
+    .await;
+}
+
+async fn append_context_representation_observation(
+    state: &ServerState,
+    session_id: SessionId,
+    canonical_turn_id: &str,
+    provider_request_id: &str,
+    model_request_sequence: u64,
+    lineage: bcode_model::lineage::RequestContextLineage,
+    receipt: bcode_model::lineage::RequestContextRepresentation,
+) {
+    if !state.observability.enabled()
+        || !(state.observability.persist_model_requests || state.observability.debug_enabled())
+        || receipt.validate(&lineage).is_err()
+        || provider_request_id.len() > 1024
+        || canonical_turn_id.len() > 1024
+    {
+        return;
+    }
+    let observation = bcode_model::lineage::ContextRepresentationObservation {
+        version: 1,
+        session_id: session_id.to_string(),
+        canonical_turn_id: canonical_turn_id.to_owned(),
+        provider_request_id: provider_request_id.to_owned(),
+        model_request_sequence,
+        request_ordinal: lineage.request_ordinal,
+        lineage,
+        receipt,
+    };
+    let max_bytes = state
+        .observability
+        .max_blob_bytes
+        .min(bcode_model::lineage::MAX_CONTEXT_REPRESENTATION_OBSERVATION_BYTES);
+    let Ok(bytes) = serde_json::to_vec(&observation) else {
+        return;
+    };
+    if bytes.len() >= max_bytes {
+        return;
+    }
+    let Some(blob) = state.trace_store.write_blob(
+        session_id,
+        "request-context-observation",
+        "application/json",
+        &bytes,
+        max_bytes,
+    ) else {
+        return;
+    };
+    let Ok(reference) = bcode_session_models::RequestContextObservationReference::new(
+        provider_request_id.to_owned(),
+        observation.request_ordinal,
+        model_request_sequence,
+        blob,
+    ) else {
+        return;
+    };
+    let Ok(detail) = reference.encode() else {
+        return;
+    };
+    append_trace_event(
+        state,
+        session_id,
+        Some(canonical_turn_id.to_owned()),
+        SessionTracePhase::ModelRequestBuilt,
+        SessionTracePayload::ProviderEvent {
+            event_type: bcode_session_models::REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE.to_owned(),
+            detail: Some(detail),
+        },
     )
     .await;
 }
@@ -27955,7 +28072,7 @@ async fn build_model_turn_request(
             &cancel,
         )
         .await;
-        judgement_history::append(
+        let history_lineage = judgement_history::append(
             state,
             session_id,
             trigger_event.sequence,
@@ -27965,6 +28082,7 @@ async fn build_model_turn_request(
             &cancel,
         )
         .await;
+        incorporated_lineage.merge(history_lineage);
     }
     // Recovery observations must follow historical snapshots to supersede them.
     if let Some(context) = &static_context.recovery_context {
@@ -28905,19 +29023,20 @@ const fn model_cache_capability_name(
 async fn append_model_request_trace(
     state: &ServerState,
     session_id: SessionId,
+    canonical_turn_id: &str,
     request: &ModelTurnRequest,
     provider_plugin_id: Option<&str>,
     round: u32,
-) {
+) -> Option<u64> {
     if !state.observability.enabled() {
-        return;
+        return None;
     }
     let request_blob = model_request_trace_blob(state, session_id, request, round);
     let metadata = model_request_trace_metadata(request, provider_plugin_id);
-    append_trace_event(
+    append_trace_event_inner(
         state,
         session_id,
-        Some(request.turn_id.clone()),
+        Some(canonical_turn_id.to_owned()),
         SessionTracePhase::ModelRequestBuilt,
         SessionTracePayload::ModelRequestBuilt {
             provider: provider_plugin_id.unwrap_or("<auto>").to_string(),
@@ -28941,7 +29060,7 @@ async fn append_model_request_trace(
             request: request_blob,
         },
     )
-    .await;
+    .await
 }
 
 fn model_request_trace_blob(
@@ -36568,7 +36687,7 @@ async fn append_trace_event_inner(
     turn_id: Option<String>,
     phase: SessionTracePhase,
     payload: SessionTracePayload,
-) {
+) -> Option<u64> {
     let opted_in_attempt_timing = matches!(
         &payload,
         SessionTracePayload::ProviderEvent { event_type, .. } if event_type == "attempt_timing"
@@ -36579,7 +36698,7 @@ async fn append_trace_event_inner(
             && !standard_trace_phase(phase)
             && !opted_in_attempt_timing)
     {
-        return;
+        return None;
     }
     let trace = SessionTraceEvent {
         timestamp_ms: current_time_ms(),
@@ -36588,8 +36707,14 @@ async fn append_trace_event_inner(
         payload,
     };
     match Box::pin(state.sessions.append_trace_event(session_id, trace)).await {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append trace event: {error}"),
+        Ok(event) => {
+            publish_session_event(state, &event).await;
+            Some(event.sequence)
+        }
+        Err(error) => {
+            tracing::warn!("failed to append trace event: {error}");
+            None
+        }
     }
 }
 
@@ -54341,6 +54466,343 @@ library = "test"
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
             metadata: BTreeMap::new(),
         }
+    }
+
+    fn context_observation_fixture_request(session: SessionId) -> ModelTurnRequest {
+        let mut request = test_model_turn_request(vec![ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "diagnostic-call".to_owned(),
+                    output: "mandatory diagnostic".to_owned(),
+                    is_error: false,
+                    content: Vec::new(),
+                },
+            }],
+        }]);
+        request.session_id = session;
+        request.context_lineage = context_lineage::final_lineage(
+            &request.messages,
+            &context_lineage::Incorporated::default(),
+        );
+        request
+    }
+
+    fn context_observation_fixture_receipt(
+        lineage: &bcode_model::lineage::RequestContextLineage,
+    ) -> bcode_model::lineage::RequestContextRepresentation {
+        bcode_model::lineage::RequestContextRepresentation {
+            version: 1,
+            request_ordinal: lineage.request_ordinal,
+            entries: lineage
+                .entries
+                .iter()
+                .map(|entry| bcode_model::lineage::ContextRepresentationEntry {
+                    source_ordinal: entry.source_ordinal,
+                    disposition:
+                        bcode_model::lineage::ContextRepresentationDisposition::Represented,
+                })
+                .collect(),
+            omitted: lineage.omitted,
+        }
+    }
+
+    #[tokio::test]
+    async fn context_observation_opt_out_and_small_cap_create_no_artifact_or_event() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_server_state(sessions);
+        state.observability.level = bcode_config::ObservabilityLevel::Standard;
+        state.trace_store = TraceStore::new(root.path().join("trace"));
+        let mut request = context_observation_fixture_request(session);
+        prepare_dispatch_context_lineage(&state, session, &mut request);
+        let lineage = request.context_lineage.unwrap();
+        let receipt = context_observation_fixture_receipt(&lineage);
+        append_context_representation_observation(
+            &state,
+            session,
+            "canonical",
+            "provider",
+            3,
+            lineage.clone(),
+            receipt.clone(),
+        )
+        .await;
+        state.observability.persist_model_requests = true;
+        state.observability.max_blob_bytes = 1;
+        append_context_representation_observation(
+            &state,
+            session,
+            "canonical",
+            "provider",
+            3,
+            lineage,
+            receipt,
+        )
+        .await;
+        let history = state.sessions.session_history(session).await.unwrap();
+        drop(state);
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::TraceEvent { .. }))
+        );
+        assert!(!root.path().join("trace").exists());
+    }
+
+    fn bind_context_observation_fixture(
+        state: &ServerState,
+        session: SessionId,
+        request: &ModelTurnRequest,
+        receipt: &bcode_model::lineage::RequestContextRepresentation,
+        sequence: u64,
+    ) {
+        let mut captures = state.context_lineage_captures.lock().unwrap();
+        assert!(
+            captures
+                .observation(session, &request.turn_id, receipt)
+                .is_none()
+        );
+        captures.bind_request_event(session, &request.turn_id, receipt.request_ordinal, sequence);
+        assert!(
+            captures
+                .observation(SessionId::new(), &request.turn_id, receipt)
+                .is_none()
+        );
+        let foreign = captures.observation(session, "foreign", receipt);
+        drop(captures);
+        assert!(foreign.is_none());
+    }
+
+    #[tokio::test]
+    async fn context_observation_exact_binding_duplicate_conflict_and_verified_read() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_server_state(sessions);
+        state.observability.persist_model_requests = true;
+        state.trace_store = TraceStore::new(root.path().join("trace"));
+        let mut request = context_observation_fixture_request(session);
+        let original_ordinal = request.context_lineage.as_ref().unwrap().request_ordinal;
+        prepare_dispatch_context_lineage(&state, session, &mut request);
+        let lineage = request.context_lineage.clone().unwrap();
+        assert_ne!(lineage.request_ordinal, original_ordinal);
+        assert_ne!(lineage.request_ordinal, 0);
+        let sequence = append_model_request_trace(&state, session, "canonical", &request, None, 1)
+            .await
+            .unwrap();
+        let receipt = context_observation_fixture_receipt(&lineage);
+        bind_context_observation_fixture(&state, session, &request, &receipt, sequence);
+        let projection = bcode_model::ProviderRequestProjection {
+            context_representation: Some(receipt.clone()),
+            ..Default::default()
+        };
+        let mut observed = false;
+        for _ in 0..2 {
+            handle_provider_request_projection_event(
+                &state,
+                session,
+                &request.turn_id,
+                "canonical",
+                projection.clone(),
+                &mut observed,
+            )
+            .await;
+        }
+        let mut conflict = projection;
+        conflict.context_representation.as_mut().unwrap().entries[0].disposition =
+            bcode_model::lineage::ContextRepresentationDisposition::Dropped;
+        let mut conflict_observed = false;
+        handle_provider_request_projection_event(
+            &state,
+            session,
+            &request.turn_id,
+            "canonical",
+            conflict,
+            &mut conflict_observed,
+        )
+        .await;
+        assert!(!conflict_observed);
+        let history = state.sessions.session_history(session).await.unwrap();
+        let observations: Vec<_> = history
+            .iter()
+            .filter_map(|event| {
+                let SessionEventKind::TraceEvent { trace } = &event.kind else {
+                    return None;
+                };
+                let SessionTracePayload::ProviderEvent {
+                    event_type,
+                    detail: Some(detail),
+                } = &trace.payload
+                else {
+                    return None;
+                };
+                bcode_session_models::RequestContextObservationReference::parse(event_type, detail)
+                    .ok()
+                    .map(|reference| (event.sequence, trace.turn_id.clone(), reference))
+            })
+            .collect();
+        assert_eq!(observations.len(), 1);
+        let (observation_sequence, canonical, reference) = &observations[0];
+        assert_eq!(canonical.as_deref(), Some("canonical"));
+        assert_eq!(reference.model_request_sequence, sequence);
+        let exported = trace_operations::read_range(
+            &state,
+            bcode_session_models::ReadSessionTraceBlobRequest {
+                version: bcode_session_models::SESSION_TRACE_EXPORT_VERSION,
+                session_id: session,
+                sequence: *observation_sequence,
+                offset: 0,
+                length: 131_072,
+            },
+        )
+        .await
+        .unwrap();
+        drop(state);
+        let decoded: bcode_model::lineage::ContextRepresentationObservation =
+            serde_json::from_slice(&exported.bytes).unwrap();
+        assert!(decoded.validate(&request, "canonical", sequence).is_ok());
+        assert!(history.iter().any(
+            |event| matches!(&event.kind, SessionEventKind::TraceEvent { trace }
+            if event.sequence == sequence && trace.turn_id.as_deref() == Some("canonical"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn context_observation_push_routing_uses_origin_not_provider_execution_id() {
+        Box::pin(assert_context_observation_routing(true)).await;
+    }
+
+    #[tokio::test]
+    async fn context_observation_poll_routing_uses_origin_not_provider_execution_id() {
+        Box::pin(assert_context_observation_routing(false)).await;
+    }
+
+    fn context_observation_references(
+        history: &[bcode_session_models::SessionEvent],
+    ) -> Vec<bcode_session_models::RequestContextObservationReference> {
+        history
+            .iter()
+            .filter_map(|event| {
+                let SessionEventKind::TraceEvent { trace } = &event.kind else {
+                    return None;
+                };
+                let SessionTracePayload::ProviderEvent {
+                    event_type,
+                    detail: Some(detail),
+                } = &trace.payload
+                else {
+                    return None;
+                };
+                bcode_session_models::RequestContextObservationReference::parse(event_type, detail)
+                    .ok()
+            })
+            .collect()
+    }
+
+    async fn assert_context_observation_routing(push: bool) {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_server_state(sessions);
+        state.observability.persist_model_requests = true;
+        state.trace_store = TraceStore::new(root.path().join("trace"));
+        let mut request = context_observation_fixture_request(session);
+        prepare_dispatch_context_lineage(&state, session, &mut request);
+        let sequence = append_model_request_trace(&state, session, "canonical", &request, None, 1)
+            .await
+            .unwrap();
+        let receipt =
+            context_observation_fixture_receipt(request.context_lineage.as_ref().unwrap());
+        bind_context_observation_fixture(&state, session, &request, &receipt, sequence);
+        let execution_id = if push {
+            format!("push-{}", request.turn_id)
+        } else {
+            "openai-compatible-turn-17".into()
+        };
+        assert_ne!(execution_id, request.turn_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued = AtomicUsize::new(0);
+        let mut context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued,
+            Arc::new(Mutex::new(None)),
+        );
+        let mut order = 0;
+        let mut stream = ModelStreamAccumulator::new(
+            session,
+            "canonical",
+            order,
+            true,
+            Arc::new(TurnCancelState::default()),
+        );
+        let mut progress = ModelStreamProgress::default();
+        let mut outcome = ModelPollOutcome {
+            originating_request_id: request.turn_id.clone(),
+            ..Default::default()
+        };
+        let event = ProviderTurnEvent::RequestProjection {
+            projection: bcode_model::ProviderRequestProjection {
+                context_representation: Some(receipt),
+                ..Default::default()
+            },
+        };
+        if push {
+            ingest_provider_stream_event_payload(
+                &state,
+                session,
+                None,
+                &execution_id,
+                "canonical",
+                &mut order,
+                0,
+                serde_json::to_vec(&event).unwrap(),
+                &mut stream,
+                &mut outcome,
+                &mut progress,
+                &mut context,
+            )
+            .await;
+        } else {
+            handle_provider_turn_event(
+                &state,
+                session,
+                &execution_id,
+                "canonical",
+                &mut order,
+                event,
+                &mut stream,
+                &mut outcome,
+                &mut progress,
+                &context,
+            )
+            .await;
+        }
+        assert!(outcome.context_representation_observed);
+        drop(context);
+        let history = state.sessions.session_history(session).await.unwrap();
+        drop(state);
+        let references = context_observation_references(&history);
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].provider_request_id, request.turn_id);
+        assert_eq!(references[0].model_request_sequence, sequence);
     }
 
     #[test]

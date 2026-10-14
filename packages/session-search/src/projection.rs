@@ -803,6 +803,23 @@ fn project_trace_metadata(
                 ),
             ]),
         ),
+        SessionTracePayload::ProviderEvent { event_type, detail }
+            if event_type == bcode_session_models::REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE =>
+        {
+            let valid = detail.as_deref().is_some_and(|detail| {
+                bcode_session_models::RequestContextObservationReference::parse(event_type, detail)
+                    .is_ok()
+            });
+            (
+                if valid {
+                    "request context observation"
+                } else {
+                    "invalid request context observation"
+                }
+                .to_owned(),
+                BTreeMap::new(),
+            )
+        }
         SessionTracePayload::ProviderEvent { event_type, detail } => (
             detail.clone().unwrap_or_else(|| event_type.clone()),
             BTreeMap::from([("event_type".to_owned(), event_type.clone())]),
@@ -2469,6 +2486,35 @@ mod tests {
                 .map(String::as_str),
             Some("2")
         );
+    }
+
+    #[test]
+    fn reserved_observation_details_never_enter_search_projection() {
+        let source = event(
+            22,
+            SessionEventKind::TraceEvent {
+                trace: Box::new(bcode_session_models::SessionTraceEvent {
+                    timestamp_ms: 123,
+                    turn_id: Some("turn-1".to_owned()),
+                    phase: bcode_session_models::SessionTracePhase::ModelProviderEvent,
+                    payload: bcode_session_models::SessionTracePayload::ProviderEvent {
+                        event_type: bcode_session_models::REQUEST_CONTEXT_OBSERVATION_EVENT_TYPE
+                            .to_owned(),
+                        detail: Some("private/locator-and-untrusted-diagnostic".to_owned()),
+                    },
+                }),
+            },
+        );
+        let projected = project_event(
+            &source,
+            &SearchProjectionPolicy {
+                trace_metadata: ProjectionContentPolicy::Include,
+                ..SearchProjectionPolicy::default()
+            },
+        );
+        let encoded = format!("{projected:?}");
+        assert!(!encoded.contains("private/locator"));
+        assert!(!encoded.contains("untrusted-diagnostic"));
     }
 
     #[test]

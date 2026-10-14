@@ -1043,6 +1043,10 @@ fn verify_cancellation(
             "schema_version": 1,
             "run_id": run_id,
             "terminal_observed": verification.terminal.is_some(),
+            "root_terminal_verified": verification.terminal.is_some(),
+            "descendant_settlement_verified": false,
+            "resource_release_verified": false,
+            "absence_of_effects_verified": false,
             "observations": verification.observations,
             "limitation": "A terminal root snapshot does not by itself verify descendant settlement, resource release or absence of effects."
         }),
@@ -1056,6 +1060,7 @@ fn cancellation_verification(
     allowance: Duration,
     wait: impl Fn(Duration),
 ) -> CancellationVerification {
+    let allowance = super::budget_allowance(allowance, true);
     let deadline = Instant::now() + allowance;
     let mut observations = Vec::new();
     while Instant::now() < deadline {
@@ -1068,6 +1073,9 @@ fn cancellation_verification(
             "1".into(),
         ];
         let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         match invoke(&args, "cancel-verification", remaining) {
             Ok(value) => {
                 let terminal = terminal_status(&value);
@@ -1290,8 +1298,9 @@ pub fn execute(
                 .min(timeout_policy.max_duration_ms.unwrap_or(u64::MAX)),
         )
     };
+    let setup_allowance = super::budget_allowance(setup_allowance, false);
     let deadline = setup_start + setup_allowance;
-    let invoke =
+    let raw_invoke =
         |args: &[String], label: &str, timeout: Duration| -> Result<serde_json::Value, EvalError> {
             let operation = readonly_operation(args);
             let started = Instant::now();
@@ -1334,6 +1343,12 @@ pub fn execute(
                 return Ok(serde_json::from_slice(&out)?);
             }
         };
+    let invoke = |args: &[String], label: &str, timeout: Duration| {
+        raw_invoke(args, label, super::budget_allowance(timeout, false))
+    };
+    let reconciliation_invoke = |args: &[String], label: &str, timeout: Duration| {
+        raw_invoke(args, label, super::budget_allowance(timeout, true))
+    };
     let remaining = || deadline.saturating_duration_since(Instant::now());
     let session = invoke(
         &[
@@ -1404,7 +1419,15 @@ pub fn execute(
         ]);
     }
     let start = Instant::now();
-    let admitted = invoke(&args, "admission", remaining())?;
+    let admitted = invoke(&args, "admission", remaining()).inspect_err(|_| {
+        // The single admission request may have committed before its transport deadline.
+        // Never replay it or guess a run identity to cancel.
+        let _ = write_json(rep_dir.join("admission-unresolved.json"), &serde_json::json!({
+            "schema_version": 1, "admission_replayed": false,
+            "effects_reconciled": false, "terminal_verified": false,
+            "message": "Admission outcome unresolved; use verified public reconciliation before any retry."
+        }));
+    })?;
     let run_id = admitted["run_id"]
         .as_str()
         .ok_or_else(|| EvalError::Validation("admission missing run identity".into()))?;
@@ -1441,7 +1464,9 @@ pub fn execute(
     loop {
         // Before a fresh subtree scan only an explicit wall limit can expire.
         // Reaching the previous idle boundary triggers observation, not a verdict.
-        if wall_limit.is_some_and(|limit| now() >= limit) {
+        if super::remaining_execution_budget(false).is_some_and(|remaining| remaining.is_zero())
+            || wall_limit.is_some_and(|limit| now() >= limit)
+        {
             timed_out = true;
             timeout_reason = Some(TimeoutReason::Wall);
             break;
@@ -1469,7 +1494,11 @@ pub fn execute(
             std::thread::sleep,
         ) {
             Ok(value) => value,
-            Err(error) if wall_limit.is_some_and(|limit| now() >= limit) => {
+            Err(error)
+                if super::remaining_execution_budget(false)
+                    .is_some_and(|remaining| remaining.is_zero())
+                    || wall_limit.is_some_and(|limit| now() >= limit) =>
+            {
                 timed_out = true;
                 timeout_reason = Some(TimeoutReason::Wall);
                 write_json(rep_dir.join("observation-error.json"), &error.to_string())?;
@@ -1477,7 +1506,7 @@ pub fn execute(
             }
             Err(error) => {
                 write_json(rep_dir.join("observation-error.json"), &error.to_string())?;
-                let cancellation = invoke(
+                let cancellation = reconciliation_invoke(
                     &[
                         "workflow".into(),
                         "cancel-run".into(),
@@ -1487,7 +1516,7 @@ pub fn execute(
                     "observation-cancellation",
                     Duration::from_secs(15),
                 );
-                let terminal = verify_cancellation(run_id, &invoke, rep_dir)?;
+                let terminal = verify_cancellation(run_id, &reconciliation_invoke, rep_dir)?;
                 let verified = terminal.is_some();
                 if terminal.is_some() {
                     last_observed = terminal;
@@ -1510,7 +1539,7 @@ pub fn execute(
             break;
         }
         if status == "repair_required" {
-            let cancellation = invoke(
+            let cancellation = reconciliation_invoke(
                 &[
                     "workflow".into(),
                     "cancel-run".into(),
@@ -1520,7 +1549,7 @@ pub fn execute(
                 "repair-cancellation",
                 Duration::from_secs(15),
             );
-            let terminal = verify_cancellation(run_id, &invoke, rep_dir)?;
+            let terminal = verify_cancellation(run_id, &reconciliation_invoke, rep_dir)?;
             let verified = terminal.is_some();
             if terminal.is_some() {
                 last_observed = terminal;
@@ -1570,9 +1599,11 @@ pub fn execute(
                     &result,
                     readiness_started.elapsed(),
                     readiness_allowance,
-                ) && wall_limit.is_none_or(|limit| now() < limit)
+                ) && super::remaining_execution_budget(false)
+                    .is_none_or(|remaining| !remaining.is_zero())
+                    && wall_limit.is_none_or(|limit| now() < limit)
                 {
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(super::budget_allowance(Duration::from_millis(100), false));
                     continue;
                 }
                 break result;
@@ -1592,7 +1623,7 @@ pub fn execute(
                     rep_dir.join("activity-observation-error.json"),
                     &error.to_string(),
                 )?;
-                let cancellation = invoke(
+                let cancellation = reconciliation_invoke(
                     &[
                         "workflow".into(),
                         "cancel-run".into(),
@@ -1602,7 +1633,7 @@ pub fn execute(
                     "activity-observation-cancellation",
                     Duration::from_secs(15),
                 );
-                let terminal = verify_cancellation(run_id, &invoke, rep_dir)?;
+                let terminal = verify_cancellation(run_id, &reconciliation_invoke, rep_dir)?;
                 let verified = terminal.is_some();
                 if terminal.is_some() {
                     last_observed = terminal;
@@ -1628,11 +1659,11 @@ pub fn execute(
             break;
         }
         let sleep = Duration::from_millis(250);
-        std::thread::sleep(sleep);
+        std::thread::sleep(super::budget_allowance(sleep, false));
     }
     let execution_elapsed = execution_duration(start, Instant::now());
     if timed_out {
-        let cancel = invoke(
+        let cancel = reconciliation_invoke(
             &[
                 "workflow".into(),
                 "cancel-run".into(),
@@ -1643,7 +1674,7 @@ pub fn execute(
             Duration::from_secs(15),
         );
         let requested = cancel.is_ok();
-        let terminal = verify_cancellation(run_id, &invoke, rep_dir)?;
+        let terminal = verify_cancellation(run_id, &reconciliation_invoke, rep_dir)?;
         let terminal_verified = terminal.is_some();
         if terminal.is_some() {
             last_observed = terminal;
@@ -1661,6 +1692,14 @@ pub fn execute(
         rep_dir.join("timeout-outcome.json"),
         &serde_json::json!({
             "policy": timeout_policy, "timed_out": timed_out, "reason": timeout_reason_name,
+            "execution_budget_policy": "caller_total_deadline_with_up_to_30s_or_one_quarter_reserved_for_reconciliation_and_evidence",
+            "execution_deadline_expired": super::remaining_execution_budget(false).is_some_and(|remaining| remaining.is_zero()),
+            "reconciliation_scope": "root_terminal_only",
+            "descendant_settlement_verified": false,
+            "resource_release_verified": false,
+            "absence_of_effects_verified": false,
+            "execution_budget_exhausted": super::remaining_execution_budget(false).is_some_and(|remaining| remaining.is_zero()),
+            "total_budget_exhausted": super::remaining_execution_budget(true).is_some_and(|remaining| remaining.is_zero()),
             "activity_scan_start_elapsed_ms": last_activity_as_of.map(|value| value.as_millis()),
             "activity_scan_age_ms": last_activity_as_of.map(|value| now().saturating_sub(value).as_millis()),
             "idle_observation_semantics": "as_of_scan_start_not_atomic_current",
@@ -1679,8 +1718,9 @@ pub fn execute(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(120_000),
     );
+    let capture_allowance = super::budget_allowance(capture_allowance, true);
     let capture_deadline = Instant::now() + capture_allowance;
-    let execution_invoke = &invoke;
+    let execution_invoke = &reconciliation_invoke;
     let invoke = |args: &[String], label: &str, timeout: Duration| {
         let allowance = capture_deadline.saturating_duration_since(Instant::now());
         if allowance.is_zero() {
@@ -2085,30 +2125,47 @@ pub fn execute(
         && config.expected_json.is_none()
         && config.oracle_command.is_none()
     {
-        false
+        Some(false)
     } else {
-        super::oracle::grade(&config, workspace, rep_dir, &output_text)?
+        match super::oracle::grade(&config, workspace, rep_dir, &output_text) {
+            Ok(correct) => Some(correct),
+            Err(error) => {
+                // Missing post-execution oracle evidence must not discard admission,
+                // cancellation or the observed terminal execution outcome.
+                capture_complete = false;
+                write_json(
+                    rep_dir.join("oracle-unavailable.json"),
+                    &serde_json::json!({"schema_version":1,"status":"unavailable","error":error.to_string()}),
+                )?;
+                None
+            }
+        }
     };
     let preservation = preserved
         .iter()
         .all(|(path, bytes)| fs::read(workspace.join(path)).is_ok_and(|current| current == *bytes));
-    let oracle_passed = preservation
-        && if config.expect_rejection {
-            !completed && status == "failed"
-        } else {
-            artifact_correct && completed
-        };
-    let false_completion =
-        completed && (!artifact_correct || !preservation || config.expect_rejection);
-    let completion_failure = !config.expect_rejection && artifact_correct && !completed;
+    let oracle_passed = artifact_correct.map(|correct| {
+        preservation
+            && if config.expect_rejection {
+                !completed && status == "failed"
+            } else {
+                correct && completed
+            }
+    });
+    let false_completion = artifact_correct
+        .map(|correct| completed && (!correct || !preservation || config.expect_rejection));
+    let completion_failure =
+        artifact_correct.map(|correct| !config.expect_rejection && correct && !completed);
     for (key, value) in [
         ("oracle_passed", oracle_passed),
         ("artifact_correct", artifact_correct),
-        ("preservation_passed", preservation),
+        ("preservation_passed", Some(preservation)),
         ("false_completion", false_completion),
         ("completion_failure", completion_failure),
     ] {
-        measurements.insert(format!("workflow.{key}"), f64::from(value));
+        if let Some(value) = value {
+            measurements.insert(format!("workflow.{key}"), f64::from(value));
+        }
     }
     let readiness = eval_readiness(
         capabilities.canonical_eval_coverage.is_some(),
@@ -2172,7 +2229,7 @@ pub fn execute(
         exit_code: Some(if timed_out {
             124
         } else {
-            i32::from(!oracle_passed)
+            i32::from(oracle_passed != Some(true))
         }),
         measurements,
         diagnostics,
@@ -3102,6 +3159,233 @@ mod observation_tests {
             EvalReadinessScope::FullWorkflowHistory
         );
         assert!(!eval_readiness(false, true, false).complete);
+    }
+
+    #[cfg(unix)]
+    fn held_cli_fixture(root: &Path) -> (super::super::EvalSuite, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = root.join("fake-cli.py");
+        fs::write(
+            &binary,
+            r"#!/usr/bin/env python3
+import json,sys
+from pathlib import Path
+root=Path(__file__).parent
+args=[arg for arg in sys.argv[1:] if arg!='--json-errors']
+with (root/'calls.jsonl').open('a') as stream: stream.write(json.dumps(args)+'\n')
+if args[:2]==['session','create']: print(json.dumps({'id':'00000000-0000-4000-8000-000000000001'}))
+elif args[0]=='goal': print(json.dumps({'run_id':'owned-held-run'}))
+elif args[:2]==['workflow','cancel-run']:
+ assert args[args.index('--run-id')+1]=='owned-held-run'
+ (root/'cancelled').touch();print('{}')
+elif args[:2]==['workflow','inspect-run']:
+ assert args[args.index('--run-id')+1]=='owned-held-run'
+ status='cancelled' if (root/'cancelled').exists() else 'running'
+ schema={'type_name':'fixture','schema':{}}
+ definition={'schema_version':1,'name':'held-fixture','input':schema,'output':schema,'nodes':{},'entries':[],'exits':[],'edges':[]}
+ run={'run_id':'owned-held-run','definition_id':'held-fixture','definition_version':1,'workspace_snapshot':'fixture','parent_session_id':'00000000-0000-4000-8000-000000000001','authorization_profile':{'version':1,'provider_id':'fixture','profile_id':'fixture','policy_digest_sha256':'a'*64},'status':status,'created_at_ms':0,'updated_at_ms':0}
+ inspection={'run':run,'definition':{'definition_id':'held-fixture','version':1,'checksum_sha256':'a'*64,'definition_json':json.dumps(definition)},'unavailable_collections':['canonical_eval_coverage','graph']}
+ inspection.update({key:[] for key in ['activations','waits','mutation_approvals','attempts','events','decisions','grants','resource_leases','outputs','child_sessions']})
+ print(json.dumps(inspection))
+else: print('{}')
+",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let suite: super::super::EvalSuite = toml::from_str(
+            r#"
+schema_version = 1
+id = "held-orchestration"
+name = "Held orchestration"
+[run]
+repetitions = 1
+timeout_ms = 10000
+isolation = "empty_temp"
+randomize_case_order = false
+fail_fast = false
+[[variants]]
+id = "held"
+executor = "workflow"
+[variants.metadata]
+daemon_isolation = "shared"
+[[cases]]
+id = "held"
+prompt = "ordinary held development work"
+[[cases.judges]]
+type = "metric_threshold"
+metric = "wall_time_ms"
+"#,
+        )
+        .unwrap();
+        let mut suite = suite;
+        suite
+            .metadata
+            .insert("suite_dir".into(), serde_json::json!(root));
+        suite.variants[0].metadata.insert(
+            "workflow".into(),
+            serde_json::json!({
+                "binary":binary,"strategy":"no-delegation","stop_condition":"finish work",
+                "max_iterations":1,"concurrency":1,"worker_attempts":1
+            }),
+        );
+        (suite, binary)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_fake_cli_workflow_budget_cancels_only_admitted_run_and_records_root_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let (suite, _binary) = held_cli_fixture(root.path());
+        let rep = root.path().join("repetition");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&rep).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        let started = Instant::now();
+        crate::with_execution_budget(
+            crate::EvalExecutionBudget::new(Duration::from_secs(3)).unwrap(),
+            || {
+                // Later capture can degrade: this proves orchestration, not daemon execution.
+                let result = execute(
+                    &suite,
+                    &suite.cases[0],
+                    &suite.variants[0],
+                    &rep,
+                    &workspace,
+                );
+                assert!(result.is_ok(), "{result:?}");
+                assert!(rep.join("oracle.json").exists());
+                assert!(rep.join("diagnosis.json").exists());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let calls: Vec<Vec<String>> = fs::read_to_string(root.path().join("calls.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.first().is_some_and(|arg| arg == "goal"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.get(1).is_some_and(|arg| arg == "cancel-run"))
+                .count(),
+            1
+        );
+        let verification: serde_json::Value =
+            serde_json::from_slice(&fs::read(rep.join("cancellation-verification.json")).unwrap())
+                .unwrap();
+        assert_eq!(verification["root_terminal_verified"], true);
+        assert_eq!(verification["resource_release_verified"], false);
+        assert_eq!(verification["descendant_settlement_verified"], false);
+        let timeout: serde_json::Value =
+            serde_json::from_slice(&fs::read(rep.join("timeout-outcome.json")).unwrap()).unwrap();
+        assert_eq!(timeout["execution_deadline_expired"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_execution_oracle_error_retains_cancelled_root_without_correctness_claims() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut suite, _binary) = held_cli_fixture(root.path());
+        suite.variants[0].metadata.get_mut("workflow").unwrap()["oracle_command"] =
+            serde_json::json!("\0");
+        let rep = root.path().join("repetition");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&rep).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        crate::with_execution_budget(
+            crate::EvalExecutionBudget::new(Duration::from_secs(3)).unwrap(),
+            || {
+                let output = execute(
+                    &suite,
+                    &suite.cases[0],
+                    &suite.variants[0],
+                    &rep,
+                    &workspace,
+                )?;
+                assert_ne!(output.exit_code, Some(0));
+                assert!(
+                    !output
+                        .measurements
+                        .contains_key("workflow.artifact_correct")
+                );
+                assert!(
+                    !output
+                        .measurements
+                        .contains_key("workflow.false_completion")
+                );
+                assert!(output.measurements["workflow.completion_claimed"].abs() < f64::EPSILON);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_slice(&fs::read(rep.join(name)).unwrap()).unwrap()
+        };
+        assert_eq!(read("admission.json")["run_id"], "owned-held-run");
+        assert_eq!(
+            read("cancellation-verification.json")["root_terminal_verified"],
+            true
+        );
+        assert_eq!(
+            read("cancellation-verification.json")["run_id"],
+            "owned-held-run"
+        );
+        assert_eq!(read("cancellation.json")["terminal_verified"], true);
+        assert_eq!(read("oracle-unavailable.json")["status"], "unavailable");
+        assert!(read("oracle.json")["artifact_correct"].is_null());
+        assert!(read("oracle.json")["passed"].is_null());
+        let diagnosis = read("diagnosis.json");
+        assert!(
+            !diagnosis["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|label| label == "delivered_artifact_incorrect_or_missing"
+                    || label == "false_completion")
+        );
+        assert_eq!(read("oracle.json")["completion_claimed"], false);
+        assert!(rep.join("eval-judgement-observation.json").exists());
+    }
+
+    #[test]
+    fn budget_reserves_bounded_terminal_verification_for_only_the_admitted_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let budget = crate::EvalExecutionBudget {
+            execution_deadline: now,
+            deadline: now + Duration::from_secs(1),
+        };
+        crate::with_execution_budget(budget, || {
+            assert_eq!(
+                crate::remaining_execution_budget(false),
+                Some(Duration::ZERO)
+            );
+            let calls = std::cell::Cell::new(0);
+            let invoke = |args: &[String], label: &str, allowance: Duration| {
+                assert_eq!(label, "cancel-verification");
+                assert_eq!(
+                    &args[..4],
+                    &["workflow", "inspect-run", "--run-id", "admitted-run"]
+                );
+                assert!(allowance <= Duration::from_secs(1));
+                calls.set(calls.get() + 1);
+                Ok(serde_json::json!({"run":{"status":"cancelled"}}))
+            };
+            assert!(verify_cancellation("admitted-run", &invoke, directory.path())?.is_some());
+            assert_eq!(calls.get(), 1);
+            Ok(())
+        })
+        .unwrap();
+        assert!(crate::remaining_execution_budget(true).is_none());
     }
 
     #[test]
