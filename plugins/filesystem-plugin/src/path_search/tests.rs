@@ -1,4 +1,6 @@
 use super::*;
+
+include!("git_tests.rs");
 use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
 use std::cell::Cell;
 use std::fs;
@@ -36,6 +38,7 @@ impl Drop for Fixture {
 fn request() -> SearchPathsRequest {
     SearchPathsRequest {
         timeout_ms: 1000,
+        scope: SearchPathsScope::Workspace,
         ..SearchPathsRequest::default()
     }
 }
@@ -350,11 +353,8 @@ fn authorized_empty_comment_and_complex_ignore_policies_have_truthful_states() {
     for text in ["**/complex", "[ab].rs", "\\#escape", "../escape"] {
         fs::write(root.0.join(".gitignore"), text).unwrap();
         let response = authorized_search(&request(), &root.grant());
-        assert_eq!(
-            response.reason.as_deref(),
-            Some("ignore_policy_unsupported")
-        );
-        assert!(response.entries.is_empty());
+        assert_eq!(response.state, SearchPathsState::Complete);
+        assert_eq!(paths(&response), ["candidate"]);
     }
 }
 

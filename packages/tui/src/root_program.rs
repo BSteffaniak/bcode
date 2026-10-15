@@ -353,6 +353,23 @@ impl BcodeRuntimeModel {
         {
             return bmux_tui::event::EventOutcome::Ignored;
         }
+        if let Some(binding) = self
+            .settings
+            .keymap()
+            .registry()
+            .action_for_key("composer_interaction", stroke)
+            && self.loop_state.composer_interaction.invoke_action(binding)
+        {
+            // The normal post-input synchronization consumes the pending activation.
+            // Do not observe or mutate the editor here, or bypass its current owner.
+            self.loop_state
+                .composer_interaction
+                .resolve_hints(self.settings.keymap().registry());
+            self.invalidation = self
+                .invalidation
+                .merge(super::invalidation::UiInvalidation::Structural);
+            return bmux_tui::event::EventOutcome::Handled;
+        }
         let input = ControlInput::from_registry(
             self.settings.keymap().registry(),
             "composer_interaction",
@@ -3683,6 +3700,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 BcodeRuntimeMessage::ComposerSearchCompleted(completion),
             ) => {
                 if self.loop_state.composer_interaction.complete(completion) {
+                    self.loop_state
+                        .composer_interaction
+                        .resolve_hints(self.settings.keymap().registry());
                     super::invalidation::UiInvalidation::Structural
                 } else {
                     super::invalidation::UiInvalidation::None
@@ -8687,6 +8707,181 @@ mod tests {
         if model.compose_focused_input_event(&event) == bmux_tui::event::EventOutcome::Ignored {
             model.handle_basic_terminal_event(event);
         }
+    }
+
+    #[tokio::test]
+    async fn composer_root_live_actions_use_effective_keys_and_replay_during_loading() {
+        for (overrides, active_key, hint) in [
+            (
+                std::collections::BTreeMap::new(),
+                Some("ctrl+r"),
+                Some("ctrl+r"),
+            ),
+            (
+                std::collections::BTreeMap::from([
+                    ("ctrl+r".into(), String::new()),
+                    ("ctrl+x".into(), "example.refresh".into()),
+                ]),
+                Some("ctrl+x"),
+                Some("ctrl+x"),
+            ),
+            (
+                std::collections::BTreeMap::from([("ctrl+r".into(), String::new())]),
+                None,
+                None,
+            ),
+        ] {
+            exercise_live_composer_action(overrides, active_key, hint);
+        }
+    }
+
+    fn live_composer_action_fixture(
+        overrides: std::collections::BTreeMap<String, String>,
+    ) -> (
+        super::BcodeRuntimeModel,
+        super::super::composer_interaction::ComposerCompletion,
+    ) {
+        use bcode_plugin_sdk::composer::{ComposerAction, ComposerPresentation};
+        use bcode_plugin_sdk::tui::keymap::KeymapAction;
+        let mut config = bcode_config::TuiConfig::default();
+        config
+            .keybindings
+            .scopes
+            .insert("composer_interaction".into(), overrides);
+        let mut model = composer_root_fixture(&config);
+        model
+            .settings
+            .integrate_keymap_contributors(Ok(vec![KeymapAction {
+                id: "example.refresh".into(),
+                scope: "composer_interaction".into(),
+                description: "Refresh".into(),
+                defaults: vec!["ctrl+r".into()],
+            }]));
+        let request = super::super::composer_interaction::tests::begin_observed(
+            &mut model.loop_state.composer_interaction,
+        );
+        let mut reply = super::super::composer_interaction::tests::completion(&request);
+        let snapshot = reply.snapshot.as_mut().unwrap();
+        snapshot
+            .interaction_state
+            .insert("mode".into(), "first".into());
+        snapshot.presentation = Some(ComposerPresentation {
+            version: 1,
+            title: "Topics".into(),
+            hint: None,
+            actions: vec![ComposerAction {
+                id: "refresh".into(),
+                label: "Refresh".into(),
+                binding: Some("example.refresh".into()),
+            }],
+        });
+        assert!(
+            model
+                .loop_state
+                .composer_interaction
+                .complete(reply.clone())
+        );
+        model
+            .loop_state
+            .composer_interaction
+            .resolve_hints(model.settings.keymap().registry());
+        (model, reply)
+    }
+
+    fn exercise_live_composer_action(
+        overrides: std::collections::BTreeMap<String, String>,
+        active_key: Option<&str>,
+        hint: Option<&str>,
+    ) {
+        use bmux_tui::event::EventOutcome;
+        let (mut model, reply) = live_composer_action_fixture(overrides);
+        let before = model.chat.app.composer().edit_state();
+        let history = (
+            model.chat.app.composer().can_undo(),
+            model.chat.app.composer().can_redo(),
+        );
+        if let Some(hint) = hint {
+            assert!(model.loop_state.composer_interaction.hint().contains(hint));
+        } else {
+            assert!(model.loop_state.composer_interaction.hint().is_empty());
+        }
+        if active_key != Some("ctrl+r") {
+            assert_eq!(
+                model.composer_interaction_key_outcome(
+                    bmux_keyboard::parse_key_stroke("ctrl+r").unwrap()
+                ),
+                EventOutcome::Ignored
+            );
+            assert!(!model.loop_state.composer_interaction.needs_activation());
+        }
+        if let Some(key) = active_key {
+            assert_eq!(
+                model.compose_focused_input_event(&bmux_tui::event::Event::Key(
+                    bmux_keyboard::parse_key_stroke(key).unwrap()
+                )),
+                EventOutcome::Handled
+            );
+            assert!(model.loop_state.composer_interaction.visible());
+            assert!(
+                model
+                    .loop_state
+                    .composer_interaction
+                    .selected_edit()
+                    .is_none()
+            );
+            assert!(
+                !model
+                    .loop_state
+                    .composer_interaction
+                    .complete(reply.clone())
+            );
+            let next = super::super::composer_interaction::tests::begin_observed(
+                &mut model.loop_state.composer_interaction,
+            );
+            assert_eq!(next.action_id.as_deref(), Some("refresh"));
+            assert_eq!(
+                next.interaction_state.get("mode").map(String::as_str),
+                Some("first")
+            );
+            assert_eq!(next.document.text, before.text);
+            assert_ne!(next.request_id, reply.request_id);
+            // The retained declaration remains usable while this request is loading.
+            assert_eq!(
+                model.composer_interaction_key_outcome(
+                    bmux_keyboard::parse_key_stroke(key).unwrap()
+                ),
+                EventOutcome::Handled
+            );
+            let last = super::super::composer_interaction::tests::begin_observed(
+                &mut model.loop_state.composer_interaction,
+            );
+            assert_eq!(last.action_id.as_deref(), Some("refresh"));
+            assert_eq!(last.document, next.document);
+            assert_ne!(last.request_id, next.request_id);
+            assert!(
+                !model
+                    .loop_state
+                    .composer_interaction
+                    .complete(super::super::composer_interaction::tests::completion(&next))
+            );
+            assert_eq!(
+                model.composer_interaction_key_outcome(
+                    bmux_keyboard::parse_key_stroke("enter").unwrap()
+                ),
+                EventOutcome::Handled
+            );
+            assert!(model.loop_state.composer_interaction.hint().contains(key));
+        }
+        assert_eq!(model.chat.app.composer().edit_state(), before);
+        assert_eq!(
+            (
+                model.chat.app.composer().can_undo(),
+                model.chat.app.composer().can_redo()
+            ),
+            history
+        );
+        assert!(model.chat.app.take_pending_submission().is_empty());
+        drop(model);
     }
 
     #[tokio::test]

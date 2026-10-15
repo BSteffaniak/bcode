@@ -36,6 +36,8 @@ pub fn path_candidate(
     Ok(ComposerCandidate {
         id,
         label: path.to_owned(),
+        matched_ranges: Vec::new(),
+        next_interaction_state: None,
         detail: directory.then(|| "Directory".to_owned()),
         edit,
         continuation: if directory {

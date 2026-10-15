@@ -6,7 +6,7 @@
 //! All offsets are UTF-8 byte offsets, not scalar, grapheme or terminal-cell offsets.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Service interface for bounded candidate search.
@@ -112,6 +112,12 @@ pub struct ComposerSearchRequest {
     pub activation: ComposerActivation,
     /// Requested upper bound, from 1 through `MAX_COMPOSER_CANDIDATES`.
     pub max_results: usize,
+    /// Opaque contributor-owned interaction state, replayed on subsequent searches.
+    #[serde(default)]
+    pub interaction_state: BTreeMap<String, String>,
+    /// Contributor action invoked for this search only; never an editor command.
+    #[serde(default)]
+    pub action_id: Option<String>,
 }
 
 /// Renderer-neutral candidate list and generic fallback surface.
@@ -134,6 +140,12 @@ pub struct ComposerSnapshot {
     pub state: ComposerSnapshotState,
     /// Contributor-ranked candidates, bounded by the request.
     pub candidates: Vec<ComposerCandidate>,
+    /// Resolved contributor state to replay; bounded independently of presentation.
+    #[serde(default)]
+    pub interaction_state: BTreeMap<String, String>,
+    /// Optional versioned chrome and contributor-owned actions.
+    #[serde(default)]
+    pub presentation: Option<ComposerPresentation>,
     /// Search omitted additional results; not permission for unbounded pagination.
     #[serde(default)]
     pub incomplete: bool,
@@ -169,6 +181,33 @@ pub enum ComposerContinuation {
     Reactivate,
 }
 
+/// Versioned portable picker chrome. Only version 1 is supported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerPresentation {
+    /// Exact presentation schema version; unknown versions fail closed.
+    pub version: u32,
+    /// Plain bounded title.
+    pub title: String,
+    /// Plain bounded optional hint.
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// At most eight contributor-owned actions.
+    #[serde(default)]
+    pub actions: Vec<ComposerAction>,
+}
+
+/// A stateless service action, not an editor mutation or execution effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerAction {
+    /// Plugin-owned action identity sent to search.
+    pub id: String,
+    /// Plain display label.
+    pub label: String,
+    /// Optional configurable keymap action identity, never raw key syntax.
+    #[serde(default)]
+    pub binding: Option<String>,
+}
+
 /// Plain text presentation with an atomic edit; no opaque execution effects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComposerCandidate {
@@ -176,6 +215,12 @@ pub struct ComposerCandidate {
     pub id: String,
     /// Plain display label, never interpreted as markup or control sequences.
     pub label: String,
+    /// Ordered nonoverlapping matched UTF-8 byte ranges into `label` (maximum 64).
+    #[serde(default)]
+    pub matched_ranges: Vec<ComposerTextRange>,
+    /// Replacement state applied only on successful `Reactivate` acceptance.
+    #[serde(default)]
+    pub next_interaction_state: Option<BTreeMap<String, String>>,
     /// Optional bounded plain display detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -227,6 +272,13 @@ impl std::error::Error for ComposerValidationError {}
 
 fn valid_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= MAX_ID_BYTES && !value.chars().any(char::is_control)
+}
+
+fn valid_state(state: &BTreeMap<String, String>) -> bool {
+    state.len() <= 8
+        && state
+            .iter()
+            .all(|(key, value)| valid_id(key) && value.len() <= MAX_ID_BYTES)
 }
 
 fn valid_display(value: &str) -> bool {
@@ -326,6 +378,8 @@ impl ComposerSearchRequest {
         if (!self.contribution_id.is_empty() && !valid_id(&self.contribution_id))
             || !valid_id(&self.request_id)
             || !(1..=MAX_COMPOSER_CANDIDATES).contains(&self.max_results)
+            || !valid_state(&self.interaction_state)
+            || self.action_id.as_ref().is_some_and(|id| !valid_id(id))
         {
             return Err(ComposerValidationError::InvalidPayload);
         }
@@ -372,11 +426,56 @@ impl ComposerSnapshot {
             }
             _ => {}
         }
+        if !valid_state(&self.interaction_state) {
+            return Err(ComposerValidationError::InvalidPayload);
+        }
+        if let Some(presentation) = &self.presentation {
+            let mut actions = BTreeSet::new();
+            if presentation.version != 1
+                || !valid_display(&presentation.title)
+                || presentation
+                    .hint
+                    .as_ref()
+                    .is_some_and(|hint| !valid_display(hint))
+                || presentation.actions.len() > 8
+                || presentation.actions.iter().any(|action| {
+                    !valid_id(&action.id)
+                        || !actions.insert(&action.id)
+                        || !valid_display(&action.label)
+                        || action.label.trim().is_empty()
+                        || action
+                            .binding
+                            .as_ref()
+                            .is_some_and(|binding| !valid_id(binding))
+                })
+            {
+                return Err(ComposerValidationError::InvalidPayload);
+            }
+        }
         if self.candidates.len() > request.max_results {
             return Err(ComposerValidationError::InvalidPayload);
         }
         let mut ids = BTreeSet::new();
         for candidate in &self.candidates {
+            if candidate
+                .next_interaction_state
+                .as_ref()
+                .is_some_and(|state| !valid_state(state))
+            {
+                return Err(ComposerValidationError::InvalidPayload);
+            }
+            let mut end = 0;
+            if candidate.matched_ranges.len() > 64
+                || candidate.matched_ranges.iter().any(|range| {
+                    let invalid = range.start < end
+                        || range.start >= range.end
+                        || candidate.label.get(range.start..range.end).is_none();
+                    end = range.end;
+                    invalid
+                })
+            {
+                return Err(ComposerValidationError::InvalidPayload);
+            }
             if !valid_id(&candidate.id)
                 || !ids.insert(&candidate.id)
                 || candidate.label.trim().is_empty()
@@ -465,6 +564,8 @@ mod tests {
                 query: "é".into(),
             },
             max_results: 2,
+            interaction_state: BTreeMap::new(),
+            action_id: None,
         }
     }
     fn edit() -> ComposerEdit {
@@ -482,8 +583,12 @@ mod tests {
             request_id: "search-1".into(),
             document_id: "draft-1".into(),
             revision: 7,
+            interaction_state: BTreeMap::new(),
+            presentation: None,
             candidates: vec![ComposerCandidate {
                 id: "topic".into(),
+                matched_ranges: Vec::new(),
+                next_interaction_state: None,
                 label: "Rust topic".into(),
                 detail: None,
                 edit: edit(),
@@ -568,6 +673,43 @@ mod tests {
         response = snapshot();
         response.candidates.clear();
         response.validate_for(&request).unwrap();
+    }
+
+    #[test]
+    fn unicode_highlights_and_versioned_metadata_are_bounded() {
+        let request = request();
+        let mut response = snapshot();
+        response.candidates[0].label = "é🦀中".into();
+        response.candidates[0].matched_ranges = vec![
+            ComposerTextRange { start: 0, end: 2 },
+            ComposerTextRange { start: 2, end: 6 },
+        ];
+        response.validate_for(&request).unwrap();
+        response.candidates[0].matched_ranges[1].start = 3;
+        assert_eq!(
+            response.validate_for(&request),
+            Err(ComposerValidationError::InvalidPayload)
+        );
+        response.candidates[0].matched_ranges.clear();
+        response.presentation = Some(ComposerPresentation {
+            version: 2,
+            title: "Topics".into(),
+            hint: None,
+            actions: Vec::new(),
+        });
+        assert_eq!(
+            response.validate_for(&request),
+            Err(ComposerValidationError::InvalidPayload)
+        );
+        response.presentation.as_mut().unwrap().version = 1;
+        response.validate_for(&request).unwrap();
+        response
+            .interaction_state
+            .insert("scope".into(), "x".repeat(257));
+        assert_eq!(
+            response.validate_for(&request),
+            Err(ComposerValidationError::InvalidPayload)
+        );
     }
 
     #[test]

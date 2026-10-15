@@ -16,6 +16,8 @@ fn context() -> NativeServiceContext {
         activation: crate::FileReferenceContributor.activate(&document).unwrap(),
         document,
         max_results: 8,
+        interaction_state: std::collections::BTreeMap::new(),
+        action_id: None,
     };
     NativeServiceContext {
         plugin_id: "bcode.file-references".into(),

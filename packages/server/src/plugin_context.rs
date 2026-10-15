@@ -425,6 +425,8 @@ fn route<'a>(
                                     authorize_workspace(state, bound, request.payload).await
                                 } else if request.operation == OP_WORKSPACE_RESOURCE_AUTHORIZE {
                                     authorize_resource(state, bound, request.payload).await
+                                } else if request.operation == bcode_plugin_sdk::workspace_access::OP_EXTERNAL_RESOURCE_AUTHORIZE {
+                                    authorize_external_resource(state, bound, request.payload).await
                                 } else { ToolInvocationServiceResolution::Unsupported }
                             } else {
                                 route_nested(state, bound, request, depth + 1).await
@@ -568,11 +570,45 @@ async fn authorize_resource(
         return denied();
     }
     let requested = bound.root.join(&request.path);
+    authorize_resource_path(state, bound, requested, bound.root.clone(), request.path).await
+}
+
+async fn authorize_external_resource(
+    state: &ServerState,
+    bound: &BoundContext,
+    payload: serde_json::Value,
+) -> ToolInvocationServiceResolution {
+    let Ok(request) = serde_json::from_value::<
+        bcode_plugin_sdk::workspace_access::ExternalResourceRequest,
+    >(payload) else {
+        return denied();
+    };
+    if !request.is_normalized() {
+        return denied();
+    }
+    let Some(parent) = request.path.parent() else {
+        return denied();
+    };
+    let Some(name) = request.path.file_name().and_then(|name| name.to_str()) else {
+        return denied();
+    };
+    let root = parent.to_path_buf();
+    let name = name.to_owned();
+    authorize_resource_path(state, bound, request.path, root, name).await
+}
+
+async fn authorize_resource_path(
+    state: &ServerState,
+    bound: &BoundContext,
+    requested: std::path::PathBuf,
+    authorized_root: std::path::PathBuf,
+    relative_path: String,
+) -> ToolInvocationServiceResolution {
     let Ok(path) = tokio::fs::canonicalize(&requested).await else {
         return denied();
     };
     // Do not broaden a request for one lexical resource into a symlink target.
-    if path != requested || !path.starts_with(&bound.root) {
+    if path != requested || !path.starts_with(&authorized_root) {
         return denied();
     }
     if !tokio::fs::metadata(&path)
@@ -633,8 +669,8 @@ async fn authorize_resource(
         }
     }
     let grant = WorkspaceResourceGrant {
-        workspace_root: bound.root.clone(),
-        path: request.path,
+        workspace_root: authorized_root,
+        path: relative_path,
     };
     serde_json::to_value(grant).map_or_else(
         |_| denied(),
@@ -1462,6 +1498,8 @@ library = "libtest_wait_second.dylib"
                 query: active.query,
             },
             max_results: 64,
+            interaction_state: std::collections::BTreeMap::new(),
+            action_id: None,
         };
         invoke(
             state,
@@ -1550,6 +1588,8 @@ library = "libtest_wait_second.dylib"
                 query: "visible".into(),
             },
             max_results: 8,
+            interaction_state: std::collections::BTreeMap::new(),
+            action_id: None,
         };
         let response = client
             .invoke_plugin_service_contextual(
@@ -1674,7 +1714,6 @@ library = "libtest_wait_second.dylib"
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(root.join(".git")).unwrap();
         std::fs::write(root.join(".gitignore"), "excluded.rs\n").unwrap();
         std::fs::write(root.join("excluded.rs"), "EXCLUDED_CONTENT_MARKER").unwrap();
         std::fs::write(root.join("文件 space.rs"), "VISIBLE_CONTENT_MARKER").unwrap();
@@ -1736,7 +1775,7 @@ library = "libtest_wait_second.dylib"
             route_id: None,
             interface_id: "bcode.filesystem/v1".into(),
             operation: "search_paths".into(),
-            payload: serde_json::json!({"query":"visible", "directory":"", "recursive":true}),
+            payload: serde_json::json!({"query":"visible", "directory":"", "recursive":true, "scope":"workspace"}),
         };
         let result = route_nested(&state, &bound, request.clone(), 1).await;
         let ToolInvocationServiceResolution::Responded { payload } = result else {
@@ -1838,6 +1877,55 @@ library = "libtest_wait_second.dylib"
             .await,
             ToolInvocationServiceResolution::Failed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn external_resource_grants_are_exact_and_do_not_change_workspace_authority() {
+        use bcode_plugin_sdk::workspace_access::ExternalResourceRequest;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let external = temp.path().join("index");
+        std::fs::write(&external, "metadata").unwrap();
+        let external = external.canonicalize().unwrap();
+        let state = bridge_state(&temp.path().join("sessions"));
+        let bound = bound_fixture(root.canonicalize().unwrap());
+        let result = authorize_external_resource(
+            &state,
+            &bound,
+            serde_json::to_value(ExternalResourceRequest {
+                path: external.clone(),
+            })
+            .unwrap(),
+        )
+        .await;
+        let ToolInvocationServiceResolution::Responded { payload } = result else {
+            panic!("authorized exact read")
+        };
+        let grant: WorkspaceResourceGrant = serde_json::from_value(payload).unwrap();
+        assert_eq!(grant.workspace_root.join(&grant.path), external);
+        assert_eq!(bound.root, root.canonicalize().unwrap());
+        assert!(matches!(
+            authorize_resource(&state, &bound, serde_json::json!({"path":"../index"})).await,
+            ToolInvocationServiceResolution::Failed { .. }
+        ));
+        for path in ["relative/index", "/tmp/../index"] {
+            assert!(matches!(
+                authorize_external_resource(&state, &bound, serde_json::json!({"path":path})).await,
+                ToolInvocationServiceResolution::Failed { .. }
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&external, &alias).unwrap();
+            assert!(matches!(
+                authorize_external_resource(&state, &bound, serde_json::json!({"path":alias}))
+                    .await,
+                ToolInvocationServiceResolution::Failed { .. }
+            ));
+        }
+        drop(state);
     }
 
     #[tokio::test]

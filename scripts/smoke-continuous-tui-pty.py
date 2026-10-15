@@ -461,7 +461,10 @@ model_id = "fake-echo"
         (repo / "continuous-review-fixture.txt").write_text("CONTINUOUS_REVIEW_FILE\n")
         if fixture in ("completion", "completion-review"):
             (repo / "completion-target.txt").write_text("offline path completion fixture\n")
-        subprocess.run(["/usr/bin/git", "-C", str(repo), "add", "--", "continuous-review-fixture.txt"],
+        tracked = ["continuous-review-fixture.txt"]
+        if fixture in ("completion", "completion-review"):
+            tracked.append("completion-target.txt")
+        subprocess.run(["/usr/bin/git", "-C", str(repo), "add", "--", *tracked],
                        env=git_env, check=True, timeout=5, capture_output=True)
     return env, config, state
 

@@ -1,12 +1,11 @@
-//! Bounded subset of gitignore syntax; unsupported syntax fails closed.
+//! Gitignore grammar over bounded, separately authorized in-memory policy text.
+//! Never use the matcher's filesystem discovery or global configuration helpers.
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub(super) struct Rule {
     base: PathBuf,
-    pattern: String,
-    directory_only: bool,
-    negated: bool,
-    anchored: bool,
+    matcher: ignore::gitignore::Gitignore,
 }
 
 pub(super) fn parse(
@@ -16,50 +15,33 @@ pub(super) fn parse(
     admit: &mut dyn FnMut(usize) -> Result<(), &'static str>,
 ) -> Result<Vec<Rule>, &'static str> {
     let mut rules = Vec::new();
-    for raw in text.lines() {
+    for line in text.lines() {
         admit(0)?;
-        let line = raw.trim_end_matches(' ');
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.len() > 512
-            || line.contains(['\\', '[', ']'])
-            || line.contains("**")
-            || line.chars().any(char::is_control)
-        {
-            return Err("ignore_policy_unsupported");
-        }
-        let (negated, line) = line
-            .strip_prefix('!')
-            .map_or((false, line), |line| (true, line));
-        let (anchored, line) = line
-            .strip_prefix('/')
-            .map_or((false, line), |line| (true, line));
-        let directory_only = line.ends_with('/');
-        let pattern = line.strip_suffix('/').unwrap_or(line);
-        if pattern.is_empty()
-            || pattern
-                .split('/')
-                .any(|part| matches!(part, ".." | "." | ""))
-        {
-            return Err("ignore_policy_unsupported");
+        if line.len() > 512 {
+            return Err("ignore_policy_limit");
         }
         if rules.len() >= remaining_rules.min(256) {
             return Err("ignore_rule_limit");
         }
-        // Charge before String/PathBuf/Vec allocation (including capacity growth).
+        // Admission precedes matcher allocations. Compilation stays bounded by the
+        // authorized file size, rule count and per-line limit, with ticks per rule.
         admit(
-            pattern
-                .len()
+            line.len()
                 .saturating_add(base.as_os_str().len())
                 .saturating_add(256),
         )?;
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(base);
+        builder
+            .add_line(None, line)
+            .map_err(|_| "ignore_policy_invalid")?;
+        admit(0)?;
+        let matcher = builder.build().map_err(|_| "ignore_policy_invalid")?;
         rules.push(Rule {
-            base: base.into(),
-            pattern: pattern.into(),
-            directory_only,
-            negated,
-            anchored,
+            base: base.to_owned(),
+            matcher,
         });
     }
     Ok(rules)
@@ -74,94 +56,49 @@ pub(super) fn ignored(
     let mut ignored = false;
     for rule in rules {
         tick()?;
-        if rule.directory_only && !directory {
+        if !path.starts_with(&rule.base) {
             continue;
         }
-        let Ok(relative) = path.strip_prefix(&rule.base) else {
-            continue;
-        };
-        let Some(relative) = relative.to_str() else {
-            return Ok(true);
-        };
-        let candidate = if rule.anchored || rule.pattern.contains('/') {
-            relative
-        } else {
-            relative.rsplit('/').next().unwrap_or(relative)
-        };
-        if glob(&rule.pattern, candidate, tick)? {
-            ignored = !rule.negated;
+        match rule.matcher.matched(path, directory) {
+            ignore::Match::Ignore(_) => ignored = true,
+            ignore::Match::Whitelist(_) => ignored = false,
+            ignore::Match::None => (),
         }
     }
     Ok(ignored)
 }
 
-// UTF-8 source offsets, not terminal geometry. No allocation for wildcard matching.
-fn glob(
-    pattern: &str,
-    path: &str,
-    tick: &mut dyn FnMut() -> Result<(), &'static str>,
-) -> Result<bool, &'static str> {
-    let (mut p, mut s, mut star, mut retry) = (0, 0, None, 0);
-    while s < path.len() {
-        tick()?;
-        let character = path[s..]
-            .chars()
-            .next()
-            .ok_or("ignore_policy_unsupported")?;
-        let next = pattern[p..].chars().next();
-        if next == Some(character) || (next == Some('?') && character != '/') {
-            p += next.map_or(0, char::len_utf8);
-            s += character.len_utf8();
-        } else if next == Some('*') {
-            star = Some(p);
-            retry = s;
-            p += 1;
-        } else if let Some(position) = star {
-            let Some(character) = path[retry..].chars().next() else {
-                return Ok(false);
-            };
-            if character == '/' {
-                return Ok(false);
-            }
-            retry += character.len_utf8();
-            s = retry;
-            p = position + 1;
-        } else {
-            return Ok(false);
-        }
-    }
-    while pattern[p..].starts_with('*') {
-        tick()?;
-        p += 1;
-    }
-    Ok(p == pattern.len())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{glob, parse};
+    use super::*;
     #[test]
-    fn wildcard_retry_checks_cancellation_without_allocating() {
-        let mut calls = 0;
-        let result = glob("*aaaaaaaaab", "aaaaaaaaaaaaaaaaaaaaaaaaac", &mut || {
-            calls += 1;
-            if calls >= 8 { Err("cancelled") } else { Ok(()) }
-        });
-        assert_eq!(result, Err("cancelled"));
-        assert_eq!(calls, 8);
+    fn full_grammar_double_star_brackets_escapes_and_negation() {
+        let rules = parse(
+            Path::new(""),
+            "**/build/**\n[ab].tmp\n\\#literal\n*.log\n!important.log\n",
+            256,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        for path in ["src/build/output", "a.tmp", "#literal", "error.log"] {
+            assert!(
+                ignored(Path::new(path), false, &rules, &mut || Ok(())).unwrap(),
+                "{path}"
+            );
+        }
+        assert!(!ignored(Path::new("important.log"), false, &rules, &mut || Ok(())).unwrap());
+        assert_eq!(
+            ignored(Path::new("a.tmp"), false, &rules, &mut || Err("cancelled")),
+            Err("cancelled")
+        );
     }
     #[test]
-    fn rule_allocation_is_admitted_before_construction() {
+    fn allocation_is_admitted_before_compilation() {
         let mut charged = 0;
-        let result = parse(
-            std::path::Path::new("src"),
-            "*.log\n*.tmp",
-            1024,
-            &mut |cost| {
-                charged += cost;
-                if cost == 0 { Ok(()) } else { Err("byte_limit") }
-            },
-        );
+        let result = parse(Path::new("src"), "*.log\n*.tmp", 1024, &mut |cost| {
+            charged += cost;
+            if cost == 0 { Ok(()) } else { Err("byte_limit") }
+        });
         assert!(matches!(result, Err("byte_limit")));
         assert_eq!(charged, 264);
     }

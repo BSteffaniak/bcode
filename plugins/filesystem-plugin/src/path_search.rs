@@ -6,10 +6,21 @@
 //! It must verify the invocation identity, derive canonical workspace context,
 //! evaluate canonical enumeration/read policy facts, and return `SearchPathsGrant`
 //! only after authorization. Unsupported/denied/missing bridges fail closed.
-//! Only separately authorized, bounded `.gitignore` policy reads are performed.
+//! Only separately authorized, bounded ignore/Git metadata reads are performed.
 //! No content is returned or attached. Unsupported ignore syntax fails closed.
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+mod git_config;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+mod git_policy;
 mod ignore_policy;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+mod inventory;
+mod matcher;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+mod prepared;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+mod workspace_inventory;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 use std::path::PathBuf;
@@ -19,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::workspace_access::{
-    OP_WORKSPACE_ACCESS_AUTHORIZE, OP_WORKSPACE_RESOURCE_AUTHORIZE, WORKSPACE_ACCESS_INTERFACE_ID,
+    ExternalResourceRequest, OP_EXTERNAL_RESOURCE_AUTHORIZE, OP_WORKSPACE_ACCESS_AUTHORIZE,
+    OP_WORKSPACE_RESOURCE_AUTHORIZE, WORKSPACE_ACCESS_INTERFACE_ID,
     WorkspaceAccessGrant as SearchPathsGrant, WorkspaceAccessRequest, WorkspaceResourceGrant,
     WorkspaceResourceRequest,
 };
@@ -37,6 +49,10 @@ pub const PATH_SEARCH_AUTHORIZATION_INTERFACE: &str = WORKSPACE_ACCESS_INTERFACE
 pub struct SearchPathsRequest {
     /// Case-insensitive Unicode subsequence matched against workspace-relative paths.
     pub query: String,
+    /// Git-index tracked paths by default; workspace also includes untracked paths.
+    pub scope: SearchPathsScope,
+    /// Bypass a fresh inventory and coalesce a bounded refresh.
+    pub refresh: bool,
     /// Workspace-relative directory; empty means workspace root. No `..` or absolute paths.
     pub directory: String,
     /// Recurse beneath `directory` when true; false returns its immediate children.
@@ -45,7 +61,7 @@ pub struct SearchPathsRequest {
     pub include_hidden: bool,
     /// Result bound, clamped to `1..=256`.
     pub max_results: usize,
-    /// Enumeration bound, clamped to `1..=20_000`, including excluded names.
+    /// Enumeration bound, clamped to `1..=250_000`, including excluded names.
     pub max_entries: usize,
     /// Directory descent bound, clamped to `1..=64`.
     pub max_depth: usize,
@@ -59,11 +75,13 @@ impl Default for SearchPathsRequest {
     fn default() -> Self {
         Self {
             query: String::new(),
+            scope: SearchPathsScope::Tracked,
+            refresh: false,
             directory: String::new(),
             recursive: true,
             include_hidden: false,
             max_results: 100,
-            max_entries: 10_000,
+            max_entries: 250_000,
             max_depth: 32,
             timeout_ms: 100,
             max_bytes: 262_144,
@@ -95,6 +113,26 @@ pub enum SearchPathKind {
     Directory,
 }
 
+/// Requested/effective path inventory scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchPathsScope {
+    /// Existing Git-index files, including staged additions.
+    #[default]
+    Tracked,
+    /// Tracked and nonignored untracked files; nonrepo confined traversal.
+    Workspace,
+}
+
+/// Half-open byte range in the original UTF-8 relative path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchPathMatchRange {
+    /// Inclusive byte offset.
+    pub start: usize,
+    /// Exclusive byte offset.
+    pub end: usize,
+}
+
 /// Workspace-relative candidate, not a file attachment or a content reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchPathEntry {
@@ -104,6 +142,9 @@ pub struct SearchPathEntry {
     pub kind: SearchPathKind,
     /// Lower is better. Equal scores are ordered by exact relative path.
     pub score: usize,
+    /// Matching original-path byte ranges, empty for an empty query.
+    #[serde(default)]
+    pub match_ranges: Vec<SearchPathMatchRange>,
 }
 
 /// Bounded path-only response; consumers must display non-complete states explicitly.
@@ -117,6 +158,9 @@ pub struct SearchPathsResponse {
     pub reason: Option<String>,
     /// Number of directory entries examined, including hidden/ignored entries.
     pub visited_entries: usize,
+    /// Scope actually searched; nonrepo fallback requires explicit workspace scope.
+    #[serde(default)]
+    pub effective_scope: SearchPathsScope,
 }
 
 impl SearchPathsResponse {
@@ -126,6 +170,7 @@ impl SearchPathsResponse {
             state,
             reason: Some(reason.into()),
             visited_entries: 0,
+            effective_scope: SearchPathsScope::Tracked,
         }
     }
 }
@@ -188,7 +233,7 @@ fn invoke_response(context: &NativeServiceContext) -> SearchPathsResponse {
             );
         }
     };
-    search(
+    search_with_metadata(
         &request,
         &grant,
         &|| context.cancellation.is_cancelled(),
@@ -204,6 +249,24 @@ fn invoke_response(context: &NativeServiceContext) -> SearchPathsResponse {
                 interface_id: WORKSPACE_ACCESS_INTERFACE_ID.into(),
                 operation: OP_WORKSPACE_RESOURCE_AUTHORIZE.into(),
                 payload: serde_json::json!(request),
+            });
+            match context.bridge.request(&nested) {
+                Ok(ServiceBridgeResponse::Service(
+                    ToolInvocationServiceResolution::Responded { payload },
+                )) => serde_json::from_value::<WorkspaceResourceGrant>(payload).ok(),
+                _ => None,
+            }
+        },
+        &|path| {
+            let nested = ServiceBridgeRequest::InvokeService(ToolInvocationServiceRequest {
+                invocation_id: String::new(),
+                request_id: "filesystem-git-metadata-authorization".into(),
+                route_id: None,
+                interface_id: WORKSPACE_ACCESS_INTERFACE_ID.into(),
+                operation: OP_EXTERNAL_RESOURCE_AUTHORIZE.into(),
+                payload: serde_json::json!(ExternalResourceRequest {
+                    path: path.to_owned()
+                }),
             });
             match context.bridge.request(&nested) {
                 Ok(ServiceBridgeResponse::Service(
@@ -249,49 +312,33 @@ fn excluded(path: &Path, grant: &SearchPathsGrant, hidden: bool) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
-fn fuzzy_score(
-    path: &str,
-    query: &str,
-    tick: &mut dyn FnMut() -> Result<(), &'static str>,
-) -> Result<Option<usize>, &'static str> {
-    if query.is_empty() {
-        return Ok(Some(0));
-    }
-    let lower = path.to_lowercase();
-    let query = query.to_lowercase();
-    let mut remaining = query.chars().peekable();
-    let mut score = 0;
-    for (position, character) in lower.chars().enumerate() {
-        tick()?;
-        if remaining.peek() == Some(&character) {
-            remaining.next();
-            score += position;
-            if remaining.peek().is_none() {
-                return Ok(Some(score));
-            }
-        }
-    }
-    Ok(None)
-}
-
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
-fn search(
+fn search_with_metadata(
     _: &SearchPathsRequest,
     _: &SearchPathsGrant,
     _: &dyn Fn() -> bool,
     _: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
+    _: &dyn Fn(&Path) -> Option<WorkspaceResourceGrant>,
 ) -> SearchPathsResponse {
     SearchPathsResponse::terminal(SearchPathsState::Unavailable, "platform_unavailable")
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
-fn search(
+fn search_with_metadata(
     request: &SearchPathsRequest,
     grant: &SearchPathsGrant,
     cancelled: &dyn Fn() -> bool,
     authorize_resource: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
+    authorize_external: &dyn Fn(&Path) -> Option<WorkspaceResourceGrant>,
 ) -> SearchPathsResponse {
-    unix::search(request, grant, cancelled, authorize_resource)
+    unix::search_with_metadata(
+        request,
+        grant,
+        cancelled,
+        authorize_resource,
+        authorize_external,
+        true,
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
@@ -299,8 +346,8 @@ mod unix {
     use super::{
         Component, Duration, Instant, Path, PathBuf, SearchPathEntry, SearchPathKind,
         SearchPathsGrant, SearchPathsRequest, SearchPathsResponse, SearchPathsState,
-        WorkspaceResourceGrant, excluded, fuzzy_score, ignore_policy, valid_relative,
-        valid_request,
+        WorkspaceResourceGrant, excluded, git_policy, ignore_policy, inventory, matcher, prepared,
+        valid_relative, valid_request, workspace_inventory,
     };
     use std::ffi::CString;
     use std::fs::File;
@@ -414,13 +461,213 @@ mod unix {
         bytes: usize,
         root_identity: Option<(u64, u64)>,
         bindings: Vec<(PathBuf, u64, u64)>,
+        tracked_paths: Option<std::sync::Arc<std::collections::BTreeSet<String>>>,
+        capture: Option<std::collections::BTreeSet<String>>,
+        resources: std::collections::BTreeMap<String, Option<[u8; 32]>>,
         response: SearchPathsResponse,
     }
 
+    impl<'a> Budget<'a> {
+        fn new(
+            request: &'a SearchPathsRequest,
+            cancelled: &'a dyn Fn() -> bool,
+            authorize_resource: &'a dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
+        ) -> Self {
+            Self {
+                request,
+                cancelled,
+                authorize_resource,
+                started: Instant::now(),
+                bytes: 256,
+                root_identity: None,
+                bindings: Vec::new(),
+                tracked_paths: None,
+                capture: None,
+                resources: std::collections::BTreeMap::new(),
+                response: SearchPathsResponse {
+                    entries: Vec::new(),
+                    state: SearchPathsState::Complete,
+                    reason: None,
+                    visited_entries: 0,
+                    effective_scope: request.scope,
+                },
+            }
+        }
+    }
     impl Budget<'_> {
+        fn descend(
+            &mut self,
+            mut root: File,
+            relative: &Path,
+            grant: &SearchPathsGrant,
+        ) -> Option<(File, Vec<ignore_policy::Rule>)> {
+            let mut rules = Vec::new();
+            let mut ancestor = PathBuf::new();
+            for part in relative.components() {
+                if !self.ignore_rules(&root, &ancestor, grant, &mut rules) {
+                    return None;
+                }
+                if self.stop() {
+                    return None;
+                }
+                let Component::Normal(name) = part else {
+                    unreachable!();
+                };
+                ancestor.push(name);
+                let ignored = self.ignored(&ancestor, true, &rules)?;
+                if ignored {
+                    self.response = SearchPathsResponse::terminal(
+                        SearchPathsState::Unavailable,
+                        "directory_ignored",
+                    );
+                    return None;
+                }
+                if let Ok(child) = open_child(&root, Path::new(name)) {
+                    root = child;
+                } else {
+                    self.response = SearchPathsResponse::terminal(
+                        SearchPathsState::Unavailable,
+                        "directory_unavailable",
+                    );
+                    return None;
+                }
+            }
+            Some((root, rules))
+        }
+        fn workspace(
+            &mut self,
+            root: &File,
+            relative: &Path,
+            grant: &SearchPathsGrant,
+            rules: &[ignore_policy::Rule],
+            authorize_external: &dyn Fn(&Path) -> Option<WorkspaceResourceGrant>,
+        ) {
+            let policy = match git_policy::load(
+                grant,
+                self.authorize_resource,
+                authorize_external,
+                &mut || self.tick(),
+            ) {
+                Ok(policy) => policy,
+                Err(reason) => {
+                    self.mark(reason);
+                    return;
+                }
+            };
+            let incomplete = policy.incomplete;
+            let mut inherited = policy.rules;
+            inherited.extend_from_slice(rules);
+            let rules = inherited.as_slice();
+            let mut build_request = self.request.clone();
+            build_request.max_entries = 250_000;
+            build_request.recursive = false;
+            build_request.timeout_ms = self.request.timeout_ms;
+            let inventory = workspace_inventory::load(
+                self.request,
+                policy.fingerprint,
+                self.tracked_paths.as_ref(),
+                grant,
+                self.cancelled,
+                self.authorize_resource,
+                &mut |progress| self.resume_workspace(progress, &build_request, grant, rules),
+            );
+            match inventory {
+                Ok(paths) => {
+                    if let Ok(workspace_root) =
+                        super::super::confined::open_directory(&grant.workspace_root)
+                    {
+                        self.tracked(&workspace_root, &paths, grant);
+                    } else {
+                        self.mark("root_unavailable");
+                    }
+                }
+                Err(reason) => self.mark(&reason),
+            }
+            self.response.entries.sort_by(|left, right| {
+                left.score
+                    .cmp(&right.score)
+                    .then_with(|| left.path.cmp(&right.path))
+            });
+            if let Some(reason) = incomplete {
+                self.mark(reason);
+            }
+            self.bound(root, relative, grant);
+            self.stop();
+        }
+        fn resume_workspace(
+            &self,
+            progress: &mut workspace_inventory::Progress,
+            request: &SearchPathsRequest,
+            grant: &SearchPathsGrant,
+            inherited: &[ignore_policy::Rule],
+        ) -> Result<(), String> {
+            while let Some((relative, depth, rules)) = progress.pending.last().cloned() {
+                let directory =
+                    super::super::confined::open_directory(&grant.workspace_root.join(&relative))
+                        .map_err(|_| "directory_changed")?;
+                let before = workspace_inventory::directory_identity(&directory)?;
+                let mut build = Budget::new(request, self.cancelled, self.authorize_resource);
+                build.started = self.started;
+                build.root_identity = self.root_identity;
+                build.tracked_paths.clone_from(&self.tracked_paths);
+                build.capture = Some(std::collections::BTreeSet::new());
+                let mut rules = if progress.pending.len() == 1 && progress.directories.is_empty() {
+                    inherited.to_vec()
+                } else {
+                    rules
+                };
+                if !build.ignore_rules(&directory, &relative, grant, &mut rules)
+                    || !build.walk_entries(&directory, &relative, depth, grant, &mut rules)
+                    || !build.bound(&directory, &relative, grant)
+                {
+                    return Err(build
+                        .response
+                        .reason
+                        .unwrap_or_else(|| "inventory_incomplete".into()));
+                }
+                if workspace_inventory::directory_identity(&directory)? != before {
+                    return Err("directory_changed".into());
+                }
+                let captured = build.capture.take().expect("capture active");
+                if progress.paths.len() + captured.len() > 250_000 {
+                    return Err("inventory_entry_limit".into());
+                }
+                progress.bytes = progress.bytes.saturating_add(build.bytes);
+                if progress.bytes > 32 * 1024 * 1024 {
+                    return Err("inventory_byte_limit".into());
+                }
+                progress.pending.pop();
+                for path in &captured {
+                    if let Some(child) = path.strip_suffix('/') {
+                        if depth >= request.max_depth.clamp(1, 64) {
+                            return Err("depth_limit".into());
+                        }
+                        progress.bytes = progress.bytes.saturating_add(
+                            child.len()
+                                + rules.len() * std::mem::size_of::<ignore_policy::Rule>()
+                                + 128,
+                        );
+                        if progress.bytes > 32 * 1024 * 1024 {
+                            return Err("inventory_byte_limit".into());
+                        }
+                        progress
+                            .pending
+                            .push((child.into(), depth + 1, rules.clone()));
+                    }
+                }
+                progress.directories.insert(relative, before);
+                progress.paths.extend(captured);
+                progress.resources.extend(build.resources);
+            }
+            Ok(())
+        }
         fn mark(&mut self, reason: &str) {
             if self.response.state == SearchPathsState::Complete {
-                self.response.state = SearchPathsState::Incomplete;
+                self.response.state = if reason == "cancelled" {
+                    SearchPathsState::Cancelled
+                } else {
+                    SearchPathsState::Incomplete
+                };
                 self.response.reason = Some(reason.into());
             }
         }
@@ -453,7 +700,12 @@ mod unix {
                 self.mark("byte_limit");
                 return false;
             };
-            if total > self.request.max_bytes.clamp(1024, 1_048_576) {
+            let limit = if self.capture.is_some() {
+                32 * 1024 * 1024
+            } else {
+                self.request.max_bytes.clamp(1024, 1_048_576)
+            };
+            if total > limit {
                 self.mark("byte_limit");
                 return false;
             }
@@ -501,6 +753,28 @@ mod unix {
             directory: bool,
             rules: &[ignore_policy::Rule],
         ) -> Option<bool> {
+            if self.tracked_paths.as_ref().is_some_and(|paths| {
+                path.to_str().is_some_and(|text| paths.contains(text))
+                    || (directory
+                        && paths
+                            .range(format!("{}/", path.display())..)
+                            .next()
+                            .is_some_and(|text| text.starts_with(&format!("{}/", path.display()))))
+            }) {
+                return Some(false);
+            }
+            let mut ancestor = path.parent();
+            while let Some(parent) = ancestor.filter(|parent| !parent.as_os_str().is_empty()) {
+                match ignore_policy::ignored(parent, true, rules, &mut || self.tick()) {
+                    Ok(true) => return Some(true),
+                    Ok(false) => (),
+                    Err(reason) => {
+                        self.mark(reason);
+                        return None;
+                    }
+                }
+                ancestor = parent.parent();
+            }
             match ignore_policy::ignored(path, directory, rules, &mut || self.tick()) {
                 Ok(ignored) => Some(ignored),
                 Err(reason) => {
@@ -572,7 +846,9 @@ mod unix {
             let dir = Directory(dir);
             let mut names = Vec::new();
             loop {
-                if !self.bound(file, relative, grant) {
+                if (self.capture.is_none() || names.len() % 128 == 0)
+                    && !self.bound(file, relative, grant)
+                {
                     return None;
                 }
                 // Clear thread-local errno so EOF and enumeration failure remain distinguishable.
@@ -591,7 +867,7 @@ mod unix {
                 if matches!(name.to_bytes(), b"." | b"..") {
                     continue;
                 }
-                if self.response.visited_entries >= self.request.max_entries.clamp(1, 20_000) {
+                if self.response.visited_entries >= self.request.max_entries.clamp(1, 250_000) {
                     self.mark("entry_limit");
                     return None;
                 }
@@ -629,6 +905,8 @@ mod unix {
             if self.stop() {
                 return false;
             }
+            self.resources
+                .insert(path.to_string_lossy().into_owned(), None);
             let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
             // SAFETY: live descriptor/name, writable stat, no symlink following.
             if unsafe {
@@ -705,8 +983,198 @@ mod unix {
                     return false;
                 }
             };
+            self.resources.insert(
+                path.to_string_lossy().into_owned(),
+                Some(<sha2::Sha256 as sha2::Digest>::digest(&bytes).into()),
+            );
             rules.extend(parsed);
             true
+        }
+        fn candidate(&mut self, path: &str, kind: SearchPathKind) -> bool {
+            if let Some(capture) = self.capture.as_mut() {
+                if capture.len() >= 250_000 {
+                    self.mark("inventory_entry_limit");
+                    return false;
+                }
+                if !self.charge(path.len() + 64) {
+                    return false;
+                }
+                let captured = if kind == SearchPathKind::Directory {
+                    format!("{path}/")
+                } else {
+                    path.into()
+                };
+                self.capture
+                    .as_mut()
+                    .expect("capture active")
+                    .insert(captured);
+                return true;
+            }
+            let request = self.request;
+            let matched = match matcher::find(path, &request.query, &mut || self.tick()) {
+                Ok(Some(matched)) => matched,
+                Ok(None) => return true,
+                Err(reason) => {
+                    self.mark(reason);
+                    return false;
+                }
+            };
+            let entry = SearchPathEntry {
+                path: path.into(),
+                kind,
+                score: matched.score,
+                match_ranges: matched.ranges,
+            };
+            let limit = request.max_results.clamp(1, 256);
+            if self.response.entries.len() == limit {
+                let worst = self
+                    .response
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| {
+                        left.score
+                            .cmp(&right.score)
+                            .then_with(|| left.path.cmp(&right.path))
+                    })
+                    .map(|(index, _)| index)
+                    .expect("nonempty bounded results");
+                self.mark("result_limit");
+                let old = &self.response.entries[worst];
+                if (entry.score, &entry.path) >= (old.score, &old.path) {
+                    return true;
+                }
+                let old_bytes = old.path.len() * 6 + old.match_ranges.len() * 32 + 128;
+                self.bytes = self.bytes.saturating_sub(old_bytes);
+                self.response.entries.swap_remove(worst);
+            }
+            if !self.charge(entry.path.len() * 6 + entry.match_ranges.len() * 32 + 128) {
+                return false;
+            }
+            self.response.entries.push(entry);
+            true
+        }
+        fn rank_prepared<'a>(
+            &mut self,
+            prepared: &'a prepared::Prepared,
+            grant: &SearchPathsGrant,
+        ) -> Option<Vec<(usize, &'a str, SearchPathKind)>> {
+            let query = matcher::Query::new(&self.request.query);
+            let mut ranked = Vec::new();
+            let directory = self.request.directory.as_str();
+            let prefix = if directory.is_empty() {
+                String::new()
+            } else {
+                format!("{directory}/")
+            };
+            let base_depth = directory.bytes().filter(|byte| *byte == b'/').count()
+                + usize::from(!directory.is_empty());
+            for (index, entry) in prepared.entries.iter().enumerate() {
+                if index % 128 == 0 && self.stop() {
+                    return None;
+                }
+                if (!self.request.include_hidden && entry.hidden)
+                    || !entry.path.starts_with(&prefix)
+                    || grant
+                        .excluded_prefixes
+                        .iter()
+                        .any(|prefix| Path::new(&entry.path).starts_with(prefix))
+                {
+                    continue;
+                }
+                let depth = entry.depth - base_depth;
+                if depth == 0
+                    || depth > self.request.max_depth.clamp(1, 64)
+                    || (!self.request.recursive && depth != 1)
+                {
+                    continue;
+                }
+                self.response.visited_entries += 1;
+                if self.response.visited_entries > self.request.max_entries.clamp(1, 250_000) {
+                    self.mark("entry_limit");
+                    return None;
+                }
+                if let Some(score) = query.score(&entry.lower, entry.mask) {
+                    ranked.push((score, entry.path.as_str(), entry.kind));
+                }
+            }
+            Some(ranked)
+        }
+        fn tracked(
+            &mut self,
+            root: &File,
+            paths: &std::sync::Arc<std::collections::BTreeSet<String>>,
+            grant: &SearchPathsGrant,
+        ) {
+            let prepared = match prepared::load(
+                paths,
+                self.request.scope == super::SearchPathsScope::Workspace,
+                &mut || self.tick(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    self.mark(reason);
+                    return;
+                }
+            };
+            let Some(mut ranked) = self.rank_prepared(&prepared, grant) else {
+                return;
+            };
+            ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+            if self.stop() {
+                return;
+            }
+            for (_, path, kind) in ranked {
+                if self.response.entries.len() >= self.request.max_results.clamp(1, 256) {
+                    self.mark("result_limit");
+                    break;
+                }
+                if !self.bound(root, Path::new(""), grant) {
+                    return;
+                }
+                let path_ref = Path::new(path);
+                let Some(parent) = path_ref.parent() else {
+                    continue;
+                };
+                let Ok(directory) =
+                    super::super::confined::open_directory(&grant.workspace_root.join(parent))
+                else {
+                    continue;
+                };
+                if !self.remember(&directory, parent, grant) {
+                    return;
+                }
+                let Some(name) = path_ref.file_name() else {
+                    continue;
+                };
+                let Ok(name) = CString::new(name.as_bytes()) else {
+                    continue;
+                };
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: live descriptor/basename/output; never follow symlinks.
+                if unsafe {
+                    libc::fstatat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        stat.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    continue;
+                }
+                // SAFETY: successful fstatat initialized output.
+                let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+                if (kind == SearchPathKind::File && mode != libc::S_IFREG)
+                    || (kind == SearchPathKind::Directory && mode != libc::S_IFDIR)
+                {
+                    continue;
+                }
+                if !self.candidate(path, kind) {
+                    return;
+                }
+            }
+            self.validate_results(grant);
         }
         fn walk(
             &mut self,
@@ -736,8 +1204,10 @@ mod unix {
             let Some(names) = self.names(file, relative, grant) else {
                 return false;
             };
-            for name in names {
-                if !self.bound(file, relative, grant) {
+            for (index, name) in names.into_iter().enumerate() {
+                if (self.capture.is_none() || index % 128 == 0)
+                    && !self.bound(file, relative, grant)
+                {
                     return false;
                 }
                 let path = relative.join(&name);
@@ -774,34 +1244,12 @@ mod unix {
                     Some(false) => (),
                     None => return false,
                 }
-                if !self.bound(file, relative, grant) {
+                if self.capture.is_none() && !self.bound(file, relative, grant) {
                     return false;
                 }
-                let Some(path_text) = path.to_str() else {
-                    self.mark("non_utf8_path");
-                    continue;
-                };
-                if !self.charge(path_text.len().saturating_mul(6).saturating_add(128)) {
+                let path_text = path.to_str().expect("validated UTF-8 path");
+                if !self.candidate(path_text, kind) {
                     return false;
-                }
-                let request = self.request;
-                let score = match fuzzy_score(path_text, &request.query, &mut || self.tick()) {
-                    Ok(score) => score,
-                    Err(reason) => {
-                        self.mark(reason);
-                        return false;
-                    }
-                };
-                if let Some(score) = score {
-                    if self.response.entries.len() >= self.request.max_results.clamp(1, 256) {
-                        self.mark("result_limit");
-                        return false;
-                    }
-                    self.response.entries.push(SearchPathEntry {
-                        path: path_text.into(),
-                        kind,
-                        score,
-                    });
                 }
                 if kind == SearchPathKind::Directory && self.request.recursive {
                     if depth >= self.request.max_depth.clamp(1, 64) {
@@ -861,27 +1309,15 @@ mod unix {
                 <= 262_144
     }
 
-    pub(super) fn search(
+    pub(super) fn search_with_metadata(
         request: &SearchPathsRequest,
         grant: &SearchPathsGrant,
         cancelled: &dyn Fn() -> bool,
         authorize_resource: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
+        authorize_external: &dyn Fn(&Path) -> Option<WorkspaceResourceGrant>,
+        use_inventory: bool,
     ) -> SearchPathsResponse {
-        let mut budget = Budget {
-            request,
-            cancelled,
-            authorize_resource,
-            started: Instant::now(),
-            bytes: 256,
-            root_identity: None,
-            bindings: Vec::new(),
-            response: SearchPathsResponse {
-                entries: Vec::new(),
-                state: SearchPathsState::Complete,
-                reason: None,
-                visited_entries: 0,
-            },
-        };
+        let mut budget = Budget::new(request, cancelled, authorize_resource);
         if budget.stop() {
             return budget.response;
         }
@@ -897,7 +1333,7 @@ mod unix {
         }
         // Reuse canonical no-follow descriptor traversal; never canonicalize untrusted
         // paths via symlink-following filesystem operations. No regular file is opened.
-        let Ok(mut root) = super::super::confined::open_directory(&grant.workspace_root) else {
+        let Ok(root) = super::super::confined::open_directory(&grant.workspace_root) else {
             return SearchPathsResponse::terminal(
                 SearchPathsState::Unavailable,
                 "root_unavailable",
@@ -916,37 +1352,47 @@ mod unix {
             );
         }
         budget.root_identity = Some((metadata.dev(), metadata.ino()));
-        let mut rules = Vec::new();
-        let mut ancestor = PathBuf::new();
-        for part in relative.components() {
-            if !budget.ignore_rules(&root, &ancestor, grant, &mut rules) {
-                return budget.response;
-            }
-            if budget.stop() {
-                return budget.response;
-            }
-            let Component::Normal(name) = part else {
-                unreachable!();
-            };
-            ancestor.push(name);
-            let Some(ignored) = budget.ignored(&ancestor, true, &rules) else {
-                return budget.response;
-            };
-            if ignored {
-                return SearchPathsResponse::terminal(
-                    SearchPathsState::Unavailable,
-                    "directory_ignored",
-                );
-            }
-            match open_child(&root, Path::new(name)) {
-                Ok(child) => root = child,
-                Err(_) => {
-                    return SearchPathsResponse::terminal(
-                        SearchPathsState::Unavailable,
-                        "directory_unavailable",
-                    );
+        let tracked = if use_inventory {
+            match inventory::load(
+                request,
+                grant,
+                authorize_resource,
+                authorize_external,
+                &mut || budget.tick(),
+            ) {
+                Ok(paths) => paths,
+                Err(reason) => {
+                    budget.mark(reason);
+                    return budget.response;
                 }
             }
+        } else {
+            None
+        };
+        if request.scope == super::SearchPathsScope::Tracked {
+            let Some(paths) = tracked else {
+                let mut response =
+                    SearchPathsResponse::terminal(SearchPathsState::Unavailable, "non_repository");
+                response.effective_scope = request.scope;
+                return response;
+            };
+            budget.tracked(&root, &paths, grant);
+            budget.bound(&root, Path::new(""), grant);
+            budget.stop();
+            budget.response.entries.sort_by(|left, right| {
+                left.score
+                    .cmp(&right.score)
+                    .then_with(|| left.path.cmp(&right.path))
+            });
+            return budget.response;
+        }
+        budget.tracked_paths = tracked;
+        let Some((root, mut rules)) = budget.descend(root, relative, grant) else {
+            return budget.response;
+        };
+        if use_inventory && request.scope == super::SearchPathsScope::Workspace {
+            budget.workspace(&root, relative, grant, &rules, authorize_external);
+            return budget.response;
         }
         budget.walk(&root, relative, 1, grant, &mut rules);
         budget.bound(&root, relative, grant);
@@ -966,3 +1412,30 @@ mod unix {
     any(target_os = "macos", target_os = "linux", target_os = "android")
 ))]
 mod tests;
+
+#[cfg(test)]
+fn search(
+    request: &SearchPathsRequest,
+    grant: &SearchPathsGrant,
+    cancelled: &dyn Fn() -> bool,
+    authorize_resource: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
+) -> SearchPathsResponse {
+    unix::search_with_metadata(
+        request,
+        grant,
+        cancelled,
+        authorize_resource,
+        &|_| None,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn inventory_search(
+    request: &SearchPathsRequest,
+    grant: &SearchPathsGrant,
+    cancelled: &dyn Fn() -> bool,
+    authorize_resource: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
+) -> SearchPathsResponse {
+    search_with_metadata(request, grant, cancelled, authorize_resource, &|_| None)
+}

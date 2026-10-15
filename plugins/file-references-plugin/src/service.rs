@@ -44,6 +44,8 @@ impl RustPlugin for FileReferencesPlugin {
                 revision: request.document.revision,
                 state: ComposerSnapshotState::Error { code: code.into() },
                 candidates: Vec::new(),
+                interaction_state: request.interaction_state.clone(),
+                presentation: None,
                 incomplete: false,
             });
         ServiceResponse::json(&snapshot).unwrap_or_else(|_| {

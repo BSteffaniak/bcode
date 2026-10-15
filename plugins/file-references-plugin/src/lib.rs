@@ -78,6 +78,25 @@ impl PluginComposerContributor for FileReferenceContributor {
 pub fn register_tui(
     registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry,
 ) -> Result<(), bcode_plugin_sdk::composer::PluginComposerRegistryError> {
+    for (id, description, key) in [
+        (
+            "bcode.file-references.toggle_scope",
+            "Toggle file search scope",
+            "ctrl+g",
+        ),
+        (
+            "bcode.file-references.refresh",
+            "Refresh file search inventory",
+            "ctrl+r",
+        ),
+    ] {
+        registry.register_keymap_action(bcode_plugin_sdk::tui::keymap::KeymapAction {
+            id: id.to_owned(),
+            scope: "composer_interaction".to_owned(),
+            description: description.to_owned(),
+            defaults: vec![key.to_owned()],
+        });
+    }
     registry.register_composer_contributor(Box::new(FileReferenceContributor))
 }
 

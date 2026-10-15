@@ -278,11 +278,15 @@ mod tests {
                 query: "rust".into(),
             },
             max_results: 8,
+            interaction_state: BTreeMap::new(),
+            action_id: None,
         }
     }
 
     fn ready_snapshot(request: &ComposerSearchRequest) -> ComposerSnapshot {
         ComposerSnapshot {
+            interaction_state: BTreeMap::new(),
+            presentation: None,
             request_id: request.request_id.clone(),
             document_id: request.document.document_id.clone(),
             revision: request.document.revision,
@@ -310,6 +314,8 @@ mod tests {
         );
         let mut legacy = serde_json::to_value(&request).unwrap();
         legacy.as_object_mut().unwrap().remove("contribution_id");
+        legacy.as_object_mut().unwrap().remove("interaction_state");
+        legacy.as_object_mut().unwrap().remove("action_id");
         let legacy: ComposerSearchRequest = serde_json::from_value(legacy).unwrap();
         assert!(legacy.contribution_id.is_empty());
         legacy.validate().unwrap();

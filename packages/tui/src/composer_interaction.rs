@@ -24,7 +24,7 @@ pub struct ComposerScope {
     pub registry_revision: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ComposerCompletion {
     pub request_id: String,
     pub snapshot: Option<ComposerSnapshot>,
@@ -50,6 +50,10 @@ pub struct ComposerInteraction {
     route: Option<PluginOwnedComposerContribution>,
     reactivate_route: Option<PluginOwnedComposerContribution>,
     snapshot: Option<ComposerSnapshot>,
+    interaction_state: std::collections::BTreeMap<String, String>,
+    presentation: Option<bcode_plugin_sdk::composer::ComposerPresentation>,
+    pending_action: Option<String>,
+    resolved_hint: String,
     task: Option<tokio::task::AbortHandle>,
     client: Option<bcode_client::BcodeClient>,
     dismissed: bool,
@@ -73,6 +77,10 @@ impl Default for ComposerInteraction {
             route: None,
             reactivate_route: None,
             snapshot: None,
+            interaction_state: std::collections::BTreeMap::new(),
+            presentation: None,
+            pending_action: None,
+            resolved_hint: String::new(),
             task: None,
             client: None,
             dismissed: false,
@@ -228,12 +236,23 @@ impl ComposerInteraction {
             .map_or(ComposerContinuation::Finish, |candidate| {
                 candidate.continuation
             });
+        let state = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .candidates
+                    .get(self.list.focused().or_else(|| self.list.selected())?)
+            })
+            .and_then(|candidate| candidate.next_interaction_state.clone())
+            .unwrap_or_else(|| self.interaction_state.clone());
         let route = self.route.clone();
         self.cancel();
         if continuation == ComposerContinuation::Finish {
             self.document = Some(result);
             self.dismissed = true;
         } else {
+            self.interaction_state = state;
             self.reactivate_route = route;
         }
     }
@@ -246,12 +265,21 @@ impl ComposerInteraction {
         if self.dismissed || route.contribution.id.trim().is_empty() {
             return None;
         }
+        if self
+            .route
+            .as_ref()
+            .is_some_and(|previous| previous != &route)
+        {
+            self.cancel();
+        }
         let request = ComposerSearchRequest {
             contribution_id: route.contribution.id.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
             document: self.document()?.clone(),
             activation,
             max_results: MAX_COMPOSER_CANDIDATES,
+            interaction_state: self.interaction_state.clone(),
+            action_id: self.pending_action.take(),
         };
         request.validate().ok()?;
         if self.route.as_ref() == Some(&route) {
@@ -259,6 +287,8 @@ impl ComposerInteraction {
         } else {
             self.cancel();
         }
+        self.interaction_state
+            .clone_from(&request.interaction_state);
         self.route = Some(route);
         self.request = Some(request.clone());
         self.status = SearchStatus::Loading;
@@ -322,6 +352,10 @@ impl ComposerInteraction {
     pub fn cancel(&mut self) {
         self.cancel_request();
         self.route = None;
+        self.interaction_state.clear();
+        self.presentation = None;
+        self.pending_action = None;
+        self.resolved_hint.clear();
         self.reactivate_route = None;
         self.snapshot = None;
         self.status = SearchStatus::Idle;
@@ -358,6 +392,9 @@ impl ComposerInteraction {
             self.status = SearchStatus::Error;
             return true;
         };
+        self.interaction_state
+            .clone_from(&snapshot.interaction_state);
+        self.presentation.clone_from(&snapshot.presentation);
         self.status = match snapshot.effective_state() {
             ComposerSnapshotState::Loading => SearchStatus::Loading,
             ComposerSnapshotState::Error { .. } => SearchStatus::Error,
@@ -370,11 +407,27 @@ impl ComposerInteraction {
             .iter()
             .map(|candidate| {
                 // Presentation only: no path parsing, trigger syntax, matching or ranking here.
-                let label = candidate.detail.as_ref().map_or_else(
-                    || candidate.label.clone(),
-                    |detail| format!("{}  {detail}", candidate.label),
-                );
-                SelectableListItem::new(&candidate.id, label)
+                use bmux_tui::prelude::{Line, Span};
+                use bmux_tui::style::{Modifier, Style};
+                let mut spans = Vec::new();
+                let mut end = 0;
+                for range in &candidate.matched_ranges {
+                    spans.push(Span::raw(candidate.label[end..range.start].to_owned()));
+                    spans.push(Span::styled(
+                        candidate.label[range.start..range.end].to_owned(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                    end = range.end;
+                }
+                spans.push(Span::raw(candidate.label[end..].to_owned()));
+                if let Some(detail) = &candidate.detail {
+                    spans.push(Span::raw(format!("  {detail}")));
+                }
+                SelectableListItem {
+                    id: candidate.id.clone(),
+                    lines: vec![Line::from_spans(spans)],
+                    disabled: false,
+                }
             })
             .collect();
         // BMUX reconciles candidate identity, focus and pointer state.
@@ -382,6 +435,60 @@ impl ComposerInteraction {
         self.list = self.completion_control.list_state().get();
         self.snapshot = Some(snapshot);
         true
+    }
+
+    /// Invoke a declared contributor action without touching the owner's editor.
+    #[must_use]
+    pub fn invoke_action(&mut self, binding: &str) -> bool {
+        let Some(action) = self.presentation.as_ref().and_then(|presentation| {
+            presentation
+                .actions
+                .iter()
+                .find(|action| action.binding.as_deref() == Some(binding))
+        }) else {
+            return false;
+        };
+        let id = action.id.clone();
+        let Some(route) = self.route.clone() else {
+            return false;
+        };
+        self.invalidate_search();
+        self.pending_action = Some(id);
+        self.reactivate_route = Some(route);
+        true
+    }
+
+    /// Contributor title, falling back to the current generic search status.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        self.presentation
+            .as_ref()
+            .map_or_else(|| self.status(), |presentation| presentation.title.as_str())
+    }
+
+    /// Resolve hints through the same remappable/unbindable registry as dispatch.
+    pub fn resolve_hints(&mut self, registry: &bcode_plugin_sdk::tui::keymap::KeymapRegistry) {
+        let mut hints = Vec::new();
+        if let Some(presentation) = &self.presentation {
+            if let Some(hint) = &presentation.hint {
+                hints.push(hint.clone());
+            }
+            for action in &presentation.actions {
+                let keys = action.binding.as_ref().map_or_else(Vec::new, |binding| {
+                    registry.keys_for_action("composer_interaction", binding)
+                });
+                if !keys.is_empty() {
+                    hints.push(format!("{} {}", keys.join("/"), action.label));
+                }
+            }
+        }
+        self.resolved_hint = hints.join(" · ");
+    }
+
+    /// Presentation hint with shortcuts resolved from the effective keymap.
+    #[must_use]
+    pub fn hint(&self) -> &str {
+        &self.resolved_hint
     }
 
     #[must_use]
@@ -529,17 +636,6 @@ pub mod tests {
         let Ok(result) = edit.apply(document) else {
             return false;
         };
-        let continuation = state
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .candidates
-                    .get(state.list.focused().or_else(|| state.list.selected())?)
-            })
-            .map_or(ComposerContinuation::Finish, |candidate| {
-                candidate.continuation
-            });
         // The live BMUX editor validates positions and records one transaction,
         // preserving its pre-edit cursor/selection and existing undo/redo history.
         let expected = buffer.edit_state();
@@ -553,15 +649,8 @@ pub mod tests {
         {
             return false;
         }
-        let route = state.route.clone();
-        state.cancel();
-        if continuation == ComposerContinuation::Finish {
-            state.document = Some(result);
-            state.selection = None;
-            state.dismissed = true;
-        } else {
-            state.reactivate_route = route;
-        }
+        state.finish_focused_edit(result);
+        state.selection = None;
         true
     }
 
@@ -627,11 +716,15 @@ pub mod tests {
         ComposerCompletion {
             request_id: request.request_id.clone(),
             snapshot: Some(ComposerSnapshot {
+                interaction_state: std::collections::BTreeMap::new(),
+                presentation: None,
                 request_id: request.request_id.clone(),
                 document_id: request.document.document_id.clone(),
                 revision: request.document.revision,
                 state: ComposerSnapshotState::Ready,
                 candidates: vec![ComposerCandidate {
+                    matched_ranges: Vec::new(),
+                    next_interaction_state: None,
                     id: "topic".into(),
                     label: "主题 👩‍💻".into(),
                     detail: None,
@@ -824,6 +917,119 @@ pub mod tests {
         assert_eq!(buffer.text(), "主题 finished 👩‍💻");
         assert!(!state.observe(scope(), &buffer));
         assert!(!state.needs_activation());
+    }
+
+    #[test]
+    fn action_hint_remap_unbind_and_identity_replacement() {
+        use bcode_plugin_sdk::composer::{ComposerAction, ComposerPresentation};
+        use bcode_plugin_sdk::tui::keymap::{KeymapAction, KeymapRegistry};
+        let mut state = ComposerInteraction::default();
+        let request = begin(&mut state, &TextEditBuffer::from_text("#rust"));
+        let mut reply = completion(&request);
+        let snapshot = reply.snapshot.as_mut().unwrap();
+        let mut other = snapshot.candidates[0].clone();
+        other.id = "other".into();
+        snapshot.candidates.push(other);
+        snapshot.presentation = Some(ComposerPresentation {
+            version: 1,
+            title: "Topics".into(),
+            hint: None,
+            actions: vec![ComposerAction {
+                id: "refresh".into(),
+                label: "Refresh".into(),
+                binding: Some("example.refresh".into()),
+            }],
+        });
+        state.complete(reply.clone());
+        state.command(bmux_tui_components::completion::CompletionCommand::Next);
+        let mut registry = KeymapRegistry::default();
+        registry
+            .register(KeymapAction {
+                id: "example.refresh".into(),
+                scope: "composer_interaction".into(),
+                description: "Refresh".into(),
+                defaults: vec!["ctrl+r".into()],
+            })
+            .unwrap();
+        state.resolve_hints(&registry);
+        assert!(state.hint().contains("ctrl+r"));
+        registry
+            .configure(std::collections::BTreeMap::from([(
+                "composer_interaction".into(),
+                std::collections::BTreeMap::from([
+                    ("ctrl+r".into(), String::new()),
+                    ("ctrl+x".into(), "example.refresh".into()),
+                ]),
+            )]))
+            .unwrap();
+        state.resolve_hints(&registry);
+        assert!(state.hint().contains("ctrl+x"));
+        assert!(!state.hint().contains("ctrl+r"));
+        assert!(state.invoke_action("example.refresh"));
+        let next = begin_observed(&mut state);
+        let snapshot = reply.snapshot.as_mut().unwrap();
+        snapshot.request_id.clone_from(&next.request_id);
+        reply.request_id.clone_from(&next.request_id);
+        snapshot.candidates.reverse();
+        assert!(state.complete(reply));
+        assert_eq!(state.items[state.list.focused().unwrap()].id, "other");
+    }
+
+    #[test]
+    fn contributor_actions_replay_state_and_fence_late_replies() {
+        use bcode_plugin_sdk::composer::{ComposerAction, ComposerPresentation};
+        let mut state = ComposerInteraction::default();
+        let editor = TextEditBuffer::from_text("#rust");
+        let request = begin(&mut state, &editor);
+        let mut reply = completion(&request);
+        let snapshot = reply.snapshot.as_mut().unwrap();
+        snapshot
+            .interaction_state
+            .insert("scope".into(), "tracked".into());
+        snapshot.presentation = Some(ComposerPresentation {
+            version: 1,
+            title: "Topics".into(),
+            hint: None,
+            actions: vec![ComposerAction {
+                id: "toggle".into(),
+                label: "Scope".into(),
+                binding: Some("example.scope".into()),
+            }],
+        });
+        assert!(state.complete(reply));
+        assert!(!state.invoke_action("unbound"));
+        assert!(state.invoke_action("example.scope"));
+        assert!(state.visible());
+        assert!(state.selected_edit().is_none());
+        assert!(!state.complete(completion(&request)));
+        let next = begin_observed(&mut state);
+        assert_eq!(next.action_id.as_deref(), Some("toggle"));
+        assert_eq!(
+            next.interaction_state.get("scope").map(String::as_str),
+            Some("tracked")
+        );
+        assert_eq!(next.document, request.document);
+        assert_ne!(next.request_id, request.request_id);
+        assert!(state.complete(completion(&next)));
+        let mut reply = completion(&next);
+        reply.snapshot.as_mut().unwrap().candidates[0].continuation =
+            ComposerContinuation::Reactivate;
+        reply.snapshot.as_mut().unwrap().candidates[0].next_interaction_state = Some(
+            std::collections::BTreeMap::from([("folder".into(), "topics".into())]),
+        );
+        let result = reply.snapshot.as_ref().unwrap().candidates[0]
+            .edit
+            .apply(&next.document)
+            .unwrap();
+        state.complete(reply);
+        state.finish_focused_edit(result);
+        assert_eq!(
+            state.interaction_state.get("folder").map(String::as_str),
+            Some("topics")
+        );
+        state.dismiss();
+        assert!(!state.invoke_action("example.scope"));
+        assert!(state.interaction_state.is_empty());
     }
 
     #[test]

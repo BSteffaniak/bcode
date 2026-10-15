@@ -46,14 +46,19 @@ pub fn paint(
             ..SelectableListStyles::default()
         },
     );
+    let title = state.title().to_owned();
+    let hint = state.hint().to_owned();
+    let has_hint = !hint.is_empty();
     let shell = PickerFrame::new()
-        .title(state.status())
+        .title(&title)
+        .header(state.status())
+        .footer(hint)
         .policy(PickerFramePolicy {
             chrome: true,
             background: true,
-            header: false,
+            header: true,
             input: false,
-            footer: false,
+            footer: has_hint,
             margin: Insets::all(0),
             padding: Insets::new(0, 1, 0, 1),
             min_size: Size::new(0, 0),
@@ -172,7 +177,19 @@ mod tests {
         let mut state = ComposerInteraction::default();
         let buffer = TextEditBuffer::from_text("#主题👩‍💻a\u{301}");
         let request = begin(&mut state, &buffer);
-        state.complete(completion(&request));
+        let mut reply = completion(&request);
+        let candidate = &mut reply.snapshot.as_mut().unwrap().candidates[0];
+        candidate.label = "主题👩‍💻a\u{301}".into();
+        candidate.matched_ranges =
+            vec![bcode_plugin_sdk::composer::ComposerTextRange { start: 0, end: 6 }];
+        state.complete(reply);
+        assert!(state.items[0].lines[0].spans.iter().any(|span| {
+            span.content == "主题"
+                && span
+                    .style
+                    .modifiers
+                    .contains(bmux_tui::style::Modifier::BOLD)
+        }));
         for (width, height) in [(90, 18), (0, 0), (1, 1), (2, 5), (5, 3), (24, 10), (90, 18)] {
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);

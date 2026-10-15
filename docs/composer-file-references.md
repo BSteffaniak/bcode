@@ -48,6 +48,55 @@ strings, credentials, numeric controls, paths and picker filters are not blanket
 completion targets. Choosing a reference still inserts text only and does not
 grant resource access.
 
+## Search scope and relevance
+
+Search defaults to **Tracked**: existing Git-index files, including staged additions.
+Untracked and ignored build output are excluded. **Ctrl-G** switches the current picker
+between Tracked and Workspace; **Ctrl-R** refreshes its inventory. The override lasts
+only for that picker interaction. Workspace includes tracked and nonignored untracked
+files. Outside a repository the popup explicitly shows Workspace. Hidden-file policy
+is independent and still enforced. Directory suggestions derive from eligible files.
+
+Queries are ordered, case-insensitive fuzzy subsequences across the whole relative
+path: `@shtml` can match `src/how-to-my-life.txt`. Exact names, filename prefixes,
+contiguous matches, component boundaries and compact matches rank ahead of scattered
+matches. Matched characters are highlighted. Accepting a directory explicitly scopes
+subsequent typing; ordinary slash-containing queries remain whole-path fuzzy searches.
+
+Inventories are bounded and reused for up to five seconds. Git index changes invalidate
+tracked inventories; refresh forces discovery. Current authorization is checked even
+for cached paths, and returned candidates are checked for deletion, relocation and
+symlink replacement. Incomplete discovery is shown rather than reported as no matches.
+The popup stays visible during refresh, but stale candidates cannot be accepted.
+
+Workspace ignore evaluation reads `.gitignore`, `info/exclude`, and Git config/global
+excludes only through exact resource authorization. Config parsing performs no implicit
+file reads. Unsupported conditional includes, injected config, nested-workspace ancestor
+ignore inheritance, and symlinked config resources produce explicit incomplete results;
+they are not treated as an exhaustive empty search. This includes symlink-managed global
+Git configs. Tracked search does not need these ignore sources.
+
+Plugin configuration (roots cannot be configured):
+
+```toml
+[plugins.config."bcode.file-references"]
+scope = "tracked" # or "workspace"
+include_hidden = false
+max_results = 32
+max_entries = 200000
+max_depth = 32
+timeout_ms = 1000
+max_bytes = 33554432
+```
+
+Live action bindings use the same generic contributor scope:
+
+```toml
+[tui.keybindings.scopes.composer_interaction]
+"ctrl+u" = "bcode.file-references.toggle_scope"
+"ctrl+r" = "" # disable refresh binding
+```
+
 ## Configuration
 
 ### Composer interaction keys

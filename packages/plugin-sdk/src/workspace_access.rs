@@ -8,7 +8,7 @@
 //! Neither grant authorizes execution, writes or model attachments.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 /// Invocation-bound host capability interface; unknown versions are unsupported.
 pub const WORKSPACE_ACCESS_INTERFACE_ID: &str = "bcode.workspace-access/v1";
@@ -16,6 +16,35 @@ pub const WORKSPACE_ACCESS_INTERFACE_ID: &str = "bcode.workspace-access/v1";
 pub const OP_WORKSPACE_ACCESS_AUTHORIZE: &str = "authorize";
 /// Operation accepting `WorkspaceResourceRequest` and returning `WorkspaceResourceGrant`.
 pub const OP_WORKSPACE_RESOURCE_AUTHORIZE: &str = "authorize_resource";
+/// Authorize one absolute resource outside the workspace without changing workspace authority.
+pub const OP_EXTERNAL_RESOURCE_AUTHORIZE: &str = "authorize_external_resource";
+
+/// Request a bounded exact-resource read under the bound invocation's read policy.
+///
+/// This grants no discovery, workspace selection, write, attachment or execution authority.
+/// Absolute paths must be normalized and canonical without symlink aliases; the host
+/// returns the authorized parent root and basename only after evaluating read policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalResourceRequest {
+    /// Exact absolute resource path; traversal and ambiguous components are rejected.
+    pub path: PathBuf,
+}
+
+impl ExternalResourceRequest {
+    /// Whether this names one unambiguous absolute resource, not a root or traversal.
+    #[must_use]
+    pub fn is_normalized(&self) -> bool {
+        self.path.is_absolute()
+            && self.path.file_name().is_some()
+            && self.path.components().all(|component| {
+                matches!(
+                    component,
+                    Component::RootDir | Component::Prefix(_) | Component::Normal(_)
+                )
+            })
+    }
+}
 
 /// Request permission for a bounded read of one workspace-relative resource.
 ///
