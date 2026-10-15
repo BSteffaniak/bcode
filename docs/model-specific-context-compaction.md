@@ -20,3 +20,5 @@ Use the provider and effective model IDs reported by Bcode. `provider_plugin_id`
 An absolute `proactive_threshold_tokens` takes precedence over a model-specific or global percentage. It measures Bcode's estimate of the complete candidate input request. The effective trigger is capped at the model's safe input capacity after output reserve and safety margin. Because provider billing token accounting can differ, configure a buffer below a hard pricing boundary—for example, `268000` for a `272000` boundary.
 
 Defining a threshold does not enable proactive compaction by itself. Set the model override's `mode` to `proactive` or `proactive_and_overflow`. `backend = "auto"` prefers provider-native compaction where supported and otherwise uses local compaction.
+
+Recent-context retention preserves complete tool exchanges, not an entire long-running user turn. Once all calls in an exchange have results, that exchange and its post-tool continuation can be summarized before the next exchange. Parallel batches and unresolved calls remain together; `keep_recent_tokens` retains a structurally complete recent tail.

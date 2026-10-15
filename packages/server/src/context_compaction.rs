@@ -1857,6 +1857,7 @@ pub fn conversational_units(
 ) -> Vec<ConversationalUnit> {
     let mut units = Vec::<ConversationalUnit>::new();
     let mut pending_tool_calls = BTreeSet::new();
+    let mut completed_tool_exchange = false;
     for event in events {
         let starts_turn_boundary = matches!(event.kind, SessionEventKind::ModelTurnStarted { .. })
             && !pending_tool_calls.is_empty();
@@ -1878,10 +1879,22 @@ pub fn conversational_units(
                 | SessionEventKind::AssistantResponseSegment { .. }
                 | SessionEventKind::PositionedAssistantResponseSegment { .. }
         ) && pending_tool_calls.is_empty()
+            && !completed_tool_exchange
             && units
                 .last()
                 .is_some_and(|unit| !unit.begins_with_user && !unit.events.is_empty());
+        // A completed exchange and its post-tool continuation can be summarized before
+        // the next exchange, even when both belong to the same user turn. Never split
+        // a parallel batch while any of its calls are still pending.
+        let starts_tool_exchange = completed_tool_exchange
+            && pending_tool_calls.is_empty()
+            && matches!(
+                event.kind,
+                SessionEventKind::ToolCallRequested { .. }
+                    | SessionEventKind::PositionedToolCallRequested { .. }
+            );
         let starts_unit = starts_turn_boundary
+            || starts_tool_exchange
             || starts_user_unit
             || starts_orphan_assistant_unit
             || units.is_empty()
@@ -1894,6 +1907,7 @@ pub fn conversational_units(
                     _ => false,
                 });
         if starts_unit {
+            completed_tool_exchange = false;
             units.push(ConversationalUnit {
                 events: Vec::new(),
                 summary_input: Vec::new(),
@@ -1909,7 +1923,10 @@ pub fn conversational_units(
                 pending_tool_calls.insert(tool_call_id.clone());
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
-                pending_tool_calls.remove(&record.invocation_id);
+                if pending_tool_calls.remove(&record.invocation_id) && pending_tool_calls.is_empty()
+                {
+                    completed_tool_exchange = true;
+                }
             }
             SessionEventKind::ModelTurnFinished { .. } => {
                 // A terminal model turn abandons any tool calls for which no result was
@@ -1999,7 +2016,7 @@ pub fn structural_compaction_plan_with_policy(
         }
         CompactionPlanningPolicy::OverflowRecovery => units.len(),
     };
-    // An interrupted tool chain and the active newest user turn are retained as complete units.
+    // Retain the newest exchange (including unresolved calls) and the recent token budget.
     let compactable_units = &units[..retained_start];
     let retained_units = &units[retained_start..];
     let compactable_prefix = compactable_units
@@ -2142,6 +2159,132 @@ mod generic_result_tests {
             provenance: None,
             kind,
         }
+    }
+
+    fn exchange_call(sequence: u64, id: &str) -> bcode_session_models::SessionEvent {
+        event(
+            sequence,
+            SessionEventKind::PositionedToolCallRequested {
+                turn_id: "long-turn".into(),
+                output_position: bcode_session_models::TurnOutputPosition::new(sequence),
+                tool_call_id: id.into(),
+                tool_name: "example.read".into(),
+                arguments_json: "{}".into(),
+                producer_plugin_id: None,
+                working_directory: None,
+            },
+        )
+    }
+
+    fn exchange_result(sequence: u64, id: &str) -> bcode_session_models::SessionEvent {
+        event(
+            sequence,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: id.into(),
+                    model_output: "completed exchange output".repeat(100),
+                    is_error: false,
+                    presentation: None,
+                    result: None,
+                    content: Vec::new(),
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn long_user_turn_can_compact_repeatedly_after_prior_boundary() {
+        let mut events = vec![
+            event(
+                1,
+                SessionEventKind::ContextCompacted {
+                    summary: "earlier history".into(),
+                    compacted_through_sequence: 0,
+                },
+            ),
+            event(
+                2,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "continue working".into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+        ];
+        for round in 0..400_u64 {
+            let sequence = 3 + round * 2;
+            let id = format!("call-{round}");
+            events.push(exchange_call(sequence, &id));
+            events.push(exchange_result(sequence + 1, &id));
+        }
+        let units = conversational_units(&events[1..], 1_000);
+        assert_eq!(units.len(), 400);
+        assert!(units.iter().all(|unit| !unit.interrupted_tool_chain));
+        let policy = CompactionPlanningPolicy::Proactive {
+            keep_recent_tokens: 2_000,
+        };
+        let first = structural_compaction_plan_with_policy(&events, 1_000, policy).unwrap();
+        assert!(first.compacted_through_sequence > 2);
+        assert!(!first.retained_tail.is_empty());
+        assert!(first.estimated_tail_tokens >= 2_000);
+        let first_boundary = first.compacted_through_sequence;
+        let mut retained = vec![event(
+            803,
+            SessionEventKind::ContextCompacted {
+                summary: "summarized completed work".into(),
+                compacted_through_sequence: first_boundary,
+            },
+        )];
+        retained.extend(first.retained_tail);
+        for round in 0..100_u64 {
+            let sequence = 804 + round * 2;
+            let id = format!("later-{round}");
+            retained.push(exchange_call(sequence, &id));
+            retained.push(exchange_result(sequence + 1, &id));
+        }
+        let second = structural_compaction_plan_with_policy(&retained, 1_000, policy).unwrap();
+        assert!(second.compacted_through_sequence > first_boundary);
+        assert_eq!(second.portable_fallback, "summarized completed work");
+        assert!(
+            second
+                .retained_tail
+                .iter()
+                .all(|event| event.sequence > second.compacted_through_sequence)
+        );
+    }
+
+    #[test]
+    fn completed_exchange_boundary_preserves_parallel_and_unresolved_calls() {
+        let events = vec![
+            exchange_call(1, "first"),
+            exchange_result(2, "first"),
+            event(
+                3,
+                SessionEventKind::AssistantMessage {
+                    text: "first continuation".into(),
+                },
+            ),
+            exchange_call(4, "parallel-a"),
+            exchange_call(5, "parallel-b"),
+            exchange_result(6, "parallel-a"),
+            exchange_call(7, "parallel-c"),
+            exchange_result(8, "parallel-b"),
+        ];
+        let units = conversational_units(&events, 1_000);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].events.len(), 3);
+        assert_eq!(units[1].events.len(), 5);
+        assert!(units[1].interrupted_tool_chain);
+        let plan = structural_compaction_plan_with_policy(
+            &events,
+            1_000,
+            CompactionPlanningPolicy::Proactive {
+                keep_recent_tokens: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.compacted_through_sequence, 3);
+        assert_eq!(plan.retained_tail[0].sequence, 4);
     }
 
     #[tokio::test]

@@ -57960,7 +57960,7 @@ library = "test"
     }
 
     #[test]
-    fn multi_round_tool_chain_stays_in_one_unit() {
+    fn multi_round_tool_chain_splits_only_between_completed_exchanges() {
         let session_id = SessionId::new();
         let mut history = vec![session_event(
             session_id,
@@ -58006,8 +58006,11 @@ library = "test"
             },
         ));
         let units = conversational_units(&history, 1_000);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].events.len(), 6);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].events.len(), 3);
+        assert_eq!(units[1].events.len(), 3);
+        assert_eq!(units[0].events.last().unwrap().sequence, 3);
+        assert_eq!(units[1].events.first().unwrap().sequence, 4);
     }
 
     #[test]
