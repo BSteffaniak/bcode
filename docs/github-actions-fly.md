@@ -9,7 +9,7 @@ is authorization to deploy, spend money, install secrets, or enroll an account.
 
 * `deploy/auth-broker/Dockerfile`: builds from the repository with
   `cargo build --locked --release -p bcode --features app,static-bundled-plugins`.
-  No published release is needed. The builder pins `RUSTUP_TOOLCHAIN=1.95.0`
+  No published release is needed. The builder pins `RUSTUP_TOOLCHAIN=1.98.0`
   explicitly so repository `channel="stable"` does not select another toolchain.
   The runtime contains the executable, CA roots,
   Bash, tini, and standard Linux process/file utilities; no Rust toolchain or

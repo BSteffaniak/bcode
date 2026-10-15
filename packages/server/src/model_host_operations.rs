@@ -718,7 +718,7 @@ fn read_identity(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>, &
         return Err("custody_identity_unavailable");
     }
     let mut identity = zeroize::Zeroizing::new(String::new());
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take(8193)
         .read_to_string(&mut identity)
         .map_err(|_| "custody_identity_unavailable")?;

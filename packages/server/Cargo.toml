@@ -143,10 +143,12 @@ tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 sshenv_vault = { workspace = true, features = [
     "linux-secret-service",
     "tpm-device-seal",
 ] }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sshenv_vault = { workspace = true, features = ["macos-keychain"] }
