@@ -6131,6 +6131,13 @@ pub fn resolve_external_workflow_templates(
     manifest: &mut PluginManifest,
     package_root: &Path,
 ) -> Result<(), PluginLoadError> {
+    if !manifest
+        .workflow_templates
+        .iter()
+        .any(|template| template.document_source.is_some())
+    {
+        return Ok(());
+    }
     let canonical_root = package_root.canonicalize()?;
     for template in &mut manifest.workflow_templates {
         let Some(source) = template.document_source.as_ref() else {
@@ -12543,6 +12550,15 @@ library = "libexample_plugin.dylib"
             std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
         }
         SERVICE_STATUS_OK
+    }
+
+    #[test]
+    fn inline_templates_do_not_require_the_build_source_directory() {
+        let mut manifest = test_manifest("portable-test");
+        let missing_root = unique_temp_dir().join("absent-build-source");
+        assert!(!missing_root.exists());
+        resolve_external_workflow_templates(&mut manifest, &missing_root)
+            .expect("no external documents require no filesystem root");
     }
 
     #[test]

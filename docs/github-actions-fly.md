@@ -34,7 +34,7 @@ those routes and does not reconnect or replay serve admission. Coordinator still
 must validate disconnect, daemon loss during startup/serve, SIGTERM and SIGINT;
 source inspection is not runtime or live deployment acceptance.
 
-The supervisor uses the implemented `server stop --yes` command for graceful
+The supervisor uses the implemented `server stop` command for graceful
 shutdown, not OS signals to the foreground daemon (which currently has no signal
 hook). It waits for daemon cleanup and the serve client; it does not SIGKILL them.
 Fly's 300-second stop timeout is best-effort: interruption/forced infrastructure

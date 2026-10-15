@@ -99,7 +99,7 @@ shutdown() {
     if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
         # Existing public API requests cancellation and cleanup. Do not signal or
         # kill the daemon: its foreground path currently has no OS signal hook.
-        bcode --request-timeout-secs 240 server stop --yes >/dev/null 2>&1 || :
+        bcode --request-timeout-secs 240 server stop >/dev/null 2>&1 || :
     fi
     if [[ -n "$daemon_pid" ]]; then wait "$daemon_pid" || :; fi
     if [[ -n "$client_pid" ]]; then wait "$client_pid" || :; fi
