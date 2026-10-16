@@ -1688,7 +1688,7 @@ impl OpenAiCompatibleProviderPlugin {
         if !context.bridge.is_available()
             && let Err(error) = Self::validate_chatgpt_refresh(&settings)
         {
-            return ServiceResponse::error(error.code, error.message);
+            return startup_error_response(context, error);
         }
         let refresh = match &self.runtime {
             Ok(runtime) => {
@@ -1738,7 +1738,7 @@ impl OpenAiCompatibleProviderPlugin {
                 }
             }
             Ok(Ok((_, None))) => {}
-            Ok(Err(error)) => return ServiceResponse::error(error.code, error.message),
+            Ok(Err(error)) => return startup_error_response(context, error),
             Err(error) => return ServiceResponse::error("runtime_error", error.to_string()),
         }
         if context.cancellation.is_cancelled() {
@@ -2372,6 +2372,18 @@ fn stream_turn_events(turn: &TurnState, context: &NativeServiceContext) -> Servi
 }
 
 /// Emit one provider turn event as an incremental service event.
+fn startup_error_response(context: &NativeServiceContext, error: ProviderError) -> ServiceResponse {
+    let mut response = ServiceResponse::error(error.code.clone(), error.message.clone());
+    let event = ProviderTurnEvent::Error { error };
+    emit_provider_turn_event(context, &event);
+    // Polling startup has no retained turn yet. Carry the normalized event in its error
+    // payload too; older hosts still consume the service code and message.
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        response.payload = payload;
+    }
+    response
+}
+
 fn emit_provider_turn_event(context: &NativeServiceContext, event: &ProviderTurnEvent) {
     if let Ok(payload) = serde_json::to_vec(event) {
         context.events.emit(&payload);

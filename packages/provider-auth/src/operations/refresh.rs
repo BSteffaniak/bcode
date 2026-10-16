@@ -17,6 +17,8 @@ use bcode_provider_auth_models::{
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroize as _;
 
+pub mod native;
+
 const fn unavailable() -> AuthVaultLifecycleError {
     AuthVaultLifecycleError::RefreshBlocked
 }
@@ -35,7 +37,7 @@ fn validate_refresh_selection(
     Ok(())
 }
 
-enum RefreshOperation {
+pub enum RefreshOperation {
     Begin(AuthRefreshBeginRequest),
     Commit(AuthRefreshCommitRequest),
 }
@@ -326,29 +328,27 @@ pub fn resolve_refresh_service_request_with_custody<'registry>(
             message: "credential refresh profile is unavailable".into(),
         };
     };
-    if !registered
+    let Some(method) = registered
         .methods
         .iter()
-        .any(|method| Some(method.method_id()) == resolved.profile.scheme.as_deref())
-    {
+        .find(|method| Some(method.method_id()) == resolved.profile.scheme.as_deref())
+    else {
         return Resolution::Failed {
             code: "auth_profile_unavailable".into(),
             message: "credential refresh method is unavailable".into(),
         };
-    }
-    let Some(custody) = custody else {
-        return Resolution::Failed {
-            code: "auth_refresh_unavailable".into(),
-            message: "durable refresh coordination is unavailable".into(),
-        };
     };
-    let result = match operation {
-        RefreshOperation::Begin(value) => custody
-            .begin_refresh(&resolved, value)
-            .and_then(|value| serde_json::to_value(value).map_err(|_| unavailable())),
-        RefreshOperation::Commit(value) => custody
-            .commit_refresh(&resolved, value)
-            .and_then(|value| serde_json::to_value(value).map_err(|_| unavailable())),
+    let result = if let Some(custody) = custody {
+        match operation {
+            RefreshOperation::Begin(value) => custody
+                .begin_refresh(&resolved, value)
+                .and_then(|value| serde_json::to_value(value).map_err(|_| unavailable())),
+            RefreshOperation::Commit(value) => custody
+                .commit_refresh(&resolved, value)
+                .and_then(|value| serde_json::to_value(value).map_err(|_| unavailable())),
+        }
+    } else {
+        native::resolve(&resolved, method, operation)
     };
     match result {
         Ok(payload) => Resolution::Responded { payload },

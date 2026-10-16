@@ -16,7 +16,7 @@ pub struct MilestonesConfig {
     pub first_turns: u32,
     /// Newly settled conversational turns between subsequent evaluations.
     pub subsequent_turns: u32,
-    /// Alternative subsequent threshold, counting only eligible normalized context tokens.
+    /// Alternative first/subsequent threshold, counting only eligible normalized context tokens.
     pub subsequent_tokens: u64,
     /// Minimum interval between evaluations, including no-milestone results.
     pub min_interval_secs: u64,

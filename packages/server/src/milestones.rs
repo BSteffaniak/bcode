@@ -86,7 +86,11 @@ async fn policy(
             cancellation,
         )
         .await
-        .map_err(|_| "milestone policy unavailable".into())
+        .map_err(|error| {
+            bcode_model_provider_runtime::sanitize_provider_diagnostic(&format!(
+                "milestone policy unavailable: {error}"
+            ))
+        })
 }
 
 /// Invoke no-tools inference only after canonical durable admission has succeeded.

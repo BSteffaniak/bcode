@@ -1,5 +1,8 @@
 //! Request-only, bounded auxiliary inference through the ordinary centralized model boundary.
 
+mod error;
+use error::GenerationError;
+
 use super::model_request_target::ResolvedModelRequestTarget;
 use super::{
     ModelRequestAttempt, ModelRequestTargetInput, ServerState, append_model_usage_event,
@@ -33,6 +36,29 @@ pub async fn generate(
     input: AuxiliaryGenerationRequest,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<AuxiliaryGenerationResult, String> {
+    let session_id = input.session_id;
+    match generate_inner(state, input, cancellation).await {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let diagnostic = error.diagnostic().to_string();
+            super::append_provider_event_trace(
+                state,
+                session_id,
+                "auxiliary-generation",
+                "error",
+                Some(diagnostic.clone()),
+            )
+            .await;
+            Err(diagnostic)
+        }
+    }
+}
+
+async fn generate_inner(
+    state: &ServerState,
+    input: AuxiliaryGenerationRequest,
+    cancellation: ServiceCancellation,
+) -> Result<AuxiliaryGenerationResult, GenerationError> {
     validate_request(&input)?;
     if cancellation.is_cancelled() {
         return Err("auxiliary generation cancelled".into());
@@ -78,7 +104,7 @@ pub async fn generate(
         )
         .await
     };
-    if let Some(usage) = &collected.usage {
+    let usage_result = if let Some(usage) = &collected.usage {
         append_model_usage_event(
             state,
             input.session_id,
@@ -86,9 +112,16 @@ pub async fn generate(
             session_token_usage(usage, Some(&attempt)),
             Some(&attempt),
         )
-        .await?;
+        .await
+        .map_err(GenerationError::from)
+    } else {
+        Ok(())
+    };
+    match (inference, usage_result) {
+        (Err(primary), Err(secondary)) => return Err(primary.secondary(secondary)),
+        (Err(error), _) | (_, Err(error)) => return Err(error),
+        (Ok(()), Ok(())) => {}
     }
-    inference?;
     check_cancel(&cancellation, deadline)?;
     Ok(AuxiliaryGenerationResult {
         text: collected.text,
@@ -128,7 +161,11 @@ async fn resolve_target(
         },
     )
     .await
-    .map_err(|_| "auxiliary model resolution failed".to_owned())?;
+    .map_err(|error| {
+        bcode_model_provider_runtime::sanitize_provider_diagnostic(&format!(
+            "auxiliary model resolution failed: {error}"
+        ))
+    })?;
     Ok((provider, target))
 }
 
@@ -219,8 +256,9 @@ async fn stream(
     cancellation: &ServiceCancellation,
     deadline: tokio::time::Instant,
     collected: &mut Collected,
-) -> Result<(), String> {
-    let payload = serde_json::to_vec(request).map_err(|_| "auxiliary request encoding failed")?;
+) -> Result<(), GenerationError> {
+    let payload =
+        serde_json::to_vec(request).map_err(bcode_plugin::PluginServiceCallError::RequestEncode)?;
     let mut invocation = tokio::time::timeout_at(
         deadline,
         state.plugins.invoke_service_with_events_and_bridge_scoped(
@@ -240,7 +278,7 @@ async fn stream(
     )
     .await
     .map_err(|_| "auxiliary provider admission deadline exceeded")?
-    .map_err(|_| "auxiliary provider unavailable")?;
+    .map_err(GenerationError::from)?;
     let result = async {
         loop {
             check_cancel(cancellation, deadline)?;
@@ -249,16 +287,17 @@ async fn stream(
             let Ok(next) = next else {
                 continue;
             };
-            match next.map_err(|_| "auxiliary provider failed")? {
+            match next.map_err(GenerationError::from)? {
                 StreamingServiceInvocationEvent::Event(payload) => {
                     let event = serde_json::from_slice::<ProviderTurnEvent>(&payload)
-                        .map_err(|_| "auxiliary provider returned invalid event")?;
+                        .map_err(bcode_plugin::PluginServiceCallError::ResponseDecode)?;
                     if collected.apply(event)? {
                         return Ok(());
                     }
                 }
                 StreamingServiceInvocationEvent::Response(result) => {
-                    result.map_err(|_| "auxiliary provider failed")?;
+                    let response = result.map_err(GenerationError::from)?;
+                    let _: serde_json::Value = decode_response(response)?;
                     return Err("auxiliary provider ended without terminal outcome".into());
                 }
             }
@@ -266,9 +305,37 @@ async fn stream(
     }
     .await;
     // Preserve executor ownership while cancellation drains the remote invocation.
-    let _ = invocation.cancel_and_settle(Duration::from_secs(2)).await;
+    let settlement = invocation.cancel_and_settle(Duration::from_secs(2)).await;
     drop(invocation);
-    result
+    let cleanup = match settlement {
+        bcode_plugin::PluginInvocationSettlement::Settled(response) => {
+            response.error.map(|error| {
+                GenerationError::from(bcode_plugin::PluginServiceCallError::Service {
+                    code: error.code,
+                    message: error.message,
+                })
+            })
+        }
+        bcode_plugin::PluginInvocationSettlement::Unknown => Some(GenerationError::from(
+            "auxiliary provider cleanup outcome unknown",
+        )),
+    };
+    match (result, cleanup) {
+        (Err(primary), Some(secondary)) => Err(primary.secondary(secondary)),
+        (Err(error), None) | (Ok(()), Some(error)) => Err(error),
+        (Ok(()), None) => Ok(()),
+    }
+}
+
+fn decode_response<R: serde::de::DeserializeOwned>(
+    response: bcode_plugin_sdk::ServiceResponse,
+) -> Result<R, GenerationError> {
+    if response.error.is_some()
+        && let Ok(ProviderTurnEvent::Error { error }) = serde_json::from_slice(&response.payload)
+    {
+        return Err(GenerationError::Provider(Box::new(error)));
+    }
+    bcode_plugin::decode_service_response(response).map_err(GenerationError::from)
 }
 
 async fn call<Q: serde::Serialize + Sync, R: serde::de::DeserializeOwned>(
@@ -278,22 +345,23 @@ async fn call<Q: serde::Serialize + Sync, R: serde::de::DeserializeOwned>(
     request: &Q,
     cancellation: &ServiceCancellation,
     deadline: tokio::time::Instant,
-) -> Result<R, String> {
+) -> Result<R, GenerationError> {
     check_cancel(cancellation, deadline)?;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    state
+    let response = state
         .plugins
-        .invoke_service_json_scoped_cancellable(
+        .invoke_service_json_response_with_bridge_scoped_cancellable(
             provider,
             MODEL_PROVIDER_INTERFACE_ID,
             operation,
             request,
             PluginInvocationScope::Global,
+            None,
             remaining,
             cancellation,
         )
-        .await
-        .map_err(|_| "auxiliary provider operation failed".into())
+        .await?;
+    decode_response(response)
 }
 
 async fn poll(
@@ -303,17 +371,29 @@ async fn poll(
     cancellation: &ServiceCancellation,
     deadline: tokio::time::Instant,
     collected: &mut Collected,
-) -> Result<(), String> {
-    let started: StartTurnResponse = call(
-        state,
-        provider,
-        OP_START_TURN,
-        request,
-        cancellation,
-        deadline,
-    )
-    .await?;
-    let result = async {
+) -> Result<(), GenerationError> {
+    check_cancel(cancellation, deadline)?;
+    let response = state
+        .plugins
+        .invoke_service_json_response_with_bridge_scoped_cancellable(
+            provider,
+            MODEL_PROVIDER_INTERFACE_ID,
+            OP_START_TURN,
+            request,
+            PluginInvocationScope::session(request.session_id.to_string()),
+            Some(super::server_model_provider_bridge(
+                state.plugins.clone(),
+                state.session_config(request.session_id).await,
+                state.optional_judgement.invalidation_handle(),
+                &request.turn_id,
+                provider,
+            )),
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            cancellation,
+        )
+        .await?;
+    let started: StartTurnResponse = decode_response(response)?;
+    let result: Result<(), GenerationError> = async {
         loop {
             let page: PollTurnEventsResponse = call(
                 state,
@@ -337,8 +417,9 @@ async fn poll(
     .await;
     let cleanup = ServiceCancellation::default();
     let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut result = result;
     if result.is_err() {
-        let _: Result<bcode_model::AckResponse, String> = call(
+        let cancellation_result: Result<bcode_model::AckResponse, GenerationError> = call(
             state,
             provider,
             OP_CANCEL_TURN,
@@ -349,8 +430,11 @@ async fn poll(
             cleanup_deadline,
         )
         .await;
+        if let Err(error) = cancellation_result {
+            result = result.map_err(|primary| primary.secondary(error));
+        }
     }
-    let _: Result<bcode_model::AckResponse, String> = call(
+    let finish_result: Result<bcode_model::AckResponse, GenerationError> = call(
         state,
         provider,
         OP_FINISH_TURN,
@@ -361,7 +445,11 @@ async fn poll(
         tokio::time::Instant::now() + Duration::from_secs(2),
     )
     .await;
-    result
+    match (result, finish_result) {
+        (Err(primary), Err(secondary)) => Err(primary.secondary(secondary)),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(_)) => Ok(()),
+    }
 }
 
 fn validate_request(request: &AuxiliaryGenerationRequest) -> Result<(), String> {
@@ -405,7 +493,7 @@ struct Collected {
 }
 
 impl Collected {
-    fn apply(&mut self, event: ProviderTurnEvent) -> Result<bool, String> {
+    fn apply(&mut self, event: ProviderTurnEvent) -> Result<bool, GenerationError> {
         match event {
             ProviderTurnEvent::TextDelta { text }
             | ProviderTurnEvent::Output {
@@ -429,7 +517,9 @@ impl Collected {
                 ..
             } => return Err("auxiliary tool calls are forbidden".into()),
             ProviderTurnEvent::Cancelled => return Err("auxiliary generation cancelled".into()),
-            ProviderTurnEvent::Error { .. } => return Err("auxiliary provider failed".into()),
+            ProviderTurnEvent::Error { error } => {
+                return Err(GenerationError::Provider(Box::new(error)));
+            }
             ProviderTurnEvent::TurnFinished { stop_reason } => {
                 if !matches!(
                     stop_reason,

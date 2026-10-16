@@ -183,7 +183,11 @@ async fn observe(
             cancellation,
         )
         .await
-        .map_err(|_| "settled observer unavailable")?;
+        .map_err(|error| {
+            bcode_model_provider_runtime::sanitize_provider_diagnostic(&format!(
+                "settled observer unavailable: {error}"
+            ))
+        })?;
     if let ObserverResponse::Application { request } = response {
         if cancellation.is_cancelled() {
             return Err("settled observer cancelled".into());

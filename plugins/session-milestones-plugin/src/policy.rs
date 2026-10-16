@@ -62,6 +62,7 @@ pub fn decide(config: &MilestonesConfig, facts: &TriggerFacts) -> Decision {
         facts.new_turns >= config.subsequent_turns || facts.new_tokens >= config.subsequent_tokens
     } else {
         facts.new_turns >= config.first_turns
+            || (facts.new_turns > 0 && facts.new_tokens >= config.subsequent_tokens)
     };
     if due { Decision::Due } else { Decision::NotDue }
 }
@@ -270,6 +271,28 @@ mod tests {
             ),
             Decision::Due
         );
+    }
+
+    #[test]
+    fn first_evaluation_can_be_due_after_one_substantial_turn() {
+        let config = enabled();
+        for (turns, tokens, expected) in [
+            (1, config.subsequent_tokens - 1, Decision::NotDue),
+            (1, config.subsequent_tokens, Decision::Due),
+            (0, config.subsequent_tokens, Decision::NotDue),
+        ] {
+            assert_eq!(
+                decide(
+                    &config,
+                    &TriggerFacts {
+                        new_turns: turns,
+                        new_tokens: tokens,
+                        ..facts()
+                    }
+                ),
+                expected
+            );
+        }
     }
 
     #[test]

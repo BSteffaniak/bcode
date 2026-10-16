@@ -197,6 +197,43 @@ impl CredentialCustodyStorage {
         Ok(store)
     }
 
+    /// Acquire durable refresh coordination for an existing native vault, without copying
+    /// its ciphertext or changing its storage format. The caller controls the parent.
+    /// Durable refresh coordination is acquired only for authorized credential operations.
+    /// No vault conversion or credential materialization is performed by this coordinator.
+    /// Errors preserve existing state for explicit maintenance.
+    pub(crate) fn native_coordinator(vault: &Path) -> Result<Self, CustodyStorageError> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        if !vault.is_absolute()
+            || std::fs::symlink_metadata(vault)
+                .map_err(CustodyStorageError::Io)?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(CustodyStorageError::Ownership);
+        }
+        let mut name = vault.as_os_str().to_os_string();
+        name.push(".refresh");
+        let path = std::path::PathBuf::from(name);
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {
+                let store = Self::acquire(&path, true)?;
+                store
+                    .directory
+                    .sync_all()
+                    .map_err(CustodyStorageError::Io)?;
+                std::fs::File::open(path.parent().ok_or(CustodyStorageError::Ownership)?)
+                    .and_then(|parent| parent.sync_all())
+                    .map_err(CustodyStorageError::Io)?;
+                Ok(store)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Self::acquire(&path, false)
+            }
+            Err(error) => Err(CustodyStorageError::Io(error)),
+        }
+    }
+
     fn acquire(path: &Path, create: bool) -> Result<Self, CustodyStorageError> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
         if !path.is_absolute() {

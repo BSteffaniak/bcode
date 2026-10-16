@@ -485,6 +485,16 @@ pub(crate) fn read_auth_vault_profile(
     vault_path: &Path,
     profile: &str,
 ) -> Result<Option<BTreeMap<String, String>>, String> {
+    #[cfg(unix)]
+    let _guard = crate::operations::refresh::native::read_guard(vault_path)
+        .map_err(|error| error.to_string())?;
+    read_auth_vault_profile_uncoordinated(vault_path, profile)
+}
+
+pub(crate) fn read_auth_vault_profile_uncoordinated(
+    vault_path: &Path,
+    profile: &str,
+) -> Result<Option<BTreeMap<String, String>>, String> {
     let (mut vault, data_key) = load_auth_vault_metadata(vault_path).map_err(|error| {
         format!(
             "failed to unlock auth vault metadata at {}: {error}",

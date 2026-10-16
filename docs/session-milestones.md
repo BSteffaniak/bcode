@@ -45,6 +45,26 @@ they do not accept a client-supplied prompt or arbitrary model override. The hos
 source evidence and applies configured admission limits before auxiliary no-tools inference.
 Generation instructions and source prompts are request-only, not durable session events.
 
+The first evaluation is due after `first_turns` settled conversational turns **or** after a
+settled turn reaches `subsequent_tokens` eligible normalized context tokens. Later evaluations
+use `subsequent_turns` or `subsequent_tokens`; all automatic retries respect the minimum interval.
+Provider rounds and tool calls are not conversational turns.
+
+Auxiliary inference retains typed provider and service failures through collection and cleanup.
+Normalized diagnostic records preserve error codes, categories, request IDs, source chains,
+retry hints and actionable failure context. Raw provider response bodies are excluded and diagnostic
+strings are sanitized. Usage-recording and cleanup failures accompany rather than replace the
+original failure. Startup failures travel as normalized error events on the push path and in the
+polling startup error payload; older consumers can still read the service code and message.
+
+Native sshenv refresh uses the ordinary host auth boundary with registry-verified ownership.
+An adjacent private `<vault>.refresh` directory retains an exclusive coordinator and versioned
+refresh intent; the existing encrypted vault remains authoritative and is not copied or converted.
+The intent fences credential reads and mutations during rotation and survives daemon interruption.
+Only a complete, matching commit clears it after durable publication. Unresolved or incompatible
+intents fail closed and are preserved for explicit maintenance; remote rotation is never replayed.
+Both streaming and polling auxiliary startup supply the host credential bridge.
+
 Accepted milestones record normalized provider/model provenance and source truncation. Evaluation
 admission and completion are durable checkpoints, including successful evaluations with no milestone.
 The generated display title is separate from an explicit session name. With `follow_title` enabled

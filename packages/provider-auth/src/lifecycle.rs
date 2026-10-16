@@ -254,6 +254,14 @@ impl<'a> AuthVaultLifecycle<'a> {
     /// Returns an error when the vault/profile cannot be read or declared ownership is invalid.
     /// Damaged state never causes reset, mutation, or fallback.
     pub fn read(&self) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
+        #[cfg(unix)]
+        let _guard = crate::operations::refresh::native::read_guard(&self.vault_path())?;
+        self.read_uncoordinated()
+    }
+
+    pub(crate) fn read_uncoordinated(
+        &self,
+    ) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
         self.read_with(|| {
             let vault = self.vault_path();
             if !vault.exists() {
@@ -262,7 +270,7 @@ impl<'a> AuthVaultLifecycle<'a> {
                     vault.display()
                 )));
             }
-            crate::security::read_auth_vault_profile(&vault, self.storage_profile())
+            crate::security::read_auth_vault_profile_uncoordinated(&vault, self.storage_profile())
                 .map_err(AuthVaultLifecycleError::ProfileUnavailable)?
                 .ok_or_else(|| {
                     AuthVaultLifecycleError::ProfileUnavailable(format!(
@@ -878,6 +886,20 @@ impl<'a> AuthVaultLifecycle<'a> {
         &self,
         changes: BTreeMap<String, Option<String>>,
     ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
+        #[cfg(unix)]
+        let _guard = {
+            if !self.vault_path().exists() {
+                self.open_or_initialize_store()?;
+            }
+            crate::operations::refresh::native::guard(&self.vault_path())?
+        };
+        self.persist_storage_updates_uncoordinated(changes)
+    }
+
+    pub(crate) fn persist_storage_updates_uncoordinated(
+        &self,
+        changes: BTreeMap<String, Option<String>>,
+    ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
         let (_store, recipient_key) = self.open_or_initialize_store()?;
         let vault_path = self.vault_path();
         let (mut vault, data_key) = sshenv_vault::load_and_unlock_metadata_with_private_key_paths(
@@ -996,6 +1018,8 @@ impl<'a> AuthVaultLifecycle<'a> {
     /// Returns an error when the vault/profile cannot be read or the resulting profile cannot be
     /// written.
     pub fn delete(&self) -> Result<(), AuthVaultLifecycleError> {
+        #[cfg(unix)]
+        let _guard = crate::operations::refresh::native::read_guard(&self.vault_path())?;
         let vault = self.vault_path();
         if !vault.exists() {
             return Ok(());
@@ -1064,7 +1088,7 @@ impl<'a> AuthVaultLifecycle<'a> {
             .map_or(self.resolved.profile_name.as_str(), String::as_str)
     }
 
-    fn vault_path(&self) -> PathBuf {
+    pub(crate) fn vault_path(&self) -> PathBuf {
         self.resolved
             .profile
             .settings
@@ -1268,6 +1292,106 @@ mod tests {
             registration,
             retained,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
+    fn native_refresh_fences_reads_and_writes_and_preserves_complete_rotation() {
+        use crate::operations::refresh::{RefreshOperation, native};
+        use bcode_provider_auth_models::{
+            AuthRefreshBeginRequest, AuthRefreshBeginResponse, AuthRefreshCommitRequest,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("vault");
+        let profile = resolved(&path);
+        let mut registration = method();
+        if let AuthMethodContribution::SecretFields { fields, .. } = &mut registration {
+            let mut field = fields[0].clone();
+            field.credential_id = "refresh_token".into();
+            field.storage_key = "REFRESH_TOKEN".into();
+            fields.push(field);
+        }
+        let lifecycle =
+            AuthVaultLifecycle::new(&profile, "exa", "bcode.web-search", &registration).unwrap();
+        lifecycle
+            .update(BTreeMap::from([
+                ("api_key".into(), Some("old".into())),
+                ("refresh_token".into(), Some("old-refresh".into())),
+            ]))
+            .unwrap();
+        let begin = AuthRefreshBeginRequest {
+            schema_version: 1,
+            provider_id: "exa".into(),
+            profile: profile.profile_name.clone(),
+            credentials: BTreeMap::from([
+                ("api_key".into(), Some("old".into())),
+                ("refresh_token".into(), Some("old-refresh".into())),
+            ]),
+        };
+        let admitted: AuthRefreshBeginResponse = serde_json::from_value(
+            native::resolve(
+                &profile,
+                &registration,
+                RefreshOperation::Begin(begin.clone()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(lifecycle.read().is_err());
+        assert!(
+            lifecycle
+                .update(BTreeMap::from([("api_key".into(), Some("other".into()))]))
+                .is_err()
+        );
+        assert!(lifecycle.delete().is_err());
+        assert!(
+            native::resolve(
+                &profile,
+                &registration,
+                RefreshOperation::Begin(begin.clone())
+            )
+            .is_err()
+        );
+        let commit = AuthRefreshCommitRequest {
+            schema_version: 1,
+            provider_id: "exa".into(),
+            profile: profile.profile_name.clone(),
+            attempt: admitted.attempt,
+            credentials: BTreeMap::from([
+                ("api_key".into(), Some("rotated".into())),
+                ("refresh_token".into(), Some("rotated-refresh".into())),
+            ]),
+        };
+        let mut incomplete = commit.clone();
+        incomplete.credentials.remove("refresh_token");
+        assert!(
+            native::resolve(
+                &profile,
+                &registration,
+                RefreshOperation::Commit(incomplete)
+            )
+            .is_err()
+        );
+        let mut foreign = commit.clone();
+        foreign.attempt = "f".repeat(64);
+        assert!(
+            native::resolve(&profile, &registration, RefreshOperation::Commit(foreign)).is_err()
+        );
+        native::resolve(
+            &profile,
+            &registration,
+            RefreshOperation::Commit(commit.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            lifecycle.read().unwrap()["refresh_token"],
+            "rotated-refresh"
+        );
+        assert!(
+            native::resolve(&profile, &registration, RefreshOperation::Commit(commit)).is_err()
+        );
+        assert!(native::resolve(&profile, &registration, RefreshOperation::Begin(begin)).is_err());
     }
 
     #[test]

@@ -51,11 +51,19 @@ where
     H: FnMut(ServiceBridgeRequest) -> Result<ServiceBridgeResponse, ProviderError>,
 {
     begin.validate().map_err(|_| reconnect())?;
-    let response = host(host_request(
+    let response = match host(host_request(
         invocation_id,
         OP_BEGIN_REFRESH,
         serde_json::to_value(&begin).map_err(|_| reconnect())?,
-    ))?;
+    ))? {
+        ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Failed {
+            code,
+            message,
+        }) => {
+            return Err(provider_error(code, ProviderErrorCategory::Auth, message));
+        }
+        response => response,
+    };
     let ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Responded {
         payload,
     }) = response

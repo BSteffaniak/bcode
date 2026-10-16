@@ -8,7 +8,7 @@ pub use enrollment::{
     CustodyEnrollment, CustodyEnrollmentMode, CustodyEnrollmentReadiness, read_custody_identity,
 };
 #[cfg(unix)]
-mod refresh;
+pub(crate) mod refresh;
 use bcode_provider_auth_models::{
     AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION, AUTH_SECURITY_INSPECTION_SCHEMA_VERSION,
     AuthCredentialUpdateRequest, AuthCredentialUpdateResponse, AuthDiagnostic,
