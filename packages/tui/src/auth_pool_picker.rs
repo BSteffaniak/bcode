@@ -70,6 +70,14 @@ impl AuthPoolPickerApp {
                     Span::styled(marker.to_owned(), muted),
                     Span::raw("  "),
                     Span::styled(availability.to_owned(), muted),
+                    Span::raw("  "),
+                    Span::styled(
+                        pool.automatic_group.as_ref().map_or_else(
+                            || "manual".to_owned(),
+                            |group| format!("automatic ({group})"),
+                        ),
+                        muted,
+                    ),
                 ])
             })
             .collect()
@@ -129,6 +137,7 @@ mod tests {
             schema_version: AUTH_POOL_SCHEMA_VERSION,
             pool: "provider".to_owned(),
             provider_plugin_id: Some("plugin".to_owned()),
+            automatic_group: None,
             strategy: "failover".to_owned(),
             preferred_profile: Some("one".to_owned()),
             preference_source: Some(AuthPoolPreferenceSource::PoolOrder),
@@ -148,6 +157,24 @@ mod tests {
             ],
             degraded_reason: None,
         }
+    }
+
+    #[test]
+    fn picker_rows_report_manual_and_automatic_management_without_changing_selection() {
+        let manual = AuthPoolPickerApp::new(vec![pool()]);
+        let text = |picker: &AuthPoolPickerApp| {
+            picker.list_items(Style::new(), Style::new())[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+        };
+        assert!(text(&manual).contains("manual"));
+        let mut automatic_pool = pool();
+        automatic_pool.automatic_group = Some("subscription".to_owned());
+        let automatic = AuthPoolPickerApp::new(vec![automatic_pool]);
+        assert!(text(&automatic).contains("automatic (subscription)"));
+        assert_eq!(manual.selected(), automatic.selected());
     }
 
     #[test]

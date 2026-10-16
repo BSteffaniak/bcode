@@ -11,6 +11,64 @@ use std::sync::{
 };
 use std::time::Duration;
 
+pub fn pool_compatibility(
+    host: &bcode_plugin::PluginHost,
+    provider: &bcode_plugin::RegisteredAuthProvider,
+) -> Result<Option<bcode_provider_auth_models::AuthPoolCompatibility>, &'static str> {
+    match host.invoke_service_json(
+        &provider.plugin_id,
+        bcode_provider_auth_models::AUTH_INTERFACE_ID,
+        bcode_provider_auth_models::OP_AUTH_POOL_COMPATIBILITY,
+        &bcode_provider_auth_models::AuthPoolCompatibilityRequest {
+            schema_version: 1,
+            provider_id: provider.contribution.provider_id.clone(),
+        },
+    ) {
+        Ok(compatibility) => {
+            let compatibility: bcode_provider_auth_models::AuthPoolCompatibility = compatibility;
+            compatibility.validate().map_err(
+                |_| "Authentication pool compatibility is malformed; credentials were not changed.",
+            )?;
+            Ok(Some(compatibility))
+        }
+        Err(bcode_plugin::PluginServiceCallError::Service { code, .. })
+            if matches!(
+                code.as_str(),
+                "unsupported_operation" | "unsupported_provider"
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(bcode_plugin::PluginServiceCallError::Invoke(
+            bcode_plugin::PluginLoadError::ServiceNotRegistered(_),
+        )) => Ok(None),
+        Err(_) => Err(
+            "Authentication pool compatibility could not be validated; credentials were not changed.",
+        ),
+    }
+}
+
+pub fn completion_message(result: &bcode_provider_auth::enrollment::EnrollmentResult) -> String {
+    result.pool.as_ref().map_or_else(
+        || "No auth pool enrollment (standalone).".to_owned(),
+        |pool| {
+            format!(
+                "Auth pool '{pool}': {} ({}).",
+                if result.joined {
+                    "joined"
+                } else {
+                    "already a member"
+                },
+                if result.automatic {
+                    "automatic"
+                } else {
+                    "manual"
+                },
+            )
+        },
+    )
+}
+
 pub enum LoginUpdate {
     Progress(Vec<String>, bool),
     Succeeded,
@@ -93,7 +151,8 @@ impl DeviceLogin {
             }
             match update {
                 LoginUpdate::Succeeded => {
-                    self.lines = vec!["Account connected. Confirm to return to setup.".to_owned()];
+                    self.lines
+                        .push("Account connected. Confirm to return to setup.".to_owned());
                     self.terminal = true;
                     self.succeeded = true;
                     self.prompt = None;
@@ -206,7 +265,8 @@ fn flow(
     let runtime = bcode_config::try_load_runtime_auth_subscriptions().map_err(|_| {
         "Authentication metadata is unreadable or unsupported. Inspect authentication state before signing in; existing credentials were not changed."
     })?;
-    let prepared = bcode_provider_auth::enrollment::prepare(
+    let compatibility = pool_compatibility(host, provider)?;
+    let plan = bcode_provider_auth::enrollment::plan(
         &config,
         &runtime,
         &provider.contribution,
@@ -217,8 +277,11 @@ fn flow(
             vault: (!vault.is_empty()).then(|| vault.into()),
             recipient_key: None,
         },
+        bcode_provider_auth::enrollment::PoolEnrollment::Automatic,
+        compatibility.as_ref(),
     )
     .map_err(|_| "Authentication profile is inconsistent.")?;
+    let prepared = &plan.prepared;
     let mut request = begin_request(provider_id, method_id, &prepared.resolved.profile_name);
     let mut browser = super::auth_browser::AuthBrowser::new(
         config
@@ -235,33 +298,14 @@ fn flow(
         if cancel.load(Ordering::Acquire) {
             request.operation = AuthFlowOperation::Cancel;
         }
-        request
-            .validate()
-            .map_err(|_| "Invalid authentication request.")?;
-        let response: AuthFlowResponse = host
-            .invoke_service_json(
-                &provider.plugin_id,
-                bcode_provider_auth_models::AUTH_INTERFACE_ID,
-                operation,
-                &request,
-            )
-            .map_err(|error| report_request_failure(&error, send))?;
-        response
-            .validate()
-            .map_err(|_| "Provider returned an invalid authentication response.")?;
-        if cancel.load(Ordering::Acquire) {
-            if request.operation != AuthFlowOperation::Cancel {
-                request.operation = AuthFlowOperation::Cancel;
-                request.state = response.state;
-                let _ = host.invoke_service_json::<_, AuthFlowResponse>(
-                    &provider.plugin_id,
-                    bcode_provider_auth_models::AUTH_INTERFACE_ID,
-                    operation,
-                    &request,
-                );
-            }
-            return Err("Sign-in cancelled; credentials were not saved.");
-        }
+        let response = exchange_flow_request(
+            host,
+            &provider.plugin_id,
+            operation,
+            &mut request,
+            cancel,
+            send,
+        )?;
         let progress = domain_flow.accept(response)?;
         match progress.status {
             AuthFlowStatus::Succeeded => {
@@ -273,10 +317,12 @@ fn flow(
                 )
                 .map_err(|_| "Profile ownership mismatch.")?;
                 lifecycle.replace_owned(domain_flow.take_credentials()).map_err(|_| "Sign-in succeeded but secure storage failed. Inspect authentication state before retrying.")?;
-                if prepared.publish_runtime {
-                    bcode_provider_auth::enrollment::publish(&prepared.resolved)
-                        .map_err(|_| "Credentials saved but profile publication failed.")?;
-                }
+                let completion = bcode_provider_auth::enrollment::complete(&plan)
+                    .map_err(|_| "Credentials saved but authentication metadata publication failed. Inspect authentication state before retrying; do not repeat sign-in merely to repair metadata.")?;
+                let _ = send.updates.send(LoginUpdate::Progress(
+                    vec![completion_message(&completion)],
+                    false,
+                ));
                 return Ok(());
             }
             AuthFlowStatus::Failed => {
@@ -289,6 +335,44 @@ fn flow(
         present_progress(progress.effects, &mut display, &mut browser, send, cancel);
         request = domain_flow.request()?.clone();
     }
+}
+
+fn exchange_flow_request(
+    host: &bcode_plugin::PluginHost,
+    plugin_id: &str,
+    operation: &str,
+    request: &mut AuthFlowRequest,
+    cancel: &AtomicBool,
+    send: &LoginChannel,
+) -> Result<AuthFlowResponse, &'static str> {
+    request
+        .validate()
+        .map_err(|_| "Invalid authentication request.")?;
+    let response: AuthFlowResponse = host
+        .invoke_service_json(
+            plugin_id,
+            bcode_provider_auth_models::AUTH_INTERFACE_ID,
+            operation,
+            request,
+        )
+        .map_err(|error| report_request_failure(&error, send))?;
+    response
+        .validate()
+        .map_err(|_| "Provider returned an invalid authentication response.")?;
+    if cancel.load(Ordering::Acquire) {
+        if request.operation != AuthFlowOperation::Cancel {
+            request.operation = AuthFlowOperation::Cancel;
+            request.state = response.state;
+            let _ = host.invoke_service_json::<_, AuthFlowResponse>(
+                plugin_id,
+                bcode_provider_auth_models::AUTH_INTERFACE_ID,
+                operation,
+                request,
+            );
+        }
+        return Err("Sign-in cancelled; credentials were not saved.");
+    }
+    Ok(response)
 }
 
 fn present_progress(
@@ -467,6 +551,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn completion_reports_pool_policy_and_survives_success_update() {
+        let result = bcode_provider_auth::enrollment::EnrollmentResult {
+            profile: "account".to_owned(),
+            pool: Some("subscriptions".to_owned()),
+            automatic: true,
+            joined: true,
+        };
+        let message = completion_message(&result);
+        assert!(message.contains("subscriptions"));
+        assert!(message.contains("joined (automatic)"));
+        let manual = bcode_provider_auth::enrollment::EnrollmentResult {
+            automatic: false,
+            joined: false,
+            ..result
+        };
+        assert!(completion_message(&manual).contains("already a member (manual)"));
+        let standalone = bcode_provider_auth::enrollment::EnrollmentResult {
+            pool: None,
+            ..manual
+        };
+        assert!(completion_message(&standalone).contains("standalone"));
+
+        let mut login = DeviceLogin::failed_for_test();
+        let (send, updates) = mpsc::channel();
+        login.updates = updates;
+        login.terminal = false;
+        send.send(LoginUpdate::Progress(vec![message.clone()], false))
+            .unwrap();
+        send.send(LoginUpdate::Succeeded).unwrap();
+        login.refresh();
+        assert!(login.succeeded);
+        assert!(login.lines.contains(&message));
+    }
+
+    #[test]
     fn terminal_progress_cannot_be_reopened_by_late_updates() {
         let (send, updates) = mpsc::channel();
         let (answers, _) = mpsc::sync_channel(1);
@@ -503,7 +622,12 @@ mod tests {
         login.refresh();
         assert!(login.succeeded);
         assert!(login.terminal);
-        assert!(login.lines[0].contains("Account connected"));
+        assert!(
+            login
+                .lines
+                .iter()
+                .any(|line| line.contains("Account connected"))
+        );
     }
 
     #[test]

@@ -7201,6 +7201,9 @@ enum AuthCommand {
         /// Add the enrolled profile to this runtime authentication pool without changing the provider binding.
         #[arg(long)]
         pool: Option<String>,
+        /// Keep this login outside automatic pool enrollment.
+        #[arg(long, conflicts_with = "pool", requires = "provider")]
+        standalone: bool,
         /// Explicit provider-local authentication method ID.
         #[arg(long)]
         method: Option<String>,
@@ -9769,6 +9772,7 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             recipient_key,
             no_device_seal,
             pool,
+            standalone,
             method,
             verify,
         } => {
@@ -9781,6 +9785,7 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
                         recipient_key: recipient_key.as_deref(),
                         no_device_seal,
                         pool: pool.as_deref(),
+                        standalone,
                         requested_method: method.as_deref(),
                         verify,
                     },
@@ -11472,7 +11477,18 @@ struct AuthProfileSummary {
 }
 
 fn auth_profile_summaries(config: &bcode_config::BcodeConfig) -> Vec<AuthProfileSummary> {
-    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let registry = if config.active_context.is_some() {
+        bcode_config::RuntimeAuthSubscriptions::default()
+    } else {
+        bcode_config::load_runtime_auth_subscriptions()
+    };
+    auth_profile_summaries_from(config, &registry)
+}
+
+fn auth_profile_summaries_from(
+    config: &bcode_config::BcodeConfig,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+) -> Vec<AuthProfileSummary> {
     let mut summaries = Vec::new();
     let mut seen = BTreeSet::new();
     for (profile, auth_profile) in &config.auth.profiles {
@@ -11482,9 +11498,32 @@ fn auth_profile_summaries(config: &bcode_config::BcodeConfig) -> Vec<AuthProfile
             source: "declared",
             backend: auth_profile.backend.clone(),
             scheme: auth_profile.scheme.clone(),
-            provider: auth_profile.settings.get("provider").cloned(),
+            provider: auth_profile
+                .provider_id
+                .clone()
+                .or_else(|| auth_profile.settings.get("provider").cloned()),
             storage_profile: auth_profile.settings.get("profile").cloned(),
             vault: auth_profile.settings.get("vault").map(PathBuf::from),
+        });
+    }
+    // Context auth replaces global auth; runtime registration is currently global only.
+    if config.active_context.is_some() {
+        summaries.sort_by(|left, right| left.profile.cmp(&right.profile));
+        return summaries;
+    }
+    // Canonical runtime profiles take precedence over legacy pool-member metadata.
+    for (profile, auth_profile) in &registry.profiles {
+        if !seen.insert(profile.clone()) {
+            continue;
+        }
+        summaries.push(AuthProfileSummary {
+            profile: profile.clone(),
+            source: "runtime",
+            backend: auth_profile.backend.clone(),
+            scheme: Some(auth_profile.scheme.clone()),
+            provider: Some(auth_profile.provider_id.clone()),
+            storage_profile: Some(auth_profile.storage_profile.clone()),
+            vault: Some(auth_profile.vault.clone()),
         });
     }
     for pool in registry.pools.values() {
@@ -11595,6 +11634,13 @@ fn auth_pool_list() -> Result<(), CliError> {
     Ok(())
 }
 
+fn auth_pool_management_label(automatic_group: Option<&str>) -> String {
+    automatic_group.map_or_else(
+        || "manual".to_owned(),
+        |group| format!("automatic ({group})"),
+    )
+}
+
 fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let registry = bcode_config::load_runtime_auth_subscriptions();
@@ -11605,6 +11651,14 @@ fn auth_pool_status(pool_name: &str) -> Result<(), CliError> {
         return Ok(());
     }
     println!("Auth pool: {pool_name}");
+    let automatic_group = declared_pool.map_or_else(
+        || runtime_pool.and_then(|pool| pool.automatic_group.as_deref()),
+        |pool| pool.automatic_group.as_deref(),
+    );
+    println!(
+        "Management: {}",
+        auth_pool_management_label(automatic_group)
+    );
     if let Some(provider_plugin_id) = declared_pool
         .and_then(|pool| pool.provider_plugin_id.as_ref())
         .or_else(|| runtime_pool.and_then(|pool| pool.provider_plugin_id.as_ref()))
@@ -11931,6 +11985,7 @@ fn resolve_registered_auth_profile(
     resolve_registered_auth_profile_from(&config, &runtime, provider, explicit_profile)
 }
 
+#[cfg(test)]
 fn resolve_or_prepare_auth_profile_from(
     config: &bcode_config::BcodeConfig,
     runtime: &bcode_config::RuntimeAuthSubscriptions,
@@ -11957,73 +12012,13 @@ fn resolve_or_prepare_auth_profile_from(
     Ok((prepared.resolved, prepared.publish_runtime))
 }
 
-fn resolve_or_prepare_auth_profile(
-    provider: &bcode_plugin::RegisteredAuthProvider,
-    method: &bcode_provider_auth_models::AuthMethodContribution,
-    explicit_profile: Option<&str>,
-    explicit_vault: Option<PathBuf>,
-    recipient_key: Option<&str>,
-) -> Result<(bcode_provider_auth::ResolvedAuthProfile, bool), CliError> {
-    let config = bcode_config::load_config()?;
-    let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
-    resolve_or_prepare_auth_profile_from(
-        &config,
-        &runtime,
-        provider,
-        method,
-        explicit_profile,
-        explicit_vault,
-        recipient_key,
-    )
-}
-
-fn runtime_pool_profile(
-    resolved: &bcode_provider_auth::ResolvedAuthProfile,
-) -> bcode_config::RuntimeAuthSubscriptionProfile {
-    let storage_profile = resolved
-        .profile
-        .settings
-        .get("profile")
-        .cloned()
-        .unwrap_or_else(|| resolved.profile_name.clone());
-    let vault = resolved
-        .profile
-        .settings
-        .get("vault")
-        .map_or_else(bcode_config::default_auth_vault_path, PathBuf::from);
-    bcode_config::RuntimeAuthSubscriptionProfile {
-        auth_profile: resolved.profile_name.clone(),
-        storage_profile,
-        vault,
-        provider: resolved.provider_id.clone(),
-        scheme: resolved.profile.scheme.clone().unwrap_or_default(),
-        owner_plugin_id: Some(resolved.owner_plugin_id.clone()),
-        map: resolved.profile.map.clone(),
-        device_seal: resolved.profile.settings.get("device_seal").cloned(),
-    }
-}
-
-fn persist_runtime_pool_profile(
-    pool: &str,
-    resolved: &bcode_provider_auth::ResolvedAuthProfile,
-) -> Result<(), CliError> {
-    bcode_config::register_runtime_auth_subscription(pool, runtime_pool_profile(resolved))?;
-    Ok(())
-}
-
-fn persist_prepared_runtime_profile(
-    resolved: &bcode_provider_auth::ResolvedAuthProfile,
-) -> Result<(), CliError> {
-    bcode_provider_auth::enrollment::publish(resolved)?;
-    Ok(())
-}
-
 struct AuthProviderLoginOptions<'a> {
     explicit_profile: Option<&'a str>,
     explicit_vault: Option<PathBuf>,
     recipient_key: Option<&'a str>,
     no_device_seal: bool,
     pool: Option<&'a str>,
+    standalone: bool,
     requested_method: Option<&'a str>,
     verify: bool,
 }
@@ -12031,6 +12026,7 @@ struct AuthProviderLoginOptions<'a> {
 struct AuthProviderLoginResult {
     resolved: bcode_provider_auth::ResolvedAuthProfile,
     persisted_runtime: bool,
+    completion: bcode_provider_auth::enrollment::EnrollmentResult,
 }
 
 fn compatible_login_profile(
@@ -12089,6 +12085,46 @@ async fn enroll_registered_auth_provider(
     result.and_then(|result| cleanup.map(|()| result))
 }
 
+fn auth_pool_compatibility(
+    host: &bcode_plugin::PluginHost,
+    provider: &bcode_plugin::RegisteredAuthProvider,
+) -> Result<Option<bcode_provider_auth_models::AuthPoolCompatibility>, CliError> {
+    auth_pool_compatibility_response(host.invoke_service_json(
+        &provider.plugin_id,
+        bcode_provider_auth_models::AUTH_INTERFACE_ID,
+        bcode_provider_auth_models::OP_AUTH_POOL_COMPATIBILITY,
+        &bcode_provider_auth_models::AuthPoolCompatibilityRequest {
+            schema_version: 1,
+            provider_id: provider.contribution.provider_id.clone(),
+        },
+    ))
+}
+
+fn auth_pool_compatibility_response(
+    response: Result<
+        bcode_provider_auth_models::AuthPoolCompatibility,
+        bcode_plugin::PluginServiceCallError,
+    >,
+) -> Result<Option<bcode_provider_auth_models::AuthPoolCompatibility>, CliError> {
+    match response {
+        Ok(compatibility) => {
+            compatibility.validate().map_err(|_| CliError::LoginProfile(
+                "Authentication pool compatibility is malformed; credentials were not changed.".to_owned(),
+            ))?;
+            Ok(Some(compatibility))
+        }
+        Err(bcode_plugin::PluginServiceCallError::Service { code, .. })
+            if matches!(code.as_str(), "unsupported_operation" | "unsupported_provider") => Ok(None),
+        Err(bcode_plugin::PluginServiceCallError::Invoke(
+            bcode_plugin::PluginLoadError::ServiceNotRegistered(_),
+        )) => Ok(None),
+        Err(_) => Err(CliError::LoginProfile(
+            "Authentication pool compatibility could not be validated; credentials were not changed."
+                .to_owned(),
+        )),
+    }
+}
+
 async fn enroll_auth_provider_with_host(
     host: &bcode_plugin::PluginHost,
     provider_id: &str,
@@ -12102,23 +12138,43 @@ async fn enroll_auth_provider_with_host(
         recipient_key,
         no_device_seal,
         pool,
+        standalone,
         requested_method,
         verify,
     } = options;
     let provider = registered_auth_provider(host, provider_id)?;
     let method = selected_auth_method(&provider, requested_method)?;
-    let (mut resolved, persist_runtime) = resolve_or_prepare_auth_profile(
-        &provider,
-        method,
-        explicit_profile,
-        explicit_vault,
-        recipient_key,
-    )?;
+    let config = bcode_config::load_config()?;
+    let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
+    let compatibility = auth_pool_compatibility(host, &provider)?;
+    let pooling = if standalone {
+        bcode_provider_auth::enrollment::PoolEnrollment::Standalone
+    } else if let Some(pool) = pool {
+        bcode_provider_auth::enrollment::PoolEnrollment::Explicit(pool.to_owned())
+    } else {
+        bcode_provider_auth::enrollment::PoolEnrollment::Automatic
+    };
+    let mut plan = bcode_provider_auth::enrollment::plan(
+        &config,
+        &runtime,
+        &provider.contribution,
+        &provider.plugin_id,
+        method.method_id(),
+        bcode_provider_auth::enrollment::EnrollmentDestination {
+            profile: registered_auth_profile_hint(&config, &runtime, &provider, explicit_profile),
+            vault: explicit_vault,
+            recipient_key: recipient_key.map(str::to_owned),
+        },
+        pooling,
+        compatibility.as_ref(),
+    )
+    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    let resolved = &mut plan.prepared.resolved;
     if no_device_seal {
         resolved
             .profile
             .settings
-            .insert("device_seal".to_owned(), "off".to_owned());
+            .insert("device_seal".to_owned(), "disabled".to_owned());
     }
     match method {
         bcode_provider_auth_models::AuthMethodContribution::SecretFields {
@@ -12134,12 +12190,12 @@ async fn enroll_auth_provider_with_host(
                 provider_id,
                 &provider,
                 method,
-                &resolved,
+                resolved,
                 supplied,
                 replace_owned,
             )?;
             if verify {
-                run_auth_interactive_flow(host, &provider, method, &resolved, true, false).await?;
+                run_auth_interactive_flow(host, &provider, method, resolved, true, false).await?;
             }
         }
         bcode_provider_auth_models::AuthMethodContribution::Interactive { .. } => {
@@ -12149,17 +12205,18 @@ async fn enroll_auth_provider_with_host(
                     method.method_id()
                 )));
             }
-            run_auth_interactive_flow(host, &provider, method, &resolved, verify, false).await?;
+            run_auth_interactive_flow(host, &provider, method, resolved, verify, false).await?;
         }
     }
-    if let Some(pool) = pool {
-        persist_runtime_pool_profile(pool, &resolved)?;
-    } else if persist_runtime {
-        persist_prepared_runtime_profile(&resolved)?;
-    }
+    let completion = bcode_provider_auth::enrollment::complete(&plan).map_err(|_| {
+        CliError::LoginProfile(
+            "Credentials saved, but authentication metadata publication failed. Inspect authentication state before retrying; do not repeat sign-in merely to repair metadata.".to_owned(),
+        )
+    })?;
     Ok(AuthProviderLoginResult {
-        resolved,
-        persisted_runtime: pool.is_some() || persist_runtime,
+        persisted_runtime: plan.prepared.publish_runtime || completion.pool.is_some(),
+        resolved: plan.prepared.resolved,
+        completion,
     })
 }
 
@@ -12173,7 +12230,28 @@ async fn auth_provider_login(
         "Authentication saved for provider '{provider_id}' in profile '{}'.",
         result.resolved.profile_name
     );
+    print_auth_enrollment_result(&result.completion);
     Ok(())
+}
+
+fn print_auth_enrollment_result(result: &bcode_provider_auth::enrollment::EnrollmentResult) {
+    if let Some(pool) = &result.pool {
+        println!(
+            "Auth pool '{pool}': {} ({}).",
+            if result.joined {
+                "joined"
+            } else {
+                "already a member"
+            },
+            if result.automatic {
+                "automatic"
+            } else {
+                "manual"
+            },
+        );
+    } else {
+        println!("No auth pool enrollment (standalone).");
+    }
 }
 
 async fn auth_provider_logout(
@@ -13116,6 +13194,7 @@ async fn run_compatible_login(plan: CompatibleLoginPlan) -> Result<(), CliError>
             recipient_key: plan.recipient_key.as_deref(),
             no_device_seal: plan.no_device_seal,
             pool: plan.pool,
+            standalone: false,
             requested_method: Some(plan.method_id),
             verify: false,
         },
@@ -13123,6 +13202,7 @@ async fn run_compatible_login(plan: CompatibleLoginPlan) -> Result<(), CliError>
         plan.replace_owned,
     )
     .await?;
+    print_auth_enrollment_result(&result.completion);
     apply_legacy_login_configuration(LegacyLoginConfiguration {
         provider: plan.provider,
         resolved: &result.resolved,
@@ -22038,6 +22118,173 @@ mod auth_cli_tests {
     }
 
     #[test]
+    fn pool_management_and_capability_response_preserve_opt_in_and_fail_closed() {
+        assert_eq!(auth_pool_management_label(None), "manual");
+        assert_eq!(
+            auth_pool_management_label(Some("subscription")),
+            "automatic (subscription)"
+        );
+        for code in ["unsupported_operation", "unsupported_provider"] {
+            assert!(
+                auth_pool_compatibility_response(Err(
+                    bcode_plugin::PluginServiceCallError::Service {
+                        code: code.to_owned(),
+                        message: "unsupported".to_owned(),
+                    },
+                ))
+                .expect("unsupported capability")
+                .is_none()
+            );
+        }
+        assert!(
+            auth_pool_compatibility_response(Err(bcode_plugin::PluginServiceCallError::Service {
+                code: "internal_error".to_owned(),
+                message: "failed".to_owned(),
+            },))
+            .is_err()
+        );
+        let valid = bcode_provider_auth_models::AuthPoolCompatibility {
+            schema_version: 1,
+            provider_id: "openai".to_owned(),
+            group: "subscription".to_owned(),
+            methods: vec!["chatgpt".to_owned(), "device".to_owned()],
+        };
+        assert_eq!(
+            auth_pool_compatibility_response(Ok(valid.clone())).unwrap(),
+            Some(valid.clone())
+        );
+        let malformed = bcode_provider_auth_models::AuthPoolCompatibility {
+            schema_version: 99,
+            ..valid
+        };
+        assert!(auth_pool_compatibility_response(Ok(malformed)).is_err());
+    }
+
+    #[test]
+    fn auth_login_standalone_is_explicit_and_conflicts_with_pool() {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "bcode",
+                "auth",
+                "login",
+                "openai",
+                "--standalone",
+                "--profile",
+                "openai-2",
+            ])
+            .expect("standalone login parses");
+        let cli = Cli::from_arg_matches(&matches).expect("standalone login decodes");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommand::Login {
+                    standalone: true,
+                    pool: None,
+                    ..
+                },
+            })
+        ));
+        assert!(
+            Cli::command()
+                .try_get_matches_from([
+                    "bcode",
+                    "auth",
+                    "login",
+                    "openai",
+                    "--standalone",
+                    "--pool",
+                    "manual",
+                ])
+                .is_err()
+        );
+        assert!(
+            Cli::command()
+                .try_get_matches_from(["bcode", "auth", "login", "--standalone",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn auth_profile_summaries_include_standalone_runtime_metadata() {
+        let config = bcode_config::BcodeConfig::default();
+        let registry = bcode_config::RuntimeAuthSubscriptions {
+            profiles: BTreeMap::from([(
+                "openai-2".to_owned(),
+                bcode_config::RuntimeAuthProfile {
+                    provider_id: "openai".to_owned(),
+                    backend: "sshenv".to_owned(),
+                    scheme: "chatgpt".to_owned(),
+                    storage_profile: "secondary".to_owned(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let summaries = auth_profile_summaries_from(&config, &registry);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].profile, "openai-2");
+        assert_eq!(summaries[0].source, "runtime");
+        assert_eq!(summaries[0].provider.as_deref(), Some("openai"));
+        assert_eq!(summaries[0].storage_profile.as_deref(), Some("secondary"));
+    }
+
+    #[test]
+    fn auth_profile_summaries_preserve_canonical_precedence_and_context_isolation() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.auth.profiles.insert(
+            "declared".to_owned(),
+            bcode_config::AuthProfileConfig {
+                provider_id: Some("typed-provider".to_owned()),
+                settings: BTreeMap::from([("provider".to_owned(), "legacy-provider".to_owned())]),
+                ..Default::default()
+            },
+        );
+        let runtime_profile = bcode_config::RuntimeAuthProfile {
+            provider_id: "runtime-provider".to_owned(),
+            backend: "runtime-backend".to_owned(),
+            ..Default::default()
+        };
+        let registry = bcode_config::RuntimeAuthSubscriptions {
+            profiles: BTreeMap::from([
+                ("declared".to_owned(), runtime_profile.clone()),
+                ("runtime".to_owned(), runtime_profile),
+            ]),
+            pools: BTreeMap::from([(
+                "legacy-pool".to_owned(),
+                bcode_config::RuntimeAuthSubscriptionPool {
+                    profiles: ["declared", "runtime", "legacy"]
+                        .into_iter()
+                        .map(|name| bcode_config::RuntimeAuthSubscriptionProfile {
+                            auth_profile: name.to_owned(),
+                            provider: "pool-provider".to_owned(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let summaries = auth_profile_summaries_from(&config, &registry);
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries[0].profile, "declared");
+        assert_eq!(summaries[0].source, "declared");
+        assert_eq!(summaries[0].provider.as_deref(), Some("typed-provider"));
+        assert_eq!(summaries[1].profile, "legacy");
+        assert_eq!(summaries[1].provider.as_deref(), Some("pool-provider"));
+        assert_eq!(summaries[2].profile, "runtime");
+        assert_eq!(summaries[2].provider.as_deref(), Some("runtime-provider"));
+        assert_eq!(summaries[2].backend, "runtime-backend");
+
+        config.active_context = Some("isolated".to_owned());
+        let isolated = auth_profile_summaries_from(&config, &registry);
+        assert_eq!(isolated, vec![summaries[0].clone()]);
+        config.auth.profiles.clear();
+        assert!(auth_profile_summaries_from(&config, &registry).is_empty());
+    }
+
+    #[test]
     fn compatibility_login_command_matrix_translates_to_registered_enrollment() {
         let cases = [
             CompatibleLoginCase {
@@ -22220,46 +22467,6 @@ mod auth_cli_tests {
         assert_eq!(
             next_compatible_pool_profile(&config, &runtime, "openai", None),
             "openai-3"
-        );
-    }
-
-    #[test]
-    fn runtime_pool_profile_preserves_registered_method_and_device_seal_policy() {
-        let resolved = bcode_provider_auth::ResolvedAuthProfile {
-            profile_name: "openai-2".to_owned(),
-            provider_id: "openai".to_owned(),
-            owner_plugin_id: "bcode.test-openai-compatible".to_owned(),
-            profile: bcode_config::AuthProfileConfig {
-                backend: "sshenv".to_owned(),
-                provider_id: Some("openai".to_owned()),
-                owner_plugin_id: Some("bcode.test-openai-compatible".to_owned()),
-                scheme: Some("device".to_owned()),
-                map: BTreeMap::from([(
-                    "access_token".to_owned(),
-                    bcode_config::AuthCredentialMapping {
-                        env: None,
-                        key: Some("TOKEN".to_owned()),
-                    },
-                )]),
-                settings: BTreeMap::from([
-                    ("profile".to_owned(), "vault-profile".to_owned()),
-                    ("vault".to_owned(), "/vault".to_owned()),
-                    ("device_seal".to_owned(), "off".to_owned()),
-                ]),
-            },
-            source: bcode_provider_auth::AuthProfileSource::Runtime,
-        };
-        let profile = runtime_pool_profile(&resolved);
-        assert_eq!(profile.auth_profile, "openai-2");
-        assert_eq!(profile.storage_profile, "vault-profile");
-        assert_eq!(profile.scheme, "device");
-        assert_eq!(profile.device_seal.as_deref(), Some("off"));
-        assert_eq!(
-            profile
-                .map
-                .get("access_token")
-                .and_then(|mapping| mapping.key.as_deref()),
-            Some("TOKEN")
         );
     }
 

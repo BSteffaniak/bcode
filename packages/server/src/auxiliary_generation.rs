@@ -158,6 +158,7 @@ async fn resolve_target(
                 .and_then(|selection| selection.model_id)
                 .as_deref(),
             provider_context: &context,
+            native_default: false,
         },
     )
     .await

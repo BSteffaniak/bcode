@@ -21,6 +21,7 @@ mod interaction_operations;
 mod invariant_guidance;
 mod judgement;
 mod judgement_history;
+mod managed_default_routing;
 mod milestones;
 mod model_check;
 mod model_evidence;
@@ -426,9 +427,11 @@ pub struct ServerState {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
+    managed_default_routing: Mutex<managed_default_routing::State>,
     startup_config: bcode_config::BcodeConfig,
     history_auth_gate: Arc<tokio::sync::Semaphore>,
     session_configs: Mutex<BTreeMap<SessionId, bcode_config::BcodeConfig>>,
+    session_external_configs: Mutex<BTreeSet<SessionId>>,
     session_skills: Mutex<BTreeMap<SessionId, Option<SkillRegistry>>>,
     session_repository_roots: Mutex<BTreeMap<SessionId, (PathBuf, Option<PathBuf>)>>,
     selected_reasoning: bcode_config::ReasoningConfig,
@@ -1220,6 +1223,8 @@ struct SessionModelSelection {
     reasoning_summary: Option<String>,
     reasoning_capabilities: Option<bcode_model::ModelReasoningInfo>,
     provider_context: bcode_model::ProviderRequestContext,
+    // Cleared whenever a client supplies transient authentication or environment.
+    native_default: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2549,10 +2554,12 @@ impl ServerState {
             selected_provider_plugin_id: init.selected_provider_plugin_id,
             selected_model_id: init.selected_model_id,
             selected_provider_context: init.selected_provider_context,
+            managed_default_routing: Mutex::new(managed_default_routing::State::default()),
             startup_config: init.startup_config,
             history_auth_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             contextual_plugin_invocations: StdMutex::default(),
             session_configs: Mutex::default(),
+            session_external_configs: Mutex::default(),
             session_skills: Mutex::default(),
             session_repository_roots: Mutex::default(),
             selected_reasoning: init.selected_reasoning,
@@ -2923,6 +2930,21 @@ impl ServerState {
         };
         let skills = build_skill_registry(&config, &workspace);
         self.optional_judgement.invalidate();
+        let mut external = self.session_external_configs.lock().await;
+        if context.is_some() {
+            external.insert(session_id);
+            if let Some(selection) = self
+                .session_model_selections
+                .lock()
+                .await
+                .get_mut(&session_id)
+            {
+                selection.native_default = false;
+            }
+        } else {
+            external.remove(&session_id);
+        }
+        drop(external);
         self.session_configs.lock().await.insert(session_id, config);
         self.session_skills.lock().await.insert(session_id, skills);
     }
@@ -4157,6 +4179,7 @@ async fn invariant_selector_runtime(
             provider_plugin_id: model.provider_plugin_id.as_deref(),
             selected_model_id: Some(&model.model_id),
             provider_context: &model.provider_context,
+            native_default: false,
         },
     ))
     .await
@@ -16576,6 +16599,7 @@ async fn verify_submission_model_target(
             provider_plugin_id: context.selected_provider_plugin_id.as_deref(),
             selected_model_id: context.selected_model_id.as_deref(),
             provider_context: &context.provider_context,
+            native_default: false,
         },
     )
     .await
@@ -18757,6 +18781,7 @@ async fn set_session_reasoning_if_changed(
                 reasoning_summary: state.selected_reasoning.summary.clone(),
                 reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
                 provider_context: state.selected_provider_context.clone(),
+                native_default: resolved.native_default,
             });
         selection.reasoning_effort = effort;
         selection.reasoning_summary = summary;
@@ -18918,6 +18943,7 @@ async fn model_status_for_selection(
     session_id: Option<SessionId>,
     config: &bcode_config::BcodeConfig,
 ) -> bcode_model::SessionModelStatus {
+    let status_auth = managed_default_routing::status_profile(state, &selection).await;
     let mut models = resolved_provider_models(
         state,
         selection.provider_plugin_id.clone(),
@@ -18970,7 +18996,7 @@ async fn model_status_for_selection(
         .reasoning_capabilities
         .clone()
         .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone()));
-    let (context_occupancy, request_context_error) = if let Some(session_id) = session_id {
+    let (context_occupancy, mut request_context_error) = if let Some(session_id) = session_id {
         state
             .sessions
             .current_context_occupancy(session_id)
@@ -19015,6 +19041,10 @@ async fn model_status_for_selection(
             selection.requested_model_id.as_deref(),
         )
         .or_else(|| model.as_ref().map(|model| model.display_name.clone()));
+    let auth_profile = status_auth.unwrap_or_else(|error| {
+        request_context_error = Some(error.to_string());
+        None
+    });
     bcode_model::SessionModelStatus {
         provider_plugin_id: selection.provider_plugin_id,
         requested_model_id: selection.requested_model_id.clone(),
@@ -19024,7 +19054,7 @@ async fn model_status_for_selection(
         context_window,
         context_occupancy: context_occupancy.map(Box::new),
         request_context_error,
-        auth_profile: selection.provider_context.auth_profile,
+        auth_profile,
         context_format_version: context_format.as_ref().map(|format| format.version),
         compatibility_key: context_format.map(|format| format.compatibility_key),
         max_output_tokens,
@@ -21878,7 +21908,7 @@ async fn run_model_turn_inner(
     let turn_id = execution_turn_id(trigger_event);
     let setup_labels = model_turn_metric_labels(session_id, &turn_id);
     let selection_timer = state.metrics.timer();
-    let Ok(selection) = Box::pin(submission_bound_model_selection(
+    let Ok(mut selection) = Box::pin(submission_bound_model_selection(
         state,
         session_id,
         trigger_event,
@@ -21908,6 +21938,30 @@ async fn run_model_turn_inner(
     }
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
+    // Resolve native membership before any credential-dependent capability or catalog call.
+    // The target resolver will reuse this frozen context rather than refreshing again.
+    if selection.native_default {
+        selection.provider_context = match managed_default_routing::refresh(
+            state,
+            provider_plugin_id.as_deref(),
+            &selection.provider_context,
+            true,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                return ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    format!("failed to resolve model request target: {error}"),
+                );
+            }
+        };
+        selection.native_default = false;
+        if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
+            turn.selection = Some(selection.clone());
+        }
+    }
     let compaction_policy_timer = state.metrics.timer();
     let mut compaction_policy =
         automatic_compaction_policy(state, &selection, &turn_config.model.compaction).await;
@@ -21944,6 +21998,7 @@ async fn run_model_turn_inner(
             provider_plugin_id: provider_plugin_id.as_deref(),
             selected_model_id: selection.model_id.as_deref(),
             provider_context: &selection.provider_context,
+            native_default: selection.native_default,
         },
     ))
     .await;
@@ -27244,6 +27299,7 @@ async fn session_model_selection_with_runtime_context(
     let Some(context) = runtime_context else {
         return selection;
     };
+    selection.native_default = false;
     let origin = state
         .session_model_selection_origins
         .lock()
@@ -27451,6 +27507,7 @@ fn default_model_selection_with_runtime_context(
         reasoning_summary: state.selected_reasoning.summary.clone(),
         reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
         provider_context: state.selected_provider_context.clone(),
+        native_default: true,
     }
 }
 
@@ -27467,6 +27524,7 @@ fn model_selection_from_runtime_context(
         reasoning_summary: state.selected_reasoning.summary.clone(),
         reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
         provider_context: context.provider_context,
+        native_default: false,
     }
 }
 
@@ -27552,6 +27610,12 @@ async fn session_model_selection(
         provider_plugin_id.as_deref(),
         model_id.as_deref(),
     );
+    let native_default = provider_plugin_id == state.selected_provider_plugin_id
+        && !state
+            .session_external_configs
+            .lock()
+            .await
+            .contains(&session_id);
     let selection = SessionModelSelection {
         provider_plugin_id,
         requested_model_id: persisted_model.clone(),
@@ -27561,6 +27625,7 @@ async fn session_model_selection(
         reasoning_summary,
         reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
         provider_context,
+        native_default,
     };
     let origin = origin_for_selection_source(runtime_selection.model_selection_source);
     state
@@ -28800,6 +28865,7 @@ async fn build_model_turn_request(
             provider_plugin_id,
             selected_model_id,
             provider_context: &selection.provider_context,
+            native_default: selection.native_default,
         },
     ))
     .await
@@ -58561,6 +58627,7 @@ library = "test"
                 provider_plugin_id: Some("bcode.fake-provider"),
                 selected_model_id: Some("fake-echo"),
                 provider_context: &provider_context,
+                native_default: false,
             },
         )
         .await

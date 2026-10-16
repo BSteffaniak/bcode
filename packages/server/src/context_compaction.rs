@@ -1088,6 +1088,7 @@ pub async fn collect_compaction_summary_once(
             provider_plugin_id: selection.provider_plugin_id.as_deref(),
             selected_model_id: selection.model_id.as_deref(),
             provider_context: &selection.provider_context,
+            native_default: selection.native_default,
         },
     ))
     .await

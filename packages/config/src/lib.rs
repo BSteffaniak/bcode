@@ -3809,6 +3809,12 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "auth_pool")]
 pub struct AuthPoolConfig {
+    /// Authentication provider identity required for declarative automatic enrollment.
+    #[serde(default)]
+    pub automatic_provider: Option<String>,
+    /// Explicit opt-in to automatic/default enrollment. Unmarked pools remain manual.
+    #[serde(default)]
+    pub automatic_group: Option<String>,
     /// Provider plugin id this pool applies to.
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
@@ -5321,6 +5327,8 @@ pub fn add_openai_chatgpt_subscription_auth(
             .pools
             .entry(pool.to_string())
             .or_insert_with(|| AuthPoolConfig {
+                automatic_provider: None,
+                automatic_group: None,
                 provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 strategy: AuthPoolStrategy::Failover,
                 preferred_profile: None,
@@ -5510,6 +5518,9 @@ fn update_writable_config(
     Ok(path)
 }
 
+mod auth_enrollment;
+pub use auth_enrollment::publish_auth_enrollment;
+
 /// Non-secret runtime subscription registry for provider logins that should not mutate declarative config.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAuthSubscriptions {
@@ -5549,6 +5560,9 @@ pub struct RuntimeAuthProfile {
 /// Runtime subscriptions associated with one logical auth pool.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAuthSubscriptionPool {
+    /// Explicit managed-default compatibility group; absence means manual.
+    #[serde(default)]
+    pub automatic_group: Option<String>,
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
     /// Provider ID associated with this pool.
@@ -5774,6 +5788,7 @@ pub fn register_runtime_auth_subscription(
             .pools
             .entry(pool.to_string())
             .or_insert_with(|| RuntimeAuthSubscriptionPool {
+                automatic_group: None,
                 provider_plugin_id: profile.owner_plugin_id.clone(),
                 provider_id: Some(profile.provider.clone()),
                 owner_plugin_id: profile.owner_plugin_id.clone(),

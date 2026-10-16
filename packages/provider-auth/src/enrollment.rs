@@ -3,6 +3,11 @@
 //! Preparation is read-only. Credential custody and interactive provider effects
 //! are separate operations; callers publish metadata only after successful enrollment.
 
+mod pooling;
+pub use pooling::{
+    EnrollmentPlan, EnrollmentResult, PoolEnrollment, complete, complete_with_config, plan,
+};
+
 use crate::{AuthProfileResolutionError, AuthProfileSource, ResolvedAuthProfile};
 use bcode_config::{
     AuthCredentialMapping, AuthProfileConfig, BcodeConfig, RuntimeAuthSubscriptions,
@@ -36,6 +41,9 @@ pub enum EnrollmentError {
     /// Registration or requested method is inconsistent.
     #[error("Authentication registration or method is invalid")]
     InvalidMethod,
+    /// Pool ownership, membership or intent is inconsistent or ambiguous.
+    #[error("Authentication pool is ambiguous or incompatible; existing metadata preserved")]
+    PoolConflict,
     /// New context accounts require a declared destination until context registration is available.
     #[error(
         "Declare this context's authentication profile before enrollment; unscoped account creation is not permitted"

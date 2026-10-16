@@ -18,6 +18,31 @@ bcode auth login openai --method chatgpt --profile openai-2 --pool openai
 
 Pool enrollment does not replace the primary provider binding. API-key pools are not supported; provider-specific base URLs and models remain model/provider configuration rather than generic auth enrollment.
 
+### Automatic subscription pools
+
+With a provider that advertises compatible subscription methods, login without `--pool` joins or creates an explicitly managed default pool. OpenAI browser and device-code logins share the `subscription` group; API keys do not participate. For example:
+
+```sh
+bcode auth login openai --method chatgpt --profile openai-2
+```
+
+Use `--standalone` to register an account without adding pool membership. `--pool <name>` selects an explicit destination instead. Login reports whether membership was added and whether the destination is automatic or manual. A storage/publication failure is reported separately from successful authentication; do not assume repeating OAuth repairs metadata.
+
+Existing unmarked pools stay manually managed, even when only one pool exists or its name is `openai`. To explicitly opt an existing pool into compatible automatic enrollment:
+
+```toml
+[auth.pools.openai]
+provider_plugin_id = "bcode.openai-compatible"
+automatic_provider = "openai"
+automatic_group = "subscription"
+profiles = ["openai"]
+```
+
+The provider and compatibility group are identities, not display names. Unknown, incompatible, ambiguous, or conflicting destinations fail closed rather than adopting a similarly named pool. Enrollment never rewrites declarative configuration. A fresh automatic OpenAI pool is named `openai-subscription-default`; name collisions are not adopted.
+
+Native daemon-owned default routing can discover new managed members before the next turn, without restarting. Explicit account-only selection and unmarked manual pools retain their previous behavior. Caller-supplied runtime contexts, external resolvers, and retained credential custody remain snapshots: pool membership does not grant new credential-acquisition authority. A turn freezes its membership across retries and compaction. Existing member credentials are not refreshed by membership discovery; removed/readded profile names require a fresh native snapshot. Named configuration contexts remain declared-only and never inherit global runtime accounts.
+
+
 The deprecated `bcode login openai` and `bcode login openai --add-subscription` commands remain temporary compatibility shims. New automation and documentation should use `bcode auth login`.
 
 Inspect the declared pool and any runtime cooldown state:

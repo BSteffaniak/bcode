@@ -543,6 +543,7 @@ impl ModelHostOperations {
                     provider_plugin_id: Some(requested_provider),
                     selected_model_id: Some(requested_model),
                     provider_context: &context,
+                    native_default: false,
                 },
             )),
         )

@@ -115,6 +115,9 @@ pub struct AuthPoolSummary {
     pub schema_version: u16,
     /// Auth-pool identifier.
     pub pool: String,
+    /// Explicit automatic/default management group; absence means manual.
+    #[serde(default)]
+    pub automatic_group: Option<String>,
     /// Provider plugin owning requests routed through this pool, when known.
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
@@ -132,6 +135,9 @@ pub struct AuthPoolSummary {
     #[serde(default)]
     pub degraded_reason: Option<String>,
 }
+mod pooling;
+pub use pooling::*;
+
 /// Plugin service interface for normalized interactive authentication flows.
 pub const AUTH_INTERFACE_ID: &str = "bcode.auth/v1";
 /// Operation used to begin, continue, or cancel an interactive authentication flow.

@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod enrollment;
 pub mod interactive;
 pub mod lifecycle;
+pub mod managed_pool;
 #[cfg(target_os = "macos")]
 pub mod native_device;
 pub mod operations;
@@ -114,6 +115,9 @@ pub fn auth_pool_summaries(
                 })
                 .collect();
             bcode_provider_auth_models::AuthPoolSummary {
+                automatic_group: declared
+                    .and_then(|pool| pool.automatic_group.clone())
+                    .or_else(|| runtime.and_then(|pool| pool.automatic_group.clone())),
                 schema_version: bcode_provider_auth_models::AUTH_POOL_SCHEMA_VERSION,
                 pool: pool.clone(),
                 provider_plugin_id: declared
@@ -1610,7 +1614,10 @@ fn auth_credential_source_keys(
     source_keys
 }
 
-fn selected_auth_pool_routing(
+/// Project one selected pool's declarative strategy, priming and quota policy.
+/// Runtime membership refresh must reuse this projection rather than inventing routing defaults.
+#[must_use]
+pub fn selected_auth_pool_routing(
     config: &bcode_config::BcodeConfig,
     auth_pool: Option<&str>,
 ) -> bcode_model::ProviderAuthPoolRouting {
@@ -2666,6 +2673,7 @@ profiles = ["account"]
                 "openai".to_owned(),
                 bcode_config::RuntimeAuthSubscriptionPool {
                     provider_plugin_id: pool_owner.map(str::to_owned),
+                    automatic_group: None,
                     provider_id: None,
                     owner_plugin_id: None,
                     preferred_profile: None,

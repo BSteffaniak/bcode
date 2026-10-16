@@ -244,9 +244,9 @@ impl ConnectionForm {
                     self.start_device_login();
                 } else if confirm {
                     match self.save() {
-                        Ok(()) => {
+                        Ok(message) => {
                             self.completed = EnrollmentStatus::Completed;
-                            "Account connected.".clone_into(&mut self.status);
+                            self.status = message;
                         }
                         Err(message) => self.status = message,
                     }
@@ -534,7 +534,7 @@ impl ConnectionForm {
         self.selected = 0;
     }
 
-    fn save(&self) -> Result<(), String> {
+    fn save(&self) -> Result<String, String> {
         let config =
             bcode_config::load_config().map_err(|_| "Cannot load configuration".to_owned())?;
         let selection = bcode_config::plugin_selection_with_default_plugin_ids(
@@ -550,14 +550,14 @@ impl ConnectionForm {
         let cleanup = host
             .deactivate_all()
             .map_err(|_| "Authentication provider cleanup failed".to_owned());
-        result.and(cleanup)
+        result.and_then(|message| cleanup.map(|()| message))
     }
 
     fn save_with_host(
         &self,
         config: &bcode_config::BcodeConfig,
         host: &bcode_plugin::PluginHost,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let provider_id = self.fields[0].buffer().text();
         let method_id = self.fields[1].buffer().text();
         let provider = host
@@ -606,7 +606,9 @@ impl ConnectionForm {
         let runtime = bcode_config::try_load_runtime_auth_subscriptions().map_err(|_| {
             "Authentication metadata is unreadable or unsupported. Inspect authentication state before saving credentials.".to_owned()
         })?;
-        let prepared = bcode_provider_auth::enrollment::prepare(
+        let compatibility =
+            super::setup_device_login::pool_compatibility(host, provider).map_err(str::to_owned)?;
+        let plan = bcode_provider_auth::enrollment::plan(
             config,
             &runtime,
             &provider.contribution,
@@ -617,8 +619,11 @@ impl ConnectionForm {
                 vault: (!vault.is_empty()).then(|| vault.into()),
                 recipient_key: None,
             },
+            bcode_provider_auth::enrollment::PoolEnrollment::Automatic,
+            compatibility.as_ref(),
         )
         .map_err(|_| "Profile ownership or destination is inconsistent".to_owned())?;
+        let prepared = &plan.prepared;
         let lifecycle = bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
             &prepared.resolved,
             provider_id,
@@ -628,10 +633,11 @@ impl ConnectionForm {
         .map_err(|_| "Profile method or ownership is inconsistent".to_owned())?;
         lifecycle.import_new(BTreeMap::from([(fields[0].credential_id.clone(), secret.to_owned())]))
             .map_err(|_| "Could not save without overwriting existing credentials. Choose a new profile or inspect the vault.".to_owned())?;
-        if prepared.publish_runtime {
-            bcode_provider_auth::enrollment::publish(&prepared.resolved).map_err(|_| "Credential saved, but profile publication failed. Inspect authentication state before retrying.".to_owned())?;
-        }
-        Ok(())
+        let completion = bcode_provider_auth::enrollment::complete(&plan).map_err(|_| "Credential saved, but authentication metadata publication failed. Inspect authentication state before retrying; do not repeat sign-in merely to repair metadata.".to_owned())?;
+        Ok(format!(
+            "Account connected. {}",
+            super::setup_device_login::completion_message(&completion)
+        ))
     }
 
     fn render_picker(&self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {

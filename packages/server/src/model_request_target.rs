@@ -11,6 +11,8 @@ pub struct ModelRequestTargetInput<'a> {
     pub provider_plugin_id: Option<&'a str>,
     pub selected_model_id: Option<&'a str>,
     pub provider_context: &'a bcode_model::ProviderRequestContext,
+    /// Trusted in-process provenance, never read from serialized credentials.
+    pub native_default: bool,
 }
 
 /// Complete application-level target for one provider model request.
@@ -49,6 +51,9 @@ pub enum ModelRequestTargetError {
     /// The resolved provider model view contained no usable model.
     #[error("model provider has no usable models")]
     NoUsableModel,
+    /// Managed membership or credential ownership could not be verified.
+    #[error("managed default authentication unavailable")]
+    ManagedAuthentication,
 }
 
 /// Resolve one request's effective model and normalized request-critical metadata.
@@ -60,11 +65,18 @@ pub async fn resolve_model_request_target(
     state: &ServerState,
     input: ModelRequestTargetInput<'_>,
 ) -> Result<ResolvedModelRequestTarget, ModelRequestTargetError> {
+    let mut provider_context = managed_default_routing::refresh(
+        state,
+        input.provider_plugin_id,
+        input.provider_context,
+        input.native_default,
+    )
+    .await?;
     let models = resolved_provider_models(
         state,
         input.provider_plugin_id.map(ToOwned::to_owned),
         bcode_model::ModelListRequest {
-            provider_context: input.provider_context.clone(),
+            provider_context: provider_context.clone(),
             selected_model_id: input.selected_model_id.map(ToOwned::to_owned),
         },
     )
@@ -95,7 +107,6 @@ pub async fn resolve_model_request_target(
         input.provider_context.api_surface,
     )
     .await;
-    let mut provider_context = input.provider_context.clone();
     provider_context.api_surface = api_surface;
     select_host_auth_pool_candidate(state, input.provider_plugin_id, &mut provider_context).await;
     let catalog_identity = if let Some(provider_id) = catalog_provider_id.as_deref() {

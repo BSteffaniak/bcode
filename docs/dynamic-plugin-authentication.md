@@ -151,7 +151,11 @@ bcode auth status <provider> [--profile <profile>]
 bcode auth logout <provider> [--profile <profile>]
 ```
 
-`--pool <pool>` adds a newly enrolled profile to a runtime auth pool without changing the primary provider binding. `--no-device-seal` records and applies the host-owned opt-out. Verification and revocation run only when the registered method advertises support.
+`--pool <pool>` selects an explicit runtime pool without changing the primary provider binding. Without it, a compatible subscription joins or creates a marked automatic default pool; `--standalone` opts out of membership changes. Existing unmarked pools remain manual. The enabled authentication owner's optional typed `pool_compatibility` operation declares the provider-local compatibility group and interactive methods; unsupported operations mean no automatic pooling, while malformed supported declarations fail closed. API-key methods do not qualify.
+
+Shared enrollment planning validates ownership, context, compatibility, and destination before authentication. Completion occurs after secure storage, checks current configuration against the plan and compares runtime metadata under the registry lock, then publishes profile and membership together. Saved credentials and failed metadata publication are distinct outcomes. `automatic_provider` and `automatic_group` explicitly opt a declarative pool into managed enrollment; names and pool counts never imply that intent. Native managed-routing receipts are in-process, non-serializable provenance—not credential authority supplied by clients. Context-local enrollment remains declared-only; global runtime profiles are not inherited.
+
+`--no-device-seal` records and applies the host-owned opt-out. Verification and revocation run only when the registered method advertises support.
 
 Interactive flows are bounded and explicit. Pending responses must provide resumable state; terminal responses cannot reopen the flow. Malformed, oversized, unknown-version, failed, or cancelled responses terminate without storing credentials. Cancellation is sent back through the normalized flow operation when possible. Diagnostics are bounded and non-secret.
 

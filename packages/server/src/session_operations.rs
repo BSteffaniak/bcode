@@ -1581,6 +1581,7 @@ pub async fn set_model(
         reasoning_summary: state.selected_reasoning.summary.clone(),
         reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
         provider_context,
+        native_default: false,
     };
     state
         .session_model_selections

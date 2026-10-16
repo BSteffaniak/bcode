@@ -1066,6 +1066,28 @@ fn prompt_cache_point_count(request: &ModelTurnRequest) -> usize {
 
 impl OpenAiCompatibleProviderPlugin {
     fn invoke_auth_service(&self, request: &ServiceRequest) -> ServiceResponse {
+        if request.operation == bcode_provider_auth_models::OP_AUTH_POOL_COMPATIBILITY {
+            let Ok(input) =
+                request.payload_json::<bcode_provider_auth_models::AuthPoolCompatibilityRequest>()
+            else {
+                return ServiceResponse::error(
+                    "invalid_request",
+                    "invalid pool compatibility request",
+                );
+            };
+            if input.validate().is_err() || input.provider_id != "openai" {
+                return ServiceResponse::error(
+                    "unsupported_provider",
+                    "unsupported pool compatibility request",
+                );
+            }
+            return json_response(&bcode_provider_auth_models::AuthPoolCompatibility {
+                schema_version: 1,
+                provider_id: "openai".to_owned(),
+                group: "subscription".to_owned(),
+                methods: vec!["chatgpt".to_owned(), "device".to_owned()],
+            });
+        }
         if request.operation != OPENAI_AUTH_FLOW_OPERATION {
             return ServiceResponse::error(
                 "unsupported_operation",
@@ -10234,6 +10256,34 @@ mod tests {
         assert!(state.turns.is_empty());
         assert!(state.auth_flows.is_empty());
         drop(state);
+    }
+
+    #[test]
+    fn pool_compatibility_is_plugin_owned_and_excludes_api_keys() {
+        let plugin = OpenAiCompatibleProviderPlugin::default();
+        let request = ServiceRequest {
+            interface_id: AUTH_INTERFACE_ID.to_owned(),
+            operation: bcode_provider_auth_models::OP_AUTH_POOL_COMPATIBILITY.to_owned(),
+            payload: serde_json::to_vec(
+                &bcode_provider_auth_models::AuthPoolCompatibilityRequest {
+                    schema_version: 1,
+                    provider_id: "openai".to_owned(),
+                },
+            )
+            .unwrap(),
+        };
+        let response = plugin.invoke_auth_service(&request);
+        assert!(response.error.is_none());
+        let capability: bcode_provider_auth_models::AuthPoolCompatibility =
+            serde_json::from_slice(&response.payload).unwrap();
+        capability.validate().unwrap();
+        assert_eq!(capability.methods, ["chatgpt", "device"]);
+        assert_eq!(capability.group, "subscription");
+        let invalid = ServiceRequest {
+            payload: br#"{"schema_version":2,"provider_id":"openai"}"#.to_vec(),
+            ..request
+        };
+        assert!(plugin.invoke_auth_service(&invalid).error.is_some());
     }
 
     #[test]

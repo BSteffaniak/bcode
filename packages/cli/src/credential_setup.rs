@@ -219,10 +219,26 @@ fn import_with_host(
     let declaration = field.discovery_sources.get(source).ok_or_else(|| {
         CliError::LoginProfile("Source is not declared by this provider.".to_owned())
     })?;
-    let (resolved, persist_runtime) =
-        super::resolve_or_prepare_auth_profile(&provider, method, profile, vault, None)?;
+    let config = bcode_config::load_config()?;
+    let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
+    let plan = bcode_provider_auth::enrollment::plan(
+        &config,
+        &runtime,
+        &provider.contribution,
+        &provider.plugin_id,
+        method_id,
+        bcode_provider_auth::enrollment::EnrollmentDestination {
+            profile: super::registered_auth_profile_hint(&config, &runtime, &provider, profile),
+            vault,
+            recipient_key: None,
+        },
+        bcode_provider_auth::enrollment::PoolEnrollment::Standalone,
+        None,
+    )
+    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    let resolved = &plan.prepared.resolved;
     let lifecycle = bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
-        &resolved,
+        resolved,
         provider_id,
         &provider.plugin_id,
         method,
@@ -270,9 +286,11 @@ fn import_with_host(
                     .to_owned(),
             )
         })?;
-    if persist_runtime {
-        super::persist_prepared_runtime_profile(&resolved)?;
-    }
+    bcode_provider_auth::enrollment::complete(&plan).map_err(|_| {
+        CliError::LoginProfile(
+            "Credential copied, but authentication metadata publication failed. Inspect authentication state before retrying; do not repeat import merely to repair metadata.".to_owned(),
+        )
+    })?;
     println!(
         "Credential copied into the owned sshenv profile. Connection has not been remotely verified."
     );
