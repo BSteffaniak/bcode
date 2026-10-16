@@ -4823,6 +4823,9 @@ fn relative_artifact(run_dir: &Path, kind: &str, path: &Path) -> EvalArtifactRef
 }
 
 #[cfg(test)]
+mod orchestration_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn history_capture_precedes_exports_without_inventing_receipts() {

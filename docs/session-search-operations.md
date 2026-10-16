@@ -6,6 +6,21 @@ the daemon and remains available through `session list`, `session history`, `ses
 Never open `catalog.db`, `session.db`, WAL files, provider checkpoint files, or provider indexes to
 investigate a session.
 
+## Interpret no-results narrowly
+
+Human search output identifies the requested session/directory scope, explicit content selection
+or provider defaults, and each provider's actual searched/excluded content and outcome. A successful
+query with no hits means no hits within that reported coverage, not absence from canonical history.
+`coverage_complete` describes the provider's selected search scope; it is not a catalog census.
+Likewise, `pending_sessions = 0` does not prove all historical sessions have been indexed. Historical
+ingestion is explicit, and message-only defaults do not search tool output or reasoning.
+
+For a known session, use bounded `session history`, `session around`, or `session inspect` to verify
+canonical evidence. Compare `session list --all-directories --json` with per-session coverage in
+`session search-status --json` when investigating catalog gaps. Treat missing coverage as unknown,
+not proof that the session is empty. Do not repair or backfill implicitly to answer a read request;
+use the explicit maintenance workflow below when authorized.
+
 ## Compatibility inventory and canonical migration
 
 Inspect compatibility without mutating canonical sessions:

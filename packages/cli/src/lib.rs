@@ -17170,7 +17170,7 @@ async fn session_around(
     after: usize,
     json: bool,
 ) -> Result<(), CliError> {
-    let window = session_owner_client(session_id)
+    let window = session_read_client(session_id)
         .await?
         .session_history_around(
             session_id,
@@ -17216,7 +17216,7 @@ async fn session_inspect(
     let cursor = before
         .or(after)
         .map(|sequence| SessionHistoryCursor { sequence });
-    let page = session_owner_client(session_id)
+    let page = session_read_client(session_id)
         .await?
         .session_inspection(
             session_id,
@@ -17562,6 +17562,108 @@ fn session_search_json(
     })
 }
 
+#[cfg(test)]
+mod session_read_cli_tests;
+#[cfg(test)]
+mod session_search_output_tests;
+
+fn write_session_search_coverage(
+    output: &mut impl std::io::Write,
+    filters: &bcode_session_search::SessionSearchFilters,
+    response: &bcode_session_search::FederatedSessionSearchResponse,
+) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "Search scope: sessions={:?}, directory={:?} (no session filter means provider-selected scope, not verified catalog-wide coverage)",
+        filters.session_ids, filters.working_directory
+    )?;
+    if filters.content_kinds.is_empty() {
+        writeln!(
+            output,
+            "Content selection: provider defaults; actual searched categories are reported below"
+        )?;
+    } else {
+        writeln!(
+            output,
+            "Content selection: explicit {:?}",
+            filters.content_kinds
+        )?;
+    }
+    for provider in &response.providers {
+        writeln!(
+            output,
+            "provider {}: {:?}, searched={:?}, excluded={:?}, query_complete={}, coverage_complete={}, elapsed={}ms, next_cursor={:?}",
+            provider.provider_id,
+            provider.outcome,
+            provider.searched_content,
+            provider.excluded_content,
+            provider.query_complete,
+            provider.coverage_complete,
+            provider.elapsed_ms,
+            provider.next_cursor
+        )?;
+    }
+    for failure in &response.failures {
+        writeln!(
+            output,
+            "provider {} {:?} ({:?}, elapsed={}ms, content={:?}): {}",
+            failure.plugin_id,
+            failure.stage,
+            failure.error.code,
+            failure.elapsed_ms,
+            failure.content,
+            failure.error.message
+        )?;
+    }
+    if response.providers.is_empty() {
+        writeln!(
+            output,
+            "No provider search report is available; content coverage is unverified"
+        )?;
+    }
+    if response.hits.is_empty() {
+        writeln!(
+            output,
+            "No hits returned within the reported provider/content coverage and requested scope; this does not establish absence in all catalog sessions"
+        )?;
+    }
+    writeln!(
+        output,
+        "Search coverage: query_complete={}, coverage_complete={}, provider_failures={}",
+        response.query_complete,
+        response.coverage_complete,
+        response.failures.len()
+    )?;
+    if !response.query_complete || !response.coverage_complete || !response.failures.is_empty() {
+        writeln!(
+            output,
+            "Coverage is partial or failed; no-results is not conclusive outside successful provider/content coverage"
+        )?;
+    }
+    Ok(())
+}
+
+fn write_session_search_hit(
+    output: &mut impl std::io::Write,
+    hit: &bcode_session_search::SessionSearchHit,
+) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "{} #{} {:?} [{} rank {}]: {}{}",
+        hit.locator.session_id,
+        hit.locator.sequence,
+        hit.content_kind,
+        hit.provider_id,
+        hit.provider_rank,
+        hit.preview.as_deref().unwrap_or("<no provider preview>"),
+        if hit.preview_truncated {
+            " [truncated]"
+        } else {
+            ""
+        }
+    )
+}
+
 async fn session_search(command: SessionSearchCliCommand) -> Result<(), CliError> {
     let policy = command.scope.policy(command.deadline_ms);
     let execution_class = policy.execution_class;
@@ -17576,6 +17678,7 @@ async fn session_search(command: SessionSearchCliCommand) -> Result<(), CliError
         command.limit,
         command.deadline_ms,
     );
+    let filters = request.filters.clone();
     let (response, hydrated_hits) = BcodeClient::default_endpoint()
         .session_search(request, policy, Vec::new(), command.hydrate)
         .await?;
@@ -17586,42 +17689,9 @@ async fn session_search(command: SessionSearchCliCommand) -> Result<(), CliError
             &hydrated_hits,
         ));
     }
+    write_session_search_coverage(&mut std::io::stderr().lock(), &filters, &response)?;
     for hit in &response.hits {
-        println!(
-            "{} #{} {:?} [{} rank {}]: {}{}",
-            hit.locator.session_id,
-            hit.locator.sequence,
-            hit.content_kind,
-            hit.provider_id,
-            hit.provider_rank,
-            hit.preview.as_deref().unwrap_or("<no provider preview>"),
-            if hit.preview_truncated {
-                " [truncated]"
-            } else {
-                ""
-            }
-        );
-    }
-    for provider in &response.providers {
-        eprintln!(
-            "provider {}: {:?}, query_complete={}, coverage_complete={}, elapsed={}ms",
-            provider.provider_id,
-            provider.outcome,
-            provider.query_complete,
-            provider.coverage_complete,
-            provider.elapsed_ms
-        );
-    }
-    for failure in &response.failures {
-        eprintln!(
-            "provider {} {:?} ({:?}, elapsed={}ms, content={:?}): {}",
-            failure.plugin_id,
-            failure.stage,
-            failure.error.code,
-            failure.elapsed_ms,
-            failure.content,
-            failure.error.message
-        );
+        write_session_search_hit(&mut std::io::stdout().lock(), hit)?;
     }
     for hydrated in &hydrated_hits {
         if hydrated.outcome != bcode_session_search::SearchHitHydrationOutcome::Hydrated {
