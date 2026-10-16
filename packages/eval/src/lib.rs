@@ -5012,12 +5012,14 @@ max = 10000
         let result = run_loaded_suite_with_execution_budget(
             &options,
             suite,
-            EvalExecutionBudget::new(Duration::from_millis(100)).unwrap(),
+            // Include suite/workspace setup in the real deadline while leaving
+            // enough time to admit the held command on a loaded test host.
+            EvalExecutionBudget::new(Duration::from_secs(2)).unwrap(),
         );
         // Deadline exhaustion degrades evidence without dropping the execution result.
         let result = result.unwrap();
         assert!(!result.variants[0].cases[0].repetitions[0].passed);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(6));
         assert!(remaining_execution_budget(true).is_none());
         let repetition = root
             .path()

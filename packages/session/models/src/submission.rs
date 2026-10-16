@@ -93,6 +93,28 @@ pub struct SubmissionRecord {
     pub status: SubmissionStatus,
     #[serde(default)]
     pub context_observation: Option<SubmissionContextObservation>,
+    /// Latest canonical authorization; the original accepted payload is never rewritten.
+    #[serde(default)]
+    pub recovery_authorization: Option<SubmissionRecoveryAuthorization>,
+}
+
+/// Canonical authorization overlay for a pending submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionRecoveryAuthorization {
+    pub operation_id: String,
+    pub event_sequence: u64,
+    pub descriptor: SubmissionExecutionDescriptor,
+}
+
+impl SubmissionRecord {
+    /// Latest authorized execution context, or the immutable acceptance context.
+    #[must_use]
+    pub fn effective_execution_descriptor(&self) -> Option<&SubmissionExecutionDescriptor> {
+        self.recovery_authorization
+            .as_ref()
+            .map(|a| &a.descriptor)
+            .or(self.submission.execution_descriptor.as_ref())
+    }
 }
 
 /// One acceptance-ordered page of currently pending input.
@@ -109,8 +131,11 @@ pub struct PendingSubmissionsPage {
     pub has_more: bool,
 }
 
-/// Secret-free recovery identity. Only version 1 is writable; runtime resolves and compares it.
-/// Profile fields are names, never credentials, paths, environment or provider-native payloads.
+/// Secret-free recovery identity.
+///
+/// Version 2 carries a verified durable recovery recipe; version 1 identities remain
+/// recognizable but cannot reconstruct lost execution context.
+/// Profile fields are names, never credentials or provider-native payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmissionExecutionDescriptor {
     pub version: u32,
@@ -121,6 +146,119 @@ pub struct SubmissionExecutionDescriptor {
     pub auth_profile: Option<String>,
     /// Runtime-owned digest of normalized, secret-free execution configuration.
     pub config_identity: String,
+    /// Versioned config-owned source references and original account-selection policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_recipe: Option<Box<SubmissionRecoveryRecipe>>,
+}
+
+/// Portable source provenance. Paths are references, never configuration or credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionConfigSources {
+    pub cwd: std::path::PathBuf,
+    pub discovered_paths: Vec<std::path::PathBuf>,
+    pub exclusive_config_path: Option<std::path::PathBuf>,
+    pub base_config_path: Option<std::path::PathBuf>,
+    pub env_config_path: Option<std::path::PathBuf>,
+    pub cli_config_path: Option<std::path::PathBuf>,
+    pub active_context: Option<String>,
+    pub model_profile: Option<String>,
+    pub inline_overrides: bool,
+}
+
+/// Versioned, bounded, secret-free configuration reference; config owns replay validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionConfigSource {
+    pub schema_version: u32,
+    pub sources: SubmissionConfigSources,
+    pub execution_digest: String,
+    pub source_presence: Vec<bool>,
+}
+
+impl SubmissionConfigSource {
+    /// Validate the portable envelope without opening files or interpreting config.
+    /// # Errors
+    /// Rejects unknown versions, dynamic overrides, malformed digests and excessive paths.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let s = &self.sources;
+        if self.schema_version != 1
+            || s.inline_overrides
+            || self.execution_digest.len() != 64
+            || !self.execution_digest.bytes().all(|b| b.is_ascii_hexdigit())
+            || s.discovered_paths.len() > 64
+            || self.source_presence.len() > 64
+            || [&s.active_context, &s.model_profile]
+                .iter()
+                .any(|v| v.as_ref().is_some_and(|v| v.is_empty() || v.len() > 256))
+        {
+            return Err("invalid configuration recovery reference");
+        }
+        let paths = std::iter::once(&s.cwd)
+            .chain(s.discovered_paths.iter())
+            .chain(s.exclusive_config_path.iter())
+            .chain(s.base_config_path.iter())
+            .chain(s.env_config_path.iter())
+            .chain(s.cli_config_path.iter());
+        for path in paths {
+            if !path.is_absolute()
+                || path.as_os_str().len() > 4096
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err("invalid configuration recovery reference");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Secret-free configuration source references. `config_source` is validated by the config owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionRecoveryRecipe {
+    pub version: u32,
+    pub config_source: SubmissionConfigSource,
+    pub model_profile: Option<String>,
+    pub auth_profile: Option<String>,
+    pub auth_pool: Option<String>,
+}
+
+/// Exact recipe shown to a caller before authorizing a pending item's recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionResumeConfirmation {
+    pub version: u32,
+    pub submission_id: SubmissionId,
+    pub expected_accepted_sequence: u64,
+    pub descriptor: SubmissionExecutionDescriptor,
+}
+
+/// Durable result of one targeted operation, including an identical operation retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionRecoveryResult {
+    pub record: SubmissionRecord,
+    pub duplicate: bool,
+}
+
+/// Bounded oldest-item queue observation. This is not an event stream or durable snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionQueueStatus {
+    pub oldest: Option<SubmissionRecord>,
+    pub blocker: Option<SubmissionQueueBlocker>,
+}
+
+/// Application-owned blocker; clients must not independently infer execution safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionQueueBlocker {
+    MissingContext,
+    IncompatibleContext,
+    InterruptedTurn,
+    /// Neither targeted resume nor targeted cancel is authorized by this session API.
+    WorkflowAuthorityRequired,
+    SteeringTargetUnavailable,
 }
 
 /// Actionable nonterminal reason why pending input cannot currently execute.

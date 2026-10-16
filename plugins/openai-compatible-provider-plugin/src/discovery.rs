@@ -160,11 +160,18 @@ mod tests {
             let mut requests = 0;
             while std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_millis(500)))
                         .unwrap();
                     let mut buffer = [0; 4096];
-                    let _ = stream.read(&mut buffer);
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut buffer).expect("fixture request headers");
+                        assert!(read > 0, "request closed before complete headers");
+                        request.extend_from_slice(&buffer[..read]);
+                        assert!(request.len() <= 16 * 1024, "bounded fixture headers");
+                    }
                     requests += 1;
                     deadline =
                         std::time::Instant::now() + LIVE_TIMEOUT + Duration::from_millis(400);
@@ -302,6 +309,8 @@ mod tests {
 
     #[tokio::test]
     async fn live_ids_supplement_catalog_without_inventing_metadata() {
+        // Catalog setup is outside the mock server's request deadline.
+        let catalog = startup::offline_catalog().unwrap();
         let (url, worker) = fixture(
             200,
             r#"{"data":[{"id":"fixture-new-model"},{"id":"fixture-new-model"},{"id":" "}]}"#,
@@ -309,14 +318,16 @@ mod tests {
         );
         let mut settings = xai_settings();
         settings.base_url = url;
-        let models =
-            crate::resolve_model_candidates(&settings, "fixture", Some("fixture-remembered"))
-                .await
-                .unwrap();
+        let models = crate::resolve_model_candidates_with_catalog(
+            &settings,
+            "fixture",
+            Some("fixture-remembered"),
+            Some(&catalog),
+        )
+        .await
+        .unwrap();
         assert!(models.iter().any(|model| {
-            model.model_id
-                == recommended_xai_model(&startup::offline_catalog().unwrap(), settings.dialect)
-                    .unwrap()
+            model.model_id == recommended_xai_model(&catalog, settings.dialect).unwrap()
         }));
         assert!(
             models

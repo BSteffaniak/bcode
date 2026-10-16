@@ -659,10 +659,33 @@ fn handle_oauth_callback_stream(
     stream: &mut TcpStream,
     expected_state: &str,
 ) -> Result<Option<String>, String> {
+    stream
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(Some(Duration::from_secs(2))))
+        .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(2))))
+        .map_err(|error| format!("OpenAI OAuth callback setup failed: {error}"))?;
     let mut request = [0_u8; 8 * 1024];
-    let size = stream
-        .read(&mut request)
-        .map_err(|error| format!("OpenAI OAuth callback read failed: {error}"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut size = 0;
+    while !request[..size].contains(&b'\n') {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("OpenAI OAuth callback request timed out".into());
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| format!("OpenAI OAuth callback setup failed: {error}"))?;
+        if size == request.len() {
+            return Err("OpenAI OAuth callback request exceeds its bounded size".into());
+        }
+        let read = stream
+            .read(&mut request[size..])
+            .map_err(|error| format!("OpenAI OAuth callback read failed: {error}"))?;
+        if read == 0 {
+            return Err("OpenAI OAuth callback closed before its request line".into());
+        }
+        size += read;
+    }
     let first_line = String::from_utf8_lossy(&request[..size])
         .lines()
         .next()
@@ -7820,10 +7843,19 @@ async fn resolve_model_candidates(
     api_key: &str,
     selected_model_id: Option<&str>,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
-    let configured_model_ids = model_ids_with_selected(&settings.model_ids, selected_model_id);
     let catalog = startup::offline_catalog();
-    let baseline =
-        discovery::offline_models_with_catalog(settings, selected_model_id, catalog.as_ref());
+    resolve_model_candidates_with_catalog(settings, api_key, selected_model_id, catalog.as_ref())
+        .await
+}
+
+async fn resolve_model_candidates_with_catalog(
+    settings: &Settings,
+    api_key: &str,
+    selected_model_id: Option<&str>,
+    catalog: Option<&bcode_model_catalog::ModelCatalog>,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let configured_model_ids = model_ids_with_selected(&settings.model_ids, selected_model_id);
+    let baseline = discovery::offline_models_with_catalog(settings, selected_model_id, catalog);
     if settings.model_ids_are_explicit || settings.live_discovery_disabled || api_key.is_empty() {
         return Ok(baseline);
     }
@@ -7834,7 +7866,7 @@ async fn resolve_model_candidates(
             settings,
             baseline,
             live_items.unwrap_or_default(),
-            catalog.as_ref(),
+            catalog,
         ));
     }
     let mut models = live_items?;
@@ -9936,8 +9968,8 @@ mod tests {
                 .unwrap();
             let mut byte = [0];
             assert_eq!(stream.read(&mut byte).unwrap(), 1);
-            server_turn.cancel();
             let _ = arrived.send(());
+            server_turn.cancel();
             // Do not send headers until the cancelled attempt has returned.
             let _ = released.recv_timeout(Duration::from_secs(5));
         });
@@ -9958,17 +9990,26 @@ mod tests {
         tokio::pin!(attempt);
         // Connection setup is not cancellation latency. Start the strict deadline
         // only once the server has received request data and cancelled the turn.
-        tokio::select! {
+        let mut arrival = Box::pin(tokio::time::timeout(Duration::from_secs(10), arrival));
+        let completed = tokio::select! {
             biased;
-            result = tokio::time::timeout(Duration::from_secs(10), arrival) => {
+            result = &mut arrival => {
                 result.expect("request setup deadline").expect("server arrival signal");
+                false
             }
-            () = &mut attempt => panic!("attempt finished before server cancellation"),
+            () = &mut attempt => {
+                // Cancellation may complete between polling arrival and attempt.
+                arrival.await.expect("request setup deadline").expect("server arrival signal");
+                true
+            }
+        };
+        if !completed {
+            tokio::time::timeout(Duration::from_secs(2), &mut attempt)
+                .await
+                .expect("cancelled turn must finish while headers are withheld");
         }
-        let result = tokio::time::timeout(Duration::from_secs(2), &mut attempt).await;
         let _ = release.send(());
         server.join().unwrap();
-        result.expect("cancelled turn must finish while headers are withheld");
         let events = turn.drain();
         assert!(matches!(
             events.last(),
@@ -10327,7 +10368,7 @@ mod tests {
         );
         let server = AuthMockServer::start(vec![(
             "200 OK",
-            r#"{"access_token":"browser-access","expires_in":3600}"#,
+            r#"{"access_token":"browser-access","refresh_token":"browser-refresh","expires_in":3600}"#,
         )]);
         let state = browser_auth_state(Vec::new(), "expected-state");
         let runtime = ProviderRuntime::new().expect("runtime");
@@ -10359,6 +10400,43 @@ mod tests {
     }
 
     #[test]
+    fn oauth_callback_accepts_delayed_fragmented_request_on_nonblocking_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            thread::sleep(Duration::from_millis(30));
+            stream
+                .write_all(b"GET /auth/callback?code=fragmented&state=fixture")
+                .unwrap();
+            thread::sleep(Duration::from_millis(30));
+            stream
+                .write_all(b" HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
+        });
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream.set_nonblocking(true).unwrap();
+        assert_eq!(
+            handle_oauth_callback_stream(&mut stream, "fixture").unwrap(),
+            Some("fragmented".into())
+        );
+        drop(stream);
+        client.join().unwrap();
+    }
+
+    #[test]
     fn browser_auth_delayed_callback_keeps_polling_without_terminal_input() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("callback listener");
         listener
@@ -10369,7 +10447,7 @@ mod tests {
         let runtime = ProviderRuntime::new().expect("runtime");
         let server = AuthMockServer::start(vec![(
             "200 OK",
-            r#"{"access_token":"delayed-access","expires_in":3600}"#,
+            r#"{"access_token":"delayed-access","refresh_token":"delayed-refresh","expires_in":3600}"#,
         )]);
         for _ in 0..3 {
             let pending = runtime
@@ -10439,7 +10517,7 @@ mod tests {
         });
         let server = AuthMockServer::start(vec![(
             "200 OK",
-            r#"{"access_token":"automatic-access","expires_in":3600}"#,
+            r#"{"access_token":"automatic-access","refresh_token":"automatic-refresh","expires_in":3600}"#,
         )]);
         let runtime = ProviderRuntime::new().expect("runtime");
         let response = runtime

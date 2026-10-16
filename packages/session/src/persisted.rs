@@ -144,6 +144,9 @@ pub enum PersistedSessionEventError {
     /// Compressed storage envelope is corrupt, oversized or unsupported.
     #[error("invalid or unsupported compressed session payload")]
     Compression(#[from] std::io::Error),
+    /// Submission execution context has an unsupported or invalid envelope.
+    #[error("invalid or unsupported submission execution descriptor")]
+    InvalidSubmissionDescriptor,
     /// Private original usage is malformed; ordinary reads must not conceal damaged evidence.
     #[error("invalid original billing usage in canonical event")]
     InvalidOriginalUsage,
@@ -194,13 +197,23 @@ impl PersistedSessionEvent {
                 current: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             });
         }
+        let kind = self.kind.into_domain();
+        let descriptor = match &kind {
+            SessionEventKind::SubmissionAccepted { submission } => {
+                submission.execution_descriptor.as_ref()
+            }
+            SessionEventKind::SubmissionRecoveryAuthorized { descriptor, .. } => Some(descriptor),
+            _ => None,
+        };
+        crate::submission::validate_descriptor(descriptor)
+            .map_err(|_| PersistedSessionEventError::InvalidSubmissionDescriptor)?;
         Ok(SessionEvent {
             schema_version: self.schema_version,
             sequence: self.sequence,
             timestamp_ms: self.timestamp_ms,
             session_id: self.session_id,
             provenance: self.provenance,
-            kind: self.kind.into_domain(),
+            kind,
         })
     }
 }
@@ -220,6 +233,17 @@ enum PersistedSessionEventKind {
     },
     ClientDetached {
         client_id: ClientId,
+    },
+    SubmissionRecoveryAuthorized {
+        submission_id: bcode_session_models::SubmissionId,
+        expected_accepted_sequence: u64,
+        operation_id: String,
+        descriptor: bcode_session_models::SubmissionExecutionDescriptor,
+    },
+    SubmissionPendingCancelled {
+        submission_id: bcode_session_models::SubmissionId,
+        expected_accepted_sequence: u64,
+        operation_id: String,
     },
     SubmissionContextObserved {
         submission_id: bcode_session_models::SubmissionId,
@@ -618,6 +642,26 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             },
             SessionEventKind::ClientDetached { client_id } => Self::ClientDetached {
                 client_id: *client_id,
+            },
+            SessionEventKind::SubmissionRecoveryAuthorized {
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+                descriptor,
+            } => Self::SubmissionRecoveryAuthorized {
+                submission_id: submission_id.clone(),
+                expected_accepted_sequence: *expected_accepted_sequence,
+                operation_id: operation_id.clone(),
+                descriptor: descriptor.clone(),
+            },
+            SessionEventKind::SubmissionPendingCancelled {
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+            } => Self::SubmissionPendingCancelled {
+                submission_id: submission_id.clone(),
+                expected_accepted_sequence: *expected_accepted_sequence,
+                operation_id: operation_id.clone(),
             },
             SessionEventKind::SubmissionContextObserved {
                 submission_id,
@@ -1079,6 +1123,26 @@ impl PersistedSessionEventKind {
             },
             Self::ClientAttached { client_id } => SessionEventKind::ClientAttached { client_id },
             Self::ClientDetached { client_id } => SessionEventKind::ClientDetached { client_id },
+            Self::SubmissionRecoveryAuthorized {
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+                descriptor,
+            } => SessionEventKind::SubmissionRecoveryAuthorized {
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+                descriptor,
+            },
+            Self::SubmissionPendingCancelled {
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+            } => SessionEventKind::SubmissionPendingCancelled {
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+            },
             Self::SubmissionContextObserved {
                 submission_id,
                 issue,

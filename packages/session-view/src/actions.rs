@@ -7,6 +7,36 @@ use bcode_session_view_models::{
 };
 use bcode_skill_models::SkillId;
 
+/// Read the bounded application-owned queue state into the shared runtime projection.
+///
+/// # Errors
+/// Returns transport, compatibility, or authoritative queue-read errors without scanning history.
+pub async fn hydrate_submission_queue(
+    client: &BcodeClient,
+    session_id: SessionId,
+    view: &mut crate::SessionView,
+) -> Result<(), ClientError> {
+    view.set_submission_queue(client.queue_status(session_id).await?);
+    Ok(())
+}
+
+/// Whether a canonical lifecycle event invalidates the independently loaded queue observation.
+#[must_use]
+pub const fn submission_queue_needs_refresh(kind: &bcode_session_models::SessionEventKind) -> bool {
+    use bcode_session_models::SessionEventKind as Event;
+    matches!(
+        kind,
+        Event::SubmissionAccepted { .. }
+            | Event::SubmissionActivated { .. }
+            | Event::SubmissionCancelled { .. }
+            | Event::SubmissionPendingCancelled { .. }
+            | Event::SubmissionRecoveryAuthorized { .. }
+            | Event::SubmissionContextObserved { .. }
+            | Event::ModelTurnStarted { .. }
+            | Event::ModelTurnFinished { .. }
+    )
+}
+
 /// Execute one renderer-neutral session action through the daemon client.
 ///
 /// # Errors
@@ -55,6 +85,43 @@ pub async fn execute_session_view_action(
             )
             .await
         }
+        SessionViewAction::PrepareSubmissionResume {
+            session_id,
+            submission_id,
+            expected_accepted_sequence,
+        } => Ok(SessionViewActionOutcome::SubmissionResumePrepared {
+            confirmation: client
+                .prepare_submission_resume(session_id, submission_id, expected_accepted_sequence)
+                .await?,
+        }),
+        SessionViewAction::ResumeSubmission {
+            session_id,
+            confirmation,
+            operation_id,
+        } => Ok(SessionViewActionOutcome::SubmissionRecovered {
+            result: Box::new(
+                client
+                    .resume_submission(session_id, confirmation, operation_id)
+                    .await?,
+            ),
+        }),
+        SessionViewAction::CancelPendingSubmission {
+            session_id,
+            submission_id,
+            expected_accepted_sequence,
+            operation_id,
+        } => Ok(SessionViewActionOutcome::SubmissionRecovered {
+            result: Box::new(
+                client
+                    .cancel_pending_submission(
+                        session_id,
+                        submission_id,
+                        expected_accepted_sequence,
+                        operation_id,
+                    )
+                    .await?,
+            ),
+        }),
         SessionViewAction::CancelTurn {
             session_id,
             clear_queue,

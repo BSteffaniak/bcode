@@ -191,6 +191,8 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::SubmissionActivated { .. }
         | SessionEventKind::SubmissionContextObserved { .. }
         | SessionEventKind::SubmissionCancelled { .. }
+        | SessionEventKind::SubmissionRecoveryAuthorized { .. }
+        | SessionEventKind::SubmissionPendingCancelled { .. }
         | SessionEventKind::SessionCreated { name: None, .. }
         | SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
@@ -456,6 +458,8 @@ fn project_non_transcript_event(
         | SessionEventKind::SubmissionActivated { .. }
         | SessionEventKind::SubmissionContextObserved { .. }
         | SessionEventKind::SubmissionCancelled { .. }
+        | SessionEventKind::SubmissionRecoveryAuthorized { .. }
+        | SessionEventKind::SubmissionPendingCancelled { .. }
         | SessionEventKind::SessionCreated { name: None, .. }
         | SessionEventKind::SessionRenamed { name: None }
         | SessionEventKind::ClientAttached { .. }

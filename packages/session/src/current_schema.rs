@@ -190,6 +190,32 @@ pub fn session_migrations() -> CurrentMigrationSource {
         drop_index("idx_session_children_pending", "session_children"),
     );
     add_milestone_migrations(&mut source);
+    add_migration(
+        &mut source,
+        "063_submission_queue_visible",
+        alter_table("submissions").add_column("queue_visible".into(), DataType::Int, true, None),
+        alter_table("submissions").drop_column("queue_visible".into()),
+    );
+    add_migration(
+        &mut source,
+        "064_submission_queue_index",
+        create_index("idx_submission_queue")
+            .if_not_exists(true)
+            .table("submissions")
+            .columns(vec!["queue_visible", "accepted_seq"]),
+        drop_index("idx_submission_queue", "submissions"),
+    );
+    add_migration(
+        &mut source,
+        "065_submission_recovery_operations",
+        create_table("submission_recovery_operations")
+            .if_not_exists(true)
+            .column(schema_column("operation_id", DataType::Text, false))
+            .primary_key("operation_id")
+            .column(schema_column("event_kind", DataType::Text, false))
+            .column(schema_column("record", DataType::Text, false)),
+        drop_table("submission_recovery_operations").if_exists(true),
+    );
     source
 }
 

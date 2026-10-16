@@ -1,6 +1,130 @@
 use super::*;
 use proptest::prelude::*;
 
+fn blocked_queue(
+    blocker: bcode_session_models::SubmissionQueueBlocker,
+) -> bcode_session_models::SubmissionQueueStatus {
+    use bcode_session_models::*;
+    let id = SubmissionId("outside-history".to_owned());
+    SubmissionQueueStatus {
+        oldest: Some(SubmissionRecord {
+            receipt: SubmissionReceipt {
+                submission_id: id.clone(),
+                accepted_event_sequence: 1,
+            },
+            submission: PromptSubmission {
+                id,
+                client_id: ClientId::new(),
+                text: "private prompt".to_owned(),
+                admission: TurnAdmissionMetadata::default(),
+                requested_placement: SubmissionPlacement::FollowUp,
+                target: SubmissionTarget::OwnTurn {
+                    turn_id: TurnId("target".to_owned()),
+                },
+                execution_descriptor: None,
+            },
+            status: SubmissionStatus::Pending,
+            context_observation: None,
+            recovery_authorization: None,
+        }),
+        blocker: Some(blocker),
+    }
+}
+
+#[test]
+fn queue_recovery_is_session_level_secret_safe_and_preserves_unavailable_actions() {
+    use bcode_session_models::SubmissionQueueBlocker as B;
+    for (blocker, resume, cancel) in [
+        (B::MissingContext, true, true),
+        (B::IncompatibleContext, true, true),
+        (B::InterruptedTurn, false, false),
+        (B::WorkflowAuthorityRequired, false, false),
+        (B::SteeringTargetUnavailable, false, true),
+    ] {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.runtime.submission_queue = Some(blocked_queue(blocker));
+        assert!(snapshot.transcript.items.is_empty());
+        let recovery = snapshot
+            .runtime
+            .queue_recovery()
+            .expect("outside-history blocker visible");
+        assert_eq!((recovery.can_resume, recovery.can_cancel), (resume, cancel));
+        assert_eq!(recovery.expected_accepted_sequence, 1);
+        assert!(!recovery.reason.contains("private prompt"));
+        let decoded: SessionViewSnapshot =
+            serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+        assert_eq!(decoded.runtime.queue_recovery(), Some(recovery));
+    }
+}
+
+#[test]
+fn targeted_queue_actions_preserve_identity_and_stale_receipt_guard() {
+    let session_id = SessionId::new();
+    let submission_id = bcode_session_models::SubmissionId("exact-item".to_owned());
+    for action in [
+        SessionViewAction::PrepareSubmissionResume {
+            session_id,
+            submission_id: submission_id.clone(),
+            expected_accepted_sequence: 42,
+        },
+        SessionViewAction::CancelPendingSubmission {
+            session_id,
+            submission_id,
+            expected_accepted_sequence: 42,
+            operation_id: "stable-retry".to_owned(),
+        },
+    ] {
+        let encoded = serde_json::to_value(&action).unwrap();
+        assert_eq!(encoded["expected_accepted_sequence"], 42);
+        assert_eq!(
+            serde_json::from_value::<SessionViewAction>(encoded).unwrap(),
+            action
+        );
+    }
+}
+
+#[test]
+fn resume_confirmation_discloses_exact_selection_without_config_identity() {
+    use bcode_session_models::*;
+    let confirmation = SubmissionResumeConfirmation {
+        version: 1,
+        submission_id: SubmissionId("selected".to_owned()),
+        expected_accepted_sequence: 42,
+        descriptor: SubmissionExecutionDescriptor {
+            version: 2,
+            provider: "chosen-provider".to_owned(),
+            model: "chosen-model".to_owned(),
+            reasoning: None,
+            model_profile: Some("chosen-profile".to_owned()),
+            auth_profile: Some("chosen-account".to_owned()),
+            config_identity: "private-config-digest".to_owned(),
+            recovery_recipe: None,
+        },
+    };
+    let text = submission_resume_settings(&confirmation);
+    for expected in [
+        "Provider: chosen-provider",
+        "Model: chosen-model",
+        "Model profile: chosen-profile",
+        "Auth profile: chosen-account",
+        "Auth pool: none",
+        "permission checks still apply",
+    ] {
+        assert!(text.contains(expected));
+    }
+    assert!(!text.contains("private-config-digest"));
+    let action = SessionViewAction::ResumeSubmission {
+        session_id: SessionId::new(),
+        confirmation,
+        operation_id: "stable-operation".to_owned(),
+    };
+    assert_eq!(
+        serde_json::from_value::<SessionViewAction>(serde_json::to_value(&action).unwrap())
+            .unwrap(),
+        action
+    );
+}
+
 #[test]
 fn prompt_action_preserves_session_owned_placement_contract() {
     for (placement, wire) in [

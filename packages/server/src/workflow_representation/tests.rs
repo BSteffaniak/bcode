@@ -2354,6 +2354,15 @@ async fn stop_fixture_driver(state: &std::sync::Arc<ServerState>) {
     // Successful callers must first establish whole-run canonical completion, not
     // an empty registry between predecessor retirement and successor admission.
     let started = std::time::Instant::now();
+    // Release test-owned provider gates before waiting for the callbacks they hold.
+    // This permits actual terminal settlement; it does not retire registrations.
+    if let Some(gate) = state
+        .selected_provider_context
+        .settings
+        .get("delegation_fixture_gate")
+    {
+        bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
+    }
     let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while !state.runtime_work.active_all().await.is_empty() {
             tokio::task::yield_now().await;

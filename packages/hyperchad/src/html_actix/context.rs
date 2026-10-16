@@ -40,6 +40,13 @@ impl PresentationContext for HtmlActixPresentationContext {
     fn action_target(&self, action: PresentationAction) -> String {
         let path = match action {
             PresentationAction::SubmitMessage => "/actions/submit-message".to_owned(),
+            PresentationAction::PrepareSubmissionResume => {
+                "/actions/prepare-submission-resume".to_owned()
+            }
+            PresentationAction::ResumeSubmission => "/actions/resume-submission".to_owned(),
+            PresentationAction::CancelPendingSubmission => {
+                "/actions/cancel-pending-submission".to_owned()
+            }
             PresentationAction::CancelTurn => "/actions/cancel-turn".to_owned(),
             PresentationAction::UpdateDraft { session_id } => {
                 format!("/actions/update-draft/{session_id}")

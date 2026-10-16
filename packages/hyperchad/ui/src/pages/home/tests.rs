@@ -13,6 +13,60 @@ use super::transcript::{
 };
 use super::usage::runtime_usage;
 use super::*;
+
+#[test]
+fn queued_blocker_outside_transcript_exposes_only_shared_available_controls() {
+    use bcode_session_models::*;
+    let session_id = SessionId::new();
+    let id = SubmissionId("oldest".to_owned());
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.session_id = Some(session_id);
+    snapshot.runtime.submission_queue = Some(SubmissionQueueStatus {
+        oldest: Some(SubmissionRecord {
+            receipt: SubmissionReceipt {
+                submission_id: id.clone(),
+                accepted_event_sequence: 1,
+            },
+            submission: PromptSubmission {
+                id,
+                client_id: ClientId::new(),
+                text: "private prompt not rendered".to_owned(),
+                admission: TurnAdmissionMetadata::default(),
+                requested_placement: SubmissionPlacement::FollowUp,
+                target: SubmissionTarget::OwnTurn {
+                    turn_id: TurnId("target".to_owned()),
+                },
+                execution_descriptor: None,
+            },
+            status: SubmissionStatus::Pending,
+            context_observation: None,
+            recovery_authorization: None,
+        }),
+        blocker: Some(SubmissionQueueBlocker::MissingContext),
+    });
+    let context = crate::context::tests::GuardedTestContext;
+    let rendered = home_content(&snapshot, &[], &context);
+    let mut text = String::new();
+    for container in &rendered {
+        container_text(container, &mut text);
+    }
+    assert!(text.contains("Queued message needs attention"));
+    assert!(text.contains("Review settings and resume"));
+    assert!(text.contains("Cancel this queued message"));
+    assert!(!text.contains("private prompt not rendered"));
+    assert!(format!("{rendered:?}").contains("prepare-submission-resume?test-capability=opaque"));
+    snapshot.runtime.submission_queue.as_mut().unwrap().blocker =
+        Some(SubmissionQueueBlocker::WorkflowAuthorityRequired);
+    let rendered = home_content(&snapshot, &[], &context);
+    let mut text = String::new();
+    for container in &rendered {
+        container_text(container, &mut text);
+    }
+    assert!(text.contains("workflow"));
+    assert!(!text.contains("Review settings and resume"));
+    assert!(!text.contains("Cancel this queued message"));
+}
+
 use bcode_session_models::{RuntimeWorkStatus, ToolArtifact, WorkId};
 use bcode_session_view_models::{
     ChatMessageView, CompactionView, CompactionViewStatus, InteractionViewSummary,
@@ -667,12 +721,12 @@ fn activity_messages_expose_bounded_details_without_parsing_payload_markup() {
         container_text(container, &mut text);
     }
     assert!(text.contains("Activity details"));
-    assert!(text.contains("Exact submitted instructions"));
-    assert!(text.contains("**exact instructions** <script>not markup</script>"));
+    assert!(text.contains("Canonical instructions"));
+    assert!(!text.contains("**exact instructions** <script>not markup</script>"));
     assert!(text.contains("run-a"));
     assert!(text.contains("session event 42"));
     assert!(text.contains("not the exact submitted instructions"));
-    assert!(text.contains("Structured details truncated for display."));
+    assert!(!text.contains("Structured details truncated for display."));
     assert!(!format!("{containers:?}").contains("Element::Raw"));
     assert!(!text.contains(&"x".repeat(40_000)));
     message.activity = None;

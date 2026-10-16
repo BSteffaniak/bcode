@@ -418,8 +418,6 @@ pub struct BmuxApp {
     target_theme: ResolvedTheme,
     presented_theme: PresentedTheme,
     theme_catalog: Option<DiscoveredThemes>,
-    #[cfg(test)]
-    theme_catalog_discovery_count: usize,
     theme_transition: ThemeTransitionState,
     theme_preview_id: Option<String>,
     thinking_label: String,
@@ -437,6 +435,8 @@ pub struct BmuxApp {
     transcript_projection_revision: u64,
     active_interaction_layout: Option<(String, u16)>,
     session_view_terminal_adapter: SessionViewTerminalAdapter,
+    /// Local presentation of an exact prepared recovery selection.
+    pub queue_recovery: QueueRecoveryPresentation,
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
     transcript_selection_pinned: bool,
@@ -493,7 +493,7 @@ pub struct BmuxApp {
     pending_markdown_focus: Option<String>,
     markdown_fragment_rows: BTreeMap<String, usize>,
     #[cfg(test)]
-    last_transcript_damage: TranscriptDocumentDamage,
+    observations: PresentationObservations,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -577,6 +577,24 @@ const fn reasoning_view_mode(
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct PresentationObservations {
+    theme_catalog_discovery_count: usize,
+    last_transcript_damage: TranscriptDocumentDamage,
+}
+
+/// Ephemeral recovery confirmation presentation; never canonical execution state.
+#[derive(Debug, Clone, Default)]
+pub struct QueueRecoveryPresentation {
+    /// Local fence invalidated by observations, commands and dismissal.
+    pub generation: u64,
+    /// Whether the exact settings fit the latest presentation.
+    pub settings_visible: bool,
+    /// Prepared selection awaiting explicit confirmation.
+    pub confirmation: Option<bcode_session_models::SubmissionResumeConfirmation>,
+}
+
 impl BmuxApp {
     /// Create TUI state with replayed session data.
     #[must_use]
@@ -639,8 +657,6 @@ impl BmuxApp {
             target_theme: *initial_theme,
             presented_theme: (*initial_theme).into(),
             theme_catalog: None,
-            #[cfg(test)]
-            theme_catalog_discovery_count: 0,
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
             theme_preview_id: None,
             thinking_label: "reasoning output shown · unsupported".to_owned(),
@@ -658,6 +674,7 @@ impl BmuxApp {
             transcript_projection_revision: 0,
             active_interaction_layout: None,
             session_view_terminal_adapter: SessionViewTerminalAdapter::default(),
+            queue_recovery: QueueRecoveryPresentation::default(),
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
             transcript_selection_pinned: false,
@@ -714,7 +731,7 @@ impl BmuxApp {
             pending_markdown_focus: None,
             markdown_fragment_rows: BTreeMap::new(),
             #[cfg(test)]
-            last_transcript_damage: TranscriptDocumentDamage::None,
+            observations: PresentationObservations::default(),
         }
     }
 
@@ -767,7 +784,8 @@ impl BmuxApp {
         self.theme_catalog.clone_from(&source.theme_catalog);
         #[cfg(test)]
         {
-            self.theme_catalog_discovery_count = source.theme_catalog_discovery_count;
+            self.observations.theme_catalog_discovery_count =
+                source.observations.theme_catalog_discovery_count;
         }
         self.take_theme_transition_state_from(source);
     }
@@ -1149,7 +1167,7 @@ impl BmuxApp {
                     (item_id, line.row_in_entry)
                 })
                 .collect(),
-            damage: self.last_transcript_damage.clone(),
+            damage: self.observations.last_transcript_damage.clone(),
             viewport_top,
             scroll_mode: if self.transcript_scroll_animation.is_some() {
                 "transition_to_entry"
@@ -2157,8 +2175,10 @@ impl BmuxApp {
             let discovered = super::theme::discover_theme_catalog(self).ok();
             #[cfg(test)]
             {
-                self.theme_catalog_discovery_count =
-                    self.theme_catalog_discovery_count.saturating_add(1);
+                self.observations.theme_catalog_discovery_count = self
+                    .observations
+                    .theme_catalog_discovery_count
+                    .saturating_add(1);
             }
             self.theme_catalog = discovered;
         }
@@ -2184,7 +2204,7 @@ impl BmuxApp {
 
     #[cfg(test)]
     pub(crate) const fn theme_catalog_discovery_count(&self) -> usize {
-        self.theme_catalog_discovery_count
+        self.observations.theme_catalog_discovery_count
     }
 
     /// Clear cached discovery so the next resolution observes current authorized inputs.
@@ -2618,6 +2638,82 @@ impl BmuxApp {
     /// Insert pasted text into the composer.
     pub fn paste_composer_text(&mut self, text: &str) {
         TextInputControl::new(&composer_policy()).handle_paste(&mut self.composer, text);
+    }
+
+    /// Accept bounded queue status through the shared semantic projection.
+    pub fn set_submission_queue(&mut self, status: bcode_session_models::SubmissionQueueStatus) {
+        self.queue_recovery.generation = self.queue_recovery.generation.wrapping_add(1);
+        if self
+            .queue_recovery
+            .confirmation
+            .as_ref()
+            .is_some_and(|confirmation| {
+                !status.oldest.as_ref().is_some_and(|record| {
+                    record.receipt.submission_id == confirmation.submission_id
+                        && record.receipt.accepted_event_sequence
+                            == confirmation.expected_accepted_sequence
+                })
+            })
+        {
+            self.queue_recovery.confirmation = None;
+            self.queue_recovery.settings_visible = false;
+        }
+        self.session_view.set_submission_queue(status);
+    }
+
+    /// Invalidate all pending recovery completions and dismiss local confirmation.
+    pub fn dismiss_queue_confirmation(&mut self) {
+        self.queue_recovery.generation = self.queue_recovery.generation.wrapping_add(1);
+        self.queue_recovery.confirmation = None;
+        self.queue_recovery.settings_visible = false;
+    }
+
+    /// Surface failed queue hydration and invalidate operations based on older observations.
+    pub fn set_submission_queue_unavailable(&mut self) {
+        self.dismiss_queue_confirmation();
+        self.session_view.set_submission_queue_unavailable();
+    }
+
+    /// Accept only a completion captured after the most recent observation or dismissal.
+    pub fn apply_queue_recovery_result(
+        &mut self,
+        generation: u64,
+        outcome: bcode_session_view_models::SessionViewActionOutcome,
+        status: bcode_session_models::SubmissionQueueStatus,
+    ) -> bool {
+        if self.queue_recovery.generation != generation {
+            return false;
+        }
+        self.set_submission_queue(status);
+        if let bcode_session_view_models::SessionViewActionOutcome::SubmissionResumePrepared {
+            confirmation,
+        } = outcome
+        {
+            self.prepare_queue_confirmation(confirmation);
+        } else {
+            self.dismiss_queue_confirmation();
+        }
+        true
+    }
+
+    /// Retain a prepared selection only while the shared queue still permits this exact resume.
+    pub fn prepare_queue_confirmation(
+        &mut self,
+        confirmation: bcode_session_models::SubmissionResumeConfirmation,
+    ) {
+        self.queue_recovery.settings_visible = false;
+        self.queue_recovery.confirmation = self
+            .session_view
+            .snapshot()
+            .runtime
+            .queue_recovery()
+            .filter(|recovery| {
+                recovery.can_resume
+                    && recovery.submission_id == confirmation.submission_id
+                    && recovery.expected_accepted_sequence
+                        == confirmation.expected_accepted_sequence
+            })
+            .map(|_| confirmation);
     }
 
     /// Return the shared renderer-neutral semantic session state.
@@ -4775,6 +4871,10 @@ impl BmuxApp {
 
     #[allow(clippy::too_many_lines)]
     fn apply_session_event(&mut self, event: &SessionEvent, application: SessionEventApplication) {
+        if bcode_session_view::submission_queue_needs_refresh(&event.kind) {
+            self.queue_recovery.generation = self.queue_recovery.generation.wrapping_add(1);
+        }
+
         if event_breaks_sticky_entry_anchor(event) {
             self.downgrade_sticky_entry_anchor();
         }
@@ -5452,7 +5552,7 @@ impl BmuxApp {
         }
         #[cfg(test)]
         {
-            self.last_transcript_damage.clone_from(&damage);
+            self.observations.last_transcript_damage.clone_from(&damage);
         }
         self.transcript_projection_revision = self.transcript_projection_revision.saturating_add(1);
         damage
@@ -6414,6 +6514,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SubmissionAccepted { .. }
         | SessionEventKind::SubmissionActivated { .. }
         | SessionEventKind::SubmissionCancelled { .. }
+        | SessionEventKind::SubmissionPendingCancelled { .. }
         | SessionEventKind::SubmissionContextObserved { .. }
         | SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantDelta { .. }
@@ -6451,7 +6552,8 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ModelTurnFinished { .. }
         | SessionEventKind::InertHistory { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
-        SessionEventKind::SessionChildrenReconciled { .. }
+        SessionEventKind::SubmissionRecoveryAuthorized { .. }
+        | SessionEventKind::SessionChildrenReconciled { .. }
         | SessionEventKind::SessionChildLinked { .. }
         | SessionEventKind::SessionCreated { .. }
         | SessionEventKind::ClientAttached { .. }
@@ -6791,6 +6893,156 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn queue_confirmation_rejects_stale_prepare_and_clears_replaced_outside_window_head() {
+        use bcode_session_models::*;
+        let confirmation = SubmissionResumeConfirmation {
+            version: 1,
+            submission_id: SubmissionId("pending".to_owned()),
+            expected_accepted_sequence: 1,
+            descriptor: SubmissionExecutionDescriptor {
+                version: 2,
+                provider: "provider-界".to_owned(),
+                model: "model-👩‍💻-e\u{301}".to_owned(),
+                model_profile: Some("selected profile".to_owned()),
+                auth_profile: Some("account".to_owned()),
+                reasoning: None,
+                config_identity: "digest".to_owned(),
+                recovery_recipe: None,
+            },
+        };
+        let id = confirmation.submission_id.clone();
+        let record = SubmissionRecord {
+            receipt: SubmissionReceipt {
+                submission_id: id.clone(),
+                accepted_event_sequence: 1,
+            },
+            submission: PromptSubmission {
+                id,
+                client_id: ClientId::new(),
+                text: "not in history".to_owned(),
+                admission: TurnAdmissionMetadata::default(),
+                requested_placement: SubmissionPlacement::FollowUp,
+                target: SubmissionTarget::OwnTurn {
+                    turn_id: TurnId("target".to_owned()),
+                },
+                execution_descriptor: None,
+            },
+            status: SubmissionStatus::Pending,
+            context_observation: None,
+            recovery_authorization: None,
+        };
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.prepare_queue_confirmation(confirmation.clone());
+        assert!(app.queue_recovery.confirmation.is_none());
+        app.set_submission_queue(SubmissionQueueStatus {
+            oldest: Some(record.clone()),
+            blocker: Some(SubmissionQueueBlocker::MissingContext),
+        });
+        assert!(app.session_view_snapshot().transcript.items.is_empty());
+        app.prepare_queue_confirmation(confirmation.clone());
+        assert_eq!(app.queue_recovery.confirmation, Some(confirmation.clone()));
+        assert!(!app.queue_recovery.settings_visible);
+        app.queue_recovery.settings_visible = true;
+        assert_queue_completion_fences(&mut app, &record, &confirmation);
+        let mut changed = record;
+        changed.receipt.accepted_event_sequence = 2;
+        app.set_submission_queue(SubmissionQueueStatus {
+            oldest: Some(changed),
+            blocker: Some(SubmissionQueueBlocker::MissingContext),
+        });
+        assert!(app.queue_recovery.confirmation.is_none());
+        assert!(!app.queue_recovery.settings_visible);
+        app.prepare_queue_confirmation(confirmation);
+        assert!(app.queue_recovery.confirmation.is_none());
+        app.set_submission_queue(SubmissionQueueStatus {
+            oldest: None,
+            blocker: None,
+        });
+        let recovery_absent = app
+            .session_view_snapshot()
+            .runtime
+            .queue_recovery()
+            .is_none();
+        drop(app);
+        assert!(recovery_absent);
+    }
+
+    fn assert_queue_completion_fences(
+        app: &mut BmuxApp,
+        record: &bcode_session_models::SubmissionRecord,
+        confirmation: &bcode_session_models::SubmissionResumeConfirmation,
+    ) {
+        use bcode_session_models::*;
+        let before_refresh = app.queue_recovery.generation;
+        app.set_submission_queue(SubmissionQueueStatus {
+            oldest: Some(record.clone()),
+            blocker: Some(SubmissionQueueBlocker::MissingContext),
+        });
+        assert!(!app.apply_queue_recovery_result(
+            before_refresh,
+            bcode_session_view_models::SessionViewActionOutcome::None,
+            SubmissionQueueStatus {
+                oldest: None,
+                blocker: None
+            }
+        ));
+        assert!(
+            app.session_view_snapshot()
+                .runtime
+                .queue_recovery()
+                .is_some()
+        );
+        let generation = app.queue_recovery.generation;
+        app.dismiss_queue_confirmation();
+        assert!(!app.apply_queue_recovery_result(
+            generation,
+            bcode_session_view_models::SessionViewActionOutcome::SubmissionResumePrepared {
+                confirmation: confirmation.clone()
+            },
+            SubmissionQueueStatus {
+                oldest: Some(record.clone()),
+                blocker: Some(SubmissionQueueBlocker::MissingContext)
+            }
+        ));
+        assert!(app.queue_recovery.confirmation.is_none());
+        let generation = app.queue_recovery.generation;
+        app.set_submission_queue(SubmissionQueueStatus {
+            oldest: Some(record.clone()),
+            blocker: Some(SubmissionQueueBlocker::WorkflowAuthorityRequired),
+        });
+        assert!(!app.apply_queue_recovery_result(
+            generation,
+            bcode_session_view_models::SessionViewActionOutcome::SubmissionResumePrepared {
+                confirmation: confirmation.clone()
+            },
+            SubmissionQueueStatus {
+                oldest: Some(record.clone()),
+                blocker: Some(SubmissionQueueBlocker::MissingContext)
+            }
+        ));
+        assert!(
+            !app.session_view_snapshot()
+                .runtime
+                .queue_recovery()
+                .unwrap()
+                .can_resume
+        );
+        app.set_submission_queue_unavailable();
+        assert!(
+            app.session_view_snapshot()
+                .runtime
+                .submission_queue_unavailable
+        );
+        assert!(
+            app.session_view_snapshot()
+                .runtime
+                .queue_recovery()
+                .is_none()
+        );
+    }
+
     use crate::transcript::TranscriptItemKind;
     use crate::transcript_layout::{TranscriptLayoutInvalidation, VisibleTranscriptSource};
 
@@ -8443,7 +8695,7 @@ mod tests {
         }));
         assert_eq!(app.scroll_offset(), before_scroll);
         let targeted_item = matches!(
-            app.last_transcript_damage,
+            app.observations.last_transcript_damage,
             TranscriptDocumentDamage::Items(ref ids) if ids.contains(&item_id)
         );
         drop(app);
@@ -8472,7 +8724,7 @@ mod tests {
                 .is_none()
         );
         let item_damage = matches!(
-            app.last_transcript_damage,
+            app.observations.last_transcript_damage,
             TranscriptDocumentDamage::Items(_)
         );
         drop(app);
@@ -9630,7 +9882,7 @@ mod tests {
             },
         )];
         let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-        app.last_transcript_damage = TranscriptDocumentDamage::None;
+        app.observations.last_transcript_damage = TranscriptDocumentDamage::None;
         let before = app.frame_observation();
 
         app.absorb_session_event(&shared_projection_adapter_event(
@@ -9660,7 +9912,7 @@ mod tests {
             },
         )];
         let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-        app.last_transcript_damage = TranscriptDocumentDamage::None;
+        app.observations.last_transcript_damage = TranscriptDocumentDamage::None;
         let before = app.frame_observation();
         app.apply_model_status(bcode_model::SessionModelStatus {
             provider_plugin_id: None,
@@ -9736,7 +9988,7 @@ mod tests {
             .map(ToOwned::to_owned)
             .collect();
         app.apply_reasoning_selection(Some("none".to_owned()), None);
-        app.last_transcript_damage = TranscriptDocumentDamage::None;
+        app.observations.last_transcript_damage = TranscriptDocumentDamage::None;
         let frame = app.frame_observation();
         let expected = [
             "minimal", "low", "medium", "high", "xhigh", "max", "none", "minimal", "low", "medium",

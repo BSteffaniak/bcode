@@ -1267,6 +1267,58 @@ mod cancellation_tests {
         );
     }
 
+    async fn admit_unobserved_shared_turn(
+        state: &std::sync::Arc<ServerState>,
+        dispatch: &PreparedActivationDispatch,
+        parent: crate::SessionId,
+    ) {
+        let metadata = bcode_session_models::TurnAdmissionMetadata {
+            origin: Some(bcode_session_models::TurnOrigin {
+                producer: "bcode.workflow".into(),
+                correlation_id: Some(dispatch.dispatch_identity.clone()),
+                display_label: None,
+            }),
+            idempotency_key: Some(dispatch.dispatch_identity.clone()),
+            execution: bcode_session_models::TurnExecutionOptions {
+                provider_plugin_id: Some("bcode.fake-provider".into()),
+                model_id: Some("fake-echo".into()),
+                structured_output: Some(bcode_session_models::TurnStructuredOutputRequest {
+                    name: bcode_session_models::structured_output_name(
+                        &dispatch.activation.node.output.type_name,
+                    ),
+                    schema: dispatch.activation.node.output.schema.clone(),
+                    strict: true,
+                    max_corrections: 0,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Admit the real provider turn without installing the workflow completion
+        // callback. This fixture models loss of that owner before receipt publication;
+        // the normal dispatch callback now independently recovers a failed publication.
+        let submitted = crate::submit_session_model_turn_with_admission(
+            state,
+            parent,
+            "Return 9".into(),
+            None,
+            metadata,
+            None,
+        )
+        .await
+        .unwrap();
+        let crate::SubmittedModelTurn::Started { completion, .. } = submitted else {
+            panic!("new shared turn");
+        };
+        let completion = completion.await.unwrap();
+        assert_eq!(
+            completion.outcome,
+            crate::ModelTurnOutcome::Completed,
+            "{:?}",
+            completion.message
+        );
+    }
+
     #[tokio::test]
     async fn completed_shared_turn_recovers_receipt_with_original_acceptance_time() {
         let (_root, _sessions, state, _) = super::super::tests::typed_provider_fixture_with_target(
@@ -1285,14 +1337,7 @@ mod cancellation_tests {
             .unwrap()
             .parse()
             .unwrap();
-        let failure =
-            crate::dispatch_workflow_prompt_turn_after_admission(&state, &dispatch, || {
-                Err(WorkflowStoreError::InvalidData(
-                    "injected initial receipt failure".into(),
-                ))
-            })
-            .await;
-        assert!(failure.is_err());
+        admit_unobserved_shared_turn(&state, &dispatch, parent).await;
         assert!(
             owner_boundary::receipt(&db, &dispatch.dispatch_identity)
                 .await

@@ -259,6 +259,9 @@ impl SessionHandle {
             memory_pending_by_turn: BTreeMap::new(),
             memory_pending_submissions: BTreeMap::new(),
             memory_running_turns: std::collections::BTreeSet::new(),
+            memory_queue_visible: BTreeMap::new(),
+            memory_queue_by_turn: BTreeMap::new(),
+            memory_recovery_operations: BTreeMap::new(),
             memory_submissions: BTreeMap::new(),
             memory_usage: bcode_session_models::SessionUsageSummary::default(),
             memory_usage_requests: BTreeMap::new(),
@@ -444,6 +447,37 @@ impl SessionHandle {
         self.send(|reply| SessionCommand::AppendToolInvocationResult {
             record,
             activity_timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
+    pub(crate) async fn submission_queue_status(
+        &self,
+    ) -> Result<bcode_session_models::SubmissionQueueStatus, SessionError> {
+        self.send(|reply| SessionCommand::SubmissionQueueStatus { reply })
+            .await?
+    }
+
+    pub(crate) async fn check_submission_recovery_retry(
+        &self,
+        kind: SessionEventKind,
+    ) -> Result<Option<bcode_session_models::SubmissionRecoveryResult>, SessionError> {
+        self.send(|reply| SessionCommand::SubmissionRecoveryRetry {
+            kind: Box::new(kind),
+            reply,
+        })
+        .await?
+    }
+
+    pub(crate) async fn recover_submission(
+        &self,
+        kind: SessionEventKind,
+        timestamp_ms: u64,
+    ) -> Result<(bcode_session_models::SubmissionRecord, Option<SessionEvent>), SessionError> {
+        self.send(|reply| SessionCommand::SubmissionMutation {
+            mutation: SubmissionMutation::Recover(Box::new(kind)),
+            timestamp_ms,
             reply,
         })
         .await?
@@ -953,6 +987,7 @@ pub type UsageNormalizer = Arc<
 >;
 
 enum SubmissionMutation {
+    Recover(Box<SessionEventKind>),
     Observe(
         bcode_session_models::SubmissionId,
         bcode_session_models::SubmissionContextIssue,
@@ -963,6 +998,15 @@ enum SubmissionMutation {
 }
 
 enum SessionCommand {
+    SubmissionQueueStatus {
+        reply: oneshot::Sender<Result<bcode_session_models::SubmissionQueueStatus, SessionError>>,
+    },
+    SubmissionRecoveryRetry {
+        kind: Box<SessionEventKind>,
+        reply: oneshot::Sender<
+            Result<Option<bcode_session_models::SubmissionRecoveryResult>, SessionError>,
+        >,
+    },
     MilestoneContext {
         max_bytes: usize,
         max_turns: usize,
@@ -1214,6 +1258,10 @@ struct SessionActor {
         BTreeMap<bcode_session_models::SubmissionId, bcode_session_models::SubmissionRecord>,
     memory_pending_by_turn:
         BTreeMap<bcode_session_models::TurnId, BTreeMap<u64, bcode_session_models::SubmissionId>>,
+    memory_queue_visible: BTreeMap<u64, bcode_session_models::SubmissionId>,
+    memory_queue_by_turn: BTreeMap<bcode_session_models::TurnId, std::collections::BTreeSet<u64>>,
+    memory_recovery_operations:
+        BTreeMap<String, (SessionEventKind, bcode_session_models::SubmissionRecord)>,
     memory_pending_submissions: BTreeMap<u64, bcode_session_models::SubmissionId>,
     memory_running_turns: std::collections::BTreeSet<String>,
     memory_usage: bcode_session_models::SessionUsageSummary,
@@ -1375,7 +1423,7 @@ impl SessionActor {
             } => {
                 let _ = reply.send(self.set_composer_draft(&text, updated_at_ms).await);
             }
-            command => return self.handle_read_command(command).await,
+            command => return Box::pin(self.handle_read_command(command)).await,
         }
         false
     }
@@ -1430,6 +1478,14 @@ impl SessionActor {
                     )
                     .await,
                 );
+            }
+            SessionCommand::SubmissionQueueStatus { reply } => {
+                let result = self.submission_queue_status().await;
+                let _ = reply.send(result);
+            }
+            SessionCommand::SubmissionRecoveryRetry { kind, reply } => {
+                let result = self.check_recovery_retry(&kind).await;
+                let _ = reply.send(result);
             }
             SessionCommand::SubmissionMutation {
                 mutation,
@@ -2575,43 +2631,114 @@ impl SessionActor {
         Ok(event)
     }
 
+    fn project_memory_submission_lifecycle(
+        &mut self,
+        event: &SessionEvent,
+    ) -> Result<(), SessionError> {
+        if crate::submission::recovery_identity(&event.kind)
+            .is_some_and(|id| self.memory_recovery_operations.contains_key(id))
+        {
+            return Err(SessionError::EventSerialization(
+                "conflicting recovery operation".into(),
+            ));
+        }
+        let record = crate::submission::memory_transition(
+            &event.kind,
+            event.sequence,
+            &self.memory_submissions,
+            &self.state.turn_evidence,
+            &self.memory_running_turns,
+        )?;
+        if record.status == bcode_session_models::SubmissionStatus::Pending {
+            self.memory_pending_submissions.insert(
+                record.receipt.accepted_event_sequence,
+                record.receipt.submission_id.clone(),
+            );
+        } else {
+            self.memory_pending_submissions
+                .remove(&record.receipt.accepted_event_sequence);
+        }
+        let target_index = self
+            .memory_pending_by_turn
+            .entry(record.submission.target.turn_id().clone())
+            .or_default();
+        if record.status == bcode_session_models::SubmissionStatus::Pending {
+            target_index.insert(
+                record.receipt.accepted_event_sequence,
+                record.receipt.submission_id.clone(),
+            );
+        } else {
+            target_index.remove(&record.receipt.accepted_event_sequence);
+        }
+        if let Some(id) = crate::submission::recovery_identity(&event.kind)
+            && self
+                .memory_recovery_operations
+                .insert(id.to_owned(), (event.kind.clone(), record.clone()))
+                .is_some()
+        {
+            return Err(SessionError::EventSerialization(
+                "conflicting recovery operation".into(),
+            ));
+        }
+        let accepted = record.receipt.accepted_event_sequence;
+        if matches!(
+            record.status,
+            bcode_session_models::SubmissionStatus::Cancelled { .. }
+        ) {
+            self.memory_queue_visible.remove(&accepted);
+            if let Some(index) = self
+                .memory_queue_by_turn
+                .get_mut(record.submission.target.turn_id())
+            {
+                index.remove(&accepted);
+            }
+        } else {
+            self.memory_queue_visible
+                .insert(accepted, record.receipt.submission_id.clone());
+            self.memory_queue_by_turn
+                .entry(record.submission.target.turn_id().clone())
+                .or_default()
+                .insert(accepted);
+        }
+        self.memory_submissions
+            .insert(record.receipt.submission_id.clone(), record);
+        Ok(())
+    }
+
     fn project_memory_submission(&mut self, event: &SessionEvent) -> Result<(), SessionError> {
         if self.store.is_none() {
             match &event.kind {
                 SessionEventKind::SubmissionAccepted { .. }
                 | SessionEventKind::SubmissionActivated { .. }
                 | SessionEventKind::SubmissionCancelled { .. }
+                | SessionEventKind::SubmissionRecoveryAuthorized { .. }
+                | SessionEventKind::SubmissionPendingCancelled { .. }
                 | SessionEventKind::SubmissionContextObserved { .. } => {
-                    let record = crate::submission::memory_transition(
-                        &event.kind,
-                        event.sequence,
-                        &self.memory_submissions,
-                        &self.state.turn_evidence,
-                        &self.memory_running_turns,
-                    )?;
-                    if record.status == bcode_session_models::SubmissionStatus::Pending {
-                        self.memory_pending_submissions.insert(
-                            record.receipt.accepted_event_sequence,
-                            record.receipt.submission_id.clone(),
-                        );
-                    } else {
-                        self.memory_pending_submissions
-                            .remove(&record.receipt.accepted_event_sequence);
+                    self.project_memory_submission_lifecycle(event)?;
+                }
+                SessionEventKind::ModelTurnFinished { turn_id, .. } => {
+                    if let Some(index) = self
+                        .memory_queue_by_turn
+                        .remove(&bcode_session_models::TurnId(turn_id.clone()))
+                    {
+                        for accepted in index {
+                            if self
+                                .memory_queue_visible
+                                .get(&accepted)
+                                .and_then(|id| self.memory_submissions.get(id))
+                                .is_some_and(|r| {
+                                    r.status != bcode_session_models::SubmissionStatus::Pending
+                                })
+                            {
+                                self.memory_queue_visible.remove(&accepted);
+                            } else {
+                                self.memory_queue_by_turn
+                                    .entry(bcode_session_models::TurnId(turn_id.clone()))
+                                    .or_default()
+                                    .insert(accepted);
+                            }
+                        }
                     }
-                    let target_index = self
-                        .memory_pending_by_turn
-                        .entry(record.submission.target.turn_id().clone())
-                        .or_default();
-                    if record.status == bcode_session_models::SubmissionStatus::Pending {
-                        target_index.insert(
-                            record.receipt.accepted_event_sequence,
-                            record.receipt.submission_id.clone(),
-                        );
-                    } else {
-                        target_index.remove(&record.receipt.accepted_event_sequence);
-                    }
-                    self.memory_submissions
-                        .insert(record.receipt.submission_id.clone(), record);
                 }
                 SessionEventKind::RuntimeWorkStarted {
                     work_id,
@@ -2692,6 +2819,121 @@ impl SessionActor {
         store.schedule_catalog_summary(summary).await;
     }
 
+    async fn submission_queue_status(
+        &mut self,
+    ) -> Result<bcode_session_models::SubmissionQueueStatus, SessionError> {
+        let oldest = if let Some(db) = self.existing_session_db().await? {
+            db.submission_queue_head().await?
+        } else {
+            self.memory_queue_visible
+                .first_key_value()
+                .and_then(|(_, id)| self.memory_submissions.get(id))
+                .cloned()
+        };
+        let blocker = oldest.as_ref().and_then(|r| {
+            use bcode_session_models::{SubmissionQueueBlocker as B, SubmissionStatus};
+            if crate::submission::validate_recovery_owner(r).is_err() {
+                Some(B::WorkflowAuthorityRequired)
+            } else if matches!(r.status, SubmissionStatus::Activated { .. }) {
+                Some(B::InterruptedTurn)
+            } else {
+                None
+            }
+        });
+        Ok(bcode_session_models::SubmissionQueueStatus { oldest, blocker })
+    }
+
+    async fn check_recovery_retry(
+        &mut self,
+        kind: &SessionEventKind,
+    ) -> Result<Option<bcode_session_models::SubmissionRecoveryResult>, SessionError> {
+        let invalid = || {
+            SessionError::EventSerialization(
+                "conflicting or unavailable submission recovery".into(),
+            )
+        };
+        let (SessionEventKind::SubmissionRecoveryAuthorized {
+            submission_id: id, ..
+        }
+        | SessionEventKind::SubmissionPendingCancelled {
+            submission_id: id, ..
+        }) = kind
+        else {
+            return Err(invalid());
+        };
+        let operation_id = crate::submission::recovery_identity(kind).ok_or_else(invalid)?;
+        let (record, retry) = if let Some(db) = self.existing_session_db().await? {
+            (
+                db.submission(id).await?,
+                db.submission_recovery_operation(operation_id).await?,
+            )
+        } else {
+            (
+                self.memory_submissions.get(id).cloned(),
+                self.memory_recovery_operations.get(operation_id).cloned(),
+            )
+        };
+        let record = record.ok_or_else(invalid)?;
+        crate::submission::validate_recovery_owner(&record)?;
+        match retry {
+            Some((retry, original_record)) if &retry == kind => {
+                Ok(Some(bcode_session_models::SubmissionRecoveryResult {
+                    record: original_record,
+                    duplicate: true,
+                }))
+            }
+            Some(_) => Err(invalid()),
+            None => Ok(None),
+        }
+    }
+
+    async fn recovery_mutation_retry(
+        &mut self,
+        prior: Option<bcode_session_models::SubmissionRecord>,
+        kind: &SessionEventKind,
+    ) -> Result<Option<bcode_session_models::SubmissionRecord>, SessionError> {
+        let invalid =
+            || SessionError::EventSerialization("conflicting or unavailable submission".into());
+        let prior = prior.ok_or_else(invalid)?;
+        crate::submission::validate_recovery_owner(&prior)?;
+        let operation_id = crate::submission::recovery_identity(kind).ok_or_else(invalid)?;
+        let retry = if let Some(db) = self.existing_session_db().await? {
+            db.submission_recovery_operation(operation_id).await?
+        } else {
+            self.memory_recovery_operations.get(operation_id).cloned()
+        };
+        if let Some((retry, original_record)) = retry {
+            return if &retry == kind {
+                Ok(Some(original_record))
+            } else {
+                Err(invalid())
+            };
+        }
+        Ok(None)
+    }
+
+    async fn projected_submission_after_mutation(
+        &mut self,
+        id: &bcode_session_models::SubmissionId,
+    ) -> Result<bcode_session_models::SubmissionRecord, SessionError> {
+        let invalid =
+            || SessionError::EventSerialization("conflicting or unavailable submission".into());
+        let record = if self.store.is_none() {
+            self.memory_submissions
+                .get(id)
+                .cloned()
+                .ok_or_else(invalid)?
+        } else {
+            self.existing_session_db()
+                .await?
+                .ok_or_else(invalid)?
+                .submission(id)
+                .await?
+                .ok_or_else(invalid)?
+        };
+        Ok(record)
+    }
+
     async fn mutate_submission(
         &mut self,
         mutation: SubmissionMutation,
@@ -2701,6 +2943,13 @@ impl SessionActor {
         let invalid =
             || SessionError::EventSerialization("conflicting or unavailable submission".into());
         let id = match &mutation {
+            SubmissionMutation::Recover(kind) => match kind.as_ref() {
+                SessionEventKind::SubmissionRecoveryAuthorized { submission_id, .. }
+                | SessionEventKind::SubmissionPendingCancelled { submission_id, .. } => {
+                    submission_id.clone()
+                }
+                _ => return Err(invalid()),
+            },
             SubmissionMutation::Accept(value) => value.id.clone(),
             SubmissionMutation::Activate(id)
             | SubmissionMutation::Cancel(id)
@@ -2712,6 +2961,13 @@ impl SessionActor {
             self.memory_submissions.get(&id).cloned()
         };
         let kind = match mutation {
+            SubmissionMutation::Recover(kind) => {
+                if let Some(record) = self.recovery_mutation_retry(prior, &kind).await? {
+                    return Ok((record, None));
+                }
+                *kind
+            }
+
             SubmissionMutation::Accept(mut submission) => {
                 if let Some(prior) = prior {
                     submission.client_id = prior.submission.client_id;
@@ -2771,19 +3027,7 @@ impl SessionActor {
             }
         };
         let event = self.append_event(kind, None, timestamp_ms).await?;
-        let record = if self.store.is_none() {
-            self.memory_submissions
-                .get(&id)
-                .cloned()
-                .ok_or_else(invalid)?
-        } else {
-            self.existing_session_db()
-                .await?
-                .ok_or_else(invalid)?
-                .submission(&id)
-                .await?
-                .ok_or_else(invalid)?
-        };
+        let record = self.projected_submission_after_mutation(&id).await?;
         Ok((record, Some(event)))
     }
 

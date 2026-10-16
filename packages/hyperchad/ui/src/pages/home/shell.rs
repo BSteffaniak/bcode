@@ -175,6 +175,7 @@ pub fn home_content(
         @if !unrepresented_invocations.is_empty() { (active_invocations_section(&unrepresented_invocations)) }
         @if !unrepresented_work.is_empty() { (runtime_work_section(&unrepresented_work)) }
         (runtime_state_section(snapshot))
+        (queue_recovery_panel(snapshot, context))
         (transcript_section(snapshot, context))
         @if !snapshot.interactions.is_empty() {
             (section_panel("interactions", &container! {
@@ -203,4 +204,38 @@ pub fn home_content(
         ),
         &body,
     )
+}
+
+fn queue_recovery_panel(
+    snapshot: &SessionViewSnapshot,
+    context: &impl PresentationContext,
+) -> Containers {
+    container! {
+        @if snapshot.runtime.submission_queue_unavailable {
+            div { "Queued message status unavailable. Reconnect to refresh status." }
+        }
+        @if let (Some(session_id), Some(recovery)) = (snapshot.session_id, snapshot.runtime.queue_recovery()) {
+            div #submission-queue-blocker padding=((space::MD)) background=(surface::INSET) {
+                h3 { "Queued message needs attention" }
+                div { (recovery.reason) }
+                @if recovery.can_resume {
+                    form hx-post=(context.action_target(crate::context::PresentationAction::PrepareSubmissionResume)) hx-target="#bcode-web-shell" hx-swap=this {
+                        input type=hidden name="session_id" value=(session_id.to_string());
+                        input type=hidden name="submission_id" value=(recovery.submission_id.0.clone());
+                        input type=hidden name="expected_accepted_sequence" value=(recovery.expected_accepted_sequence.to_string());
+                        button type=submit { "Review settings and resume…" }
+                    }
+                }
+                @if recovery.can_cancel {
+                    form hx-post=(context.action_target(crate::context::PresentationAction::CancelPendingSubmission)) hx-target="#bcode-web-shell" hx-swap=this {
+                        input type=hidden name="session_id" value=(session_id.to_string());
+                        input type=hidden name="submission_id" value=(recovery.submission_id.0.clone());
+                        input type=hidden name="expected_accepted_sequence" value=(recovery.expected_accepted_sequence.to_string());
+                        input type=hidden name="operation_id" value=(format!("cancel:{}:{}", recovery.submission_id.0, recovery.expected_accepted_sequence));
+                        button type=submit { "Cancel this queued message" }
+                    }
+                }
+            }
+        }
+    }
 }

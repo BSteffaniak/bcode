@@ -35,6 +35,13 @@ pub enum SessionStreamUpdate {
         session_id: SessionId,
         record: Box<bcode_session_models::SubmissionRecord>,
     },
+    /// Bounded authoritative queue status independent of history.
+    QueueStatus {
+        session_id: SessionId,
+        status: Box<bcode_session_models::SubmissionQueueStatus>,
+    },
+    /// Bounded queue hydration failed; not an execution outcome.
+    QueueUnavailable { session_id: SessionId },
     /// Event continuity was lost and the stream is reconnecting.
     ResyncStarted { session_id: SessionId },
     /// Fresh bounded state installed by a replacement attachment.
@@ -232,7 +239,7 @@ pub async fn attach_paused_session_event_stream(
         if release_receiver.await.is_err() {
             return;
         }
-        reconnecting_event_stream(
+        Box::pin(reconnecting_event_stream(
             reconnect_client,
             session_id,
             event_sender,
@@ -245,7 +252,7 @@ pub async fn attach_paused_session_event_stream(
                         .await
                 })
             },
-        )
+        ))
         .await;
     });
     Ok((attached, event_task, release_sender))
@@ -353,7 +360,7 @@ fn spawn_reconnecting_recent_event_stream(
     connection: bcode_client::ClientConnection,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        reconnecting_event_stream(
+        Box::pin(reconnecting_event_stream(
             client,
             session_id,
             event_sender,
@@ -365,7 +372,7 @@ fn spawn_reconnecting_recent_event_stream(
                         .await
                 })
             },
-        )
+        ))
         .await;
     })
 }
@@ -378,7 +385,7 @@ fn spawn_reconnecting_window_event_stream(
     connection: bcode_client::ClientConnection,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        reconnecting_event_stream(
+        Box::pin(reconnecting_event_stream(
             client,
             session_id,
             event_sender,
@@ -391,7 +398,7 @@ fn spawn_reconnecting_window_event_stream(
                         .await
                 })
             },
-        )
+        ))
         .await;
     })
 }
@@ -545,6 +552,13 @@ async fn hydrate_cancelled_submission(
         return true;
     };
     let (bcode_session_models::SessionEventKind::SubmissionCancelled { submission_id }
+    | bcode_session_models::SessionEventKind::SubmissionPendingCancelled {
+        submission_id, ..
+    }
+    | bcode_session_models::SessionEventKind::SubmissionRecoveryAuthorized {
+        submission_id,
+        ..
+    }
     | bcode_session_models::SessionEventKind::SubmissionContextObserved {
         submission_id, ..
     }) = &event.kind
@@ -591,15 +605,26 @@ async fn reconnecting_event_stream<F>(
         + 'static,
 {
     let mut reconnect_delay = std::time::Duration::from_millis(100);
+    if !send_queue_status(&client, session_id, &event_sender).await {
+        return;
+    }
     let mut pending_progress = BTreeMap::new();
     let progress_flush = tokio::time::sleep(SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
     tokio::pin!(progress_flush);
+    let queue_refresh = tokio::time::sleep(std::time::Duration::from_secs(30));
+    tokio::pin!(queue_refresh);
     loop {
-        let Some(received) = receive_with_progress_flush(
-            connection.recv_event_without_reconnect(),
+        let Some(received) = receive_with_queue_refresh(
+            &client,
+            session_id,
             &event_sender,
-            &mut pending_progress,
-            progress_flush.as_mut(),
+            queue_refresh.as_mut(),
+            receive_with_progress_flush(
+                connection.recv_event_without_reconnect(),
+                &event_sender,
+                &mut pending_progress,
+                progress_flush.as_mut(),
+            ),
         )
         .await
         else {
@@ -616,22 +641,21 @@ async fn reconnecting_event_stream<F>(
                 true
             }
             Ok(event) => {
-                reconnect_delay = std::time::Duration::from_millis(100);
-                if let Some(key) = supersedable_event_key(&event) {
-                    let was_empty = pending_progress.is_empty();
-                    pending_progress.insert(key, event);
-                    if pending_progress.len() >= MAX_PENDING_PROGRESS_KEYS
-                        && !flush_superseded_progress(&event_sender, &mut pending_progress).await
-                    {
-                        return;
-                    }
-                    if was_empty {
-                        progress_flush.as_mut().reset(
-                            tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL,
-                        );
-                    }
-                } else if !send_canonical_event(&event_sender, &mut pending_progress, event).await {
+                if matches!(&event, BcodeEvent::Session(event) if bcode_session_view::submission_queue_needs_refresh(&event.kind))
+                    && !send_queue_status(&client, session_id, &event_sender).await
+                {
                     return;
+                }
+                reconnect_delay = std::time::Duration::from_millis(100);
+                let Some(reset_flush) =
+                    forward_stream_event(&event_sender, &mut pending_progress, event).await
+                else {
+                    return;
+                };
+                if reset_flush {
+                    progress_flush
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
                 }
                 false
             }
@@ -664,13 +688,7 @@ async fn reconnecting_event_stream<F>(
             match client.connect("bcode-tui-bmux").await {
                 Ok(mut next_connection) => {
                     if let Ok(attached) = attach(&mut next_connection, session_id).await {
-                        if event_sender
-                            .send(SessionStreamUpdate::Resynchronized {
-                                session_id,
-                                attached: Box::new(attached),
-                            })
-                            .await
-                            .is_err()
+                        if !send_resynchronized(&client, session_id, &event_sender, attached).await
                         {
                             return;
                         }
@@ -683,17 +701,199 @@ async fn reconnecting_event_stream<F>(
                 }
                 Err(_error) => {}
             }
-            tracing::warn!(target: "bcode_tui::session_stream", %session_id,
-                retry_delay_ms = reconnect_delay.as_millis(),
-                "session reconnect or attachment failed; retrying");
-            tokio::time::sleep(reconnect_delay).await;
-            reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(2));
+            reconnect_delay = wait_before_reconnect(session_id, reconnect_delay).await;
         }
     }
 }
 
+async fn wait_before_reconnect(
+    session_id: SessionId,
+    delay: std::time::Duration,
+) -> std::time::Duration {
+    tracing::warn!(target: "bcode_tui::session_stream", %session_id,
+        retry_delay_ms = delay.as_millis(),
+        "session reconnect or attachment failed; retrying");
+    tokio::time::sleep(delay).await;
+    (delay * 2).min(std::time::Duration::from_secs(2))
+}
+
+async fn receive_with_queue_refresh<F, T>(
+    client: &BcodeClient,
+    session_id: SessionId,
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+    mut deadline: std::pin::Pin<&mut tokio::time::Sleep>,
+    receive: F,
+) -> Option<T>
+where
+    F: std::future::Future<Output = Option<T>>,
+{
+    tokio::pin!(receive);
+    loop {
+        tokio::select! {
+            result = &mut receive => return result,
+            () = sender.closed() => return None,
+            () = deadline.as_mut() => {
+                if !send_queue_status(client, session_id, sender).await { return None; }
+                deadline.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+async fn send_queue_status(
+    client: &BcodeClient,
+    session_id: SessionId,
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+) -> bool {
+    send_queue_status_with_retry(
+        session_id,
+        sender,
+        || client.queue_status(session_id),
+        std::time::Duration::from_secs(1),
+    )
+    .await
+}
+
+async fn send_queue_status_with_retry<F, Fut>(
+    session_id: SessionId,
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+    mut fetch: F,
+    delay: std::time::Duration,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<bcode_session_models::SubmissionQueueStatus, bcode_client::ClientError>,
+        >,
+{
+    for attempt in 0..4 {
+        if let Ok(status) = fetch().await {
+            return sender
+                .send(SessionStreamUpdate::QueueStatus {
+                    session_id,
+                    status: Box::new(status),
+                })
+                .await
+                .is_ok();
+        }
+        if attempt == 0
+            && sender
+                .send(SessionStreamUpdate::QueueUnavailable { session_id })
+                .await
+                .is_err()
+        {
+            return false;
+        }
+        if attempt < 3 {
+            tokio::select! {
+                () = sender.closed() => return false,
+                () = tokio::time::sleep(delay.saturating_mul(1 << attempt)) => {}
+            }
+        }
+    }
+    true
+}
+
+async fn forward_stream_event(
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+    pending: &mut BTreeMap<SupersedableEventKey, BcodeEvent>,
+    event: BcodeEvent,
+) -> Option<bool> {
+    if let Some(key) = supersedable_event_key(&event) {
+        let was_empty = pending.is_empty();
+        pending.insert(key, event);
+        if pending.len() >= MAX_PENDING_PROGRESS_KEYS
+            && !flush_superseded_progress(sender, pending).await
+        {
+            return None;
+        }
+        Some(was_empty)
+    } else {
+        send_canonical_event(sender, pending, event)
+            .await
+            .then_some(false)
+    }
+}
+
+async fn send_resynchronized(
+    client: &BcodeClient,
+    session_id: SessionId,
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+    attached: bcode_client::AttachedSessionHistory,
+) -> bool {
+    if sender
+        .send(SessionStreamUpdate::Resynchronized {
+            session_id,
+            attached: Box::new(attached),
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    send_queue_status(client, session_id, sender).await
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn queue_hydration_failure_is_visible_and_recovers_without_lifecycle_events() {
+        let session_id = SessionId::new();
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut attempts = 0;
+        let started = std::time::Instant::now();
+        let result = send_queue_status_with_retry(
+            session_id,
+            &sender,
+            || {
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Err(bcode_client::ClientError::UnexpectedResponse)
+                } else {
+                    Ok(bcode_session_models::SubmissionQueueStatus {
+                        oldest: None,
+                        blocker: None,
+                    })
+                })
+            },
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(result);
+        assert_eq!(attempts, 2);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1));
+        assert!(
+            matches!(receiver.recv().await, Some(SessionStreamUpdate::QueueUnavailable { session_id: actual }) if actual == session_id)
+        );
+        assert!(
+            matches!(receiver.recv().await, Some(SessionStreamUpdate::QueueStatus { status, .. }) if status.oldest.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_hydration_retry_budget_is_finite_and_preserves_unavailable_state() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut attempts = 0;
+        assert!(
+            send_queue_status_with_retry(
+                SessionId::new(),
+                &sender,
+                || {
+                    attempts += 1;
+                    std::future::ready(Err(bcode_client::ClientError::UnexpectedResponse))
+                },
+                std::time::Duration::from_millis(1)
+            )
+            .await
+        );
+        assert_eq!(attempts, 4);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SessionStreamUpdate::QueueUnavailable { .. })
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -22,6 +22,19 @@ use switchy_database::query::{
 };
 use switchy_database::{Database, DatabaseError, DatabaseValue as V, Row, TransactionMode};
 
+fn receipt_redelivery_status(status: &str) -> bool {
+    matches!(
+        status,
+        "admitted"
+            | "running"
+            | "cancelling"
+            | "sibling_cancelling"
+            | "succeeded"
+            | "failed"
+            | "cancelled"
+    )
+}
+
 impl WorkflowStore {
     /// Persist an external admission/service receipt after dispatch.
     ///
@@ -41,8 +54,9 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Rejects stale authority, malformed or conflicting receipts, terminal attempts,
-    /// oversized data, and persistence failures.
+    /// Rejects stale authority, malformed, conflicting or oversized receipts, new receipts for
+    /// terminal attempts, and persistence failures. Exact receipt redelivery is non-mutating,
+    /// including after terminal settlement.
     pub fn persist_owned_dispatch_receipt(
         &self,
         receipt: &DispatchReceipt,
@@ -167,11 +181,9 @@ impl WorkflowStore {
             ),
         )?;
         if changed != 1 {
-            if matches!(
-                status.as_str(),
-                "admitted" | "running" | "cancelling" | "sibling_cancelling"
-            ) && database::optional_text(&row, "receipt_json")?.as_deref()
+            if database::optional_text(&row, "receipt_json")?.as_deref()
                 == Some(receipt_json.as_str())
+                && receipt_redelivery_status(&status)
             {
                 return Ok(());
             }

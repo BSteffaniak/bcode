@@ -1,5 +1,9 @@
 use super::*;
 
+// Each fixture independently proves provider overlap for up to 100 members.
+// Do not make two host-saturation fixtures compete for the same process resources.
+static FANOUT_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn fanout_definition(
     leaf: bcode_workflow::NodeDefinition,
     count: u32,
@@ -35,8 +39,9 @@ fn fanout_definition(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fanout_real_provider_members_overlap_at_32_and_100() {
+    let _fixture = FANOUT_FIXTURE.lock().await;
     for count in [32, 100] {
         Box::pin(fanout_overlap(count)).await;
     }
@@ -193,8 +198,9 @@ impl Drop for ReleaseGate {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn normal_start_fanout_respects_cap8_and_uncapped32() {
+    let _fixture = FANOUT_FIXTURE.lock().await;
     for cap in [Some(8), None] {
         let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
         let mut cleanup = FixtureCleanup::new(&state);

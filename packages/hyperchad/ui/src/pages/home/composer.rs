@@ -93,7 +93,7 @@ pub(super) fn composer(
             @if let Some(session_id) = snapshot.session_id {
                 form hx-post=(context.action_target(PresentationAction::CancelTurn)) hx-target="#bcode-web-shell" hx-swap=this margin-top=((space::S10)) {
                     input type=hidden name="session_id" value=(session_id.to_string());
-                    input type=hidden name="clear_queue" value="true";
+                    input type=hidden name="clear_queue" value="false";
                     button type=submit background=(accent::DESTRUCTIVE) color=(color::ON_ACCENT) border-radius=((radius::CONTROL)) padding="8, 14" {
                         "Cancel active turn"
                     }

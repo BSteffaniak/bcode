@@ -1645,6 +1645,12 @@ impl SessionCostSummary {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeViewState {
+    /// Authoritative bounded queue state, independent of the loaded transcript window.
+    #[serde(default)]
+    pub submission_queue: Option<bcode_session_models::SubmissionQueueStatus>,
+    /// Queue observation failed; retained state is not currently authoritative.
+    #[serde(default)]
+    pub submission_queue_unavailable: bool,
     /// Selected provider plugin, when known.
     pub provider_plugin_id: Option<String>,
     /// User-facing requested model selection, when known.
@@ -1679,6 +1685,89 @@ pub struct SessionRuntimeViewState {
     pub last_turn_message: Option<String>,
     /// Current provider-stream progress, when an active stream exposed status.
     pub provider_progress: Option<ProviderProgressView>,
+}
+
+impl SessionRuntimeViewState {
+    /// Session-level recovery presentation, independent of resident history.
+    #[allow(clippy::must_use_candidate)] // Option already carries must-use semantics.
+    pub fn queue_recovery(&self) -> Option<SubmissionQueueRecoveryView> {
+        use bcode_session_models::SubmissionQueueBlocker as Blocker;
+        if self.submission_queue_unavailable {
+            return None;
+        }
+        let status = self.submission_queue.as_ref()?;
+        let record = status.oldest.as_ref()?;
+        let blocker = status.blocker?;
+        let (reason, can_resume, can_cancel) = match blocker {
+            Blocker::MissingContext => (
+                "The oldest queued message is missing its execution settings. Newer messages are waiting behind it.",
+                true,
+                true,
+            ),
+            Blocker::IncompatibleContext => (
+                "The oldest queued message's execution settings are no longer compatible. Newer messages are waiting behind it.",
+                true,
+                true,
+            ),
+            Blocker::InterruptedTurn => (
+                "This message's previous turn was interrupted. Resuming it could repeat effects; inspect its turn before recovering it.",
+                false,
+                false,
+            ),
+            Blocker::WorkflowAuthorityRequired => (
+                "This queued message belongs to a workflow. Resume or cancel it through the workflow's authorized controls.",
+                false,
+                false,
+            ),
+            Blocker::SteeringTargetUnavailable => (
+                "The turn targeted by this steering message is no longer available. Cancel this item to unblock later messages.",
+                false,
+                true,
+            ),
+        };
+        Some(SubmissionQueueRecoveryView {
+            submission_id: record.receipt.submission_id.clone(),
+            expected_accepted_sequence: record.receipt.accepted_event_sequence,
+            reason: reason.to_owned(),
+            can_resume,
+            can_cancel,
+        })
+    }
+}
+
+/// Shared recovery semantics; renderers adapt these controls without reinterpreting safety.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionQueueRecoveryView {
+    /// Exact pending item.
+    pub submission_id: bcode_session_models::SubmissionId,
+    /// Receipt sequence required by recovery actions.
+    pub expected_accepted_sequence: u64,
+    /// Plain-language session-level blocker, containing no prompt or configuration secrets.
+    pub reason: String,
+    /// Whether preparing an explicit resume confirmation is available.
+    pub can_resume: bool,
+    /// Whether cancellation of this pending item is available.
+    pub can_cancel: bool,
+}
+
+/// Display only the secret-free selection approved by the prepare operation.
+#[must_use]
+pub fn submission_resume_settings(
+    confirmation: &bcode_session_models::SubmissionResumeConfirmation,
+) -> String {
+    let descriptor = &confirmation.descriptor;
+    format!(
+        "Provider: {}\nModel: {}\nModel profile: {}\nAuth profile: {}\nAuth pool: {}\nThis resumes only this queued message. Existing permission checks still apply.",
+        descriptor.provider,
+        descriptor.model,
+        descriptor.model_profile.as_deref().unwrap_or("none"),
+        descriptor.auth_profile.as_deref().unwrap_or("none"),
+        descriptor
+            .recovery_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.auth_pool.as_deref())
+            .unwrap_or("none")
+    )
 }
 
 /// Renderer-neutral provider stream progress.
@@ -1856,6 +1945,16 @@ pub enum SessionViewActionOutcome {
         /// Authoritative admission disposition.
         disposition: MessageAcceptanceDispositionView,
     },
+    /// Read-only exact settings prepared for explicit confirmation.
+    SubmissionResumePrepared {
+        /// Secret-free execution confirmation; preparation never starts work.
+        confirmation: bcode_session_models::SubmissionResumeConfirmation,
+    },
+    /// Targeted durable queue recovery result.
+    SubmissionRecovered {
+        /// Exact record and duplicate-operation disposition.
+        result: Box<bcode_session_models::SubmissionRecoveryResult>,
+    },
     /// Cancellation request result.
     Cancelled { cancelled: bool },
     /// Permission resolution result.
@@ -1909,6 +2008,35 @@ pub enum SessionViewAction {
         /// Provider-neutral execution options captured for this exact admitted turn.
         #[serde(default)]
         execution: Box<bcode_session_models::TurnExecutionOptions>,
+    },
+    /// Prepare a pending item using requester settings without authorizing execution.
+    PrepareSubmissionResume {
+        /// Owning session.
+        session_id: SessionId,
+        /// Exact pending item.
+        submission_id: bcode_session_models::SubmissionId,
+        /// Receipt sequence guarding against stale selections.
+        expected_accepted_sequence: u64,
+    },
+    /// Resume exactly the settings explicitly displayed and confirmed by the user.
+    ResumeSubmission {
+        /// Owning session.
+        session_id: SessionId,
+        /// Exact prepared confirmation, never reconstructed from renderer settings.
+        confirmation: bcode_session_models::SubmissionResumeConfirmation,
+        /// Stable idempotency identity for this operation.
+        operation_id: String,
+    },
+    /// Cancel one pending item, not the active turn or the whole queue.
+    CancelPendingSubmission {
+        /// Owning session.
+        session_id: SessionId,
+        /// Exact pending item.
+        submission_id: bcode_session_models::SubmissionId,
+        /// Receipt sequence guarding against stale selections.
+        expected_accepted_sequence: u64,
+        /// Stable idempotency identity for this operation.
+        operation_id: String,
     },
     /// Cancel the active model turn.
     CancelTurn {

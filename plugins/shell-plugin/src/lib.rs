@@ -5500,7 +5500,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Linux retains the PTY master until inherited slave handles close. macOS
+    // instead reports EOF when the controlling session leader exits.
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_capture_deadline_covers_inherited_stdin() {
         let environment = isolated_config_environment("inherited-stdin");
@@ -5532,7 +5534,8 @@ mod tests {
         );
         assert!(
             response.is_error,
-            "incomplete capture must not report success"
+            "incomplete capture must not report success: {}",
+            response.output
         );
         assert!(response.output.contains("timed out"), "{}", response.output);
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -5542,7 +5545,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_capture_cancellation_interrupts_inherited_stdin() {
         let environment = isolated_config_environment("cancel-inherited-stdin");
@@ -5580,6 +5583,42 @@ mod tests {
         assert!(response.is_error);
         assert!(response.output.contains("cancelled"), "{}", response.output);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_capture_finishes_when_controlling_session_exits_with_inherited_stdin() {
+        let environment = isolated_config_environment("inherited-stdin-eof");
+        let dir = tempfile::tempdir().expect("artifacts");
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "inherited-stdin-eof",
+            &ShellRunArguments {
+                command: "python3 -c 'import subprocess; subprocess.Popen([\"sleep\", \"2\"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); print(\"launched\")'".to_owned(),
+                cwd: None,
+                timeout_ms: Some(10_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(dir.path()),
+                input_bridge: None,
+                primary_presentation: None,
+            },
+            &environment,
+        );
+        assert!(!response.is_error, "{}", response.output);
+        let output: serde_json::Value = serde_json::from_str(&response.output).unwrap();
+        assert_eq!(output["exit_code"], 0);
+        assert_eq!(output["timed_out"], false);
+        assert_eq!(output["cancelled"], false);
+        assert!(output["output"].as_str().unwrap().contains("launched"));
+        assert!(response.result.is_some(), "EOF permits complete replay");
     }
 
     #[cfg(unix)]

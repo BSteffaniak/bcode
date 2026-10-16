@@ -406,6 +406,26 @@ pub enum SessionTurnRequest {
         after: Option<u64>,
         limit: u32,
     },
+    /// Read the oldest queued item and its blocker.
+    SubmissionQueueStatus {
+        session_id: SessionId,
+    },
+    PrepareSubmissionResume {
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        expected_accepted_sequence: u64,
+    },
+    ResumeSubmission {
+        session_id: SessionId,
+        confirmation: bcode_session_models::SubmissionResumeConfirmation,
+        operation_id: String,
+    },
+    CancelPendingSubmission {
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        expected_accepted_sequence: u64,
+        operation_id: String,
+    },
     /// Submit an ordinary turn through generic admission metadata.
     SubmitTurn {
         session_id: SessionId,
@@ -1206,6 +1226,38 @@ impl RoutedRequest {
                 placement,
                 admission,
                 require_active_turn,
+            }),
+            Request::SubmissionQueueStatus { session_id } => {
+                Self::SessionTurn(SessionTurnRequest::SubmissionQueueStatus { session_id })
+            }
+            Request::PrepareSubmissionResume {
+                session_id,
+                submission_id,
+                expected_accepted_sequence,
+            } => Self::SessionTurn(SessionTurnRequest::PrepareSubmissionResume {
+                session_id,
+                submission_id,
+                expected_accepted_sequence,
+            }),
+            Request::ResumeSubmission {
+                session_id,
+                confirmation,
+                operation_id,
+            } => Self::SessionTurn(SessionTurnRequest::ResumeSubmission {
+                session_id,
+                confirmation,
+                operation_id,
+            }),
+            Request::CancelPendingSubmission {
+                session_id,
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+            } => Self::SessionTurn(SessionTurnRequest::CancelPendingSubmission {
+                session_id,
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
             }),
             Request::PendingSubmissions {
                 session_id,

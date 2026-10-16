@@ -1414,6 +1414,62 @@ library = "libtest_wait_second.dylib"
         super::super::tests::test_server_state_with_plugins(sessions, runtime)
     }
 
+    // The real filesystem plugin evaluates Git's ambient ignore sources. Run these
+    // integration fixtures in a separate process with ordinary, isolated sources;
+    // changing process-global environment inside parallel async tests is unsafe.
+    fn isolated_git_fixture(test: &str) -> bool {
+        const MARKER: &str = "BCODE_SERVER_ISOLATED_GIT_FIXTURE";
+        if std::env::var(MARKER).as_deref() == Ok(test) {
+            return false;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/git")).unwrap();
+        let config = home.path().join("gitconfig");
+        std::fs::write(&config, "").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_CONFIG") {
+                child.env_remove(name);
+            }
+        }
+        let output = child
+            .args(["--exact", test, "--nocapture"])
+            .env(MARKER, test)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", config)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    fn stage_fixture_paths(root: &Path, paths: &[&str]) {
+        for args in [
+            vec!["init", "--quiet"],
+            [vec!["add", "--"], paths.to_vec()].concat(),
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     fn real_composer_state(root: &Path, enabled: bool) -> ServerState {
         let plugins = [
             bcode_plugin::StaticBundledPlugin::new(
@@ -1557,9 +1613,15 @@ library = "libtest_wait_second.dylib"
             ComposerActivation, ComposerDocument, ComposerSearchRequest, ComposerSnapshot,
             ComposerTextRange,
         };
+        if isolated_git_fixture(
+            "plugin_context::tests::real_session_owned_composer_search_over_ipc",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("visible.rs"), "NO_CONTENT_IN_RESPONSE").unwrap();
+        stage_fixture_paths(&root, &["visible.rs"]);
         let state = std::sync::Arc::new(real_composer_state(&temp.path().join("sessions"), true));
         let session = state
             .sessions
@@ -1711,12 +1773,18 @@ library = "libtest_wait_second.dylib"
         use bcode_plugin_sdk::composer::{
             ComposerContinuation, ComposerDocument, ComposerSnapshot, ComposerSnapshotState,
         };
+        if isolated_git_fixture(
+            "plugin_context::tests::real_composer_filesystem_resource_ignore_chain_and_disabled_route",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join(".gitignore"), "excluded.rs\n").unwrap();
         std::fs::write(root.join("excluded.rs"), "EXCLUDED_CONTENT_MARKER").unwrap();
         std::fs::write(root.join("文件 space.rs"), "VISIBLE_CONTENT_MARKER").unwrap();
+        stage_fixture_paths(&root, &[".gitignore", "文件 space.rs"]);
         let root = root.canonicalize().unwrap();
         let state = real_composer_state(&temp.path().join("sessions"), true);
         let response = search_real_composer(&state, &root).await.unwrap();
@@ -1763,10 +1831,16 @@ library = "libtest_wait_second.dylib"
 
     #[tokio::test]
     async fn nested_declared_discovery_routes_through_bound_workspace_grant() {
+        if isolated_git_fixture(
+            "plugin_context::tests::nested_declared_discovery_routes_through_bound_workspace_grant",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(workspace.join("visible.rs"), "not read by discovery").unwrap();
+        stage_fixture_paths(&workspace, &["visible.rs"]);
         let state = bridge_state(&temp.path().join("sessions"));
         let bound = bound_fixture(workspace.canonicalize().unwrap());
         let request = bcode_tool::ToolInvocationServiceRequest {
@@ -1775,7 +1849,7 @@ library = "libtest_wait_second.dylib"
             route_id: None,
             interface_id: "bcode.filesystem/v1".into(),
             operation: "search_paths".into(),
-            payload: serde_json::json!({"query":"visible", "directory":"", "recursive":true, "scope":"workspace"}),
+            payload: serde_json::json!({"query":"visible", "directory":"", "recursive":true, "scope":"workspace", "timeout_ms":1000}),
         };
         let result = route_nested(&state, &bound, request.clone(), 1).await;
         let ToolInvocationServiceResolution::Responded { payload } = result else {

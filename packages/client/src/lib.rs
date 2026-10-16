@@ -1389,12 +1389,13 @@ mod startup_environment_tests {
 
 fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
     let working_directory = current_working_directory();
-    let config = bcode_config::load_config().map_err(|_| {
-        ClientError::Protocol(
-            "Client configuration could not be loaded; daemon defaults were not substituted."
-                .to_owned(),
-        )
-    })?;
+    let (config, launch) = bcode_config::recovery::load_current_config_with_recovery_context()
+        .map_err(|_| {
+            ClientError::Protocol(
+                "Client configuration could not be loaded; daemon defaults were not substituted."
+                    .to_owned(),
+            )
+        })?;
     let effective_config_toml =
         Some(bcode_config::encode_effective_config(&config).map_err(|_| {
             ClientError::Protocol(
@@ -1430,6 +1431,7 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
         resolved,
         provider_context,
         env,
+        Some(launch),
     ))
 }
 
@@ -1439,6 +1441,7 @@ fn runtime_context_from_selection(
     resolved: bcode_config::ResolvedModelSelection,
     mut provider_context: bcode_model::ProviderRequestContext,
     process_env: BTreeMap<String, String>,
+    launch: Option<bcode_config::ConfigLaunchContext>,
 ) -> ClientRuntimeContext {
     // Process environment retains its existing precedence, but do not mix credentials
     // from unselected pool candidates into the selected account's environment.
@@ -1450,9 +1453,7 @@ fn runtime_context_from_selection(
         .map(|key| (key, true))
         .collect();
     ClientRuntimeContext {
-        config_launch: Some(Box::new(bcode_config::config_launch_context(
-            &working_directory,
-        ))),
+        config_launch: launch.map(Box::new),
         working_directory: Some(working_directory),
         effective_config_toml: effective_config_toml.map(Box::new),
         selected_provider_plugin_id: resolved.provider_plugin_id,
@@ -1566,6 +1567,7 @@ mod runtime_context_auth_tests {
             },
             provider_context,
             process_env.clone(),
+            None,
         );
         assert_eq!(
             context.provider_context.auth_profile.as_deref(),
@@ -1590,6 +1592,7 @@ mod runtime_context_auth_tests {
                 ..Default::default()
             },
             BTreeMap::from([("SETTING".to_owned(), "shell-value".to_owned())]),
+            None,
         );
         assert_eq!(context.provider_context.env["SETTING"], "shell-value");
         assert_eq!(
@@ -4089,6 +4092,97 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::PendingSubmissions { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Observe the oldest pending acceptance and its current recovery blocker.
+    ///
+    /// # Errors
+    /// Returns storage, transport, or unexpected-response errors.
+    pub async fn queue_status(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bcode_session_models::SubmissionQueueStatus, ClientError> {
+        match self
+            .send_request(Request::SubmissionQueueStatus { session_id })
+            .await?
+        {
+            ResponsePayload::SubmissionQueueStatus { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Prepare the requesting client's exact secret-free recovery recipe for confirmation.
+    /// This read-only operation does not authorize or dispatch execution.
+    ///
+    /// # Errors
+    /// Returns stale acceptance, unavailable context, workflow authority, transport, or response errors.
+    pub async fn prepare_submission_resume(
+        &self,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        expected_accepted_sequence: u64,
+    ) -> Result<bcode_session_models::SubmissionResumeConfirmation, ClientError> {
+        match self
+            .send_request(Request::PrepareSubmissionResume {
+                session_id,
+                submission_id,
+                expected_accepted_sequence,
+            })
+            .await?
+        {
+            ResponsePayload::SubmissionResumePrepared { confirmation } => Ok(confirmation),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Authorize only the exact confirmed pending acceptance. Retain `operation_id` for retries.
+    /// This never resumes ambiguous tool execution or reopens a terminal turn.
+    ///
+    /// # Errors
+    /// Returns conflicting duplicate, stale confirmation, workflow authority, storage, or transport errors.
+    pub async fn resume_submission(
+        &self,
+        session_id: SessionId,
+        confirmation: bcode_session_models::SubmissionResumeConfirmation,
+        operation_id: String,
+    ) -> Result<bcode_session_models::SubmissionRecoveryResult, ClientError> {
+        match self
+            .send_request(Request::ResumeSubmission {
+                session_id,
+                confirmation,
+                operation_id,
+            })
+            .await?
+        {
+            ResponsePayload::SubmissionRecovered { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Cancel one exact pending acceptance without cancelling active work or clearing the queue.
+    /// Retain the acceptance sequence and `operation_id` unchanged for retries.
+    ///
+    /// # Errors
+    /// Returns stale acceptance, conflicting duplicate, workflow authority, storage, or transport errors.
+    pub async fn cancel_pending_submission(
+        &self,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        expected_accepted_sequence: u64,
+        operation_id: String,
+    ) -> Result<bcode_session_models::SubmissionRecoveryResult, ClientError> {
+        match self
+            .send_request(Request::CancelPendingSubmission {
+                session_id,
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+            })
+            .await?
+        {
+            ResponsePayload::SubmissionRecovered { result } => Ok(result),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

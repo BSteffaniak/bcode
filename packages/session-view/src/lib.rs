@@ -7,13 +7,18 @@
 //! This crate owns the application of durable and live session events into semantic view state that
 //! terminal, web, and future renderers can consume without inheriting terminal layout concerns.
 
+#[cfg(test)]
+mod queue_tests;
+
 mod actions;
 pub mod child_activity;
 pub mod child_attention;
 pub mod navigation;
 pub mod presentation;
 
-pub use actions::execute_session_view_action;
+pub use actions::{
+    execute_session_view_action, hydrate_submission_queue, submission_queue_needs_refresh,
+};
 
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionId, SessionLiveEvent, SessionLiveEventKind,
@@ -639,6 +644,10 @@ impl SessionView {
 
     /// Apply canonical session metadata from an attach or catalog response.
     pub fn set_session_summary(&mut self, summary: bcode_session_models::SessionSummary) {
+        if self.snapshot.session_id != Some(summary.id) {
+            self.snapshot.runtime.submission_queue = None;
+            self.snapshot.runtime.submission_queue_unavailable = false;
+        }
         let title = summary.title().map(ToOwned::to_owned);
         let changed = self.snapshot.session_id != Some(summary.id)
             || title
@@ -656,6 +665,38 @@ impl SessionView {
         self.snapshot.working_directory = Some(summary.working_directory.clone());
         self.snapshot.session_summary = Some(summary);
         self.bump_revision();
+    }
+
+    fn clear_submission_queue_item(&mut self, submission_id: &bcode_session_models::SubmissionId) {
+        if self
+            .snapshot
+            .runtime
+            .submission_queue
+            .as_ref()
+            .and_then(|status| status.oldest.as_ref())
+            .is_some_and(|record| &record.receipt.submission_id == submission_id)
+        {
+            self.snapshot.runtime.submission_queue = None;
+        }
+    }
+
+    /// Replace authoritative queue state without consulting or replaying transcript history.
+    pub fn set_submission_queue(&mut self, status: bcode_session_models::SubmissionQueueStatus) {
+        if self.snapshot.runtime.submission_queue_unavailable
+            || self.snapshot.runtime.submission_queue.as_ref() != Some(&status)
+        {
+            self.snapshot.runtime.submission_queue_unavailable = false;
+            self.snapshot.runtime.submission_queue = Some(status);
+            self.bump_revision();
+        }
+    }
+
+    /// Mark a failed bounded queue read without presenting an error as execution state.
+    pub const fn set_submission_queue_unavailable(&mut self) {
+        if !self.snapshot.runtime.submission_queue_unavailable {
+            self.snapshot.runtime.submission_queue_unavailable = true;
+            self.bump_revision();
+        }
     }
 
     /// Replace composer draft state.
@@ -1331,6 +1372,7 @@ impl SessionView {
                 admission,
                 ..
             } => {
+                self.clear_submission_queue_item(submission_id);
                 let id = TranscriptViewItemId::new(format!("submission:{}", submission_id.0));
                 if self.snapshot.transcript.items.iter().any(|item| item.id == id &&
                     (matches!(&item.kind, TranscriptViewItemKind::UserMessage { message } if matches!(message.submission_status, Some(bcode_session_models::SubmissionStatus::Cancelled { .. })))
@@ -1369,7 +1411,9 @@ impl SessionView {
                     },
                 );
             }
-            SessionEventKind::SubmissionCancelled { submission_id } => {
+            SessionEventKind::SubmissionCancelled { submission_id }
+            | SessionEventKind::SubmissionPendingCancelled { submission_id, .. } => {
+                self.clear_submission_queue_item(submission_id);
                 let id = TranscriptViewItemId::new(format!("submission:{}", submission_id.0));
                 let message = self
                     .snapshot
@@ -3633,6 +3677,12 @@ impl SessionView {
     ///
     /// Callers resolve missing acceptance payloads through the application client, never replay.
     pub fn apply_submission_record(&mut self, record: &bcode_session_models::SubmissionRecord) {
+        if !matches!(
+            record.status,
+            bcode_session_models::SubmissionStatus::Pending
+        ) {
+            self.clear_submission_queue_item(&record.receipt.submission_id);
+        }
         let id = TranscriptViewItemId::new(format!("submission:{}", record.submission.id.0));
         let sequence = match record.status {
             bcode_session_models::SubmissionStatus::Pending => {
@@ -6630,6 +6680,7 @@ mod tests {
             },
         ));
         hydrated.apply_submission_record(&SubmissionRecord {
+            recovery_authorization: None,
             context_observation: None,
             receipt: SubmissionReceipt {
                 submission_id: id.clone(),
@@ -6659,6 +6710,59 @@ mod tests {
         assert_cancelled_submission_stays_terminal(session_id, id, submission, &activation);
     }
 
+    #[test]
+    fn queue_blocker_survives_history_window_changes_and_clears_only_targeted_lifecycle() {
+        use bcode_session_models::*;
+        let session_id = SessionId::new();
+        let id = SubmissionId("oldest-outside-window".to_owned());
+        let record = SubmissionRecord {
+            receipt: SubmissionReceipt {
+                submission_id: id.clone(),
+                accepted_event_sequence: 1,
+            },
+            submission: PromptSubmission {
+                id: id.clone(),
+                client_id: ClientId::new(),
+                text: "hidden prompt".to_owned(),
+                admission: TurnAdmissionMetadata::default(),
+                requested_placement: SubmissionPlacement::FollowUp,
+                target: SubmissionTarget::OwnTurn {
+                    turn_id: TurnId("target".to_owned()),
+                },
+                execution_descriptor: None,
+            },
+            status: SubmissionStatus::Pending,
+            context_observation: None,
+            recovery_authorization: None,
+        };
+        let mut view = SessionView::new();
+        view.set_submission_queue(SubmissionQueueStatus {
+            oldest: Some(record),
+            blocker: Some(SubmissionQueueBlocker::MissingContext),
+        });
+        view.clear_history_window();
+        assert!(view.snapshot().runtime.queue_recovery().is_some());
+        assert!(view.snapshot().transcript.items.is_empty());
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::SubmissionCancelled {
+                submission_id: SubmissionId("another".to_owned()),
+            },
+        ));
+        assert!(view.snapshot().runtime.queue_recovery().is_some());
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::SubmissionPendingCancelled {
+                submission_id: id,
+                expected_accepted_sequence: 1,
+                operation_id: "cancel-one".to_owned(),
+            },
+        ));
+        assert!(view.snapshot().runtime.queue_recovery().is_none());
+    }
+
     fn assert_cancelled_submission_stays_terminal(
         session_id: SessionId,
         id: bcode_session_models::SubmissionId,
@@ -6675,6 +6779,7 @@ mod tests {
             },
         ));
         cancelled.apply_submission_record(&SubmissionRecord {
+            recovery_authorization: None,
             context_observation: None,
             receipt: SubmissionReceipt {
                 submission_id: id,
@@ -6707,6 +6812,7 @@ mod tests {
         let id = SubmissionId("blocked".to_owned());
         let mut view = SessionView::new();
         let mut record = SubmissionRecord {
+            recovery_authorization: None,
             receipt: SubmissionReceipt {
                 submission_id: id.clone(),
                 accepted_event_sequence: 1,

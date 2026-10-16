@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 15;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 16;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -708,7 +708,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 51;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 52;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -719,6 +719,8 @@ pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
     "submission_activated",
     "submission_cancelled",
     "submission_context_observed",
+    "submission_recovery_authorized",
+    "submission_pending_cancelled",
     "agent_changed",
     "assistant_delta",
     "assistant_message",
@@ -793,6 +795,8 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
         SessionEventKind::SubmissionAccepted { .. } => "submission_accepted",
         SessionEventKind::SubmissionActivated { .. } => "submission_activated",
         SessionEventKind::SubmissionCancelled { .. } => "submission_cancelled",
+        SessionEventKind::SubmissionRecoveryAuthorized { .. } => "submission_recovery_authorized",
+        SessionEventKind::SubmissionPendingCancelled { .. } => "submission_pending_cancelled",
         SessionEventKind::SubmissionContextObserved { .. } => "submission_context_observed",
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
@@ -4441,6 +4445,19 @@ pub enum SessionEventKind {
         submission_id: SubmissionId,
     },
     /// Nonterminal recovery observation; does not activate or remove pending input.
+    /// Append-only authorization, distinct from acceptance and activation.
+    SubmissionRecoveryAuthorized {
+        submission_id: SubmissionId,
+        expected_accepted_sequence: u64,
+        operation_id: String,
+        descriptor: SubmissionExecutionDescriptor,
+    },
+    /// Targeted cancellation with a durable conflicting-retry identity.
+    SubmissionPendingCancelled {
+        submission_id: SubmissionId,
+        expected_accepted_sequence: u64,
+        operation_id: String,
+    },
     SubmissionContextObserved {
         submission_id: SubmissionId,
         issue: SubmissionContextIssue,

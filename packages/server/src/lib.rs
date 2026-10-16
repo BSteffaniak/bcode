@@ -43,6 +43,9 @@ pub mod storage_maintenance;
 pub mod storage_maintenance_worker;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod storage_read_admission;
+mod submission_recovery;
+#[cfg(test)]
+mod submission_recovery_tests;
 mod tool_catalog;
 mod tool_host_retry;
 mod trace_operations;
@@ -6510,6 +6513,10 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SubmitPrompt { session_id, .. }
         | Request::GetSubmission { session_id, .. }
         | Request::PendingSubmissions { session_id, .. }
+        | Request::SubmissionQueueStatus { session_id }
+        | Request::PrepareSubmissionResume { session_id, .. }
+        | Request::ResumeSubmission { session_id, .. }
+        | Request::CancelPendingSubmission { session_id, .. }
         | Request::InvokeSkill { session_id, .. }
         | Request::InvokeSkillWithExecution { session_id, .. }
         | Request::CancelSessionTurn { session_id, .. }
@@ -6605,6 +6612,10 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SubmitPrompt { .. } => "submit_prompt",
         Request::GetSubmission { .. } => "get_submission",
         Request::PendingSubmissions { .. } => "pending_submissions",
+        Request::SubmissionQueueStatus { .. } => "submission_queue_status",
+        Request::PrepareSubmissionResume { .. } => "prepare_submission_resume",
+        Request::ResumeSubmission { .. } => "resume_submission",
+        Request::CancelPendingSubmission { .. } => "cancel_pending_submission",
         Request::InvokeSkill { .. } => "invoke_skill",
         Request::InvokeSkillWithExecution { .. } => "invoke_skill_with_execution",
         Request::CancelSessionTurn { .. } => "cancel_session_turn",
@@ -7717,6 +7728,117 @@ async fn handle_turn_workflow_model_request(
                     "compatible active turn unavailable for steering",
                 )),
                 Err(error) => Response::Err(server_session_error_response(&error)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        SessionTurnRequest::SubmissionQueueStatus { session_id } => {
+            if let Some(active_namespace) = state
+                .active_session_namespace_mismatch(session_id, client_id)
+                .await
+            {
+                return send_incompatible_active_session_response(
+                    writer,
+                    request_id,
+                    &active_namespace,
+                )
+                .await;
+            }
+            let response = match submission_recovery::status(state, session_id).await {
+                Ok(status) => Response::Ok(ResponsePayload::SubmissionQueueStatus { status }),
+                Err(error) => Response::Err(error),
+            };
+            send_response(writer, request_id, response).await
+        }
+        SessionTurnRequest::PrepareSubmissionResume {
+            session_id,
+            submission_id,
+            expected_accepted_sequence,
+        } => {
+            if let Some(active_namespace) = state
+                .active_session_namespace_mismatch(session_id, client_id)
+                .await
+            {
+                return send_incompatible_active_session_response(
+                    writer,
+                    request_id,
+                    &active_namespace,
+                )
+                .await;
+            }
+            let response = match submission_recovery::prepare(
+                state,
+                session_id,
+                client_id,
+                submission_id,
+                expected_accepted_sequence,
+            )
+            .await
+            {
+                Ok(confirmation) => {
+                    Response::Ok(ResponsePayload::SubmissionResumePrepared { confirmation })
+                }
+                Err(error) => Response::Err(error),
+            };
+            send_response(writer, request_id, response).await
+        }
+        SessionTurnRequest::ResumeSubmission {
+            session_id,
+            confirmation,
+            operation_id,
+        } => {
+            if let Some(active_namespace) = state
+                .active_session_namespace_mismatch(session_id, client_id)
+                .await
+            {
+                return send_incompatible_active_session_response(
+                    writer,
+                    request_id,
+                    &active_namespace,
+                )
+                .await;
+            }
+            let response = match submission_recovery::resume(
+                state,
+                session_id,
+                client_id,
+                confirmation,
+                operation_id,
+            )
+            .await
+            {
+                Ok(result) => Response::Ok(ResponsePayload::SubmissionRecovered { result }),
+                Err(error) => Response::Err(error),
+            };
+            send_response(writer, request_id, response).await
+        }
+        SessionTurnRequest::CancelPendingSubmission {
+            session_id,
+            submission_id,
+            expected_accepted_sequence,
+            operation_id,
+        } => {
+            if let Some(active_namespace) = state
+                .active_session_namespace_mismatch(session_id, client_id)
+                .await
+            {
+                return send_incompatible_active_session_response(
+                    writer,
+                    request_id,
+                    &active_namespace,
+                )
+                .await;
+            }
+            let response = match submission_recovery::cancel(
+                state,
+                session_id,
+                submission_id,
+                expected_accepted_sequence,
+                operation_id,
+            )
+            .await
+            {
+                Ok(result) => Response::Ok(ResponsePayload::SubmissionRecovered { result }),
+                Err(error) => Response::Err(error),
             };
             send_response(writer, request_id, response).await
         }
@@ -15636,7 +15758,89 @@ fn submission_execution_descriptor(
         model_profile: context.model_profile.clone(),
         auth_profile: context.auth_profile.clone(),
         config_identity,
+        recovery_recipe: None,
     })
+}
+
+fn submission_execution_descriptor_with_recipe(
+    selection: &SessionModelSelection,
+    config: &bcode_config::BcodeConfig,
+    execution: &TurnExecutionOptions,
+    launch: Option<&bcode_config::ConfigLaunchContext>,
+) -> Option<bcode_session_models::SubmissionExecutionDescriptor> {
+    // Request-only context has no durable source and is never persisted implicitly.
+    if execution.request_context_id.is_some() {
+        return None;
+    }
+    let reference = match bcode_config::recovery::capture(config, launch) {
+        Ok(reference) => reference,
+        Err(error) => {
+            tracing::debug!(reason = %error, "queued submission requires explicit recovery context after restart");
+            return None;
+        }
+    };
+    if let Err(reason) =
+        bcode_provider_auth::recovery::capture_policy(config, &selection.provider_context)
+    {
+        tracing::debug!(
+            reason,
+            "queued submission has request-only provider policy; explicit recovery required after restart"
+        );
+        return None;
+    }
+    let context = &selection.provider_context;
+    Some(bcode_session_models::SubmissionExecutionDescriptor {
+        version: 2,
+        provider: selection.provider_plugin_id.clone()?,
+        model: selection.model_id.clone()?,
+        reasoning: Some(bcode_session_models::TurnReasoningOptions {
+            effort: selection.reasoning_effort.clone(),
+            summary: selection.reasoning_summary.clone(),
+        }),
+        model_profile: context.model_profile.clone(),
+        auth_profile: context.auth_profile.clone(),
+        config_identity: reference.execution_digest.clone(),
+        recovery_recipe: Some(Box::new(bcode_session_models::SubmissionRecoveryRecipe {
+            version: 1,
+            config_source: serde_json::from_value(serde_json::to_value(reference).ok()?).ok()?,
+            model_profile: context.model_profile.clone(),
+            auth_profile: context.auth_profile.clone(),
+            auth_pool: context.auth_pool.clone(),
+        })),
+    })
+}
+
+async fn capture_submission_execution_descriptor(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    config: &bcode_config::BcodeConfig,
+    execution: &TurnExecutionOptions,
+    launch: Option<&bcode_config::ConfigLaunchContext>,
+) -> Option<bcode_session_models::SubmissionExecutionDescriptor> {
+    let selection = selection.clone();
+    let config = config.clone();
+    let execution = execution.clone();
+    let launch = launch.cloned();
+    let descriptor = tokio::task::spawn_blocking(move || {
+        submission_execution_descriptor_with_recipe(
+            &selection,
+            &config,
+            &execution,
+            launch.as_ref(),
+        )
+    })
+    .await
+    .ok()
+    .flatten()?;
+    // Capture rejects session/provider overrides that the named source cannot reproduce.
+    let context = resolve_submission_context(state, session_id, &descriptor)
+        .await
+        .ok()?;
+    verify_submission_model_target(state, &descriptor, &context)
+        .await
+        .ok()?;
+    Some(descriptor)
 }
 
 async fn publish_submission_acceptance(
@@ -15765,6 +15969,21 @@ fn strict_steering_target_available(
         )
 }
 
+async fn prepare_submission_admission(
+    state: &ServerState,
+    session_id: SessionId,
+    admission: &mut bcode_session_models::TurnAdmissionMetadata,
+) -> Result<(), bcode_session::SessionError> {
+    admission.activity = None;
+    validate_interaction_route(state, session_id, &admission.execution).await?;
+    if admission.execution.agent_profile.is_none() {
+        admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
+    }
+    admission
+        .validate()
+        .map_err(bcode_session::SessionError::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_prompt_submission_inner(
     state: &Arc<ServerState>,
@@ -15776,14 +15995,7 @@ async fn enqueue_prompt_submission_inner(
     require_active_turn: bool,
     mut admission: bcode_session_models::TurnAdmissionMetadata,
 ) -> Result<bcode_session_models::SubmissionReceipt, ServerError> {
-    admission.activity = None;
-    validate_interaction_route(state, session_id, &admission.execution).await?;
-    if admission.execution.agent_profile.is_none() {
-        admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
-    }
-    admission
-        .validate()
-        .map_err(bcode_session::SessionError::from)?;
+    prepare_submission_admission(state, session_id, &mut admission).await?;
     let ownership = state
         .sessions
         .acquire_session_ownership(
@@ -15801,8 +16013,17 @@ async fn enqueue_prompt_submission_inner(
         .and_then(|context| context.effective_config_toml.as_deref())
         .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
         .unwrap_or_else(|| state.startup_config.clone());
-    let execution_descriptor =
-        submission_execution_descriptor(&requested_selection, &config, &admission.execution);
+    let execution_descriptor = capture_submission_execution_descriptor(
+        state,
+        session_id,
+        &requested_selection,
+        &config,
+        &admission.execution,
+        runtime_context
+            .as_ref()
+            .and_then(|context| context.config_launch.as_deref()),
+    )
+    .await;
     let handle = live_submission_runtime(state, session_id).await;
     let admission_lock = turn_admission_lock(state, session_id).await;
     let admission_guard = admission_lock.lock().await;
@@ -16005,7 +16226,17 @@ async fn admit_turn_inner(
         .and_then(|context| context.effective_config_toml.as_deref())
         .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
         .unwrap_or_else(|| state.startup_config.clone());
-    let descriptor = submission_execution_descriptor(&selection, &config, &admission.execution);
+    let descriptor = capture_submission_execution_descriptor(
+        state,
+        session_id,
+        &selection,
+        &config,
+        &admission.execution,
+        runtime_context
+            .as_ref()
+            .and_then(|context| context.config_launch.as_deref()),
+    )
+    .await;
     let (admission, events) = observe_turn_admission_result(
         state,
         &diagnostic_labels,
@@ -16337,6 +16568,139 @@ async fn prune_settled_dispatch_hints(
     Ok(())
 }
 
+async fn verify_submission_model_target(
+    state: &ServerState,
+    descriptor: &bcode_session_models::SubmissionExecutionDescriptor,
+    context: &ClientRuntimeContext,
+) -> Result<(), bcode_session_models::SubmissionContextIssue> {
+    let target = model_request_target::resolve_model_request_target(
+        state,
+        model_request_target::ModelRequestTargetInput {
+            provider_plugin_id: context.selected_provider_plugin_id.as_deref(),
+            selected_model_id: context.selected_model_id.as_deref(),
+            provider_context: &context.provider_context,
+        },
+    )
+    .await
+    .map_err(|_| bcode_session_models::SubmissionContextIssue::Unavailable)?;
+    if target.provider_plugin_id.as_deref() != Some(&descriptor.provider)
+        || target.model_id != descriptor.model
+    {
+        return Err(bcode_session_models::SubmissionContextIssue::Incompatible);
+    }
+    Ok(())
+}
+
+fn verified_submission_runtime_context(
+    descriptor: &bcode_session_models::SubmissionExecutionDescriptor,
+    working_directory: &Path,
+) -> Result<ClientRuntimeContext, bcode_session_models::SubmissionContextIssue> {
+    use bcode_session_models::SubmissionContextIssue;
+    if descriptor.version != 2 {
+        return Err(SubmissionContextIssue::Incompatible);
+    }
+    let recipe = descriptor
+        .recovery_recipe
+        .as_ref()
+        .ok_or(SubmissionContextIssue::Unavailable)?;
+    if recipe.version != 1
+        || recipe.model_profile != descriptor.model_profile
+        || recipe.auth_profile != descriptor.auth_profile
+    {
+        return Err(SubmissionContextIssue::Incompatible);
+    }
+    recipe
+        .config_source
+        .validate()
+        .map_err(|_| SubmissionContextIssue::Incompatible)?;
+    let reference: bcode_config::recovery::ConfigRecoveryReference = serde_json::from_value(
+        serde_json::to_value(&recipe.config_source)
+            .map_err(|_| SubmissionContextIssue::Incompatible)?,
+    )
+    .map_err(|_| SubmissionContextIssue::Incompatible)?;
+    if reference.execution_digest != descriptor.config_identity {
+        return Err(SubmissionContextIssue::Incompatible);
+    }
+    let roots = bcode_config::recovery::default_allowed_recovery_roots(working_directory)
+        .map_err(|_| SubmissionContextIssue::Unavailable)?;
+    let config = bcode_config::recovery::resolve_with_roots(&reference, &roots).map_err(
+        |error| match error {
+            bcode_config::recovery::ConfigRecoveryError::Changed
+            | bcode_config::recovery::ConfigRecoveryError::UnsupportedVersion => {
+                SubmissionContextIssue::Incompatible
+            }
+            _ => SubmissionContextIssue::Unavailable,
+        },
+    )?;
+    let original_selection = if let Some(profile) = recipe.model_profile.as_deref() {
+        config
+            .resolved_model_profile(profile)
+            .ok_or(SubmissionContextIssue::Incompatible)?
+    } else {
+        config.resolved_model_selection_with_environment(
+            &bcode_config::ConfigEnvironmentSnapshot::new(
+                BTreeMap::new(),
+                working_directory.to_owned(),
+            ),
+        )
+    };
+    if original_selection.provider_plugin_id.as_deref() != Some(descriptor.provider.as_str()) {
+        return Err(SubmissionContextIssue::Incompatible);
+    }
+    let provider_context = bcode_provider_auth::recovery::resolve(
+        &config,
+        recipe.model_profile.as_deref(),
+        recipe.auth_profile.as_deref(),
+        recipe.auth_pool.as_deref(),
+    )
+    .map_err(|_| SubmissionContextIssue::Unavailable)?;
+    Ok(ClientRuntimeContext {
+        working_directory: Some(reference.sources.cwd.clone()),
+        config_launch: Some(Box::new(bcode_config::ConfigLaunchContext {
+            recovery_sources: Some(reference.sources),
+            ..Default::default()
+        })),
+        effective_config_toml: Some(Box::new(
+            bcode_config::encode_effective_config(&config)
+                .map_err(|_| SubmissionContextIssue::Unavailable)?,
+        )),
+        selected_provider_plugin_id: original_selection.provider_plugin_id,
+        selected_model_id: original_selection.model_id,
+        requested_model_id: original_selection.selected_model_id,
+        provider_context,
+        ..Default::default()
+    })
+}
+
+async fn resolve_submission_context(
+    state: &ServerState,
+    session_id: SessionId,
+    descriptor: &bcode_session_models::SubmissionExecutionDescriptor,
+) -> Result<ClientRuntimeContext, bcode_session_models::SubmissionContextIssue> {
+    Box::pin(resolve_submission_context_inner(
+        state, session_id, descriptor,
+    ))
+    .await
+}
+
+async fn resolve_submission_context_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    descriptor: &bcode_session_models::SubmissionExecutionDescriptor,
+) -> Result<ClientRuntimeContext, bcode_session_models::SubmissionContextIssue> {
+    let session = state
+        .sessions
+        .session_summary(session_id)
+        .await
+        .map_err(|_| bcode_session_models::SubmissionContextIssue::Unavailable)?;
+    let descriptor = descriptor.clone();
+    tokio::task::spawn_blocking(move || {
+        verified_submission_runtime_context(&descriptor, &session.working_directory)
+    })
+    .await
+    .map_err(|_| bcode_session_models::SubmissionContextIssue::Unavailable)?
+}
+
 async fn recover_pending_submission_hint(
     state: &ServerState,
     session_id: SessionId,
@@ -16345,7 +16709,75 @@ async fn recover_pending_submission_hint(
     recover_pending_submission_hint_with_authority(state, session_id, record, false).await
 }
 
-async fn recover_pending_submission_hint_with_authority(
+async fn recover_submission_recipe(
+    state: &ServerState,
+    session_id: SessionId,
+    record: &bcode_session_models::SubmissionRecord,
+    expected: &bcode_session_models::SubmissionExecutionDescriptor,
+) -> Result<Option<FollowupCommand>, bcode_session::SessionError> {
+    let resolved = match Box::pin(resolve_submission_context(state, session_id, expected)).await {
+        Ok(context) => match verify_submission_model_target(state, expected, &context).await {
+            Ok(()) => Ok(context),
+            Err(issue) => Err(issue),
+        },
+        Err(issue) => Err(issue),
+    };
+    match resolved {
+        Ok(context) => {
+            let ownership = state
+                .sessions
+                .acquire_session_ownership(
+                    session_id,
+                    bcode_session::SessionOwnershipKind::QueuedCommand,
+                )
+                .await?;
+            Ok(Some(FollowupCommand::ExecuteSubmission {
+                submission_id: record.receipt.submission_id.clone(),
+                runtime_context: Some(context),
+                ownership,
+            }))
+        }
+        Err(issue) => {
+            if record
+                .context_observation
+                .as_ref()
+                .is_none_or(|observation| observation.issue != issue)
+            {
+                state
+                    .sessions
+                    .observe_submission_context(
+                        session_id,
+                        record.receipt.submission_id.clone(),
+                        issue,
+                    )
+                    .await?;
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn recover_pending_submission_hint_with_authority<'a>(
+    state: &'a ServerState,
+    session_id: SessionId,
+    record: &'a bcode_session_models::SubmissionRecord,
+    workflow_authorized: bool,
+) -> Pin<
+    Box<
+        dyn Future<Output = Result<Option<FollowupCommand>, bcode_session::SessionError>>
+            + Send
+            + 'a,
+    >,
+> {
+    Box::pin(recover_pending_submission_hint_with_authority_inner(
+        state,
+        session_id,
+        record,
+        workflow_authorized,
+    ))
+}
+
+async fn recover_pending_submission_hint_with_authority_inner(
     state: &ServerState,
     session_id: SessionId,
     record: &bcode_session_models::SubmissionRecord,
@@ -16356,7 +16788,15 @@ async fn recover_pending_submission_hint_with_authority(
     if record.submission.admission.execution.correlation.is_some() && !workflow_authorized {
         return Ok(None);
     }
-    let issue = if let Some(expected) = &record.submission.execution_descriptor {
+    if record.status != bcode_session_models::SubmissionStatus::Pending {
+        return Ok(None);
+    }
+    if let Some(expected) = record.effective_execution_descriptor()
+        && expected.version == 2
+    {
+        return recover_submission_recipe(state, session_id, record, expected).await;
+    }
+    let issue = if let Some(expected) = record.effective_execution_descriptor() {
         let mut selection =
             session_model_selection_with_runtime_context(state, session_id, None).await;
         apply_turn_model_selection(&mut selection, &record.submission.admission.execution);
@@ -16410,6 +16850,17 @@ async fn next_pending_submission_command(
     hints: &mut Vec<FollowupCommand>,
 ) -> Result<Option<FollowupCommand>, bcode_session::SessionError> {
     prune_settled_dispatch_hints(state, session_id, hints).await?;
+    // Activated input with no terminal evidence is an unresolved execution obligation.
+    // Do not run later FIFO input around it or interpret activation as permission to replay tools.
+    let queue = state.sessions.submission_queue_status(session_id).await?;
+    if queue.oldest.as_ref().is_some_and(|record| {
+        matches!(
+            record.status,
+            bcode_session_models::SubmissionStatus::Activated { .. }
+        )
+    }) {
+        return Ok(None);
+    }
     let records = state
         .sessions
         .pending_submissions(session_id, *after, 32)
@@ -16466,7 +16917,18 @@ async fn next_pending_submission_command(
                 command_submission_id(command) == Some(&record.receipt.submission_id)
             });
             if let Some(index) = selected {
-                return Ok(Some(hints.remove(index)));
+                if record.recovery_authorization.is_none() {
+                    return Ok(Some(hints.remove(index)));
+                }
+                // Authorization supersedes all old transient dispatch contexts for this item.
+                hints.retain(|command| {
+                    command_submission_id(command) != Some(&record.receipt.submission_id)
+                });
+            }
+            // Failed recovery is a durable blocker, not a filesystem polling obligation.
+            // An explicit verified Resume supplies a new dispatch hint and clears the observation.
+            if record.context_observation.is_some() {
+                return Ok(None);
             }
             return recover_pending_submission_hint(state, session_id, &record).await;
         }
@@ -21294,6 +21756,77 @@ const fn model_turn_outcome_metric_label(outcome: ModelTurnOutcome) -> &'static 
     }
 }
 
+// Canonical acceptance, not a client-supplied override, binds queued execution.
+// Re-resolve its durable config/auth recipe and catalog target before selecting;
+// sticky session choices and immutable admission overrides cannot replace it.
+async fn submission_bound_model_selection(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger: &bcode_session_models::SessionEvent,
+    runtime_context: Option<ClientRuntimeContext>,
+) -> Result<SessionModelSelection, bcode_session::SessionError> {
+    if let SessionEventKind::SubmissionActivated { submission_id, .. } = &trigger.kind {
+        let record = state
+            .sessions
+            .submission(session_id, submission_id.clone())
+            .await?
+            .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+        if let Some(descriptor) = record.effective_execution_descriptor()
+            && descriptor.version == 2
+        {
+            let context = resolve_submission_context(state, session_id, descriptor)
+                .await
+                .map_err(|_| {
+                    bcode_session::SessionError::EventSerialization(
+                        "accepted execution context unavailable or changed".into(),
+                    )
+                })?;
+            verify_submission_model_target(state, descriptor, &context)
+                .await
+                .map_err(|_| {
+                    bcode_session::SessionError::EventSerialization(
+                        "accepted provider model unavailable or changed".into(),
+                    )
+                })?;
+            let execution = &record.submission.admission.execution;
+            if execution
+                .provider_plugin_id
+                .as_ref()
+                .is_some_and(|provider| provider != &descriptor.provider)
+                || execution.model_id.as_ref().is_some_and(|model| {
+                    model != &descriptor.model && Some(model) != context.requested_model_id.as_ref()
+                })
+                || execution.reasoning.as_ref().is_some_and(|reasoning| {
+                    Some(reasoning.as_ref()) != descriptor.reasoning.as_ref()
+                })
+            {
+                return Err(bcode_session::SessionError::EventSerialization(
+                    "accepted execution descriptor conflicts with immutable admission".into(),
+                ));
+            }
+            return Ok(SessionModelSelection {
+                provider_plugin_id: Some(descriptor.provider.clone()),
+                requested_model_id: context.requested_model_id,
+                model_id: Some(descriptor.model.clone()),
+                reasoning_effort: descriptor
+                    .reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.effort.clone()),
+                reasoning_summary: descriptor
+                    .reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.summary.clone()),
+                provider_context: context.provider_context,
+                ..Default::default()
+            });
+        }
+    }
+    let mut selection =
+        session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
+    apply_turn_model_selection(&mut selection, &turn_execution_options(trigger));
+    Ok(selection)
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::large_stack_frames,
@@ -21314,10 +21847,19 @@ async fn run_model_turn_inner(
     let turn_id = execution_turn_id(trigger_event);
     let setup_labels = model_turn_metric_labels(session_id, &turn_id);
     let selection_timer = state.metrics.timer();
-    let mut selection =
-        session_model_selection_with_runtime_context(state, session_id, runtime_context.clone())
-            .await;
-    apply_turn_model_selection(&mut selection, &execution);
+    let Ok(selection) = Box::pin(submission_bound_model_selection(
+        state,
+        session_id,
+        trigger_event,
+        runtime_context.clone(),
+    ))
+    .await
+    else {
+        return ModelTurnCompletion::with_message(
+            ModelTurnOutcome::ProviderUnavailable,
+            "accepted execution context is unavailable or changed",
+        );
+    };
     if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
         turn.selection = Some(selection.clone());
     }
@@ -39120,6 +39662,7 @@ async fn dispatch_workflow_plugin_block(
     })?;
     let artifact_references = Arc::new(StdMutex::new(WorkflowArtifactReferences::default()));
     let run_work_id = WorkId::new(format!("workflow:{}", request.activation.run_id));
+    let block_config = state.session_config(parent_session_id).await;
     let mut invocation = state
         .plugins
         .invoke_service_with_events_and_bridge_scoped(
@@ -39130,7 +39673,7 @@ async fn dispatch_workflow_plugin_block(
             PluginInvocationScope::session(parent_session_id.to_string()),
             Some(server_workflow_plugin_bridge_observed(
                 Arc::clone(state),
-                state.session_config(parent_session_id).await,
+                block_config,
                 parent_session_id,
                 &request.dispatch_identity,
                 &block.plugin_id,
@@ -40728,6 +41271,40 @@ const fn recoverable_workflow_observation(
     )
 }
 
+fn retain_workflow_admission_receipt(
+    store: &bcode_workflow_store::WorkflowStore,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    candidate: bcode_workflow_store::DispatchReceipt,
+) -> Result<bcode_workflow_store::DispatchReceipt, WorkflowStoreError> {
+    let proposed = workflow_receipts::AgentTurnReceipt::decode(&candidate.receipt)
+        .map_err(|message| WorkflowStoreError::InvalidData(message.into()))?;
+    let retained = store.dispatch_receipt(&candidate.dispatch_identity)?;
+    let receipt = retained.unwrap_or(candidate);
+    let persisted = store.persist_owned_dispatch_receipt(&receipt, authority);
+    let receipt = if let Err(error) = persisted {
+        // A completion callback can publish between the exact lookup and attach.
+        let Some(retained) = store.dispatch_receipt(&receipt.dispatch_identity)? else {
+            return Err(error);
+        };
+        retained
+    } else {
+        receipt
+    };
+    let actual = workflow_receipts::AgentTurnReceipt::decode(&receipt.receipt)
+        .map_err(|message| WorkflowStoreError::InvalidData(message.into()))?;
+    if proposed.session_id != actual.session_id
+        || proposed.turn_id != actual.turn_id
+        || proposed.output_schema_id != actual.output_schema_id
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "recovered workflow admission identity conflicts".into(),
+        ));
+    }
+    // Recheck authority even when recovering a concurrent winner; no stale owner succeeds.
+    store.persist_owned_dispatch_receipt(&receipt, authority)?;
+    Ok(receipt)
+}
+
 async fn recover_completed_workflow_admission_page(
     state: &Arc<ServerState>,
     store_path: &Path,
@@ -40770,11 +41347,25 @@ async fn recover_completed_workflow_admission_page(
         else {
             continue;
         };
-        let owner_receipt = recovered_workflow_receipt(
+        let recovered_receipt = recovered_workflow_receipt(
             session_id,
             &receipt,
             &request.activation.node.output.type_name,
         );
+        // An installed completion owner may have published its exact receipt since
+        // this recovery page selected the preparation. Preserve its ownership facts
+        // instead of replacing them with a reconstructed receipt.
+        let candidate = bcode_workflow_store::DispatchReceipt {
+            run_id: run_id.to_owned(),
+            node_id: request.activation.node_id.clone(),
+            activation_id: request.activation.activation_id.clone(),
+            attempt: request.attempt,
+            dispatch_identity: request.dispatch_identity.clone(),
+            receipt: recovered_receipt,
+            admitted_at_ms: current_unix_millis(),
+        };
+        let retained = retain_workflow_admission_receipt(&store, authority, candidate)?;
+        let owner_receipt = retained.receipt.clone();
         let _runtime = session_runtime_handle(state, session_id).await;
         let observation = observe_workflow_turn(
             state,
@@ -40794,18 +41385,7 @@ async fn recover_completed_workflow_admission_page(
         .await?;
         // Advance discovery past deferred work without classifying or redispatching it.
         if let bcode_workflow_store::AttemptObservation::Deferred { .. } = observation {
-            store.persist_owned_dispatch_receipt(
-                &bcode_workflow_store::DispatchReceipt {
-                    run_id: run_id.to_owned(),
-                    node_id: request.activation.node_id.clone(),
-                    activation_id: request.activation.activation_id.clone(),
-                    attempt: request.attempt,
-                    dispatch_identity: request.dispatch_identity.clone(),
-                    receipt: owner_receipt,
-                    admitted_at_ms: current_unix_millis(),
-                },
-                authority,
-            )?;
+            store.persist_owned_dispatch_receipt(&retained, authority)?;
             examined.classifiable.pop();
             examined.deferred = true;
             continue;
@@ -40817,15 +41397,7 @@ async fn recover_completed_workflow_admission_page(
             continue;
         }
         let summary = store.recover_owned_dispatch_observation(
-            &bcode_workflow_store::DispatchReceipt {
-                run_id: run_id.to_owned(),
-                node_id: request.activation.node_id,
-                activation_id: request.activation.activation_id,
-                attempt: request.attempt,
-                dispatch_identity: request.dispatch_identity.clone(),
-                receipt: owner_receipt,
-                admitted_at_ms: current_unix_millis(),
-            },
+            &retained,
             authority,
             observation,
             current_unix_millis(),
@@ -42640,6 +43212,8 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SubmissionActivated { .. } => "submission_activated",
         SessionEventKind::SubmissionContextObserved { .. } => "submission_context_observed",
         SessionEventKind::SubmissionCancelled { .. } => "submission_cancelled",
+        SessionEventKind::SubmissionRecoveryAuthorized { .. } => "submission_recovery_authorized",
+        SessionEventKind::SubmissionPendingCancelled { .. } => "submission_pending_cancelled",
         SessionEventKind::InertHistory { .. } => "inert_history",
     }
 }
@@ -49895,9 +50469,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let final_lineage = context_lineage::final_lineage(&retained, &lineage).unwrap();
         assert!(final_lineage.validate(&retained).is_ok());
         assert!(final_lineage.entries.iter().any(|entry| entry.mandatory));
-        if !lineage.calls.is_empty() {
-            assert!(final_lineage.entries.iter().any(|entry| !entry.mandatory));
-        }
+        // Contribution identity does not certify an optional slice after hydration;
+        // the final tool-result block remains mandatory and the observation is omitted.
+        assert!(final_lineage.entries.iter().all(|entry| entry.mandatory));
+        assert_eq!(
+            final_lineage.omitted,
+            lineage.omitted + lineage.calls.len() as u64
+        );
         let mut final_request = test_model_turn_request(retained.clone());
         final_request.context_lineage = Some(final_lineage.clone());
         let wire = serde_json::to_value(&final_request).unwrap();
@@ -61049,6 +61627,7 @@ library = "test"
             config_files: vec![PathBuf::from("/configs/sol.toml")],
             inline_overrides: false,
             provider_config_directory: PathBuf::from("/configs/providers"),
+            recovery_sources: None,
         };
         let second = bcode_config::ConfigLaunchContext {
             config_files: vec![PathBuf::from("/configs/other.toml")],
@@ -71231,6 +71810,28 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap();
         assert_eq!(command_submission_id(&selected), Some(&id(&first)));
         activated_submission_event(&state, session.id, id(&first))
+            .await
+            .unwrap();
+        // Activation without terminal evidence is not permission to dispatch the next input.
+        assert!(
+            next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        state
+            .sessions
+            .append_model_turn_finished(
+                session.id,
+                match &first.kind {
+                    SessionEventKind::SubmissionAccepted { submission } => {
+                        submission.target.turn_id().0.clone()
+                    }
+                    _ => panic!("acceptance"),
+                },
+                ModelTurnOutcome::Completed,
+                None,
+            )
             .await
             .unwrap();
         let selected = next_pending_submission_command(&state, session.id, &mut None, &mut hints)
@@ -81775,14 +82376,27 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .any(|attempt| attempt.status == "admitted" && attempt.has_receipt),
                 "{attempts:?}"
             );
-            tokio::time::sleep(Duration::from_millis(1800)).await;
-            restore_workflow_runtime_work(&state).await;
-            let attempts = state
-                .workflow_store
-                .lock()
-                .expect("store")
-                .attempt_history("redispatch-run", None, 10)
-                .expect("recovered attempts");
+            let attempts = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    restore_workflow_runtime_work(&state).await;
+                    let attempts = state
+                        .workflow_store
+                        .lock()
+                        .expect("store")
+                        .attempt_history("redispatch-run", None, 10)
+                        .expect("recovered attempts");
+                    if attempts.len() == 2
+                        && attempts
+                            .iter()
+                            .all(|attempt| attempt.status == "succeeded" && attempt.has_receipt)
+                    {
+                        break attempts;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("both accepted turns settle through recovery");
             assert_eq!(attempts.len(), 2);
             assert!(
                 attempts

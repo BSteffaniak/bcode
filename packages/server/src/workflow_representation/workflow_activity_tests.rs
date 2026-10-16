@@ -286,6 +286,36 @@ async fn completion_observation_token(
         .await
 }
 
+async fn admit_shared_fixture_turn(
+    state: &ServerState,
+    parent: crate::SessionId,
+    dispatch: &str,
+) -> bcode_session_models::TurnReceipt {
+    let metadata = bcode_session_models::TurnAdmissionMetadata {
+        origin: Some(bcode_session_models::TurnOrigin {
+            producer: "bcode.workflow".into(),
+            correlation_id: None,
+            display_label: None,
+        }),
+        idempotency_key: Some(dispatch.into()),
+        ..Default::default()
+    };
+    let bcode_session_models::TurnAdmission::Accepted(receipt) = state
+        .sessions
+        .admit_turn(
+            parent,
+            crate::ClientId::new(),
+            "shared fixture".into(),
+            metadata,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("new acceptance");
+    };
+    receipt
+}
+
 #[tokio::test]
 async fn shared_completion_waits_for_durable_settlement_before_releasing_guards() {
     let (_root, state, run_id, dispatch) =
@@ -324,11 +354,12 @@ async fn shared_completion_waits_for_durable_settlement_before_releasing_guards(
         permit.as_ref().unwrap(),
     )
     .await;
+    let accepted = admit_shared_fixture_turn(&state, parent.id, &dispatch).await;
     let finished = state
         .sessions
         .append_model_turn_finished(
             parent.id,
-            "turn".into(),
+            accepted.turn_id.0.clone(),
             bcode_session_models::ModelTurnOutcome::Completed,
             None,
         )
@@ -337,7 +368,11 @@ async fn shared_completion_waits_for_durable_settlement_before_releasing_guards(
     crate::publish_session_event(&state, &finished).await;
     let gate = crate::workflow_drive_gate(&state, &run_id);
     let guard = gate.lock().await;
-    let receipt = serde_json::json!({"owner":"bcode.server.agent-turn/v1","session_id":parent.id,"turn_id":"turn"});
+    let receipt = crate::recovered_workflow_receipt(
+        parent.id,
+        &accepted,
+        &dispatch_request.activation.node.output.type_name,
+    );
     let mut completion = Box::pin(crate::complete_workflow_prompt_dispatch(
         &state,
         &dispatch_request,

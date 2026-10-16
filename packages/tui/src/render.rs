@@ -487,7 +487,10 @@ pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
     }
     let composer_height = composer_height(app, area);
     let composer_y = area.bottom().saturating_sub(composer_height);
-    let body_height = composer_y.saturating_sub(area.y.saturating_add(2));
+    let status_height = queue_status_height(app, area.width)
+        .min(composer_y.saturating_sub(area.y.saturating_add(1)));
+    let body_height =
+        composer_y.saturating_sub(area.y.saturating_add(1).saturating_add(status_height));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
     transcript_area_for_body(app, body)
 }
@@ -506,6 +509,9 @@ pub fn prepare_frame_with_bottom_dock(
     area: Rect,
     dock_height: u16,
 ) -> Option<(FrameLayout, Rect)> {
+    if area.is_empty() {
+        app.queue_recovery.settings_visible = false;
+    }
     let layout = frame_layout(app, area)?;
     app.set_composer_content_area(layout.composer_content);
     let (layout, dock) = layout.with_bottom_dock(app, dock_height);
@@ -595,6 +601,7 @@ pub fn render_prepared_damage(
     intersects: impl Fn(Rect) -> bool,
 ) {
     if layout.area.is_empty() {
+        app.queue_recovery.settings_visible = false;
         return;
     }
 
@@ -616,7 +623,7 @@ pub fn render_prepared_damage(
         );
         render_composer(app, layout.composer, frame, theme);
     }
-    if intersects(layout.body) {
+    if intersects(layout.body) && app.queue_recovery.confirmation.is_none() {
         frame.fill(
             LocalRect::terminal(layout.body),
             " ",
@@ -661,6 +668,34 @@ pub fn render_prepared_damage(
             app.presented_theme().canvas,
         );
         render_status(app, layout.status, frame, theme);
+    }
+    if let Some(confirmation) = &app.queue_recovery.confirmation {
+        let text = format!(
+            "{}\n\nType /queue-confirm to explicitly confirm these settings.\nType /queue-dismiss to return without resuming.",
+            bcode_session_view_models::submission_resume_settings(confirmation)
+        );
+        let component = bcode_tui_components::composer::composer_panel(
+            bcode_tui_components::composer::ComposerStyle {
+                border: theme.warning,
+                surface: theme.raised,
+            },
+            TextBlock::new(text),
+        );
+        let area = layout.body;
+        let natural = component.layout(
+            Constraints::loose(bmux_tui::geometry::Size::new(area.width, u16::MAX)),
+            &mut LayoutCx::new(),
+        );
+        app.queue_recovery.settings_visible = area.width > 0
+            && natural.size.width <= u64::from(area.width)
+            && natural.size.height <= u64::from(area.height);
+        let measured = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&measured, cx),
+        );
     }
 }
 
@@ -722,7 +757,11 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
     let header = Rect::new(area.x, area.y, area.width, 1);
     let composer_height = composer_height(app, area);
     let composer = composer_area(area, composer_height);
-    let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
+    let status_height = queue_status_height(app, area.width)
+        .min(composer.y.saturating_sub(area.y.saturating_add(1)));
+    let body_height = composer
+        .y
+        .saturating_sub(area.y.saturating_add(1).saturating_add(status_height));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
     let panel_height = if app.child_panel_open() {
         let presentation = app.monitor_presentation();
@@ -755,9 +794,9 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         (latest_bar_height > 0).then_some(Rect::new(area.x, body.bottom(), area.width, 1));
     let status = Rect::new(
         area.x,
-        composer.y.saturating_sub(1),
+        composer.y.saturating_sub(status_height),
         area.width,
-        u16::from(composer.y > area.y.saturating_add(1)),
+        status_height,
     );
     Some(FrameLayout {
         area,
@@ -1134,6 +1173,41 @@ fn pure_scroll_reuses_markdown_projection_without_rendering() {
     prepare_frame(&mut app, area).expect("scrolled frame");
     assert_eq!(app.transcript_markdown_cache().render_count(), 1);
     drop(app);
+}
+
+#[cfg(test)]
+#[test]
+fn queue_resume_settings_require_complete_presentation_and_survive_resize() {
+    use bcode_session_models::*;
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.queue_recovery.confirmation = Some(SubmissionResumeConfirmation {
+        version: 1,
+        submission_id: SubmissionId("pending".to_owned()),
+        expected_accepted_sequence: 1,
+        descriptor: SubmissionExecutionDescriptor {
+            version: 2,
+            provider: "provider-界".to_owned(),
+            model: "model-👩‍💻-e\u{301}".to_owned(),
+            model_profile: Some("selected profile".to_owned()),
+            auth_profile: Some("account".to_owned()),
+            reasoning: None,
+            config_identity: "digest".to_owned(),
+            recovery_recipe: None,
+        },
+    });
+    for (width, height, visible) in [
+        (120, 40, true),
+        (8, 6, false),
+        (0, 0, false),
+        (80, 30, true),
+    ] {
+        app.queue_recovery.settings_visible = false;
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        render(&mut app, &mut PaintCx::new(&mut frame));
+        assert_eq!(app.queue_recovery.settings_visible, visible);
+    }
 }
 
 #[cfg(test)]
@@ -5505,14 +5579,73 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: 
         return;
     }
 
+    if let Some(text) = queue_status_text(app) {
+        let component = TextBlock::new(text).style(theme.warning);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
+        return;
+    }
     let spans = statusline_spans(app, usize::from(area.width), theme);
     frame.write_line(LocalRect::terminal(area), &Line::from_spans(spans));
+}
+
+fn queue_status_height(app: &BmuxApp, width: u16) -> u16 {
+    queue_status_text(app).map_or(1, |text| {
+        let node = TextBlock::new(text).layout(
+            Constraints::loose(bmux_tui::geometry::Size::new(width, u16::MAX)),
+            &mut LayoutCx::new(),
+        );
+        u16::try_from(node.size.height).unwrap_or(u16::MAX)
+    })
+}
+
+fn queue_status_text(app: &BmuxApp) -> Option<String> {
+    if app
+        .session_view_snapshot()
+        .runtime
+        .submission_queue_unavailable
+    {
+        return Some("Queued message status unavailable. Retrying bounded status reads; reconnect to retry if it remains unavailable.".to_owned());
+    }
+    let recovery = app.session_view_snapshot().runtime.queue_recovery()?;
+    let controls = if recovery.can_resume {
+        "\n/queue-resume: review settings · /queue-cancel: cancel this item"
+    } else if recovery.can_cancel {
+        "\n/queue-cancel: cancel this item"
+    } else {
+        ""
+    };
+    Some(format!(
+        "Queued message needs attention: {}{}",
+        recovery.reason, controls
+    ))
 }
 
 use bcode_tui_components::chrome::ChromeLine;
 
 fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = theme.muted;
+    if let Some(recovery) = app.session_view_snapshot().runtime.queue_recovery() {
+        let controls = if recovery.can_resume {
+            " /queue-resume · /queue-cancel"
+        } else if recovery.can_cancel {
+            " /queue-cancel"
+        } else {
+            ""
+        };
+        return ChromeLine::new(" · ", muted)
+            .required(
+                format!("{}{}", recovery.reason, controls),
+                theme.error,
+                true,
+            )
+            .spans(width);
+    }
     let mut line = ChromeLine::new(" · ", muted).required(
         activity_label(
             app.activity(),

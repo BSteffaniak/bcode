@@ -31,6 +31,8 @@ pub mod contexts;
 pub mod edit;
 pub mod judgement;
 pub mod milestones;
+/// Verified declarative configuration restart recovery.
+pub mod recovery;
 pub use milestones::MilestonesConfig;
 /// Versioned remembered startup choices and optional fallback support.
 pub mod startup;
@@ -953,13 +955,23 @@ pub struct ConfigLaunchContext {
     pub inline_overrides: bool,
     /// Directory containing optional user-managed provider config files.
     pub provider_config_directory: PathBuf,
+    /// Complete load-time sources for verified restart recovery. Absent legacy
+    /// provenance is explicitly unavailable, never inferred by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_sources: Option<recovery::ConfigRecoverySources>,
 }
 
 /// Capture the initiating process's config sources without exposing their contents.
 #[must_use]
 pub fn config_launch_context(cwd: &Path) -> ConfigLaunchContext {
     let overrides = effective_config_overrides(&ProcessConfigEnvironment);
+    let recovery_sources = recovery::sources_from_overrides(
+        cwd,
+        &default_config_paths_with_environment(&ProcessConfigEnvironment),
+        &overrides,
+    );
     ConfigLaunchContext {
+        recovery_sources: Some(recovery_sources),
         config_files: [
             overrides.base_config_path,
             overrides.env_config_path,
@@ -9711,10 +9723,10 @@ mod tests {
         load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, load_tui_streaming_presentation_override_from,
         load_tui_theme_selection_from, merge_config_values,
-        plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
-        register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
-        set_tui_streaming_presentation_override, set_tui_theme_selection,
-        upsert_agent_permission_rule, validate_config,
+        plugin_selection_with_default_plugin_ids, push_process_config_overrides, recovery,
+        register_runtime_auth_profile, register_runtime_auth_subscription,
+        set_openai_compatible_sshenv_auth_method, set_tui_streaming_presentation_override,
+        set_tui_theme_selection, upsert_agent_permission_rule, validate_config,
     };
     use bcode_agent_policy_models::Action;
     use bcode_plugin_models::{PluginSelection, PluginSelectionMode};
@@ -10631,6 +10643,39 @@ enabled = false
     ];
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn recovery_current_load_retains_effective_exclusive_context_and_profile() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exclusive.toml");
+        std::fs::write(&path, "[contexts.entries.work.model.profiles.fast]\nprovider_plugin_id='owned.provider'\nmodel_id='fast-model'\n").unwrap();
+        let overrides = ConfigLoadOverrides {
+            exclusive_config_path: Some(path.clone()),
+            cli_config_toml: Some(
+                "[contexts]\nactive='work'\n[model]\nprofile='fast'\n".to_owned(),
+            ),
+            ..Default::default()
+        };
+        let _override = push_process_config_overrides(overrides.clone());
+        let (config, launch) = recovery::load_current_config_with_recovery_context().unwrap();
+        assert_eq!(config.active_context.as_deref(), Some("work"));
+        assert_eq!(config.model.profile.as_deref(), Some("fast"));
+        let sources = launch.recovery_sources.as_ref().unwrap();
+        assert_eq!(sources.exclusive_config_path.as_ref(), Some(&path));
+        assert_eq!(sources.active_context.as_deref(), Some("work"));
+        assert_eq!(sources.model_profile.as_deref(), Some("fast"));
+        assert!(!sources.inline_overrides);
+        let environment = ConfigEnvironmentSnapshot::isolated(dir.path());
+        let (deterministic, retained) =
+            recovery::load_config_with_recovery_context(&environment, &overrides).unwrap();
+        assert_eq!(
+            recovery::execution_fingerprint(&config).unwrap(),
+            recovery::execution_fingerprint(&deterministic).unwrap()
+        );
+        assert_eq!(retained.recovery_sources.unwrap().cwd, dir.path());
+        recovery::capture_with_sources(&config, sources, &[dir.path().to_owned()]).unwrap();
+    }
 
     #[test]
     fn request_overlay_preserves_launch_layers_and_restores_them() {

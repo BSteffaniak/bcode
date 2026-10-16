@@ -3557,6 +3557,34 @@ impl SessionDb {
     /// # Errors
     ///
     /// Returns an error if event queries or deserialization fail.
+    pub(crate) async fn submission_queue_head(
+        &self,
+    ) -> SessionDbResult<Option<bcode_session_models::SubmissionRecord>> {
+        self.validate_write_readiness().await?;
+        self.db
+            .select("submissions")
+            .columns(&["record"])
+            .where_eq("queue_visible", 1_i64)
+            .sort("accepted_seq", switchy::database::query::SortDirection::Asc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?
+            .map(|r| Ok(serde_json::from_str(&required_string(&r, "record")?)?))
+            .transpose()
+    }
+
+    pub(crate) async fn submission_recovery_operation(
+        &self,
+        operation_id: &str,
+    ) -> SessionDbResult<Option<(SessionEventKind, bcode_session_models::SubmissionRecord)>> {
+        self.validate_write_readiness().await?;
+        crate::submission::recovery_operation(&**self.db, operation_id).await
+    }
+
+    /// Read the current projected submission without replay or repair.
+    ///
+    /// # Errors
+    /// Returns an error for invalid storage, stale projections, or malformed records.
     pub async fn submission(
         &self,
         id: &bcode_session_models::SubmissionId,
@@ -3710,6 +3738,9 @@ impl SessionDb {
         rebuild_model_context_projection_from_events(&*tx, &events).await?;
         rebuild_transcript_projection_from_events(&*tx, &events).await?;
         tx.delete("submissions").execute(&*tx).await?;
+        tx.delete("submission_recovery_operations")
+            .execute(&*tx)
+            .await?;
         for event in &events {
             crate::submission::project(&*tx, event).await?;
         }
@@ -4823,6 +4854,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
             "turn_evidence",
             "turn_receipts",
             "submissions",
+            "submission_recovery_operations",
             "session_children",
             "milestone_evaluations",
             "milestone_scheduling",
@@ -5027,11 +5059,111 @@ async fn rebuild_transcript_projection_from_events(
     events: &[SessionEvent],
 ) -> SessionDbResult<()> {
     db.delete("transcript_items").execute(db).await?;
+    // Reindex only transcript geometry; replaying the general projector would also
+    // insert duplicate input, rewrite session state and re-admit milestone work.
     for event in events {
-        project_event(db, event, false).await?;
+        rebuild_transcript_event(db, event).await?;
     }
     if let Some(tail) = events.last() {
         update_projection_checkpoint(db, MaterializedProjection::Transcript, tail).await?;
+    }
+    Ok(())
+}
+
+async fn rebuild_transcript_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+    match &event.kind {
+        SessionEventKind::UserMessage { text, .. }
+        | SessionEventKind::SubmissionAccepted {
+            submission: bcode_session_models::PromptSubmission { text, .. },
+        } => {
+            insert_transcript_item(db, event, "user", "message", "complete", Some(text.clone()))
+                .await?;
+        }
+        SessionEventKind::AssistantMessage { text }
+        | SessionEventKind::AssistantResponseSegment { text, .. }
+        | SessionEventKind::PositionedAssistantResponseSegment { text, .. } => {
+            insert_transcript_item(
+                db,
+                event,
+                "assistant",
+                "message",
+                "complete",
+                Some(text.clone()),
+            )
+            .await?;
+        }
+        SessionEventKind::PluginStatusNote { text, .. } => {
+            insert_transcript_item(
+                db,
+                event,
+                "system",
+                "plugin_status_note",
+                "complete",
+                Some(text.clone()),
+            )
+            .await?;
+        }
+        SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::PositionedToolCallRequested { .. } => {
+            insert_transcript_item(db, event, "tool", "invocation", "running", None).await?;
+        }
+        SessionEventKind::ToolInvocationResultRecorded { record } => {
+            finalize_tool_transcript_item(
+                db,
+                &record.invocation_id,
+                event.sequence,
+                record.is_error,
+            )
+            .await?;
+        }
+        SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
+            use bcode_session_models::ToolInvocationLifecycleStage as S;
+            if matches!(lifecycle.stage, S::Completed | S::Cancelled | S::Failed) {
+                finalize_tool_transcript_item(
+                    db,
+                    &lifecycle.invocation_id,
+                    event.sequence,
+                    matches!(lifecycle.stage, S::Cancelled | S::Failed),
+                )
+                .await?;
+            }
+        }
+        SessionEventKind::ToolExchangeRequested { request } => {
+            insert_transcript_item(
+                db,
+                event,
+                "runtime",
+                "tool_exchange_requested",
+                "running",
+                Some(serde_json::to_string(request)?),
+            )
+            .await?;
+        }
+        SessionEventKind::ToolExchangeResolved { event: resolution } => {
+            insert_transcript_item(
+                db,
+                event,
+                "runtime",
+                "tool_exchange_resolved",
+                "complete",
+                Some(serde_json::to_string(resolution)?),
+            )
+            .await?;
+        }
+        SessionEventKind::ToolContribution {
+            event: contribution,
+        } => {
+            insert_transcript_item(
+                db,
+                event,
+                "runtime",
+                "tool_contribution",
+                "complete",
+                Some(serde_json::to_string(contribution)?),
+            )
+            .await?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -10173,6 +10305,20 @@ mod tests {
                 .await
                 .unwrap();
         }
+        switchy::database::schema::drop_table("submission_recovery_operations")
+            .if_exists(true)
+            .execute(db.database())
+            .await
+            .unwrap();
+        switchy::database::schema::drop_index("idx_submission_queue", "submissions")
+            .execute(db.database())
+            .await
+            .unwrap();
+        switchy::database::schema::alter_table("submissions")
+            .drop_column("queue_visible".into())
+            .execute(db.database())
+            .await
+            .unwrap();
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
             .where_gte("id", "050")

@@ -19,6 +19,8 @@ pub mod lifecycle;
 #[cfg(target_os = "macos")]
 pub mod native_device;
 pub mod operations;
+/// Verified restart credential materialization.
+pub mod recovery;
 pub mod security;
 pub mod startup;
 pub mod store;

@@ -131,8 +131,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 52 adds bounded cross-location session discovery.
 /// Version 53 adds contextual plugin invocation, cancellation, composer discovery and agent hints.
 /// Version 54 combines those contextual additions with the updated upstream positional layout.
+/// Version 55 adds secret-free queued-submission recovery confirmation and targeted operations.
 /// Older positional request/response layouts are rejected rather than misinterpreted.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 54;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 55;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -648,6 +649,29 @@ pub enum Request {
         after: Option<u64>,
         /// Page size from 1 through 128.
         limit: u32,
+    },
+    /// Read the oldest queued item and its blocker without recovering or replaying work.
+    SubmissionQueueStatus {
+        session_id: SessionId,
+    },
+    /// Prepare a secret-free execution recipe for explicit caller confirmation.
+    PrepareSubmissionResume {
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        expected_accepted_sequence: u64,
+    },
+    /// Authorize recovery of this exact pending item using the confirmed recipe.
+    ResumeSubmission {
+        session_id: SessionId,
+        confirmation: bcode_session_models::SubmissionResumeConfirmation,
+        operation_id: String,
+    },
+    /// Cancel only this exact pending item; never cancel active work or clear the queue.
+    CancelPendingSubmission {
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        expected_accepted_sequence: u64,
+        operation_id: String,
     },
     /// Submit an ordinary turn through generic admission metadata.
     SubmitTurn {
@@ -2319,6 +2343,18 @@ pub enum ResponsePayload {
     /// Bounded pending-queue observation; not a snapshot or event stream.
     PendingSubmissions {
         page: bcode_session_models::PendingSubmissionsPage,
+    },
+    /// Bounded oldest-item queue observation, not an event stream or durable snapshot.
+    SubmissionQueueStatus {
+        status: bcode_session_models::SubmissionQueueStatus,
+    },
+    /// Exact secret-free recipe requiring explicit caller confirmation before recovery.
+    SubmissionResumePrepared {
+        confirmation: bcode_session_models::SubmissionResumeConfirmation,
+    },
+    /// Durable targeted recovery operation receipt.
+    SubmissionRecovered {
+        result: bcode_session_models::SubmissionRecoveryResult,
     },
     /// Bounded authoritative lookup; absence is not an inferred cancellation.
     Submission {

@@ -251,6 +251,21 @@ struct PromptForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct QueueRecoveryForm {
+    session_id: String,
+    #[serde(default)]
+    submission_id: String,
+    #[serde(default)]
+    expected_accepted_sequence: u64,
+    #[serde(default)]
+    operation_id: String,
+    #[serde(default)]
+    confirmation: String,
+    #[serde(default)]
+    confirmed: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct CancelTurnForm {
     session_id: String,
     #[serde(default)]
@@ -624,6 +639,7 @@ async fn session_view_from_attached_history(
     let mut view = view_from_attached_history(&attached);
     view.set_reasoning_presentation_policy(reasoning_presentation_policy);
     hydrate_session_model_status(client, attached.session.id, &mut view).await?;
+    bcode_session_view::hydrate_submission_queue(client, attached.session.id, &mut view).await?;
     hydrate_pending_permissions(client, attached.session.id, &mut view).await?;
     hydrate_pending_interactions(
         client,
@@ -1064,6 +1080,9 @@ pub fn router_from_state(state: HyperChadAppState) -> Router {
     let history_state = state.clone();
     #[cfg(feature = "renderer-html-actix")]
     let artifact_state = state.clone();
+    let prepare_resume_state = state.clone();
+    let resume_state = state.clone();
+    let cancel_pending_state = state.clone();
     let interaction_state = state;
     let router = Router::new()
         .with_route("/", move |request| {
@@ -1092,6 +1111,18 @@ pub fn router_from_state(state: HyperChadAppState) -> Router {
         .with_route("/actions/submit-message", move |request| {
             let state = submit_state.clone();
             async move { state.handle_submit_message(request).await }
+        })
+        .with_route("/actions/prepare-submission-resume", move |request| {
+            let state = prepare_resume_state.clone();
+            async move { state.handle_queue_recovery(request, false, false).await }
+        })
+        .with_route("/actions/resume-submission", move |request| {
+            let state = resume_state.clone();
+            async move { state.handle_queue_recovery(request, true, false).await }
+        })
+        .with_route("/actions/cancel-pending-submission", move |request| {
+            let state = cancel_pending_state.clone();
+            async move { state.handle_queue_recovery(request, false, true).await }
         })
         .with_route("/actions/cancel-turn", move |request| {
             let state = cancel_state.clone();
@@ -1244,6 +1275,88 @@ impl HyperChadAppState {
         match execute_session_view_action(&self.client, action).await {
             Ok(_) => {
                 self.render_session_or_initial(Some(session_id), "turn cancelled")
+                    .await
+            }
+            Err(error) => {
+                self.render_session_or_initial(Some(session_id), &client_error_message(&error))
+                    .await
+            }
+        }
+    }
+
+    async fn handle_queue_recovery(
+        &self,
+        request: RouteRequest,
+        resume: bool,
+        cancel: bool,
+    ) -> hyperchad::template::Containers {
+        if !self.authorizes(&request) {
+            return unauthorized_page();
+        }
+        let Ok(form) = request.parse_form::<QueueRecoveryForm>() else {
+            return error_page("Invalid queue recovery form");
+        };
+        let Some(session_id) = parse_session_id(&form.session_id) else {
+            return error_page("invalid session id");
+        };
+        let action = if resume {
+            if !form.confirmed {
+                return error_page("Confirm the displayed execution settings before resuming.");
+            }
+            let Ok(confirmation) = serde_json::from_str(&form.confirmation) else {
+                return error_page("Invalid resume confirmation");
+            };
+            SessionViewAction::ResumeSubmission {
+                session_id,
+                confirmation,
+                operation_id: form.operation_id,
+            }
+        } else if cancel {
+            SessionViewAction::CancelPendingSubmission {
+                session_id,
+                submission_id: bcode_session_models::SubmissionId(form.submission_id),
+                expected_accepted_sequence: form.expected_accepted_sequence,
+                operation_id: form.operation_id,
+            }
+        } else {
+            SessionViewAction::PrepareSubmissionResume {
+                session_id,
+                submission_id: bcode_session_models::SubmissionId(form.submission_id),
+                expected_accepted_sequence: form.expected_accepted_sequence,
+            }
+        };
+        match execute_session_view_action(&self.client, action).await {
+            Ok(bcode_session_view_models::SessionViewActionOutcome::SubmissionResumePrepared {
+                confirmation,
+            }) => {
+                use bcode_hyperchad_ui::context::PresentationContext as _;
+                let settings = bcode_session_view_models::submission_resume_settings(&confirmation);
+                let Ok(encoded) = serde_json::to_string(&confirmation) else {
+                    return error_page("Resume confirmation unavailable");
+                };
+                let operation_id = SessionId::new().to_string();
+                #[cfg(feature = "renderer-html-actix")]
+                let context =
+                    html_actix::HtmlActixPresentationContext::new(Arc::clone(&self.access_token));
+                #[cfg(not(feature = "renderer-html-actix"))]
+                let context = bcode_hyperchad_ui::context::StaticPresentationContext;
+                hyperchad::template::container! {
+                    div #bcode-web-shell {
+                        h2 { "Confirm queued message resume" }
+                        div white-space="preserve-wrap" { (settings) }
+                        form hx-post=(context.action_target(bcode_hyperchad_ui::context::PresentationAction::ResumeSubmission)) hx-target="#bcode-web-shell" hx-swap=this {
+                            input type=hidden name="session_id" value=(session_id.to_string());
+                            input type=hidden name="confirmation" value=(encoded);
+                            input type=hidden name="operation_id" value=(operation_id);
+                            input type=hidden name="confirmed" value="true";
+                            button type=submit { "Confirm settings and resume this message" }
+                        }
+                        anchor href=(context.session_target(session_id)) { "Back without resuming" }
+                    }
+                }
+            }
+            Ok(_) => {
+                self.render_session_or_initial(Some(session_id), "Queued message updated")
                     .await
             }
             Err(error) => {
@@ -2166,6 +2279,14 @@ async fn apply_watched_event_hydrated(
     let cancelled = match &event {
         SessionWatchEvent::Durable(event) => match &event.kind {
             bcode_session_models::SessionEventKind::SubmissionCancelled { submission_id }
+            | bcode_session_models::SessionEventKind::SubmissionPendingCancelled {
+                submission_id,
+                ..
+            }
+            | bcode_session_models::SessionEventKind::SubmissionRecoveryAuthorized {
+                submission_id,
+                ..
+            }
             | bcode_session_models::SessionEventKind::SubmissionContextObserved {
                 submission_id,
                 ..
@@ -2174,7 +2295,11 @@ async fn apply_watched_event_hydrated(
         },
         _ => None,
     };
+    let refresh_queue = matches!(&event, SessionWatchEvent::Durable(event) if bcode_session_view::submission_queue_needs_refresh(&event.kind));
     let resync = apply_watched_event(view, session_id, event);
+    if refresh_queue {
+        bcode_session_view::hydrate_submission_queue(&context.client, session_id, view).await?;
+    }
     if let Some(id) = cancelled {
         let record = context
             .client

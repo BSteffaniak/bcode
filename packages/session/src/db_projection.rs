@@ -60,9 +60,8 @@ impl MaterializedProjection {
         match self {
             Self::RequestContextOccupancy => 4,
             Self::Transcript => 3,
-            Self::ToolRuns => 2,
+            Self::ToolRuns | Self::Submissions => 2,
             Self::Milestones
-            | Self::Submissions
             | Self::SessionState
             | Self::InputHistory
             | Self::ArtifactReferences

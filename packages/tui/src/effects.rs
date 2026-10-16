@@ -242,6 +242,12 @@ pub enum TuiEffect {
         /// Directory for draft-session draft scope.
         launch_working_directory: std::path::PathBuf,
     },
+    /// Execute one typed targeted recovery action through the shared application boundary.
+    QueueRecovery {
+        session_id: SessionId,
+        generation: u64,
+        action: Box<SessionViewAction>,
+    },
     /// Load non-critical status for an attached session.
     LoadSessionStatus {
         /// Session to hydrate.
@@ -601,6 +607,20 @@ impl DaemonObservation {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Targeted recovery action and fresh bounded status.
+    QueueRecovery {
+        session_id: SessionId,
+        generation: u64,
+        result: Box<
+            Result<
+                (
+                    SessionViewActionOutcome,
+                    bcode_session_models::SubmissionQueueStatus,
+                ),
+                ClientError,
+            >,
+        >,
+    },
     SessionChildrenLoaded {
         parent_id: SessionId,
         generation: u64,
@@ -1010,6 +1030,7 @@ impl TuiEffectResult {
     #[must_use]
     pub fn daemon_observation(&self) -> DaemonObservation {
         match self {
+            Self::QueueRecovery { result, .. } => DaemonObservation::from_client_result(result),
             Self::SessionChildrenLoaded { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
@@ -1161,6 +1182,7 @@ pub struct SubmitMessageResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    QueueRecovery,
     SessionOpen,
     Config,
     ThemeSelection,
@@ -1234,6 +1256,15 @@ impl TuiEffect {
     #[allow(clippy::too_many_lines, dead_code)]
     fn daemon_start_failed(self, client_error: ClientError) -> TuiEffectResult {
         match self {
+            Self::QueueRecovery {
+                session_id,
+                generation,
+                ..
+            } => TuiEffectResult::QueueRecovery {
+                generation,
+                session_id,
+                result: Box::new(Err(client_error)),
+            },
             Self::LoadSessionChildren {
                 parent_id,
                 generation,
@@ -1411,6 +1442,7 @@ impl TuiEffect {
                 allow_daemon_start: true,
                 ..
             }
+            | Self::QueueRecovery { .. }
             | Self::LoadDraftStatus { .. }
             | Self::LoadSessionStatus { .. }
             | Self::LoadAgentCatalog
@@ -1666,6 +1698,7 @@ impl TuiEffect {
 
     fn key(&self) -> EffectKey {
         match self {
+            Self::QueueRecovery { .. } => EffectKey::QueueRecovery,
             Self::OpenSession { .. } => EffectKey::SessionOpen,
             Self::LoadConfig => EffectKey::Config,
             Self::PersistThemeSelection { .. } | Self::ClearThemeSelection => {
@@ -1757,6 +1790,23 @@ impl TuiEffect {
         streaming_sender: mpsc::Sender<TuiEffectResult>,
     ) -> TuiEffectResult {
         match self {
+            Self::QueueRecovery {
+                session_id,
+                generation,
+                action,
+            } => {
+                let result = async {
+                    let outcome = execute_session_view_action(&client, *action).await?;
+                    let status = client.queue_status(session_id).await?;
+                    Ok((outcome, status))
+                }
+                .await;
+                TuiEffectResult::QueueRecovery {
+                    session_id,
+                    generation,
+                    result: Box::new(result),
+                }
+            }
             Self::LoadSessionChildren {
                 parent_id,
                 after,
@@ -2452,10 +2502,7 @@ impl TuiEffect {
                 session_id,
                 result: match execute_session_view_action(
                     &client,
-                    SessionViewAction::CancelTurn {
-                        session_id,
-                        clear_queue: true,
-                    },
+                    active_turn_cancel_action(session_id),
                 )
                 .await
                 {
@@ -3107,6 +3154,13 @@ pub async fn load_pending_interactions(
     Ok(interactions)
 }
 
+const fn active_turn_cancel_action(session_id: SessionId) -> SessionViewAction {
+    SessionViewAction::CancelTurn {
+        session_id,
+        clear_queue: false,
+    }
+}
+
 async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> TuiEffectResult {
     let (model, model_error) = Box::pin(optional_client_result(
         client.session_model_status(session_id),
@@ -3143,6 +3197,18 @@ async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> Tui
 
 #[cfg(test)]
 mod projection_paging_tests {
+    #[test]
+    fn active_turn_cancel_preserves_all_pending_queue_items() {
+        let session_id = SessionId::new();
+        assert_eq!(
+            active_turn_cancel_action(session_id),
+            SessionViewAction::CancelTurn {
+                session_id,
+                clear_queue: false
+            }
+        );
+    }
+
     use super::*;
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionSourceRange, ProjectionWindow,
@@ -3181,6 +3247,147 @@ mod projection_paging_tests {
                 })
                 .collect(),
         }
+    }
+
+    fn queue_test_hello() -> bcode_ipc::ResponsePayload {
+        bcode_ipc::ResponsePayload::Hello {
+            protocol_version: bcode_ipc::ProtocolVersion::current(),
+            client_id: ClientId::new(),
+            daemon: bcode_ipc::DaemonStatus {
+                namespace: bcode_ipc::daemon_namespace(),
+                protocol_version: u32::from(bcode_ipc::ProtocolVersion::current().0),
+                artifact_id: Some(bcode_ipc::ArtifactId::current()),
+                executable_digest: Some(
+                    bcode_daemon_lifecycle::current_executable_identity()
+                        .unwrap()
+                        .1,
+                ),
+                build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+                storage_writer_epoch: Some(
+                    bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                ),
+                session_event_schema_version: Some(CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+                state_location_id: Some(bcode_ipc::state_location_id()),
+                ..bcode_ipc::DaemonStatus::default()
+            },
+        }
+    }
+    async fn respond_to_prepare(
+        listener: bcode_ipc::LocalIpcListener,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        confirmation: bcode_session_models::SubmissionResumeConfirmation,
+    ) {
+        let mut prepared = false;
+        let mut finished = false;
+        while !finished {
+            let mut stream = listener.accept().await.unwrap();
+            loop {
+                let Ok(envelope) = bcode_ipc::recv_envelope(&mut stream).await else {
+                    break;
+                };
+                let request = bcode_ipc::decode_request(&envelope.payload).unwrap();
+                let response = match request {
+                    bcode_ipc::Request::Hello { .. } => queue_test_hello(),
+                    bcode_ipc::Request::PrepareSubmissionResume {
+                        session_id: requested,
+                        submission_id: requested_id,
+                        expected_accepted_sequence,
+                    } => {
+                        assert_eq!(requested, session_id);
+                        assert_eq!(requested_id, submission_id);
+                        assert_eq!(expected_accepted_sequence, 17);
+                        assert!(!prepared);
+                        prepared = true;
+                        bcode_ipc::ResponsePayload::SubmissionResumePrepared {
+                            confirmation: confirmation.clone(),
+                        }
+                    }
+                    bcode_ipc::Request::SubmissionQueueStatus {
+                        session_id: requested,
+                    } => {
+                        assert!(prepared);
+                        assert_eq!(requested, session_id);
+                        finished = true;
+                        bcode_ipc::ResponsePayload::SubmissionQueueStatus {
+                            status: bcode_session_models::SubmissionQueueStatus {
+                                oldest: None,
+                                blocker: None,
+                            },
+                        }
+                    }
+                    other => panic!("prepare must not mutate or scan history: {other:?}"),
+                };
+                let reply = bcode_ipc::response_envelope(
+                    envelope.request_id,
+                    &bcode_ipc::Response::Ok(response),
+                )
+                .unwrap();
+                bcode_ipc::send_envelope(&mut stream, &reply).await.unwrap();
+                if finished {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn targeted_prepare_dispatches_read_only_identity_then_bounded_status() {
+        use bcode_session_models::*;
+        let session_id = SessionId::new();
+        let submission_id = SubmissionId("exact-pending".to_owned());
+        let confirmation = SubmissionResumeConfirmation {
+            version: 1,
+            submission_id: submission_id.clone(),
+            expected_accepted_sequence: 17,
+            descriptor: SubmissionExecutionDescriptor {
+                version: 2,
+                provider: "provider".to_owned(),
+                model: "model".to_owned(),
+                reasoning: None,
+                model_profile: Some("selected-profile".to_owned()),
+                auth_profile: None,
+                config_identity: "digest".to_owned(),
+                recovery_recipe: None,
+            },
+        };
+        let expected = confirmation.clone();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("queue.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let responder = tokio::spawn(respond_to_prepare(
+            listener,
+            session_id,
+            submission_id,
+            confirmation,
+        ));
+        let effect = TuiEffect::QueueRecovery {
+            session_id,
+            generation: 0,
+            action: Box::new(SessionViewAction::PrepareSubmissionResume {
+                session_id,
+                submission_id: expected.submission_id.clone(),
+                expected_accepted_sequence: 17,
+            }),
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            effect.run(BcodeClient::new(endpoint), sender),
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        let TuiEffectResult::QueueRecovery { result, .. } = result else {
+            panic!("expected recovery result");
+        };
+        let Ok((SessionViewActionOutcome::SubmissionResumePrepared { confirmation }, status)) =
+            *result
+        else {
+            panic!("expected read-only prepared confirmation");
+        };
+        assert_eq!(confirmation, expected);
+        assert!(status.oldest.is_none());
     }
 
     #[tokio::test]

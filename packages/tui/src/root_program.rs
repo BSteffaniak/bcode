@@ -2469,6 +2469,13 @@ impl BcodeRuntimeModel {
                 }
             }
             super::composer_flow::RootSubmission::SlashCommand(message) => {
+                if matches!(
+                    message.trim(),
+                    "/queue-resume" | "/queue-cancel" | "/queue-confirm" | "/queue-dismiss"
+                ) {
+                    self.stage_queue_recovery(message.trim());
+                    return;
+                }
                 let working_directory = self
                     .chat
                     .app
@@ -2489,6 +2496,82 @@ impl BcodeRuntimeModel {
                     .set_status("running slash command…".to_owned());
             }
         }
+    }
+
+    fn stage_queue_recovery(&mut self, command: &str) {
+        use bcode_session_view_models::SessionViewAction;
+        if command == "/queue-dismiss" {
+            self.chat.app.dismiss_queue_confirmation();
+            return;
+        }
+        let Some(session_id) = self.chat.attached_session_id() else {
+            return;
+        };
+        let Some(recovery) = self
+            .chat
+            .app
+            .session_view_snapshot()
+            .runtime
+            .queue_recovery()
+        else {
+            self.chat
+                .app
+                .set_status("No queued message needs recovery".to_owned());
+            self.chat.app.dismiss_queue_confirmation();
+            return;
+        };
+        let action = match command {
+            "/queue-resume" if recovery.can_resume => SessionViewAction::PrepareSubmissionResume {
+                session_id,
+                submission_id: recovery.submission_id,
+                expected_accepted_sequence: recovery.expected_accepted_sequence,
+            },
+            "/queue-cancel" if recovery.can_cancel => SessionViewAction::CancelPendingSubmission {
+                session_id,
+                operation_id: format!(
+                    "cancel:{}:{}",
+                    recovery.submission_id.0, recovery.expected_accepted_sequence
+                ),
+                submission_id: recovery.submission_id,
+                expected_accepted_sequence: recovery.expected_accepted_sequence,
+            },
+            "/queue-confirm" if recovery.can_resume => {
+                if !self.chat.app.queue_recovery.settings_visible {
+                    self.chat.app.set_status(
+                        "Enlarge the terminal to review all resume settings before confirming"
+                            .to_owned(),
+                    );
+                    return;
+                }
+                let Some(confirmation) = self.chat.app.queue_recovery.confirmation.take() else {
+                    return;
+                };
+                if confirmation.submission_id != recovery.submission_id
+                    || confirmation.expected_accepted_sequence
+                        != recovery.expected_accepted_sequence
+                {
+                    return;
+                }
+                SessionViewAction::ResumeSubmission {
+                    session_id,
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    confirmation,
+                }
+            }
+            _ => {
+                self.chat.app.set_status(recovery.reason);
+                return;
+            }
+        };
+        self.chat.app.queue_recovery.generation =
+            self.chat.app.queue_recovery.generation.wrapping_add(1);
+        let generation = self.chat.app.queue_recovery.generation;
+        self.chat
+            .start_effect(super::effects::TuiEffect::QueueRecovery {
+                generation,
+                session_id,
+                action: Box::new(action),
+            });
     }
 
     fn apply_root_command_action(&mut self, request: super::chat_loop::CommandDispatchRequest) {

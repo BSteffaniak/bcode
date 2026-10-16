@@ -3457,6 +3457,25 @@ pub fn apply_effect_result(
         } => {
             apply_session_status_result(chat, loop_state, session_id, *hydration);
         }
+        TuiEffectResult::QueueRecovery {
+            session_id,
+            generation,
+            result,
+        } => {
+            if chat.viewing_session_id() == Some(session_id)
+                && chat.app.queue_recovery.generation == generation
+            {
+                match *result {
+                    Ok((outcome, status)) => {
+                        chat.app
+                            .apply_queue_recovery_result(generation, outcome, status);
+                    }
+                    Err(error) => {
+                        report_nonfatal_client_error(chat, "Queue recovery unavailable", &error);
+                    }
+                }
+            }
+        }
         TuiEffectResult::SessionModelStatusLoaded { session_id, result } => {
             if chat.viewing_session_id() == Some(session_id) {
                 match result {
@@ -6431,6 +6450,20 @@ fn absorb_session_stream_update(
     update: history_flow::SessionStreamUpdate,
 ) -> bool {
     match update {
+        history_flow::SessionStreamUpdate::QueueUnavailable { session_id } => {
+            if chat.viewing_session_id() != Some(session_id) {
+                return false;
+            }
+            chat.app.set_submission_queue_unavailable();
+            true
+        }
+        history_flow::SessionStreamUpdate::QueueStatus { session_id, status } => {
+            if chat.viewing_session_id() != Some(session_id) {
+                return false;
+            }
+            chat.app.set_submission_queue(*status);
+            true
+        }
         history_flow::SessionStreamUpdate::Submission { session_id, record } => {
             if chat.viewing_session_id() != Some(session_id) {
                 return false;

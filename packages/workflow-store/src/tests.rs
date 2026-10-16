@@ -6811,6 +6811,24 @@ fn receipt_backed_restart_reconciliation_persists_terminal_success() {
     )
     .expect("activation");
     assert_eq!(activation_status, "completed");
+    let receipt = DispatchReceipt {
+        run_id: "run-1".into(),
+        node_id: "review".into(),
+        activation_id: activation_id(),
+        attempt: 1,
+        dispatch_identity: attempt.dispatch_identity,
+        receipt: serde_json::json!({"turn_id": "turn-1"}),
+        admitted_at_ms: 13,
+    };
+    let before = fixture_changes(&store.connection);
+    store
+        .persist_dispatch_receipt(&receipt)
+        .expect("terminal exact receipt redelivery");
+    assert_eq!(fixture_changes(&store.connection), before);
+    let mut conflicting = receipt;
+    conflicting.receipt = serde_json::json!({"turn_id": "different"});
+    assert!(store.persist_dispatch_receipt(&conflicting).is_err());
+    assert_eq!(fixture_changes(&store.connection), before);
 }
 
 #[test]
@@ -7571,19 +7589,24 @@ fn exercise_fan_out_retirement(succeeds: Option<bool>) {
     if succeeds.is_some() {
         return;
     }
-    assert!(
-        store
-            .persist_dispatch_receipt(&DispatchReceipt {
-                run_id: run.run_id.clone(),
-                node_id: member.node_id.clone(),
-                activation_id: member.activation_id.clone(),
-                attempt: prepared.attempt,
-                dispatch_identity: prepared.dispatch_identity,
-                receipt: serde_json::json!({"accepted":true}),
-                admitted_at_ms: 23,
-            })
-            .is_err()
-    );
+    let receipt = DispatchReceipt {
+        run_id: run.run_id.clone(),
+        node_id: member.node_id.clone(),
+        activation_id: member.activation_id.clone(),
+        attempt: prepared.attempt,
+        dispatch_identity: prepared.dispatch_identity,
+        receipt: serde_json::json!({"accepted":true}),
+        admitted_at_ms: 23,
+    };
+    let before = fixture_changes(&store.connection);
+    store
+        .persist_dispatch_receipt(&receipt)
+        .expect("exact cancelled receipt is idempotent");
+    assert_eq!(fixture_changes(&store.connection), before);
+    let mut conflicting = receipt;
+    conflicting.receipt = serde_json::json!({"accepted":"conflict"});
+    assert!(store.persist_dispatch_receipt(&conflicting).is_err());
+    assert_eq!(fixture_changes(&store.connection), before);
     drop(store);
     assert_retired_fan_out_after_reopen(temp.path(), &run.run_id);
 }

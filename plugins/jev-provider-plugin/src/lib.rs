@@ -1181,10 +1181,11 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
                 .expect("write partial reply");
             request_seen.send(()).expect("notify pending response");
-            let len = stream
-                .read(&mut buffer)
-                .expect("client closes cancelled request");
-            assert_eq!(len, 0, "cancelled HTTP request must close its socket");
+            match stream.read(&mut buffer) {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                result => panic!("cancelled HTTP request must close its socket: {result:?}"),
+            }
         });
         let cancellation = ServiceCancellation::default();
         let cancel = cancellation.clone();

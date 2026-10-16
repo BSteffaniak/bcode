@@ -4388,6 +4388,39 @@ impl WorkflowStore {
         receipt_backed_attempts(&self.connection, Some(run_id), bounded_limit(limit)?)
     }
 
+    /// Read the exact retained receipt for a prepared dispatch, including terminal attempts.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid identity, malformed receipt, or database failure.
+    pub fn dispatch_receipt(
+        &self,
+        dispatch_identity: &str,
+    ) -> Result<Option<DispatchReceipt>, WorkflowStoreError> {
+        validate_id("dispatch_identity", dispatch_identity)?;
+        let rows = database::rows(
+            &self.connection,
+            &select("workflow_attempts")
+                .where_eq("dispatch_identity", dispatch_identity)
+                .limit(1),
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let Some(receipt_json) = database::optional_text(row, "receipt_json")? else {
+            return Ok(None);
+        };
+        Ok(Some(DispatchReceipt {
+            run_id: database::text(row, "run_id")?,
+            node_id: database::text(row, "node_id")?,
+            activation_id: database::text(row, "activation_id")?,
+            attempt: u32::try_from(database::unsigned(row, "attempt")?)
+                .map_err(|_| WorkflowStoreError::InvalidData("invalid attempt number".into()))?,
+            dispatch_identity: dispatch_identity.into(),
+            receipt: serde_json::from_str(&receipt_json)?,
+            admitted_at_ms: database::unsigned(row, "admitted_at_ms")?,
+        }))
+    }
+
     /// Report whether the exact prepared attempt has a committed owner receipt.
     ///
     /// # Errors

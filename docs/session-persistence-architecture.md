@@ -98,6 +98,39 @@ Worker progress is evidence, not task admission. Orchestration skills can use
 bounded worker history reads without sending each status report as a steering or
 follow-up prompt. No inter-session report protocol or automatic wakeup is required.
 
+### Queued input after daemon loss
+
+New independently queued submissions retain a versioned execution recovery recipe.
+The recipe contains bounded configuration-source references and a verification digest,
+plus the selected model and named authentication policy; it never contains effective
+configuration TOML, credential values, or a process-environment dump. Configuration
+replay uses the captured layer order and context/profile selection, not the replacement
+daemon's defaults. Authentication is materialized again through the provider-auth
+owner; credential refresh does not authorize a different model or account policy.
+Transient settings without verified declarative sources remain explicitly unrecoverable.
+
+The oldest pending independent acceptance retains FIFO priority. A missing or changed
+recipe pauses the queue rather than skipping an instruction or guessing its settings.
+`session queue-status SESSION_ID` returns the bounded oldest-item observation and
+application-owned blocker independently of the visible history window. Shared frontend
+state presents the same blocker and available actions after attach/reconnect.
+
+Existing descriptor-less submissions require an explicit recovery decision:
+
+* `session prepare-resume SESSION_ID SUBMISSION_ID --expected-accepted-sequence SEQUENCE`
+  returns the exact proposed execution confirmation without activating the message.
+* Review the provider, model and named authentication policy, then submit the saved
+  confirmation with `session resume-pending SESSION_ID --confirmation FILE --operation-id ID`.
+* `session cancel-pending SESSION_ID SUBMISSION_ID --expected-accepted-sequence SEQUENCE
+  --operation-id ID` cancels only that pending message, not active work or the whole queue.
+
+Reuse an operation ID only for an identical retry. Stale, conflicting, unsupported, or
+no-longer-pending requests are rejected. Recovery authorization is append-only canonical
+history and does not rewrite the accepted text, turn target, ordering, or permissions.
+Workflow-owned input requires the workflow's authorized recovery controls. Queued-input
+recovery is not permission to repeat an interrupted tool with an unverifiable outcome
+or reopen an authoritative terminal turn.
+
 ## Canonical storage and authority
 
 A Bcode session id maps to exactly one canonical database within the state location that owns it:

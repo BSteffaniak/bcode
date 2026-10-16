@@ -10,6 +10,12 @@ pub(crate) mod tests;
 pub enum PresentationAction {
     /// Submit a user message.
     SubmitMessage,
+    /// Prepare the exact resume selection for explicit confirmation.
+    PrepareSubmissionResume,
+    /// Confirm and resume one prepared item.
+    ResumeSubmission,
+    /// Cancel one pending item.
+    CancelPendingSubmission,
     /// Cancel the active turn.
     CancelTurn,
     /// Persist the draft for a session.
@@ -54,6 +60,13 @@ impl PresentationContext for StaticPresentationContext {
     fn action_target(&self, action: PresentationAction) -> String {
         match action {
             PresentationAction::SubmitMessage => "/actions/submit-message".to_owned(),
+            PresentationAction::PrepareSubmissionResume => {
+                "/actions/prepare-submission-resume".to_owned()
+            }
+            PresentationAction::ResumeSubmission => "/actions/resume-submission".to_owned(),
+            PresentationAction::CancelPendingSubmission => {
+                "/actions/cancel-pending-submission".to_owned()
+            }
             PresentationAction::CancelTurn => "/actions/cancel-turn".to_owned(),
             PresentationAction::UpdateDraft { session_id } => {
                 format!("/actions/update-draft/{session_id}")

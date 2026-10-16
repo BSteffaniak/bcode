@@ -6258,6 +6258,34 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Observe the oldest pending item and application-owned recovery blocker.
+    QueueStatus {
+        session_id: SessionId,
+    },
+    /// Prepare an exact secret-free recipe to review before explicitly resuming.
+    PrepareResume {
+        session_id: SessionId,
+        submission_id: String,
+        #[arg(long)]
+        expected_accepted_sequence: u64,
+    },
+    /// Resume using the exact JSON confirmation emitted by prepare-resume.
+    ResumePending {
+        session_id: SessionId,
+        #[arg(long)]
+        confirmation: PathBuf,
+        #[arg(long)]
+        operation_id: String,
+    },
+    /// Cancel only one exact pending item, without cancelling active work.
+    CancelPending {
+        session_id: SessionId,
+        submission_id: String,
+        #[arg(long)]
+        expected_accepted_sequence: u64,
+        #[arg(long)]
+        operation_id: String,
+    },
     /// Inspect a bounded point-in-time pending queue, not a snapshot or event stream.
     Pending {
         session_id: SessionId,
@@ -8702,6 +8730,70 @@ async fn dispatch_non_ranking_session_command(
             limit,
             json,
         } => Box::pin(watch_session(session_id, limit, json)).await?,
+        SessionCommand::QueueStatus { session_id } => {
+            print_json(
+                &session_read_client(session_id)
+                    .await?
+                    .queue_status(session_id)
+                    .await?,
+            )?;
+        }
+        SessionCommand::PrepareResume {
+            session_id,
+            submission_id,
+            expected_accepted_sequence,
+        } => {
+            print_json(
+                &session_read_client(session_id)
+                    .await?
+                    .prepare_submission_resume(
+                        session_id,
+                        bcode_session_models::SubmissionId(submission_id),
+                        expected_accepted_sequence,
+                    )
+                    .await?,
+            )?;
+        }
+        SessionCommand::ResumePending {
+            session_id,
+            confirmation,
+            operation_id,
+        } => {
+            let mut contents = Vec::new();
+            std::io::Read::take(std::fs::File::open(&confirmation)?, 65_537)
+                .read_to_end(&mut contents)?;
+            if contents.len() > 65_536 {
+                return Err(CliError::InvalidArguments(
+                    "recovery confirmation exceeds 64 KiB".into(),
+                ));
+            }
+            let confirmation: bcode_session_models::SubmissionResumeConfirmation =
+                serde_json::from_slice(&contents)?;
+            print_json(
+                &session_read_client(session_id)
+                    .await?
+                    .resume_submission(session_id, confirmation, operation_id)
+                    .await?,
+            )?;
+        }
+        SessionCommand::CancelPending {
+            session_id,
+            submission_id,
+            expected_accepted_sequence,
+            operation_id,
+        } => {
+            print_json(
+                &session_read_client(session_id)
+                    .await?
+                    .cancel_pending_submission(
+                        session_id,
+                        bcode_session_models::SubmissionId(submission_id),
+                        expected_accepted_sequence,
+                        operation_id,
+                    )
+                    .await?,
+            )?;
+        }
         SessionCommand::Pending {
             session_id,
             after,
@@ -19295,6 +19387,8 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SubmissionAccepted { .. } => "submission_accepted",
         SessionEventKind::SubmissionActivated { .. } => "submission_activated",
         SessionEventKind::SubmissionCancelled { .. } => "submission_cancelled",
+        SessionEventKind::SubmissionRecoveryAuthorized { .. } => "submission_recovery_authorized",
+        SessionEventKind::SubmissionPendingCancelled { .. } => "submission_pending_cancelled",
         SessionEventKind::SubmissionContextObserved { .. } => "submission_context_observed",
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
@@ -20836,6 +20930,26 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         } => {
             println!(
                 "#{} submission {} activated: {text}",
+                event.sequence, submission_id.0
+            );
+        }
+        SessionEventKind::SubmissionRecoveryAuthorized {
+            submission_id,
+            operation_id,
+            ..
+        } => {
+            println!(
+                "#{} submission {} recovery authorized ({operation_id}); activation pending",
+                event.sequence, submission_id.0
+            );
+        }
+        SessionEventKind::SubmissionPendingCancelled {
+            submission_id,
+            operation_id,
+            ..
+        } => {
+            println!(
+                "#{} submission {} cancelled before activation ({operation_id})",
                 event.sequence, submission_id.0
             );
         }
@@ -26697,6 +26811,7 @@ mod send_cli_tests {
                 },
                 status,
                 context_observation,
+                recovery_authorization: None,
             });
         }
         let page = PendingSubmissionsPage {
