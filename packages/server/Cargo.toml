@@ -77,6 +77,8 @@ url = { workspace = true }
 uuid = { workspace = true }
 wait-timeout = { workspace = true }
 
+zeroize = { workspace = true }
+
 [dev-dependencies]
 bcode_bundled_plugins = { workspace = true, features = [
     "static-bundled-default-agents-plugin",

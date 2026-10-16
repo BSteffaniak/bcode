@@ -707,6 +707,10 @@ fn tool_invocation_projection_mut<'a>(
         })
 }
 
+/// Stable execution-checkpoint marker carried by canonical provider events.
+/// Its detail is a versioned host-owned retry checkpoint, or `None` when retired.
+pub const PROVIDER_RETRY_CHECKPOINT_EVENT: &str = "provider_retry_checkpoint_v1";
+
 /// Current persisted session event schema version.
 pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 52;
 

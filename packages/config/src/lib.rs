@@ -4361,7 +4361,7 @@ const fn default_no_progress_timeout_retry_enabled() -> bool {
 }
 
 const fn default_no_progress_timeout_initial_delay_ms() -> u64 {
-    1_000
+    2_000
 }
 
 const fn default_no_progress_timeout_max_delay_ms() -> u64 {

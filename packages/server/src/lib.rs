@@ -28,6 +28,7 @@ mod model_ignores;
 mod model_request_target;
 mod plugin_context;
 mod plugin_operations;
+mod provider_retry_recovery;
 mod request_routing;
 mod runtime_work;
 /// Transport-neutral runtime-work reads, observations and cancellation operations.
@@ -5850,16 +5851,12 @@ async fn recover_abandoned_session_runtime_work_best_effort_inner(
     }
 }
 
-const fn enqueue_recovered_model_turn(
-    _state: &Arc<ServerState>,
-    _session_id: SessionId,
-    _work: &bcode_session::db::RuntimeWorkProjection,
-) -> bool {
-    // Runtime work recorded before an admitted turn carried a versioned, secret-free execution
-    // descriptor cannot be reconstructed safely. In particular, using the new daemon's startup
-    // model/provider context could retarget the turn to another Bedrock surface or credential
-    // identity. Return false so recovery terminalizes the abandoned work instead of guessing.
-    false
+async fn enqueue_recovered_model_turn(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    work: &bcode_session::db::RuntimeWorkProjection,
+) -> Result<bool, ServerError> {
+    provider_retry_recovery::preserve_abandoned(state, session_id, work).await
 }
 
 async fn recover_abandoned_tool_runs(
@@ -6011,7 +6008,7 @@ async fn recover_abandoned_session_runtime_work_inner(
         }
         if work.kind == RuntimeWorkKind::ModelTurn
             && work.parent_work_id.is_none()
-            && enqueue_recovered_model_turn(state, session_id, &work)
+            && enqueue_recovered_model_turn(state, session_id, &work).await?
         {
             continue;
         }
@@ -16830,6 +16827,13 @@ async fn recover_pending_submission_hint_with_authority_inner(
     } else {
         SubmissionContextIssue::Unavailable
     };
+    if matches!(
+        record.status,
+        bcode_session_models::SubmissionStatus::Activated { .. }
+    ) {
+        append_system_event(state, session_id, format!("Retry recovery deferred: original execution context is {issue:?}; restore the original model/provider configuration before resuming.")).await;
+        return Ok(None);
+    }
     if record
         .context_observation
         .as_ref()
@@ -17113,6 +17117,24 @@ async fn run_session_runtime_inner(
                                 "submission activation must return its canonical event"
                             ),
                         };
+                        let recovering = match provider_retry_recovery::is_recovering(
+                            &state,
+                            session_id,
+                            &execution_turn_id(&event),
+                        )
+                        .await
+                        {
+                            Ok(recovering) => recovering,
+                            Err(error) => {
+                                append_system_event(
+                                    &state,
+                                    session_id,
+                                    format!("retry recovery deferred: {error}"),
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
                         Box::pin(process_existing_user_event_command(
                             &state,
                             &mut permit,
@@ -17127,7 +17149,7 @@ async fn run_session_runtime_inner(
                             event,
                             None,
                             None,
-                            false,
+                            recovering,
                         ))
                         .await;
                     }
@@ -21415,12 +21437,17 @@ struct ModelTurnRecoveryState {
     retried_after_context_pressure: bool,
     retried_after_malformed_tool_arguments: bool,
     max_tokens_continuations: u32,
+    consecutive_retry_attempts: u64,
     retry_attempts: BTreeMap<String, u64>,
+    structured_output_finalization: bool,
+    structured_result_corrections: u32,
+    structured_result_correction_error: Option<String>,
     retry_instruction: Option<&'static str>,
 }
 
 impl ModelTurnRecoveryState {
     fn record_successful_provider_round(&mut self) {
+        self.consecutive_retry_attempts = 0;
         self.retry_attempts.clear();
         self.retry_instruction = None;
     }
@@ -21435,6 +21462,10 @@ struct ProviderErrorRetryContext<'a> {
     retry_config: &'a bcode_config::ModelRetryConfig,
     cancel_state: &'a TurnCancelState,
     phase: &'a Arc<Mutex<SessionRuntimePhase>>,
+    provider_round: u32,
+    completed_tool_rounds: u32,
+    segment_order: u32,
+    output_position: u64,
     compaction_decision: CompactionDecision,
 }
 
@@ -22084,12 +22115,45 @@ async fn run_model_turn_inner(
         }
     };
     let mut rounds = ModelTurnRoundState::new(turn_config.model.effective_max_tool_rounds());
-    let mut structured_output_finalization = false;
-    let mut structured_result_corrections = 0_u32;
-    let mut structured_result_correction_error: Option<String> = None;
     let mut next_assistant_segment_order = 0_u32;
     let mut next_output_position = 0_u64;
     let mut recovery = ModelTurnRecoveryState::default();
+    if recovering {
+        match provider_retry_recovery::restore(
+            state,
+            session_id,
+            &turn_id,
+            (
+                &mut recovery,
+                &mut rounds,
+                &mut next_assistant_segment_order,
+                &mut next_output_position,
+            ),
+            cancel_state.as_ref(),
+            command_context,
+        )
+        .await
+        {
+            Ok(ModelTurnRetry::Continue) => {
+                if let Err(error) =
+                    provider_retry_recovery::clear(state, session_id, &turn_id).await
+                {
+                    return ModelTurnCompletion::with_message(
+                        ModelTurnOutcome::Error,
+                        format!("retry checkpoint retirement failed: {error}"),
+                    );
+                }
+            }
+            Ok(ModelTurnRetry::Return(completion)) => return completion,
+            Ok(ModelTurnRetry::None) => unreachable!("retry recovery always waits or cancels"),
+            Err(error) => {
+                return ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    format!("retry recovery failed: {error}"),
+                );
+            }
+        }
+    }
     let mut last_proactive_compaction_boundary = None;
     let mut last_proactive_attempt_boundary = None;
     append_context_compaction_trace(
@@ -22153,7 +22217,7 @@ async fn run_model_turn_inner(
             mut catalog_identity,
             structured_output_execution,
         } = prepared;
-        let structured_output_phase = if structured_output_finalization {
+        let structured_output_phase = if recovery.structured_output_finalization {
             StructuredOutputPhase::Finalization
         } else if !request.tools.is_empty() {
             StructuredOutputPhase::Work
@@ -22167,7 +22231,7 @@ async fn run_model_turn_inner(
             structured_output_execution,
             structured_output_phase,
         );
-        if structured_result_corrections > 0 {
+        if recovery.structured_result_corrections > 0 {
             request.tools.clear();
             request.tool_call_policy = bcode_model::ToolCallRequestPolicy {
                 parallel: Some(false),
@@ -22177,10 +22241,10 @@ async fn run_model_turn_inner(
             request.structured_output = desired_structured_output.clone();
             request.metadata.insert(
                 "bcode_structured_result_correction_attempt".to_string(),
-                structured_result_corrections.to_string(),
+                recovery.structured_result_corrections.to_string(),
             );
         }
-        if structured_output_finalization {
+        if recovery.structured_output_finalization {
             context_projection = projected_request_context(
                 state,
                 session_id,
@@ -22189,7 +22253,7 @@ async fn run_model_turn_inner(
             )
             .await;
         }
-        if let Some(error) = structured_result_correction_error.take() {
+        if let Some(error) = recovery.structured_result_correction_error.take() {
             request.messages.push(ModelMessage {
                 role: MessageRole::User,
                 content: vec![ContentBlock::Text {
@@ -22283,7 +22347,7 @@ async fn run_model_turn_inner(
                 catalog_provider_id = prepared.catalog_provider_id;
                 catalog_identity = prepared.catalog_identity;
                 let desired_structured_output = request.structured_output.clone();
-                let phase = if structured_output_finalization {
+                let phase = if recovery.structured_output_finalization {
                     StructuredOutputPhase::Finalization
                 } else if !request.tools.is_empty() {
                     StructuredOutputPhase::Work
@@ -22413,6 +22477,10 @@ async fn run_model_turn_inner(
             retry_config: &turn_config.model.retry,
             cancel_state: cancel_state.as_ref(),
             phase,
+            provider_round: rounds.provider_round,
+            completed_tool_rounds: rounds.completed_tool_rounds,
+            segment_order: next_assistant_segment_order,
+            output_position: next_output_position,
             compaction_decision,
         };
         match Box::pin(maybe_retry_after_provider_error(
@@ -22426,6 +22494,14 @@ async fn run_model_turn_inner(
         .await
         {
             ModelTurnRetry::Continue => {
+                if let Err(error) =
+                    provider_retry_recovery::clear(state, session_id, &turn_id).await
+                {
+                    return ModelTurnCompletion::with_message(
+                        ModelTurnOutcome::Error,
+                        format!("retry checkpoint retirement failed: {error}"),
+                    );
+                }
                 rounds.complete_provider_round();
                 continue;
             }
@@ -22433,6 +22509,15 @@ async fn run_model_turn_inner(
             ModelTurnRetry::None => {}
         }
         if outcome.provider_error.is_none() {
+            if recovery.consecutive_retry_attempts > 0
+                && let Err(error) =
+                    provider_retry_recovery::clear(state, session_id, &turn_id).await
+            {
+                return ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    format!("retry checkpoint completion failed: {error}"),
+                );
+            }
             recovery.record_successful_provider_round();
         }
         if let Some(completion) = outcome.completion.clone() {
@@ -22441,7 +22526,7 @@ async fn run_model_turn_inner(
         }
         match outcome.stop_reason {
             Some(bcode_model::StopReason::ToolCall) => {
-                if structured_output_finalization {
+                if recovery.structured_output_finalization {
                     return ModelTurnCompletion::with_message(
                         ModelTurnOutcome::Error,
                         "structured-output finalization requested a host tool despite tool-free execution",
@@ -22601,7 +22686,7 @@ async fn run_model_turn_inner(
                         }
                     }
                 }
-                if !structured_output_finalization
+                if !recovery.structured_output_finalization
                     && structured_output_execution
                         == Some(bcode_model::CapabilityExecution::ToolFreeProviderRound)
                     && desired_structured_output.is_some()
@@ -22618,7 +22703,7 @@ async fn run_model_turn_inner(
                                 ModelTurnCompletion::completed().with_output(output)
                             });
                     }
-                    structured_output_finalization = true;
+                    recovery.structured_output_finalization = true;
                     append_provider_event_trace(
                         state,
                         session_id,
@@ -22640,9 +22725,10 @@ async fn run_model_turn_inner(
                     && let Some(output) = outcome.assistant_output.as_deref()
                     && let Err(error) = validate_structured_result_candidate(structured, output)
                 {
-                    if structured_result_corrections >= structured.max_corrections {
+                    if recovery.structured_result_corrections >= structured.max_corrections {
                         let message = format!(
-                            "structured result remained invalid after {structured_result_corrections} correction attempts: {error}"
+                            "structured result remained invalid after {} correction attempts: {error}",
+                            recovery.structured_result_corrections
                         );
                         append_provider_event_trace(
                             state,
@@ -22654,17 +22740,18 @@ async fn run_model_turn_inner(
                         .await;
                         return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
                     }
-                    structured_result_corrections = structured_result_corrections.saturating_add(1);
-                    structured_output_finalization = true;
-                    structured_result_correction_error = Some(error.clone());
+                    recovery.structured_result_corrections =
+                        recovery.structured_result_corrections.saturating_add(1);
+                    recovery.structured_output_finalization = true;
+                    recovery.structured_result_correction_error = Some(error.clone());
                     append_provider_event_trace(
                         state,
                         session_id,
                         &request.turn_id,
                         "structured_result_correction_started",
                         Some(format!(
-                            "attempt={structured_result_corrections}; max_attempts={}; validation_error={error}",
-                            structured.max_corrections
+                            "attempt={}; max_attempts={}; validation_error={error}",
+                            recovery.structured_result_corrections, structured.max_corrections
                         )),
                     )
                     .await;
@@ -22925,10 +23012,31 @@ async fn maybe_retry_after_provider_error(
             .or_default();
         if policy.allows_attempt(*attempts) {
             *attempts = attempts.saturating_add(1);
+            recovery.consecutive_retry_attempts =
+                recovery.consecutive_retry_attempts.saturating_add(1);
+            let policy_attempt = *attempts;
+            if let Err(error) = provider_retry_recovery::schedule(
+                state,
+                session_id,
+                &context,
+                recovery,
+                provider_retry_delay(&policy, error, recovery.consecutive_retry_attempts),
+            )
+            .await
+            {
+                return ModelTurnRetry::Return(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    format!("retry checkpoint failed: {error}"),
+                ));
+            }
             return retry_after_provider_error(
                 state,
                 session_id,
-                (context.turn_id, *attempts),
+                (
+                    context.turn_id,
+                    policy_attempt,
+                    recovery.consecutive_retry_attempts,
+                ),
                 error,
                 &policy,
                 context.cancel_state,
@@ -23010,14 +23118,17 @@ fn matching_provider_retry_policy(
     {
         return Some(policy);
     }
-    is_transient_provider_error(error).then(|| ProviderRetryPolicy {
-        id: "builtin.transient".to_string(),
-        display_name: "transient provider error".to_string(),
-        max_retries: None,
-        initial_delay_ms: default_provider_retry_initial_delay_ms(),
-        max_delay_ms: default_provider_retry_max_delay_ms(),
-        use_provider_retry_hint: default_provider_retry_use_provider_retry_hint(),
-        kind: ProviderRetryPolicyKind::Transient,
+    // The specialized watchdog opt-out must not fall through to generic timeout recovery.
+    (!is_model_no_progress_timeout(error) && is_transient_provider_error(error)).then(|| {
+        ProviderRetryPolicy {
+            id: "builtin.transient".to_string(),
+            display_name: "transient provider error".to_string(),
+            max_retries: None,
+            initial_delay_ms: default_provider_retry_initial_delay_ms(),
+            max_delay_ms: default_provider_retry_max_delay_ms(),
+            use_provider_retry_hint: default_provider_retry_use_provider_retry_hint(),
+            kind: ProviderRetryPolicyKind::Transient,
+        }
     })
 }
 
@@ -23026,6 +23137,7 @@ const fn is_transient_provider_error(error: &bcode_model::ProviderError) -> bool
         && matches!(
             error.category,
             bcode_model::ProviderErrorCategory::Network
+                | bcode_model::ProviderErrorCategory::Timeout
                 | bcode_model::ProviderErrorCategory::ProviderInternal
         )
 }
@@ -23103,7 +23215,7 @@ impl ProviderRetryPolicy {
 }
 
 const fn default_provider_retry_initial_delay_ms() -> u64 {
-    1_000
+    2_000
 }
 
 const fn default_provider_retry_max_delay_ms() -> u64 {
@@ -23303,13 +23415,13 @@ fn provider_error_category(category: &str) -> Option<bcode_model::ProviderErrorC
 async fn retry_after_provider_error(
     state: &ServerState,
     session_id: SessionId,
-    (turn_id, attempt): (&str, u64),
+    (turn_id, attempt, backoff_attempt): (&str, u64, u64),
     error: &bcode_model::ProviderError,
     policy: &ProviderRetryPolicy,
     cancel_state: &TurnCancelState,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> ModelTurnRetry {
-    let delay = provider_retry_delay(policy, error, attempt);
+    let delay = provider_retry_delay(policy, error, backoff_attempt);
     append_provider_event_trace(
         state,
         session_id,
@@ -23335,12 +23447,26 @@ async fn retry_after_provider_error(
     )
     .await;
 
+    wait_for_provider_retry(state, session_id, delay, cancel_state, command_context).await
+}
+
+async fn wait_for_provider_retry(
+    state: &ServerState,
+    session_id: SessionId,
+    delay: Duration,
+    cancel_state: &TurnCancelState,
+    command_context: &mut RuntimeCommandContext<'_>,
+) -> ModelTurnRetry {
     let delay = tokio::time::sleep(delay);
     tokio::pin!(delay);
     loop {
         tokio::select! {
-            () = &mut delay => return ModelTurnRetry::Continue,
-            command = command_context.cancel_commands.recv() => {
+            biased;
+            () = cancel_state.cancelled() => return ModelTurnRetry::Return(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
+            )),
+            command = command_context.cancel_commands.recv(), if !command_context.cancel_commands.is_closed() || !command_context.cancel_commands.is_empty() => {
                 if let Some(command) = command {
                     process_cancel_turn_command(
                         state,
@@ -23351,10 +23477,7 @@ async fn retry_after_provider_error(
                     ).await;
                 }
             }
-            () = cancel_state.cancelled() => return ModelTurnRetry::Return(ModelTurnCompletion::with_message(
-                ModelTurnOutcome::Cancelled,
-                "model turn cancelled",
-            )),
+            () = &mut delay => return ModelTurnRetry::Continue,
         }
     }
 }
@@ -44566,6 +44689,7 @@ mod tests {
     mod collaboration_execution;
     mod goal_entry;
     mod judgement_quality;
+    mod provider_retry;
     mod scheduler;
     // Destructured bindings below avoid significant_drop_tightening false positives on moved
     // owners and non-owning adapters. Actual resource owners retain explicit teardown drops.
@@ -59660,6 +59784,7 @@ library = "test"
         recovery.record_successful_provider_round();
 
         assert!(recovery.retry_attempts.is_empty());
+        assert_eq!(recovery.consecutive_retry_attempts, 0);
         assert_eq!(recovery.retry_instruction, None);
     }
 
@@ -60089,7 +60214,7 @@ library = "test"
 
             assert_eq!(policy.id, "builtin.transient");
             assert_eq!(policy.max_retries, None);
-            assert_eq!(policy.initial_delay_ms, 1_000);
+            assert_eq!(policy.initial_delay_ms, 2_000);
             assert_eq!(policy.max_delay_ms, 600_000);
         }
 
@@ -60459,7 +60584,7 @@ library = "test"
 
         assert_eq!(policy.id, "builtin.no_progress_timeout");
         assert_eq!(policy.max_retries, None);
-        assert_eq!(policy.initial_delay_ms, 1_000);
+        assert_eq!(policy.initial_delay_ms, 2_000);
         assert_eq!(policy.max_delay_ms, 600_000);
         assert!(!policy.use_provider_retry_hint);
         drop(state);

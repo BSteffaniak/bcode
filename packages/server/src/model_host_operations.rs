@@ -452,6 +452,7 @@ impl ModelHostOperations {
         .key_source(Arc::new(FreshCustodyKey));
         let custody = Arc::new(custody);
         *retained = Some(Arc::clone(&custody));
+        drop(retained);
         Ok(Some(custody))
     }
 
@@ -760,6 +761,7 @@ fn build_turn_request(
             ),
             ..bcode_model::ModelParameters::default()
         },
+        context_lineage: None,
         structured_output: None,
         context_management: bcode_model::ContextManagementRequest::default(),
         prompt_cache: bcode_model::PromptCacheHints::default(),

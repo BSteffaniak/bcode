@@ -3364,7 +3364,7 @@ impl SessionDb {
             ));
         }
         let mut events = Vec::new();
-        for kind in ["terminal", "output"] {
+        for kind in ["terminal", "output", "retry"] {
             let mut query = self
                 .db
                 .select("turn_evidence")
@@ -3409,6 +3409,11 @@ impl SessionDb {
             })?;
             let event = strict_event_from_row(row, self.session_id)?;
             let matches = match &event.kind {
+                SessionEventKind::TraceEvent { trace } => {
+                    kind == "retry"
+                        && trace.turn_id.as_deref() == Some(turn_id)
+                        && matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. } if event_type == bcode_session_models::PROVIDER_RETRY_CHECKPOINT_EVENT)
+                }
                 SessionEventKind::ModelTurnFinished { turn_id: id, .. } => {
                     kind == "terminal" && id == turn_id
                 }
@@ -5515,6 +5520,13 @@ async fn project_appended_event(db: &dyn Database, event: &SessionEvent) -> Sess
 
 async fn project_turn_evidence(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
     let (turn_id, kind, order) = match &event.kind {
+        SessionEventKind::TraceEvent { trace } if matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. } if event_type == bcode_session_models::PROVIDER_RETRY_CHECKPOINT_EVENT) =>
+        {
+            let Some(turn_id) = trace.turn_id.as_ref() else {
+                return Ok(());
+            };
+            (turn_id, "retry", event.sequence)
+        }
         SessionEventKind::ModelTurnFinished { turn_id, .. } => (turn_id, "terminal", 0),
         SessionEventKind::AssistantResponseSegment {
             turn_id,

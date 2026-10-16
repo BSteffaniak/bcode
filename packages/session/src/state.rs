@@ -454,6 +454,18 @@ impl SessionState {
         }
         if self.events.is_some() {
             match &event.kind {
+                SessionEventKind::TraceEvent { trace }
+                    if trace.turn_id.is_some()
+                        && matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. } if event_type == bcode_session_models::PROVIDER_RETRY_CHECKPOINT_EVENT) =>
+                {
+                    let evidence = self
+                        .turn_evidence
+                        .entry(trace.turn_id.clone().expect("checked turn"))
+                        .or_default();
+                    evidence
+                        .retain(|item| !matches!(item.kind, SessionEventKind::TraceEvent { .. }));
+                    evidence.push(event.clone());
+                }
                 SessionEventKind::ModelTurnFinished { turn_id, .. } => {
                     let evidence = self.turn_evidence.entry(turn_id.clone()).or_default();
                     if !evidence
@@ -478,7 +490,7 @@ impl SessionState {
                         .iter()
                         .any(|item| matches!(item.kind, SessionEventKind::ModelTurnFinished { .. }))
                     {
-                        let prior_order = evidence.first().and_then(|item| match &item.kind {
+                        let prior_order = evidence.iter().find_map(|item| match &item.kind {
                             SessionEventKind::AssistantResponseSegment {
                                 segment_order, ..
                             }
@@ -489,7 +501,9 @@ impl SessionState {
                             _ => None,
                         });
                         if prior_order.is_none_or(|order| order <= *segment_order) {
-                            evidence.clear();
+                            evidence.retain(|item| {
+                                matches!(item.kind, SessionEventKind::TraceEvent { .. })
+                            });
                             evidence.push(event.clone());
                         }
                     }

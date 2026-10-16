@@ -405,7 +405,7 @@ async fn drive_with(
                         setup_error("Invalid enrollment answer; custody remains fenced.")
                     })?,
                 AuthFlowEffect::Wait { millis } => {
-                    tokio::time::sleep(std::time::Duration::from_millis(*millis)).await
+                    tokio::time::sleep(std::time::Duration::from_millis(*millis)).await;
                 }
                 _ => {}
             }

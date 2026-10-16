@@ -5,6 +5,35 @@ See [Child sessions](child-sessions.md) for immutable recursive session relation
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 
+## Provider retry recovery
+
+Recoverable provider timeouts, network failures and provider-internal errors use the existing
+host retry policy. Built-in transient and no-progress recovery starts at two seconds and doubles
+up to ten minutes; unlimited retry is the default, while explicit retry opt-outs, custom rules
+and finite limits remain authoritative. Consecutive failures share a backoff counter even when
+the matching policy changes. Policy-specific counters still enforce each configured attempt
+limit. Only a successful provider round resets recovery counters. Cancellation interrupts both
+provider waits and backoff.
+
+Writer epoch 16 adds indexed provider-retry evidence to the existing `turn_evidence` projection.
+The event schema remains 51: checkpoints are versioned host-owned details of canonical
+`TraceEvent::ProviderEvent` records, written regardless of optional trace configuration.
+The latest checkpoint retains the activation sequence, next provider round, completed tool-round
+count, source output positions, policy counters and absolute retry deadline. An indexed lookup
+reads at most one retry checkpoint alongside existing terminal/output evidence; unrelated session
+history cannot hide it. The epoch-15-to-16 migration rebuilds derived evidence through the normal
+exclusive migration path; older writers are fenced from silently discarding retry evidence.
+
+A checkpoint authorizes recovery only during a provider-only backoff interval, after failed-attempt
+cleanup. It is retired before another provider attempt or tool execution can begin. Restart
+recovery retains nonterminal work and verifies the original submission execution descriptor and
+session/workflow ownership before dispatching the same activation. It restores remaining backoff,
+limits and source positions without activating input again or replaying tools. A mismatched or
+unavailable execution context defers recovery rather than selecting replacement defaults. Terminal
+turn evidence is never reopened. An interrupted attempt after checkpoint retirement is not proven
+safe by an older checkpoint; general in-flight/provider/tool reconciliation remains outside this
+backoff-only recovery contract.
+
 ## Prompt acceptance and conversation activation
 
 Session event schema 48 and writer epoch 12 distinguish durable prompt acceptance from
