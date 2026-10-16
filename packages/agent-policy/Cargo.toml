@@ -17,6 +17,7 @@ bcode_session_models                = { workspace = true }
 bcode_shell_command_analysis        = { workspace = true }
 bcode_shell_command_analysis_models = { workspace = true }
 globset                             = { workspace = true }
+regex                               = { workspace = true, features = ["std", "unicode", "perf"] }
 
 [dev-dependencies]
 proptest   = { workspace = true }

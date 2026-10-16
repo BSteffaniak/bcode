@@ -68,6 +68,10 @@ pub struct PermissionConfig {
     #[config_doc(map_key = "<word-pattern>")]
     #[serde(default)]
     pub command_patterns: BTreeMap<String, Action>,
+    /// Opt-in ordered command layers. Absence preserves legacy policy and identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[config_doc(nested)]
+    pub command_policy: Option<CommandPolicy>,
     /// Read-only filesystem tool rules keyed by path glob.
     #[config_doc(map_key = "<path-glob>")]
     #[serde(default)]
@@ -89,12 +93,61 @@ pub struct PermissionConfig {
     pub external_directory: Action,
 }
 
+/// Ordered command policy. Version 1 evaluates the implicit legacy base followed
+/// by these layers; the last matching layer wins independently for each command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[serde(deny_unknown_fields)]
+pub struct CommandPolicy {
+    /// Policy representation version. Only version 1 is supported.
+    #[serde(deserialize_with = "deserialize_command_policy_version")]
+    pub version: u32,
+    /// Layers in evaluation order (not sorted or merged).
+    #[config_doc(nested)]
+    pub layers: Vec<CommandPolicyLayer>,
+}
+
+impl Default for CommandPolicy {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            layers: Vec::new(),
+        }
+    }
+}
+
+fn deserialize_command_policy_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if version != 1 {
+        return Err(serde::de::Error::custom(
+            "unsupported command policy version",
+        ));
+    }
+    Ok(version)
+}
+
+/// One command-policy layer. Within a layer, deny wins over ask over allow.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[serde(deny_unknown_fields)]
+pub struct CommandPolicyLayer {
+    /// Legacy text-glob command rules.
+    #[serde(default)]
+    #[config_doc(map_key = "<pattern>")]
+    pub command: BTreeMap<String, Action>,
+    /// Parsed word-pattern rules.
+    #[serde(default)]
+    #[config_doc(map_key = "<word-pattern>")]
+    pub command_patterns: BTreeMap<String, Action>,
+}
+
 impl Default for PermissionConfig {
     fn default() -> Self {
         Self {
             tools: BTreeMap::new(),
             command: BTreeMap::new(),
             command_patterns: BTreeMap::new(),
+            command_policy: None,
             read: BTreeMap::new(),
             write: BTreeMap::new(),
             edit: BTreeMap::new(),

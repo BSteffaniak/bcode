@@ -104,6 +104,7 @@ impl RustPlugin for DefaultAgentsPlugin {
             OP_AGENT_CONTEXT => agent_context(&context.request),
             OP_EVALUATE_TOOL_CALL => evaluate_tool(&context.request),
             OP_POLICY_STATUS => json_response(&policy_status()),
+            bcode_agent_profile::OP_PREVIEW_COMMAND => preview_command(&context.request),
             OP_RESOLVE_POLICY_PROFILE_IDENTITY => resolve_policy_profile_identity(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_operation",
@@ -308,6 +309,98 @@ fn evaluate_tool_request(
         }
     }
     Ok(evaluate_profile_tool_call(&agent, request, &cwd))
+}
+
+fn preview_command(request: &ServiceRequest) -> ServiceResponse {
+    let Ok(request) = request.payload_json::<bcode_agent_profile::PreviewCommandRequest>() else {
+        return ServiceResponse::error("invalid_request", "invalid command preview request");
+    };
+    match preview_command_request(&request) {
+        Ok(response) => json_response(&response),
+        Err(message) => ServiceResponse::error("invalid_preview", message),
+    }
+}
+
+fn preview_command_request(
+    request: &bcode_agent_profile::PreviewCommandRequest,
+) -> Result<bcode_agent_profile::PreviewCommandResponse, &'static str> {
+    use bcode_agent_profile::{PreviewCommandSubject, PreviewCommandWord, ToolPolicyOperation};
+    use bcode_shell_command_analysis_models::{ShellAnalysisRequest, ShellWord};
+
+    let (declarative, _) = effective_config_layers(Some(&request.effective_config_toml))
+        .ok_or("invalid declarative configuration")?;
+    // Deliberately exclude persisted approvals: this operation is an offline declarative preview.
+    let (config, source) = compose_agent_policy(&declarative, None);
+    if !source.diagnostics.is_empty() {
+        return Err("declarative agent policy could not be loaded without degradation");
+    }
+    if !config.agent.contains_key(&request.agent_id) {
+        return Err("unknown agent profile");
+    }
+    let cwd = PathBuf::from(&request.cwd);
+    if !cwd.is_absolute() {
+        return Err("command preview requires an absolute working directory");
+    }
+    let (analysis, analysis_error) =
+        match bcode_shell_command_analysis::analyze(&ShellAnalysisRequest::posix(&request.command))
+        {
+            Ok(analysis) => (Some(analysis), None),
+            Err(error) => (None, Some(error)),
+        };
+    let subjects = analysis.as_ref().map_or_else(Vec::new, |analysis| {
+        analysis
+            .commands
+            .iter()
+            .map(|subject| PreviewCommandSubject {
+                span: subject.span,
+                words: std::iter::once(&subject.executable)
+                    .chain(&subject.arguments)
+                    .map(|word| PreviewCommandWord {
+                        span: word.span(),
+                        dynamic: matches!(word, ShellWord::Dynamic { .. }),
+                    })
+                    .collect(),
+                assignments: subject
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.span)
+                    .collect(),
+            })
+            .collect()
+    });
+    let analysis_valid = analysis
+        .as_ref()
+        .is_some_and(|analysis| analysis.completeness.is_complete());
+    let evaluation = EvaluateToolCallRequest {
+        session_id: bcode_session_models::SessionId::new(),
+        agent_id: request.agent_id.clone(),
+        tool_name: "shell.run".to_owned(),
+        operation: ToolPolicyOperation::Command {
+            command: Some(request.command.clone()),
+            analysis,
+            analysis_error,
+        },
+        aliases: Vec::new(),
+        requires_permission: true,
+        policy_profile: None,
+        cwd: Some(request.cwd.clone()),
+        effective_config_toml: None,
+    };
+    let preview = bcode_agent_policy::preview_tool_call(
+        &agent_config(&config, &request.agent_id),
+        &evaluation,
+        &cwd,
+    );
+    Ok(bcode_agent_profile::PreviewCommandResponse {
+        agent_id: request.agent_id.clone(),
+        scope: "declarative_command_policy".to_owned(),
+        full_authorization: false,
+        decision: preview.decision,
+        matched_rule: preview.matched_rule,
+        matches: preview.matches,
+        subjects,
+        analysis_valid,
+    })
 }
 
 fn evaluate_tool(request: &ServiceRequest) -> ServiceResponse {
@@ -541,6 +634,137 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
         DefaultAgentsPlugin,
         include_str!("../bcode-plugin.toml")
     )
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use bcode_agent_profile::PreviewCommandRequest;
+
+    fn request(command: &str) -> PreviewCommandRequest {
+        PreviewCommandRequest {
+            agent_id: "build".to_owned(),
+            command: command.to_owned(),
+            cwd: "/tmp".to_owned(),
+            effective_config_toml:
+                "[agent.build.permission.command]\n\"*\" = \"deny\"\n\"printf *\" = \"allow\"\n"
+                    .to_owned(),
+        }
+    }
+
+    #[test]
+    fn preview_aggregates_without_executing_and_omits_values() {
+        let response =
+            preview_command_request(&request("TOKEN=supersecret printf credential; forbidden"))
+                .unwrap();
+        assert_eq!(response.decision, AgentDecision::Deny);
+        assert_eq!(response.subjects.len(), 2);
+        assert!(!response.full_authorization);
+        assert_eq!(response.scope, "declarative_command_policy");
+        assert_eq!(response.subjects[0].assignments.len(), 1);
+        let json = serde_json::to_string(&response).unwrap();
+        for secret in ["TOKEN", "supersecret", "credential", "forbidden"] {
+            assert!(!json.contains(secret));
+        }
+    }
+
+    #[test]
+    fn preview_syntax_dynamic_and_configuration_fail_closed() {
+        let invalid = preview_command_request(&request("printf 'unterminated")).unwrap();
+        assert_eq!(invalid.decision, AgentDecision::Deny);
+        assert!(!invalid.analysis_valid);
+        let dynamic = preview_command_request(&request("$COMMAND")).unwrap();
+        assert_eq!(dynamic.decision, AgentDecision::Deny);
+        assert!(dynamic.subjects[0].words[0].dynamic);
+        let mut invalid = request("printf ok");
+        invalid.effective_config_toml = "not [valid".to_owned();
+        assert!(preview_command_request(&invalid).is_err());
+        invalid = request("printf ok");
+        invalid.agent_id = "missing".to_owned();
+        assert!(preview_command_request(&invalid).is_err());
+    }
+
+    #[test]
+    fn preview_forwards_layer_carveout_locators_and_regex_flags() {
+        let mut request = request("git status && git diff");
+        request.effective_config_toml = r#"
+[agent.build.permission]
+command_policy = { version = 1, layers = [ { command = { "git *" = "deny" } }, { command_patterns = { "git status" = "allow" } } ] }
+"#.to_owned();
+        let response = preview_command_request(&request).unwrap();
+        assert_eq!(response.decision, AgentDecision::Deny);
+        let winners: Vec<_> = response
+            .matches
+            .iter()
+            .filter(|matched| matched.winning)
+            .collect();
+        assert_eq!(winners.len(), 2);
+        assert_eq!(
+            (
+                winners[0].subject_index,
+                winners[0].layer_index,
+                winners[0].rule_index
+            ),
+            (0, 2, 0)
+        );
+        assert_eq!(winners[0].rule_kind, "command_patterns");
+        assert_eq!(winners[0].decision, AgentDecision::Allow);
+        assert!(!winners[0].broad);
+        assert_eq!((winners[1].subject_index, winners[1].layer_index), (1, 1));
+        assert!(winners[1].broad);
+        assert!(
+            response
+                .matches
+                .iter()
+                .any(|matched| matched.layer_index == 1
+                    && matched.subject_index == 0
+                    && !matched.winning
+                    && matched.broad)
+        );
+
+        request.command = "git STATUS".to_owned();
+        request.effective_config_toml = r#"
+[agent.build.permission]
+command_policy = { version = 1, layers = [ { command_patterns = { "git /status/i" = "allow" } } ] }
+"#
+        .to_owned();
+        let regex = preview_command_request(&request).unwrap();
+        assert_eq!(regex.decision, AgentDecision::Allow);
+        let winner = regex
+            .matches
+            .iter()
+            .find(|matched| matched.winning)
+            .unwrap();
+        assert_eq!(winner.regex_flags, ["i"]);
+        assert_eq!(winner.layer_index, 1);
+        assert!(!winner.uncertain);
+
+        request.command = "git $ACTION".to_owned();
+        request.effective_config_toml = r#"
+[agent.build.permission]
+command_policy = { version = 1, layers = [ { command_patterns = { "git /push/i" = "deny" } } ] }
+"#
+        .to_owned();
+        let dynamic = preview_command_request(&request).unwrap();
+        assert_eq!(dynamic.decision, AgentDecision::Deny);
+        assert!(
+            dynamic
+                .matches
+                .iter()
+                .any(|matched| matched.uncertain && matched.regex_flags == ["i"])
+        );
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("supersecret"));
+        assert!(!json.contains("git status"));
+    }
+
+    #[test]
+    fn preview_static_allow_is_only_declarative() {
+        let response = preview_command_request(&request("printf ok")).unwrap();
+        assert_eq!(response.decision, AgentDecision::Allow);
+        assert!(response.analysis_valid);
+        assert!(!response.full_authorization);
+    }
 }
 
 #[cfg(test)]

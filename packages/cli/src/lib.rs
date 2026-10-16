@@ -4362,8 +4362,74 @@ async fn handle_session_io_command(
     Ok(())
 }
 
+fn permission_check(agent: String, command: String, json: bool) -> Result<(), CliError> {
+    use bcode_agent_profile::{
+        AGENT_PROFILE_INTERFACE_ID, OP_PREVIEW_COMMAND, PreviewCommandRequest,
+        PreviewCommandResponse,
+    };
+    let config = bcode_config::load_config()?;
+    let request = PreviewCommandRequest {
+        agent_id: agent,
+        command,
+        cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
+        effective_config_toml: bcode_config::encode_effective_config(&config)?,
+    };
+    let mut host = load_plugin_service_host(&[])?;
+    let result = host.invoke_service_by_interface(
+        AGENT_PROFILE_INTERFACE_ID,
+        OP_PREVIEW_COMMAND,
+        serde_json::to_vec(&request)?,
+    );
+    let deactivation = host.deactivate_all();
+    let response = result?;
+    deactivation?;
+    if let Some(error) = response.error {
+        return Err(CliError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let preview: PreviewCommandResponse = serde_json::from_slice(&response.payload)?;
+    write_permission_preview(&mut std::io::stdout().lock(), &preview, json)
+}
+
+fn write_permission_preview(
+    output: &mut impl std::io::Write,
+    preview: &bcode_agent_profile::PreviewCommandResponse,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        write_json_result(output, preview)
+    } else {
+        writeln!(
+            output,
+            "Declarative command-policy preview: {:?}",
+            preview.decision
+        )?;
+        writeln!(
+            output,
+            "Analysis valid: {}; parsed subjects: {}",
+            preview.analysis_valid,
+            preview.subjects.len()
+        )?;
+        writeln!(
+            output,
+            "Not full authorization: resource, tool, skill, and runtime permissions are not granted."
+        )?;
+        output.flush()?;
+        Ok(())
+    }
+}
+
 async fn handle_permission_command(command: PermissionCommand) -> Result<(), CliError> {
     match command {
+        PermissionCommand::Check {
+            agent,
+            command,
+            json,
+        } => {
+            permission_check(agent, command, json)?;
+        }
         PermissionCommand::Status { json } => {
             ensure_server_running().await?;
             let status = BcodeClient::default_endpoint()
@@ -7375,6 +7441,18 @@ enum OpenAiLoginFlow {
 
 #[derive(Debug, Subcommand)]
 enum PermissionCommand {
+    /// Analyze command policy offline without executing, prompting, or granting authorization.
+    Check {
+        /// Declarative agent profile to inspect.
+        #[arg(long)]
+        agent: String,
+        /// Shell source to analyze, not execute.
+        #[arg(long, allow_hyphen_values = true)]
+        command: String,
+        /// Print the secret-safe structured preview.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect the daemon's effective agent-policy summary and degradation diagnostics.
     Status {
         #[arg(long)]
@@ -27921,6 +27999,51 @@ mod permission_cli_tests {
     use super::{Cli, Commands, PermissionCommand};
     use clap::Parser as _;
     use std::str::FromStr as _;
+
+    #[test]
+    fn permission_preview_output_is_explicitly_not_authorization() {
+        let preview = bcode_agent_profile::PreviewCommandResponse {
+            agent_id: "build".to_owned(),
+            scope: "declarative_command_policy".to_owned(),
+            full_authorization: false,
+            decision: bcode_agent_profile::AgentDecision::Allow,
+            matched_rule: true,
+            matches: Vec::new(),
+            subjects: Vec::new(),
+            analysis_valid: true,
+        };
+        let mut output = Vec::new();
+        super::write_permission_preview(&mut output, &preview, false).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Not full authorization")
+        );
+        let mut output = Vec::new();
+        super::write_permission_preview(&mut output, &preview, true).unwrap();
+        let decoded: bcode_agent_profile::PreviewCommandResponse =
+            serde_json::from_slice(&output).unwrap();
+        assert_eq!(decoded, preview);
+    }
+
+    #[test]
+    fn permission_check_parses_command_as_data_and_requires_profile() {
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "permission",
+            "check",
+            "--agent",
+            "build",
+            "--command",
+            "TOKEN=private printf ok; forbidden",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Commands::Permission {
+            command: PermissionCommand::Check { agent, command, json: true }
+        }) if agent == "build" && command == "TOKEN=private printf ok; forbidden"));
+        assert!(Cli::try_parse_from(["bcode", "permission", "check", "--command", "pwd"]).is_err());
+    }
 
     #[test]
     fn permission_status_parses_human_and_machine_output() {

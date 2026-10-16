@@ -182,6 +182,7 @@ pub fn allow_all_agent_policy() -> AgentPermissionPolicy {
             tools: BTreeMap::new(),
             command: BTreeMap::from([("*".to_string(), Action::Allow)]),
             command_patterns: BTreeMap::new(),
+            command_policy: None,
             read: BTreeMap::from([("*".to_string(), Action::Allow)]),
             write: BTreeMap::from([("*".to_string(), Action::Allow)]),
             edit: BTreeMap::from([("*".to_string(), Action::Allow)]),

@@ -8537,6 +8537,9 @@ fn write_agents_toml(
 
         let permission = &agent.permission;
         let has_permission = !permission.command.is_empty()
+            || !permission.command_patterns.is_empty()
+            || permission.command_policy.is_some()
+            || !permission.tools.is_empty()
             || !permission.read.is_empty()
             || !permission.write.is_empty()
             || !permission.edit.is_empty()
@@ -8560,6 +8563,13 @@ fn write_agents_toml(
             .expect("writing to string should not fail");
         }
         write_action_map(output, "command", &permission.command);
+        write_action_map(output, "command_patterns", &permission.command_patterns);
+        write_action_map(output, "tools", &permission.tools);
+        if let Some(policy) = &permission.command_policy {
+            let value = toml::Value::try_from(policy).expect("command policy is TOML serializable");
+            writeln!(output, "command_policy = {value}")
+                .expect("writing to string should not fail");
+        }
         write_action_map(output, "read", &permission.read);
         write_action_map(output, "write", &permission.write);
         write_action_map(output, "edit", &permission.edit);
@@ -9511,6 +9521,88 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordered_policy_settings_roundtrip_and_identity_preserve_order() {
+        let raw = r#"
+[agent.build.permission]
+command_patterns = { "git ..." = "ask" }
+command_policy = { version = 1, layers = [ { command = { "git *" = "deny" } }, { command_patterns = { "git status" = "allow" } } ] }
+"#;
+        let config: super::BcodeConfig = toml::from_str(raw).unwrap();
+        let encoded = super::config_to_toml(&config);
+        let decoded: super::BcodeConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.agent, config.agent);
+        let mut state = String::new();
+        super::write_agents_toml(&mut state, &config.agent);
+        let decoded: bcode_agent_policy_models::AgentPermissionConfig =
+            toml::from_str(&state).unwrap();
+        assert_eq!(decoded.agent, config.agent);
+        let mut reversed = config.agent["build"].clone();
+        reversed
+            .permission
+            .command_policy
+            .as_mut()
+            .unwrap()
+            .layers
+            .reverse();
+        assert_ne!(
+            serde_json::to_vec(&reversed).unwrap(),
+            serde_json::to_vec(&config.agent["build"]).unwrap()
+        );
+        let legacy = bcode_agent_policy_models::PermissionConfig::default();
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("command_policy").is_none());
+        assert_eq!(serialized.as_object().unwrap().len(), 8);
+        assert_eq!(
+            serde_json::from_value::<bcode_agent_policy_models::PermissionConfig>(serialized)
+                .unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn ordered_policy_composition_replaces_layer_vector_without_reordering() {
+        let mut base: toml::Value = toml::from_str(
+            r#"
+[agent.build.permission]
+command_policy = { version = 1, layers = [{ command = { base = "deny" } }] }
+"#,
+        )
+        .unwrap();
+        let overlay: toml::Value = toml::from_str(r#"
+[agent.build.permission]
+command_policy = { version = 1, layers = [{ command = { z = "deny" } }, { command = { a = "allow" } }] }
+"#).unwrap();
+        super::merge_config_values(&mut base, overlay);
+        let config: super::BcodeConfig = base.try_into().unwrap();
+        let policy = config.agent["build"]
+            .permission
+            .command_policy
+            .as_ref()
+            .unwrap();
+        assert_eq!(policy.layers.len(), 2);
+        assert!(policy.layers[0].command.contains_key("z"));
+        assert!(policy.layers[1].command.contains_key("a"));
+    }
+
+    #[test]
+    fn ordered_policy_rejects_unknown_version_fields_and_missing_shape() {
+        for policy in [
+            "{ version = 2, layers = [] }",
+            "{ version = 1 }",
+            "{ layers = [] }",
+            "{ version = 1, layers = [], future = true }",
+            "{ version = 1, layers = [{ commands = {} }] }",
+            "{ version = 1, layers = [{ command = { x = 'permit' } }] }",
+        ] {
+            let raw = format!("[agent.build.permission]\ncommand_policy = {policy}\n");
+            assert!(
+                toml::from_str::<super::BcodeConfig>(&raw).is_err(),
+                "{policy}"
+            );
+        }
+    }
+
     #[test]
     fn config_serialization_preserves_credential_discovery_opt_out() {
         let config = super::BcodeConfig {

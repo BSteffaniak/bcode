@@ -26,6 +26,87 @@ pub const OP_AGENT_CONTEXT: &str = "agent_context";
 /// Operation for evaluating a tool call against an agent profile.
 pub const OP_EVALUATE_TOOL_CALL: &str = "evaluate_tool_call";
 
+/// Read-only declarative command-policy preview; never executes or grants permission.
+pub const OP_PREVIEW_COMMAND: &str = "preview_command";
+
+/// Request for [`OP_PREVIEW_COMMAND`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewCommandRequest {
+    /// Agent profile to inspect.
+    pub agent_id: String,
+    /// Shell source, used only for analysis and never echoed in the response.
+    pub command: String,
+    /// Explicit working directory for path-policy interpretation.
+    pub cwd: String,
+    /// Resolved declarative configuration. Invalid configuration must not fall back.
+    pub effective_config_toml: String,
+}
+
+/// Secret-safe parsed command leaf, without argument or assignment values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewCommandSubject {
+    /// Source range in the original command.
+    pub span: bcode_shell_command_analysis_models::ShellSourceSpan,
+    /// Word source ranges and whether expansion is required.
+    pub words: Vec<PreviewCommandWord>,
+    /// Assignment source ranges; names and values are deliberately omitted.
+    pub assignments: Vec<bcode_shell_command_analysis_models::ShellSourceSpan>,
+}
+
+/// A parsed word represented without its potentially sensitive value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewCommandWord {
+    /// Source range in the original command.
+    pub span: bcode_shell_command_analysis_models::ShellSourceSpan,
+    /// Whether the complete value requires runtime expansion.
+    pub dynamic: bool,
+}
+
+/// One configured rule matched by the canonical policy evaluator.
+/// Rule values are intentionally represented by indices rather than potentially secret text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewCommandMatch {
+    /// Zero-based parsed command index.
+    pub subject_index: usize,
+    /// Zero is the implicit legacy base; explicit layers start at one.
+    pub layer_index: usize,
+    /// Zero-based rule index within its sorted rule map.
+    pub rule_index: usize,
+    /// `command` or `command_patterns`.
+    pub rule_kind: String,
+    /// Whether this rule determined the leaf decision.
+    pub winning: bool,
+    /// Configured action, not a runtime grant.
+    pub decision: AgentDecision,
+    /// Whether the rule is broad rather than an exact literal rule.
+    pub broad: bool,
+    /// Regex flags used by slash-delimited word regex tokens.
+    pub regex_flags: Vec<String>,
+    /// Whether a dynamic word prevents proving the match absent (deny fail-closed).
+    pub uncertain: bool,
+}
+
+/// Response for [`OP_PREVIEW_COMMAND`]. An allow is not a full authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewCommandResponse {
+    /// Profile inspected.
+    pub agent_id: String,
+    /// Always `declarative_command_policy` for this operation.
+    pub scope: String,
+    /// Always false: resource, tool, skill, and runtime approvals are not granted.
+    pub full_authorization: bool,
+    /// Aggregate policy result through the enforcement evaluator.
+    pub decision: AgentDecision,
+    /// Whether the evaluator selected a configured rule.
+    pub matched_rule: bool,
+    /// Secret-safe rule locators emitted by the canonical enforcement evaluator.
+    pub matches: Vec<PreviewCommandMatch>,
+    /// Parsed leaves, represented only by source geometry.
+    pub subjects: Vec<PreviewCommandSubject>,
+    /// False for unsupported or malformed shell syntax; the result fails closed.
+    pub analysis_valid: bool,
+}
+
 /// Operation for reporting the active policy config source/status.
 pub const OP_POLICY_STATUS: &str = "policy_status";
 

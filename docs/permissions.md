@@ -117,6 +117,60 @@ Analysis is bounded. Syntax errors, missing or mismatched analysis, unsupported 
 
 A parser error means Bcode could not safely understand the shell program. A complete parse followed by denial may instead mean no configured command wildcard allows that executable subject. Add a narrow policy rule only after verifying the reported subject; parser correctness does not imply policy expansion.
 
+#### Parsed argument patterns
+
+`command_patterns` matches parsed argument **values**, not raw shell text or joined argv. Matching is whole-command and whole-value; quoting and empty arguments survive shell analysis. There are no tool-specific option catalogs or automatic basename/wrapper normalization.
+
+```toml
+[agent.build.permission.command_patterns]
+"git [--no-pager] commit ..." = "deny"
+"git [--no-pager | -C <arg> | -c <arg>]* commit ..." = "deny"
+"git <options>* commit ..." = "deny"
+'printf /hello world/i' = "ask"
+```
+
+* Literal values match exactly. Quote literals with single/double quotes or backslash-escape DSL punctuation; `''` matches an empty argument.
+* `<arg>` matches exactly one argument. `[a | b c]` is an optional group of alternative sequences. A following `*` repeats whole branches, including zero occurrences. Groups do not nest.
+* `...` matches zero or more remaining arguments and is legal only at the end. The first value must be a literal executable.
+* `/expression/imsx` is a first-class whole-value Rust regex, usable wherever an argument predicate is accepted, including optional/repeated groups. Flags mean case-insensitive, multiline, dot-matches-newline, and ignore-pattern-whitespace. Unicode is enabled. Duplicate/unsupported regex flags, including `g`, are errors. This is not ECMAScript syntax. Escaped `/` and `/` inside a character class are not delimiters. Executable tokens remain literal; ordinary absolute paths such as `/usr/bin/git` and `/tmp/path` remain literals. To resolve slash-led argument collisions, `/tmp/` and `/tmp/i` select regex, `/tmp/g` rejects reserved `g`, while plain unknown suffixes such as `/tmp/z` remain paths. Explicit regex constructs with unknown flags are rejected. Quote ambiguous paths (`'/tmp/i'`) and slash-shaped literal values; escape internal regex slashes or put them in classes.
+
+Separate option/value pairs are explicit sequences: `-C <arg>` consumes both words atomically. Thus `git -C commit status` does not match the precise repeated-group commit rule, but `git -C repo commit` does. Attached and equals spellings are separate single-value predicates, such as `/-C.+/` or `/--directory=.+/`; a pair does not imply either spelling. In particular this DSL makes no claim that Git accepts `-C=value`.
+
+`<options>*` deliberately explores generic ambiguous interpretations. Each dash-led value other than lone `-` or `--` can be an option; an option without `=` may additionally consume one following non-dash-led argument (or lone `-`) as its value. Clusters, negative numbers, and attached values are simply option-looking values; inline `=value` stays in one word. A consumed `--` ends that options segment. Any complete matching interpretation counts; this **static, explicitly selected grammar ambiguity does not itself require approval**. No CLI-specific option semantics are inferred: false positives remain possible, including command-looking option values. Use precise pairs or ordered exceptions when necessary. Dynamic shell expansion is different and cannot become an automatic allow through this ambiguity.
+
+Pattern bytes, grammar size, regex compilation, argv size, and matching work are bounded. Invalid patterns fail closed rather than becoming legacy globs. Assignment prefixes do not suppress structured denies; they do not make structured allows trustworthy. `env`, `command`, aliases, executable paths, scripts, and subprocesses are not transparently normalized. A matcher is not a sandbox.
+
+#### Opt-in ordered command policy
+
+Existing policies keep their old resolution and exact legacy-deny protection. To permit intentional carve-outs, opt into version 1 explicitly:
+
+```toml
+[agent.build.permission.command_policy]
+version = 1
+
+[[agent.build.permission.command_policy.layers]]
+[agent.build.permission.command_policy.layers.command_patterns]
+"git <options>* commit ..." = "deny"
+
+[[agent.build.permission.command_policy.layers]]
+[agent.build.permission.command_policy.layers.command_patterns]
+"git -C commit status" = "allow"
+```
+
+Existing `permission.command` and `permission.command_patterns` form an implicit base layer. Each explicit layer contains `command` legacy globs and/or `command_patterns` parsed patterns. **Last matching layer wins for each individual command.** Within one layer, action precedence is `deny > ask > allow`, with deterministic specificity/pattern tie-breaking; map serialization order is never policy order. In this opt-in mode an exact base legacy deny is not an unoverrideable guard: a later explicit exception can replace it. Unknown versions and malformed patterns fail closed.
+
+Layers do not override disabled tools, resource/path/external-directory/skill authorization, invalid or incomplete shell analysis, dynamic executable identity, or unresolved dynamic execution into automatic allow. Redirections retain their path rules. After leaf resolution, whole-program aggregation remains `deny > ask > allow`: `allowed; denied` cannot launder a denied sibling. Policy identities include the ordered configuration, so a pinned workflow does not silently acquire later exceptions. Deploy runtime support before emitting this configuration; old binaries must not be used to interpret advanced policies.
+
+#### Non-executing preview
+
+```sh
+bcode permission check --agent build --command 'git --no-pager commit -m example' --json
+```
+
+This read-only interface parses the supplied string and calls the agent-policy service; it never runs the command. It previews the effective **declarative** policy through the enforcement evaluator, not a separately implemented matcher. Output includes the decision, source spans, static/dynamic word metadata, assignment counts, and matched-rule locators. Layer 0 is the implicit base; subsequent indices identify explicit layers in list order. Rule indices refer to sorted keys within the named `command` or `command_patterns` map. Match entries identify broad rules, the winner, regex flags, and conservative dynamic handling without echoing argument or assignment values. A preview allow is not an execution grant: session-specific runtime rules, pinned workflow policy, skill restrictions, resources, and other authorization still apply when an operation is actually requested. Use synthetic values when checking sensitive commands.
+
+For Nix-generated configurations, keep ordered lists and advanced strings intact for Bcode. OpenCode/Pi raw-glob backends cannot generally express regex, repetition, generic options, or layer carve-outs: the shared Nix generator requires explicit reviewed target fallbacks or rejects evaluation. Upgrade/build Bcode first, run non-executing checks and pure Nix tests, then separately review and authorize activation. No rebuild or switch is part of implementing these changes.
+
 #### Canonical command candidates
 
 Bcode retains the exact original command subject and may add narrowly reviewed aliases. Alias candidates participate in normal specificity matching and cannot erase a more specific restrictive match against the original subject.

@@ -748,7 +748,6 @@ fn build_turn_request(
         provider_context,
         system_prompt: None,
         messages: input.messages.clone(),
-        context_lineage: None,
         tools: input.tools.clone(),
         tool_call_policy: input.tool_call_policy.clone(),
         tool_schema_mode: input.tool_schema_mode,
