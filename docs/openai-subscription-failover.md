@@ -20,6 +20,10 @@ Pool enrollment does not replace the primary provider binding. API-key pools are
 
 ### Automatic subscription pools
 
+For one pool policy shared by multiple model presets, see
+[Shared authentication pool policy](shared-auth-pools.md). The explicit
+`auth_pool_config` reference avoids copying this section into every preset.
+
 With a provider that advertises compatible subscription methods, login without `--pool` joins or creates an explicitly managed default pool. OpenAI browser and device-code logins share the `subscription` group; API keys do not participate. For example:
 
 ```sh

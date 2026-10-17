@@ -174,7 +174,11 @@ fn plan_validated_field_edit(
         table.remove(key);
     }
     let updated = document.to_string();
-    toml::from_str::<BcodeConfig>(&updated)
+    let mut resolved: toml::Value = toml::from_str(&updated)
+        .map_err(|_| invalid("Edited configuration fails schema validation"))?;
+    crate::shared_pools::expand(&mut resolved, &path)?;
+    resolved
+        .try_into::<BcodeConfig>()
         .map_err(|_| invalid("Edited configuration fails schema validation"))?;
     Ok(ConfigEdit {
         path,

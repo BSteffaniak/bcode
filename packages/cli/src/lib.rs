@@ -7230,6 +7230,21 @@ enum AuthProfileCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuthPoolCommand {
+    /// Consolidate identical preset pool policies into one explicitly shared file.
+    /// Dry-run by default; apply retains backups and never touches account state.
+    MigrateConfig {
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long, required = true, num_args = 1..)]
+        source: Vec<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+        /// Opt one shared pool into automatic enrollment for this registered auth provider.
+        #[arg(long, requires = "provider")]
+        default_pool: Option<String>,
+        #[arg(long, requires = "default_pool")]
+        provider: Option<String>,
+    },
     List,
     /// Read normalized, secret-free auth-pool status from the daemon as JSON.
     /// Unlike local list/status, this reports the running host's effective pools.
@@ -9805,6 +9820,50 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
 
 async fn handle_auth_pool_command(command: AuthPoolCommand) -> Result<(), CliError> {
     match command {
+        AuthPoolCommand::MigrateConfig {
+            destination,
+            source,
+            apply,
+            default_pool,
+            provider,
+        } => {
+            let mut plan = bcode_config::shared_pools::migration::plan(&destination, &source)?;
+            if let (Some(pool), Some(provider)) = (default_pool, provider) {
+                let mut host = load_cli_plugin_host()?;
+                let result = registered_auth_provider(&host, &provider).and_then(|registered| {
+                    let capability =
+                        auth_pool_compatibility(&host, &registered)?.ok_or_else(|| {
+                            CliError::LoginProfile(
+                                "Provider does not support automatic pools".to_owned(),
+                            )
+                        })?;
+                    if capability.provider_id != provider {
+                        return Err(CliError::LoginProfile(
+                            "Provider compatibility identity mismatch".to_owned(),
+                        ));
+                    }
+                    plan.mark_default(&pool, &provider, &registered.plugin_id, &capability.group)?;
+                    Ok(())
+                });
+                let cleanup = host.deactivate_all().map_err(CliError::from);
+                result.and(cleanup)?;
+            }
+            println!("Shared pools: {}", plan.pools().join(", "));
+            for path in plan.paths() {
+                println!("Update: {}", path.display());
+            }
+            if apply {
+                plan.apply()?;
+                println!(
+                    "Pool configuration migrated; backups retained. Restart to load the shared policy."
+                );
+            } else {
+                println!(
+                    "Dry run; no files changed. Use --apply after reviewing paths and pool identities."
+                );
+            }
+            Ok(())
+        }
         AuthPoolCommand::List => auth_pool_list(),
         AuthPoolCommand::DaemonStatus => {
             let pools = Box::pin(BcodeClient::default_endpoint().auth_pool_list()).await?;
@@ -22158,6 +22217,63 @@ mod auth_cli_tests {
             ..valid
         };
         assert!(auth_pool_compatibility_response(Ok(malformed)).is_err());
+    }
+
+    #[test]
+    fn shared_pool_migration_requires_explicit_sources_and_defaults_are_paired() {
+        for arguments in [
+            vec![
+                "bcode",
+                "auth",
+                "pool",
+                "migrate-config",
+                "--destination",
+                "/tmp/pools.toml",
+                "--source",
+                "/tmp/one.toml",
+            ],
+            vec![
+                "bcode",
+                "auth",
+                "pool",
+                "migrate-config",
+                "--destination",
+                "/tmp/pools.toml",
+                "--source",
+                "/tmp/one.toml",
+                "--default-pool",
+                "accounts",
+                "--provider",
+                "example",
+                "--apply",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+        for arguments in [
+            vec![
+                "bcode",
+                "auth",
+                "pool",
+                "migrate-config",
+                "--destination",
+                "/tmp/pools.toml",
+            ],
+            vec![
+                "bcode",
+                "auth",
+                "pool",
+                "migrate-config",
+                "--destination",
+                "/tmp/pools.toml",
+                "--source",
+                "/tmp/one.toml",
+                "--default-pool",
+                "accounts",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub mod judgement;
 pub mod milestones;
 /// Verified declarative configuration restart recovery.
 pub mod recovery;
+pub mod shared_pools;
 pub use milestones::MilestonesConfig;
 /// Versioned remembered startup choices and optional fallback support.
 pub mod startup;
@@ -5099,6 +5100,9 @@ fn validate_removed_permission_categories(value: &toml::Value) -> Result<(), Con
 }
 
 fn validate_config_value(value: toml::Value, context: &str) -> Result<BcodeConfig, ConfigError> {
+    if value.get("auth_pool_config").is_some() {
+        return Err(ConfigError::Composition { message: "auth_pool_config requires a file-backed configuration layer; unresolved references are not accepted in inline or transported configuration".to_owned() });
+    }
     validate_removed_permission_categories(&value)?;
     let config = value
         .try_into()
@@ -9519,12 +9523,14 @@ fn load_toml_file(path: &Path) -> Result<toml::Value, ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
-    toml::from_str(&contents).map_err(|source| ConfigError::Composition {
+    let mut raw = toml::from_str(&contents).map_err(|source| ConfigError::Composition {
         message: format!(
             "failed to parse config {}: {source}",
             display_from_current_dir(path)
         ),
-    })
+    })?;
+    shared_pools::expand(&mut raw, path)?;
+    Ok(raw)
 }
 
 fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
