@@ -1,12 +1,12 @@
 [package]
 authors     = { workspace = true }
-categories  = ["observability", "telemetry"]
+categories  = ["development-tools::debugging"]
 description = "Structured observability utilities for brouter"
 edition     = { workspace = true }
 keywords    = ["observability", "logging", "telemetry", "tracing"]
 license     = { workspace = true }
 name        = "brouter_telemetry_util"
-readme      = "README.md"
+readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
 
