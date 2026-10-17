@@ -1029,6 +1029,8 @@ impl DecodedMarkdownImage {
             },
             destination,
             clip,
+            fit: bmux_tui::image::ImageFit::Contain,
+            allocation: None,
             lifecycle: ImageLifecycle::Frame,
         })
     }

@@ -15,11 +15,6 @@ name              = "bcode"
 path              = "src/main.rs"
 required-features = ["app"]
 
-[[bin]]
-name              = "bmux-mermaid-worker"
-path              = "../mermaid-render/src/bin/worker.rs"
-required-features = ["mermaid-renderer"]
-
 [[example]]
 name              = "embedded_fake_provider"
 required-features = ["embedded-plugins", "static-bundled-fake-provider-plugin"]
@@ -49,7 +44,6 @@ bcode_client = { workspace = true, optional = true }
 bcode_config = { workspace = true, optional = true }
 bcode_eval = { workspace = true, optional = true }
 bcode_fake_provider_plugin = { workspace = true, optional = true }
-bcode_mermaid_render = { workspace = true, optional = true }
 bcode_metrics = { workspace = true, optional = true }
 bcode_model = { workspace = true }
 bcode_model_catalog = { workspace = true }
@@ -142,14 +136,12 @@ distribution = [
     "app",
     "bundled-ocr-tesseract",
     "config",
-    "mermaid-renderer",
     "static-bundled-plugins",
     "web-renderer",
 ]
 embedded-plugins = ["dep:bcode_plugin"]
 evaluation = ["dep:bcode_eval"]
 fail-on-warnings = []
-mermaid-renderer = ["dep:bcode_mermaid_render"]
 metrics = ["dep:bcode_metrics", "dep:tracing-subscriber"]
 openai-compatible-provider = ["dep:bcode_openai_compatible_provider_plugin"]
 opentelemetry = ["dep:tracing-opentelemetry"]

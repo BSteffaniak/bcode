@@ -80,7 +80,7 @@ verification remains enabled on both paths.
 macOS and Windows artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Portable ZIP
 is the complete initial Windows distribution format; an installer, Store package, package-manager
 publication, and auto-updater are outside the v1 Windows milestone. Every archive contains
-`bcode` and the process-isolated `bcode-mermaid-worker` (with `.exe` suffixes on Windows), plus
+`bcode` (with an `.exe` suffix on Windows), plus
 the bundled Tesseract runtime tree selected by the `distribution` feature. Windows source
 builds use the MSVC Rust target and require Visual Studio Build Tools with C++ support and CMake.
 CI verifies `cmake`, `cl.exe`, and `link.exe` explicitly and initializes the Visual Studio amd64
@@ -104,16 +104,17 @@ From a Developer PowerShell with the MSVC C++ tools available:
 
 ```powershell
 rustup target add x86_64-pc-windows-msvc
-cargo build --release --package bcode --bin bcode --bin bcode-mermaid-worker `
+cargo build --release --package bcode --bin bcode `
   --features distribution --target x86_64-pc-windows-msvc
 cargo xtask release --target x86_64-pc-windows-msvc --version v0.1.0
 cargo xtask verify-release --target x86_64-pc-windows-msvc --version v0.1.0
 ```
 
-Extract the ZIP as a directory and preserve its relative layout: `bcode.exe` and
-`bcode-mermaid-worker.exe` remain at the root, while the versioned OCR DLLs and language data stay
+Extract the ZIP as a directory and preserve its relative layout: `bcode.exe`
+remains at the root, while the versioned OCR DLLs and language data stay
 under `bcode-runtimes\\tesseract`. Run `bcode.exe --version` from the extracted directory as a basic
-installation check. Release verification additionally exercises the Mermaid worker, bundled OCR,
+installation check. Mermaid WASM and AOT artifacts are embedded at compile time;
+no external renderer worker is shipped. Release verification additionally exercises bundled OCR,
 and named-pipe daemon lifecycle. Verification is successful only when those extracted-product checks
 pass on a native Windows host; creating a ZIP from another host is not evidence that the Windows
 distribution is supported.

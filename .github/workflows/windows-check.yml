@@ -112,16 +112,12 @@ jobs:
           cargo test --package bcode_ipc default_windows_endpoint_is_a_namespaced_named_pipe
           cargo test --package bcode_daemon_lifecycle --lib
           cargo test --package bcode_ocr_plugin ocr_relative_path_rejects_directory_junction_escape
-          cargo test --package bcode_mermaid_render cancellation_is_stable_and_backend_neutral
-          cargo test --package bcode_mermaid_render tiny_deadline_returns_typed_timeout
-          cargo test --package bcode_mermaid_render --no-default-features
           cargo test --package bcode_shell_plugin windows_shell_plan_uses_cmd_contract
           cargo test --package bcode_shell_plugin terminal_mode_executes_cmd_through_native_pty
           cargo test --package bcode_shell_plugin cancellation_terminates_windows_terminal_child_promptly
           cargo test --package bcode_tool_runtime cancellation_terminates_windows_process_tree
           cargo test --package bcode_tool_runtime --all-targets --features fail-on-warnings
-          cargo test --package bcode_mermaid_render --test worker public_worker_adapter_forcefully_terminates_cancelled_worker
-          cargo test --package bcode_mermaid_render --test worker public_worker_adapter_forcefully_terminates_timed_out_worker
+          cargo test --package bcode_tui --lib markdown_mermaid
           cargo test --package bcode_tesseract_ocr runtime_root_tests
           cargo test --package xtask release_artifact_inputs_reject_unsafe_versions_and_output_roots
           cargo test --package xtask archive_creation_rejects_destination_inside_staging
@@ -230,7 +226,7 @@ jobs:
           $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $archive))
           try {
             $entries = $zip.Entries.FullName
-            foreach ($required in 'bcode.exe', 'bcode-mermaid-worker.exe', 'bcode-runtimes/tesseract/manifest.json') {
+            foreach ($required in 'bcode.exe', 'bcode-runtimes/tesseract/manifest.json') {
               if ($entries -notcontains $required) {
                 throw "Windows CI archive is missing $required"
               }

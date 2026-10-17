@@ -416,11 +416,7 @@ fn record_early_startup(times: [Instant; 6]) {
 }
 
 fn initialize_process_executables() -> Result<(), CliError> {
-    let bootstrap = bcode_daemon_lifecycle::initialize_artifact_bootstrap()?;
-    // Optional helper failure is retained, but never prevents unrelated CLI work.
-    if let Some(directory) = bootstrap.source_path().parent() {
-        let _ = bcode_mermaid_render::IsolatedMermaidRenderer::initialize_packaged(directory);
-    }
+    bcode_daemon_lifecycle::initialize_artifact_bootstrap()?;
     Ok(())
 }
 

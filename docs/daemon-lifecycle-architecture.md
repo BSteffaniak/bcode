@@ -215,4 +215,4 @@ The first verified connection hashes the retained bootstrap executable; subseque
 
 ## Packaged helpers
 
-CLI bootstrap captures the optional Mermaid worker once from the bootstrap installation directory (or its explicit environment override). The renderer owns a private process-lifetime snapshot, checks its digest before each launch, and preserves capture failure instead of rediscovering another binary later. Snapshot failure disables Mermaid rendering only. Explicit low-level renderer paths remain caller-owned; normal packaged rendering never uses PATH discovery.
+Mermaid rendering uses BMUX's embedded WASM renderer. Portable guest WASM and destination AOT artifacts are bundled at compile time; bootstrap does not discover or snapshot an external renderer executable. Renderer initialization failures disable Mermaid rendering only.

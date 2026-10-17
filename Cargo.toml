@@ -73,7 +73,6 @@ members = [
     "packages/models-site",
     "packages/models-site/ui",
     "packages/markdown-render",
-    "packages/mermaid-render",
     "packages/usage",
     "packages/usage/models",
     "packages/metrics",
@@ -206,7 +205,6 @@ bcode_ipc                               = { version = "0.0.1-alpha.0", default-f
 bcode_jev_provider_plugin               = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/jev-provider-plugin" }
 bcode_loop_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/loop-plugin" }
 bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/markdown-render" }
-bcode_mermaid_render                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mermaid-render" }
 bcode_metrics                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/metrics" }
 bcode_metrics_plugin                    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/metrics-plugin" }
 bcode_model                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/model" }

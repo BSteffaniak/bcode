@@ -12,7 +12,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -21,7 +21,6 @@ use sha2::{Digest, Sha256};
 
 const PACKAGE_NAME: &str = "bcode";
 const BINARY_NAME: &str = "bcode";
-const MERMAID_WORKER_BINARY_NAME: &str = "bmux-mermaid-worker";
 const DIST_DIR: &str = "target/dist";
 const DEFAULT_DEV_CODESIGN_IDENTITY: &str = "Bcode Dev";
 const DEV_CODESIGN_KEYCHAIN_RELATIVE_DIR: &str = "Library/Application Support/bcode/dev-signing";
@@ -1278,12 +1277,6 @@ fn selected_features(options: &Options, default_distribution: bool) -> Vec<Strin
         .collect()
 }
 
-fn features_enable_mermaid_worker(features: &[String]) -> bool {
-    features
-        .iter()
-        .any(|feature| matches!(feature.as_str(), "distribution" | "mermaid-renderer"))
-}
-
 fn features_enable_bundled_tesseract(features: &[String]) -> bool {
     features.iter().any(|feature| {
         feature == "distribution"
@@ -1362,9 +1355,6 @@ fn build_bcode_release(
         .arg(PACKAGE_NAME)
         .arg("--bin")
         .arg(BINARY_NAME);
-    if features_enable_mermaid_worker(features) {
-        command.arg("--bin").arg(MERMAID_WORKER_BINARY_NAME);
-    }
     command
         .arg("--no-default-features")
         .arg("--features")
@@ -1384,7 +1374,6 @@ fn build(options: &Options) -> Result<()> {
 fn release(options: &Options) -> Result<()> {
     ensure_windows_release_runs_natively(&options.target, "release")?;
     let features = selected_features(options, true);
-    let include_mermaid_worker = features_enable_mermaid_worker(&features);
     let include_tesseract = features_enable_bundled_tesseract(&features);
     let target_kind = TargetKind::parse(&options.target)?;
     if target_kind == TargetKind::Windows {
@@ -1399,28 +1388,13 @@ fn release(options: &Options) -> Result<()> {
     } else {
         None
     };
-    let mermaid_worker =
-        include_mermaid_worker.then(|| built_mermaid_worker(&options.target, target_kind));
-    if let Some(worker) = &mermaid_worker {
-        ensure_file(worker)?;
-    }
     if target_kind == TargetKind::Macos {
         sign_macos_release_binary(&binary)?;
         verify_macos_signature(&binary)?;
-        if let Some(worker) = &mermaid_worker {
-            sign_macos_release_binary(worker)?;
-            verify_macos_signature(worker)?;
-        }
     } else if target_kind == TargetKind::Linux {
         strip_binary(&binary);
-        if let Some(worker) = &mermaid_worker {
-            strip_binary(worker);
-        }
     } else if target_kind == TargetKind::Windows {
         sign_windows_release_binary_if_configured(&binary)?;
-        if let Some(worker) = &mermaid_worker {
-            sign_windows_release_binary_if_configured(worker)?;
-        }
     }
     if let Some(expected_artifact_id) = artifact_id_before_postprocessing.as_deref() {
         let actual_artifact_id = probe_artifact_identity(&binary)?;
@@ -1443,10 +1417,6 @@ fn release(options: &Options) -> Result<()> {
                 "artifact identity changed while staging release: expected {expected_artifact_id}, found {staged_artifact_id}"
             )));
         }
-    }
-    if let Some(worker) = &mermaid_worker {
-        let staged_worker = staging_dir.join(mermaid_worker_file_name(target_kind));
-        copy_release_binary(worker, &staged_worker)?;
     }
     if include_tesseract {
         let runtime_source = latest_bundled_runtime_root(&options.target)?;
@@ -1473,40 +1443,25 @@ fn release(options: &Options) -> Result<()> {
 
 fn verify_release(options: &Options) -> Result<()> {
     let features = selected_features(options, true);
-    let include_mermaid_worker = features_enable_mermaid_worker(&features);
     let include_tesseract = features_enable_bundled_tesseract(&features);
     let target_kind = TargetKind::parse(&options.target)?;
     let archive = archive_path(options, target_kind);
     ensure_file(&archive)?;
     ensure_file(&checksum_path(&archive))?;
     verify_checksum(&archive)?;
-    verify_archive_contents(
-        &archive,
-        target_kind,
-        include_mermaid_worker,
-        include_tesseract,
-    )?;
+    verify_archive_contents(&archive, target_kind, include_tesseract)?;
 
     if target_kind == TargetKind::Macos {
         let binary = built_binary(&options.target, target_kind);
         ensure_file(&binary)?;
         verify_macos_signature(&binary)?;
-        if include_mermaid_worker {
-            let mermaid_worker = built_mermaid_worker(&options.target, target_kind);
-            ensure_file(&mermaid_worker)?;
-            verify_macos_signature(&mermaid_worker)?;
-        }
     } else if target_kind == TargetKind::Windows && windows_signing_requested()? {
         verify_windows_signature(&built_binary(&options.target, target_kind))?;
-        if include_mermaid_worker {
-            verify_windows_signature(&built_mermaid_worker(&options.target, target_kind))?;
-        }
     }
     if options.target == host_target() {
         smoke_test_release_archive(
             &archive,
             target_kind,
-            include_mermaid_worker,
             include_tesseract,
             normalize_release_version(&options.version)?,
         )?;
@@ -2418,16 +2373,10 @@ fn verify_checksum(archive: &Path) -> Result<()> {
 fn verify_archive_contents(
     archive: &Path,
     target_kind: TargetKind,
-    include_mermaid_worker: bool,
     include_tesseract: bool,
 ) -> Result<()> {
     if target_kind == TargetKind::Linux {
-        return verify_tar_archive_contents(
-            archive,
-            target_kind,
-            include_mermaid_worker,
-            include_tesseract,
-        );
+        return verify_tar_archive_contents(archive, target_kind, include_tesseract);
     }
     let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
     let mut entries = std::collections::BTreeSet::new();
@@ -2437,19 +2386,12 @@ fn verify_archive_contents(
             entries.insert(entry.name().to_owned());
         }
     }
-    verify_required_archive_entries(
-        &entries,
-        archive,
-        target_kind,
-        include_mermaid_worker,
-        include_tesseract,
-    )
+    verify_required_archive_entries(&entries, archive, target_kind, include_tesseract)
 }
 
 fn verify_tar_archive_contents(
     archive: &Path,
     target_kind: TargetKind,
-    include_mermaid_worker: bool,
     include_tesseract: bool,
 ) -> Result<()> {
     let listing = command_output(Command::new("tar").arg("-tzf").arg(archive))?;
@@ -2457,13 +2399,7 @@ fn verify_tar_archive_contents(
         .lines()
         .map(|entry| entry.trim_start_matches("./").to_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    verify_required_archive_entries(
-        &entries,
-        archive,
-        target_kind,
-        include_mermaid_worker,
-        include_tesseract,
-    )
+    verify_required_archive_entries(&entries, archive, target_kind, include_tesseract)
 }
 
 fn verification_extraction_path(archive: &Path) -> PathBuf {
@@ -2491,7 +2427,6 @@ fn next_verification_temp_id() -> u64 {
 fn smoke_test_release_archive(
     archive: &Path,
     target_kind: TargetKind,
-    include_mermaid_worker: bool,
     include_tesseract: bool,
     expected_version: &str,
 ) -> Result<()> {
@@ -2502,7 +2437,6 @@ fn smoke_test_release_archive(
         archive,
         target_kind,
         &extraction,
-        include_mermaid_worker,
         include_tesseract,
         expected_version,
     );
@@ -2564,7 +2498,6 @@ fn smoke_test_release_archive_in(
     archive: &Path,
     target_kind: TargetKind,
     extraction: &Path,
-    include_mermaid_worker: bool,
     include_tesseract: bool,
     expected_version: &str,
 ) -> Result<()> {
@@ -2594,12 +2527,6 @@ fn smoke_test_release_archive_in(
         verify_binary_version(&mut version, expected_version)?;
     }
     verify_extracted_artifact_identity(&binary)?;
-    if include_mermaid_worker {
-        smoke_test_mermaid_worker(
-            &extraction.join(mermaid_worker_file_name(target_kind)),
-            (target_kind == TargetKind::Windows).then_some(extraction),
-        )?;
-    }
     if include_tesseract {
         smoke_test_extracted_tesseract(extraction, target_kind)?;
     }
@@ -2610,9 +2537,6 @@ fn smoke_test_release_archive_in(
         smoke_test_windows_daemon(&binary, extraction)?;
         if windows_signing_requested()? {
             verify_windows_signature(&binary)?;
-            if include_mermaid_worker {
-                verify_windows_signature(&extraction.join(mermaid_worker_file_name(target_kind)))?;
-            }
         }
     }
     Ok(())
@@ -3586,69 +3510,13 @@ fn extract_zip_confined<R: io::Read + io::Seek>(
     Ok(())
 }
 
-fn smoke_test_mermaid_worker(worker: &Path, windows_extraction: Option<&Path>) -> Result<()> {
-    ensure_file(worker)?;
-    let source = b"graph TD; A-->B";
-    let mut request = Vec::new();
-    request.extend_from_slice(b"BCMW");
-    request.extend_from_slice(&1_u16.to_be_bytes());
-    request.extend_from_slice(&800_u32.to_be_bytes());
-    request.extend_from_slice(&600_u32.to_be_bytes());
-    request.extend_from_slice(&(4_u32 * 1024 * 1024).to_be_bytes());
-    request.extend_from_slice(
-        &u32::try_from(source.len())
-            .map_err(|_| format_error("Mermaid smoke request is too large"))?
-            .to_be_bytes(),
-    );
-    request.extend_from_slice(source);
-    let mut command = Command::new(worker);
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let windows_smoke_root = windows_extraction.map(|extraction| {
-        let root = extraction.join("windows mermaid smoke 状态");
-        (extraction, root)
-    });
-    if let Some((extraction, smoke_root)) = &windows_smoke_root {
-        fs::create_dir_all(smoke_root.join("temp"))?;
-        windows_product_smoke_environment(&mut command, extraction, smoke_root, None);
-    }
-    let mut child = command.spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| format_error("Mermaid worker stdin was unavailable"))?
-        .write_all(&request)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success()
-        || output.stdout.len() < 11
-        || &output.stdout[..4] != b"BCMR"
-        || output.stdout[6] != 1
-    {
-        return Err(format_error(format!(
-            "packaged Mermaid worker smoke test failed with {} and {} response bytes",
-            output.status,
-            output.stdout.len()
-        )));
-    }
-    if let Some((_, smoke_root)) = windows_smoke_root {
-        fs::remove_dir_all(smoke_root)?;
-    }
-    Ok(())
-}
-
 fn verify_required_archive_entries(
     entries: &BTreeSet<String>,
     archive: &Path,
     target_kind: TargetKind,
-    include_mermaid_worker: bool,
     include_tesseract: bool,
 ) -> Result<()> {
     let mut required = vec![binary_file_name(target_kind)];
-    if include_mermaid_worker {
-        required.push(mermaid_worker_file_name(target_kind));
-    }
     if include_tesseract {
         required.push("bcode-runtimes/tesseract/manifest.json");
     }
@@ -3701,10 +3569,6 @@ fn built_binary(target: &str, target_kind: TargetKind) -> PathBuf {
     built_release_binary(target, binary_file_name(target_kind))
 }
 
-fn built_mermaid_worker(target: &str, target_kind: TargetKind) -> PathBuf {
-    built_release_binary(target, mermaid_worker_file_name(target_kind))
-}
-
 fn built_release_binary(target: &str, file_name: &str) -> PathBuf {
     PathBuf::from("target")
         .join(target)
@@ -3755,13 +3619,6 @@ const fn binary_file_name(target_kind: TargetKind) -> &'static str {
     match target_kind {
         TargetKind::Macos | TargetKind::Linux => BINARY_NAME,
         TargetKind::Windows => "bcode.exe",
-    }
-}
-
-const fn mermaid_worker_file_name(target_kind: TargetKind) -> &'static str {
-    match target_kind {
-        TargetKind::Macos | TargetKind::Linux => MERMAID_WORKER_BINARY_NAME,
-        TargetKind::Windows => "bmux-mermaid-worker.exe",
     }
 }
 
@@ -3942,6 +3799,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn explicit_release_features_replace_distribution_and_imply_app() {
@@ -3972,10 +3830,6 @@ mod tests {
 
     #[test]
     fn optional_release_assets_follow_selected_features() {
-        assert!(!features_enable_mermaid_worker(&["app".to_owned()]));
-        assert!(features_enable_mermaid_worker(&[
-            "mermaid-renderer".to_owned()
-        ]));
         assert!(!features_enable_bundled_tesseract(&[
             "static-bundled-plugins".to_owned()
         ]));
@@ -4231,10 +4085,6 @@ mod tests {
     #[test]
     fn platform_release_file_names_and_extensions_are_explicit() {
         assert_eq!(binary_file_name(TargetKind::Windows), "bcode.exe");
-        assert_eq!(
-            mermaid_worker_file_name(TargetKind::Windows),
-            "bmux-mermaid-worker.exe"
-        );
         assert_eq!(archive_extension(TargetKind::Windows), "zip");
         assert_eq!(archive_extension(TargetKind::Macos), "zip");
         assert_eq!(archive_extension(TargetKind::Linux), "tar.gz");
@@ -4293,7 +4143,6 @@ mod tests {
         fs::create_dir_all(runtime.join("lib")).expect("runtime lib dir");
         fs::create_dir_all(runtime.join("tessdata")).expect("tessdata dir");
         fs::write(staging.join("bcode.exe"), b"bcode").expect("bcode");
-        fs::write(staging.join("bmux-mermaid-worker.exe"), b"mermaid worker").expect("worker");
         fs::write(
             staging.join("bcode-runtimes/tesseract/manifest.json"),
             b"{}",
@@ -4304,13 +4153,12 @@ mod tests {
         fs::write(runtime.join("tessdata/eng.traineddata"), b"language").expect("language data");
         let archive = temp.path().join("release.zip");
         create_zip_archive(&archive, &staging).expect("create archive");
-        verify_archive_contents(&archive, TargetKind::Windows, true, true)
-            .expect("complete archive");
+        verify_archive_contents(&archive, TargetKind::Windows, true).expect("complete archive");
 
-        fs::remove_file(staging.join("bmux-mermaid-worker.exe")).expect("remove worker");
+        fs::remove_file(staging.join("bcode.exe")).expect("remove product binary");
         let incomplete = temp.path().join("incomplete.zip");
         create_zip_archive(&incomplete, &staging).expect("create incomplete archive");
-        assert!(verify_archive_contents(&incomplete, TargetKind::Windows, true, true).is_err());
+        assert!(verify_archive_contents(&incomplete, TargetKind::Windows, true).is_err());
     }
 
     #[test]
@@ -4332,7 +4180,6 @@ mod tests {
     fn windows_archive_requires_canonical_leptonica_dll() {
         let entries = std::collections::BTreeSet::from([
             "bcode.exe".to_owned(),
-            "bmux-mermaid-worker.exe".to_owned(),
             "bcode-runtimes/tesseract/manifest.json".to_owned(),
             "bcode-runtimes/tesseract/5.5.2/lib/tesseract.dll".to_owned(),
             "bcode-runtimes/tesseract/5.5.2/tessdata/eng.traineddata".to_owned(),
@@ -4342,7 +4189,6 @@ mod tests {
                 &entries,
                 Path::new("release.zip"),
                 TargetKind::Windows,
-                true,
                 true,
             )
             .is_err()
@@ -4379,7 +4225,7 @@ mod tests {
         let second_extraction = verification_extraction_path(&archive);
         assert_ne!(first_extraction, second_extraction);
         assert!(
-            smoke_test_release_archive(&archive, TargetKind::Windows, true, true, "0.0.1-alpha.0",)
+            smoke_test_release_archive(&archive, TargetKind::Windows, true, "0.0.1-alpha.0",)
                 .is_err()
         );
         let leaked = fs::read_dir(temp.path())

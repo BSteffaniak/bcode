@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bcode_mermaid_render::{
+use bmux_mermaid_render::{
     MermaidCancellationToken, MermaidRenderCache, MermaidRenderError, MermaidRendered,
     MermaidRenderedOutput,
 };
@@ -18,27 +18,26 @@ pub const MAX_MERMAID_PREFETCH: usize = 4;
 pub const RESERVED_MERMAID_ROWS: u16 = 8;
 
 /// Runtime Mermaid presentation state owned by the interactive chat loop.
-#[derive(Debug)]
 pub struct MarkdownMermaidRuntime {
     /// Resident per-contribution lifecycle state.
     pub presentations: MarkdownMermaidPresentationStore,
     /// Bounded successful render cache.
     pub cache: MermaidRenderCache,
-    /// Process-isolated renderer adapter.
-    pub renderer: bcode_mermaid_render::IsolatedMermaidRenderer,
+    /// Embedded WASM renderer adapter.
+    pub renderer: bmux_mermaid_render::WasmMermaidRenderer,
 }
 
 impl MarkdownMermaidRuntime {
-    /// Create runtime state using the renderer packaged beside Bcode.
+    /// Create runtime state using the embedded renderer.
     ///
     /// # Errors
     ///
-    /// Returns a typed unavailable error when packaged renderer discovery fails.
+    /// Returns a typed error when the embedded renderer cannot initialize.
     pub fn packaged() -> Result<Self, MermaidRenderError> {
         Ok(Self {
             presentations: MarkdownMermaidPresentationStore::default(),
             cache: MermaidRenderCache::default(),
-            renderer: bcode_mermaid_render::IsolatedMermaidRenderer::packaged()?,
+            renderer: bmux_mermaid_render::WasmMermaidRenderer::new()?,
         })
     }
 
@@ -101,6 +100,8 @@ impl DecodedMermaidImage {
             },
             destination,
             clip,
+            fit: bmux_tui::image::ImageFit::Contain,
+            allocation: None,
             lifecycle: ImageLifecycle::Frame,
         })
     }
@@ -473,7 +474,7 @@ impl MarkdownMermaidPresentationStore {
     }
 }
 
-/// Complete one scheduled process-isolated Mermaid render.
+/// Complete one scheduled WASM-isolated Mermaid render.
 #[derive(Debug)]
 pub struct MarkdownMermaidCompletion {
     /// Versioned request cache key.
@@ -485,7 +486,7 @@ pub struct MarkdownMermaidCompletion {
 /// Start scheduled Mermaid work on blocking tasks outside the frame renderer.
 #[must_use]
 pub fn spawn_mermaid_work(
-    renderer: &bcode_mermaid_render::IsolatedMermaidRenderer,
+    renderer: &bmux_mermaid_render::WasmMermaidRenderer,
     work: Vec<MarkdownMermaidWork>,
 ) -> Vec<tokio::task::JoinHandle<MarkdownMermaidCompletion>> {
     work.into_iter()
@@ -493,12 +494,12 @@ pub fn spawn_mermaid_work(
             let renderer = renderer.clone();
             tokio::task::spawn_blocking(move || {
                 let request =
-                    bcode_mermaid_render::MermaidRenderRequest::svg(work.source, 1600, 1200);
+                    bmux_mermaid_render::MermaidRenderRequest::svg(work.source, 1600, 1200);
                 let cache_key = work.cache_key;
                 let result = if request.cache_key() == cache_key {
                     renderer.render(&request, &work.cancellation)
                 } else {
-                    Err(MermaidRenderError::InvalidWorkerResponse {
+                    Err(MermaidRenderError::InvalidGuestResponse {
                         message: "scheduled Mermaid cache key does not match its source".to_owned(),
                     })
                 };
@@ -523,7 +524,7 @@ pub struct MarkdownMermaidWork {
 
 #[cfg(test)]
 mod tests {
-    use bcode_mermaid_render::{
+    use bmux_mermaid_render::{
         MermaidRenderCache, MermaidRenderError, MermaidRenderRequest, MermaidRendered,
         MermaidRenderedOutput,
     };
@@ -537,6 +538,20 @@ mod tests {
         MarkdownMermaidPresentationStore, MarkdownMermaidRuntime, RESERVED_MERMAID_ROWS,
         spawn_mermaid_work,
     };
+
+    #[test]
+    fn embedded_renderer_produces_svg_for_tui_rasterization() {
+        let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+        let rendered = bmux_mermaid_render::render_mermaid(
+            &request,
+            &bmux_mermaid_render::MermaidCancellationToken::default(),
+        )
+        .expect("embedded WASM render");
+        let MermaidRenderedOutput::Svg(bytes) = rendered.output;
+        let svg = std::str::from_utf8(&bytes).expect("UTF-8 SVG");
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("</svg>"));
+    }
 
     fn input(id: &str, key: &str, may_render: bool) -> MarkdownMermaidInput {
         MarkdownMermaidInput {
@@ -578,8 +593,8 @@ mod tests {
         }
         assert_eq!(store.active_worker_count(), MAX_MERMAID_PREFETCH);
         assert_eq!(store.len(), 1_000);
-        assert!(cache.len() <= bcode_mermaid_render::MAX_CACHE_ENTRIES);
-        assert!(cache.payload_bytes() <= bcode_mermaid_render::MAX_CACHE_BYTES);
+        assert!(cache.len() <= bmux_mermaid_render::MAX_CACHE_ENTRIES);
+        assert!(cache.payload_bytes() <= bmux_mermaid_render::MAX_CACHE_BYTES);
 
         let retained = &inputs[900..];
         store.reconcile(retained, true);
@@ -652,15 +667,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_reconcile_starts_and_completes_current_worker_failure() {
+    async fn runtime_reconcile_starts_and_completes_guest_failure() {
         let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 1600, 1200);
         let inputs = [input("diagram", &request.cache_key(), true)];
         let mut runtime = MarkdownMermaidRuntime {
             presentations: MarkdownMermaidPresentationStore::default(),
             cache: MermaidRenderCache::default(),
-            renderer: bcode_mermaid_render::IsolatedMermaidRenderer::from_path(
-                "/definitely/missing/diagram-renderer",
-            ),
+            renderer: bmux_mermaid_render::WasmMermaidRenderer::new_with_fuel(1).expect("renderer"),
         };
         let (removed, tasks) = runtime.reconcile_and_start(&inputs, true);
         assert!(removed.is_empty());
@@ -680,9 +693,7 @@ mod tests {
         let mut runtime = MarkdownMermaidRuntime {
             presentations: MarkdownMermaidPresentationStore::default(),
             cache: MermaidRenderCache::default(),
-            renderer: bcode_mermaid_render::IsolatedMermaidRenderer::from_path(
-                "/definitely/missing/diagram-renderer",
-            ),
+            renderer: bmux_mermaid_render::WasmMermaidRenderer::new_with_fuel(1).expect("renderer"),
         };
         let (_, tasks) = runtime.reconcile_and_start(&inputs, true);
         let [task] = tasks.try_into().expect("one worker task");
@@ -694,15 +705,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn isolated_worker_start_failure_completes_as_typed_visible_diagnostic() {
+    async fn guest_fuel_exhaustion_completes_as_typed_visible_diagnostic() {
         let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 1600, 1200);
         let inputs = [input("diagram", &request.cache_key(), true)];
         let mut store = MarkdownMermaidPresentationStore::default();
         store.reconcile(&inputs, true);
         let work = store.schedule(&inputs);
-        let renderer = bcode_mermaid_render::IsolatedMermaidRenderer::from_path(
-            "/definitely/missing/diagram-renderer",
-        );
+        let renderer =
+            bmux_mermaid_render::WasmMermaidRenderer::new_with_fuel(1).expect("renderer");
         let [task] = spawn_mermaid_work(&renderer, work)
             .try_into()
             .expect("one worker task");
@@ -712,7 +722,7 @@ mod tests {
 
         let state = store.state("diagram").expect("diagram state");
         assert!(matches!(state, MarkdownMermaidPresentationState::Failed(_)));
-        assert!(state.fallback("flowchart").contains("worker unavailable"));
+        assert!(state.fallback("flowchart").contains("guest"));
     }
 
     #[test]

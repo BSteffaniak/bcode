@@ -30,6 +30,7 @@
             cargo
             rustfmt
             clippy
+            llvmPackages.lld
             cmake
             markdownlint-cli
             pkg-config
