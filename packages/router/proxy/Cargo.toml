@@ -1,6 +1,6 @@
 [package]
 authors     = { workspace = true }
-categories  = ["proxy", "llm"]
+categories  = ["network-programming", "web-programming::http-server"]
 description = "Lightweight proxy for forwarding LLM API requests with observability"
 edition     = { workspace = true }
 keywords    = ["proxy", "llm", "router", "forwarding"]
