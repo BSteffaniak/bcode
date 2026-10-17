@@ -161,6 +161,22 @@ Existing `permission.command` and `permission.command_patterns` form an implicit
 
 Layers do not override disabled tools, resource/path/external-directory/skill authorization, invalid or incomplete shell analysis, dynamic executable identity, or unresolved dynamic execution into automatic allow. Redirections retain their path rules. After leaf resolution, whole-program aggregation remains `deny > ask > allow`: `allowed; denied` cannot launder a denied sibling. Policy identities include the ordered configuration, so a pinned workflow does not silently acquire later exceptions. Deploy runtime support before emitting this configuration; old binaries must not be used to interpret advanced policies.
 
+#### Compiled policy reuse
+
+The permission evaluator retains compiled command policies in the daemon's plugin
+process, keyed by the exact base command tables and ordered layers (including
+versions and actions). Sessions with identical policies share compiled snapshots;
+configuration or runtime permission changes select a new snapshot. Invalid
+snapshots fail closed with the compilation reason rather than using an older
+valid policy. Cache entries are disposable and least-recently-used snapshots are
+evicted; eviction never rejects a policy or invalidates in-flight evaluations.
+
+There is no aggregate rule-count, layer-count, pattern-byte, compiled-state, or
+regex-count ceiling. Individual patterns and regexes retain complexity/memory
+budgets. Static executable indexes select relevant argv rules for evaluation and
+preview while preserving sorted configuration locators and rule precedence.
+Dynamic executables and oversized subjects retain conservative deny handling.
+
 #### Non-executing preview
 
 ```sh

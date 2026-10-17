@@ -17,10 +17,10 @@
 //! `/[a]/zz` is an invalid explicit regex. Duplicate flags and unsupported flags on explicit regexes
 //! are errors, never fallback literals.
 //!
-//! `compile` admits at most 128 rules, 32 KiB combined pattern text, 4096
-//! compiled argv states, and 64 regexes. Each regex has a 256 KiB compiled-size
-//! limit and a 256 KiB lazy-DFA cache limit (16 MiB aggregate apiece). Counts
-//! are checked before compiling the next regex; an invalid set fails atomically.
+//! Compilation has no aggregate rule-count, pattern-byte, state, or regex-count
+//! ceiling. Individual patterns and regexes retain their complexity budgets.
+//! Compiled policies are reused by the permission evaluator; exact executable
+//! indexes avoid running unrelated argv state machines.
 //!
 //! `<options>*` consumes zero or more dash-led values other than `-`/`--`.
 //! An option without `=` may also consume one non-dash-led value (including
@@ -35,10 +35,7 @@ use regex::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const MAX_PATTERN_BYTES: usize = 1024;
-const MAX_RULES: usize = 128;
-const MAX_TOTAL_PATTERN_BYTES: usize = 32 * 1024;
 const MAX_REGEXES: usize = 64;
-const MAX_TOTAL_STATES: usize = 4096;
 const MAX_SEGMENTS: usize = 32;
 const MAX_STATES: usize = 256;
 const MAX_WORDS: usize = 256;
@@ -87,6 +84,7 @@ enum Token {
 pub struct WordRule {
     pub pattern: String,
     pub action: Action,
+    pub index: usize,
     edges: Vec<Vec<(Option<Atom>, usize)>>,
     accept: usize,
     specificity: (usize, usize),
@@ -328,6 +326,7 @@ fn parse_with_budget(
     let mut rule = WordRule {
         pattern: pattern.to_owned(),
         action,
+        index: 0,
         edges: vec![Vec::new()],
         accept: 0,
         specificity: (0, 0),
@@ -412,25 +411,100 @@ fn parse_with_budget(
     Ok(rule)
 }
 
-pub fn compile(rules: &BTreeMap<String, Action>) -> Result<Vec<WordRule>, String> {
-    if rules.len() > MAX_RULES {
-        return Err("word rules exceed 128 rules".to_owned());
-    }
-    if rules.keys().map(String::len).sum::<usize>() > MAX_TOTAL_PATTERN_BYTES {
-        return Err("word rules exceed 32768 pattern bytes".to_owned());
-    }
-    let mut regexes = 0;
-    let mut states = 0;
-    let mut compiled = Vec::with_capacity(rules.len());
+pub fn compile(rules: &BTreeMap<String, Action>) -> Result<WordRules, String> {
+    let mut compiled = WordRules::default();
     for (pattern, action) in rules {
-        let rule = parse_with_budget(pattern, *action, &mut regexes)?;
-        states += rule.edges.len();
-        if states > MAX_TOTAL_STATES {
-            return Err("word rules exceed 4096 states".to_owned());
-        }
-        compiled.push(rule);
+        let mut rule = parse_with_budget(pattern, *action, &mut 0)?;
+        rule.index = compiled.rules.len();
+        let executable = match &rule.edges[0][0].0 {
+            Some(Atom::Literal(executable)) => executable.clone(),
+            _ => unreachable!("parser requires a literal executable"),
+        };
+        compiled
+            .by_executable
+            .entry(executable)
+            .or_default()
+            .push(compiled.rules.len());
+        compiled.rules.push(rule);
     }
     Ok(compiled)
+}
+
+/// Rules retain configuration order for diagnostic locators; the index only
+/// selects candidates and never changes precedence or dynamic-executable denies.
+#[derive(Debug, Default)]
+pub struct WordRules {
+    rules: Vec<WordRule>,
+    by_executable: BTreeMap<String, Vec<usize>>,
+}
+
+impl std::ops::Deref for WordRules {
+    type Target = [WordRule];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rules
+    }
+}
+
+impl WordRules {
+    pub fn candidates<'a>(
+        &'a self,
+        command: &ShellCommand,
+    ) -> impl Iterator<Item = (usize, &'a WordRule)> {
+        let oversized = command.arguments.len() >= MAX_WORDS
+            || std::iter::once(&command.executable)
+                .chain(&command.arguments)
+                .filter_map(static_word)
+                .map(str::len)
+                .sum::<usize>()
+                > MAX_WORD_BYTES;
+        let executable = if oversized {
+            None
+        } else {
+            static_word(&command.executable)
+        };
+        let indices = executable.and_then(|value| self.by_executable.get(value));
+        let count = if executable.is_none() {
+            self.rules.len()
+        } else {
+            indices.map_or(0, Vec::len)
+        };
+        (0..count).map(move |offset| {
+            let index = indices.map_or(offset, |indices| indices[offset]);
+            (index, &self.rules[index])
+        })
+    }
+
+    pub fn matching(&self, command: &ShellCommand) -> Option<&WordRule> {
+        let words = std::iter::once(&command.executable)
+            .chain(&command.arguments)
+            .map(static_word)
+            .collect::<Vec<_>>();
+        self.candidates(command)
+            .map(|(_, rule)| rule)
+            .filter(|rule| {
+                (command.assignments.is_empty() || rule.action == Action::Deny)
+                    && matches(rule, &words, false)
+            })
+            .max_by(|lhs, rhs| rank(lhs, rhs))
+    }
+
+    pub fn uncertain_deny(&self, command: &ShellCommand) -> Option<&WordRule> {
+        let words = std::iter::once(&command.executable)
+            .chain(&command.arguments)
+            .map(static_word)
+            .collect::<Vec<_>>();
+        if words.iter().all(Option::is_some)
+            && words.len() <= MAX_WORDS
+            && words.iter().flatten().map(|s| s.len()).sum::<usize>() <= MAX_WORD_BYTES
+        {
+            return None;
+        }
+        self.candidates(command)
+            .map(|(_, rule)| rule)
+            .filter(|rule| rule.action == Action::Deny && matches(rule, &words, true))
+            .max_by(|lhs, rhs| rank(lhs, rhs))
+    }
 }
 
 fn static_word(word: &ShellWord) -> Option<&str> {
@@ -770,31 +844,67 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_compile_budgets() {
-        let rules = (0..=MAX_RULES)
-            .map(|i| (format!("cmd{i}"), Action::Deny))
-            .collect();
-        assert!(compile(&rules).unwrap_err().contains("128 rules"));
-        let rules = (0..40)
-            .map(|i| (format!("cmd{i} {}", "a".repeat(900)), Action::Deny))
-            .collect();
-        assert!(compile(&rules).unwrap_err().contains("pattern bytes"));
-        let rules = (0..=MAX_REGEXES)
+    fn large_policies_compile_and_only_visit_relevant_executables() {
+        let rules = (0..2048)
             .map(|i| (format!("cmd{i} /a/"), Action::Deny))
             .collect();
-        assert!(compile(&rules).unwrap_err().contains("64 regexes"));
-        let rules = (0..MAX_REGEXES)
-            .map(|i| (format!("cmd{i} /a/"), Action::Deny))
-            .collect();
-        assert_eq!(compile(&rules).unwrap().len(), MAX_REGEXES);
-        let rules = (0..128)
-            .map(|i| (format!("cmd{i} [{}]", "a ".repeat(40)), Action::Deny))
-            .collect();
-        assert!(compile(&rules).unwrap_err().contains("4096 states"));
-        let rules = (0..MAX_RULES)
-            .map(|i| (format!("cmd{i}"), Action::Deny))
-            .collect();
-        assert_eq!(compile(&rules).unwrap().len(), MAX_RULES);
+        let compiled = compile(&rules).unwrap();
+        assert_eq!(compiled.len(), 2048);
+        let subject = command("cmd2047 a");
+        assert_eq!(compiled.candidates(&subject).count(), 1);
+        assert_eq!(compiled.matching(&subject).unwrap().action, Action::Deny);
+        assert_eq!(compiled.candidates(&command("git status")).count(), 0);
+        let dynamic = command("$COMMAND a");
+        assert_eq!(compiled.candidates(&dynamic).count(), 2048);
+        assert!(compiled.uncertain_deny(&dynamic).is_some());
+    }
+
+    #[test]
+    fn indexed_matching_agrees_with_full_scan_for_dynamic_and_oversized_subjects() {
+        let rules = BTreeMap::from([
+            ("git status".to_owned(), Action::Allow),
+            ("git ...".to_owned(), Action::Ask),
+            ("git /push/i ...".to_owned(), Action::Deny),
+            ("rm ...".to_owned(), Action::Deny),
+        ]);
+        let compiled = compile(&rules).unwrap();
+        for source in [
+            "git status",
+            "git PUSH",
+            "git $ARGS",
+            "$COMMAND status",
+            "NAME=value git status",
+            "rm file",
+            "unknown arg",
+        ] {
+            let subject = command(source);
+            assert_eq!(
+                compiled.matching(&subject).map(|rule| rule.index),
+                matching(&compiled, &subject).map(|rule| rule.index),
+                "{source}"
+            );
+            assert_eq!(
+                compiled.uncertain_deny(&subject).map(|rule| rule.index),
+                uncertain_deny(&compiled, &subject).map(|rule| rule.index),
+                "{source}"
+            );
+        }
+        let mut oversized = command("git status");
+        oversized.arguments = vec![oversized.arguments[0].clone(); MAX_WORDS];
+        assert_eq!(
+            compiled.uncertain_deny(&oversized).map(|rule| rule.index),
+            uncertain_deny(&compiled, &oversized).map(|rule| rule.index)
+        );
+        assert!(compiled.matching(&oversized).is_none());
+        let mut large_word = command("git status");
+        if let ShellWord::Static { value, .. } = &mut large_word.arguments[0] {
+            *value = "x".repeat(MAX_WORD_BYTES + 1);
+        }
+        assert_eq!(
+            compiled.uncertain_deny(&large_word).map(|rule| rule.index),
+            uncertain_deny(&compiled, &large_word).map(|rule| rule.index)
+        );
+        assert!(compiled.matching(&large_word).is_none());
     }
 
     #[test]
