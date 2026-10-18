@@ -54,6 +54,7 @@ pub mod projection;
 pub mod repair;
 pub use invocation_recovery::{InvocationRecoveryCheckpoint, InvocationRecoveryObservation};
 mod runtime_work;
+pub use runtime_work::InterruptedRecoveryWork;
 pub(crate) mod state;
 pub mod storage_access;
 pub mod storage_admission;

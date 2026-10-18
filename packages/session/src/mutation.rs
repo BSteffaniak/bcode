@@ -656,6 +656,32 @@ impl SessionManager {
         Ok(event)
     }
 
+    /// Append only if canonical history still has the inspected generation.
+    ///
+    /// # Errors
+    /// Returns ownership, storage, or generation-conflict errors without retrying.
+    pub async fn append_event_at_generation(
+        &self,
+        session_id: SessionId,
+        kind: SessionEventKind,
+        expected_generation: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        Box::pin(self.ensure_session_loaded(session_id)).await?;
+        let handle = self.session_handle(session_id).await?;
+        let event = handle
+            .append_event_at_generation(
+                kind,
+                expected_generation,
+                self.next_activity_timestamp_ms(),
+            )
+            .await?;
+        let summary = handle.summary().await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        self.publish_committed_mutation(event.clone(), summary);
+        Ok(event)
+    }
+
     /// Append an event with optional source provenance to a session.
     ///
     /// # Errors

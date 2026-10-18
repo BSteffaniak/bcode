@@ -1710,7 +1710,7 @@ impl SessionRuntimeViewState {
                 true,
             ),
             Blocker::InterruptedTurn => (
-                "This message's previous turn was interrupted. Resuming it could repeat effects; inspect its turn before recovering it.",
+                "This message's previous turn was interrupted. Inspect its effects, then explicitly end the interrupted turn to unblock later messages; tools will not be replayed.",
                 false,
                 false,
             ),
@@ -1729,6 +1729,8 @@ impl SessionRuntimeViewState {
             submission_id: record.receipt.submission_id.clone(),
             expected_accepted_sequence: record.receipt.accepted_event_sequence,
             reason: reason.to_owned(),
+            interrupted_turn_id: (blocker == Blocker::InterruptedTurn)
+                .then(|| record.submission.target.turn_id().0.clone()),
             can_resume,
             can_cancel,
         })
@@ -1744,6 +1746,8 @@ pub struct SubmissionQueueRecoveryView {
     pub expected_accepted_sequence: u64,
     /// Plain-language session-level blocker, containing no prompt or configuration secrets.
     pub reason: String,
+    /// Exact interrupted turn that may be explicitly ended without replaying tools.
+    pub interrupted_turn_id: Option<String>,
     /// Whether preparing an explicit resume confirmation is available.
     pub can_resume: bool,
     /// Whether cancellation of this pending item is available.
@@ -2037,6 +2041,13 @@ pub enum SessionViewAction {
         expected_accepted_sequence: u64,
         /// Stable idempotency identity for this operation.
         operation_id: String,
+    },
+    /// End only the inspected interrupted turn; never cancel a successor or replay tools.
+    EndInterruptedTurn {
+        /// Owning session.
+        session_id: SessionId,
+        /// Exact turn shown by the shared queue recovery observation.
+        turn_id: String,
     },
     /// Cancel the active model turn.
     CancelTurn {

@@ -336,6 +336,224 @@ async fn resume_inner(
     Ok(result)
 }
 
+/// Explicitly end one orphaned interactive turn, without replaying any invocation.
+/// False means this is not the exact interrupted queue head; ordinary cancellation may apply.
+///
+/// # Errors
+/// Returns storage, ownership, concurrent-change, and incomplete-evidence errors.
+pub async fn end_interrupted_turn(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    turn_id: &str,
+) -> Result<bool, super::ServerError> {
+    use bcode_session_models::SessionEventKind;
+
+    let _ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?;
+    let lock = turn_admission_lock(state, session_id).await;
+    let admission_guard = lock.lock().await;
+    let observed = status(state, session_id).await.map_err(|error| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(error.message)
+    })?;
+    let Some(record) = observed.oldest else {
+        return Ok(false);
+    };
+    if observed.blocker != Some(SubmissionQueueBlocker::InterruptedTurn)
+        || record.submission.target.turn_id().0 != turn_id
+    {
+        return Ok(false);
+    }
+    if state
+        .sessions
+        .session_summary(session_id)
+        .await?
+        .execution
+        .is_some()
+        || !state
+            .runtime_work
+            .active_ids_for_session(session_id)
+            .await
+            .is_empty()
+    {
+        return Err(
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "interrupted turn still has execution ownership; use its authorized controls"
+                    .into(),
+            ),
+        );
+    }
+    if let Some(runtime) = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        && (runtime.current_turn.lock().await.is_some()
+            || runtime.phase.lock().await.has_active_work()
+            || runtime
+                .queued_followups
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0)
+    {
+        return Err(
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "turn execution is live or scheduled; retry after it settles".into(),
+            ),
+        );
+    }
+    let generation = state
+        .sessions
+        .current_session_generation(session_id)
+        .await?;
+    let terminal = state
+        .sessions
+        .session_turn_evidence(session_id, turn_id)
+        .await?;
+    if terminal
+        .iter()
+        .any(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }))
+    {
+        return Ok(false);
+    }
+    let events = interrupted_terminal_events(state, session_id, turn_id, generation).await?;
+    let mut expected_generation = generation;
+    for kind in events {
+        let permission = match &kind {
+            SessionEventKind::PermissionResolved { permission_id, .. } => {
+                Some(permission_id.clone())
+            }
+            _ => None,
+        };
+        let event = state
+            .sessions
+            .append_event_at_generation(session_id, kind, expected_generation)
+            .await?;
+        expected_generation = event.sequence;
+        super::publish_session_event(state, &event).await;
+        if let Some(id) = permission {
+            state.recovered_permissions.lock().await.remove(&id);
+            state.pending_permissions.lock().await.remove(&id);
+        }
+    }
+    drop(admission_guard);
+    let _handle = live_submission_runtime(state, session_id).await;
+    Ok(true)
+}
+
+const INTERRUPTED_TURN_MESSAGE: &str = "The interrupted turn was explicitly ended without replaying tools. Prior effects may have occurred; inspect them before retrying.";
+
+fn validate_interrupted_work(
+    work: &[bcode_session::db::RuntimeWorkProjection],
+    turn_id: &str,
+) -> Result<(), super::ServerError> {
+    let mut owned = std::collections::BTreeSet::from([format!("model_{turn_id}")]);
+    for _ in 0..work.len() {
+        for item in work {
+            if item
+                .parent_work_id
+                .as_ref()
+                .is_some_and(|id| owned.contains(&id.to_string()))
+            {
+                owned.insert(item.work_id.to_string());
+            }
+        }
+    }
+    if work
+        .iter()
+        .any(|item| !owned.contains(&item.work_id.to_string()))
+    {
+        return Err(
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "unrelated runtime work must settle before interrupted recovery".into(),
+            ),
+        );
+    }
+    Ok(())
+}
+
+async fn interrupted_terminal_events(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    generation: u64,
+) -> Result<Vec<bcode_session_models::SessionEventKind>, super::ServerError> {
+    use bcode_session_models::{ModelTurnOutcome, RuntimeWorkStatus, SessionEventKind};
+    let bcode_session::InterruptedRecoveryWork { tools, work } =
+        state.sessions.interrupted_recovery_work(session_id).await?;
+    if tools.len() > 128 || work.len() > 256 {
+        return Err(
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "interrupted recovery exceeds its bounded work page".into(),
+            ),
+        );
+    }
+    validate_interrupted_work(&work, turn_id)?;
+    let message = INTERRUPTED_TURN_MESSAGE;
+    let mut events = Vec::new();
+    for tool in tools {
+        let interval = state
+            .sessions
+            .session_events_range(session_id, tool.event_seq_start, generation, 1024)
+            .await?;
+        if interval
+            .last()
+            .is_none_or(|event| event.sequence != generation)
+            || !matches!(interval.first().map(|event| &event.kind),
+                Some(SessionEventKind::PositionedToolCallRequested { turn_id: requested_turn, .. }) if requested_turn == turn_id)
+        {
+            return Err(
+                super::ServerError::WorkflowApplicationOperationUnauthorized(
+                    "invocation ownership or bounded recovery evidence is unavailable".into(),
+                ),
+            );
+        }
+        for event in &interval {
+            if let SessionEventKind::PermissionRequested { permission_id, tool_call_id, .. } = &event.kind
+                && tool_call_id == &tool.tool_call_id
+                && !interval.iter().any(|event| matches!(&event.kind,
+                    SessionEventKind::PermissionResolved { permission_id: id, .. } if id == permission_id))
+            {
+                events.push(SessionEventKind::PermissionResolved { permission_id: permission_id.clone(), approved: false });
+            }
+        }
+        events.push(SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: tool.tool_call_id,
+                model_output: message.into(),
+                is_error: true,
+                content: vec![bcode_session_models::ToolResultContent::Text {
+                    text: message.into(),
+                }],
+                presentation: None,
+                result: Some(bcode_session_models::ToolInvocationResult::Text {
+                    text: message.into(),
+                }),
+            },
+        });
+    }
+    for item in work.into_iter().rev() {
+        events.push(SessionEventKind::RuntimeWorkFinished {
+            work_id: item.work_id,
+            finished_at_ms: Some(super::current_time_ms()),
+            status: RuntimeWorkStatus::Cancelled,
+            message: Some(message.into()),
+        });
+    }
+    // The terminal event goes last: interruption before it preserves the queue blocker.
+    // A retry reobserves only unfinished work, never replays a tool or reopens a terminal turn.
+    events.push(SessionEventKind::ModelTurnFinished {
+        turn_id: turn_id.into(),
+        outcome: ModelTurnOutcome::Cancelled,
+        message: Some(message.into()),
+    });
+    Ok(events)
+}
+
 pub async fn cancel(
     state: &Arc<ServerState>,
     session_id: SessionId,

@@ -160,6 +160,31 @@ Workflow-owned input requires the workflow's authorized recovery controls. Queue
 recovery is not permission to repeat an interrupted tool with an unverifiable outcome
 or reopen an authoritative terminal turn.
 
+### Explicitly ending an interrupted interactive turn
+
+An activated submission with no matching live turn remains a FIFO blocker. It cannot be
+resumed as new input or removed with `cancel-pending`: either would conceal possible effects.
+After inspecting its history, use `/queue-end-interrupted` in the TUI, or
+`bcode cancel SESSION_ID --turn-id TURN_ID` with the exact turn ID from the oldest activated
+record reported by `session queue-status`. This explicitly ends that turn without replaying
+tools or clearing later input. The normal pending-input recovery controls apply to any later
+message missing its execution configuration.
+
+The application verifies session ownership, the exact interrupted queue head, absence of live
+or scheduled execution, current tool/work projections, and bounded invocation ownership evidence.
+Workflow-owned sessions and submissions require workflow controls instead. Missing, stale,
+foreign, oversized, or unverifiable evidence fails closed without guessing. Active recovery
+reads at most 129 tools and 257 work records (one overflow sentinel), and at most 1024 events
+per tool; these are recovery-page budgets, not session-lifetime limits.
+
+Unresolved permissions are denied and unfinished tools receive error results explicitly saying
+that prior effects may have occurred. Runtime work settles before the turn's cancellation terminal
+is appended; this terminal clears only its activated queue entries. Each append checks the inspected
+canonical generation. A conflict stops the operation rather than silently rebasing; a retry
+reobserves unfinished work, and an already terminal turn is never reopened or duplicated.
+No accepted text, target, or prior event is rewritten. The durable event schema is unchanged;
+existing terminal-event projections govern queue visibility and reconnect behavior.
+
 ## Canonical storage and authority
 
 A Bcode session id maps to exactly one canonical database within the state location that owns it:

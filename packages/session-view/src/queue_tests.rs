@@ -113,6 +113,19 @@ async fn queue_hydration_and_targeted_actions_use_only_bounded_application_opera
             .await
             .unwrap();
         assert!(view.snapshot().runtime.queue_recovery().is_none());
+        let ended = execute_session_view_action(
+            &client,
+            SessionViewAction::EndInterruptedTurn {
+                session_id,
+                turn_id: "inspected-interrupted-turn".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            ended,
+            SessionViewActionOutcome::Cancelled { cancelled: true }
+        ));
         responder.await.unwrap();
     };
     tokio::time::timeout(std::time::Duration::from_secs(10), exercise)
@@ -142,6 +155,35 @@ fn recovery_test_hello() -> ResponsePayload {
     }
 }
 
+fn interrupted_cancel_response(
+    stage: usize,
+    requested: SessionId,
+    session_id: SessionId,
+    expected_turn_id: Option<&str>,
+    clear_queue: bool,
+) {
+    assert_eq!(stage, 5);
+    assert_eq!(requested, session_id);
+    assert_eq!(expected_turn_id, Some("inspected-interrupted-turn"));
+    assert!(!clear_queue);
+}
+
+fn queue_response(stage: usize, pending: &SubmissionRecord) -> ResponsePayload {
+    ResponsePayload::SubmissionQueueStatus {
+        status: if stage == 1 {
+            SubmissionQueueStatus {
+                oldest: Some(pending.clone()),
+                blocker: Some(SubmissionQueueBlocker::MissingContext),
+            }
+        } else {
+            SubmissionQueueStatus {
+                oldest: None,
+                blocker: None,
+            }
+        },
+    }
+}
+
 async fn respond_to_recovery_scenario(
     listener: bcode_ipc::LocalIpcListener,
     session_id: SessionId,
@@ -149,7 +191,7 @@ async fn respond_to_recovery_scenario(
     confirmation: SubmissionResumeConfirmation,
 ) {
     let mut stage = 0;
-    while stage < 5 {
+    while stage < 6 {
         let mut stream = listener.accept().await.unwrap();
         loop {
             let Ok(envelope) = bcode_ipc::recv_envelope(&mut stream).await else {
@@ -164,19 +206,7 @@ async fn respond_to_recovery_scenario(
                     assert_eq!(requested, session_id);
                     assert!(stage == 0 || stage == 4);
                     stage += 1;
-                    ResponsePayload::SubmissionQueueStatus {
-                        status: if stage == 1 {
-                            SubmissionQueueStatus {
-                                oldest: Some(pending.clone()),
-                                blocker: Some(SubmissionQueueBlocker::MissingContext),
-                            }
-                        } else {
-                            SubmissionQueueStatus {
-                                oldest: None,
-                                blocker: None,
-                            }
-                        },
-                    }
+                    queue_response(stage, &pending)
                 }
                 Request::PrepareSubmissionResume {
                     session_id: requested,
@@ -230,6 +260,21 @@ async fn respond_to_recovery_scenario(
                         },
                     }
                 }
+                Request::CancelSessionTurn {
+                    session_id: requested,
+                    expected_turn_id,
+                    clear_queue,
+                } => {
+                    interrupted_cancel_response(
+                        stage,
+                        requested,
+                        session_id,
+                        expected_turn_id.as_deref(),
+                        clear_queue,
+                    );
+                    stage += 1;
+                    ResponsePayload::TurnCancellationRequested { cancelled: true }
+                }
                 other => panic!(
                     "recovery must not scan history, change settings, or grant permissions: {other:?}"
                 ),
@@ -237,7 +282,7 @@ async fn respond_to_recovery_scenario(
             let reply =
                 bcode_ipc::response_envelope(envelope.request_id, &Response::Ok(payload)).unwrap();
             bcode_ipc::send_envelope(&mut stream, &reply).await.unwrap();
-            if stage == 5 {
+            if stage == 6 {
                 break;
             }
         }

@@ -49,6 +49,10 @@ fn queue_recovery_is_session_level_secret_safe_and_preserves_unavailable_actions
             .queue_recovery()
             .expect("outside-history blocker visible");
         assert_eq!((recovery.can_resume, recovery.can_cancel), (resume, cancel));
+        assert_eq!(
+            recovery.interrupted_turn_id.as_deref(),
+            (blocker == B::InterruptedTurn).then_some("target")
+        );
         assert_eq!(recovery.expected_accepted_sequence, 1);
         assert!(!recovery.reason.contains("private prompt"));
         let decoded: SessionViewSnapshot =

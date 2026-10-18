@@ -122,6 +122,14 @@ pub async fn execute_session_view_action(
                     .await?,
             ),
         }),
+        SessionViewAction::EndInterruptedTurn {
+            session_id,
+            turn_id,
+        } => Ok(SessionViewActionOutcome::Cancelled {
+            cancelled: client
+                .cancel_exact_session_turn(session_id, turn_id)
+                .await?,
+        }),
         SessionViewAction::CancelTurn {
             session_id,
             clear_queue,

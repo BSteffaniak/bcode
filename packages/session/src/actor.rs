@@ -834,6 +834,12 @@ impl SessionHandle {
         self.send(SessionCommand::ModelContextEvents).await?
     }
 
+    pub async fn interrupted_recovery_work(
+        &self,
+    ) -> Result<crate::InterruptedRecoveryWork, SessionError> {
+        self.send(SessionCommand::InterruptedRecoveryWork).await?
+    }
+
     pub async fn active_tool_runs(&self) -> Result<Vec<crate::db::ToolRun>, SessionError> {
         self.send(SessionCommand::ActiveToolRuns).await?
     }
@@ -1200,6 +1206,7 @@ enum SessionCommand {
         oneshot::Sender<Result<bcode_session_models::ActivatedConversationSnapshot, SessionError>>,
     ),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
+    InterruptedRecoveryWork(oneshot::Sender<Result<crate::InterruptedRecoveryWork, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
     ActiveRuntimeWork {
         reply: oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>,
@@ -1743,6 +1750,10 @@ impl SessionActor {
             }
             SessionCommand::ModelContextEvents(reply) => {
                 let _ = reply.send(self.model_context_events().await);
+            }
+            SessionCommand::InterruptedRecoveryWork(reply) => {
+                let result = self.interrupted_recovery_work().await;
+                let _ = reply.send(result);
             }
             SessionCommand::ActiveToolRuns(reply) => {
                 let _ = reply.send(self.active_tool_runs().await);
@@ -3604,6 +3615,36 @@ impl SessionActor {
                 .collect());
         }
         Err(SessionError::NotFound(self.state.summary.id))
+    }
+
+    async fn interrupted_recovery_work(
+        &mut self,
+    ) -> Result<crate::InterruptedRecoveryWork, SessionError> {
+        let expected = self.state.next_sequence.saturating_sub(1);
+        let Some(db) = self.existing_session_db().await? else {
+            // In-memory sessions have no durable recovery projections.
+            return Err(SessionError::EventSerialization(
+                "durable recovery projections unavailable".into(),
+            ));
+        };
+        for (projection, name) in [
+            (MaterializedProjection::ToolRuns, "tool_runs"),
+            (MaterializedProjection::RuntimeWork, "runtime_work"),
+        ] {
+            let checkpoint = db.materialized_projection_checkpoint(projection).await?;
+            if checkpoint.is_none_or(|value| value < expected) {
+                return Err(SessionError::ProjectionStale {
+                    session_id: self.state.summary.id,
+                    projection: name,
+                    checkpoint,
+                    expected,
+                });
+            }
+        }
+        Ok(crate::InterruptedRecoveryWork {
+            tools: db.active_tool_runs_bounded(129).await?,
+            work: db.active_runtime_work_bounded(Some(257)).await?,
+        })
     }
 
     async fn active_tool_runs(&mut self) -> Result<Vec<crate::db::ToolRun>, SessionError> {

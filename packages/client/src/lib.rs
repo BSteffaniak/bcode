@@ -4983,9 +4983,10 @@ impl BcodeClient {
         }
     }
 
-    /// Request cancellation only if the specified turn is still active.
+    /// Request cancellation only of the specified live or interrupted turn.
     ///
-    /// Never clears queued work. A true acknowledgement is not a terminal outcome.
+    /// An interrupted turn is ended without replaying tools. Prior effects remain unverifiable.
+    /// Never clears queued work. A true acknowledgement is not by itself a terminal observation.
     ///
     /// # Errors
     ///

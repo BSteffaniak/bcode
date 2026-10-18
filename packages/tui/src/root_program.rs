@@ -2471,7 +2471,11 @@ impl BcodeRuntimeModel {
             super::composer_flow::RootSubmission::SlashCommand(message) => {
                 if matches!(
                     message.trim(),
-                    "/queue-resume" | "/queue-cancel" | "/queue-confirm" | "/queue-dismiss"
+                    "/queue-resume"
+                        | "/queue-cancel"
+                        | "/queue-confirm"
+                        | "/queue-dismiss"
+                        | "/queue-end-interrupted"
                 ) {
                     self.stage_queue_recovery(message.trim());
                     return;
@@ -2521,6 +2525,14 @@ impl BcodeRuntimeModel {
             return;
         };
         let action = match command {
+            "/queue-end-interrupted" if recovery.interrupted_turn_id.is_some() => {
+                SessionViewAction::EndInterruptedTurn {
+                    session_id,
+                    turn_id: recovery
+                        .interrupted_turn_id
+                        .expect("guarded interrupted identity"),
+                }
+            }
             "/queue-resume" if recovery.can_resume => SessionViewAction::PrepareSubmissionResume {
                 session_id,
                 submission_id: recovery.submission_id,

@@ -4849,7 +4849,7 @@ enum Commands {
         session_id: SessionId,
         #[arg(long)]
         clear_queue: bool,
-        /// Target only this active turn; never cancel a successor or queued work.
+        /// Target only this live or interrupted turn; never cancel a successor or queued work.
         #[arg(long, conflicts_with = "clear_queue")]
         turn_id: Option<String>,
         /// Print the cancellation request result as JSON.

@@ -662,6 +662,408 @@ async fn persistent_blocked_head_requires_exact_confirmation_and_duplicate_does_
     state.request_shutdown();
 }
 
+async fn orphaned_permission_fixture(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    directory: &Path,
+) {
+    let model = bcode_session_models::WorkId::new(format!("model_{turn_id}"));
+    state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: model.clone(),
+                kind: bcode_session_models::RuntimeWorkKind::ModelTurn,
+                label: format!("model turn {turn_id}"),
+                parent_work_id: None,
+                started_at_ms: Some(1),
+                cancellable: true,
+                tool_call_id: None,
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+            },
+        )
+        .await
+        .unwrap();
+    state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::PositionedToolCallRequested {
+                turn_id: turn_id.to_owned(),
+                output_position: bcode_session_models::TurnOutputPosition::new(0),
+                tool_call_id: "interrupted-call".into(),
+                producer_plugin_id: Some("example".into()),
+                tool_name: "example.write".into(),
+                arguments_json: "{}".into(),
+                working_directory: Some(directory.to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: bcode_session_models::WorkId::new("tool_interrupted-call"),
+                kind: bcode_session_models::RuntimeWorkKind::Tool,
+                label: "example.write".into(),
+                parent_work_id: Some(model),
+                started_at_ms: Some(2),
+                cancellable: true,
+                tool_call_id: Some("interrupted-call".into()),
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+            },
+        )
+        .await
+        .unwrap();
+    state
+        .sessions
+        .append_permission_requested(
+            session_id,
+            SessionEventKind::PermissionRequested {
+                permission_id: "orphaned-permission".into(),
+                tool_call_id: "interrupted-call".into(),
+                producer_plugin_id: Some("example".into()),
+                tool_name: "example.write".into(),
+                arguments_json: "{}".into(),
+                batch: None,
+                policy_source: None,
+                policy_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn assert_no_recovery_mutation(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    turn_id: &str,
+) {
+    let generation = state
+        .sessions
+        .current_session_generation(session_id)
+        .await
+        .unwrap();
+    assert!(
+        !crate::submission_recovery::end_interrupted_turn(state, session_id, turn_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .sessions
+            .current_session_generation(session_id)
+            .await
+            .unwrap(),
+        generation
+    );
+}
+
+#[tokio::test]
+async fn interrupted_turn_can_be_explicitly_ended_without_replaying_tools_or_losing_fifo() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("sessions");
+    let sessions = SessionManager::persistent(root.clone()).unwrap();
+    let session = sessions
+        .create_session(None, directory.path().to_owned())
+        .await
+        .unwrap();
+    let state = Arc::new(crate::tests::test_server_state_with_fake_provider(sessions));
+    let first = pending(&state, session.id, "orphaned", false).await;
+    state
+        .sessions
+        .activate_submission(session.id, first.receipt.submission_id.clone())
+        .await
+        .unwrap();
+    let turn_id = first.submission.target.turn_id().0.clone();
+    orphaned_permission_fixture(&state, session.id, &turn_id, directory.path()).await;
+    let later = pending(&state, session.id, "preserved-followup", false).await;
+    assert_no_recovery_mutation(&state, session.id, "wrong-turn").await;
+    assert!(
+        crate::session_operations::cancel_turn(
+            &state,
+            session.id,
+            false,
+            ClientId::new(),
+            Some(turn_id.clone())
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        status(&state, session.id).await.unwrap().oldest,
+        Some(later.clone())
+    );
+    assert!(
+        state
+            .sessions
+            .active_tool_runs(session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        state
+            .sessions
+            .active_runtime_work(session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let history = state.sessions.session_history(session.id).await.unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::SubmissionActivated { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(history.iter().filter(|event| matches!(&event.kind, SessionEventKind::ToolInvocationResultRecorded { record } if record.invocation_id == "interrupted-call" && record.is_error)).count(), 1);
+    assert!(history.iter().any(|event| matches!(&event.kind, SessionEventKind::PermissionResolved { permission_id, approved: false } if permission_id == "orphaned-permission")));
+    assert_eq!(history.iter().filter(|event| matches!(&event.kind, SessionEventKind::ModelTurnFinished { turn_id: id, outcome: bcode_session_models::ModelTurnOutcome::Cancelled, .. } if id == &turn_id)).count(), 1);
+    assert_no_recovery_mutation(&state, session.id, &turn_id).await;
+    state.request_shutdown();
+    drop(state);
+    let sessions = SessionManager::persistent(root).unwrap();
+    let recovered = sessions
+        .submission_queue_status(session.id)
+        .await
+        .unwrap()
+        .oldest
+        .unwrap();
+    assert_eq!(recovered.receipt, later.receipt);
+    assert_eq!(recovered.submission, later.submission);
+    assert_eq!(recovered.status, SubmissionStatus::Pending);
+}
+
+#[tokio::test]
+async fn interrupted_recovery_refuses_workflow_and_unrelated_work_without_mutation() {
+    for workflow in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent(directory.path().join("sessions")).unwrap();
+        let session = sessions
+            .create_session(None, directory.path().to_owned())
+            .await
+            .unwrap();
+        let state = Arc::new(crate::tests::test_server_state_with_fake_provider(sessions));
+        let first = pending(&state, session.id, "fenced", workflow).await;
+        state
+            .sessions
+            .activate_submission(session.id, first.receipt.submission_id)
+            .await
+            .unwrap();
+        state
+            .sessions
+            .append_event(
+                session.id,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: bcode_session_models::WorkId::new("unrelated"),
+                    kind: bcode_session_models::RuntimeWorkKind::ModelTurn,
+                    label: "unrelated work".into(),
+                    parent_work_id: None,
+                    started_at_ms: Some(1),
+                    cancellable: true,
+                    tool_call_id: None,
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                },
+            )
+            .await
+            .unwrap();
+        let generation = state
+            .sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap();
+        let result = crate::submission_recovery::end_interrupted_turn(
+            &state,
+            session.id,
+            &first.submission.target.turn_id().0,
+        )
+        .await;
+        if workflow {
+            assert!(!result.unwrap());
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(
+            state
+                .sessions
+                .current_session_generation(session.id)
+                .await
+                .unwrap(),
+            generation
+        );
+    }
+}
+
+#[tokio::test]
+async fn interrupted_recovery_refuses_live_execution_and_incomplete_invocation_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let sessions = SessionManager::persistent(directory.path().join("sessions")).unwrap();
+    let session = sessions
+        .create_session(None, directory.path().to_owned())
+        .await
+        .unwrap();
+    let state = Arc::new(crate::tests::test_server_state_with_fake_provider(sessions));
+    let first = pending(&state, session.id, "not-safe", false).await;
+    state
+        .sessions
+        .activate_submission(session.id, first.receipt.submission_id)
+        .await
+        .unwrap();
+    let turn_id = first.submission.target.turn_id().0.clone();
+    let runtime = live_submission_runtime(&state, session.id).await;
+    *runtime.phase.lock().await = crate::SessionRuntimePhase::PreparingModelRequest;
+    let generation = state
+        .sessions
+        .current_session_generation(session.id)
+        .await
+        .unwrap();
+    assert!(
+        crate::submission_recovery::end_interrupted_turn(&state, session.id, &turn_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap(),
+        generation
+    );
+    *runtime.phase.lock().await = crate::SessionRuntimePhase::Idle;
+    state
+        .sessions
+        .append_event(
+            session.id,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "unattributed".into(),
+                tool_name: "example.write".into(),
+                arguments_json: "{}".into(),
+                producer_plugin_id: None,
+                working_directory: None,
+            },
+        )
+        .await
+        .unwrap();
+    let generation = state
+        .sessions
+        .current_session_generation(session.id)
+        .await
+        .unwrap();
+    assert!(
+        crate::submission_recovery::end_interrupted_turn(&state, session.id, &turn_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap(),
+        generation
+    );
+    // Recovery appends cannot silently rebase across unrelated canonical changes.
+    assert!(
+        state
+            .sessions
+            .append_event_at_generation(
+                session.id,
+                SessionEventKind::SystemMessage {
+                    text: "must not append".into()
+                },
+                generation - 1
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap(),
+        generation
+    );
+    state.request_shutdown();
+}
+
+#[tokio::test]
+async fn interrupted_recovery_work_is_bounded_and_overflow_does_not_mutate() {
+    let directory = tempfile::tempdir().unwrap();
+    let sessions = SessionManager::persistent(directory.path().join("sessions")).unwrap();
+    let session = sessions
+        .create_session(None, directory.path().to_owned())
+        .await
+        .unwrap();
+    let state = Arc::new(crate::tests::test_server_state_with_fake_provider(sessions));
+    let first = pending(&state, session.id, "overflow", false).await;
+    state
+        .sessions
+        .activate_submission(session.id, first.receipt.submission_id)
+        .await
+        .unwrap();
+    let turn_id = first.submission.target.turn_id().0.clone();
+    for index in 0..140 {
+        state
+            .sessions
+            .append_event(
+                session.id,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id: turn_id.clone(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(index),
+                    tool_call_id: format!("call-{index}"),
+                    producer_plugin_id: Some("example".into()),
+                    tool_name: "example.write".into(),
+                    arguments_json: "{}".into(),
+                    working_directory: Some(directory.path().to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        state
+            .sessions
+            .interrupted_recovery_work(session.id)
+            .await
+            .unwrap()
+            .tools
+            .len(),
+        129
+    );
+    let generation = state
+        .sessions
+        .current_session_generation(session.id)
+        .await
+        .unwrap();
+    assert!(
+        crate::submission_recovery::end_interrupted_turn(&state, session.id, &turn_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap(),
+        generation
+    );
+}
+
 #[tokio::test]
 async fn activated_crash_is_a_blocker_not_permission_to_replay_or_run_later_input() {
     let directory = tempfile::tempdir().unwrap();

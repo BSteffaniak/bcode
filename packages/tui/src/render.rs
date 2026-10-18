@@ -5613,7 +5613,9 @@ fn queue_status_text(app: &BmuxApp) -> Option<String> {
         return Some("Queued message status unavailable. Retrying bounded status reads; reconnect to retry if it remains unavailable.".to_owned());
     }
     let recovery = app.session_view_snapshot().runtime.queue_recovery()?;
-    let controls = if recovery.can_resume {
+    let controls = if recovery.interrupted_turn_id.is_some() {
+        "\n/queue-end-interrupted: end this turn without replaying tools (prior effects remain)"
+    } else if recovery.can_resume {
         "\n/queue-resume: review settings · /queue-cancel: cancel this item"
     } else if recovery.can_cancel {
         "\n/queue-cancel: cancel this item"
@@ -5631,7 +5633,9 @@ use bcode_tui_components::chrome::ChromeLine;
 fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = theme.muted;
     if let Some(recovery) = app.session_view_snapshot().runtime.queue_recovery() {
-        let controls = if recovery.can_resume {
+        let controls = if recovery.interrupted_turn_id.is_some() {
+            " /queue-end-interrupted"
+        } else if recovery.can_resume {
             " /queue-resume · /queue-cancel"
         } else if recovery.can_cancel {
             " /queue-cancel"

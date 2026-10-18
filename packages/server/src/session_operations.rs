@@ -1219,6 +1219,11 @@ pub async fn cancel_turn(
     client_id: bcode_session_models::ClientId,
     expected_turn_id: Option<String>,
 ) -> Result<bool, super::ServerError> {
+    if let Some(turn_id) = expected_turn_id.as_deref()
+        && super::submission_recovery::end_interrupted_turn(state, session_id, turn_id).await?
+    {
+        return Ok(true);
+    }
     super::enqueue_targeted_cancel_turn_command(
         state,
         session_id,

@@ -1685,6 +1685,15 @@ impl SessionDb {
         self.tool_runs_by_status("running").await
     }
 
+    /// Read a bounded active-tool page for explicit recovery.
+    ///
+    /// # Errors
+    /// Returns projection query or decoding errors.
+    pub async fn active_tool_runs_bounded(&self, limit: usize) -> SessionDbResult<Vec<ToolRun>> {
+        self.tool_runs_by_status_bounded("running", Some(limit))
+            .await
+    }
+
     /// Return all tool-run projection rows for `tool_call_id`.
     ///
     /// # Errors
@@ -1717,7 +1726,15 @@ impl SessionDb {
     ///
     /// Returns an error if the projection query fails or a row is malformed.
     pub async fn tool_runs_by_status(&self, status: &str) -> SessionDbResult<Vec<ToolRun>> {
-        let rows = self
+        self.tool_runs_by_status_bounded(status, None).await
+    }
+
+    async fn tool_runs_by_status_bounded(
+        &self,
+        status: &str,
+        limit: Option<usize>,
+    ) -> SessionDbResult<Vec<ToolRun>> {
+        let mut query = self
             .db
             .select("tool_runs")
             .columns(&[
@@ -1732,9 +1749,11 @@ impl SessionDb {
                 "is_error",
             ])
             .where_eq("status", status)
-            .sort("event_seq_start", SortDirection::Asc)
-            .execute(&**self.db)
-            .await?;
+            .sort("event_seq_start", SortDirection::Asc);
+        if let Some(limit) = limit {
+            query = query.limit(limit);
+        }
+        let rows = query.execute(&**self.db).await?;
         rows.iter().map(tool_run_from_row).collect()
     }
 
@@ -1744,7 +1763,18 @@ impl SessionDb {
     ///
     /// Returns an error if the projection query fails or a row is malformed.
     pub async fn active_runtime_work(&self) -> SessionDbResult<Vec<RuntimeWorkProjection>> {
-        let rows = self
+        self.active_runtime_work_bounded(None).await
+    }
+
+    /// Read an optionally bounded active-work page without changing its projection.
+    ///
+    /// # Errors
+    /// Returns projection query or decoding errors.
+    pub async fn active_runtime_work_bounded(
+        &self,
+        limit: Option<usize>,
+    ) -> SessionDbResult<Vec<RuntimeWorkProjection>> {
+        let mut query = self
             .db
             .select("runtime_work")
             .columns(&[
@@ -1770,9 +1800,11 @@ impl SessionDb {
                 .map(|status| DatabaseValue::String(runtime_work_status_name(status).to_owned()))
                 .to_vec(),
             )
-            .sort("event_seq_start", SortDirection::Asc)
-            .execute(&**self.db)
-            .await?;
+            .sort("event_seq_start", SortDirection::Asc);
+        if let Some(limit) = limit {
+            query = query.limit(limit);
+        }
+        let rows = query.execute(&**self.db).await?;
         rows.iter().map(runtime_work_from_row).collect()
     }
 

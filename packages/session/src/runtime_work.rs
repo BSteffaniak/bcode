@@ -5,6 +5,14 @@ use bcode_session_models::{
     ClientId, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionId, WorkId,
 };
 
+/// Bounded current-format work inspected for explicit interrupted-turn recovery.
+pub struct InterruptedRecoveryWork {
+    /// Active invocation projections, including one overflow sentinel.
+    pub tools: Vec<db::ToolRun>,
+    /// Active execution projections, including one overflow sentinel.
+    pub work: Vec<db::RuntimeWorkProjection>,
+}
+
 impl SessionManager {
     /// Return active runtime-work rows through the session actor's DB connection.
     ///
@@ -24,6 +32,22 @@ impl SessionManager {
         let result = handle.active_runtime_work().await;
         phase.finish_result(&result);
         result
+    }
+
+    /// Read bounded, freshness-checked work for explicit interrupted-turn recovery.
+    /// More than 128 tools or 256 work records is returned as an overflow sentinel;
+    /// callers must reject overflow rather than treat the page as complete.
+    ///
+    /// # Errors
+    /// Returns missing durable projections, ownership, or storage errors.
+    pub async fn interrupted_recovery_work(
+        &self,
+        session_id: SessionId,
+    ) -> Result<InterruptedRecoveryWork, SessionError> {
+        self.session_handle(session_id)
+            .await?
+            .interrupted_recovery_work()
+            .await
     }
 
     /// Probe active work without sleeping on database-open contention.
