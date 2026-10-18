@@ -31,6 +31,8 @@ pub enum SlashCommandOutcome {
     },
     /// Open timeline message browser.
     OpenTimeline,
+    /// Refresh pending permissions and open the existing review dialog.
+    ReviewPermissions,
     /// Switch to a new unpersisted draft session.
     NewDraftSession,
     /// Set the draft session agent locally.
@@ -827,6 +829,7 @@ async fn execute_builtin(
         BuiltinCommandId::Sessions => Ok(SlashCommandOutcome::PickSession),
         BuiltinCommandId::Monitor => Ok(SlashCommandOutcome::OpenChildMonitor),
         BuiltinCommandId::Search => Ok(SlashCommandOutcome::SearchSessions),
+        BuiltinCommandId::Permissions => Ok(SlashCommandOutcome::ReviewPermissions),
         BuiltinCommandId::Resync => resync_command(client, parts).await,
         BuiltinCommandId::RescanImports => client.refresh_session_catalog(None).await.map(|list| {
             SlashCommandOutcome::Handled(format!(
@@ -1038,6 +1041,30 @@ mod tests {
         assert_eq!(
             format_unix_timestamp_utc(1_735_689_600),
             "2025-01-01T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissions_builtin_routes_to_existing_review() {
+        let outcome = execute_builtin(
+            &BcodeClient::default_endpoint(),
+            Some(SessionId::new()),
+            SlashExecutionContext {
+                working_directory: std::path::Path::new("."),
+                current_agent_id: "build",
+                reasoning_display_mode: bcode_config::TuiThinkingMode::All,
+                reasoning_visible: true,
+            },
+            "/permissions",
+            &["/permissions"],
+            slash_registry::BuiltinCommandId::Permissions,
+        )
+        .await
+        .expect("local permission review command");
+        assert_eq!(outcome, SlashCommandOutcome::ReviewPermissions);
+        assert_eq!(
+            slash_registry::builtin_command("permissions").unwrap().id(),
+            slash_registry::BuiltinCommandId::Permissions
         );
     }
 

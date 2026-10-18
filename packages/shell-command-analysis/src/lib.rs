@@ -390,6 +390,7 @@ impl<'a> Adapter<'a> {
     ) -> Result<(), ShellAnalysisError> {
         let Some(executable) = &command.word_or_name else {
             self.simple_items(command, None, depth)?;
+            self.command_item_substitutions(command, None, context, depth)?;
             return Ok(());
         };
         if self.commands.len() >= self.request.limits.max_commands as usize {
@@ -475,11 +476,33 @@ impl<'a> Adapter<'a> {
         });
         self.redirections.extend(redirects);
         self.word_substitutions(executable, Some(id), context, depth)?;
-        if let Some(suffix) = &command.suffix {
-            for item in &suffix.0 {
-                if let ast::CommandPrefixOrSuffixItem::Word(word) = item {
-                    self.word_substitutions(word, Some(id), context, depth)?;
+        self.command_item_substitutions(command, Some(id), context, depth)?;
+        Ok(())
+    }
+
+    fn command_item_substitutions(
+        &mut self,
+        command: &ast::SimpleCommand,
+        id: Option<ShellCommandId>,
+        context: WalkContext,
+        depth: u16,
+    ) -> Result<(), ShellAnalysisError> {
+        for item in command
+            .prefix
+            .iter()
+            .flat_map(|prefix| &prefix.0)
+            .chain(command.suffix.iter().flat_map(|suffix| &suffix.0))
+        {
+            match item {
+                ast::CommandPrefixOrSuffixItem::Word(word) => {
+                    self.word_substitutions(word, id, context, depth)?;
                 }
+                ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) => {
+                    if let ast::AssignmentValue::Scalar(word) = &assignment.value {
+                        self.word_substitutions(word, id, context, depth)?;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())

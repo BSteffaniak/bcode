@@ -46,19 +46,16 @@ async fn append_permission_requested_event(
     state: &ServerState,
     session_id: SessionId,
     request: bcode_session_models::SessionEventKind,
-) -> bool {
+) -> Option<bcode_session_models::SessionEvent> {
     match state
         .sessions
         .append_permission_requested(session_id, request)
         .await
     {
-        Ok(event) => {
-            publish_session_event(state, &event).await;
-            true
-        }
+        Ok(event) => Some(event),
         Err(error) => {
             tracing::warn!("failed to append permission request: {error}");
-            false
+            None
         }
     }
 }
@@ -263,16 +260,19 @@ pub async fn register_pending_permission(
         .session_current_turn(pending.summary.session_id)
         .await
         .and_then(|turn| turn.interaction_route);
-    if !append_permission_requested_event(state, pending.summary.session_id, event).await {
+    // Canonical append notifies subscribers. Fence immediate list/resolve calls until
+    // persistence and registration complete, without exposing an unpersisted request.
+    let mut permissions = state.pending_permissions.lock().await;
+    let Some(event) =
+        append_permission_requested_event(state, pending.summary.session_id, event).await
+    else {
         return Err(false);
-    }
-    state
-        .pending_permissions
-        .lock()
-        .await
-        .insert(pending.summary.permission_id.clone(), routed.clone());
-    notify_interaction_destination(state, &routed.summary).await;
+    };
+    permissions.insert(pending.summary.permission_id.clone(), routed.clone());
+    drop(permissions);
     drop(batch_decision);
+    publish_session_event(state, &event).await;
+    notify_interaction_destination(state, &routed.summary).await;
     Ok(())
 }
 

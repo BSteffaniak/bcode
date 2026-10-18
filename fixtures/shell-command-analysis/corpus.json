@@ -99,8 +99,8 @@
       "classification": "canonicalization_defect",
       "source": "GIT_PAGER=cat git show --stat HEAD",
       "policy": {"rules": [{"pattern": "git show *", "action": "allow"}, {"pattern": "git *", "action": "deny"}], "default_action": "deny"},
-      "expected": {"commands": ["GIT_PAGER=cat git show --stat HEAD"], "executables": ["git"], "assignments": ["GIT_PAGER=cat"], "redirections": [], "completeness": "complete", "policy": "deny"},
-      "notes": "Assignment-prefixed commands receive no aliases in the initial implementation; parsing identifies git correctly, but authorization remains conservative."
+      "expected": {"commands": ["GIT_PAGER=cat git show --stat HEAD"], "executables": ["git"], "assignments": ["GIT_PAGER=cat"], "redirections": [], "completeness": "complete", "policy": "allow"},
+      "notes": "Environment assignments remain facts; ordinary command rules match the effective git command without an implicit permission change."
     },
     {
       "id": "missing-printf-policy",
@@ -121,7 +121,8 @@
       "classification": "parser_boundary_defect",
       "source": "for item in a b; do printf '%s\\n' \"$item\"; done",
       "policy": {"rules": [{"pattern": "printf *", "action": "allow"}], "default_action": "deny"},
-      "expected": {"commands": ["printf '%s\\n' \"$item\""], "redirections": [], "completeness": "complete", "policy": "allow"}
+      "expected": {"commands": ["printf '%s\\n' \"$item\""], "redirections": [], "completeness": "complete", "policy": "ask"},
+      "notes": "The loop body is parsed, but its dynamic argument retains conservative approval rather than becoming a static allow."
     },
     {
       "id": "if-condition-and-body",

@@ -5,6 +5,7 @@
 //! Pi/OpenCode-style agent policy parsing and evaluation.
 
 mod compiled_commands;
+mod environment;
 mod word_patterns;
 
 use compiled_commands::CompiledCommandLayer;
@@ -404,15 +405,14 @@ struct ShellSubjectDecision {
 }
 
 fn shell_subject_can_allow(subject: &bcode_shell_command_analysis_models::ShellCommand) -> bool {
-    subject.assignments.is_empty()
-        && std::iter::once(&subject.executable)
-            .chain(&subject.arguments)
-            .all(|word| {
-                matches!(
-                    word,
-                    bcode_shell_command_analysis_models::ShellWord::Static { .. }
-                )
-            })
+    std::iter::once(&subject.executable)
+        .chain(&subject.arguments)
+        .all(|word| {
+            matches!(
+                word,
+                bcode_shell_command_analysis_models::ShellWord::Static { .. }
+            )
+        })
 }
 
 fn evaluate_ordered_subject(
@@ -420,8 +420,7 @@ fn evaluate_ordered_subject(
     subject: &bcode_shell_command_analysis_models::ShellCommand,
 ) -> ShellSubjectDecision {
     let mut winner: Option<(Rule, (usize, bool, usize))> = None;
-    // Assignment-bearing commands retain deny matching through the grammar API;
-    // legacy allows cannot erase those denies by ignoring environment prefixes.
+    // Environment assignments are retained as facts; all layers match the effective command.
     for (layer_index, layer) in layers.iter().enumerate() {
         let candidates: BTreeSet<_> = subject
             .match_candidates
@@ -436,14 +435,12 @@ fn evaluate_ordered_subject(
         let legacy = candidates
             .into_iter()
             .map(|index| (index, &layer.legacy[index]))
-            .filter(|(_, rule)| subject.assignments.is_empty() || rule.action != Action::Allow)
             .map(|(index, rule)| (rule.clone(), (layer_index, false, index)));
         let word = layer
             .words
             .matching(subject)
             .into_iter()
             .chain(layer.words.uncertain_deny(subject))
-            .filter(|rule| subject.assignments.is_empty() || rule.action != Action::Allow)
             .map(|rule| {
                 (
                     Rule {
@@ -491,7 +488,7 @@ fn evaluate_ordered_subject(
 
 fn preview_command_matches(
     layers: &[CompiledCommandLayer],
-    ordered: bool,
+    _ordered: bool,
     subject: &bcode_shell_command_analysis_models::ShellCommand,
     subject_index: usize,
     locator: Option<(usize, bool, usize)>,
@@ -510,9 +507,6 @@ fn preview_command_matches(
             .collect();
         for rule_index in candidates {
             let rule = &layer.legacy[rule_index];
-            if ordered && !subject.assignments.is_empty() && rule.action == Action::Allow {
-                continue;
-            }
             matches.push(bcode_agent_profile::PreviewCommandMatch {
                 subject_index,
                 layer_index,
@@ -591,7 +585,12 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
     let ordered_layers = compiled.ordered.then_some(compiled.layers.as_slice());
     let word_rules = &compiled.layers[0].words;
     let mut results = Vec::new();
-    for subject in &analysis.commands {
+    for original in &analysis.commands {
+        let subject = match environment::effective_command(original) {
+            Ok(subject) => subject,
+            Err(reason) => return shell_fact_denied(request, reason),
+        };
+        let subject = subject.as_ref();
         if subject.match_candidates.is_empty() {
             return shell_fact_denied(request, "shell command has no policy match candidate");
         }
@@ -724,11 +723,13 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         .iter()
         .zip(&results)
         .enumerate()
-        .flat_map(|(index, (subject, result))| {
+        .flat_map(|(index, (original, result))| {
+            let subject = environment::effective_command(original)
+                .expect("effective command was validated during evaluation");
             preview_command_matches(
                 diagnostic_layers,
                 ordered_layers.is_some(),
-                subject,
+                &subject,
                 index,
                 result.locator,
             )
@@ -1165,9 +1166,9 @@ mod tests {
     }
 
     #[test]
-    fn ordered_dynamic_and_assignment_allows_remain_conservative() {
+    fn ordered_dynamic_commands_remain_conservative_and_assignments_are_transparent() {
         let config = ordered_config(vec![layer(&[("*", Action::Allow)], &[])]);
-        for source in ["$EXEC status", "git $ARGS", "NAME=value git status"] {
+        for source in ["$EXEC status", "git $ARGS"] {
             assert_ne!(decision(&config, source), AgentDecision::Allow, "{source}");
         }
         let config = ordered_config(vec![layer(
@@ -1184,9 +1185,96 @@ mod tests {
         ]);
         assert_eq!(
             decision(&config, "NAME=value git status"),
-            AgentDecision::Deny
+            AgentDecision::Allow
         );
         assert_eq!(decision(&config, "git status"), AgentDecision::Allow);
+    }
+
+    #[test]
+    fn environment_prefixes_preserve_all_command_actions_and_preview() {
+        for action in [Action::Allow, Action::Ask, Action::Deny] {
+            let configs = [
+                AgentConfig {
+                    permission: PermissionConfig {
+                        command: BTreeMap::from([
+                            ("*".to_owned(), Action::Deny),
+                            ("git status".to_owned(), action),
+                        ]),
+                        ..PermissionConfig::default()
+                    },
+                    ..AgentConfig::default()
+                },
+                ordered_config(vec![
+                    layer(&[("*", Action::Deny)], &[]),
+                    layer(&[], &[("git status", action)]),
+                ]),
+            ];
+            for config in configs {
+                for source in [
+                    "git status",
+                    "MODE=test git status",
+                    "MODE=$VALUE git status",
+                    "A=1 B=2 git 'status'",
+                    "env MODE=test git status",
+                    "env MODE=$VALUE git status",
+                    "env 'MODE=test value' git status",
+                    "/usr/bin/env -i MODE=test git status",
+                    "env -u MODE -- git status",
+                    "env --unset=MODE git status",
+                    "env env MODE=test git status",
+                ] {
+                    let request = request(BUILD_AGENT, source);
+                    let result = evaluate_tool_call(&config, &request, Path::new("/tmp"));
+                    assert_eq!(result.response.decision, agent_decision(action), "{source}");
+                    let preview = preview_tool_call(&config, &request, Path::new("/tmp"));
+                    assert_eq!(preview.decision, result.response.decision, "{source}");
+                    assert!(
+                        preview
+                            .matches
+                            .iter()
+                            .any(|rule| rule.winning && rule.decision == agent_decision(action)),
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_environment_globs_and_nested_execution_remain_enforced() {
+        let config = AgentConfig {
+            permission: PermissionConfig {
+                command: BTreeMap::from([
+                    ("*".to_owned(), Action::Allow),
+                    ("MODE=restricted *".to_owned(), Action::Deny),
+                    ("env MODE=review *".to_owned(), Action::Ask),
+                    ("dangerous".to_owned(), Action::Deny),
+                ]),
+                ..PermissionConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            decision(&config, "MODE=restricted git status"),
+            AgentDecision::Deny
+        );
+        assert_eq!(
+            decision(&config, "env MODE=review git status"),
+            AgentDecision::Ask
+        );
+        for source in [
+            "MODE=$(dangerous) git status",
+            "MODE=$(dangerous); git status",
+            "env MODE=$(dangerous) git status",
+            "MODE=`dangerous` git status",
+            "env MODE=x dangerous",
+            "MODE=x git status; dangerous",
+            "env -S 'dangerous'",
+            "env MODE=x eval dangerous",
+            "env MODE=x source script",
+        ] {
+            assert_eq!(decision(&config, source), AgentDecision::Deny, "{source}");
+        }
     }
 
     #[test]
@@ -1659,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn word_patterns_do_not_match_dynamic_arguments_or_assignments() {
+    fn word_patterns_do_not_match_dynamic_arguments() {
         let config = AgentConfig {
             accent: None,
             tools: BTreeMap::new(),
@@ -1669,7 +1757,11 @@ mod tests {
                 ..PermissionConfig::default()
             },
         };
-        for source in ["printf \"$VALUE\"", "X=1 printf literal"] {
+        for source in [
+            "printf \"$VALUE\"",
+            "printf $VALUE",
+            "X=1 printf \"$VALUE\"",
+        ] {
             assert_eq!(
                 evaluate_tool_call(
                     &config,

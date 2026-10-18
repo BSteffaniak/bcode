@@ -72517,6 +72517,114 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn permission_is_listable_at_canonical_notification_before_plugin_publication() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let session_id = state
+            .sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let mut subscription = state
+            .sessions
+            .subscribe_session_events(session_id)
+            .await
+            .unwrap();
+        let mut pending =
+            pending_permission_for_batch("visible-before-publish", session_id, 0, "unused");
+        pending.summary.batch = None;
+        // Freeze plugin publication deterministically. Canonical append already wakes clients.
+        {
+            let publication = state.activity_observations.lock().await;
+            let registration = interaction_operations::register_pending_permission(
+                &state,
+                &pending,
+                SessionEventKind::PermissionRequested {
+                    permission_id: pending.summary.permission_id.clone(),
+                    tool_call_id: pending.summary.tool_call_id.clone(),
+                    producer_plugin_id: None,
+                    tool_name: pending.summary.tool_name.clone(),
+                    arguments_json: "{}".to_owned(),
+                    batch: None,
+                    policy_source: None,
+                    policy_reason: None,
+                },
+            );
+            tokio::pin!(registration);
+            let immediate_fetch = async {
+                let event = subscription.events.recv().await.unwrap();
+                assert!(matches!(
+                    event.kind,
+                    SessionEventKind::PermissionRequested { .. }
+                ));
+                let listed = interaction_operations::list_permissions(&state).await;
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0].permission_id, "visible-before-publish");
+            };
+            tokio::select! {
+                result = &mut registration => panic!("publication should be blocked: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(5), immediate_fetch) => result.unwrap(),
+            }
+            drop(publication);
+            registration.await.unwrap();
+        }
+        assert!(
+            interaction_operations::resolve_permission(
+                &state,
+                "visible-before-publish",
+                false,
+                false
+            )
+            .await
+        );
+        assert!(
+            interaction_operations::list_permissions(&state)
+                .await
+                .is_empty()
+        );
+        assert!(
+            !interaction_operations::resolve_permission(
+                &state,
+                "visible-before-publish",
+                true,
+                false
+            )
+            .await
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn failed_permission_persistence_never_exposes_pending_request() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let mut pending =
+            pending_permission_for_batch("missing-session", SessionId::new(), 0, "unused");
+        pending.summary.batch = None;
+        let result = interaction_operations::register_pending_permission(
+            &state,
+            &pending,
+            SessionEventKind::PermissionRequested {
+                permission_id: pending.summary.permission_id.clone(),
+                tool_call_id: pending.summary.tool_call_id.clone(),
+                producer_plugin_id: None,
+                tool_name: pending.summary.tool_name.clone(),
+                arguments_json: "{}".to_owned(),
+                batch: None,
+                policy_source: None,
+                policy_reason: None,
+            },
+        )
+        .await;
+        assert_eq!(result, Err(false));
+        assert!(
+            interaction_operations::list_permissions(&state)
+                .await
+                .is_empty()
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn interaction_operations_batch_permission_resolution_is_latched_and_batch_scoped() {
         let state = test_server_state(SessionManager::default());
         let session_id = state

@@ -86,6 +86,22 @@ These rules apply only to the generic mutating-operation fallback; they do not o
 filesystem, shell, or web operation rules or disabled tools. Declarative and runtime-state
 overlays retain their usual precedence. Unlisted mutating tools still ask by default.
 
+## Reviewing pending requests
+
+The TUI's `/permissions` command refreshes requests addressed to the viewed session and opens the normal approval/denial dialog. Requests are also available through the supported application CLI:
+
+```sh
+bcode permission list --session-id SESSION_ID --json
+bcode permission approve PERMISSION_ID
+bcode permission deny PERMISSION_ID
+bcode permission resolve-batch BATCH_ID --approve
+bcode permission resolve-batch BATCH_ID --deny
+```
+
+Use the matching executable, state root, and configuration context for the serving daemon. Approval resumes pending work; denial refuses it. `approve --remember` is supported only when the request advertises remember capability.
+
+Permission registration fences list/resolve calls across canonical persistence and pending-map insertion. Canonical append may wake subscribers, but their fetch cannot return until registration completes. Failed persistence never exposes an approvable request. Plugin publication and routed invalidations happen after registration and outside the queue lock; notifications are invalidations, not execution authority. Refresh reconciles resolved dialogs, and fetch failures remain visible rather than silently leaving the UI waiting.
+
 ## Actions
 
 * `allow` — run the tool immediately. No prompt.
@@ -110,6 +126,10 @@ Path globs use the same syntax as ripgrep (`globset`): `**` matches any number o
 ### Shell command analysis
 
 On Unix, `shell.run` is analyzed as one complete POSIX/`sh` program before authorization. Quotes, escapes, heredoc bodies, assignment prefixes, pipelines, lists, newlines, background execution, groups, loops, conditionals, subshells, and command substitutions are interpreted as shell syntax rather than split as plain text. Every executable leaf is evaluated independently, including leaves nested in control flow and substitutions. The aggregate decision is `deny > ask > allow`, so an allowed preamble or sibling can never hide a denied command.
+
+Environment assignment prefixes do not independently change a command's permission. `MODE=test git status` and `env MODE=test git status` match ordinary rules for `git status`, preserving allow, ask, and deny. The original source and parsed assignments remain available: explicit legacy globs such as `MODE=restricted *` or `env MODE=restricted *` still participate in normal rule precedence. Structured argument patterns match effective executable/argv values, not environment assignments. No new environment-specific schema is implied.
+
+The recognized `env`, `/usr/bin/env`, and `/bin/env` forms support static assignments, `-i`/`--ignore-environment`, `-u NAME`/`--unset NAME`/`--unset=NAME`, and `--`. Unsupported options (including split-string execution) and unresolved dynamic `env` argv fail closed instead of hiding a utility behind the wrapper. `env` without a utility remains an environment-printing command. Dynamic executable/argument protections and redirection checks remain unchanged; substitutions in assignment values are evaluated as separate executable leaves. Variables such as `PATH`, loader options, and application configuration can alter behavior; restricting them requires explicit policy rather than an implicit ask for every assignment.
 
 Input redirections with static paths are evaluated through `read` rules. Output, append, and read/write redirections with static paths are evaluated through `write` rules. Dynamic redirection targets fail closed. Heredoc bodies are data and are never reinterpreted as shell commands.
 
@@ -138,7 +158,7 @@ Separate option/value pairs are explicit sequences: `-C <arg>` consumes both wor
 
 `<options>*` deliberately explores generic ambiguous interpretations. Each dash-led value other than lone `-` or `--` can be an option; an option without `=` may additionally consume one following non-dash-led argument (or lone `-`) as its value. Clusters, negative numbers, and attached values are simply option-looking values; inline `=value` stays in one word. A consumed `--` ends that options segment. Any complete matching interpretation counts; this **static, explicitly selected grammar ambiguity does not itself require approval**. No CLI-specific option semantics are inferred: false positives remain possible, including command-looking option values. Use precise pairs or ordered exceptions when necessary. Dynamic shell expansion is different and cannot become an automatic allow through this ambiguity.
 
-Pattern bytes, grammar size, regex compilation, argv size, and matching work are bounded. Invalid patterns fail closed rather than becoming legacy globs. Assignment prefixes do not suppress structured denies; they do not make structured allows trustworthy. `env`, `command`, aliases, executable paths, scripts, and subprocesses are not transparently normalized. A matcher is not a sandbox.
+Pattern bytes, grammar size, regex compilation, argv size, and matching work are bounded. Invalid patterns fail closed rather than becoming legacy globs. Assignment prefixes preserve ordinary command matching. Only the documented `env` forms are normalized; `command`, aliases, arbitrary executable paths, scripts, and subprocesses are not transparently normalized. A matcher is not a sandbox.
 
 #### Opt-in ordered command policy
 
@@ -191,7 +211,7 @@ For Nix-generated configurations, keep ordered lists and advanced strings intact
 
 Bcode retains the exact original command subject and may add narrowly reviewed aliases. Alias candidates participate in normal specificity matching and cannot erase a more specific restrictive match against the original subject.
 
-The initial Git aliases remove only reviewed behavior-neutral global options before a subcommand: `--no-pager`, `--no-replace-objects`, `--literal-pathspecs`, `--no-optional-locks`, and explicit `--color=...`. Bcode does not remove behavior-changing options such as `-C`, `-c`, `--config-env`, `--git-dir`, `--work-tree`, `--exec-path`, or `--namespace`. Assignment-prefixed commands currently receive no alias, including `PATH=...`, pager, and color assignments.
+The initial Git aliases remove only reviewed behavior-neutral global options before a subcommand: `--no-pager`, `--no-replace-objects`, `--literal-pathspecs`, `--no-optional-locks`, and explicit `--color=...`. Bcode does not remove behavior-changing options such as `-C`, `-c`, `--config-env`, `--git-dir`, `--work-tree`, `--exec-path`, or `--namespace`. Assignment-prefixed commands use the effective command matching described above; this does not add Git-specific option stripping.
 
 Rules that allow command runners or arbitrary execution remain powerful even when parsing is correct. Review broad rules for `python -c *`, `python3 -c *`, `cargo run *`, `go run *`, `find *`, `xargs *`, `curl *`, and `timeout *` carefully: each can execute arbitrary or mutating behavior. Bcode does not add implicit code-level allows for missing entries such as `printf *` or `command -v *`.
 

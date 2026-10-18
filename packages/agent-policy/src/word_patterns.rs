@@ -482,10 +482,7 @@ impl WordRules {
             .collect::<Vec<_>>();
         self.candidates(command)
             .map(|(_, rule)| rule)
-            .filter(|rule| {
-                (command.assignments.is_empty() || rule.action == Action::Deny)
-                    && matches(rule, &words, false)
-            })
+            .filter(|rule| matches(rule, &words, false))
             .max_by(|lhs, rhs| rank(lhs, rhs))
     }
 
@@ -571,15 +568,12 @@ pub fn matching<'a>(rules: &'a [WordRule], command: &ShellCommand) -> Option<&'a
         .collect::<Vec<_>>();
     rules
         .iter()
-        .filter(|rule| {
-            (command.assignments.is_empty() || rule.action == Action::Deny)
-                && matches(rule, &words, false)
-        })
+        .filter(|rule| matches(rule, &words, false))
         .max_by(|lhs, rhs| rank(lhs, rhs))
 }
 
-/// A deny that may apply once dynamically expanded words are known. Assignment
-/// prefixes never suppress denies and never grant allows through `matching`.
+/// A deny that may apply once dynamically expanded argument words are known.
+/// Environment assignments do not suppress command matching.
 pub fn uncertain_deny<'a>(rules: &'a [WordRule], command: &ShellCommand) -> Option<&'a WordRule> {
     let words = std::iter::once(&command.executable)
         .chain(&command.arguments)
@@ -949,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn assignments_never_grant_allows_but_keep_denies() {
+    fn assignments_preserve_command_matching() {
         for source in ["X=1 cmd dangerous", "X=$unknown cmd dangerous"] {
             let command = command(source);
             let rules = compile(&BTreeMap::from([
@@ -958,7 +952,10 @@ mod tests {
             ]))
             .unwrap();
             assert_eq!(matching(&rules, &command).unwrap().action, Action::Deny);
-            assert!(matching(&rules[..1], &command).is_none());
+            assert_eq!(
+                matching(&rules[..1], &command).unwrap().action,
+                Action::Allow
+            );
         }
     }
 

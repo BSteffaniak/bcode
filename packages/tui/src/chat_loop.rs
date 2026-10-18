@@ -4411,6 +4411,24 @@ fn permission_summary_view(
     }
 }
 
+fn reconcile_permission_dialog(
+    dialog: &mut Option<PermissionDialogState>,
+    permissions: Vec<bcode_session_view_models::PermissionView>,
+) {
+    if dialog.as_ref().is_some_and(|dialog| {
+        !permissions
+            .iter()
+            .any(|permission| permission.permission_id == dialog.permission_id())
+    }) {
+        *dialog = None;
+    }
+    if dialog.is_none()
+        && let Some(permission) = permissions.into_iter().next()
+    {
+        *dialog = Some(PermissionDialogState::new(permission));
+    }
+}
+
 fn apply_permission_list_result(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
@@ -4429,13 +4447,16 @@ fn apply_permission_list_result(
                 .collect::<Vec<_>>();
             chat.app
                 .set_pending_permission_views(active_permissions.clone());
-            if loop_state.permission_dialog.is_none()
-                && let Some(permission) = active_permissions.into_iter().next()
-            {
-                loop_state.permission_dialog = Some(PermissionDialogState::new(permission));
+            if chat.app.status() == "Refreshing pending permissions…" {
+                chat.app.set_status(if active_permissions.is_empty() {
+                    "No pending permissions for this session".to_owned()
+                } else {
+                    format!("{} pending permission(s)", active_permissions.len())
+                });
             }
+            reconcile_permission_dialog(&mut loop_state.permission_dialog, active_permissions);
         }
-        Err(_error) => {}
+        Err(error) => report_nonfatal_client_error(chat, "Pending permissions unavailable", &error),
     }
 }
 
@@ -4638,6 +4659,11 @@ fn apply_root_slash_command_outcome(
                 .app
                 .set_status(format!("host slash route pending root navigation: {route}")),
         },
+        SlashCommandOutcome::ReviewPermissions => {
+            chat.replace_effect(TuiEffect::ListPermissions);
+            chat.app
+                .set_status("Refreshing pending permissions…".to_owned());
+        }
         SlashCommandOutcome::OpenTimeline => {
             loop_state.milestone_requests.cancel();
             let entries = if chat.viewing_session_id().is_some() {
@@ -7486,6 +7512,36 @@ mod scheduler_tests {
             .clone()
             .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
         ChatLoopState::new(&client, &passive, false)
+    }
+
+    #[test]
+    fn permission_refresh_preserves_focus_and_replaces_resolved_dialogs() {
+        let permission = |id: &str| bcode_session_view_models::PermissionView {
+            permission_id: id.to_owned(),
+            session_id: Some(bcode_session_models::SessionId::new()),
+            tool_call_id: id.to_owned(),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: "{}".to_owned(),
+            batch: None,
+            agent_id: "build".to_owned(),
+            title: None,
+            policy_source: None,
+            detail: None,
+            resolved: false,
+            approved: None,
+            can_remember: false,
+        };
+        let first = permission("first");
+        let second = permission("second");
+        let mut dialog = None;
+        reconcile_permission_dialog(&mut dialog, vec![first.clone(), second.clone()]);
+        assert_eq!(dialog.as_ref().unwrap().permission_id(), "first");
+        reconcile_permission_dialog(&mut dialog, vec![second.clone(), first]);
+        assert_eq!(dialog.as_ref().unwrap().permission_id(), "first");
+        reconcile_permission_dialog(&mut dialog, vec![second]);
+        assert_eq!(dialog.as_ref().unwrap().permission_id(), "second");
+        reconcile_permission_dialog(&mut dialog, Vec::new());
+        assert!(dialog.is_none());
     }
 
     #[tokio::test]

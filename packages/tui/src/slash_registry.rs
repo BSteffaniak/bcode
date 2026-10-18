@@ -32,6 +32,7 @@ pub enum BuiltinCommandId {
     Stop,
     CancelRuntime,
     Runtime,
+    Permissions,
 }
 
 /// Resolved host-owned slash command.
@@ -105,6 +106,14 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         id: BuiltinCommandId::Search,
         names: &["search"],
         completions: &[completion!("/search", "Search session transcripts")],
+    },
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Permissions,
+        names: &["permissions"],
+        completions: &[completion!(
+            "/permissions",
+            "Refresh and review pending permissions"
+        )],
     },
     BuiltinCommandSpec {
         id: BuiltinCommandId::Resync,
