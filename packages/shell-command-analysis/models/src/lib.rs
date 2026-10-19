@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Current serialized shell analysis schema version.
-pub const SHELL_ANALYSIS_SCHEMA_VERSION: u32 = 1;
+pub const SHELL_ANALYSIS_SCHEMA_VERSION: u32 = 2;
 
 /// Shell language selected for analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +140,8 @@ pub enum ShellWord {
     },
     /// A word whose complete value is not statically known.
     Dynamic {
+        /// Parser-owned possible expanded argv shape. Required in analysis schema 2.
+        shape: ShellArgumentShape,
         /// Expansion kinds that make the value dynamic.
         expansions: Vec<ShellExpansionKind>,
         /// Source range for the original word.
@@ -155,6 +157,21 @@ impl ShellWord {
             Self::Static { span, .. } | Self::Dynamic { span, .. } => *span,
         }
     }
+}
+
+/// Conservative argument-language facts; never resolved by executing shell code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShellArgumentShape {
+    /// Exactly one value, retaining proven literal boundaries around unknown contents.
+    One {
+        /// Literal prefix of every possible value.
+        prefix: String,
+        /// Literal suffix of every possible value.
+        suffix: String,
+    },
+    /// Zero or more arbitrary values (splitting, globbing, positional arrays, or unknown syntax).
+    Many,
 }
 
 /// Expansion that prevents a shell word from being fully static.
@@ -174,6 +191,8 @@ pub enum ShellExpansionKind {
     Process,
     /// Glob or pattern expansion.
     Pattern,
+    /// Expansion syntax whose executable work cannot yet be analyzed safely.
+    Unsupported,
 }
 
 /// Assignment prefix associated with a command.
@@ -550,6 +569,16 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_shapes_are_required_and_future_shapes_are_rejected() {
+        for json in [
+            r#"{"kind":"dynamic","expansions":["parameter"],"span":{"start":0,"end":1}}"#,
+            r#"{"kind":"dynamic","shape":{"kind":"future"},"expansions":["parameter"],"span":{"start":0,"end":1}}"#,
+        ] {
+            assert!(serde_json::from_str::<ShellWord>(json).is_err());
+        }
+    }
+
+    #[test]
     fn every_tagged_contract_shape_round_trips() {
         let span = ShellSourceSpan::new(1, 2);
         for value in [
@@ -558,6 +587,7 @@ mod tests {
                 span,
             },
             ShellWord::Dynamic {
+                shape: ShellArgumentShape::Many,
                 expansions: vec![ShellExpansionKind::Parameter],
                 span,
             },

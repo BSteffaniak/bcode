@@ -60,6 +60,9 @@ pub struct PreviewCommandWord {
     pub span: bcode_shell_command_analysis_models::ShellSourceSpan,
     /// Whether the complete value requires runtime expansion.
     pub dynamic: bool,
+    /// Parser-proven argv cardinality: `one` or `many`; omitted for static words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cardinality: Option<String>,
 }
 
 /// One configured rule matched by the canonical policy evaluator.
@@ -82,7 +85,8 @@ pub struct PreviewCommandMatch {
     pub broad: bool,
     /// Regex flags used by slash-delimited word regex tokens.
     pub regex_flags: Vec<String>,
-    /// Whether a dynamic word prevents proving the match absent (deny fail-closed).
+    /// Whether runtime expansion prevents proving that this rule applies for every value.
+    /// For allows, a possible match is diagnostic-only and grants no permission.
     pub uncertain: bool,
 }
 
@@ -191,7 +195,7 @@ pub struct AgentContextResponse {
 pub const TOOL_POLICY_AUTHORIZATION_NAMESPACE: &str = "bcode.agent-policy.tool";
 
 /// Current schema version for [`ToolPolicyAuthorizationMetadata`].
-pub const TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION: u32 = 2;
+pub const TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION: u32 = 3;
 
 /// Action for invoking a tool under the standard agent policy authorization fact.
 pub const TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE: &str = "invoke";
@@ -479,6 +483,12 @@ pub struct ShellPolicyDiagnostic {
     pub match_candidate: String,
     /// Winning policy rule or explicit missing-rule marker.
     pub matched_rule: String,
+    /// Configured rule action, distinct from final authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_action: Option<AgentDecision>,
+    /// `definite` or `possible`; possible restrictions conservatively retain their action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_certainty: Option<String>,
     /// Whether the subject is a command or redirection.
     pub subject_kind: ShellPolicySubjectKind,
     /// Decision for the determining command or redirection.

@@ -358,6 +358,13 @@ fn preview_command_request(
                     .map(|word| PreviewCommandWord {
                         span: word.span(),
                         dynamic: matches!(word, ShellWord::Dynamic { .. }),
+                        cardinality: match word {
+                            ShellWord::Static { .. } => None,
+                            ShellWord::Dynamic { shape, .. } => Some(match shape {
+                                bcode_shell_command_analysis_models::ShellArgumentShape::One { .. } => "one",
+                                bcode_shell_command_analysis_models::ShellArgumentShape::Many => "many",
+                            }.to_owned()),
+                        },
                     })
                     .collect(),
                 assignments: subject
@@ -426,7 +433,9 @@ fn policy_profile_identity(
         .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut profile = agent_config(&config, profile_id);
     apply_tool_selection(&mut profile, &tools_config, &[]);
-    let encoded = serde_json::to_vec(&profile).map_err(|error| error.to_string())?;
+    let encoded =
+        serde_json::to_vec(&(bcode_agent_policy::SHELL_POLICY_SEMANTICS_VERSION, &profile))
+            .map_err(|error| error.to_string())?;
     let digest = Sha256::digest(encoded);
     let mut policy_digest_sha256 = String::with_capacity(64);
     for byte in digest {
@@ -900,6 +909,18 @@ read = { "**" = "deny" }
         let first = policy_profile_identity("build", None).expect("first identity");
         let repeated = policy_profile_identity("build", None).expect("repeat identity");
         assert_eq!(first, repeated);
+        let (config, _) = load_config();
+        let mut legacy_profile = agent_config(&config, "build");
+        apply_tool_selection(&mut legacy_profile, &load_tools_config(), &[]);
+        let legacy_digest = Sha256::digest(serde_json::to_vec(&legacy_profile).unwrap());
+        let mut legacy_hex = String::new();
+        for byte in legacy_digest {
+            write!(legacy_hex, "{byte:02x}").unwrap();
+        }
+        assert_ne!(
+            first.policy_digest_sha256, legacy_hex,
+            "a workflow pinned before symbolic semantics must require reauthorization"
+        );
         std::fs::write(
             &config_path,
             "[agent.build.permission]\ncommand = { \"*\" = \"deny\" }\n",

@@ -4,13 +4,15 @@
 
 //! Bounded POSIX shell command analysis behind Bcode-owned contracts.
 
+mod argument_shape;
+
 use bcode_shell_command_analysis_models::{
     SHELL_ANALYSIS_SCHEMA_VERSION, ShellAnalysis, ShellAnalysisCompleteness,
     ShellAnalysisDiagnostic, ShellAnalysisError, ShellAnalysisErrorKind, ShellAnalysisLimitKind,
-    ShellAssignment, ShellCommand, ShellCommandContext, ShellCommandId, ShellCommandMatchCandidate,
-    ShellCommandMatchCandidateKind, ShellCommandRelation, ShellDialect, ShellExpansionKind,
-    ShellFileDescriptor, ShellIncompleteReason, ShellPipelinePosition, ShellRedirection,
-    ShellRedirectionKind, ShellSourceSpan, ShellWord,
+    ShellArgumentShape, ShellAssignment, ShellCommand, ShellCommandContext, ShellCommandId,
+    ShellCommandMatchCandidate, ShellCommandMatchCandidateKind, ShellCommandRelation, ShellDialect,
+    ShellExpansionKind, ShellFileDescriptor, ShellIncompleteReason, ShellPipelinePosition,
+    ShellRedirection, ShellRedirectionKind, ShellSourceSpan, ShellWord,
 };
 use brush_parser::ast::{self, SourceLocation};
 use brush_parser::word::{self, WordPiece};
@@ -606,6 +608,7 @@ impl<'a> Adapter<'a> {
         let value = match &assignment.value {
             ast::AssignmentValue::Scalar(word) => self.word(word)?,
             ast::AssignmentValue::Array(_) => ShellWord::Dynamic {
+                shape: ShellArgumentShape::Many,
                 expansions: vec![ShellExpansionKind::Pattern],
                 span: self.owned_span(&assignment.loc)?,
             },
@@ -632,7 +635,14 @@ impl<'a> Adapter<'a> {
             )
         })?;
         let mut expansions = Vec::new();
-        collect_expansions(&pieces, &mut expansions);
+        if argument_shape::unsupported(&pieces) {
+            return Err(error(
+                self.request.dialect,
+                ShellAnalysisErrorKind::Parser,
+                "unsupported nested parameter or arithmetic expansion".to_owned(),
+            ));
+        }
+        collect_expansions(&pieces, &mut expansions, false);
         expansions.sort_unstable_by_key(|kind| *kind as u8);
         expansions.dedup();
         if expansions.is_empty() {
@@ -641,7 +651,11 @@ impl<'a> Adapter<'a> {
                 span,
             })
         } else {
-            Ok(ShellWord::Dynamic { expansions, span })
+            Ok(ShellWord::Dynamic {
+                shape: argument_shape::shape(&pieces),
+                expansions,
+                span,
+            })
         }
     }
 
@@ -661,6 +675,23 @@ impl<'a> Adapter<'a> {
         })?;
         let mut scripts = Vec::new();
         collect_substitutions(&pieces, &mut scripts);
+        let mut operands = Vec::new();
+        argument_shape::operands(&pieces, &mut operands);
+        for operand in operands {
+            if depth >= self.request.limits.max_nesting_depth {
+                return Err(error(
+                    self.request.dialect,
+                    ShellAnalysisErrorKind::Parser,
+                    "nested parameter expansion analysis limit exceeded".to_owned(),
+                ));
+            }
+            let nested = ast::Word {
+                value: operand.to_owned(),
+                loc: word.loc.clone(),
+            };
+            self.word(&nested)?;
+            self.word_substitutions(&nested, parent_id, context, depth.saturating_add(1))?;
+        }
         for script in scripts {
             if context.substitution_depth >= self.request.limits.max_substitutions {
                 self.incomplete.push(ShellIncompleteReason::LimitExceeded {
@@ -756,6 +787,7 @@ impl<'a> Adapter<'a> {
                         self.mark_unsupported("process_substitution", command.location().as_ref());
                         (
                             ShellWord::Dynamic {
+                                shape: ShellArgumentShape::Many,
                                 expansions: vec![ShellExpansionKind::Process],
                                 span: command
                                     .location()
@@ -998,16 +1030,20 @@ fn extend_owned_bounds(
 fn collect_expansions(
     pieces: &[word::WordPieceWithSource],
     expansions: &mut Vec<ShellExpansionKind>,
+    quoted: bool,
 ) {
     for piece in pieces {
         match &piece.piece {
+            WordPiece::Text(text) if !quoted && text.contains(['*', '?', '[']) => {
+                expansions.push(ShellExpansionKind::Pattern);
+            }
             WordPiece::Text(_)
             | WordPiece::SingleQuotedText(_)
             | WordPiece::AnsiCQuotedText(_)
             | WordPiece::EscapeSequence(_) => {}
             WordPiece::DoubleQuotedSequence(nested)
             | WordPiece::GettextDoubleQuotedSequence(nested) => {
-                collect_expansions(nested, expansions);
+                collect_expansions(nested, expansions, true);
             }
             WordPiece::TildeExpansion(_) => expansions.push(ShellExpansionKind::Tilde),
             WordPiece::ParameterExpansion(_) => expansions.push(ShellExpansionKind::Parameter),
@@ -1284,6 +1320,69 @@ mod tests {
                 "unsafe canonicalization for {source}"
             );
         }
+    }
+
+    #[test]
+    fn parser_owned_argument_shapes_preserve_quote_boundaries() {
+        for (source, expected) in [
+            (
+                "cmd \"$value\"",
+                ShellArgumentShape::One {
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+            ),
+            (
+                "cmd \"prefix-$value-suffix\"",
+                ShellArgumentShape::One {
+                    prefix: "prefix-".to_owned(),
+                    suffix: "-suffix".to_owned(),
+                },
+            ),
+            (
+                "cmd \"a${x}b${y}c\"",
+                ShellArgumentShape::One {
+                    prefix: "a".to_owned(),
+                    suffix: "c".to_owned(),
+                },
+            ),
+            ("cmd $value", ShellArgumentShape::Many),
+            ("cmd \"$@\"", ShellArgumentShape::Many),
+            ("cmd *.rs", ShellArgumentShape::Many),
+        ] {
+            let analysis = analyze(&ShellAnalysisRequest::posix(source)).unwrap();
+            let ShellWord::Dynamic { shape, .. } = &analysis.commands[0].arguments[0] else {
+                panic!("dynamic shape: {source}")
+            };
+            assert_eq!(shape, &expected, "{source}");
+        }
+        let analysis = analyze(&ShellAnalysisRequest::posix("cmd \"*.rs\" '*.txt'")).unwrap();
+        assert!(
+            analysis.commands[0]
+                .arguments
+                .iter()
+                .all(|word| matches!(word, ShellWord::Static { .. }))
+        );
+    }
+
+    #[test]
+    fn nested_parameter_operands_are_traversed_without_expansion() {
+        let analysis = analyze(&ShellAnalysisRequest::posix(
+            "printf \"${x:-${y:-$(dangerous)}}\"",
+        ))
+        .unwrap();
+        assert!(
+            analysis
+                .commands
+                .iter()
+                .any(|command| static_word_value(&command.executable) == Some("dangerous"))
+        );
+        let mut old = ShellAnalysisRequest::posix("exit 0");
+        old.schema_version = 1;
+        assert_eq!(
+            analyze(&old).unwrap_err().kind,
+            ShellAnalysisErrorKind::UnsupportedSchema
+        );
     }
 
     #[test]

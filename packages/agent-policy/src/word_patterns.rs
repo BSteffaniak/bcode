@@ -29,10 +29,16 @@
 //! `--` also prevents subsequent generic option consumption. This is generic
 //! syntax, not an assertion about any executable's actual option semantics.
 
+#[path = "symbolic.rs"]
+mod symbolic;
+pub use symbolic::{Match, classify};
+
 use bcode_agent_policy_models::Action;
 use bcode_shell_command_analysis_models::{ShellCommand, ShellWord};
 use regex::{Regex, RegexBuilder};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_PATTERN_BYTES: usize = 1024;
 const MAX_REGEXES: usize = 64;
@@ -476,30 +482,24 @@ impl WordRules {
     }
 
     pub fn matching(&self, command: &ShellCommand) -> Option<&WordRule> {
-        let words = std::iter::once(&command.executable)
-            .chain(&command.arguments)
-            .map(static_word)
-            .collect::<Vec<_>>();
         self.candidates(command)
             .map(|(_, rule)| rule)
-            .filter(|rule| matches(rule, &words, false))
+            .filter(|rule| classify(rule, command) == Match::Definite)
             .max_by(|lhs, rhs| rank(lhs, rhs))
     }
 
     pub fn uncertain_deny(&self, command: &ShellCommand) -> Option<&WordRule> {
-        let words = std::iter::once(&command.executable)
-            .chain(&command.arguments)
-            .map(static_word)
-            .collect::<Vec<_>>();
-        if words.iter().all(Option::is_some)
-            && words.len() <= MAX_WORDS
-            && words.iter().flatten().map(|s| s.len()).sum::<usize>() <= MAX_WORD_BYTES
-        {
-            return None;
-        }
+        self.possible_restriction(command, Action::Deny)
+    }
+
+    pub fn possible_restriction(
+        &self,
+        command: &ShellCommand,
+        action: Action,
+    ) -> Option<&WordRule> {
         self.candidates(command)
             .map(|(_, rule)| rule)
-            .filter(|rule| rule.action == Action::Deny && matches(rule, &words, true))
+            .filter(|rule| rule.action == action && classify(rule, command) == Match::Possible)
             .max_by(|lhs, rhs| rank(lhs, rhs))
     }
 }
@@ -513,6 +513,7 @@ fn static_word(word: &ShellWord) -> Option<&str> {
 
 /// Product of the rule NFA and argv. An unknown expansion denotes ANY sequence
 /// of values, including zero, not a single wildcard. Revisited pairs are shared.
+#[cfg(test)]
 fn matches(rule: &WordRule, words: &[Option<&str>], uncertain: bool) -> bool {
     if words.len() > MAX_WORDS
         || words.iter().flatten().map(|s| s.len()).sum::<usize>() > MAX_WORD_BYTES
@@ -562,32 +563,19 @@ fn matches(rule: &WordRule, words: &[Option<&str>], uncertain: bool) -> bool {
 }
 
 pub fn matching<'a>(rules: &'a [WordRule], command: &ShellCommand) -> Option<&'a WordRule> {
-    let words = std::iter::once(&command.executable)
-        .chain(&command.arguments)
-        .map(static_word)
-        .collect::<Vec<_>>();
     rules
         .iter()
-        .filter(|rule| matches(rule, &words, false))
+        .filter(|rule| classify(rule, command) == Match::Definite)
         .max_by(|lhs, rhs| rank(lhs, rhs))
 }
 
 /// A deny that may apply once dynamically expanded argument words are known.
 /// Environment assignments do not suppress command matching.
+#[cfg(test)]
 pub fn uncertain_deny<'a>(rules: &'a [WordRule], command: &ShellCommand) -> Option<&'a WordRule> {
-    let words = std::iter::once(&command.executable)
-        .chain(&command.arguments)
-        .map(static_word)
-        .collect::<Vec<_>>();
-    if words.iter().all(Option::is_some)
-        && words.len() <= MAX_WORDS
-        && words.iter().flatten().map(|s| s.len()).sum::<usize>() <= MAX_WORD_BYTES
-    {
-        return None;
-    }
     rules
         .iter()
-        .filter(|rule| rule.action == Action::Deny && matches(rule, &words, true))
+        .filter(|rule| rule.action == Action::Deny && classify(rule, command) == Match::Possible)
         .max_by(|lhs, rhs| rank(lhs, rhs))
 }
 
@@ -976,7 +964,11 @@ mod tests {
             "cmd $(printf ignored)",
         ] {
             let command = command(source);
-            assert!(matching(&rules, &command).is_none(), "{source}");
+            assert_eq!(
+                matching(&rules, &command).is_some(),
+                source != "$exe",
+                "{source}"
+            );
             assert!(uncertain_deny(&rules, &command).is_some(), "{source}");
         }
         let command = command("cmd unrelated $args");
@@ -1003,10 +995,11 @@ mod tests {
             let mut command = command("cmd placeholder end");
             let span = command.arguments[0].span();
             command.arguments[0] = ShellWord::Dynamic {
+                shape: bcode_shell_command_analysis_models::ShellArgumentShape::Many,
                 expansions: vec![kind],
                 span,
             };
-            assert!(matching(&rules, &command).is_none(), "{kind:?}");
+            assert!(matching(&rules, &command).is_some(), "{kind:?}");
             assert!(uncertain_deny(&rules, &command).is_some(), "{kind:?}");
         }
         let deny = parse("cmd a b end", Action::Deny).unwrap();

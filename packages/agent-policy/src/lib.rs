@@ -6,6 +6,7 @@
 
 mod compiled_commands;
 mod environment;
+mod legacy_symbolic;
 mod word_patterns;
 
 use compiled_commands::CompiledCommandLayer;
@@ -21,6 +22,9 @@ use bcode_agent_profile::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// Version of shell matching semantics included in pinned policy identities.
+pub const SHELL_POLICY_SEMANTICS_VERSION: u32 = 2;
 
 /// Built-in build agent ID.
 pub const BUILD_AGENT: &str = "build";
@@ -404,17 +408,6 @@ struct ShellSubjectDecision {
     locator: Option<(usize, bool, usize)>,
 }
 
-fn shell_subject_can_allow(subject: &bcode_shell_command_analysis_models::ShellCommand) -> bool {
-    std::iter::once(&subject.executable)
-        .chain(&subject.arguments)
-        .all(|word| {
-            matches!(
-                word,
-                bcode_shell_command_analysis_models::ShellWord::Static { .. }
-            )
-        })
-}
-
 fn evaluate_ordered_subject(
     layers: &[CompiledCommandLayer],
     subject: &bcode_shell_command_analysis_models::ShellCommand,
@@ -441,6 +434,7 @@ fn evaluate_ordered_subject(
             .matching(subject)
             .into_iter()
             .chain(layer.words.uncertain_deny(subject))
+            .chain(layer.words.possible_restriction(subject, Action::Ask))
             .map(|rule| {
                 (
                     Rule {
@@ -451,18 +445,25 @@ fn evaluate_ordered_subject(
                     (layer_index, true, rule.index),
                 )
             });
-        if let Some(rule) = legacy.chain(word).max_by_key(|(rule, _)| {
-            (
-                action_precedence(rule.action),
-                rule.specificity,
-                rule.pattern.len(),
+        if let Some(rule) = legacy
+            .chain(word)
+            .chain(
+                legacy_symbolic::restrictions(layer, subject)
+                    .map(|(index, rule)| (rule.clone(), (layer_index, false, index))),
             )
-        }) {
+            .max_by_key(|(rule, _)| {
+                (
+                    action_precedence(rule.action),
+                    rule.specificity,
+                    rule.pattern.len(),
+                )
+            })
+        {
             winner = Some(rule);
         }
     }
     let locator = winner.as_ref().map(|(_, locator)| *locator);
-    let rule = winner.map_or_else(
+    let mut rule = winner.map_or_else(
         || Rule {
             pattern: "<missing-rule>".to_owned(),
             action: Action::Deny,
@@ -470,11 +471,29 @@ fn evaluate_ordered_subject(
         },
         |(rule, _)| rule,
     );
-    let action = if rule.action == Action::Allow && !shell_subject_can_allow(subject) {
-        Action::Ask
-    } else {
-        rule.action
-    };
+    // A later exception cannot erase an earlier restriction whose applicability is unresolved.
+    let mut locator = locator;
+    for (index, layer) in layers.iter().enumerate() {
+        for (rule_index, possible) in legacy_symbolic::restrictions(layer, subject) {
+            if action_precedence(possible.action) > action_precedence(rule.action) {
+                rule = possible.clone();
+                locator = Some((index, false, rule_index));
+            }
+        }
+        for action in [Action::Ask, Action::Deny] {
+            if let Some(possible) = layer.words.possible_restriction(subject, action)
+                && action_precedence(action) > action_precedence(rule.action)
+            {
+                rule = Rule {
+                    pattern: possible.pattern.clone(),
+                    action,
+                    specificity: usize::MAX,
+                };
+                locator = Some((index, true, possible.index));
+            }
+        }
+    }
+    let action = rule.action;
     ShellSubjectDecision {
         action,
         rule,
@@ -519,10 +538,24 @@ fn preview_command_matches(
                 uncertain: false,
             });
         }
+        for (rule_index, rule) in legacy_symbolic::restrictions(layer, subject) {
+            matches.push(bcode_agent_profile::PreviewCommandMatch {
+                subject_index,
+                layer_index,
+                rule_index,
+                rule_kind: "command".to_owned(),
+                winning: locator == Some((layer_index, false, rule_index)),
+                decision: agent_decision(rule.action),
+                broad: rule.pattern.contains('*'),
+                regex_flags: Vec::new(),
+                uncertain: true,
+            });
+        }
         for (rule_index, rule) in layer.words.candidates(subject) {
             let rules = std::slice::from_ref(rule);
             let certain = word_patterns::matching(rules, subject).is_some();
-            let uncertain = !certain && word_patterns::uncertain_deny(rules, subject).is_some();
+            let uncertain = !certain
+                && word_patterns::classify(rule, subject) == word_patterns::Match::Possible;
             if !certain && !uncertain {
                 continue;
             }
@@ -591,6 +624,12 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
             Err(reason) => return shell_fact_denied(request, reason),
         };
         let subject = subject.as_ref();
+        if !matches!(
+            subject.executable,
+            bcode_shell_command_analysis_models::ShellWord::Static { .. }
+        ) {
+            return shell_fact_denied(request, "effective executable identity is unresolved");
+        }
         if subject.match_candidates.is_empty() {
             return shell_fact_denied(request, "shell command has no policy match candidate");
         }
@@ -647,6 +686,18 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
                 candidate = subject.source.as_str();
             }
         }
+        if let Some(possible_ask) = word_rules.possible_restriction(subject, Action::Ask)
+            && action == Action::Allow
+        {
+            locator = Some((0, true, possible_ask.index));
+            action = Action::Ask;
+            rule = Rule {
+                pattern: possible_ask.pattern.clone(),
+                action,
+                specificity: usize::MAX,
+            };
+            candidate = subject.source.as_str();
+        }
         if let Some(uncertain_deny) = word_rules.uncertain_deny(subject) {
             locator = Some((0, true, uncertain_deny.index));
             action = Action::Deny;
@@ -657,8 +708,13 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
             };
             candidate = subject.source.as_str();
         }
-        if action == Action::Allow && !shell_subject_can_allow(subject) {
-            action = Action::Ask;
+        for (index, possible) in legacy_symbolic::restrictions(&compiled.layers[0], subject) {
+            if action_precedence(possible.action) > action_precedence(action) {
+                locator = Some((0, false, index));
+                action = possible.action;
+                rule = possible.clone();
+                candidate = subject.source.as_str();
+            }
         }
         results.push(ShellSubjectDecision {
             action,
@@ -718,7 +774,7 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
     }
 
     let diagnostic_layers = compiled.layers.as_slice();
-    let matches = analysis
+    let matches: Vec<bcode_agent_profile::PreviewCommandMatch> = analysis
         .commands
         .iter()
         .zip(&results)
@@ -740,8 +796,16 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         .max_by_key(|result| action_precedence(result.action))
         .expect("shell analysis contains at least one command result");
     let decision = agent_decision(winner.action);
+    let winner_index = analysis
+        .commands
+        .iter()
+        .position(|command| Some(command.span) == winner.span && command.source == winner.subject);
+    let possible = matches.iter().any(|matched| {
+        Some(matched.subject_index) == winner_index && matched.winning && matched.uncertain
+    });
+    let certainty = if possible { "possible" } else { "definite" };
     let aggregate_reason = format!(
-        "{} shell program: {} '{}' at bytes {}..{} using candidate '{}' matched rule '{}' ({:?}); aggregate precedence deny > ask > allow selected {:?}",
+        "{} shell program: {} '{}' at bytes {}..{} using candidate '{}' matched rule '{}' ({:?}); configured action {:?}, {} match; aggregate precedence deny > ask > allow selected {:?}",
         match decision {
             AgentDecision::Allow => "allowed",
             AgentDecision::Ask => "asks before",
@@ -757,6 +821,8 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         winner.candidate,
         winner.rule.pattern,
         analysis.dialect,
+        agent_decision(winner.rule.action),
+        certainty,
         decision,
     );
     let diagnostic = ShellPolicyDiagnostic {
@@ -766,6 +832,8 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         dialect: analysis.dialect,
         match_candidate: winner.candidate,
         matched_rule: winner.rule.pattern.clone(),
+        rule_action: Some(agent_decision(winner.rule.action)),
+        match_certainty: Some(certainty.to_owned()),
         subject_kind: winner.kind,
         subject_decision: decision,
         aggregate_decision: decision,
@@ -1168,7 +1236,7 @@ mod tests {
     #[test]
     fn ordered_dynamic_commands_remain_conservative_and_assignments_are_transparent() {
         let config = ordered_config(vec![layer(&[("*", Action::Allow)], &[])]);
-        for source in ["$EXEC status", "git $ARGS"] {
+        for source in ["$EXEC status", "\"$EXEC\" status"] {
             assert_ne!(decision(&config, source), AgentDecision::Allow, "{source}");
         }
         let config = ordered_config(vec![layer(
@@ -1275,6 +1343,53 @@ mod tests {
         ] {
             assert_eq!(decision(&config, source), AgentDecision::Deny, "{source}");
         }
+    }
+
+    #[test]
+    fn ordered_dynamic_restrictions_cannot_be_erased_by_later_exceptions() {
+        for action in [Action::Deny, Action::Ask] {
+            let config = ordered_config(vec![
+                layer(&[("*", Action::Allow)], &[("git stash ...", action)]),
+                layer(&[], &[("git ...", Action::Allow)]),
+            ]);
+            assert_eq!(decision(&config, "git \"$op\""), agent_decision(action));
+            assert_eq!(
+                decision(&config, "git diff \"$args\""),
+                AgentDecision::Allow
+            );
+            // Known argv retains the existing last-matching-layer exception semantics.
+            assert_eq!(decision(&config, "git stash show"), AgentDecision::Allow);
+        }
+        let config = ordered_config(vec![
+            layer(&[("*", Action::Allow), ("git stash *", Action::Deny)], &[]),
+            layer(&[("git *", Action::Allow)], &[]),
+        ]);
+        assert_eq!(decision(&config, "git $args"), AgentDecision::Deny);
+    }
+
+    #[test]
+    fn symbolic_decision_diagnostics_distinguish_possible_restrictions() {
+        let config = AgentConfig {
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Allow)]),
+                command_patterns: BTreeMap::from([("git push ...".to_owned(), Action::Ask)]),
+                ..PermissionConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let result = evaluate_tool_call(
+            &config,
+            &request(BUILD_AGENT, "git \"$op\""),
+            Path::new("/tmp"),
+        );
+        assert_eq!(result.response.decision, AgentDecision::Ask);
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|rule| rule.winning && rule.uncertain && rule.decision == AgentDecision::Ask)
+        );
+        assert!(result.response.reason.unwrap().contains("possible match"));
     }
 
     #[test]
@@ -1747,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn word_patterns_do_not_match_dynamic_arguments() {
+    fn word_patterns_cover_dynamic_arguments_with_rest() {
         let config = AgentConfig {
             accent: None,
             tools: BTreeMap::new(),
@@ -1770,7 +1885,7 @@ mod tests {
                 )
                 .response
                 .decision,
-                AgentDecision::Deny,
+                AgentDecision::Allow,
                 "{source}"
             );
         }
@@ -1850,7 +1965,7 @@ mod tests {
             assert_eq!(
                 result.response.decision,
                 if source.starts_with("git diff") {
-                    AgentDecision::Ask
+                    AgentDecision::Allow
                 } else {
                     AgentDecision::Deny
                 },
