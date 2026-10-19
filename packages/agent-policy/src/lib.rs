@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Version of shell matching semantics included in pinned policy identities.
-pub const SHELL_POLICY_SEMANTICS_VERSION: u32 = 3;
+pub const SHELL_POLICY_SEMANTICS_VERSION: u32 = 4;
 
 /// Built-in build agent ID.
 pub const BUILD_AGENT: &str = "build";
@@ -409,9 +409,16 @@ struct ShellSubjectDecision {
     locator: Option<(usize, bool, usize)>,
 }
 
+// Defaults apply to the original subject only. Reapplying a catch-all after
+// dropping a prefix would invalidate an explicitly authorized original command.
+fn applies_to_subject(rule: &Rule, restriction_only: bool) -> bool {
+    !restriction_only || !rule.pattern.chars().all(|ch| ch == '*')
+}
+
 fn evaluate_ordered_subject(
     layers: &[CompiledCommandLayer],
     subject: &bcode_shell_command_analysis_models::ShellCommand,
+    restriction_only: bool,
 ) -> ShellSubjectDecision {
     let mut winner: Option<(Rule, (usize, bool, usize))> = None;
     // Environment assignments are retained as facts; all layers match the effective command.
@@ -429,6 +436,7 @@ fn evaluate_ordered_subject(
         let legacy = candidates
             .into_iter()
             .map(|index| (index, &layer.legacy[index]))
+            .filter(|(_, rule)| applies_to_subject(rule, restriction_only))
             .map(|(index, rule)| (rule.clone(), (layer_index, false, index)));
         let word = layer
             .words
@@ -467,7 +475,11 @@ fn evaluate_ordered_subject(
     let mut rule = winner.map_or_else(
         || Rule {
             pattern: "<missing-rule>".to_owned(),
-            action: Action::Deny,
+            action: if restriction_only {
+                Action::Allow
+            } else {
+                Action::Deny
+            },
             specificity: 0,
         },
         |(rule, _)| rule,
@@ -508,7 +520,7 @@ fn evaluate_ordered_subject(
 
 fn preview_command_matches(
     layers: &[CompiledCommandLayer],
-    _ordered: bool,
+    restriction_only: bool,
     subject: &bcode_shell_command_analysis_models::ShellCommand,
     subject_index: usize,
     locator: Option<(usize, bool, usize)>,
@@ -527,6 +539,9 @@ fn preview_command_matches(
             .collect();
         for rule_index in candidates {
             let rule = &layer.legacy[rule_index];
+            if !applies_to_subject(rule, restriction_only) {
+                continue;
+            }
             matches.push(bcode_agent_profile::PreviewCommandMatch {
                 subject_index,
                 layer_index,
@@ -580,6 +595,7 @@ fn preview_command_matches(
 fn evaluate_base_subject(
     layer: &CompiledCommandLayer,
     subject: &bcode_shell_command_analysis_models::ShellCommand,
+    restriction_only: bool,
 ) -> ShellSubjectDecision {
     let word_rules = &layer.words;
     let mut winning_locator = None;
@@ -587,6 +603,7 @@ fn evaluate_base_subject(
     for candidate in &subject.match_candidates {
         let Some((index, rule)) = layer
             .legacy_candidates(&candidate.subject)
+            .filter(|(_, rule)| applies_to_subject(rule, restriction_only))
             .filter(|(_, rule)| glob_matches(&rule.pattern, &candidate.subject))
             .max_by_key(|(_, rule)| (rule.specificity, rule.pattern.len()))
         else {
@@ -607,10 +624,18 @@ fn evaluate_base_subject(
     let mut locator = winning_locator;
     let (mut action, mut rule, mut candidate) = winning.unwrap_or_else(|| {
         (
-            Action::Deny,
+            if restriction_only {
+                Action::Allow
+            } else {
+                Action::Deny
+            },
             Rule {
                 pattern: "<missing-rule>".to_owned(),
-                action: Action::Deny,
+                action: if restriction_only {
+                    Action::Allow
+                } else {
+                    Action::Deny
+                },
                 specificity: 0,
             },
             subject.source.as_str(),
@@ -728,8 +753,8 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
             return shell_fact_denied(request, "shell command has no policy match candidate");
         }
         let mut result = ordered_layers.map_or_else(
-            || evaluate_base_subject(&compiled.layers[0], subject),
-            |layers| evaluate_ordered_subject(layers, subject),
+            || evaluate_base_subject(&compiled.layers[0], subject, false),
+            |layers| evaluate_ordered_subject(layers, subject, false),
         );
         let views = match execution_views::views(subject) {
             Ok(views) => views,
@@ -737,8 +762,8 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         };
         for view in &views {
             let mut restriction = ordered_layers.map_or_else(
-                || evaluate_base_subject(&compiled.layers[0], view),
-                |layers| evaluate_ordered_subject(layers, view),
+                || evaluate_base_subject(&compiled.layers[0], view, true),
+                |layers| evaluate_ordered_subject(layers, view, true),
             );
             if restriction.locator.is_some()
                 && action_precedence(restriction.action) > action_precedence(result.action)
@@ -805,18 +830,13 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         .flat_map(|(index, (original, result))| {
             let subject = environment::effective_command(original)
                 .expect("effective command was validated during evaluation");
-            let mut matches = preview_command_matches(
-                diagnostic_layers,
-                ordered_layers.is_some(),
-                &subject,
-                index,
-                result.locator,
-            );
+            let mut matches =
+                preview_command_matches(diagnostic_layers, false, &subject, index, result.locator);
             if let Ok(views) = execution_views::views(&subject) {
                 for view in &views {
                     for matched in preview_command_matches(
                         diagnostic_layers,
-                        ordered_layers.is_some(),
+                        true,
                         view,
                         index,
                         result.locator,
@@ -1268,6 +1288,145 @@ mod tests {
             .insert("*".to_owned(), Action::Allow);
         assert_eq!(
             decision(&config, "git status > result"),
+            AgentDecision::Allow
+        );
+    }
+
+    #[test]
+    fn explicit_grants_survive_restriction_views_but_not_command_restrictions() {
+        for source in [
+            "MODE=test git status",
+            "env MODE=test git status",
+            "command git status",
+            "exec git status",
+            "/usr/bin/git status",
+        ] {
+            for fallback in [Action::Ask, Action::Deny] {
+                let mut base = AgentConfig::default();
+                base.permission.command = BTreeMap::from([
+                    ("*".to_owned(), fallback),
+                    (source.to_owned(), Action::Allow),
+                ]);
+                let ordered = ordered_config(vec![
+                    layer(&[("*", fallback)], &[]),
+                    layer(&[(source, Action::Allow)], &[]),
+                ]);
+                for mut config in [base, ordered] {
+                    assert_eq!(decision(&config, source), AgentDecision::Allow, "{source}");
+                    if let Some(policy) = config.permission.command_policy.as_mut() {
+                        policy
+                            .layers
+                            .push(layer(&[], &[("git status", Action::Deny)]));
+                    } else {
+                        config
+                            .permission
+                            .command_patterns
+                            .insert("git status".to_owned(), Action::Deny);
+                    }
+                    assert_eq!(decision(&config, source), AgentDecision::Deny, "{source}");
+                }
+            }
+        }
+        let mut config = AgentConfig::default();
+        config.permission.command = BTreeMap::from([
+            ("*".to_owned(), Action::Deny),
+            ("command git push".to_owned(), Action::Allow),
+            ("git push".to_owned(), Action::Deny),
+        ]);
+        assert_eq!(decision(&config, "command git push"), AgentDecision::Deny);
+    }
+
+    #[test]
+    fn env_launcher_options_are_consistent_inside_and_outside_wrappers() {
+        for prefix in ["", "command ", "exec "] {
+            for env in [
+                "env -C /tmp",
+                "env --chdir=/tmp",
+                "env -i -u HOME MODE=test",
+                "env -- MODE=test",
+            ] {
+                let mut config = AgentConfig::default();
+                config
+                    .permission
+                    .command
+                    .insert("*".to_owned(), Action::Allow);
+                let source = format!("{prefix}{env} git status");
+                assert_eq!(decision(&config, &source), AgentDecision::Allow, "{source}");
+                config
+                    .permission
+                    .command_patterns
+                    .insert("git status".to_owned(), Action::Deny);
+                assert_eq!(decision(&config, &source), AgentDecision::Deny, "{source}");
+            }
+            for env in [
+                "env -C",
+                "env -C \"$DIR\"",
+                "env -u",
+                "env -S 'git status'",
+                "env $ARGS",
+            ] {
+                let mut config = AgentConfig::default();
+                config
+                    .permission
+                    .command
+                    .insert("*".to_owned(), Action::Allow);
+                let source = format!("{prefix}{env}");
+                assert_eq!(decision(&config, &source), AgentDecision::Deny, "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn execution_views_keep_symbolic_restrictions_and_specificity() {
+        for source in ["command git \"$ACTION\"", "exec /usr/bin/git \"$ACTION\""] {
+            for action in [Action::Ask, Action::Deny] {
+                for words in [false, true] {
+                    let mut config = AgentConfig::default();
+                    config
+                        .permission
+                        .command
+                        .insert("*".to_owned(), Action::Allow);
+                    if words {
+                        config
+                            .permission
+                            .command_patterns
+                            .insert("git push ...".to_owned(), action);
+                    } else {
+                        config
+                            .permission
+                            .command
+                            .insert("git push *".to_owned(), action);
+                    }
+                    let expected = agent_decision(action);
+                    let result = evaluate_tool_call(
+                        &config,
+                        &request(BUILD_AGENT, source),
+                        Path::new("/tmp"),
+                    );
+                    assert_eq!(result.response.decision, expected, "{source}");
+                    assert_eq!(
+                        result.response.shell.unwrap().match_certainty.as_deref(),
+                        Some("possible")
+                    );
+                    assert_eq!(decision(&config, source), expected, "{source}");
+                }
+            }
+        }
+        let mut config = AgentConfig::default();
+        config.permission.command = BTreeMap::from([
+            ("*".to_owned(), Action::Deny),
+            ("command git status".to_owned(), Action::Allow),
+        ]);
+        config
+            .permission
+            .command
+            .insert("git *".to_owned(), Action::Deny);
+        config
+            .permission
+            .command
+            .insert("git status".to_owned(), Action::Allow);
+        assert_eq!(
+            decision(&config, "command git status"),
             AgentDecision::Allow
         );
     }

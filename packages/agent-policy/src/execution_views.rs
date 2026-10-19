@@ -22,58 +22,18 @@ fn basename(value: &str) -> &str {
 /// Resolve only reviewed launcher syntax. Unknown/dynamic launcher options must
 /// not turn a configured denial into an allow.
 fn launched_word(executable: &str, arguments: &[ShellWord]) -> Result<Option<usize>, String> {
+    if executable == "env" {
+        let (index, _) = crate::environment::utility(arguments).map_err(str::to_owned)?;
+        return Ok((index < arguments.len()).then_some(index));
+    }
     let mut index = 0;
     while let Some(word) = arguments.get(index) {
         let value = literal(word).ok_or("dynamic launcher argument")?;
         if value == "--" {
             index += 1;
-            if executable == "env" {
-                while arguments.get(index).and_then(literal).is_some_and(|value| {
-                    value.split_once('=').is_some_and(|(name, _)| {
-                        !name.is_empty()
-                            && name
-                                .chars()
-                                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-                    })
-                }) {
-                    index += 1;
-                }
-            }
             break;
         }
         match executable {
-            "env" => {
-                if matches!(value, "-i" | "--ignore-environment" | "-" | "-0" | "--null") {
-                    index += 1;
-                    continue;
-                }
-                if matches!(value, "-u" | "--unset" | "-C" | "--chdir") {
-                    index += 1;
-                    if arguments.get(index).and_then(literal).is_none() {
-                        return Err("missing or dynamic launcher option value".to_owned());
-                    }
-                    index += 1;
-                    continue;
-                }
-                if value.starts_with("--unset=") || value.starts_with("--chdir=") {
-                    index += 1;
-                    continue;
-                }
-                if value.starts_with('-') {
-                    return Err("unsupported env launcher option".to_owned());
-                }
-                if value.split_once('=').is_some_and(|(name, _)| {
-                    !name.is_empty()
-                        && name.chars().enumerate().all(|(index, ch)| {
-                            ch == '_'
-                                || ch.is_ascii_alphabetic()
-                                || (index > 0 && ch.is_ascii_digit())
-                        })
-                }) {
-                    index += 1;
-                    continue;
-                }
-            }
             "command" => {
                 if matches!(value, "-v" | "-V") {
                     return Ok(None); // Query only: it does not execute its operand.

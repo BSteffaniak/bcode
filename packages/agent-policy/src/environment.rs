@@ -15,46 +15,7 @@ pub fn effective_command(command: &ShellCommand) -> Result<Cow<'_, ShellCommand>
         static_value(&effective.executable),
         Some("env" | "/usr/bin/env" | "/bin/env")
     ) {
-        let mut index = 0;
-        let mut options = true;
-        let mut assignments = Vec::new();
-        while let Some(word) = effective.arguments.get(index) {
-            let Some(value) = static_value(word) else {
-                return Err("env command prefix or executable is dynamic");
-            };
-            if options && value == "--" {
-                options = false;
-            } else if options && matches!(value, "-i" | "--ignore-environment" | "-") {
-                // These change the environment, not the command's policy identity.
-            } else if options && matches!(value, "-u" | "--unset") {
-                index += 1;
-                if effective
-                    .arguments
-                    .get(index)
-                    .and_then(static_value)
-                    .is_none()
-                {
-                    return Err("env unset option requires a static variable name");
-                }
-            } else if options && value.starts_with("--unset=") {
-                // No additional argv word.
-            } else if options && value.starts_with('-') {
-                return Err("unsupported env option; effective command cannot be determined");
-            } else if let Some((name, value)) = assignment(value) {
-                assignments.push(ShellAssignment {
-                    name: name.to_owned(),
-                    value: ShellWord::Static {
-                        value: value.to_owned(),
-                        span: word.span(),
-                    },
-                    span: word.span(),
-                });
-                options = false;
-            } else {
-                break;
-            }
-            index += 1;
-        }
+        let (index, assignments) = utility(&effective.arguments)?;
         let Some(executable) = effective.arguments.get(index).cloned() else {
             // With no utility, env itself prints the environment.
             break;
@@ -96,6 +57,45 @@ pub fn effective_command(command: &ShellCommand) -> Result<Cow<'_, ShellCommand>
         add_candidate(effective, words.join(" "));
     }
     Ok(Cow::Owned(effective.clone()))
+}
+
+/// Parse the reviewed env launcher grammar shared by effective commands and restriction views.
+pub fn utility(arguments: &[ShellWord]) -> Result<(usize, Vec<ShellAssignment>), &'static str> {
+    let mut index = 0;
+    let mut options = true;
+    let mut assignments = Vec::new();
+    while let Some(word) = arguments.get(index) {
+        let value = static_value(word).ok_or("env command prefix or executable is dynamic")?;
+        if options && value == "--" {
+            options = false;
+        } else if options && matches!(value, "-i" | "--ignore-environment" | "-" | "-0" | "--null")
+        {
+            // These change the environment or its display, not the utility's policy identity.
+        } else if options && matches!(value, "-u" | "--unset" | "-C" | "--chdir") {
+            index += 1;
+            if arguments.get(index).and_then(static_value).is_none() {
+                return Err("env option requires a static value");
+            }
+        } else if options && (value.starts_with("--unset=") || value.starts_with("--chdir=")) {
+            // The option value occupies the same argv word.
+        } else if options && value.starts_with('-') {
+            return Err("unsupported env option; effective command cannot be determined");
+        } else if let Some((name, value)) = assignment(value) {
+            assignments.push(ShellAssignment {
+                name: name.to_owned(),
+                value: ShellWord::Static {
+                    value: value.to_owned(),
+                    span: word.span(),
+                },
+                span: word.span(),
+            });
+            options = false;
+        } else {
+            break;
+        }
+        index += 1;
+    }
+    Ok((index, assignments))
 }
 
 fn add_candidate(command: &mut ShellCommand, subject: String) {
