@@ -4,9 +4,8 @@
 //! grants, and original spans are retained for diagnostics. Paths are compared
 //! by basename only for restrictions, never as proof of executable identity.
 
-use bcode_shell_command_analysis_models::{
-    ShellCommand, ShellCommandMatchCandidate, ShellCommandMatchCandidateKind, ShellWord,
-};
+use crate::shell_subject::{Subject, validate_executable};
+use bcode_shell_command_analysis_models::ShellWord;
 
 fn literal(word: &ShellWord) -> Option<&str> {
     match word {
@@ -23,7 +22,9 @@ fn basename(value: &str) -> &str {
 /// not turn a configured denial into an allow.
 fn launched_word(executable: &str, arguments: &[ShellWord]) -> Result<Option<usize>, String> {
     if executable == "env" {
-        let (index, _) = crate::environment::utility(arguments).map_err(str::to_owned)?;
+        let index = crate::environment::utility(arguments)
+            .map_err(str::to_owned)?
+            .executable_index;
         return Ok((index < arguments.len()).then_some(index));
     }
     let mut index = 0;
@@ -70,63 +71,90 @@ fn launched_word(executable: &str, arguments: &[ShellWord]) -> Result<Option<usi
     Ok((index < arguments.len()).then_some(index))
 }
 
-pub fn views(subject: &ShellCommand) -> Result<Vec<ShellCommand>, String> {
-    let mut current = subject.clone();
-    let mut views = Vec::new();
-    loop {
-        let executable = literal(&current.executable).ok_or("dynamic launched executable")?;
-        let name = basename(executable).to_owned();
-        let changed = name != executable || !current.assignments.is_empty();
-        if changed {
-            current.executable = ShellWord::Static {
-                value: name.clone(),
-                span: current.executable.span(),
-            };
-            current.assignments.clear();
-            update_candidates(&mut current, subject);
-            views.push(current.clone());
-        }
-        if !matches!(name.as_str(), "env" | "command" | "exec") {
-            break;
-        }
-        let Some(index) = launched_word(&name, &current.arguments)? else {
-            break;
-        };
-        current.executable = current.arguments[index].clone();
-        current.arguments.drain(..=index);
-        update_candidates(&mut current, subject);
-        views.push(current.clone());
+// A work allowance, not a wrapper-depth limit. Source/argv scans across all
+// views are charged before allocating canonical candidates or matching rules.
+const MAX_VIEW_WORK: usize = 1024 * 1024;
+
+struct ViewWork(usize);
+
+impl ViewWork {
+    fn charge(
+        &mut self,
+        subject: &Subject<'_>,
+        executable: &ShellWord,
+        arguments: &[ShellWord],
+    ) -> Result<(), String> {
+        let offset = executable.span().start.saturating_sub(subject.span.start) as usize;
+        let work = subject
+            .source
+            .len()
+            .saturating_sub(offset)
+            .saturating_add(arguments.len());
+        self.0 = self
+            .0
+            .checked_sub(work)
+            .ok_or("shell execution views exceed work allowance")?;
+        Ok(())
     }
-    Ok(views)
 }
 
-fn update_candidates(view: &mut ShellCommand, original: &ShellCommand) {
-    view.match_candidates.clear();
-    let offset = usize::try_from(
-        view.executable
-            .span()
-            .start
-            .saturating_sub(original.span.start),
-    )
-    .unwrap_or(usize::MAX);
-    if let Some(source) = original.source.get(offset..) {
-        source.clone_into(&mut view.source);
-        view.match_candidates.push(ShellCommandMatchCandidate {
-            subject: source.to_owned(),
-            kind: ShellCommandMatchCandidateKind::Original,
-            transformation: None,
-        });
+/// Visit one borrowed view at a time. No suffix commands survive the callback.
+pub fn visit(subject: &Subject<'_>, mut visitor: impl FnMut(&Subject<'_>)) -> Result<(), String> {
+    let mut executable = subject.executable.as_ref();
+    let mut arguments = subject.arguments;
+    let mut first = true;
+    let mut work = ViewWork(MAX_VIEW_WORK);
+    loop {
+        validate_executable(executable).map_err(str::to_owned)?;
+        let value = literal(executable).expect("validated executable");
+        let name = basename(value);
+        if name != value || (first && subject.has_assignments) {
+            work.charge(subject, executable, arguments)?;
+            let view = Subject::restriction(subject, executable, arguments, name != value);
+            validate_executable(&view.executable).map_err(str::to_owned)?;
+            visitor(&view);
+        }
+        first = false;
+        if !matches!(name, "env" | "command" | "exec") {
+            break;
+        }
+        let Some(index) = launched_word(name, arguments)? else {
+            break;
+        };
+        executable = &arguments[index];
+        arguments = &arguments[index + 1..];
+        validate_executable(executable).map_err(str::to_owned)?;
+        work.charge(subject, executable, arguments)?;
+        visitor(&Subject::restriction(subject, executable, arguments, false));
     }
-    let words = std::iter::once(&view.executable).chain(&view.arguments);
-    if let Some(words) = words.map(literal).collect::<Option<Vec<_>>>()
-        && words
-            .iter()
-            .all(|word| !word.is_empty() && !word.chars().any(char::is_whitespace))
-    {
-        view.match_candidates.push(ShellCommandMatchCandidate {
-            subject: words.join(" "),
-            kind: ShellCommandMatchCandidateKind::Canonical,
-            transformation: Some("restriction-only execution view".to_owned()),
-        });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_shell_command_analysis::analyze;
+    use bcode_shell_command_analysis_models::ShellAnalysisRequest;
+
+    #[test]
+    fn restriction_views_borrow_original_argv_and_source() {
+        let analysis = analyze(&ShellAnalysisRequest::posix(
+            "MODE=test command env -i /usr/bin/git status",
+        ))
+        .unwrap();
+        let command = &analysis.commands[0];
+        let subject = crate::environment::effective_command(command).unwrap();
+        let mut visits = 0;
+        visit(&subject, |view| {
+            visits += 1;
+            let end = command.arguments.as_ptr_range().end;
+            assert_eq!(view.arguments.as_ptr_range().end, end);
+            assert_eq!(
+                view.source.as_bytes().as_ptr_range().end,
+                command.source.as_bytes().as_ptr_range().end
+            );
+        })
+        .unwrap();
+        assert_eq!(visits, 4);
     }
 }

@@ -1,7 +1,9 @@
 //! Bounded symbolic execution of the existing argv-pattern NFA.
 
+use crate::shell_subject::CommandWords;
+
 use super::{Atom, MAX_WORD_BYTES, MAX_WORDS, WordRule};
-use bcode_shell_command_analysis_models::{ShellArgumentShape, ShellCommand, ShellWord};
+use bcode_shell_command_analysis_models::{ShellArgumentShape, ShellWord};
 use std::collections::{BTreeSet, VecDeque};
 
 type States = BTreeSet<(usize, bool)>;
@@ -14,9 +16,14 @@ pub enum Match {
     Absent,
 }
 
-pub fn classify(rule: &WordRule, command: &ShellCommand) -> Match {
-    let words = std::iter::once(&command.executable)
-        .chain(&command.arguments)
+#[cfg(test)]
+thread_local! { pub static CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+pub fn classify(rule: &WordRule, command: &impl CommandWords) -> Match {
+    #[cfg(test)]
+    CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+    let words = std::iter::once(command.executable())
+        .chain(command.arguments())
         .collect::<Vec<_>>();
     if words.len() > MAX_WORDS
         || words

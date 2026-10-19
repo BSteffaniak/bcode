@@ -8,6 +8,7 @@ mod compiled_commands;
 mod environment;
 mod execution_views;
 mod legacy_symbolic;
+mod shell_subject;
 mod word_patterns;
 
 use compiled_commands::CompiledCommandLayer;
@@ -25,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Version of shell matching semantics included in pinned policy identities.
-pub const SHELL_POLICY_SEMANTICS_VERSION: u32 = 4;
+pub const SHELL_POLICY_SEMANTICS_VERSION: u32 = 5;
 
 /// Built-in build agent ID.
 pub const BUILD_AGENT: &str = "build";
@@ -417,19 +418,20 @@ fn applies_to_subject(rule: &Rule, restriction_only: bool) -> bool {
 
 fn evaluate_ordered_subject(
     layers: &[CompiledCommandLayer],
-    subject: &bcode_shell_command_analysis_models::ShellCommand,
+    subject: &shell_subject::Subject<'_>,
     restriction_only: bool,
+    classified: &[word_patterns::ClassifiedWords<'_>],
 ) -> ShellSubjectDecision {
     let mut winner: Option<(Rule, (usize, bool, usize))> = None;
     // Environment assignments are retained as facts; all layers match the effective command.
     for (layer_index, layer) in layers.iter().enumerate() {
         let candidates: BTreeSet<_> = subject
-            .match_candidates
+            .candidates
             .iter()
             .flat_map(|candidate| {
                 layer
-                    .legacy_candidates(&candidate.subject)
-                    .filter(move |(_, rule)| glob_matches(&rule.pattern, &candidate.subject))
+                    .legacy_candidates(candidate)
+                    .filter(move |(_, rule)| glob_matches(&rule.pattern, candidate))
                     .map(|(index, _)| index)
             })
             .collect();
@@ -438,12 +440,11 @@ fn evaluate_ordered_subject(
             .map(|index| (index, &layer.legacy[index]))
             .filter(|(_, rule)| applies_to_subject(rule, restriction_only))
             .map(|(index, rule)| (rule.clone(), (layer_index, false, index)));
-        let word = layer
-            .words
-            .matching(subject)
+        let word = classified[layer_index]
+            .matching()
             .into_iter()
-            .chain(layer.words.uncertain_deny(subject))
-            .chain(layer.words.possible_restriction(subject, Action::Ask))
+            .chain(classified[layer_index].possible_restriction(Action::Deny))
+            .chain(classified[layer_index].possible_restriction(Action::Ask))
             .map(|rule| {
                 (
                     Rule {
@@ -494,7 +495,7 @@ fn evaluate_ordered_subject(
             }
         }
         for action in [Action::Ask, Action::Deny] {
-            if let Some(possible) = layer.words.possible_restriction(subject, action)
+            if let Some(possible) = classified[index].possible_restriction(action)
                 && action_precedence(action) > action_precedence(rule.action)
             {
                 rule = Rule {
@@ -510,8 +511,8 @@ fn evaluate_ordered_subject(
     ShellSubjectDecision {
         action,
         rule,
-        candidate: subject.source.clone(),
-        subject: subject.source.clone(),
+        candidate: subject.source.to_owned(),
+        subject: subject.source.to_owned(),
         span: Some(subject.span),
         kind: ShellPolicySubjectKind::Command,
         locator,
@@ -521,19 +522,20 @@ fn evaluate_ordered_subject(
 fn preview_command_matches(
     layers: &[CompiledCommandLayer],
     restriction_only: bool,
-    subject: &bcode_shell_command_analysis_models::ShellCommand,
+    subject: &shell_subject::Subject<'_>,
     subject_index: usize,
     locator: Option<(usize, bool, usize)>,
+    classified: &[word_patterns::ClassifiedWords<'_>],
 ) -> Vec<bcode_agent_profile::PreviewCommandMatch> {
     let mut matches = Vec::new();
     for (layer_index, layer) in layers.iter().enumerate() {
         let candidates: BTreeSet<_> = subject
-            .match_candidates
+            .candidates
             .iter()
             .flat_map(|candidate| {
                 layer
-                    .legacy_candidates(&candidate.subject)
-                    .filter(move |(_, rule)| glob_matches(&rule.pattern, &candidate.subject))
+                    .legacy_candidates(candidate)
+                    .filter(move |(_, rule)| glob_matches(&rule.pattern, candidate))
                     .map(|(index, _)| index)
             })
             .collect();
@@ -567,11 +569,9 @@ fn preview_command_matches(
                 uncertain: true,
             });
         }
-        for (rule_index, rule) in layer.words.candidates(subject) {
-            let rules = std::slice::from_ref(rule);
-            let certain = word_patterns::matching(rules, subject).is_some();
-            let uncertain = !certain
-                && word_patterns::classify(rule, subject) == word_patterns::Match::Possible;
+        for &(rule_index, rule, kind) in &classified[layer_index].matches {
+            let certain = kind == word_patterns::Match::Definite;
+            let uncertain = kind == word_patterns::Match::Possible;
             if !certain && !uncertain {
                 continue;
             }
@@ -594,17 +594,18 @@ fn preview_command_matches(
 
 fn evaluate_base_subject(
     layer: &CompiledCommandLayer,
-    subject: &bcode_shell_command_analysis_models::ShellCommand,
+    subject: &shell_subject::Subject<'_>,
     restriction_only: bool,
+    classified: &[word_patterns::ClassifiedWords<'_>],
 ) -> ShellSubjectDecision {
-    let word_rules = &layer.words;
+    let word_rules = &classified[0];
     let mut winning_locator = None;
     let mut winning: Option<(Action, Rule, &str)> = None;
-    for candidate in &subject.match_candidates {
+    for candidate in &subject.candidates {
         let Some((index, rule)) = layer
-            .legacy_candidates(&candidate.subject)
+            .legacy_candidates(candidate)
             .filter(|(_, rule)| applies_to_subject(rule, restriction_only))
-            .filter(|(_, rule)| glob_matches(&rule.pattern, &candidate.subject))
+            .filter(|(_, rule)| glob_matches(&rule.pattern, candidate))
             .max_by_key(|(_, rule)| (rule.specificity, rule.pattern.len()))
         else {
             continue;
@@ -614,7 +615,7 @@ fn evaluate_base_subject(
         });
         if replace {
             winning_locator = Some((0, false, index));
-            winning = Some((rule.action, rule.clone(), candidate.subject.as_str()));
+            winning = Some((rule.action, rule.clone(), candidate.as_ref()));
         }
     }
     let exact_legacy_deny = matches!(
@@ -638,10 +639,10 @@ fn evaluate_base_subject(
                 },
                 specificity: 0,
             },
-            subject.source.as_str(),
+            subject.source,
         )
     });
-    if let Some(word_rule) = word_rules.matching(subject) {
+    if let Some(word_rule) = word_rules.matching() {
         // A structured rule can refine a legacy wildcard, but cannot
         // override an exact legacy denial.
         if !exact_legacy_deny {
@@ -652,10 +653,10 @@ fn evaluate_base_subject(
                 action,
                 specificity: usize::MAX,
             };
-            candidate = subject.source.as_str();
+            candidate = subject.source;
         }
     }
-    if let Some(uncertain_deny) = word_rules.uncertain_deny(subject) {
+    if let Some(uncertain_deny) = word_rules.possible_restriction(Action::Deny) {
         locator = Some((0, true, uncertain_deny.index));
         action = Action::Deny;
         rule = Rule {
@@ -663,9 +664,9 @@ fn evaluate_base_subject(
             action,
             specificity: usize::MAX,
         };
-        candidate = subject.source.as_str();
+        candidate = subject.source;
     }
-    if let Some(possible_ask) = word_rules.possible_restriction(subject, Action::Ask)
+    if let Some(possible_ask) = word_rules.possible_restriction(Action::Ask)
         && action == Action::Allow
     {
         locator = Some((0, true, possible_ask.index));
@@ -675,25 +676,55 @@ fn evaluate_base_subject(
             action,
             specificity: usize::MAX,
         };
-        candidate = subject.source.as_str();
+        candidate = subject.source;
     }
     for (index, possible) in legacy_symbolic::restrictions(layer, subject) {
         if action_precedence(possible.action) > action_precedence(action) {
             locator = Some((0, false, index));
             action = possible.action;
             rule = possible.clone();
-            candidate = subject.source.as_str();
+            candidate = subject.source;
         }
     }
     ShellSubjectDecision {
         action,
         rule,
         candidate: candidate.to_owned(),
-        subject: subject.source.clone(),
+        subject: subject.source.to_owned(),
         span: Some(subject.span),
         kind: ShellPolicySubjectKind::Command,
         locator,
     }
+}
+
+fn evaluate_subject(
+    compiled: &compiled_commands::CompiledCommandPolicy,
+    subject: &shell_subject::Subject<'_>,
+    restriction_only: bool,
+    subject_index: usize,
+) -> (
+    ShellSubjectDecision,
+    Vec<bcode_agent_profile::PreviewCommandMatch>,
+) {
+    let classified = compiled
+        .layers
+        .iter()
+        .map(|layer| layer.words.classified(subject))
+        .collect::<Vec<_>>();
+    let result = if compiled.ordered {
+        evaluate_ordered_subject(&compiled.layers, subject, restriction_only, &classified)
+    } else {
+        evaluate_base_subject(&compiled.layers[0], subject, restriction_only, &classified)
+    };
+    let matches = preview_command_matches(
+        &compiled.layers,
+        restriction_only,
+        subject,
+        subject_index,
+        result.locator,
+        &classified,
+    );
+    (result, matches)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -735,43 +766,47 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
             return shell_fact_denied(request, &format!("invalid command policy: {error}"));
         }
     };
-    let ordered_layers = compiled.ordered.then_some(compiled.layers.as_slice());
     let mut results = Vec::new();
-    for original in &analysis.commands {
+    let mut matches = Vec::new();
+    for (subject_index, original) in analysis.commands.iter().enumerate() {
         let subject = match environment::effective_command(original) {
             Ok(subject) => subject,
             Err(reason) => return shell_fact_denied(request, reason),
         };
-        let subject = subject.as_ref();
+        let subject = &subject;
         if !matches!(
-            subject.executable,
+            *subject.executable,
             bcode_shell_command_analysis_models::ShellWord::Static { .. }
         ) {
             return shell_fact_denied(request, "effective executable identity is unresolved");
         }
-        if subject.match_candidates.is_empty() {
+        if subject.candidates.is_empty() {
             return shell_fact_denied(request, "shell command has no policy match candidate");
         }
-        let mut result = ordered_layers.map_or_else(
-            || evaluate_base_subject(&compiled.layers[0], subject, false),
-            |layers| evaluate_ordered_subject(layers, subject, false),
-        );
-        let views = match execution_views::views(subject) {
-            Ok(views) => views,
-            Err(error) => return shell_fact_denied(request, &error),
-        };
-        for view in &views {
-            let mut restriction = ordered_layers.map_or_else(
-                || evaluate_base_subject(&compiled.layers[0], view, true),
-                |layers| evaluate_ordered_subject(layers, view, true),
-            );
-            if restriction.locator.is_some()
-                && action_precedence(restriction.action) > action_precedence(result.action)
-            {
-                restriction.subject.clone_from(&subject.source);
+        let (mut result, mut subject_matches) =
+            evaluate_subject(&compiled, subject, false, subject_index);
+        if let Err(error) = execution_views::visit(subject, |view| {
+            let (mut restriction, view_matches) =
+                evaluate_subject(&compiled, view, true, subject_index);
+            let replaces = restriction.locator.is_some()
+                && action_precedence(restriction.action) > action_precedence(result.action);
+            if replaces {
+                subject.source.clone_into(&mut restriction.subject);
                 result = restriction;
+                for matched in &mut subject_matches {
+                    matched.winning = false;
+                }
             }
+            for mut matched in view_matches {
+                matched.winning &= replaces;
+                if matched.decision != AgentDecision::Allow && !subject_matches.contains(&matched) {
+                    subject_matches.push(matched);
+                }
+            }
+        }) {
+            return shell_fact_denied(request, &error);
         }
+        matches.extend(subject_matches);
         results.push(result);
     }
 
@@ -821,35 +856,6 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         });
     }
 
-    let diagnostic_layers = compiled.layers.as_slice();
-    let matches: Vec<bcode_agent_profile::PreviewCommandMatch> = analysis
-        .commands
-        .iter()
-        .zip(&results)
-        .enumerate()
-        .flat_map(|(index, (original, result))| {
-            let subject = environment::effective_command(original)
-                .expect("effective command was validated during evaluation");
-            let mut matches =
-                preview_command_matches(diagnostic_layers, false, &subject, index, result.locator);
-            if let Ok(views) = execution_views::views(&subject) {
-                for view in &views {
-                    for matched in preview_command_matches(
-                        diagnostic_layers,
-                        true,
-                        view,
-                        index,
-                        result.locator,
-                    ) {
-                        if matched.decision != AgentDecision::Allow && !matches.contains(&matched) {
-                            matches.push(matched);
-                        }
-                    }
-                }
-            }
-            matches
-        })
-        .collect();
     let winner = results
         .into_iter()
         .max_by_key(|result| action_precedence(result.action))
@@ -1334,6 +1340,125 @@ mod tests {
             ("git push".to_owned(), Action::Deny),
         ]);
         assert_eq!(decision(&config, "command git push"), AgentDecision::Deny);
+    }
+
+    #[test]
+    fn every_launcher_view_rejects_unresolved_source_and_executables() {
+        let configs = [
+            AgentConfig {
+                permission: PermissionConfig {
+                    command: BTreeMap::from([("*".to_owned(), Action::Allow)]),
+                    ..PermissionConfig::default()
+                },
+                ..AgentConfig::default()
+            },
+            ordered_config(vec![layer(&[("*", Action::Allow)], &[])]),
+        ];
+        for config in &configs {
+            for prefix in [
+                "",
+                "command ",
+                "command -p -- ",
+                "command command ",
+                "command env ",
+                "env command ",
+                "exec command ",
+            ] {
+                for executable in ["eval", ".", "source", "\"$tool\""] {
+                    let source = format!("{prefix}{executable} 'printf ok'");
+                    let result = evaluate_tool_call(
+                        config,
+                        &request(BUILD_AGENT, &source),
+                        Path::new("/tmp"),
+                    );
+                    assert_eq!(result.response.decision, AgentDecision::Deny, "{source}");
+                    assert_eq!(
+                        preview_tool_call(
+                            config,
+                            &request(BUILD_AGENT, &source),
+                            Path::new("/tmp")
+                        )
+                        .decision,
+                        AgentDecision::Deny,
+                        "{source}"
+                    );
+                }
+            }
+            for source in [
+                "command -v eval",
+                "command -V eval",
+                "printf %s eval",
+                "command printf %s eval",
+            ] {
+                assert_eq!(decision(config, source), AgentDecision::Allow, "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn enforcement_and_diagnostics_share_each_symbolic_classification() {
+        let patterns = [
+            ("cmd ...", Action::Allow),
+            ("cmd bad ...", Action::Deny),
+            ("cmd push ...", Action::Ask),
+        ];
+        let base = AgentConfig {
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Allow)]),
+                command_patterns: patterns
+                    .iter()
+                    .map(|(pattern, action)| ((*pattern).to_owned(), *action))
+                    .collect(),
+                ..PermissionConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        let ordered = ordered_config(vec![
+            layer(&[("*", Action::Allow)], &patterns),
+            layer(&[], &patterns),
+        ]);
+        for (config, expected_count) in [(&base, 3), (&ordered, 6)] {
+            for source in ["cmd \"$arg\"", "command env cmd \"$arg\""] {
+                word_patterns::CLASSIFICATIONS.with(|count| count.set(0));
+                let result =
+                    evaluate_tool_call(config, &request(BUILD_AGENT, source), Path::new("/tmp"));
+                assert_eq!(result.response.decision, AgentDecision::Deny);
+                word_patterns::CLASSIFICATIONS
+                    .with(|count| assert_eq!(count.get(), expected_count, "{source}"));
+                let winners = result
+                    .matches
+                    .iter()
+                    .filter(|matched| matched.winning)
+                    .collect::<Vec<_>>();
+                assert_eq!(winners.len(), 1);
+                assert_eq!(winners[0].decision, AgentDecision::Deny);
+                assert!(winners[0].uncertain);
+            }
+        }
+    }
+
+    #[test]
+    fn excessive_wrapper_work_fails_closed_before_matching_all_suffixes() {
+        let config = AgentConfig {
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Allow)]),
+                ..PermissionConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            decision(&config, &format!("{}printf ok", "command ".repeat(100))),
+            AgentDecision::Allow
+        );
+        let source = format!("{}printf ok", "command ".repeat(3200));
+        let result = evaluate_tool_call(&config, &request(BUILD_AGENT, &source), Path::new("/tmp"));
+        assert_eq!(result.response.decision, AgentDecision::Deny);
+        assert!(result.response.reason.unwrap().contains("work allowance"));
+        // Env-only chains are consumed in a single forward pass, not rejected by depth.
+        assert_eq!(
+            decision(&config, &format!("{}printf ok", "env ".repeat(3200))),
+            AgentDecision::Allow
+        );
     }
 
     #[test]

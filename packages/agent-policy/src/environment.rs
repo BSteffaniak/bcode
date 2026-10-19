@@ -1,69 +1,53 @@
 //! Environment prefixes are operation facts, not an implicit permission action.
 
+use crate::shell_subject::{Subject, literal as static_value, validate_executable};
+use bcode_shell_command_analysis_models::{ShellCommand, ShellWord};
 use std::borrow::Cow;
 
-use bcode_shell_command_analysis_models::{
-    ShellAssignment, ShellCommand, ShellCommandMatchCandidate, ShellCommandMatchCandidateKind,
-    ShellWord,
-};
-
-/// Retain the original subject for environment-sensitive globs while matching ordinary rules
-/// against the executable and argv. Unsupported `env` options must not hide an executable.
-pub fn effective_command(command: &ShellCommand) -> Result<Cow<'_, ShellCommand>, &'static str> {
-    let mut effective = Cow::Borrowed(command);
+/// Normalize reviewed env prefixes without cloning or draining argument vectors.
+pub fn effective_command(command: &ShellCommand) -> Result<Subject<'_>, &'static str> {
+    let mut subject = Subject::original(command);
+    let mut changed = !command.assignments.is_empty();
     while matches!(
-        static_value(&effective.executable),
+        static_value(&subject.executable),
         Some("env" | "/usr/bin/env" | "/bin/env")
     ) {
-        let (index, assignments) = utility(&effective.arguments)?;
-        let Some(executable) = effective.arguments.get(index).cloned() else {
-            // With no utility, env itself prints the environment.
+        let utility = utility(subject.arguments)?;
+        let index = utility.executable_index;
+        let Some(executable) = subject.arguments.get(index) else {
             break;
         };
-        let effective = effective.to_mut();
-        effective.arguments.drain(..=index);
-        effective.executable = executable;
-        effective.assignments.extend(assignments);
+        subject.has_assignments |= utility.has_assignments;
+        subject.executable = Cow::Borrowed(executable);
+        subject.arguments = &subject.arguments[index + 1..];
+        changed = true;
     }
-    if matches!(
-        static_value(&effective.executable),
-        Some("eval" | "." | "source")
-    ) {
-        return Err("effective command contains unresolved shell source");
+    validate_executable(&subject.executable)?;
+    if changed {
+        if let Some(offset) = subject
+            .executable
+            .span()
+            .start
+            .checked_sub(command.span.start)
+            && let Some(source) = command.source.get(offset as usize..)
+        {
+            subject.add_candidate(Cow::Borrowed(source));
+        }
+        subject.add_canonical();
     }
-    if effective.assignments.is_empty() && matches!(effective, Cow::Borrowed(_)) {
-        return Ok(effective);
-    }
-    let effective = effective.to_mut();
-    // Keep original source and byte spans. This additional subject is only a policy candidate.
-    if let Some(offset) = effective
-        .executable
-        .span()
-        .start
-        .checked_sub(command.span.start)
-        && let Some(source) = command.source.get(offset as usize..)
-    {
-        add_candidate(effective, source.to_owned());
-    }
-    let words = std::iter::once(&effective.executable)
-        .chain(&effective.arguments)
-        .map(static_value)
-        .collect::<Option<Vec<_>>>();
-    if let Some(words) = words
-        && words
-            .iter()
-            .all(|word| !word.is_empty() && !word.chars().any(char::is_whitespace))
-    {
-        add_candidate(effective, words.join(" "));
-    }
-    Ok(Cow::Owned(effective.clone()))
+    Ok(subject)
+}
+
+pub struct Utility {
+    pub executable_index: usize,
+    pub has_assignments: bool,
 }
 
 /// Parse the reviewed env launcher grammar shared by effective commands and restriction views.
-pub fn utility(arguments: &[ShellWord]) -> Result<(usize, Vec<ShellAssignment>), &'static str> {
+pub fn utility(arguments: &[ShellWord]) -> Result<Utility, &'static str> {
     let mut index = 0;
     let mut options = true;
-    let mut assignments = Vec::new();
+    let mut has_assignments = false;
     while let Some(word) = arguments.get(index) {
         let value = static_value(word).ok_or("env command prefix or executable is dynamic")?;
         if options && value == "--" {
@@ -80,43 +64,18 @@ pub fn utility(arguments: &[ShellWord]) -> Result<(usize, Vec<ShellAssignment>),
             // The option value occupies the same argv word.
         } else if options && value.starts_with('-') {
             return Err("unsupported env option; effective command cannot be determined");
-        } else if let Some((name, value)) = assignment(value) {
-            assignments.push(ShellAssignment {
-                name: name.to_owned(),
-                value: ShellWord::Static {
-                    value: value.to_owned(),
-                    span: word.span(),
-                },
-                span: word.span(),
-            });
+        } else if assignment(value).is_some() {
+            has_assignments = true;
             options = false;
         } else {
             break;
         }
         index += 1;
     }
-    Ok((index, assignments))
-}
-
-fn add_candidate(command: &mut ShellCommand, subject: String) {
-    if !command
-        .match_candidates
-        .iter()
-        .any(|candidate| candidate.subject == subject)
-    {
-        command.match_candidates.push(ShellCommandMatchCandidate {
-            subject,
-            kind: ShellCommandMatchCandidateKind::Canonical,
-            transformation: Some("effective command with environment retained as facts".to_owned()),
-        });
-    }
-}
-
-fn static_value(word: &ShellWord) -> Option<&str> {
-    match word {
-        ShellWord::Static { value, .. } => Some(value),
-        ShellWord::Dynamic { .. } => None,
-    }
+    Ok(Utility {
+        executable_index: index,
+        has_assignments,
+    })
 }
 
 fn assignment(value: &str) -> Option<(&str, &str)> {

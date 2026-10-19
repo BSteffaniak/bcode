@@ -29,12 +29,18 @@
 //! `--` also prevents subsequent generic option consumption. This is generic
 //! syntax, not an assertion about any executable's actual option semantics.
 
+use crate::shell_subject::CommandWords;
+
 #[path = "symbolic.rs"]
 mod symbolic;
+#[cfg(test)]
+pub use symbolic::CLASSIFICATIONS;
 pub use symbolic::{Match, classify};
 
 use bcode_agent_policy_models::Action;
-use bcode_shell_command_analysis_models::{ShellCommand, ShellWord};
+#[cfg(test)]
+use bcode_shell_command_analysis_models::ShellCommand;
+use bcode_shell_command_analysis_models::ShellWord;
 use regex::{Regex, RegexBuilder};
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -455,11 +461,11 @@ impl std::ops::Deref for WordRules {
 impl WordRules {
     pub fn candidates<'a>(
         &'a self,
-        command: &ShellCommand,
+        command: &impl CommandWords,
     ) -> impl Iterator<Item = (usize, &'a WordRule)> {
-        let oversized = command.arguments.len() >= MAX_WORDS
-            || std::iter::once(&command.executable)
-                .chain(&command.arguments)
+        let oversized = command.arguments().len() >= MAX_WORDS
+            || std::iter::once(command.executable())
+                .chain(command.arguments())
                 .filter_map(static_word)
                 .map(str::len)
                 .sum::<usize>()
@@ -467,7 +473,7 @@ impl WordRules {
         let executable = if oversized {
             None
         } else {
-            static_word(&command.executable)
+            static_word(command.executable())
         };
         let indices = executable.and_then(|value| self.by_executable.get(value));
         let count = if executable.is_none() {
@@ -481,25 +487,44 @@ impl WordRules {
         })
     }
 
-    pub fn matching(&self, command: &ShellCommand) -> Option<&WordRule> {
-        self.candidates(command)
-            .map(|(_, rule)| rule)
-            .filter(|rule| classify(rule, command) == Match::Definite)
+    pub fn classified(&self, command: &impl CommandWords) -> ClassifiedWords<'_> {
+        ClassifiedWords {
+            matches: self
+                .candidates(command)
+                .map(|(index, rule)| (index, rule, classify(rule, command)))
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn matching(&self, command: &impl CommandWords) -> Option<&WordRule> {
+        self.classified(command).matching()
+    }
+
+    #[cfg(test)]
+    pub fn uncertain_deny(&self, command: &impl CommandWords) -> Option<&WordRule> {
+        self.classified(command).possible_restriction(Action::Deny)
+    }
+}
+
+/// Classification belongs to one evaluation and is reused by enforcement and diagnostics.
+pub struct ClassifiedWords<'a> {
+    pub matches: Vec<(usize, &'a WordRule, Match)>,
+}
+
+impl<'a> ClassifiedWords<'a> {
+    pub fn matching(&self) -> Option<&'a WordRule> {
+        self.matches
+            .iter()
+            .filter(|(_, _, kind)| *kind == Match::Definite)
+            .map(|(_, rule, _)| *rule)
             .max_by(|lhs, rhs| rank(lhs, rhs))
     }
-
-    pub fn uncertain_deny(&self, command: &ShellCommand) -> Option<&WordRule> {
-        self.possible_restriction(command, Action::Deny)
-    }
-
-    pub fn possible_restriction(
-        &self,
-        command: &ShellCommand,
-        action: Action,
-    ) -> Option<&WordRule> {
-        self.candidates(command)
-            .map(|(_, rule)| rule)
-            .filter(|rule| rule.action == action && classify(rule, command) == Match::Possible)
+    pub fn possible_restriction(&self, action: Action) -> Option<&'a WordRule> {
+        self.matches
+            .iter()
+            .filter(|(_, rule, kind)| rule.action == action && *kind == Match::Possible)
+            .map(|(_, rule, _)| *rule)
             .max_by(|lhs, rhs| rank(lhs, rhs))
     }
 }
@@ -562,7 +587,8 @@ fn matches(rule: &WordRule, words: &[Option<&str>], uncertain: bool) -> bool {
     false
 }
 
-pub fn matching<'a>(rules: &'a [WordRule], command: &ShellCommand) -> Option<&'a WordRule> {
+#[cfg(test)]
+pub fn matching<'a>(rules: &'a [WordRule], command: &impl CommandWords) -> Option<&'a WordRule> {
     rules
         .iter()
         .filter(|rule| classify(rule, command) == Match::Definite)
@@ -572,7 +598,10 @@ pub fn matching<'a>(rules: &'a [WordRule], command: &ShellCommand) -> Option<&'a
 /// A deny that may apply once dynamically expanded argument words are known.
 /// Environment assignments do not suppress command matching.
 #[cfg(test)]
-pub fn uncertain_deny<'a>(rules: &'a [WordRule], command: &ShellCommand) -> Option<&'a WordRule> {
+pub fn uncertain_deny<'a>(
+    rules: &'a [WordRule],
+    command: &impl CommandWords,
+) -> Option<&'a WordRule> {
     rules
         .iter()
         .filter(|rule| rule.action == Action::Deny && classify(rule, command) == Match::Possible)

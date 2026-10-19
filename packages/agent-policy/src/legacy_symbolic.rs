@@ -4,15 +4,15 @@
 //! restriction disjoint; complex glob suffixes are deliberately not used as allow proofs.
 
 use super::{Action, Rule, compiled_commands::CompiledCommandLayer, glob_matches};
-use bcode_shell_command_analysis_models::{ShellCommand, ShellWord};
+use bcode_shell_command_analysis_models::ShellWord;
 
 pub fn restrictions<'a>(
     layer: &'a CompiledCommandLayer,
-    command: &ShellCommand,
+    command: &crate::shell_subject::Subject<'_>,
 ) -> impl Iterator<Item = (usize, &'a Rule)> {
     let mut prefix = String::new();
     let mut dynamic = false;
-    for word in std::iter::once(&command.executable).chain(&command.arguments) {
+    for word in std::iter::once(command.executable.as_ref()).chain(command.arguments) {
         match word {
             ShellWord::Static { value, .. } => {
                 if !prefix.is_empty() {
@@ -33,9 +33,9 @@ pub fn restrictions<'a>(
             if !dynamic
                 || rule.action == Action::Allow
                 || command
-                    .match_candidates
+                    .candidates
                     .iter()
-                    .any(|candidate| glob_matches(&rule.pattern, &candidate.subject))
+                    .any(|candidate| glob_matches(&rule.pattern, candidate))
             {
                 return false;
             }
