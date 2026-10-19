@@ -6,6 +6,7 @@
 
 mod compiled_commands;
 mod environment;
+mod execution_views;
 mod legacy_symbolic;
 mod word_patterns;
 
@@ -24,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Version of shell matching semantics included in pinned policy identities.
-pub const SHELL_POLICY_SEMANTICS_VERSION: u32 = 2;
+pub const SHELL_POLICY_SEMANTICS_VERSION: u32 = 3;
 
 /// Built-in build agent ID.
 pub const BUILD_AGENT: &str = "build";
@@ -576,6 +577,100 @@ fn preview_command_matches(
     matches
 }
 
+fn evaluate_base_subject(
+    layer: &CompiledCommandLayer,
+    subject: &bcode_shell_command_analysis_models::ShellCommand,
+) -> ShellSubjectDecision {
+    let word_rules = &layer.words;
+    let mut winning_locator = None;
+    let mut winning: Option<(Action, Rule, &str)> = None;
+    for candidate in &subject.match_candidates {
+        let Some((index, rule)) = layer
+            .legacy_candidates(&candidate.subject)
+            .filter(|(_, rule)| glob_matches(&rule.pattern, &candidate.subject))
+            .max_by_key(|(_, rule)| (rule.specificity, rule.pattern.len()))
+        else {
+            continue;
+        };
+        let replace = winning.as_ref().is_none_or(|(_, current, _)| {
+            (rule.specificity, rule.pattern.len()) > (current.specificity, current.pattern.len())
+        });
+        if replace {
+            winning_locator = Some((0, false, index));
+            winning = Some((rule.action, rule.clone(), candidate.subject.as_str()));
+        }
+    }
+    let exact_legacy_deny = matches!(
+        &winning,
+        Some((Action::Deny, legacy_rule, _)) if !legacy_rule.pattern.contains('*')
+    );
+    let mut locator = winning_locator;
+    let (mut action, mut rule, mut candidate) = winning.unwrap_or_else(|| {
+        (
+            Action::Deny,
+            Rule {
+                pattern: "<missing-rule>".to_owned(),
+                action: Action::Deny,
+                specificity: 0,
+            },
+            subject.source.as_str(),
+        )
+    });
+    if let Some(word_rule) = word_rules.matching(subject) {
+        // A structured rule can refine a legacy wildcard, but cannot
+        // override an exact legacy denial.
+        if !exact_legacy_deny {
+            locator = Some((0, true, word_rule.index));
+            action = word_rule.action;
+            rule = Rule {
+                pattern: word_rule.pattern.clone(),
+                action,
+                specificity: usize::MAX,
+            };
+            candidate = subject.source.as_str();
+        }
+    }
+    if let Some(uncertain_deny) = word_rules.uncertain_deny(subject) {
+        locator = Some((0, true, uncertain_deny.index));
+        action = Action::Deny;
+        rule = Rule {
+            pattern: uncertain_deny.pattern.clone(),
+            action,
+            specificity: usize::MAX,
+        };
+        candidate = subject.source.as_str();
+    }
+    if let Some(possible_ask) = word_rules.possible_restriction(subject, Action::Ask)
+        && action == Action::Allow
+    {
+        locator = Some((0, true, possible_ask.index));
+        action = Action::Ask;
+        rule = Rule {
+            pattern: possible_ask.pattern.clone(),
+            action,
+            specificity: usize::MAX,
+        };
+        candidate = subject.source.as_str();
+    }
+    for (index, possible) in legacy_symbolic::restrictions(layer, subject) {
+        if action_precedence(possible.action) > action_precedence(action) {
+            locator = Some((0, false, index));
+            action = possible.action;
+            rule = possible.clone();
+            candidate = subject.source.as_str();
+        }
+    }
+    ShellSubjectDecision {
+        action,
+        rule,
+        candidate: candidate.to_owned(),
+        subject: subject.source.clone(),
+        span: Some(subject.span),
+        kind: ShellPolicySubjectKind::Command,
+        locator,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
     let ToolPolicyOperation::Command {
@@ -616,7 +711,6 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         }
     };
     let ordered_layers = compiled.ordered.then_some(compiled.layers.as_slice());
-    let word_rules = &compiled.layers[0].words;
     let mut results = Vec::new();
     for original in &analysis.commands {
         let subject = match environment::effective_command(original) {
@@ -633,98 +727,27 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         if subject.match_candidates.is_empty() {
             return shell_fact_denied(request, "shell command has no policy match candidate");
         }
-        if let Some(layers) = ordered_layers {
-            results.push(evaluate_ordered_subject(layers, subject));
-            continue;
-        }
-        let mut winning_locator = None;
-        let mut winning: Option<(Action, Rule, &str)> = None;
-        for candidate in &subject.match_candidates {
-            let Some((index, rule)) = compiled.layers[0]
-                .legacy_candidates(&candidate.subject)
-                .filter(|(_, rule)| glob_matches(&rule.pattern, &candidate.subject))
-                .max_by_key(|(_, rule)| (rule.specificity, rule.pattern.len()))
-            else {
-                continue;
-            };
-            let replace = winning.as_ref().is_none_or(|(_, current, _)| {
-                (rule.specificity, rule.pattern.len())
-                    > (current.specificity, current.pattern.len())
-            });
-            if replace {
-                winning_locator = Some((0, false, index));
-                winning = Some((rule.action, rule.clone(), candidate.subject.as_str()));
-            }
-        }
-        let exact_legacy_deny = matches!(
-            &winning,
-            Some((Action::Deny, legacy_rule, _)) if !legacy_rule.pattern.contains('*')
+        let mut result = ordered_layers.map_or_else(
+            || evaluate_base_subject(&compiled.layers[0], subject),
+            |layers| evaluate_ordered_subject(layers, subject),
         );
-        let mut locator = winning_locator;
-        let (mut action, mut rule, mut candidate) = winning.unwrap_or_else(|| {
-            (
-                Action::Deny,
-                Rule {
-                    pattern: "<missing-rule>".to_owned(),
-                    action: Action::Deny,
-                    specificity: 0,
-                },
-                subject.source.as_str(),
-            )
-        });
-        if let Some(word_rule) = word_rules.matching(subject) {
-            // A structured rule can refine a legacy wildcard, but cannot
-            // override an exact legacy denial.
-            if !exact_legacy_deny {
-                locator = Some((0, true, word_rule.index));
-                action = word_rule.action;
-                rule = Rule {
-                    pattern: word_rule.pattern.clone(),
-                    action,
-                    specificity: usize::MAX,
-                };
-                candidate = subject.source.as_str();
+        let views = match execution_views::views(subject) {
+            Ok(views) => views,
+            Err(error) => return shell_fact_denied(request, &error),
+        };
+        for view in &views {
+            let mut restriction = ordered_layers.map_or_else(
+                || evaluate_base_subject(&compiled.layers[0], view),
+                |layers| evaluate_ordered_subject(layers, view),
+            );
+            if restriction.locator.is_some()
+                && action_precedence(restriction.action) > action_precedence(result.action)
+            {
+                restriction.subject.clone_from(&subject.source);
+                result = restriction;
             }
         }
-        if let Some(possible_ask) = word_rules.possible_restriction(subject, Action::Ask)
-            && action == Action::Allow
-        {
-            locator = Some((0, true, possible_ask.index));
-            action = Action::Ask;
-            rule = Rule {
-                pattern: possible_ask.pattern.clone(),
-                action,
-                specificity: usize::MAX,
-            };
-            candidate = subject.source.as_str();
-        }
-        if let Some(uncertain_deny) = word_rules.uncertain_deny(subject) {
-            locator = Some((0, true, uncertain_deny.index));
-            action = Action::Deny;
-            rule = Rule {
-                pattern: uncertain_deny.pattern.clone(),
-                action,
-                specificity: usize::MAX,
-            };
-            candidate = subject.source.as_str();
-        }
-        for (index, possible) in legacy_symbolic::restrictions(&compiled.layers[0], subject) {
-            if action_precedence(possible.action) > action_precedence(action) {
-                locator = Some((0, false, index));
-                action = possible.action;
-                rule = possible.clone();
-                candidate = subject.source.as_str();
-            }
-        }
-        results.push(ShellSubjectDecision {
-            action,
-            rule,
-            candidate: candidate.to_owned(),
-            subject: subject.source.clone(),
-            span: Some(subject.span),
-            kind: ShellPolicySubjectKind::Command,
-            locator,
-        });
+        results.push(result);
     }
 
     for redirect in &analysis.redirections {
@@ -782,13 +805,29 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
         .flat_map(|(index, (original, result))| {
             let subject = environment::effective_command(original)
                 .expect("effective command was validated during evaluation");
-            preview_command_matches(
+            let mut matches = preview_command_matches(
                 diagnostic_layers,
                 ordered_layers.is_some(),
                 &subject,
                 index,
                 result.locator,
-            )
+            );
+            if let Ok(views) = execution_views::views(&subject) {
+                for view in &views {
+                    for matched in preview_command_matches(
+                        diagnostic_layers,
+                        ordered_layers.is_some(),
+                        view,
+                        index,
+                        result.locator,
+                    ) {
+                        if matched.decision != AgentDecision::Allow && !matches.contains(&matched) {
+                            matches.push(matched);
+                        }
+                    }
+                }
+            }
+            matches
         })
         .collect();
     let winner = results
@@ -1234,10 +1273,107 @@ mod tests {
     }
 
     #[test]
+    fn configured_allows_do_not_prompt_but_execution_views_preserve_denials() {
+        let mut config = AgentConfig::default();
+        config
+            .permission
+            .command
+            .insert("*".to_owned(), Action::Allow);
+        config
+            .permission
+            .command_patterns
+            .insert("git <options>* push ...".to_owned(), Action::Deny);
+        for source in [
+            "git push",
+            "git -C /tmp push",
+            "git -c key=value push",
+            "git --git-dir=/tmp/repo push",
+            "git --no-optional-locks push",
+            "env git push",
+            "env -i NAME=value /usr/bin/git -C /tmp push",
+            "env -- NAME=value git push",
+            "command -- git push",
+            "command -p git push",
+            "exec git push",
+            "exec -a name git push",
+            "/usr/bin/git push",
+            "./git push",
+            "NAME=value git push",
+            "NAME=value /usr/bin/git push",
+            "env -C /tmp command /usr/bin/git push",
+            "git -C \"$HOME\" push",
+            "git \"$OPERATION\"",
+            "git status; env git push",
+        ] {
+            let result =
+                evaluate_tool_call(&config, &request(BUILD_AGENT, source), Path::new("/tmp"));
+            assert_eq!(result.response.decision, AgentDecision::Deny, "{source}");
+        }
+        for source in [
+            "BCODE_CONFIG=/tmp/config bcode permission check --help",
+            "NAME=value git status",
+            "printf '%s' \"$HOME\"",
+            "env NAME=value git status",
+            "command -v git",
+            "exec git status",
+            "git status",
+        ] {
+            assert_eq!(decision(&config, source), AgentDecision::Allow, "{source}");
+        }
+        for source in [
+            "env -S 'git push'",
+            "env $ARGS",
+            "command $EXEC",
+            "exec -a $NAME git push",
+        ] {
+            assert_eq!(decision(&config, source), AgentDecision::Deny, "{source}");
+        }
+        let mut restrictive = AgentConfig::default();
+        restrictive
+            .permission
+            .command
+            .insert("*".to_owned(), Action::Deny);
+        restrictive
+            .permission
+            .command_patterns
+            .insert("git status".to_owned(), Action::Allow);
+        for source in [
+            "/usr/bin/git status",
+            "command git status",
+            "exec git status",
+        ] {
+            assert_eq!(
+                decision(&restrictive, source),
+                AgentDecision::Deny,
+                "{source}"
+            );
+        }
+        for source in ["env git status", "NAME=value git status"] {
+            assert_eq!(
+                decision(&restrictive, source),
+                AgentDecision::Allow,
+                "{source}"
+            );
+        }
+        config.permission.command_policy = Some(CommandPolicy::default());
+        assert_eq!(
+            decision(&config, "env git -C /tmp push"),
+            AgentDecision::Deny
+        );
+        assert_eq!(
+            decision(&config, "NAME=value git status"),
+            AgentDecision::Allow
+        );
+    }
+
+    #[test]
     fn ordered_dynamic_commands_remain_conservative_and_assignments_are_transparent() {
         let config = ordered_config(vec![layer(&[("*", Action::Allow)], &[])]);
         for source in ["$EXEC status", "\"$EXEC\" status"] {
             assert_ne!(decision(&config, source), AgentDecision::Allow, "{source}");
+        }
+        for source in ["git $ARGS", "NAME=value git status"] {
+            assert_eq!(decision(&config, source), AgentDecision::Allow, "{source}");
         }
         let config = ordered_config(vec![layer(
             &[("*", Action::Allow)],
