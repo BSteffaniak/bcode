@@ -6,6 +6,11 @@
 
 mod auth_broker_setup;
 pub mod clierror;
+mod command_automation;
+pub mod interaction_automation;
+
+/// Supported secret-safe, versioned CLI diagnostic envelope.
+pub use clierror::CliDiagnosticError;
 mod plugin_cli;
 pub mod retired_catalogs;
 mod session_migration_adapter;
@@ -108,6 +113,18 @@ pub enum CliError {
     /// Derivation returned a non-success terminal outcome already printed as JSON.
     #[error("session derivation did not succeed; see JSON outcome")]
     SessionDerivationNotSucceeded,
+    /// Composed spawn returned a failure or a non-executable admission receipt.
+    #[error("session spawn did not admit executable work; inspect JSON result before retrying")]
+    SessionSpawnNotAdmitted,
+    /// Plugin command/effect outcome was unsuccessful and has already been printed.
+    #[error("plugin command or effect failed; inspect JSON result before retrying")]
+    PluginCommandNotApplied,
+    /// Semantic controller rejected input or returned a cancelled terminal output.
+    #[error("interaction controller did not apply successful work; inspect JSON result")]
+    InteractionControllerNotApplied,
+    /// A permission or raw exchange resolution was not applied.
+    #[error("resolution was not applied; inspect the returned receipt")]
+    InteractionResolutionNotApplied,
     #[error("workflow store error: {0}")]
     WorkflowStore(#[from] bcode_workflow_store::WorkflowStoreError),
     #[error("session database error: {0}")]
@@ -315,6 +332,10 @@ impl CliError {
             | Self::WorkflowApplication { .. }
             | Self::WorkflowDraftEditNotApplied
             | Self::SessionDerivationNotSucceeded
+            | Self::SessionSpawnNotAdmitted
+            | Self::PluginCommandNotApplied
+            | Self::InteractionControllerNotApplied
+            | Self::InteractionResolutionNotApplied
             | Self::WorkflowApprovalContinuationFailed
             | Self::SessionCompressionIncomplete
             | Self::WorkflowApprovalDecisionNotApplied => 1,
@@ -834,7 +855,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         } => handle_web_command(bind, port, allow_non_loopback).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
         Commands::Theme { command } => handle_theme_command(command)?,
-        Commands::Judgement { command } => handle_judgement_command(command).await?,
+        Commands::Judgement { command } => Box::pin(handle_judgement_command(command)).await?,
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Auth { command } => {
             if cli.no_credential_discovery && matches!(command, AuthCommand::Discover) {
@@ -3653,8 +3674,115 @@ fn filter_session_exchanges(
     }
 }
 
+async fn execute_controller_drive(path: &Path) -> Result<(), CliError> {
+    use bcode_plugin_sdk::interaction_application::{
+        InteractionApplication as _, InteractionControllerInput,
+    };
+    use bcode_tool_models::interaction::InteractionOutput;
+    let request: interaction_automation::ControllerDriveRequest =
+        serde_json::from_value(read_bounded_interaction_json(path)?).map_err(|_| {
+            CliError::InvalidArguments("invalid interaction controller drive request".to_owned())
+        })?;
+    request.validate()?;
+    let consumer = controller_cli_client()
+        .interaction_controller_consumer()
+        .await?;
+    let mut snapshot = match consumer
+        .open_controller(request.version, &request.exchange_id)
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return print_controller_drive_error(error),
+    };
+    print_json_line(&snapshot)?;
+    for input in request.inputs {
+        if matches!(
+            &snapshot.output,
+            InteractionOutput::Submitted { .. } | InteractionOutput::Cancelled
+        ) {
+            // Never drive input past canonical completion or imply a retry after it.
+            return Err(CliError::InteractionControllerNotApplied);
+        }
+        snapshot = match consumer
+            .controller_input(InteractionControllerInput {
+                version: request.version,
+                exchange_id: request.exchange_id.clone(),
+                expected_revision: snapshot.revision,
+                input,
+            })
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return print_controller_drive_error(error),
+        };
+        print_json_line(&snapshot)?;
+    }
+    match snapshot.output {
+        InteractionOutput::Submitted { .. } => Ok(()),
+        // A finite batch which did not canonically submit is not completion. Detach
+        // invalidates the ephemeral state; no output is a durable resume token.
+        InteractionOutput::None | InteractionOutput::Redraw | InteractionOutput::Cancelled => {
+            Err(CliError::InteractionControllerNotApplied)
+        }
+    }
+}
+
+fn print_controller_drive_error(
+    error: bcode_plugin_sdk::interaction_application::InteractionControllerError,
+) -> Result<(), CliError> {
+    print_json_line(
+        &serde_json::json!({"version":1,"error":{"code":error,"message":error.message()}}),
+    )?;
+    Err(CliError::InteractionControllerNotApplied)
+}
+
+fn controller_cli_client() -> BcodeClient {
+    BcodeClient::default_endpoint()
+        .with_interaction_controller_versions(std::collections::BTreeSet::from([1]))
+}
+
+fn print_controller_result(
+    result: Result<
+        bcode_plugin_sdk::interaction_application::InteractionControllerSnapshot,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    >,
+) -> Result<(), CliError> {
+    match result {
+        Ok(snapshot) => {
+            let cancelled = matches!(
+                &snapshot.output,
+                bcode_tool_models::interaction::InteractionOutput::Cancelled
+            );
+            print_json(&snapshot)?;
+            if cancelled {
+                return Err(CliError::InteractionControllerNotApplied);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            print_json(
+                &serde_json::json!({"version":1,"error":{"code":error,"message":error.message()}}),
+            )?;
+            Err(CliError::InteractionControllerNotApplied)
+        }
+    }
+}
+
 async fn handle_interaction_command(command: InteractionCommand) -> Result<(), CliError> {
     match command {
+        InteractionCommand::ControllerDrive { request } => {
+            execute_controller_drive(&request).await?;
+        }
+        InteractionCommand::ControllerOpen {
+            exchange_id,
+            version,
+        } => {
+            let consumer = controller_cli_client()
+                .interaction_controller_consumer()
+                .await?;
+            let result = consumer.open(version, &exchange_id).await;
+            print_controller_result(result)?;
+        }
         InteractionCommand::Input {
             session_id,
             payload,
@@ -3791,7 +3919,11 @@ fn write_interaction_list<W: std::io::Write>(
 }
 
 fn print_interaction_resolution(resolved: bool, json: bool) -> Result<(), CliError> {
-    write_interaction_resolution(&mut std::io::stdout().lock(), resolved, json)
+    write_interaction_resolution(&mut std::io::stdout().lock(), resolved, json)?;
+    if !resolved {
+        return Err(CliError::InteractionResolutionNotApplied);
+    }
+    Ok(())
 }
 
 fn write_interaction_resolution<W: std::io::Write>(
@@ -3815,6 +3947,13 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
                 Box::pin(BcodeClient::default_endpoint().plugin_contributions()).await?;
             print_json(&contributions)?;
         }
+        PluginCommand::Command {
+            plugin_id,
+            command_id,
+            request,
+        } => {
+            execute_plugin_command(&plugin_id, &command_id, &request).await?;
+        }
         PluginCommand::List { root, json } => list_plugins(&root, json)?,
         PluginCommand::Services { root, daemon, json } => {
             list_plugin_services(&root, daemon, json).await?;
@@ -3827,6 +3966,7 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
             interface_id,
             operation,
             payload,
+            payload_file,
             json,
         } => {
             invoke_plugin_service(
@@ -3834,7 +3974,7 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
                 &plugin_id,
                 &interface_id,
                 &operation,
-                payload,
+                read_plugin_payload(payload, payload_file.as_deref())?,
                 daemon,
                 json,
             )
@@ -3846,15 +3986,36 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
             interface_id,
             operation,
             payload,
+            payload_file,
             json,
-        } => call_plugin_service(&root, &interface_id, &operation, payload, daemon, json).await?,
+        } => {
+            call_plugin_service(
+                &root,
+                &interface_id,
+                &operation,
+                read_plugin_payload(payload, payload_file.as_deref())?,
+                daemon,
+                json,
+            )
+            .await?;
+        }
         PluginCommand::Publish {
             root,
             daemon,
             topic,
             payload,
+            payload_file,
             json,
-        } => publish_plugin_event(&root, &topic, payload, daemon, json).await?,
+        } => {
+            publish_plugin_event(
+                &root,
+                &topic,
+                read_plugin_payload(payload, payload_file.as_deref())?,
+                daemon,
+                json,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -6001,6 +6162,17 @@ enum SessionCommand {
         #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=32))]
         max_pages: u32,
     },
+    /// Resolve exact canonical session metadata without attaching or submitting work (JSON).
+    Summary {
+        session_id: SessionId,
+    },
+    /// Create and admit an ordinary child through the composed application operation.
+    /// Prints the complete result even after partial failure; failures exit nonzero.
+    Spawn {
+        /// Versioned `SessionSpawnRequest` JSON file, or - for stdin (maximum 1 MiB).
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Read canonical milestones or explicitly request optional generation (JSON).
     Milestones {
         #[command(subcommand)]
@@ -6313,6 +6485,10 @@ enum SessionCommand {
     /// Watch bounded initial state followed by ordered durable/live session events.
     Watch {
         session_id: SessionId,
+        /// Register renderer-neutral interaction consumption while this watcher is alive.
+        /// Start before submitting work that may ask questions; detach ends this capability.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1))]
+        interaction_controller_version: Option<u32>,
         /// Maximum initial durable events.
         #[arg(long, default_value_t = SESSION_CLI_PAGE_LIMIT)]
         limit: usize,
@@ -7528,6 +7704,20 @@ enum PermissionCommand {
 
 #[derive(Debug, Subcommand)]
 enum InteractionCommand {
+    /// Open and drive one ephemeral controller on a single authenticated connection.
+    /// Emits finite JSONL snapshots; detach discards controller state, not durable work.
+    ControllerDrive {
+        /// Typed `version`/`exchange_id`/`inputs` request, or - for stdin (maximum 256 KiB).
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Open an exact producer/schema controller as a point-in-time JSON diagnostic.
+    /// Its ephemeral state is discarded on exit; use controller-drive for usable input.
+    ControllerOpen {
+        exchange_id: String,
+        #[arg(long, default_value_t = 1)]
+        version: u32,
+    },
     /// Print one pending exchange as JSON, preserving its producer schema and payload.
     Inspect {
         /// Pending exchange identifier.
@@ -7626,6 +7816,15 @@ enum WorktreeCommand {
 enum PluginCommand {
     /// Query the daemon's plugin contributions as JSON without invoking commands or effects.
     Contributions,
+    /// Invoke a contributed command and consume its finite effects without entering a TUI.
+    /// Unsupported native surfaces are reported explicitly and exit nonzero.
+    Command {
+        plugin_id: String,
+        command_id: String,
+        /// Typed `InvokeCommandRequest` JSON, or - for stdin (maximum 1 MiB).
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Discover selected local plugin manifests without loading native libraries.
     List {
         #[arg(long = "root")]
@@ -7668,7 +7867,11 @@ enum PluginCommand {
         plugin_id: String,
         interface_id: String,
         operation: String,
+        #[arg(conflicts_with = "payload_file")]
         payload: Option<String>,
+        /// Read at most 1 MiB from FILE, or `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        payload_file: Option<PathBuf>,
         /// Print the structured plugin response as JSON.
         #[arg(long)]
         json: bool,
@@ -7685,7 +7888,11 @@ enum PluginCommand {
         daemon: bool,
         interface_id: String,
         operation: String,
+        #[arg(conflicts_with = "payload_file")]
         payload: Option<String>,
+        /// Read at most 1 MiB from FILE, or `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        payload_file: Option<PathBuf>,
         /// Print the structured plugin response as JSON.
         #[arg(long)]
         json: bool,
@@ -7697,7 +7904,11 @@ enum PluginCommand {
         #[arg(long, conflicts_with = "root")]
         daemon: bool,
         topic: String,
+        #[arg(conflicts_with = "payload_file")]
         payload: Option<String>,
+        /// Read at most 1 MiB from FILE, or `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        payload_file: Option<PathBuf>,
         /// Print the delivery count as JSON.
         #[arg(long)]
         json: bool,
@@ -8027,6 +8238,12 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             ))
             .await
         }
+        SessionCommand::Summary { session_id } => print_json(
+            &BcodeClient::default_endpoint()
+                .session_summary(*session_id)
+                .await?,
+        ),
+        SessionCommand::Spawn { request } => Box::pin(execute_session_spawn(request)).await,
         SessionCommand::Derive { request } => Box::pin(execute_derivation(request)).await,
         SessionCommand::DerivationPrompts {
             session_id,
@@ -8613,6 +8830,8 @@ async fn dispatch_non_ranking_session_command(
         }
         SessionCommand::Milestones { .. }
         | SessionCommand::AppendPresentationNote { .. }
+        | SessionCommand::Summary { .. }
+        | SessionCommand::Spawn { .. }
         | SessionCommand::Derive { .. }
         | SessionCommand::DerivationPrompts { .. }
         | SessionCommand::DerivationSnapshot { .. }
@@ -8821,7 +9040,16 @@ async fn dispatch_non_ranking_session_command(
             session_id,
             limit,
             json,
-        } => Box::pin(watch_session(session_id, limit, json)).await?,
+            interaction_controller_version,
+        } => {
+            Box::pin(watch_session(
+                session_id,
+                limit,
+                json,
+                interaction_controller_version,
+            ))
+            .await?;
+        }
         SessionCommand::QueueStatus { session_id } => {
             print_json(
                 &session_read_client(session_id)
@@ -13757,7 +13985,7 @@ async fn invoke_plugin_service(
     json: bool,
 ) -> Result<(), CliError> {
     validate_plugin_service_route(Some(plugin_id), interface_id, operation)?;
-    let payload = payload.unwrap_or_default().into_bytes();
+    let payload = bounded_plugin_payload(payload)?;
     if daemon {
         let response = BcodeClient::default_endpoint()
             .invoke_plugin_service(
@@ -13787,7 +14015,7 @@ async fn call_plugin_service(
     json: bool,
 ) -> Result<(), CliError> {
     validate_plugin_service_route(None, interface_id, operation)?;
-    let payload = payload.unwrap_or_default().into_bytes();
+    let payload = bounded_plugin_payload(payload)?;
     if daemon {
         let response = BcodeClient::default_endpoint()
             .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning)
@@ -13802,6 +14030,121 @@ async fn call_plugin_service(
     let response = response?;
     deactivation?;
     print_service_response(response, json)
+}
+
+async fn execute_plugin_command(
+    plugin_id: &str,
+    command_id: &str,
+    path: &Path,
+) -> Result<(), CliError> {
+    use bcode_command::application::{CommandApplication as _, CommandInvocationRequest};
+    let request: bcode_command::InvokeCommandRequest = serde_json::from_value(
+        read_json_with_limit(path, MAX_CLI_PLUGIN_PAYLOAD_BYTES, "plugin command request")?,
+    )
+    .map_err(|_| CliError::InvalidArguments("invalid plugin command request".to_owned()))?;
+    if request.command_id != command_id {
+        return Err(CliError::InvalidArguments(
+            "plugin command request identity must match the selected command".to_owned(),
+        ));
+    }
+    validate_plugin_service_route(
+        Some(plugin_id),
+        bcode_command::COMMAND_INTERFACE_ID,
+        bcode_command::OP_INVOKE_COMMAND,
+    )?;
+    let client = BcodeClient::default_endpoint();
+    // The owning application resolves canonical session/workspace facts. CLI context
+    // is selection only and never grants attachment, permissions or command authority.
+    let result = client
+        .invoke_command(CommandInvocationRequest {
+            plugin_id: plugin_id.to_owned(),
+            invocation_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: None,
+            launch_root: request.context.as_ref().and_then(|context| {
+                context
+                    .session_id
+                    .is_none()
+                    .then(|| context.working_directory.clone())
+            }),
+            deadline_ms: 30_000,
+            command: request,
+        })
+        .await;
+    let (outcome, failed) =
+        command_automation::consume_invocation(&client, plugin_id, result).await;
+    print_json(&outcome)?;
+    if failed {
+        return Err(CliError::PluginCommandNotApplied);
+    }
+    Ok(())
+}
+
+async fn execute_session_spawn(path: &Path) -> Result<(), CliError> {
+    let request: bcode_session_models::SessionSpawnRequest = serde_json::from_value(
+        read_json_with_limit(path, 1024 * 1024, "session spawn request")?,
+    )
+    .map_err(|_| CliError::InvalidArguments("invalid session spawn request".to_owned()))?;
+    let result = BcodeClient::default_endpoint()
+        .spawn_session(request)
+        .await?;
+    print_json(&result)?;
+    result.validate().map_err(|_| {
+        CliError::InvalidArguments(
+            "inconsistent session spawn result; inspect before retrying".to_owned(),
+        )
+    })?;
+    if result.failure.is_some()
+        || matches!(
+            result.admission,
+            Some(
+                bcode_session_models::TurnAdmission::Rejected(_)
+                    | bcode_session_models::TurnAdmission::CancelledBeforeStart(_)
+            )
+        )
+    {
+        return Err(CliError::SessionSpawnNotAdmitted);
+    }
+    Ok(())
+}
+
+const MAX_CLI_PLUGIN_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+fn read_plugin_payload(
+    payload: Option<String>,
+    file: Option<&Path>,
+) -> Result<Option<String>, CliError> {
+    let Some(file) = file else {
+        return Ok(payload);
+    };
+    if payload.is_some() {
+        return Err(CliError::InvalidArguments(
+            "plugin payload and --payload-file are mutually exclusive".to_owned(),
+        ));
+    }
+    let bytes = if file == Path::new("-") {
+        read_bytes_with_limit(
+            std::io::stdin().lock(),
+            MAX_CLI_PLUGIN_PAYLOAD_BYTES,
+            "plugin service payload",
+        )?
+    } else {
+        read_bytes_with_limit(
+            fs::File::open(file)?,
+            MAX_CLI_PLUGIN_PAYLOAD_BYTES,
+            "plugin service payload",
+        )?
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| CliError::InvalidArguments("plugin service payload must be UTF-8".to_owned()))
+}
+
+fn bounded_plugin_payload(payload: Option<String>) -> Result<Vec<u8>, CliError> {
+    read_bytes_with_limit(
+        payload.unwrap_or_default().as_bytes(),
+        MAX_CLI_PLUGIN_PAYLOAD_BYTES,
+        "plugin service payload",
+    )
 }
 
 fn validate_plugin_service_route(
@@ -13904,7 +14247,7 @@ async fn publish_plugin_event(
     daemon: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let payload = payload.unwrap_or_default().into_bytes();
+    let payload = bounded_plugin_payload(payload)?;
     if daemon {
         let delivered = BcodeClient::default_endpoint()
             .publish_plugin_event(topic.to_string(), payload)
@@ -16957,12 +17300,24 @@ async fn set_session_skill(
 }
 
 async fn compact_session(session_id: SessionId, json: bool) -> Result<(), CliError> {
-    let message = BcodeClient::default_endpoint()
-        .compact_session(session_id)
-        .await?;
+    let client = BcodeClient::default_endpoint();
+    let outcome = bcode_session_models::SessionApplication::compact_session(&client, session_id)
+        .await
+        .map_err(|failure| bcode_client::ClientError::Server {
+            code: failure.code,
+            message: failure.message,
+        })?;
+    let (status, message) = match outcome {
+        bcode_session_models::SessionCompactionResult::Compacted(message) => {
+            ("context_compacted", message)
+        }
+        bcode_session_models::SessionCompactionResult::Noop(message) => {
+            ("context_compaction_noop", message)
+        }
+    };
     if json {
         print_json(&serde_json::json!({
-            "status": "context_compacted",
+            "status": status,
             "session_id": session_id,
             "message": message,
         }))
@@ -20057,7 +20412,11 @@ fn print_permission_resolution(resolved: bool, json: bool) -> Result<(), CliErro
         &serde_json::json!({ "resolved": resolved }),
         format_args!("resolved: {resolved}"),
         json,
-    )
+    )?;
+    if !resolved {
+        return Err(CliError::InteractionResolutionNotApplied);
+    }
+    Ok(())
 }
 
 async fn add_permission_rule(
@@ -20122,8 +20481,17 @@ fn write_permission_list<W: std::io::Write>(
     Ok(())
 }
 
-async fn watch_session(session_id: SessionId, limit: usize, json: bool) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
+async fn watch_session(
+    session_id: SessionId,
+    limit: usize,
+    json: bool,
+    interaction_controller_version: Option<u32>,
+) -> Result<(), CliError> {
+    let mut client = BcodeClient::default_endpoint();
+    if let Some(version) = interaction_controller_version {
+        client = client
+            .with_interaction_controller_versions(std::collections::BTreeSet::from([version]));
+    }
     let mut watcher = client.watch_session(session_id, limit).await?;
     let initial = watcher
         .take_initial()
@@ -21588,7 +21956,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 title.as_deref().unwrap_or("")
             );
         }
-        SessionEventKind::ChildSessionCreated { request } => {
+        SessionEventKind::ChildSessionCreated { request, .. } => {
             println!(
                 "#{} child session: {} (parent: {})",
                 event.sequence, request.child_id, request.parent_id
@@ -25997,7 +26365,9 @@ mod workflow_source_tests {
             .find(|package| package.package_id == "bcode/examples-command")
             .expect("command plan");
         assert_eq!(
-            call.target.definition_identity(),
+            call.target
+                .definition_identity()
+                .expect("resolved definition identity"),
             &command_plan.plan.members[0].definition_identity
         );
     }
@@ -27584,6 +27954,7 @@ mod watch_cli_tests {
                     session_id: parsed,
                     limit: 25,
                     json: true,
+                    interaction_controller_version: None,
                 }
             }) if parsed == session_id
         ));

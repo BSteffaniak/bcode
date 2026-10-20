@@ -3277,6 +3277,24 @@ fn search_backfill_status_message(
     )
 }
 
+// Failed command responses may carry diagnostics but cannot request native effects.
+fn plugin_command_presentation(
+    response: bcode_command::InvokeCommandResponse,
+) -> (Option<String>, Vec<bcode_command::CommandEffect>) {
+    if response.success {
+        (response.message, response.effects)
+    } else {
+        (
+            Some(
+                response
+                    .message
+                    .unwrap_or_else(|| "Plugin command failed".to_owned()),
+            ),
+            Vec::new(),
+        )
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn apply_effect_result(
     settings: &mut TuiRuntimeSettings,
@@ -3926,10 +3944,11 @@ pub fn apply_effect_result(
         }
         TuiEffectResult::PluginCommandInvoked { plugin_id, result } => match result {
             Ok(response) => {
-                if let Some(message) = response.message {
+                let (message, effects) = plugin_command_presentation(response);
+                if let Some(message) = message {
                     chat.app.set_status(message);
                 }
-                for effect in response.effects {
+                for effect in effects {
                     match effect {
                         bcode_command::CommandEffect::Status { message } => {
                             chat.app.set_status(message);
@@ -3981,7 +4000,7 @@ pub fn apply_effect_result(
                     }
                 }
             }
-            Err(error) => report_nonfatal_tui_error(chat, "Plugin command failed", &error),
+            Err(error) => report_nonfatal_tui_error(chat, "Plugin command outcome", &error),
         },
         TuiEffectResult::SubmitMessage {
             submission_id,
@@ -6976,6 +6995,65 @@ pub fn cycle_session_agent(chat: &mut ActiveChat) {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    fn command_response(success: bool) -> bcode_command::InvokeCommandResponse {
+        bcode_command::InvokeCommandResponse {
+            success,
+            message: Some("command diagnostic".to_owned()),
+            updated_model: None,
+            updated_provider: None,
+            updated_thinking: None,
+            effects: vec![
+                bcode_command::CommandEffect::Status {
+                    message: "must not replace failure".to_owned(),
+                },
+                bcode_command::CommandEffect::CopyText {
+                    text: "clipboard".to_owned(),
+                },
+                bcode_command::CommandEffect::AppendText {
+                    text: "transcript".to_owned(),
+                    format: bcode_command::CommandTextFormat::PlainText,
+                },
+                bcode_command::CommandEffect::ToggleSurface {
+                    surface_id: "surface".to_owned(),
+                },
+                bcode_command::CommandEffect::OpenSession {
+                    session_id: bcode_session_models::SessionId::new(),
+                    focus: bcode_command::SessionOpenFocus::Composer,
+                },
+                bcode_command::CommandEffect::OpenPluginSurface {
+                    surface_kind: "kind".to_owned(),
+                    instance_id: "instance".to_owned(),
+                    options: serde_json::Value::Null,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn failed_command_preserves_diagnostic_and_suppresses_native_effects() {
+        let (message, effects) = plugin_command_presentation(command_response(false));
+        assert_eq!(message.as_deref(), Some("command diagnostic"));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn successful_command_preserves_native_effects_in_order() {
+        let response = command_response(true);
+        let expected = response.effects.clone();
+        let (message, effects) = plugin_command_presentation(response);
+        assert_eq!(message.as_deref(), Some("command diagnostic"));
+        assert_eq!(effects, expected);
+    }
+
+    #[test]
+    fn failed_command_without_message_has_failure_status() {
+        let mut response = command_response(false);
+        response.message = None;
+        let (message, effects) = plugin_command_presentation(response);
+        assert_eq!(message.as_deref(), Some("Plugin command failed"));
+        assert!(effects.is_empty());
+    }
 
     #[test]
     fn search_maintenance_status_messages_are_human_readable_and_truthful() {

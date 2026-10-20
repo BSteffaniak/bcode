@@ -41,7 +41,12 @@ async fn transient_storage_recovery_drives_canonical_run_once() {
     while let Some(result) = retries.join_next().await {
         let result = result.unwrap();
         assert!(
-            result.is_ok() || matches!(result, Err(ServerError::WorkflowStorageUnavailable(_)))
+            result.is_ok()
+                || matches!(
+                    result,
+                    Err(ServerError::WorkflowStorageUnavailable(_)
+                        | ServerError::WorkflowStorageBusy)
+                )
         );
     }
     tokio::time::timeout(Duration::from_secs(2), async {

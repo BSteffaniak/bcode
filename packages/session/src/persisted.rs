@@ -17,6 +17,324 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Independent decode limits for an initial observation event page.
+///
+/// Counts use session-owned structural dimensions, not guessed allocator overhead.
+/// The decoded byte limit also bounds JSON parser string scratch space. A page shares
+/// one budget across events; exhausted admission is distinct from canonical damage.
+#[derive(Debug)]
+pub struct EventDecodeBudget {
+    remaining_decoded_bytes: usize,
+    limits: bcode_session_models::retention::ObservationRetentionLimits,
+    usage: bcode_session_models::retention::ObservationRetentionUsage,
+    exceeded: bool,
+}
+
+impl EventDecodeBudget {
+    /// Create an explicit page budget; no hidden defaults or byte multipliers.
+    #[must_use]
+    pub const fn new(
+        max_decoded_bytes: usize,
+        limits: bcode_session_models::retention::ObservationRetentionLimits,
+    ) -> Self {
+        Self {
+            remaining_decoded_bytes: max_decoded_bytes,
+            limits,
+            usage: bcode_session_models::retention::ObservationRetentionUsage {
+                scalar_capacity_bytes: 0,
+                collection_entries: 0,
+                value_nodes: 0,
+                depth: 0,
+                copies: 0,
+            },
+            exceeded: false,
+        }
+    }
+
+    /// Inspect an already-decoded source before an initial-page clone.
+    /// # Errors
+    /// Uninspected domains or exhausted aggregate structural policy fail closed.
+    pub(crate) fn admit_source_clone(
+        &mut self,
+        event: &SessionEvent,
+    ) -> Result<(), EventDecodeError> {
+        if event.schema_version != CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+            return Err(EventDecodeError::ResourceLimit);
+        }
+        let source_limits = bcode_session_models::retention::SessionObservationSourceLimits {
+            max_scalar_capacity_bytes: self.limits.scalar_capacity_bytes,
+            max_collection_entries: self.limits.collection_entries,
+            max_value_nodes: self.limits.value_nodes,
+            max_depth: self.limits.depth,
+            max_queued_events: self.limits.copies,
+            max_in_flight_events: 0,
+        };
+        let usage = bcode_session_models::retention_events::inspect_durable(event, &source_limits)
+            .map_err(|_| EventDecodeError::ResourceLimit)?;
+        self.usage
+            .try_add(usage, self.limits)
+            .map_err(|_| EventDecodeError::ResourceLimit)?;
+        Ok(())
+    }
+
+    fn charge(&mut self, scalars: usize, entries: usize, depth: usize) -> Result<(), ()> {
+        let Some(scalar_capacity_bytes) = self.usage.scalar_capacity_bytes.checked_add(scalars)
+        else {
+            self.exceeded = true;
+            return Err(());
+        };
+        let Some(collection_entries) = self.usage.collection_entries.checked_add(entries) else {
+            self.exceeded = true;
+            return Err(());
+        };
+        let Some(value_nodes) = self.usage.value_nodes.checked_add(1) else {
+            self.exceeded = true;
+            return Err(());
+        };
+        let next = bcode_session_models::retention::ObservationRetentionUsage {
+            scalar_capacity_bytes,
+            collection_entries,
+            value_nodes,
+            depth: self.usage.depth.max(depth),
+            copies: 1,
+        };
+        if next.check(self.limits).is_err() {
+            self.exceeded = true;
+            return Err(());
+        }
+        self.usage = next;
+        Ok(())
+    }
+}
+
+/// Initial-page resource exhaustion is not canonical corruption or an unsupported version.
+#[derive(Debug, thiserror::Error)]
+pub enum EventDecodeError {
+    /// Explicit observation resource policy cannot admit this event page.
+    #[error("initial observation event decode resource limit exceeded")]
+    ResourceLimit,
+    /// Existing canonical decoding classification is retained unchanged.
+    #[error(transparent)]
+    Canonical(#[from] PersistedSessionEventError),
+}
+
+struct EventShapeSeed<'a> {
+    budget: &'a mut EventDecodeBudget,
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for EventShapeSeed<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        self.budget
+            .charge(0, 0, self.depth)
+            .map_err(|()| serde::de::Error::custom("event resource limit"))?;
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for EventShapeSeed<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("canonical JSON value within observation limits")
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
+        self.budget
+            .charge(value.len(), 0, self.depth)
+            .map_err(|()| E::custom("event resource limit"))
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if seq.size_hint().is_some_and(|hint| {
+            hint > self
+                .budget
+                .limits
+                .collection_entries
+                .saturating_sub(self.budget.usage.collection_entries)
+        }) {
+            self.budget.exceeded = true;
+            return Err(serde::de::Error::custom("event resource limit"));
+        }
+        loop {
+            // Charge the prospective slot before decoding it, without allocating a vector.
+            self.budget
+                .charge(0, 1, self.depth)
+                .map_err(|()| serde::de::Error::custom("event resource limit"))?;
+            if seq
+                .next_element_seed(EventShapeSeed {
+                    budget: self.budget,
+                    depth: self.depth.saturating_add(1),
+                })?
+                .is_none()
+            {
+                self.budget.usage.collection_entries -= 1;
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        if map.size_hint().is_some_and(|hint| {
+            hint > self
+                .budget
+                .limits
+                .collection_entries
+                .saturating_sub(self.budget.usage.collection_entries)
+        }) {
+            self.budget.exceeded = true;
+            return Err(serde::de::Error::custom("event resource limit"));
+        }
+        loop {
+            self.budget
+                .charge(0, 1, self.depth)
+                .map_err(|()| serde::de::Error::custom("event resource limit"))?;
+            if map
+                .next_key_seed(EventShapeSeed {
+                    budget: self.budget,
+                    depth: self.depth.saturating_add(1),
+                })?
+                .is_none()
+            {
+                self.budget.usage.collection_entries -= 1;
+                break;
+            }
+            map.next_value_seed(EventShapeSeed {
+                budget: self.budget,
+                depth: self.depth.saturating_add(1),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Decode one current canonical event after bounded decompression and streaming shape admission.
+///
+/// The streaming pass retains no JSON tree; collection hints never cause reservations.
+/// Encoded/decompressed bytes bound parser scratch before parsing. The admitted shape
+/// is then decoded by the existing canonical decoder. This bounds initial-page inputs,
+/// not all allocations or every session read path.
+/// # Errors
+/// Returns a distinct resource limit or the existing canonical damage/version error.
+pub fn decode_session_event_with_budget(
+    payload: &str,
+    budget: &mut EventDecodeBudget,
+) -> Result<SessionEvent, EventDecodeError> {
+    use serde::de::DeserializeSeed as _;
+    if budget.exceeded {
+        return Err(EventDecodeError::ResourceLimit);
+    }
+    // Bound the decompressor before any output allocation. Structural scratch admission
+    // uses the explicit remaining output cap, not a guessed heap multiplier.
+    let output_limit = budget.remaining_decoded_bytes.min(
+        budget
+            .limits
+            .scalar_capacity_bytes
+            .saturating_sub(budget.usage.scalar_capacity_bytes),
+    );
+    let decoded = crate::event_compression::decode_event_payload_with_limit(payload, output_limit)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::OutOfMemory {
+                EventDecodeError::ResourceLimit
+            } else {
+                EventDecodeError::Canonical(PersistedSessionEventError::Compression(error))
+            }
+        })?;
+    budget.remaining_decoded_bytes -= decoded.len();
+    // Reserve decoded text and parser scratch independently before either JSON tree exists.
+    budget
+        .charge(decoded.len(), 0, 1)
+        .map_err(|()| EventDecodeError::ResourceLimit)?;
+    budget
+        .charge(decoded.len(), 0, 1)
+        .map_err(|()| EventDecodeError::ResourceLimit)?;
+    let mut deserializer = serde_json::Deserializer::from_str(&decoded);
+    let checked = EventShapeSeed { budget, depth: 1 }.deserialize(&mut deserializer);
+    if let Err(error) = checked {
+        return Err(if budget.exceeded {
+            EventDecodeError::ResourceLimit
+        } else {
+            EventDecodeError::Canonical(PersistedSessionEventError::Json(error))
+        });
+    }
+    deserializer
+        .end()
+        .map_err(PersistedSessionEventError::Json)?;
+    decode_session_event(&decoded).map_err(EventDecodeError::Canonical)
+}
+
+#[cfg(test)]
+mod initial_decode_budget_tests {
+    use super::*;
+    fn budget(bytes: usize, entries: usize, depth: usize) -> EventDecodeBudget {
+        EventDecodeBudget::new(
+            bytes,
+            bcode_session_models::retention::ObservationRetentionLimits {
+                scalar_capacity_bytes: 4096,
+                collection_entries: entries,
+                value_nodes: 4096,
+                depth,
+                copies: 1,
+            },
+        )
+    }
+    #[test]
+    fn structural_limits_are_distinct_from_invalid_canonical_json() {
+        assert!(matches!(
+            decode_session_event_with_budget("[0,0,0,0]", &mut budget(100, 2, 10)),
+            Err(EventDecodeError::ResourceLimit)
+        ));
+        assert!(matches!(
+            decode_session_event_with_budget("[[[[0]]]]", &mut budget(100, 100, 2)),
+            Err(EventDecodeError::ResourceLimit)
+        ));
+        assert!(matches!(
+            decode_session_event_with_budget("{", &mut budget(100, 100, 10)),
+            Err(EventDecodeError::Canonical(_))
+        ));
+        assert!(matches!(
+            decode_session_event_with_budget("\"oversize\"", &mut budget(2, 100, 10)),
+            Err(EventDecodeError::ResourceLimit)
+        ));
+    }
+    #[test]
+    fn page_budget_is_aggregate_and_old_decoder_classification_is_preserved() {
+        let mut page = budget(8, 100, 10);
+        assert!(matches!(
+            decode_session_event_with_budget("null", &mut page),
+            Err(EventDecodeError::Canonical(_))
+        ));
+        assert!(matches!(
+            decode_session_event_with_budget("null", &mut page),
+            Err(EventDecodeError::Canonical(_))
+        ));
+        assert!(matches!(
+            decode_session_event_with_budget("null", &mut page),
+            Err(EventDecodeError::ResourceLimit)
+        ));
+        let future = r#"{"schema_version":65535,"kind":{"Future":null}}"#;
+        assert!(matches!(
+            decode_session_event_with_budget(future, &mut budget(100, 100, 10)),
+            Err(EventDecodeError::Canonical(
+                PersistedSessionEventError::UnsupportedSchemaVersion { .. }
+            ))
+        ));
+    }
+}
+
 /// Decode a persisted session event from durable JSON.
 ///
 /// # Errors
@@ -571,6 +889,8 @@ enum PersistedSessionEventKind {
     },
     ChildSessionCreated {
         request: Box<bcode_session_models::SessionChildCreateRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawning: Option<Box<bcode_session_models::SessionSpawnRequest>>,
     },
     SessionChildLinked {
         child_id: SessionId,
@@ -627,9 +947,12 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                     title: title.clone(),
                 }
             }
-            SessionEventKind::ChildSessionCreated { request } => Self::ChildSessionCreated {
-                request: request.clone(),
-            },
+            SessionEventKind::ChildSessionCreated { request, spawning } => {
+                Self::ChildSessionCreated {
+                    request: request.clone(),
+                    spawning: spawning.clone(),
+                }
+            }
             SessionEventKind::SessionCreated {
                 name,
                 working_directory,
@@ -1111,8 +1434,8 @@ impl PersistedSessionEventKind {
             Self::SessionChildPublished { child_id, title } => {
                 SessionEventKind::SessionChildPublished { child_id, title }
             }
-            Self::ChildSessionCreated { request } => {
-                SessionEventKind::ChildSessionCreated { request }
+            Self::ChildSessionCreated { request, spawning } => {
+                SessionEventKind::ChildSessionCreated { request, spawning }
             }
             Self::SessionCreated {
                 name,
@@ -1574,6 +1897,70 @@ impl PersistedSessionEventKind {
 mod tests {
     use super::*;
     use bcode_session_models::ToolInvocationResult;
+
+    fn child_creation_event(spawned: bool) -> SessionEvent {
+        let child_id = SessionId::new();
+        let request = bcode_session_models::SessionChildCreateRequest {
+            child_id,
+            parent_id: SessionId::new(),
+            name: Some("child".to_owned()),
+            working_directory: "/tmp".into(),
+        };
+        let spawning = spawned.then(|| {
+            Box::new(bcode_session_models::SessionSpawnRequest {
+                version: 1,
+                creation: request.clone(),
+                worktree_directory: Some("/tmp".into()),
+                input: "immutable input".to_owned(),
+                admission: TurnAdmissionMetadata::default(),
+                auth_profile: Some("configured-profile".to_owned()),
+            })
+        });
+        SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 13,
+            session_id: child_id,
+            provenance: None,
+            kind: SessionEventKind::ChildSessionCreated {
+                request: Box::new(request),
+                spawning,
+            },
+        }
+    }
+
+    #[test]
+    fn child_creation_codec_preserves_composed_request_and_ordinary_absence() {
+        for spawned in [false, true] {
+            let event = child_creation_event(spawned);
+            let encoded = encode_session_event(&event).expect("encode child creation");
+            let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                value["kind"]["child_session_created"]
+                    .get("spawning")
+                    .is_some(),
+                spawned
+            );
+            assert_eq!(
+                decode_session_event(&encoded).expect("decode child creation"),
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn child_creation_codec_rejects_old_and_future_schemas_before_dropping_composition() {
+        for spawned in [false, true] {
+            let encoded = encode_session_event(&child_creation_event(spawned)).unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            for schema in [51, CURRENT_SESSION_EVENT_SCHEMA_VERSION + 1] {
+                value["schema_version"] = schema.into();
+                assert!(matches!(decode_session_event(&value.to_string()),
+                    Err(PersistedSessionEventError::UnsupportedSchemaVersion { actual, current })
+                    if actual == schema && current == CURRENT_SESSION_EVENT_SCHEMA_VERSION));
+            }
+        }
+    }
 
     #[test]
     fn model_usage_round_trips_applied_rates_without_catalog_lookup() {

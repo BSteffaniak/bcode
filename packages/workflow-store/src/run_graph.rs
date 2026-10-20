@@ -2323,7 +2323,33 @@ impl WorkflowStore {
                 serde_json::from_value(node.configuration.clone())?;
             call.validate()
                 .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-            let identity = call.target.definition_identity();
+            let local_identity;
+            let identity = if let bcode_workflow::WorkflowCallTarget::PackageLocal { reference } =
+                &call.target
+            {
+                let binding =
+                    Self::package_binding_in(transaction, &request.run_id)?.ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "local graph call requires bound run".into(),
+                        )
+                    })?;
+                let lock = Self::package_lock_on(transaction, &binding.0, &binding.1)?.ok_or_else(
+                    || WorkflowStoreError::InvalidData("parent package unavailable".into()),
+                )?;
+                let member = lock
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == reference.member_id)
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData("member absent from bound lock".into())
+                    })?;
+                local_identity = member.definition_identity.clone();
+                &local_identity
+            } else {
+                call.target
+                    .definition_identity()
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+            };
             let target = Self::definition_in(
                 transaction,
                 &identity.definition_id,
@@ -2334,6 +2360,21 @@ impl WorkflowStore {
             })?;
             let definition: bcode_workflow::WorkflowDefinition =
                 serde_json::from_str(&target.definition_json)?;
+            if let bcode_workflow::WorkflowCallTarget::PackageLocal { reference } = &call.target
+                && (
+                    reference.workflow_id.as_str(),
+                    &reference.input,
+                    &reference.output,
+                ) != (
+                    identity.kind.as_str(),
+                    &definition.input,
+                    &definition.output,
+                )
+            {
+                return Err(WorkflowStoreError::InvalidData(
+                    "local call declared interface differs from bound definition".into(),
+                ));
+            }
             if node.input != definition.input || node.output != definition.output {
                 return Err(WorkflowStoreError::InvalidData(
                     "published call target interface mismatch".to_owned(),

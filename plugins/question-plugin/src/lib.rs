@@ -4,7 +4,7 @@
 
 //! Interactive question tool plugin for Bcode.
 
-#[cfg(feature = "static-bundled")]
+mod question_controller;
 mod question_interaction;
 #[cfg(feature = "static-bundled")]
 mod question_outcome_tui;
@@ -29,7 +29,6 @@ const MAX_QUESTIONS: usize = 32;
 const MAX_OPTIONS_PER_QUESTION: usize = 100;
 const MAX_QUESTION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_OPTION_TEXT_BYTES: usize = 4 * 1024;
-#[cfg(feature = "static-bundled")]
 const MAX_CUSTOM_ANSWER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
@@ -52,6 +51,7 @@ impl RustPlugin for QuestionPlugin {
 fn invoke_question_service(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.interface_id.as_str() {
         TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(context),
+        "bcode.interaction-controller/v1" => question_controller::invoke(context),
         _ => ServiceResponse::error(
             "unsupported_interface",
             "unsupported question plugin service interface",

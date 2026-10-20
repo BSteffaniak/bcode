@@ -47,6 +47,18 @@ use std::path::PathBuf;
 /// Requests owned by the `SessionLifecycle` dispatcher (41 variants).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionLifecycleRequest {
+    OpenSessionObservation {
+        request: bcode_session_models::observation::SessionObservationRequest,
+    },
+    PullSessionObservation {
+        request: bcode_session_models::observation::SessionObservationPullRequest,
+    },
+    CloseSessionObservation {
+        handle: bcode_session_models::observation::SessionObservationHandle,
+    },
+    SpawnSession {
+        request: bcode_session_models::SessionSpawnRequest,
+    },
     Hello {
         client_name: String,
         runtime_context: Option<ClientRuntimeContext>,
@@ -70,6 +82,9 @@ pub enum SessionLifecycleRequest {
     },
     /// Inspect effective model catalog and refresh state.
     ModelCatalogDiagnostics,
+    RuntimeStatus,
+    ModelCatalogSnapshot,
+    RefreshModelCatalog,
     ServerStop {
         mode: ServerStopMode,
     },
@@ -827,6 +842,9 @@ pub enum CoreRuntimeRequest {
         after: Option<WorkId>,
         limit: usize,
     },
+    RuntimeWorkPage {
+        request: bcode_session_models::RuntimeWorkPageRequest,
+    },
     ListRuntimeWork {
         session_id: SessionId,
     },
@@ -901,6 +919,15 @@ pub enum CoreRuntimeRequest {
         auth_profile: String,
         request_json: String,
     },
+    ListApplicationCommands {
+        plugin_id: String,
+    },
+    InvokeApplicationCommand {
+        request: Box<bcode_command::application::CommandInvocationRequest>,
+    },
+    CancelApplicationCommand {
+        invocation_id: String,
+    },
     AuthPoolList,
     SetAuthPoolPreference {
         pool: String,
@@ -911,6 +938,16 @@ pub enum CoreRuntimeRequest {
 /// Requests owned by the `PermissionInteraction` dispatcher (5 variants).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionInteractionRequest {
+    OpenInteractionController {
+        version: u32,
+        exchange_id: String,
+    },
+    InteractionControllerSnapshot {
+        exchange_id: String,
+    },
+    InteractionControllerInput {
+        input: bcode_plugin_models::interaction_controller::InteractionControllerInput,
+    },
     ListPermissions,
     ResolvePermission {
         permission_id: String,
@@ -2149,6 +2186,9 @@ impl RoutedRequest {
                 after,
                 limit,
             })),
+            Request::RuntimeWorkPage { request } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::RuntimeWorkPage { request }))
+            }
             Request::ListRuntimeWork { session_id } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::ListRuntimeWork { session_id }))
             }
@@ -2187,6 +2227,39 @@ impl RoutedRequest {
             Request::ComposerDraft { scope } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ComposerDraft { scope }))
             }
+            Request::OpenSessionObservation { request } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::OpenSessionObservation {
+                    request,
+                }))
+            }
+            Request::PullSessionObservation { request } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::PullSessionObservation {
+                    request,
+                }))
+            }
+            Request::CloseSessionObservation { handle } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CloseSessionObservation {
+                    handle,
+                }))
+            }
+            Request::SpawnSession { request } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SpawnSession { request }))
+            }
+            Request::OpenInteractionController {
+                version,
+                exchange_id,
+            } => Self::PermissionInteraction(
+                PermissionInteractionRequest::OpenInteractionController {
+                    version,
+                    exchange_id,
+                },
+            ),
+            Request::InteractionControllerSnapshot { exchange_id } => Self::PermissionInteraction(
+                PermissionInteractionRequest::InteractionControllerSnapshot { exchange_id },
+            ),
+            Request::InteractionControllerInput { input } => Self::PermissionInteraction(
+                PermissionInteractionRequest::InteractionControllerInput { input },
+            ),
             Request::ListPendingToolExchanges => {
                 Self::PermissionInteraction(PermissionInteractionRequest::ListPendingToolExchanges)
             }
@@ -2197,6 +2270,15 @@ impl RoutedRequest {
                 exchange_id,
                 resolution_json,
             }),
+            Request::RuntimeStatus => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RuntimeStatus))
+            }
+            Request::ModelCatalogSnapshot => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ModelCatalogSnapshot))
+            }
+            Request::RefreshModelCatalog => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RefreshModelCatalog))
+            }
             Request::ModelCatalogDiagnostics => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ModelCatalogDiagnostics))
             }
@@ -2237,6 +2319,21 @@ impl RoutedRequest {
             Request::IngestClientMetrics { batch } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::IngestClientMetrics {
                     batch,
+                }))
+            }
+            Request::ListApplicationCommands { plugin_id } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::ListApplicationCommands {
+                    plugin_id,
+                }))
+            }
+            Request::InvokeApplicationCommand { request } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::InvokeApplicationCommand {
+                    request,
+                }))
+            }
+            Request::CancelApplicationCommand { invocation_id } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::CancelApplicationCommand {
+                    invocation_id,
                 }))
             }
             Request::AuthPoolList => Self::CoreRuntime(Box::new(CoreRuntimeRequest::AuthPoolList)),

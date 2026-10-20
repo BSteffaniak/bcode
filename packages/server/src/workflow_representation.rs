@@ -106,11 +106,35 @@ async fn retained_store(
     }
 }
 
+#[cfg(test)]
+#[test]
+fn read_failure_normalization_preserves_only_typed_busy() {
+    use representation::RepresentationError;
+
+    let busy = backpressure::normalize(RepresentationError::Database(
+        switchy_database::DatabaseError::Busy,
+    ));
+    assert!(matches!(&busy, ServerError::WorkflowStorageBusy));
+    assert_eq!(
+        crate::request_error_response(&busy).code,
+        "workflow_storage_busy"
+    );
+    for error in [
+        RepresentationError::MaintenanceRequired,
+        RepresentationError::UnsupportedStore,
+        RepresentationError::AuthorityConflict,
+    ] {
+        let failure = crate::request_error_response(&backpressure::normalize(error));
+        assert_eq!(failure.code, "workflow_unavailable");
+        assert_eq!(failure.message, "workflow state is unavailable");
+    }
+}
+
 async fn lookup_at(path: &Path, run_id: &str) -> Result<RunLookup, ServerError> {
     let db = open(path, false)?;
-    backpressure::retry(|| representation::runs::lookup(&db, run_id))
+    backpressure::queued(path, || representation::runs::lookup(&db, run_id))
         .await
-        .map_err(|_| unavailable())
+        .map_err(backpressure::normalize)
 }
 
 /// Exact status routing. Only a verified legacy identity reaches the legacy reader.
@@ -127,7 +151,7 @@ pub async fn status(
             let db = open(path, false)?;
             backpressure::retry(|| representation::runs::summary(&db, run_id))
                 .await
-                .map_err(|_| unavailable())
+                .map_err(backpressure::normalize)
         }
         RunLookup::UnsupportedRepresentation => Err(unsupported()),
         RunLookup::Degraded => Err(unavailable()),
@@ -178,6 +202,14 @@ pub async fn admit_prepared(
     state: &ServerState,
     run: &bcode_workflow_store::NewWorkflowRun,
 ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, ServerError> {
+    admit_prepared_package(state, run, None).await
+}
+
+pub async fn admit_prepared_package(
+    state: &ServerState,
+    run: &bcode_workflow_store::NewWorkflowRun,
+    package: Option<(&str, &str)>,
+) -> Result<Option<bcode_workflow::WorkflowRunSummary>, ServerError> {
     use representation::AdmissionFamily;
     let retained = retained_store(state).await?;
     let db = open(retained.path(), false)?;
@@ -221,12 +253,20 @@ pub async fn admit_prepared(
         .map_err(|_| unavailable())?;
     let capture_observations =
         state.observability.persist_model_requests || state.observability.persist_tool_io;
+    let binding = package.map(
+        |(id, digest)| bcode_workflow_store::WorkflowRunPackageBinding {
+            version: 1,
+            package_id: id.into(),
+            lock_digest: digest.into(),
+        },
+    );
     backpressure::retry(|| {
-        Box::pin(representation::admit_registered_observed(
+        Box::pin(representation::admit_registered_package_observed(
             &db,
             run,
             &definition,
             capture_observations,
+            binding.as_ref(),
         ))
     })
     .await
@@ -234,6 +274,40 @@ pub async fn admit_prepared(
     backpressure::retry(|| representation::runs::summary(&db, &run.run_id))
         .await
         .map_err(|_| unavailable())
+}
+
+fn normalize_package_binding_failure(error: representation::RepresentationError) -> ServerError {
+    if matches!(
+        error,
+        representation::RepresentationError::Database(switchy_database::DatabaseError::Busy)
+    ) {
+        ServerError::WorkflowStorageBusy
+    } else {
+        drop(error);
+        unsupported()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn package_binding_failure_preserves_busy_without_accepting_unsupported_state() {
+    use representation::RepresentationError;
+
+    let busy = normalize_package_binding_failure(RepresentationError::Database(
+        switchy_database::DatabaseError::Busy,
+    ));
+    assert!(matches!(busy, ServerError::WorkflowStorageBusy));
+    for error in [
+        RepresentationError::MaintenanceRequired,
+        RepresentationError::UnsupportedStore,
+        RepresentationError::AuthorityConflict,
+    ] {
+        let failure = normalize_package_binding_failure(error);
+        assert!(matches!(
+            failure,
+            ServerError::WorkflowStore(bcode_workflow_store::WorkflowStoreError::InvalidData(_))
+        ));
+    }
 }
 
 /// Route an existing exact run without admitting new work or claiming unknown authority.
@@ -251,10 +325,15 @@ pub async fn drive_if_represented(
         }
         RunLookup::Available(_) => {
             let db = open(retained.path(), false)?;
+            backpressure::retry(|| {
+                representation::admission_projection::package_binding(&db, run_id)
+            })
+            .await
+            .map_err(normalize_package_binding_failure)?;
             let (_, definition) =
                 backpressure::retry(|| representation::graph_revision::current(&db, run_id))
                     .await
-                    .map_err(|_| unavailable())?;
+                    .map_err(backpressure::normalize)?;
             if representation::definition_dispatch_availability(&definition)
                 .map_err(|_| unsupported())?
                 != representation::DispatchAvailability::AgentControlLifecycle

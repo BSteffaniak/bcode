@@ -5,6 +5,27 @@ use bcode_session_models::{SessionEvent, SessionId, SessionSummary};
 use tokio::sync::broadcast;
 
 impl SessionManager {
+    /// Subscribe to admission-bounded observation updates without attaching a client.
+    ///
+    /// Queue/structural exhaustion terminates this observer only, not persistence
+    /// or the existing broadcast feeds. The initial summary is inspected/reserved
+    /// before cloning, and shares structural admission with queued/in-flight updates.
+    /// Initial durable reads must be decoded under their own bounded read policy;
+    /// use `admit_history_event` before retaining an additional source event copy.
+    ///
+    /// # Errors
+    /// Returns an error when the session cannot be opened. Invalid limits are
+    /// reported as a terminal `LimitReached` by the returned subscription.
+    pub async fn subscribe_session_events_bounded(
+        &self,
+        session_id: SessionId,
+        limits: bcode_session_models::SessionObservationSourceLimits,
+    ) -> Result<crate::BoundedSessionEventSubscription, SessionError> {
+        self.session_handle(session_id)
+            .await?
+            .subscribe_events_bounded(limits)
+            .await
+    }
     /// Subscribe to committed durable session mutations.
     #[must_use]
     pub fn subscribe_mutations(&self) -> broadcast::Receiver<SessionMutationCommitted> {

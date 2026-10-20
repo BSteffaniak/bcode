@@ -5,10 +5,12 @@
 
 //! Plugin author SDK for Bcode native plugins.
 
+pub mod application;
 pub mod auxiliary_generation;
 pub mod composer;
 pub mod generation;
 pub mod interaction;
+pub mod interaction_application;
 pub mod milestones;
 pub mod settled_turn;
 /// Portable contributor-owned action declarations.

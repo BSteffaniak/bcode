@@ -239,7 +239,7 @@ async fn persisted_capture_lists_reads_and_fails_closed_on_damaged_bytes() {
         mut request,
         bytes,
         path,
-    } = fixture().await;
+    } = Box::pin(fixture()).await;
     let artifacts = list(&state, &request.run_id, &request.dispatch_identity)
         .await
         .unwrap();

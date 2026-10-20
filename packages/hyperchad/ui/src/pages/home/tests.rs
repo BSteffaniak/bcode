@@ -729,6 +729,29 @@ fn activity_messages_expose_bounded_details_without_parsing_payload_markup() {
     assert!(!text.contains("Structured details truncated for display."));
     assert!(!format!("{containers:?}").contains("Element::Raw"));
     assert!(!text.contains(&"x".repeat(40_000)));
+
+    let activity = message.activity.as_mut().unwrap();
+    activity.exact_instructions = None;
+    activity.instruction_bytes = 100_001;
+    let omitted = message_content(&message);
+    let mut omitted_text = String::new();
+    for container in &omitted {
+        container_text(container, &mut omitted_text);
+    }
+    assert!(omitted_text.contains("Exact instructions omitted from this snapshot"));
+    assert!(omitted_text.contains("100001 UTF-8 bytes"));
+    assert!(omitted_text.contains("session event 42"));
+    assert!(!omitted_text.contains("Exact submitted instructions"));
+    assert!(!format!("{omitted:?}").contains("Element::Raw"));
+
+    message.activity.as_mut().unwrap().exact_instructions = Some("Ω".repeat(100_001));
+    let mut truncated_text = String::new();
+    for container in &message_content(&message) {
+        container_text(container, &mut truncated_text);
+    }
+    assert!(truncated_text.contains("Instructions truncated for display"));
+    assert_eq!(truncated_text.matches('Ω').count(), 100_000);
+
     message.activity = None;
     let mut ordinary = String::new();
     for container in &message_content(&message) {

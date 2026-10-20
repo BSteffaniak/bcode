@@ -1307,7 +1307,24 @@ fn startup_upgrade_does_not_revoke_old_store_ownership() {
     assert_eq!(detected_store_schema(&connection), Some(15));
     drop(connection);
     drop(owner);
-    assert!(WorkflowStore::initialize_in_state_dir(temp.path(), 905).is_ok());
+    let upgraded = WorkflowStore::initialize_in_state_dir(temp.path(), 905)
+        .expect("upgrade after historical store owner releases ownership");
+    assert_eq!(
+        detected_store_schema(&upgraded.connection),
+        Some(WORKFLOW_STORE_SCHEMA_VERSION)
+    );
+    assert!(
+        upgraded
+            .run_summary("run-1")
+            .expect("preserved run")
+            .is_some()
+    );
+    assert!(
+        upgraded
+            .run_graph_revision("run-1")
+            .expect("migrated graph")
+            .is_some()
+    );
 }
 #[test]
 fn schema_migration_rolls_back_when_canonical_relationships_are_damaged() {

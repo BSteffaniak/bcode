@@ -10,6 +10,7 @@
 #[cfg(test)]
 mod bpdl_contract_tests;
 
+pub mod application;
 pub mod completion;
 
 use bcode_model::ReasoningEffort;

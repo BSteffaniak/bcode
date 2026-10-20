@@ -489,15 +489,8 @@ pub struct SessionCompatibilityInventoryResponse {
     pub next_cursor: Option<SessionCompatibilityCursor>,
 }
 
-/// Normalized result of explicitly requested optional milestone generation.
-/// Failure text is diagnostic presentation, never provider-private data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionMilestoneGenerationOutcome {
-    /// Whether the optional generation operation succeeded (including a no-milestone result).
-    pub success: bool,
-    /// Bounded human-readable outcome.
-    pub text: String,
-}
+/// Compatibility export of the session-owned milestone-generation result.
+pub use bcode_session_models::SessionMilestoneGenerationOutcome;
 
 #[cfg(test)]
 mod milestone_wire_tests {
@@ -1326,6 +1319,33 @@ pub enum Request {
     ComposerDraft {
         scope: ComposerDraftScope,
     },
+    /// Open a connection-owned bounded semantic session observation.
+    OpenSessionObservation {
+        request: bcode_session_models::observation::SessionObservationRequest,
+    },
+    /// Pull the next semantic delivery without durable reconnection guarantees.
+    PullSessionObservation {
+        request: bcode_session_models::observation::SessionObservationPullRequest,
+    },
+    /// Release a connection-owned observation without cancelling session work.
+    CloseSessionObservation {
+        handle: bcode_session_models::observation::SessionObservationHandle,
+    },
+    /// Compose canonical child creation and initial ordinary turn admission.
+    SpawnSession {
+        request: bcode_session_models::SessionSpawnRequest,
+    },
+    /// Open a producer-pinned ephemeral semantic controller for a pending exchange.
+    OpenInteractionController {
+        version: u32,
+        exchange_id: String,
+    },
+    InteractionControllerSnapshot {
+        exchange_id: String,
+    },
+    InteractionControllerInput {
+        input: bcode_plugin_models::interaction_controller::InteractionControllerInput,
+    },
     ListPendingToolExchanges,
     ResolveToolExchange {
         exchange_id: String,
@@ -1563,6 +1583,28 @@ pub enum Request {
     WorkflowActivityClose {
         scan_id: String,
     },
+    /// Read portable runtime facts without materializing the compatibility session catalog.
+    RuntimeStatus,
+    /// Explicit full model catalog compatibility snapshot.
+    ModelCatalogSnapshot,
+    /// Explicit network/cache refresh; failed refresh remains visible in diagnostics.
+    RefreshModelCatalog,
+    /// Discover typed command descriptors from an enabled plugin.
+    ListApplicationCommands {
+        plugin_id: String,
+    },
+    /// Invoke through the typed command owner with caller-scoped cancellation.
+    InvokeApplicationCommand {
+        request: Box<bcode_command::application::CommandInvocationRequest>,
+    },
+    /// Request cancellation; acknowledgment does not establish terminal completion.
+    CancelApplicationCommand {
+        invocation_id: String,
+    },
+    /// Bounded ephemeral active-owner range; not durable resume or idleness proof.
+    RuntimeWorkPage {
+        request: bcode_session_models::RuntimeWorkPageRequest,
+    },
 }
 
 /// Server stop request policy.
@@ -1610,6 +1652,10 @@ pub struct ClientRuntimeContext {
     /// case no cross-provider environment is applied.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub process_env: BTreeMap<String, String>,
+    /// Explicit renderer-neutral interaction-controller versions accepted by this consumer.
+    /// Unknown versions confer no capability; omission retains legacy renderer-only admission.
+    #[serde(default)]
+    pub interaction_controller_versions: BTreeSet<u32>,
     /// Renderer-owned adapters available on this client connection.
     #[serde(default)]
     pub interaction_adapters:
@@ -1842,34 +1888,13 @@ mod contextual_agent_contract_tests {
     }
 }
 
-/// Context hints and lifetime for one client-owned plugin invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginServiceContext {
-    /// Selected enabled agent hint. Missing legacy hints use the explicit default policy.
-    #[serde(default)]
-    pub agent_id: Option<String>,
-    /// Unique identity within the connected client; reuse is rejected.
-    pub invocation_id: String,
-    /// Workspace hints validated by the daemon, never authorization grants.
-    pub workspace: bcode_plugin_sdk::WorkspaceContext,
-    /// Total admission and execution deadline, between 1 and 30,000 milliseconds.
-    pub deadline_ms: u64,
-}
+/// Compatibility exports of plugin-owned application service contracts.
+pub use bcode_plugin_sdk::application::{
+    PluginServiceContext, PluginServiceError, PluginServiceResponse, PluginServiceSummary,
+};
 
 /// Compatibility export of the plugin SDK's discovery contract.
 pub use bcode_plugin_sdk::PluginContributions;
-
-/// Service interface provided by a loaded plugin.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginServiceSummary {
-    pub plugin_id: String,
-    pub interface_id: String,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub workflow_blocks: Vec<bcode_workflow::WorkflowBlockDefinition>,
-}
 
 /// Correlation metadata for one permission checkpoint in a complete tool-call batch.
 pub use bcode_session_models::PermissionBatchCorrelation;
@@ -1885,20 +1910,6 @@ pub use bcode_session_models::SessionArtifactRange;
 
 /// Pending renderer-neutral invocation exchange.
 pub use bcode_session_models::PendingToolExchangeSummary;
-
-/// Plugin service invocation result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginServiceResponse {
-    pub payload: Vec<u8>,
-    pub error: Option<PluginServiceError>,
-}
-
-/// Plugin service invocation error payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginServiceError {
-    pub code: String,
-    pub message: String,
-}
 
 /// Compatibility export of the import-domain warning contract.
 pub use bcode_session_import::ImportWarning as SessionImportWarning;
@@ -2757,6 +2768,26 @@ pub enum ResponsePayload {
     PluginContributions {
         contributions: PluginContributions,
     },
+    SessionObservationOpened {
+        handle: bcode_session_models::observation::SessionObservationHandle,
+    },
+    SessionObservationPulled {
+        #[serde(with = "observation_wire")]
+        result: Box<
+            bcode_session_models::observation::SessionObservationPullResult<
+                bcode_session_view_models::SessionViewSnapshot,
+            >,
+        >,
+    },
+    SessionObservationClosed {
+        closed: bool,
+    },
+    SessionSpawned {
+        result: bcode_session_models::SessionSpawnResult,
+    },
+    InteractionControllerSnapshot {
+        snapshot: bcode_plugin_models::interaction_controller::InteractionControllerSnapshot,
+    },
     PendingToolExchangeList {
         exchanges: Vec<PendingToolExchangeSummary>,
     },
@@ -2919,6 +2950,35 @@ pub enum ResponsePayload {
     },
     /// Ephemeral read resources released; no execution effects.
     WorkflowActivityClosed,
+    /// Portable runtime facts, not private daemon identity/transport state.
+    RuntimeStatus {
+        connected_client_count: usize,
+        selected_provider_plugin_id: Option<String>,
+        selected_model_id: Option<String>,
+        idle_shutdown_blocker: Option<String>,
+        workflow_unavailable_reason: Option<String>,
+    },
+    /// Explicit full model catalog document.
+    ModelCatalogSnapshot {
+        #[serde(with = "model_catalog_wire")]
+        catalog: Box<bcode_model_catalog_models::CatalogDocument>,
+    },
+    /// Typed command discovery response.
+    ApplicationCommandList {
+        commands: bcode_command::CommandList,
+    },
+    /// Settled command response retains success/failure and command-owned effects.
+    ApplicationCommandInvoked {
+        result: Box<bcode_command::application::CommandInvocationResult>,
+    },
+    /// Cancellation admission only.
+    ApplicationCommandCancelled {
+        result: bcode_command::application::CommandCancellationAcknowledgment,
+    },
+    /// Bounded active-owner page.
+    RuntimeWorkPage {
+        page: bcode_session_models::RuntimeWorkPage,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -2966,6 +3026,210 @@ impl ErrorResponse {
             code: code.into(),
             message: message.into(),
         }
+    }
+}
+
+// Internally tagged semantic events buffer their nested fields through Serde
+// Content. The binary codec's named-struct representation is enum-backed in
+// deserialize_any, which Content cannot consume. Adapt only this wire field to
+// self-describing maps; retain the domain's typed value and JSON representation.
+// Catalog deployments flatten their target fields. The binary serializer requires
+// known map lengths, so materialize a self-describing value tree at this field only.
+// This is a typed map/sequence wire representation, not JSON text or opaque bytes.
+mod model_catalog_wire {
+    use serde::{Deserialize as _, Serialize as _};
+    type Catalog = Box<bcode_model_catalog_models::CatalogDocument>;
+
+    pub fn serialize<S: serde::Serializer>(
+        catalog: &Catalog,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            return catalog.serialize(serializer);
+        }
+        serde_json::to_value(catalog)
+            .map_err(|_| serde::ser::Error::custom("model catalog wire projection failed"))?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Catalog, D::Error> {
+        if deserializer.is_human_readable() {
+            return Catalog::deserialize(deserializer);
+        }
+        let tree = serde_json::Value::deserialize(deserializer)?;
+        serde_json::from_value(tree)
+            .map_err(|_| serde::de::Error::custom("invalid model catalog wire projection"))
+    }
+}
+
+#[cfg(test)]
+mod model_catalog_wire_tests {
+    use super::*;
+
+    #[test]
+    fn full_catalog_flattened_deployments_roundtrip_through_typed_response() {
+        let document: bcode_model_catalog_models::CatalogDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "3.0.0", "catalog_revision": "wire-fixture", "generated_at": "2026-01-01T00:00:00Z",
+            "providers": { "fixture": {
+                "provider_id": "fixture", "display_name": "Fixture λ", "kind": "other",
+                "models": { "model": {
+                    "model_id": "model", "display_name": "Complete deployment fixture", "status": "stable",
+                    "deployments": [{
+                        "provider": "fixture", "auth_mode": "api_key", "api_surface": "responses_api",
+                        "integration": "bcode", "context_window": 123_456, "max_output_tokens": 8192
+                    }]
+                }}
+            }}
+        })).unwrap();
+        let response = Response::Ok(ResponsePayload::ModelCatalogSnapshot {
+            catalog: Box::new(document),
+        });
+        let bytes = encode_response(&response).unwrap();
+        assert_eq!(decode_response(&bytes).unwrap(), response);
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(serde_json::from_value::<Response>(json).unwrap(), response);
+    }
+}
+
+mod observation_wire {
+    use serde::{Deserialize as _, Serialize as _};
+    type ResultValue = bcode_session_models::observation::SessionObservationPullResult<
+        bcode_session_view_models::SessionViewSnapshot,
+    >;
+
+    pub fn serialize<S: serde::Serializer>(
+        value: &ResultValue,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            return value.serialize(serializer);
+        }
+        serde_json::to_value(value)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Box<ResultValue>, D::Error> {
+        if deserializer.is_human_readable() {
+            return Box::<ResultValue>::deserialize(deserializer);
+        }
+        let value = serde_json::Value::deserialize(deserializer)?;
+        serde_json::from_value(value)
+            .map(Box::new)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod observation_wire_tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnboxedObservationResponse<'a> {
+        Ok(UnboxedObservationPayload<'a>),
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnboxedObservationPayload<'a> {
+        SessionObservationPulled {
+            #[serde(with = "observation_wire")]
+            result: &'a bcode_session_models::observation::SessionObservationPullResult<
+                bcode_session_view_models::SessionViewSnapshot,
+            >,
+        },
+    }
+
+    fn assert_unboxed_wire_compatibility(response: &Response) {
+        #[derive(Serialize)]
+        struct PreviousField<'a> {
+            #[serde(with = "observation_wire")]
+            result: &'a bcode_session_models::observation::SessionObservationPullResult<
+                bcode_session_view_models::SessionViewSnapshot,
+            >,
+        }
+        #[derive(Serialize)]
+        struct BoxedField {
+            #[serde(with = "observation_wire")]
+            result: Box<
+                bcode_session_models::observation::SessionObservationPullResult<
+                    bcode_session_view_models::SessionViewSnapshot,
+                >,
+            >,
+        }
+        let Response::Ok(ResponsePayload::SessionObservationPulled { result }) = response else {
+            panic!("observation pull response required");
+        };
+        let previous =
+            UnboxedObservationResponse::Ok(UnboxedObservationPayload::SessionObservationPulled {
+                result,
+            });
+        assert_eq!(
+            serde_json::to_vec(response).unwrap(),
+            serde_json::to_vec(&previous).unwrap()
+        );
+        assert_eq!(
+            encode_typed_stable(&PreviousField { result }).unwrap(),
+            encode_typed_stable(&BoxedField {
+                result: result.clone()
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn observation_snapshot_wire_roundtrip_preserves_nested_semantics() {
+        let session_id = SessionId::new();
+        let mut snapshot = bcode_session_view_models::SessionViewSnapshot::empty();
+        snapshot.session_id = Some(session_id);
+        snapshot.title = Some("question then cancellation".into());
+        snapshot.runtime.active_turn_id = Some("next-turn".into());
+        for initial in [true, false] {
+            let response = Response::Ok(ResponsePayload::SessionObservationPulled {
+                result: Box::new(bcode_session_models::observation::SessionObservationPullResult {
+                    schema_version: 1, handle_id: "wire-token".into(), finished: false,
+                    delivery: Some(bcode_session_models::observation::SessionObservationEnvelope {
+                        schema_version: 1, session_id, sequence: u64::from(!initial), source_sequence: Some(19),
+                        event: bcode_session_models::observation::SessionObservationEvent::Snapshot {
+                            initial, snapshot: snapshot.clone(),
+                        },
+                    }),
+                }),
+            });
+            assert_unboxed_wire_compatibility(&response);
+            let bytes = encode_response(&response).unwrap();
+            assert_eq!(decode_response(&bytes).unwrap(), response);
+            let json = serde_json::to_vec(&response).unwrap();
+            assert_eq!(serde_json::from_slice::<Response>(&json).unwrap(), response);
+        }
+        let terminal = Response::Ok(ResponsePayload::SessionObservationPulled {
+            result: Box::new(bcode_session_models::observation::SessionObservationPullResult {
+                schema_version: 1, handle_id: "wire-token".into(), finished: false,
+                delivery: Some(bcode_session_models::observation::SessionObservationEnvelope {
+                    schema_version: 1, session_id, sequence: 2, source_sequence: Some(19),
+                    event: bcode_session_models::observation::SessionObservationEvent::Ended {
+                        reason: bcode_session_models::observation::SessionObservationEnd::Gap {
+                            source: bcode_session_models::observation::SessionObservationSource::Live, skipped: Some(3),
+                        },
+                    },
+                }),
+            }),
+        });
+        assert_unboxed_wire_compatibility(&terminal);
+        let terminal_json = serde_json::to_vec(&terminal).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Response>(&terminal_json).unwrap(),
+            terminal
+        );
+        assert_eq!(
+            decode_response(&encode_response(&terminal).unwrap()).unwrap(),
+            terminal
+        );
     }
 }
 
@@ -6484,6 +6748,7 @@ mod tests {
                         tui_surface_kind: None,
                     },
                 ],
+                interaction_controller_versions: BTreeSet::from([1]),
                 env_keys: BTreeMap::from([("OPENROUTER_API_KEY".to_string(), true)]),
                 process_env: BTreeMap::from([("AWS_REGION".to_string(), "us-east-1".to_string())]),
             }),

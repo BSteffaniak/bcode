@@ -8,6 +8,12 @@ description  = "Model-callable Git worktree tools"
 interface_id = "bcode.tool/v1"
 name         = "Worktree Tools"
 
+[[services]]
+description           = "Contributed Git worktree commands"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Worktree Commands"
+
 [[tui_surfaces]]
 description = "Plugin-owned worktree attach UI"
 kind        = "command.work-tree.attach"

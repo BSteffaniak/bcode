@@ -35,9 +35,11 @@ pub async fn record(
         category,
         observed_at_ms: crate::current_unix_millis(),
     };
-    admission_observation::record(&db, authority, &observation)
-        .await
-        .map_err(super::super::backpressure::normalize)
+    super::super::backpressure::queued(retained.path(), || {
+        admission_observation::record(&db, authority, &observation)
+    })
+    .await
+    .map_err(super::super::backpressure::normalize)
 }
 
 #[cfg(test)]

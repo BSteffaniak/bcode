@@ -225,6 +225,12 @@ async fn terminal_scheduler_removal_preserves_evidence_until_explicit_ownership_
     );
     drop(ownership);
     wait_for_settled_ownership(&state, id).await;
+    // Acknowledging guard release must not discard the server's observation evidence.
+    {
+        let observations = state.activity_observations.lock().await;
+        assert!(observations.evidence(id).counts_complete);
+        assert_eq!(observations.evidence(id).observed_event_sequence, Some(3));
+    }
     let outcome = crate::explicit_session_ownership_release_outcome(&state, id)
         .await
         .unwrap();

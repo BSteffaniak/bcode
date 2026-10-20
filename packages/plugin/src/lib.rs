@@ -4,6 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod bmux_host_adapter;
+pub mod interaction_controller;
 mod invocation_callbacks;
 
 use bcode_plugin_sdk::path::display_from_current_dir;

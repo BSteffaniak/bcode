@@ -187,6 +187,21 @@ pub(super) fn message_content(message: &ChatMessageView) -> Containers {
                         "Canonical instructions: session event " (activity.source_sequence.to_string())
                         ". The compact message is a preview, not the exact submitted instructions."
                     }
+                    @if let Some(instructions) = &activity.exact_instructions {
+                        @let (instructions, instructions_truncated) = bounded_message_text(instructions);
+                        div color=(color::MUTED) { "Exact submitted instructions" }
+                        div white-space="preserve-wrap" color=(color::TEXT) { (instructions) }
+                        @if instructions_truncated {
+                            (truncation_notice("Instructions truncated for display; retrieve the canonical session event for the complete text."))
+                        }
+                    } @else {
+                        div color=(color::MUTED) {
+                            "Exact instructions omitted from this snapshot ("
+                            (activity.instruction_bytes.to_string())
+                            " UTF-8 bytes); retrieve the canonical session event."
+                        }
+                    }
+                    (json_panel("Producer details", &activity.presentation.payload))
                 }))
             }
         }

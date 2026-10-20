@@ -8,11 +8,14 @@ use switchy_database::{Database, DatabaseValue, TransactionMode};
 
 pub mod activity;
 mod admission_policy;
-mod admission_projection;
+/// Typed immutable admission extensions and bounded canonical package-context reads.
+pub mod admission_projection;
 /// Store-local generation-fenced current membership inventory.
 pub mod inventory;
 mod registered;
-pub use registered::{admit_registered, admit_registered_observed};
+pub use registered::{
+    admit_registered, admit_registered_observed, admit_registered_package_observed,
+};
 /// Monotonic execution and retry allowance controls.
 pub mod allowance;
 /// Fenced attempt ledger; not permission to dispatch unfinished representation lifecycles.
@@ -358,10 +361,57 @@ pub(super) async fn admit_in(
     run: &super::NewWorkflowRun,
     definition: &bcode_workflow::WorkflowDefinition,
 ) -> Result<RepresentationAdmission, RepresentationError> {
+    admit_package_in(tx, run, definition, None).await
+}
+
+async fn verify_existing_admission(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run: &super::NewWorkflowRun,
+    package_binding: Option<&crate::WorkflowRunPackageBinding>,
+    definition: &str,
+    definition_sha256: &str,
+) -> Result<(), RepresentationError> {
+    let rows = tx
+        .select(RUNS)
+        .columns(&["admission_json", "definition_json", "definition_sha256"])
+        .where_eq("run_id", run.run_id.as_str())
+        .limit(1)
+        .execute(tx)
+        .await?;
+    let Some(DatabaseValue::String(existing_json)) =
+        rows.first().and_then(|r| r.get("admission_json"))
+    else {
+        return Err(RepresentationError::MaintenanceRequired);
+    };
+    let existing = admission_projection::admission(&existing_json)?;
+    if existing.admission != *run
+        || admission_projection::package_binding(tx, &run.run_id)
+            .await?
+            .as_ref()
+            != package_binding
+        || rows.first().and_then(|r| r.get("definition_json"))
+            != Some(DatabaseValue::String(definition.to_owned()))
+        || rows.first().and_then(|r| r.get("definition_sha256"))
+            != Some(DatabaseValue::String(definition_sha256.to_owned()))
+    {
+        return Err(RepresentationError::InvalidAdmission);
+    }
+    Ok(())
+}
+
+pub(super) async fn admit_package_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    run: &super::NewWorkflowRun,
+    definition: &bcode_workflow::WorkflowDefinition,
+    package_binding: Option<&crate::WorkflowRunPackageBinding>,
+) -> Result<RepresentationAdmission, RepresentationError> {
     validate_admission(run, definition)?;
     let graph_definition = definition;
-    let admission =
-        serde_json::to_string(run).map_err(|_| RepresentationError::InvalidAdmission)?;
+    let admission = serde_json::to_string(&crate::RepresentedWorkflowAdmission {
+        admission: run.clone(),
+        package_binding: package_binding.cloned(),
+    })
+    .map_err(|_| RepresentationError::InvalidAdmission)?;
     let definition =
         serde_json::to_string(definition).map_err(|_| RepresentationError::InvalidAdmission)?;
     let definition_sha256 = crate::sha256_hex(definition.as_bytes());
@@ -375,22 +425,8 @@ pub(super) async fn admit_in(
     }
     let already_present = location.is_some();
     if already_present {
-        let rows = tx
-            .select(RUNS)
-            .columns(&["admission_json", "definition_json", "definition_sha256"])
-            .where_eq("run_id", run.run_id.as_str())
-            .limit(1)
-            .execute(tx)
+        verify_existing_admission(tx, run, package_binding, &definition, &definition_sha256)
             .await?;
-        if rows.first().and_then(|r| r.get("admission_json"))
-            != Some(DatabaseValue::String(admission))
-            || rows.first().and_then(|r| r.get("definition_json"))
-                != Some(DatabaseValue::String(definition))
-            || rows.first().and_then(|r| r.get("definition_sha256"))
-                != Some(DatabaseValue::String(definition_sha256))
-        {
-            return Err(RepresentationError::InvalidAdmission);
-        }
     } else {
         let text = |value: Option<&str>| {
             value.map_or(DatabaseValue::Null, |s| DatabaseValue::String(s.into()))
@@ -642,6 +678,8 @@ fn definition_call_supported(node: &bcode_workflow::NodeDefinition) -> bool {
         && matches!(
             config.target,
             bcode_workflow::WorkflowCallTarget::Definition { .. }
+                | bcode_workflow::WorkflowCallTarget::PackageLocal { .. }
+                | bcode_workflow::WorkflowCallTarget::PackageMember { .. }
         )
 }
 

@@ -106,6 +106,87 @@ Plugin workflows remain plugin-owned. Application and renderer adapters may use 
 
 Pending exchange application coordination is transport-neutral and server-owned. `interaction_operations` owns permission and exchange registration, compatible-consumer checks, response authorization, duplicate conflicts, cancellation, consumer detachment, terminal completion, cleanup, and bounded listing. IPC dispatch only decodes/maps typed requests and responses; client connection context remains explicit input to compatibility checks. Focused in-process tests cover successful response, cancellation, last-consumer detachment, invocation mismatch, no compatible consumer, conflicting duplicate identity, unknown resolution variants, and canonical pending-state cleanup without opening a socket.
 
+## Portable callers and retained consumers
+
+Public operation traits belong to their domains; server handles bind verified caller
+context and delegate to existing owners. A transport adapter encodes requests and maps
+normalized responses. It must not redefine permission policy, acquire canonical state
+through private persistence, or interpret plugin-owned payloads as application effects.
+
+`BcodeClient::with_interaction_controller_versions(BTreeSet<u32>)` changes only the
+semantic compatibility declaration, retaining resolved runtime configuration and any
+configuration error. It does not manufacture renderer adapters.
+`interaction_controller_consumer()` opts in to semantic version 1 and returns a
+connection-retaining `InteractionControllerConsumer`. Its `InteractionApplication`
+methods `open_controller`, `controller_snapshot`, and `controller_input` run on that
+same connection. Inputs carry the exact exchange identity and expected host revision.
+Disconnect does not transfer ownership, remove revision fencing, or authorize replay;
+transport failure may leave effects unknown. Establish a semantic consumer before work
+needs it, and keep it alive while driving the pending exchange. Only canonical host
+consumption establishes a terminal result, not local input exhaustion or a plugin's
+intermediate output.
+
+Both `SessionApplicationHandle` and `BcodeClient` implement the portable
+`SessionObservationApplication` contract. `ClientSessionObservation` consumes server-owned
+semantic snapshots and ordered updates with bounded retention; gaps, limits, invalid sources
+and transport loss end the stream explicitly. Close/drop releases observation, not the turn.
+Resynchronization opens a fresh bounded observation, not replay. `SessionWatcher` remains
+a separate bounded attachment/event surface with resync signals; neither surface is a
+durable resume protocol.
+
+Usage reads query existing accounting snapshots; they do not collect or rebuild usage.
+Import discovery/loading does not implicitly create a canonical session. Search reads
+and hydration remain bounded and non-mutating; purge/rebuild and backfill are explicit
+maintenance operations. Keep required confirmations, selected-location checks,
+operation revisions and cancellation propagation at their existing owners. Dropping an
+observer is not cancellation, cancellation acceptance is not rollback, and an admission
+receipt is not a completed operation.
+
+## Typed commands and native effects
+
+`CommandApplicationHandle` and `BcodeClient` implement the command-owned
+`CommandApplication`. CLI command automation and TUI invocation use it; opaque
+`PluginApplication` payloads do not independently define command semantics. The owner
+resolves canonical session/workspace context and performs contextual invocation policy
+checks. A retained client socket carries invocation and bounded cancellation control
+under the same caller identity. Clones share their local controls; independent clients
+cannot gain cancellation authority by knowing an ID. Read-ahead reserves the ID before
+ordered dispatch and handles caller-scoped cancellation without queuing behind the
+blocked command. Reservation grants no execution authority.
+
+`Completed` retains the owner's response, including `success: false`. `Failed` is a known
+application failure; `Unknown` means no trustworthy settled result is available and effects
+may have committed. Transport loss does not establish terminal failure, success, rollback,
+or safe replay. Do not retry automatically. Cancellation acceptance is distinct from
+terminal cancellation and does not roll back committed effects.
+
+Renderers adapt typed effects natively. Status/copy presentation does not implicitly
+append canonical history; TUI explicitly handles `AppendText` through its canonical
+presentation-note operation, while CLI emits the text without that mutation. Session
+navigation uses canonical access. Failed commands do not
+drive success effects, and unknown outcomes supply no effects to apply. Clipboard, focus
+and surface presentation remain frontend-local. CLI reports unsupported native surfaces
+with stable identities and structured fallback rather than pretending to open them.
+Plugin-owned options remain plugin-owned; fallback does not transfer business rules.
+HyperChad's existing session/interaction actions do not by themselves establish generic
+command invocation or command-effect coverage.
+
+## Runtime lifecycle
+
+`RuntimeApplication` exposes status and explicit shutdown through `ServicesApplicationHandle`
+and `BcodeClient`. Host-only `RuntimeShutdownPreparationApplication` returns a borrowed,
+single-use operation. Preparation does not signal shutdown or reserve idleness; dropping
+it does not commit. IPC acknowledges before consuming `commit`. The receipt is admission,
+not proof of process exit, cleanup completion, or rollback. No serialized prepare/resume
+capability or equivalence to runtime-work cancellation is implied.
+
 ## Verification
 
-Representative coverage combines direct in-process operation tests with local IPC integration tests. Workflow source application exercises both paths and verifies identical created/updated outcomes and canonical store effects. Permission and interaction coverage directly proves operation-owned permission resolution and exchange lifecycle behavior without transport framing, real IPC permission persistence, and IPC/HyperChad plugin-owned semantic-controller behavior. Plugin service coverage verifies direct/IPC inventory and normalized result equivalence. Both explicit-plugin and unique-interface service operations return `PluginServiceOperationResult`; conversion from the plugin runtime response is private to the operation module, and IPC framing only maps the normalized fields. Real IPC tests cover unsupported-operation results through both routing modes, plus missing-plugin and missing-interface routing failures with matching public errors that do not echo the supplied identifiers. This is representative routing/error coverage, not proof of every plugin's payload or workflow semantics. Runtime-work coverage verifies direct list/history/cancellation behavior, real IPC list/history equivalence and cancellation admission, initial watch catch-up, and post-subscription cancellation delivery. Session coverage directly exercises create, rename, working-directory mutation, bounded reads, complete-history access, damaged-state behavior, and deletion without transport framing; real IPC coverage verifies create, rename, delete, bounded history pages, and around-anchor windows. Completion of the broader application-boundary effort still requires the unfinished daemon-hosted/CLI semantic-controller paths. Plugin event coverage verifies both no-subscriber routing and subscriber delivery through direct operations and real IPC.
+Source implementation and test definitions are not passing runtime evidence. The command
+regressions cover blocked active cancellation, foreign-caller rejection, transport-loss
+uncertainty/no automatic replay, and native effect handling. Their integrated results,
+lifecycle tests and renderer suites must be recorded separately by validation; this document
+does not certify them or declare merge readiness. Ralph read-path migration and bounded-history
+limitations remain explicitly deferred; see the parity inventory.
+
+Representative coverage combines direct in-process operation tests with local IPC integration tests. Workflow source application exercises both paths and verifies identical created/updated outcomes and canonical store effects. Permission and interaction coverage directly proves operation-owned permission resolution and exchange lifecycle behavior without transport framing, real IPC permission persistence, and IPC/HyperChad plugin-owned semantic-controller behavior. Plugin service coverage verifies direct/IPC inventory and normalized result equivalence. Both explicit-plugin and unique-interface service operations return `PluginServiceOperationResult`; conversion from the plugin runtime response is private to the operation module, and IPC framing only maps the normalized fields. Real IPC tests cover unsupported-operation results through both routing modes, plus missing-plugin and missing-interface routing failures with matching public errors that do not echo the supplied identifiers. This is representative routing/error coverage, not proof of every plugin's payload or workflow semantics. Runtime-work coverage verifies direct list/history/cancellation behavior, real IPC list/history equivalence and cancellation admission, initial watch catch-up, and post-subscription cancellation delivery. Session coverage directly exercises create, rename, working-directory mutation, bounded reads, complete-history access, damaged-state behavior, and deletion without transport framing; real IPC coverage verifies create, rename, delete, bounded history pages, and around-anchor windows. Completion of the broader application-boundary effort still requires observed integrated results for portable observation, command cancellation/effect consumers, lifecycle cleanup and individual operation parity; implemented contracts alone do not close those qualifications. Plugin event coverage verifies both no-subscriber routing and subscriber delivery through direct operations and real IPC.

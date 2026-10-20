@@ -3,6 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 //! Versioned, renderer-neutral usage reports. Amounts are estimates, not invoices.
 
+pub mod application;
+
 use bcode_session_models::{SessionCostRange, SessionId, SessionUsageEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

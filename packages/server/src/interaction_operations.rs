@@ -775,22 +775,73 @@ pub async fn client_supports_exchange(
         })
 }
 
+/// Return whether a registered caller explicitly supports current semantic controller contracts.
+pub async fn client_supports_controller(state: &ServerState, client_id: ClientId) -> bool {
+    state
+        .client_runtime_contexts
+        .lock()
+        .await
+        .get(&client_id)
+        .is_some_and(|context| {
+            context.interaction_controller_versions.contains(
+                &bcode_plugin_models::interaction_controller::INTERACTION_CONTROLLER_VERSION,
+            )
+        })
+}
+
 /// Return whether any connected client advertised a compatible exchange adapter.
 pub async fn has_exchange_consumer(
     state: &ServerState,
     request: &bcode_session_models::ToolExchangeRequest,
 ) -> bool {
+    let (raw, semantic) = {
+        let contexts = state.client_runtime_contexts.lock().await;
+        (
+            contexts.values().any(|context| {
+                context.interaction_adapters.iter().any(|adapter| {
+                    adapter.supports(&request.schema, request.schema_version)
+                        && request.producer_id == adapter.producer_id
+                })
+            }),
+            contexts.values().any(|context| {
+                context.interaction_controller_versions.contains(
+                    &bcode_plugin_models::interaction_controller::INTERACTION_CONTROLLER_VERSION,
+                )
+            }),
+        )
+    };
+    if raw {
+        return true;
+    }
+    if !semantic || !exchange_has_controller(state, request).await {
+        return false;
+    }
     state
         .client_runtime_contexts
         .lock()
         .await
         .values()
         .any(|context| {
-            context.interaction_adapters.iter().any(|adapter| {
-                adapter.supports(&request.schema, request.schema_version)
-                    && request.producer_id == adapter.producer_id
-            })
+            context.interaction_controller_versions.contains(
+                &bcode_plugin_models::interaction_controller::INTERACTION_CONTROLLER_VERSION,
+            )
         })
+}
+
+async fn exchange_has_controller(
+    state: &ServerState,
+    request: &bcode_session_models::ToolExchangeRequest,
+) -> bool {
+    bcode_plugin::interaction_controller::discover_controller(
+        &state.plugins,
+        &request.producer_id,
+        &request.schema,
+        request.schema_version,
+        bcode_plugin::PluginInvocationScope::Global,
+        &bcode_plugin_sdk::ServiceCancellation::default(),
+    )
+    .await
+    .is_ok()
 }
 
 /// Register one pending exchange and return its shared resolution state.
@@ -839,28 +890,79 @@ pub async fn register_pending_tool_exchange(
 
 /// Resolve pending exchanges that no longer have any compatible connected consumer.
 pub async fn resolve_exchanges_without_consumers(state: &ServerState) {
+    // Discovery runs outside all lifecycle/client/pending locks. Recheck current
+    // connected capabilities at commit so a detached caller never confers authority.
+    let candidates = state
+        .pending_tool_exchanges
+        .lock()
+        .await
+        .values()
+        .map(|exchange| exchange.summary.request.clone())
+        .collect::<Vec<_>>();
+    let candidate_ids = candidates
+        .iter()
+        .map(|request| request.exchange_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut controller_routes = std::collections::BTreeSet::new();
+    let semantic = state
+        .client_runtime_contexts
+        .lock()
+        .await
+        .values()
+        .any(|context| {
+            context.interaction_controller_versions.contains(
+                &bcode_plugin_models::interaction_controller::INTERACTION_CONTROLLER_VERSION,
+            )
+        });
+    let mut inspected_routes = std::collections::BTreeSet::new();
+    if semantic {
+        for request in &candidates {
+            let identity = (
+                request.producer_id.clone(),
+                request.schema.clone(),
+                request.schema_version,
+            );
+            if inspected_routes.insert(identity.clone())
+                && exchange_has_controller(state, request).await
+            {
+                controller_routes.insert(identity);
+            }
+        }
+    }
+    let mut controllers = state.interaction_controllers.lock().await;
     let contexts = state.client_runtime_contexts.lock().await;
     let mut pending = state.pending_tool_exchanges.lock().await;
     let entries = std::mem::take(&mut *pending);
     let (retained, detached): (BTreeMap<_, _>, BTreeMap<_, _>) =
         entries.into_iter().partition(|(_, exchange)| {
+            let request = &exchange.summary.request;
+            // Requests registered while discovery was in flight perform their own
+            // consumer admission; this cleanup pass has no evidence about them.
+            if !candidate_ids.contains(&request.exchange_id) {
+                return true;
+            }
             contexts.values().any(|context| {
                 context.interaction_adapters.iter().any(|adapter| {
-                    adapter.producer_id == exchange.summary.request.producer_id
-                        && adapter.supports(
-                            &exchange.summary.request.schema,
-                            exchange.summary.request.schema_version,
-                        )
-                })
+                    adapter.producer_id == request.producer_id
+                        && adapter.supports(&request.schema, request.schema_version)
+                }) || (context.interaction_controller_versions.contains(
+                    &bcode_plugin_models::interaction_controller::INTERACTION_CONTROLLER_VERSION,
+                ) && controller_routes.contains(&(
+                    request.producer_id.clone(),
+                    request.schema.clone(),
+                    request.schema_version,
+                )))
             })
         });
     *pending = retained;
     drop(contexts);
     drop(pending);
     for exchange in detached.into_values() {
+        controllers.remove_exchange(&exchange.summary.request.exchange_id);
         *exchange.resolution.lock().await = Some(ToolExchangeResolution::ConsumerDetached);
         exchange.notify.notify_waiters();
     }
+    drop(controllers);
 }
 
 /// Return the current bounded pending tool-exchange summaries.
@@ -908,25 +1010,81 @@ pub async fn wait_for_tool_exchange_resolution(
     }
 }
 
+/// Cancel residual exchanges after the canonical session turn owner has settled
+/// its inner execution, while its admission guard still prevents the next turn.
+/// Callers must await this cleanup before publishing the turn terminal outcome.
+/// This is not a concurrent session cancellation or a workflow-wide cleanup API.
+/// Registry lock order matches semantic effects: controllers, then pending exchanges.
+pub async fn cancel_session_tool_exchanges(state: &ServerState, session_id: SessionId) {
+    let removed = {
+        let mut controllers = state.interaction_controllers.lock().await;
+        let mut exchanges = state.pending_tool_exchanges.lock().await;
+        let ids = exchanges
+            .iter()
+            .filter(|(_, pending)| pending.summary.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut removed = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(pending) = exchanges.remove(&id) {
+                controllers.remove_exchange(&id);
+                removed.push(pending);
+            }
+        }
+        drop(exchanges);
+        drop(controllers);
+        removed
+    };
+    for pending in removed {
+        let mut resolution = pending.resolution.lock().await;
+        if resolution.is_none() {
+            *resolution = Some(ToolExchangeResolution::Cancelled);
+        }
+        drop(resolution);
+        pending.notify.notify_waiters();
+        notify_route_destination(state, pending.summary.interaction_route.as_ref()).await;
+    }
+}
+
 /// Remove one pending exchange because its owning workflow cancelled or lost its consumer.
 pub async fn abort_tool_exchange(
     state: &ServerState,
     interaction_id: &str,
     resolution: ToolExchangeResolution,
 ) -> ToolExchangeResolution {
+    let mut controllers = state.interaction_controllers.lock().await;
+    controllers.remove_exchange(interaction_id);
     let pending = state
         .pending_tool_exchanges
         .lock()
         .await
         .remove(interaction_id);
     if let Some(pending) = pending {
+        *pending.resolution.lock().await = Some(resolution.clone());
+        pending.notify.notify_waiters();
         notify_route_destination(state, pending.summary.interaction_route.as_ref()).await;
     }
+    drop(controllers);
     resolution
 }
 
 /// Complete a known pending exchange from an authoritative internal consumer.
 pub async fn complete_pending_tool_exchange(
+    state: &ServerState,
+    interaction_id: &str,
+    resolution: ToolExchangeResolution,
+) -> bool {
+    let mut controllers = state.interaction_controllers.lock().await;
+    controllers.remove_exchange(interaction_id);
+    let completed =
+        complete_tool_exchange_under_controller_lock(state, interaction_id, resolution).await;
+    drop(controllers);
+    completed
+}
+
+/// Consume a canonical effect while the caller holds the controller lifecycle lock.
+/// This lock order is shared by cancellation, raw resolution, and semantic input.
+pub async fn complete_tool_exchange_under_controller_lock(
     state: &ServerState,
     interaction_id: &str,
     resolution: ToolExchangeResolution,
@@ -972,6 +1130,16 @@ fn validate_resolution_size(value: &impl serde::Serialize) -> Result<(), Resolve
         value,
     )
     .map_err(|_| ResolveToolExchangeError::InvalidResolution)
+}
+
+/// Enforce canonical encoded bounds on a plugin-proposed semantic resolution.
+///
+/// # Errors
+/// Returns `InvalidResolution` for oversized or malformed serialization.
+pub fn validate_controller_resolution(
+    value: &ToolExchangeResolution,
+) -> Result<(), ResolveToolExchangeError> {
+    validate_resolution_size(value)
 }
 
 /// Decode one serialized client tool-exchange resolution without exposing serde failures.
@@ -1027,6 +1195,182 @@ pub async fn resolve_tool_exchange(
         return Err(ResolveToolExchangeError::IncompatibleConsumer);
     }
     Ok(complete_pending_tool_exchange(state, interaction_id, resolution).await)
+}
+
+#[cfg(test)]
+mod controller_consumer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn settled_owner_cleanup_releases_abandoned_exchange_without_touching_sibling() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let session = SessionId::new();
+        let sibling = SessionId::new();
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "abandoned-invocation".into(),
+            exchange_id: "abandoned-exchange".into(),
+            producer_id: "test".into(),
+            schema: "test.request".into(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let (resolution, notify) = register_pending_tool_exchange(&state, session, &request)
+            .await
+            .unwrap();
+        let mut other = request.clone();
+        other.invocation_id = "sibling-invocation".into();
+        other.exchange_id = "sibling-exchange".into();
+        let (other_resolution, _) = register_pending_tool_exchange(&state, sibling, &other)
+            .await
+            .unwrap();
+        let cancellation = TurnCancelState::default();
+        {
+            let waiter = wait_for_tool_exchange_resolution(
+                &state,
+                &request.exchange_id,
+                &resolution,
+                &notify,
+                &cancellation,
+            );
+            tokio::pin!(waiter);
+            tokio::select! { biased;
+                outcome = &mut waiter => panic!("unexpected outcome: {outcome:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        // Canonical owner cleanup is awaited independently of the dropped inner
+        // invocation future, with no spawned cleanup or sibling cancellation.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        cancel_session_tool_exchanges(&state, session).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+        assert_eq!(
+            *resolution.lock().await,
+            Some(ToolExchangeResolution::Cancelled)
+        );
+        assert!(other_resolution.lock().await.is_none());
+        let pending = list_pending_tool_exchanges(&state).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].session_id, sibling);
+        assert!(
+            !complete_pending_tool_exchange(
+                &state,
+                &request.exchange_id,
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"stale":true})
+                }
+            )
+            .await
+        );
+        cancel_session_tool_exchanges(&state, session).await;
+        assert!(other_resolution.lock().await.is_none());
+        cancel_session_tool_exchanges(&state, sibling).await;
+        assert!(list_pending_tool_exchanges(&state).await.is_empty());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn canonical_cancel_notifies_pending_waiters_and_stale_effect_cannot_reopen() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let session = SessionId::new();
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "cancel-invocation".into(),
+            exchange_id: "cancel-exchange".into(),
+            producer_id: "test".into(),
+            schema: "test.request".into(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let (resolution, _) = register_pending_tool_exchange(&state, session, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            abort_tool_exchange(
+                &state,
+                &request.exchange_id,
+                ToolExchangeResolution::Cancelled
+            )
+            .await,
+            ToolExchangeResolution::Cancelled
+        );
+        assert_eq!(
+            *resolution.lock().await,
+            Some(ToolExchangeResolution::Cancelled)
+        );
+        assert!(
+            !complete_pending_tool_exchange(
+                &state,
+                &request.exchange_id,
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"stale":true})
+                }
+            )
+            .await
+        );
+        assert_eq!(
+            *resolution.lock().await,
+            Some(ToolExchangeResolution::Cancelled)
+        );
+        assert!(list_pending_tool_exchanges(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_capability_uses_exact_dynamic_discovery_without_granting_raw_resolution() {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        );
+        let state = crate::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::default(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: std::collections::BTreeSet::from(["bcode.question".to_owned()]),
+                    disabled: std::collections::BTreeSet::new(),
+                },
+                &[plugin],
+            )
+            .unwrap(),
+        );
+        let client = ClientId::new();
+        let mut context = bcode_ipc::ClientRuntimeContext::default();
+        context.interaction_controller_versions.insert(2);
+        state
+            .client_runtime_contexts
+            .lock()
+            .await
+            .insert(client, context.clone());
+        let mut request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "invocation".into(),
+            exchange_id: "exchange".into(),
+            producer_id: "bcode.question".into(),
+            schema: "bcode.question.request".into(),
+            schema_version: 1,
+            payload: serde_json::json!({"questions":[{"text":"Proceed?","custom":true}]}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        assert!(!has_exchange_consumer(&state, &request).await);
+        context.interaction_controller_versions.insert(1);
+        state
+            .client_runtime_contexts
+            .lock()
+            .await
+            .insert(client, context);
+        assert!(has_exchange_consumer(&state, &request).await);
+        assert!(client_supports_controller(&state, client).await);
+        assert!(!client_supports_exchange(&state, client, &request).await);
+        request.schema_version = 2;
+        assert!(!has_exchange_consumer(&state, &request).await);
+        request.schema_version = 1;
+        request.producer_id = "spoofed".into();
+        assert!(!has_exchange_consumer(&state, &request).await);
+        drop(state);
+    }
 }
 
 #[cfg(test)]

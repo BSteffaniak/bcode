@@ -52,28 +52,7 @@ async fn fanout_overlap(count: u32) {
     let mut cleanup = FixtureCleanup::new(&state);
     let _release =
         ReleaseGate(state.selected_provider_context.settings["delegation_fixture_gate"].clone());
-    let leaf = parallel_provider_definition().nodes["left"].clone();
-    let definition = fanout_definition(leaf, count);
-    let db = open(&crate::workflow_store_path(&state), true).expect("db");
-    let authority = owner::local_authority(&state, "new")
-        .await
-        .expect("owner")
-        .expect("authority");
-    let mut run = representation::hierarchy::parent_context(&db, &authority.authority, "new")
-        .await
-        .expect("context")
-        .admission;
-    let identity =
-        bcode_workflow::WorkflowDefinitionIdentity::for_definition("fanout", &definition)
-            .expect("identity");
-    run.run_id = "fanout".into();
-    run.definition_id = identity.definition_id;
-    run.definition_version = identity.definition_version;
-    run.input = Some(serde_json::json!(vec![1_u32; count as usize]));
-    run.limits.node_execution_cap = u64::from(count) + 1;
-    representation::admit(&db, &run, &definition)
-        .await
-        .expect("fixture typed admission");
+    let db = admit_overlap_fixture(&state, count).await;
     let started = std::time::Instant::now();
     let drive_state = std::sync::Arc::clone(&state);
     let mut initial_drive = OwnedFixtureTask::new(
@@ -120,7 +99,13 @@ async fn fanout_overlap(count: u32) {
     let completion =
         tokio::time::timeout(std::time::Duration::from_secs(u64::from(count)), async {
             loop {
-                driver::drive(&state, "fanout").await.expect("drive");
+                match driver::drive(&state, "fanout").await {
+                    Err(ServerError::WorkflowStorageBusy) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        continue;
+                    }
+                    result => result.expect("drive"),
+                }
                 if status(&state, "fanout")
                     .await
                     .expect("status")
@@ -144,6 +129,35 @@ async fn fanout_overlap(count: u32) {
     );
     cleanup.finish_run("fanout").await;
     drop(cleanup);
+}
+
+async fn admit_overlap_fixture(
+    state: &ServerState,
+    count: u32,
+) -> switchy_database::rusqlite::RusqliteDatabase {
+    let leaf = parallel_provider_definition().nodes["left"].clone();
+    let definition = fanout_definition(leaf, count);
+    let db = open(&crate::workflow_store_path(state), true).expect("db");
+    let authority = owner::local_authority(state, "new")
+        .await
+        .expect("owner")
+        .expect("authority");
+    let mut run = representation::hierarchy::parent_context(&db, &authority.authority, "new")
+        .await
+        .expect("context")
+        .admission;
+    let identity =
+        bcode_workflow::WorkflowDefinitionIdentity::for_definition("fanout", &definition)
+            .expect("identity");
+    run.run_id = "fanout".into();
+    run.definition_id = identity.definition_id;
+    run.definition_version = identity.definition_version;
+    run.input = Some(serde_json::json!(vec![1_u32; count as usize]));
+    run.limits.node_execution_cap = u64::from(count) + 1;
+    representation::admit(&db, &run, &definition)
+        .await
+        .expect("fixture typed admission");
+    db
 }
 
 async fn diagnose_fanout_before_failure_cleanup(
@@ -198,12 +212,56 @@ impl Drop for ReleaseGate {
     }
 }
 
+struct ArmStages(super::super::fanout_stages::Experiment);
+
+impl Drop for ArmStages {
+    fn drop(&mut self) {
+        use super::super::fanout_stages::Observation;
+        let snapshot = self.0.snapshot();
+        eprintln!(
+            "fanout_arm stages={} dropped={}",
+            snapshot.observations.len(),
+            snapshot.dropped
+        );
+        let mut stages = std::collections::BTreeMap::<String, (usize, u128)>::new();
+        for observation in snapshot.observations {
+            let (kind, elapsed) = match observation {
+                Observation::Stage { stage, elapsed, .. } => {
+                    (format!("admission:{stage:?}"), elapsed)
+                }
+                Observation::ChildCreation(observation) => (
+                    format!("child:{:?}", observation.stage),
+                    observation.elapsed,
+                ),
+                Observation::RepositoryProbe { probe, elapsed, .. } => {
+                    (format!("repository:{probe:?}"), elapsed)
+                }
+            };
+            let (count, max_us) = stages.entry(kind).or_default();
+            *count += 1;
+            *max_us = (*max_us).max(elapsed.as_micros());
+        }
+        for (kind, (count, max_us)) in stages {
+            eprintln!("fanout_arm kind={kind} count={count} max_us={max_us}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn normal_start_fanout_respects_cap8_and_uncapped32() {
     let _fixture = FANOUT_FIXTURE.lock().await;
     for cap in [Some(8), None] {
         let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
         let mut cleanup = FixtureCleanup::new(&state);
+        let _stages = ArmStages(super::super::fanout_stages::Experiment::begin(
+            if cap.is_some() {
+                "normal-cap8"
+            } else {
+                "normal-uncapped32"
+            },
+            "normal-fanout",
+            &std::env::current_dir().expect("fixture workspace"),
+        ));
         let gate = ReleaseGate(
             state.selected_provider_context.settings["delegation_fixture_gate"].clone(),
         );
@@ -213,12 +271,17 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
         eprintln!(
             "normal fanout arm cap={cap:?}, expected_initial_admissions={expected_admissions}"
         );
-        start_public(
-            &state,
-            "normal-fanout",
-            definition,
-            serde_json::json!(vec![1; 32]),
-            cap,
+        Box::pin(
+            bcode_session::child_creation_observation::observe_child_creation(
+                super::super::fanout_stages::child_creation_observer("normal-fanout"),
+                start_public(
+                    &state,
+                    "normal-fanout",
+                    definition,
+                    serde_json::json!(vec![1; 32]),
+                    cap,
+                ),
+            ),
         )
         .await;
         let db = open(&crate::workflow_store_path(&state), false).expect("db");
@@ -284,24 +347,28 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
 #[tokio::test]
 #[ignore = "fixed-artifact causal measurement; no latency threshold"]
 async fn probe_real_repo_cap8() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     Box::pin(probe_workspace("real-cap8", false, Some(8))).await;
 }
 
 #[tokio::test]
 #[ignore = "fixed-artifact causal measurement; no latency threshold"]
 async fn probe_minimal_repo_cap8() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     Box::pin(probe_workspace("minimal-cap8", true, Some(8))).await;
 }
 
 #[tokio::test]
 #[ignore = "fixed-artifact causal measurement; no latency threshold"]
 async fn probe_real_repo_uncapped32() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     Box::pin(probe_workspace("real-32", false, None)).await;
 }
 
 #[tokio::test]
 #[ignore = "fixed-artifact causal measurement; no latency threshold"]
 async fn probe_minimal_repo_uncapped32() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     Box::pin(probe_workspace("minimal-32", true, None)).await;
 }
 
@@ -554,6 +621,49 @@ async fn start_public_in_workspace(
     eprintln!("bounded provider delivery diagnosis run={run_id} cap={cap:?} start returned");
 }
 
+async fn failed_attempt_diagnostic(
+    state: &ServerState,
+    db: &dyn switchy_database::Database,
+    run_id: &str,
+    activation: &representation::scheduling::ActivationObservation,
+    attempt: &representation::scheduling::AttemptObservation,
+) -> Result<String, ServerError> {
+    use representation::attempts::owner_boundary;
+    use std::fmt::Write as _;
+
+    let outcome = owner_boundary::terminal_outcome(db, run_id, &attempt.dispatch_identity)
+        .await
+        .map_err(backpressure::normalize)?;
+    let mut diagnostic = format!(
+        "\nfailed_node={} attempt={} owner_terminal={outcome:?} error_code=not_recorded",
+        activation.node_id, attempt.attempt,
+    );
+    let Some(receipt) = owner_boundary::receipt(db, &attempt.dispatch_identity)
+        .await
+        .map_err(backpressure::normalize)?
+    else {
+        return Ok(diagnostic);
+    };
+    let Ok(owner) = crate::workflow_receipts::AgentTurnReceipt::decode(&receipt.receipt) else {
+        return Ok(diagnostic);
+    };
+    let Ok(events) = state
+        .sessions
+        .session_turn_evidence(owner.session_id, &owner.turn_id)
+        .await
+    else {
+        return Ok(diagnostic);
+    };
+    let terminal = events.iter().rev().find_map(|event| match &event.kind {
+        bcode_session_models::SessionEventKind::ModelTurnFinished {
+            turn_id, outcome, ..
+        } if turn_id == &owner.turn_id => Some(outcome),
+        _ => None,
+    });
+    write!(diagnostic, " session_terminal={terminal:?}").ok();
+    Ok(diagnostic)
+}
+
 async fn bounded_run_diagnostic(state: &ServerState, run_id: &str) -> String {
     use std::fmt::Write as _;
 
@@ -565,6 +675,16 @@ async fn bounded_run_diagnostic(state: &ServerState, run_id: &str) -> String {
         // Typed snapshot has identities, attempt numbers, receipt-presence and terminal
         // facts only. No input, intent, receipt payload or provider-private metadata.
         let mut diagnostic = format!("{snapshot:?}");
+        for activation in &snapshot.activations {
+            let Some(attempt) = &activation.latest_attempt else {
+                continue;
+            };
+            if attempt.terminal == Some(representation::attempts::TerminalOutcome::Failed) {
+                diagnostic.push_str(
+                    &failed_attempt_diagnostic(state, &db, run_id, activation, attempt).await?,
+                );
+            }
+        }
         let pending = representation::attempts::pending(&db, run_id, None, 8)
             .await
             .map_err(backpressure::normalize)?;
@@ -656,18 +776,27 @@ async fn wait_public_with_budget(
                 state,
                 crate::ClientId::new(),
             );
-            let summary = bcode_workflow::WorkflowRunApplication::workflow_run_status(
+            let summary = match bcode_workflow::WorkflowRunApplication::workflow_run_status(
                 &application,
                 run_id.into(),
             )
             .await
-            .expect("public status")
-            .expect("run");
+            {
+                Err(error) if error.code == "workflow_storage_busy" => {
+                    drop(application);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    continue;
+                }
+                result => result.expect("public status").expect("run"),
+            };
             drop(application);
             if summary.status == bcode_workflow::RunStatus::Completed {
                 break;
             }
-            assert_ne!(summary.status, bcode_workflow::RunStatus::Failed);
+            if summary.status == bcode_workflow::RunStatus::Failed {
+                let diagnostic = bounded_run_diagnostic(state, run_id).await;
+                panic!("workflow run failed run={run_id}: {diagnostic}");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })

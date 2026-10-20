@@ -57,9 +57,61 @@ impl AgentTurnReceipt {
     }
 }
 
+/// Compare exact admission payloads while permitting omitted legacy owner hints.
+/// Conflicting supplied ownership hints and unknown payload differences remain invalid.
+pub fn same_admission(existing: &serde_json::Value, proposed: &serde_json::Value) -> bool {
+    if existing == proposed {
+        return true;
+    }
+    if AgentTurnReceipt::decode(existing).is_err() || AgentTurnReceipt::decode(proposed).is_err() {
+        return false;
+    }
+    let (Some(mut existing), Some(mut proposed)) =
+        (existing.as_object().cloned(), proposed.as_object().cloned())
+    else {
+        return false;
+    };
+    for key in ["owner_artifact_id", "owner_daemon_instance_id"] {
+        let first = existing.remove(key).filter(|value| !value.is_null());
+        let second = proposed.remove(key).filter(|value| !value.is_null());
+        if first.is_some() && second.is_some() && first != second {
+            return false;
+        }
+    }
+    existing == proposed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_comparison_preserves_payload_and_supplied_owner_conflicts() {
+        let session_id = SessionId::new();
+        let accepted = TurnReceipt::from_accepted_event(session_id, 42);
+        let recovered = serde_json::json!({
+            "owner": AGENT_TURN_OWNER, "session_id": session_id,
+            "turn_id": accepted.turn_id, "work_id": accepted.work_id,
+            "accepted_event_sequence": 42, "output_schema_id": "result",
+        });
+        let mut live = recovered.clone();
+        live["owner_artifact_id"] = "artifact".into();
+        live["owner_daemon_instance_id"] = "daemon".into();
+        assert!(same_admission(&live, &recovered));
+        assert!(same_admission(&recovered, &live));
+        let mut conflict = live.clone();
+        conflict["owner_daemon_instance_id"] = "another".into();
+        assert!(!same_admission(&live, &conflict));
+        conflict = recovered.clone();
+        conflict["output_schema_id"] = "different".into();
+        assert!(!same_admission(&live, &conflict));
+        conflict = recovered.clone();
+        conflict["extra"] = true.into();
+        assert!(!same_admission(&live, &conflict));
+        conflict = recovered;
+        conflict["accepted_event_sequence"] = 43.into();
+        assert!(!same_admission(&live, &conflict));
+    }
 
     #[test]
     fn agent_turn_contract_validates_admission_and_preserves_legacy_v1() {

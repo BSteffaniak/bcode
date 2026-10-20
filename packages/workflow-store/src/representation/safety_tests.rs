@@ -10,6 +10,12 @@ fn recovery_owner(id: &str, generation: u64) -> WorkflowExecutionAuthority {
 }
 
 async fn recovery_fixture() -> Box<dyn Database> {
+    recovery_fixture_with_binding(None).await
+}
+
+async fn recovery_fixture_with_binding(
+    binding: Option<&crate::WorkflowRunPackageBinding>,
+) -> Box<dyn Database> {
     let db = super::super::tests::database().await;
     super::super::install(&*db).await.unwrap();
     let definition = bcode_workflow::WorkflowBuilder::new(
@@ -25,9 +31,14 @@ async fn recovery_fixture() -> Box<dyn Database> {
     let mut request = super::super::tests::run("recovery", false);
     request.definition_id = id.definition_id;
     request.definition_version = id.definition_version;
-    super::super::admit(&*db, &request, &definition)
+    let tx = db.begin_transaction().await.unwrap();
+    super::super::admit_package_in(&*tx, &request, &definition, binding)
         .await
         .unwrap();
+    super::super::hierarchy::register_root(&*tx, &request)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     db
 }
 
@@ -127,6 +138,74 @@ async fn recovery_handoff_preserves_unresolved_receipt_until_exact_settlement() 
             .unwrap(),
         Some(receipt)
     );
+}
+
+#[tokio::test]
+async fn binding_survives_generic_transfer_and_stale_owner_cannot_mutate() {
+    for version in [1, 999] {
+        let binding = crate::WorkflowRunPackageBinding {
+            version,
+            package_id: "test/transfer".into(),
+            lock_digest: "a".repeat(64),
+        };
+        let db = recovery_fixture_with_binding(Some(&binding)).await;
+        let old = recovery_owner("old", 1);
+        let new = recovery_owner("new", 2);
+        super::super::attempts::claim_authority(&*db, "recovery", &old)
+            .await
+            .unwrap();
+        let transition = AuthorityHandoff {
+            run_id: "recovery".into(),
+            expected: old.clone(),
+            replacement: new.clone(),
+        };
+        handoff_authority(&*db, &transition, &Resolver(true))
+            .await
+            .unwrap();
+        handoff_authority(&*db, &transition, &Resolver(true))
+            .await
+            .unwrap();
+        assert!(
+            request_cancellation(&*db, "recovery", &old, 2)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::super::attempts::owner_boundary::verify(&*db, "recovery", &old)
+                .await
+                .is_err()
+        );
+        request_cancellation(&*db, "recovery", &new, 3)
+            .await
+            .unwrap();
+        let rows = db
+            .select(super::super::RUNS)
+            .columns(&["admission_json"])
+            .where_eq("run_id", "recovery")
+            .limit(1)
+            .execute(&*db)
+            .await
+            .unwrap();
+        let Some(DatabaseValue::String(json)) = rows[0].get("admission_json") else {
+            panic!("admission");
+        };
+        let admission = super::super::admission_projection::admission(&json).unwrap();
+        assert_eq!(admission.package_binding, Some(binding.clone()));
+        assert!(serde_json::from_str::<crate::NewWorkflowRun>(&json).is_ok());
+        if version == 1 {
+            assert_eq!(
+                super::super::admission_projection::package_binding(&*db, "recovery")
+                    .await
+                    .unwrap(),
+                Some(binding)
+            );
+        } else {
+            assert!(matches!(
+                super::super::admission_projection::package_binding(&*db, "recovery").await,
+                Err(Error::UnsupportedLifecycle)
+            ));
+        }
+    }
 }
 
 struct Resolver(bool);

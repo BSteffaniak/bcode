@@ -98,9 +98,78 @@ pub(super) async fn register_root(
         .await?;
     Ok(())
 }
+/// Resolve a call against one exact immutable publication; never searches publications by member.
+/// # Errors
+/// Rejects unsupported targets, absent/unknown bindings and mismatched locked identities.
+pub async fn resolve_call(
+    db: &dyn Database,
+    binding: Option<&crate::WorkflowRunPackageBinding>,
+    target: &bcode_workflow::WorkflowCallTarget,
+) -> Result<bcode_workflow::WorkflowDefinitionIdentity, Error> {
+    use bcode_workflow::WorkflowCallTarget;
+    if binding.is_some_and(|b| b.version != 1) {
+        return Err(Error::UnsupportedLifecycle);
+    }
+    if let WorkflowCallTarget::Definition { identity } = target {
+        return Ok(identity.clone());
+    }
+    let binding = binding.ok_or(Error::InvalidAdmission)?;
+    let lock = super::admission_projection::publication(db, binding).await?;
+    let member_id = match target {
+        WorkflowCallTarget::PackageLocal { reference } => {
+            reference.validate().map_err(|_| Error::InvalidAdmission)?;
+            &reference.member_id
+        }
+        WorkflowCallTarget::PackageMember { member_id, .. } => member_id,
+        _ => return Err(Error::UnsupportedLifecycle),
+    };
+    let member = lock
+        .members
+        .iter()
+        .find(|m| &m.member_id == member_id)
+        .ok_or(Error::InvalidAdmission)?;
+    if let WorkflowCallTarget::PackageMember {
+        definition_identity,
+        ..
+    } = target
+        && definition_identity != &member.definition_identity
+    {
+        return Err(Error::InvalidAdmission);
+    }
+    Ok(member.definition_identity.clone())
+}
+
+async fn stable_child_retry(
+    tx: &dyn DatabaseTransaction,
+    child: &NewWorkflowRun,
+    link: &crate::WorkflowRunLink,
+    original: Option<&crate::RepresentedWorkflowAdmission>,
+) -> Result<(NewWorkflowRun, crate::WorkflowRunLink), Error> {
+    let mut stable_child = child.clone();
+    let mut stable_link = link.clone();
+    if let Some(original) = original {
+        let lineage = exact(tx, LINEAGE, "run_id", &child.run_id).await?;
+        let prior_link: crate::WorkflowRunLink =
+            serde_json::from_str(&text(&lineage, "link_json")?)
+                .map_err(|_| Error::MaintenanceRequired)?;
+        stable_child.created_at_ms = original.admission.created_at_ms;
+        stable_link.created_at_ms = prior_link.created_at_ms;
+        let mut comparison = stable_child.clone();
+        // Original admission authority is historical; current parent authority is checked below.
+        // Returning an existing child neither transfers its ownership nor authorizes dispatch.
+        comparison
+            .execution_authority
+            .clone_from(&original.admission.execution_authority);
+        if comparison != original.admission || stable_link != prior_link {
+            return Err(Error::InvalidAdmission);
+        }
+    }
+    Ok((stable_child, stable_link))
+}
+
 /// Admit an exact compiled-definition child and its lineage atomically.
 ///
-/// Package and authored targets require their owning resolver and remain unsupported here.
+/// Package targets resolve only through the parent's immutable canonical lineage binding.
 /// This never dispatches child work or infers authority from caller-supplied lineage.
 /// # Errors
 /// Rejects stale parent ownership, mismatched call target, invalid lineage, policy widening,
@@ -129,9 +198,26 @@ pub async fn admit_child(
     if call.target != link.target {
         return Err(Error::InvalidAdmission);
     }
-    let bcode_workflow::WorkflowCallTarget::Definition { identity } = &call.target else {
-        return Err(Error::UnsupportedLifecycle);
-    };
+    let binding = super::admission_projection::package_binding(&*tx, &link.parent_run_id).await?;
+    let existing = tx
+        .select(RUNS)
+        .columns(&["admission_json"])
+        .where_eq("run_id", child.run_id.as_str())
+        .limit(1)
+        .execute(&*tx)
+        .await?;
+    let original = existing
+        .first()
+        .map(|row| {
+            let json = text(row, "admission_json")?;
+            super::admission_projection::admission(&json)
+        })
+        .transpose()?;
+    let (stable_child, stable_link) =
+        stable_child_retry(&*tx, child, link, original.as_ref()).await?;
+    let child = &stable_child;
+    let link = &stable_link;
+    let identity = resolve_call(&*tx, binding.as_ref(), &call.target).await?;
     if identity.definition_id != child.definition_id
         || identity.definition_version != child.definition_version
     {
@@ -144,8 +230,44 @@ pub async fn admit_child(
     {
         return Err(Error::InvalidAdmission);
     }
+    let actual = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+        identity.kind.clone(),
+        definition,
+    )
+    .map_err(|_| Error::InvalidAdmission)?;
+    if actual != identity {
+        return Err(Error::InvalidAdmission);
+    }
+    if let bcode_workflow::WorkflowCallTarget::PackageLocal { reference } = &call.target {
+        let lock = super::admission_projection::publication(
+            &*tx,
+            binding.as_ref().ok_or(Error::InvalidAdmission)?,
+        )
+        .await?;
+        reference
+            .resolve(&lock, definition)
+            .map_err(|_| Error::InvalidAdmission)?;
+    }
     register_child(&*tx, owner, link, child).await?;
-    let result = super::admit_in(&*tx, child, definition).await?;
+    let result = if original.is_some() {
+        if super::admission_projection::package_binding(&*tx, &child.run_id).await? != binding {
+            return Err(Error::InvalidAdmission);
+        }
+        let row = exact(&*tx, RUNS, "run_id", &child.run_id).await?;
+        let json = serde_json::to_string(definition).map_err(|_| Error::InvalidAdmission)?;
+        if text(&row, "definition_json")? != json
+            || text(&row, "definition_sha256")? != crate::sha256_hex(json.as_bytes())
+        {
+            return Err(Error::MaintenanceRequired);
+        }
+        super::RepresentationAdmission {
+            run_id: child.run_id.clone(),
+            already_present: true,
+            dispatch: super::DispatchAvailability::UnsupportedLifecycle,
+        }
+    } else {
+        super::admit_package_in(&*tx, child, definition, binding.as_ref()).await?
+    };
     tx.commit().await?;
     Ok(result)
 }
@@ -265,6 +387,8 @@ fn validate_child_authority(
         .map_err(|_| Error::MaintenanceRequired)?;
     if text(parent, "status")? != "paused"
         || child.authorization_ceiling > request.authorization_ceiling
+        || child.authorization_profile != request.authorization_profile
+        || child.execution_authority.as_ref() != Some(owner)
     {
         return Err(Error::InvalidAdmission);
     }
@@ -467,6 +591,18 @@ mod tests {
         bcode_workflow::WorkflowCallTarget,
         NewWorkflowRun,
     ) {
+        child_fixture_with_binding(db, None).await
+    }
+
+    async fn child_fixture_with_binding(
+        db: &dyn Database,
+        binding: Option<&crate::WorkflowRunPackageBinding>,
+    ) -> (
+        bcode_workflow::WorkflowDefinition,
+        bcode_workflow::WorkflowDefinitionIdentity,
+        bcode_workflow::WorkflowCallTarget,
+        NewWorkflowRun,
+    ) {
         let child_definition = bcode_workflow::WorkflowBuilder::new(
             "child",
             bcode_workflow::Step::task("work", |v: u32, _| async move { Ok(v) }),
@@ -500,10 +636,170 @@ mod tests {
         parent.definition_id = parent_identity.definition_id;
         parent.definition_version = parent_identity.definition_version;
         parent.limits.node_execution_cap = 2;
-        super::super::admit(db, &parent, &parent_definition)
+        let tx = db.begin_transaction().await.unwrap();
+        super::super::admit_package_in(&*tx, &parent, &parent_definition, binding)
             .await
             .unwrap();
+        register_root(&*tx, &parent).await.unwrap();
+        tx.commit().await.unwrap();
         (child_definition, identity, target, parent)
+    }
+
+    struct EndedOwner;
+    impl super::super::safety::AuthorityHandoffResolver for EndedOwner {
+        fn verify<'a>(
+            &'a self,
+            transition: &'a super::super::safety::AuthorityHandoff,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<super::super::safety::HandoffEvidence, Error>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(super::super::safety::HandoffEvidence::Verified {
+                    transition: Box::new(transition.clone()),
+                    receipt_id: "ended".into(),
+                    verified_at_ms: 100,
+                })
+            })
+        }
+    }
+
+    async fn assert_child_recovery_fence(
+        db: &dyn Database,
+        stale: &crate::WorkflowExecutionAuthority,
+        link: &crate::WorkflowRunLink,
+        child: &mut NewWorkflowRun,
+        definition: &bcode_workflow::WorkflowDefinition,
+        child_id: &str,
+    ) {
+        let mut replacement = stale.clone();
+        replacement.daemon_instance_id = "replacement".into();
+        replacement.fencing_token = "replacement-fence".into();
+        let transition = super::super::safety::AuthorityHandoff {
+            run_id: "parent".into(),
+            expected: crate::WorkflowExecutionAuthority {
+                target_artifact_id: "a".into(),
+                daemon_instance_id: "d".into(),
+                generation: 1,
+                fencing_token: "f".into(),
+            },
+            replacement: replacement.clone(),
+        };
+        super::super::safety::handoff_for_recovery(db, &transition, &EndedOwner)
+            .await
+            .unwrap();
+        child.execution_authority = Some(replacement.clone());
+        assert!(
+            admit_child(db, stale, link, child, definition)
+                .await
+                .is_err()
+        );
+        // Recovery barrier is intentional: duplicate child discovery is allowed only after
+        // reconciliation, never as a way around recovery or to transfer the existing child.
+        assert!(
+            admit_child(db, &replacement, link, child, definition)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            super::super::admission_projection::package_binding(db, child_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .package_id,
+            "test/mixed"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_definition_child_omission_inherits_root_binding_and_retries_do_not_rewrite() {
+        let db = super::super::tests::database().await;
+        super::super::install(&*db).await.unwrap();
+        let binding = crate::WorkflowRunPackageBinding {
+            version: 1,
+            package_id: "test/mixed".into(),
+            lock_digest: "a".repeat(64),
+        };
+        let (definition, identity, target, parent) =
+            child_fixture_with_binding(&*db, Some(&binding)).await;
+        let owner = crate::WorkflowExecutionAuthority {
+            target_artifact_id: "a".into(),
+            daemon_instance_id: "d".into(),
+            generation: 1,
+            fencing_token: "f".into(),
+        };
+        let (activation, _) = prepared_call(&*db, "parent", "work", &owner).await;
+        let child_id = crate::workflow_child_run_id("parent", "parent", &activation, 1, &target);
+        let mut child = super::super::tests::run(&child_id, false);
+        child.definition_id = identity.definition_id;
+        child.definition_version = identity.definition_version;
+        child.parent_session_id = Some("parent-session".into());
+        child.execution_authority = Some(owner.clone());
+        child.limits = parent.limits;
+        let link = crate::WorkflowRunLink {
+            version: crate::WORKFLOW_RUN_LINK_VERSION,
+            root_run_id: "parent".into(),
+            parent_run_id: "parent".into(),
+            parent_node_id: "work".into(),
+            parent_activation_id: activation,
+            parent_attempt: 1,
+            child_run_id: child_id.clone(),
+            target,
+            depth: 2,
+            created_at_ms: 4,
+        };
+        // Model the old Definition-only transaction: bare admission plus canonical lineage.
+        let tx = db.begin_transaction().await.unwrap();
+        register_child(&*tx, &owner, &link, &child).await.unwrap();
+        super::super::admit_in(&*tx, &child, &definition)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            super::super::admission_projection::package_binding(&*db, &child_id)
+                .await
+                .unwrap(),
+            Some(binding)
+        );
+        let mut later_child = child.clone();
+        later_child.created_at_ms += 100;
+        let mut later_link = link.clone();
+        later_link.created_at_ms += 100;
+        assert!(
+            admit_child(&*db, &owner, &later_link, &later_child, &definition)
+                .await
+                .unwrap()
+                .already_present
+        );
+        let mut stale = owner;
+        stale.generation += 1;
+        assert!(
+            admit_child(&*db, &stale, &later_link, &later_child, &definition)
+                .await
+                .is_err()
+        );
+        assert_child_recovery_fence(
+            &*db,
+            &stale,
+            &later_link,
+            &mut later_child,
+            &definition,
+            &child_id,
+        )
+        .await;
+        let row = exact(&*db, RUNS, "run_id", &child_id).await.unwrap();
+        let stored =
+            super::super::admission_projection::admission(&text(&row, "admission_json").unwrap())
+                .unwrap();
+        assert_eq!(stored.admission, child);
+        assert!(
+            stored.package_binding.is_none(),
+            "lineage recovery must not rewrite old admissions"
+        );
     }
 
     async fn assert_child_discovery(
@@ -544,6 +840,8 @@ mod tests {
         let mut child = super::super::tests::run(&child_id, false);
         child.definition_id = identity.definition_id;
         child.definition_version = identity.definition_version;
+        child.parent_session_id = Some("parent-session".into());
+        child.execution_authority = Some(owner.clone());
         child.limits = parent.limits.clone();
         let link = crate::WorkflowRunLink {
             version: crate::WORKFLOW_RUN_LINK_VERSION,

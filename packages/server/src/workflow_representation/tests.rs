@@ -695,6 +695,7 @@ pub(super) async fn typed_provider_fixture_with_target(
 
 #[tokio::test]
 async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions_root, state, _) = typed_provider_fixture_with_target(
         false,
         bcode_workflow::PromptContextTarget::SharedParentSequential,
@@ -763,6 +764,7 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
 async fn owner_admission_waits_for_store_writer_and_rechecks_authority() {
     use bcode_workflow_store::ActivationDispatchOwner;
 
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, definition) = typed_provider_fixture().await;
     let path = crate::workflow_store_path(&state);
     let db = open(&path, true).expect("db");
@@ -851,6 +853,8 @@ async fn owner_admission_waits_for_store_writer_and_rechecks_authority() {
 #[tokio::test]
 async fn typed_agent_test_harness_uses_real_prompt_owner_and_fake_provider() {
     use bcode_workflow_store::ActivationDispatchOwner;
+
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions_root, state, definition) = typed_provider_fixture().await;
     let db = open(&crate::workflow_store_path(&state), true).expect("typed store");
     let guard = crate::workflow_operations::execution_authority(&state, "new")
@@ -944,6 +948,7 @@ async fn typed_agent_test_harness_uses_real_prompt_owner_and_fake_provider() {
 
 #[tokio::test]
 async fn normal_start_uses_typed_family_and_rescans_two_running_agents_without_duplicate_turns() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions_root, state, _) = typed_provider_fixture().await;
     let parent = state
         .sessions
@@ -1064,6 +1069,7 @@ fn parallel_provider_definition() -> bcode_workflow::WorkflowDefinition {
 
 #[tokio::test]
 async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("root");
     let sessions = crate::SessionManager::persistent_lazy(root.path());
     let parent = sessions
@@ -1144,6 +1150,7 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
 
 #[tokio::test]
 async fn failed_receipt_is_terminal_not_repeated_scheduler_progress() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions_root, state, _) = typed_provider_fixture().await;
     let db = open(&crate::workflow_store_path(&state), true).expect("typed store");
     let guard = owner::local_authority(&state, "new")
@@ -1398,6 +1405,7 @@ fn configure_delegation_fixture(state: &mut ServerState) {
 
 #[tokio::test]
 async fn typed_coordinator_stages_and_publishes_delegation_through_normal_tool() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         Box::pin(run_typed_delegation()),
@@ -1552,6 +1560,7 @@ async fn invoke_delegation_tool(
 
 #[tokio::test]
 async fn public_cancellation_settles_real_gated_provider_without_late_reopen() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
     crate::drive_workflow_run(&state, "new")
         .await
@@ -1638,6 +1647,7 @@ async fn public_cancellation_settles_real_gated_provider_without_late_reopen() {
 
 #[tokio::test]
 async fn takeover_uses_real_lifetime_evidence_and_preserves_ambiguous_mutating_intent() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     takeover_receipt_fixture(false).await;
     takeover_receipt_fixture(true).await;
 }
@@ -2478,6 +2488,7 @@ async fn attach_recovery_receipt(
 
 #[tokio::test]
 async fn represented_acceptance_recovery_is_exact_idempotent_and_never_redispatches() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
     let db = open(&crate::workflow_store_path(&state), true).expect("db");
     let authority = owner::local_authority(&state, "new")
@@ -2500,7 +2511,7 @@ async fn represented_acceptance_recovery_is_exact_idempotent_and_never_redispatc
         crate::drive_workflow_run(&state, "new").await.is_err(),
         "receipt-less preparation without acceptance must not be redispatched"
     );
-    interrupt_after_canonical_acceptance(&state, &dispatch).await;
+    Box::pin(interrupt_after_canonical_acceptance(&state, &dispatch)).await;
     assert!(
         representation::attempts::owner_boundary::receipt(&db, &dispatch.dispatch_identity)
             .await
@@ -2603,11 +2614,15 @@ async fn pending_receipt_publication_cancellation_retains_accepted_turn_observer
     let (transfer, acquired) = tokio::sync::oneshot::channel();
     let owned_state = std::sync::Arc::clone(&state);
     let owned_dispatch = dispatch.clone();
+    let owned_gate = gate.clone();
     let mut outer = tokio::spawn(async move {
         crate::dispatch_workflow_prompt_turn_with_publication_hook(
             &owned_state,
             &owned_dispatch,
             || async move {
+                // Submission activation verifies durable workflow authority through
+                // this same queue. Observe the provider before fencing publication.
+                wait_publication_provider_gate(&owned_gate).await;
                 let queue = backpressure::write_queue(&path).expect("canonical fixture queue");
                 let held = queue.lock_owned().await;
                 transfer
@@ -2681,7 +2696,21 @@ async fn publication_accepted_receipt(
         .await
         .expect("prepared")
         .expect("attempt");
-    let session = acceptance_recovery_session(state, &prepared).await;
+    // The fixture deliberately owns the writer queue. Read its already-persisted
+    // link directly rather than reentering the queued application read.
+    let session = representation::attempts::owner_boundary::execution_session_link(
+        db,
+        &prepared.run_id,
+        &prepared.node_id,
+        &prepared.activation_id,
+        prepared.attempt,
+    )
+    .await
+    .expect("fixture link read")
+    .expect("accepted execution link")
+    .session_id
+    .parse()
+    .expect("session identity");
     let accepted = state
         .sessions
         .turn_receipt(session, "bcode.workflow", dispatch_identity)
@@ -2929,11 +2958,15 @@ async fn interrupt_after_canonical_acceptance(
     let started = std::time::Instant::now();
     fixture_stage_diagnostic(state, "before-real-acceptance-interruption", started).await;
     assert!(
-        crate::dispatch_workflow_prompt_turn_after_admission(state, dispatch, || {
-            Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
-                "interrupted after canonical acceptance before workflow receipt".into(),
-            ))
-        })
+        Box::pin(crate::dispatch_workflow_prompt_turn_after_admission(
+            state,
+            dispatch,
+            || {
+                Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "interrupted after canonical acceptance before workflow receipt".into(),
+                ))
+            }
+        ))
         .await
         .is_err()
     );
@@ -2961,6 +2994,7 @@ async fn acceptance_recovery_session(
 
 #[tokio::test]
 async fn represented_acceptance_recovery_live_owner_cancel_settles_exact_turn() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
     let db = open(&crate::workflow_store_path(&state), true).expect("db");
     let authority = owner::local_authority(&state, "new")
@@ -2968,7 +3002,7 @@ async fn represented_acceptance_recovery_live_owner_cancel_settles_exact_turn() 
         .expect("owner")
         .expect("local");
     let dispatch = prepare_acceptance_recovery_fixture(&state, &db, &authority.authority).await;
-    interrupt_after_canonical_acceptance(&state, &dispatch).await;
+    Box::pin(interrupt_after_canonical_acceptance(&state, &dispatch)).await;
     let prepared =
         representation::attempts::owner_boundary::prepared(&db, "new", &dispatch.dispatch_identity)
             .await
@@ -3085,6 +3119,7 @@ pub(super) async fn prepare_acceptance_recovery_fixture(
 
 #[tokio::test]
 async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
     let mut cleanup = FixtureCleanup::new(&state);
     state.start_workflow_driver().await;
@@ -3136,6 +3171,7 @@ async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
 
 #[tokio::test]
 async fn normal_input_resolution_preserves_gate_identity_and_resumes_provider_work() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
     let parent = state
         .sessions
@@ -3239,6 +3275,7 @@ async fn normal_input_resolution_preserves_gate_identity_and_resumes_provider_wo
 
 #[tokio::test]
 async fn normal_approval_denial_is_not_success_and_wrong_gate_kind_rejects() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
     let parent = state
         .sessions

@@ -14,6 +14,28 @@
 //! Normal model-context reads return that marker plus later semantic events without replaying or
 //! repairing the complete event log.
 
+/// Initial observation resource exhaustion is not canonical damage.
+#[derive(Debug, thiserror::Error)]
+pub enum InitialObservationPageError {
+    /// Explicit page policy was exhausted.
+    #[error("initial observation page resource limit exceeded")]
+    ResourceLimit,
+    /// Existing canonical/session read failure.
+    #[error(transparent)]
+    Canonical(#[from] SessionError),
+}
+
+impl From<crate::db_event_store::BudgetedEventRowError> for InitialObservationPageError {
+    fn from(error: crate::db_event_store::BudgetedEventRowError) -> Self {
+        match error {
+            crate::db_event_store::BudgetedEventRowError::ResourceLimit => Self::ResourceLimit,
+            crate::db_event_store::BudgetedEventRowError::Canonical(error) => {
+                Self::Canonical(error.into())
+            }
+        }
+    }
+}
+
 mod actor;
 pub mod artifact_compression;
 pub mod artifact_reader;
@@ -52,6 +74,7 @@ pub mod ownership;
 pub mod persisted;
 pub mod projection;
 pub mod repair;
+mod spawning;
 pub use invocation_recovery::{InvocationRecoveryCheckpoint, InvocationRecoveryObservation};
 mod runtime_work;
 pub use runtime_work::InterruptedRecoveryWork;
@@ -100,7 +123,10 @@ pub use manifest::{
     CURRENT_SESSION_FORMAT_EPOCH, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
 };
 use manifest::{SessionFormatMarker, SessionManifest};
-pub use state::RememberedReasoning;
+pub use state::{
+    BoundedSessionEvent, BoundedSessionEventError, BoundedSessionEventLoss,
+    BoundedSessionEventSubscription, BoundedSessionEventUpdate, RememberedReasoning,
+};
 use state::{SessionLiveEventBroker, SessionLoadStatusKind, SessionState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
@@ -1653,6 +1679,7 @@ impl SessionManager {
                 .append_event(
                     SessionEventKind::ChildSessionCreated {
                         request: Box::new(request),
+                        spawning: None,
                     },
                     now_ms,
                 )
@@ -2805,6 +2832,57 @@ impl SessionManager {
         window.has_older = window.has_older || page.has_more;
         window.has_newer = false;
         Ok(window)
+    }
+
+    /// Load initial observation events with a shared decode budget; ordinary history is unchanged.
+    /// # Errors
+    /// Separates resource policy exhaustion from existing canonical read failures.
+    pub async fn session_history_page_with_decode_budget(
+        &self,
+        session_id: SessionId,
+        query: SessionHistoryQuery,
+        budget: crate::persisted::EventDecodeBudget,
+    ) -> Result<
+        (SessionHistoryPage, crate::persisted::EventDecodeBudget),
+        InitialObservationPageError,
+    > {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached {
+            return handle.history_page_with_decode_budget(query, budget).await;
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?;
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id).into());
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path())
+            .await
+            .map_err(SessionError::from)?;
+        let mut budget = budget;
+        let page = db
+            .history_page_with_decode_budget(query, &mut budget)
+            .await?;
+        Ok((page, budget))
+    }
+
+    /// Load a projection initial page after budget admission of source events.
+    /// The second history read shares the aggregate budget with the first scan.
+    /// # Errors
+    /// Separates resource exhaustion from canonical/session damage; never repairs state.
+    pub async fn session_projection_history_page_with_decode_budget(
+        &self,
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+        budget: crate::persisted::EventDecodeBudget,
+    ) -> Result<ProjectionHistoryPage, InitialObservationPageError> {
+        let handle = self.session_handle(session_id).await?;
+        handle
+            .projection_history_page_with_decode_budget(request, budget)
+            .await
     }
 
     /// Return one read-only bounded projection page with its canonical source events.

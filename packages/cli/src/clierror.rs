@@ -6,7 +6,7 @@ use crate::CliError;
 
 /// Command-line selection of the returned-error presentation contract.
 #[derive(Debug, clap::Args)]
-pub(crate) struct CliErrorOutputOptions {
+pub struct CliErrorOutputOptions {
     /// Emit secret-safe versioned JSON for returned errors (not argument-parser exits).
     #[arg(long, global = true)]
     pub(crate) json_errors: bool,
@@ -42,6 +42,26 @@ impl CliDiagnosticError {
                 bcode_daemon_lifecycle::DaemonStartError::NotificationTimeout { .. },
             ) => Self::notification_timeout(),
             CliError::WorkflowApplication { code, .. } => Self::application(code),
+            CliError::SessionSpawnNotAdmitted => Self::diagnostic(
+                "session_spawn_not_admitted",
+                "session_spawn",
+                "Session spawn returned a failure or non-executable admission; inspect the complete JSON result before retrying.",
+            ),
+            CliError::PluginCommandNotApplied => Self::diagnostic(
+                "plugin_command_not_applied",
+                "plugin_command",
+                "Plugin command or effect was unsuccessful; inspect the ordered effect outcomes and retained receipts before retrying.",
+            ),
+            CliError::InteractionResolutionNotApplied => Self::diagnostic(
+                "interaction_resolution_not_applied",
+                "interaction_resolution",
+                "Permission or exchange resolution was not applied; inspect the exact receipt before retrying.",
+            ),
+            CliError::InteractionControllerNotApplied => Self::diagnostic(
+                "interaction_controller_not_applied",
+                "interaction_controller",
+                "Semantic controller rejected input or returned cancellation; inspect the typed result and refresh before further input.",
+            ),
             CliError::Signal(error) | CliError::ThemeIo(error) => Self::io(error.kind()),
             CliError::Json(_) => Self::diagnostic(
                 "json_decode_failed",

@@ -4,6 +4,8 @@
 
 //! Model catalog loading, validation, and static artifact generation.
 
+pub mod application;
+
 use bcode_model::{
     CapabilitySource, CapabilitySupport, MediaInputFeature, ModelCacheCapability, ModelCacheInfo,
     ModelCapability, ModelInfo, ModelMetadataSource, ModelPricingInfo, ModelPricingSource,

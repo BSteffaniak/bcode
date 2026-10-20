@@ -13,10 +13,13 @@ pub(crate) mod artifact_operations;
 mod auxiliary_generation;
 #[cfg(test)]
 mod child_session_ipc_tests;
+mod command_application;
 mod context_accounting;
 pub(crate) mod context_compaction;
 mod context_lineage;
 mod image_input;
+mod import_search_application;
+mod interaction_application;
 mod interaction_operations;
 mod invariant_guidance;
 mod judgement;
@@ -27,6 +30,7 @@ mod model_check;
 mod model_evidence;
 mod model_ignores;
 mod model_request_target;
+pub use command_application::CommandApplicationHandle;
 mod plugin_context;
 mod plugin_operations;
 mod provider_retry_recovery;
@@ -35,8 +39,13 @@ mod runtime_work;
 /// Transport-neutral runtime-work reads, observations and cancellation operations.
 pub mod runtime_work_operations;
 mod server_operations;
+mod services_application;
 mod session_activity;
 mod session_application;
+mod session_spawning;
+pub use import_search_application::ImportSearchApplicationHandle;
+pub use interaction_application::InteractionApplicationHandle;
+pub use services_application::ServicesApplicationHandle;
 mod session_bulk_migration;
 mod session_compression;
 pub use session_application::SessionApplicationHandle;
@@ -69,6 +78,18 @@ pub use workflow_operations::{
 };
 mod worktree_creation;
 mod worktree_operations;
+
+use bcode_agent_profile::application::AgentApplication as _;
+use bcode_command::application::CommandApplication as _;
+use bcode_daemon_lifecycle::application::RuntimeApplication as _;
+use bcode_model_catalog::application::ModelApplication as _;
+use bcode_plugin_sdk::application::PluginApplication as _;
+use bcode_session_import::application::ImportApplication as _;
+use bcode_session_models::{SessionApplication as _, application::RuntimeWorkApplication as _};
+use bcode_session_search::application::SearchApplication as _;
+use bcode_skill_models::application::SkillApplication as _;
+use bcode_workflow_view_models::application::SessionProgressApplication as _;
+use bcode_worktree_models::application::WorktreeApplication as _;
 
 use judgement::invoke_judgement_model;
 mod model_host_operations;
@@ -119,9 +140,8 @@ use bcode_agent_runtime::{
 };
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
-    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionBatchCorrelation, PluginServiceError,
-    PluginServiceResponse, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
-    WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest, decode_request,
+    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionBatchCorrelation, Request, Response,
+    ResponsePayload, ServerStatus, ServerStopMode, WorktreeCreateRequest, decode_request,
     encode_envelope_frames, event_envelope, recv_envelope, response_envelope,
     write_encoded_envelope_frames,
 };
@@ -500,6 +520,7 @@ pub struct ServerState {
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
     model_checks: Mutex<BTreeMap<String, model_check::ActiveCheck>>,
+    session_observations: session_observation::SessionObservationRegistry,
     generation_contexts: Mutex<BTreeMap<String, context_generation::CapturedContext>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_model_selection_origins: Mutex<BTreeMap<SessionId, SessionModelSelectionOrigin>>,
@@ -509,6 +530,7 @@ pub struct ServerState {
     recovered_permissions: Mutex<BTreeMap<String, bcode_session::InvocationRecoveryCheckpoint>>,
     pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
+    interaction_controllers: Mutex<bcode_plugin::interaction_controller::InteractionControllerHost>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     invocation_input_controllers: StdMutex<BTreeMap<(SessionId, String), ClientId>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
@@ -1750,10 +1772,7 @@ impl ServerState {
             Ok(failure) => failure,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(ServerError::WorkflowStorageUnavailable(
-                    "workflow readiness status is temporarily unavailable; retry the workflow request (no initialization progress has been verified)"
-                        .into(),
-                ));
+                return Err(ServerError::WorkflowStorageBusy);
             }
         };
         let Some(reason) = failure.as_ref() else {
@@ -2640,6 +2659,7 @@ impl ServerState {
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
             model_checks: Mutex::default(),
+            session_observations: session_observation::SessionObservationRegistry::default(),
             generation_contexts: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_model_selection_origins: Mutex::default(),
@@ -2648,6 +2668,7 @@ impl ServerState {
             recovered_permissions: Mutex::default(),
             pending_permission_batches: Arc::new(StdMutex::default()),
             pending_tool_exchanges: Mutex::default(),
+            interaction_controllers: Mutex::default(),
             active_plugin_invocations: Arc::default(),
             invocation_input_controllers: StdMutex::default(),
             active_artifacts: Arc::default(),
@@ -2870,6 +2891,11 @@ impl ServerState {
     }
 
     async fn close_client(&self, client_id: ClientId) -> Result<(), ServerError> {
+        self.session_observations.remove_client(client_id);
+        self.interaction_controllers
+            .lock()
+            .await
+            .remove_owner(&client_id.to_string());
         plugin_context::disconnect(self, client_id);
         self.abort_client_forwarders(client_id).await;
         let detach_result = self.detach_client_session(client_id).await;
@@ -5525,15 +5551,24 @@ async fn run_constructed_server(
     }
     if let Some(ready) = workflow_ready {
         use futures::FutureExt as _;
+        let callback_client_id = ClientId::new();
         let callback_result = {
             let application =
-                workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
-            // Include callback construction as well as future polling in the unwind boundary.
-            // Do not reuse the callback after a panic; drain the host through normal cleanup.
-            std::panic::AssertUnwindSafe(async { ready(&application).await })
-                .catch_unwind()
-                .await
+                workflow_operations::WorkflowAuthoringApplication::new(&state, callback_client_id)
+                    .with_embedded_consumer_registration();
+            // Construction and polling are fenced; cancellation drops the borrowed callback
+            // before caller cleanup. No detached cleanup task or owned host handle is created.
+            tokio::select! {
+                result = std::panic::AssertUnwindSafe(async { ready(&application).await }).catch_unwind() => result,
+                () = host_shutdown.cancelled() => Ok(()),
+                _ = shutdown.recv() => Ok(()),
+            }
         };
+        let cleanup_result = state.close_client(callback_client_id).await;
+        if let Err(error) = cleanup_result {
+            drop(listener);
+            return shutdown_constructed_server(state, Err(error)).await;
+        }
         if callback_result.is_err() {
             drop(listener);
             return shutdown_constructed_server(
@@ -6126,6 +6161,10 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
             "workflow_execution_allowance_exhausted",
             "workflow execution allowance is exhausted; no additional work was admitted",
         ),
+        WorkflowStoreError::UnsupportedUncappedConcurrency => (
+            "workflow_uncapped_concurrency_unsupported",
+            "this workflow storage representation requires an explicit finite concurrency limit; use supported admission or explicit maintenance before requesting uncapped execution",
+        ),
         WorkflowStoreError::ConcurrencyCapacityReached => (
             "workflow_concurrency_capacity_reached",
             "workflow execution slots are occupied; pending work waits for settlement",
@@ -6232,6 +6271,52 @@ fn handle_client(
     }
 }
 
+// Reserve cancellable invocation identities at read admission so an early same-caller
+// cancellation cannot race serial dispatch. This grants no execution authority.
+fn contextual_invocation_reservation(request: Request) -> Option<bcode_ipc::PluginServiceContext> {
+    match request {
+        Request::InvokePluginServiceContextual { context, .. } => Some(context),
+        Request::InvokeApplicationCommand { request } => Some(bcode_ipc::PluginServiceContext {
+            agent_id: request.agent_id,
+            invocation_id: request.invocation_id,
+            workspace: bcode_plugin_sdk::WorkspaceContext {
+                session_id: request
+                    .command
+                    .context
+                    .and_then(|context| context.session_id)
+                    .map(|id| id.to_string()),
+                launch_root: request.launch_root,
+            },
+            deadline_ms: request.deadline_ms,
+        }),
+        _ => None,
+    }
+}
+
+// Only caller-scoped cancellation control bypasses ordered operation dispatch.
+fn contextual_cancellation_response(
+    state: &ServerState,
+    client_id: ClientId,
+    request: Request,
+) -> Option<ResponsePayload> {
+    match request {
+        Request::CancelPluginServiceInvocation { invocation_id } => {
+            let accepted = plugin_context::cancel(state, client_id, &invocation_id);
+            Some(ResponsePayload::PluginServiceInvocationCancelled { accepted })
+        }
+        Request::CancelApplicationCommand { invocation_id } => {
+            let accepted = plugin_context::cancel(state, client_id, &invocation_id);
+            Some(ResponsePayload::ApplicationCommandCancelled {
+                result: bcode_command::application::CommandCancellationAcknowledgment {
+                    invocation_id,
+                    accepted,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
 async fn read_client_envelopes(
     mut reader: tokio::io::ReadHalf<LocalIpcStream>,
     incoming: tokio::sync::mpsc::Sender<Result<bcode_ipc::Envelope, CodecError>>,
@@ -6245,8 +6330,8 @@ async fn read_client_envelopes(
         let envelope = recv_envelope(&mut reader).await;
         if let Ok(envelope) = &envelope
             && envelope.kind == EnvelopeKind::Request
-            && let Ok(Request::InvokePluginServiceContextual { context, .. }) =
-                decode_request(&envelope.payload)
+            && let Ok(request) = decode_request(&envelope.payload)
+            && let Some(context) = contextual_invocation_reservation(request)
             && !plugin_context::reserve(&state, client_id, &context)
         {
             if send_response(
@@ -6270,17 +6355,12 @@ async fn read_client_envelopes(
         // Only this bounded, client-owned control request bypasses serial dispatch.
         if let Ok(envelope) = &envelope
             && envelope.kind == EnvelopeKind::Request
-            && let Ok(Request::CancelPluginServiceInvocation { invocation_id }) =
-                decode_request(&envelope.payload)
+            && let Ok(request) = decode_request(&envelope.payload)
+            && let Some(response) = contextual_cancellation_response(&state, client_id, request)
         {
-            let accepted = plugin_context::cancel(&state, client_id, &invocation_id);
-            if send_response(
-                &writer,
-                envelope.request_id,
-                Response::Ok(ResponsePayload::PluginServiceInvocationCancelled { accepted }),
-            )
-            .await
-            .is_err()
+            if send_response(&writer, envelope.request_id, Response::Ok(response))
+                .await
+                .is_err()
             {
                 request_end.send_replace(true);
                 disconnected.notify_one();
@@ -6320,6 +6400,7 @@ async fn run_client_operation(
             | Request::JudgementVerify { .. }
             | Request::JudgementSetup
             | Request::InvokePluginServiceContextual { .. }
+            | Request::InvokeApplicationCommand { .. }
     );
     let operation = Box::pin(handle_request(
         request,
@@ -6505,6 +6586,9 @@ fn request_metrics_context(
 #[allow(clippy::too_many_lines)]
 const fn request_session_id(request: &Request) -> Option<SessionId> {
     match request {
+        Request::RuntimeWorkPage { request } => Some(request.session_id),
+        Request::OpenSessionObservation { request } => Some(request.session_id),
+        Request::CloseSessionObservation { handle } => Some(handle.session_id),
         Request::SessionCompress { request } => Some(request.session_id),
         Request::PrepareContextGeneration { request } => Some(request.source_session_id),
         Request::SessionWorkingDocument { request } => Some(request.session_id),
@@ -6575,11 +6659,21 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::Ping => "ping",
         Request::IngestClientMetrics { .. } => "ingest_client_metrics",
         Request::ServerStatus { .. } => "server_status",
+        Request::ListApplicationCommands { .. } => "list_application_commands",
+        Request::InvokeApplicationCommand { .. } => "invoke_application_command",
+        Request::CancelApplicationCommand { .. } => "cancel_application_command",
+        Request::RuntimeStatus => "runtime_status",
+        Request::ModelCatalogSnapshot => "model_catalog_snapshot",
+        Request::RefreshModelCatalog => "refresh_model_catalog",
         Request::ModelCatalogDiagnostics => "model_catalog_diagnostics",
         Request::ServerStop { .. } => "server_stop",
         Request::ReleaseSessionOwnership { .. } => "release_session_ownership",
         Request::CreateSession { .. } => "create_session",
         Request::CreateChildSession { .. } => "create_child_session",
+        Request::SpawnSession { .. } => "spawn_session",
+        Request::OpenInteractionController { .. } => "open_interaction_controller",
+        Request::InteractionControllerSnapshot { .. } => "interaction_controller_snapshot",
+        Request::InteractionControllerInput { .. } => "interaction_controller_input",
         Request::SessionSummary { .. } => "session_summary",
         Request::WorkflowActivityPage { .. } => "workflow_activity_page",
         Request::WorkflowActivityClose { .. } => "workflow_activity_close",
@@ -6678,12 +6772,16 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::DeriveSession { .. } => "derive_session",
         Request::SessionDerivationStatus { .. } => "session_derivation_status",
         Request::CancelSessionDerivation { .. } => "cancel_session_derivation",
+        Request::OpenSessionObservation { .. } => "open_session_observation",
+        Request::PullSessionObservation { .. } => "pull_session_observation",
+        Request::CloseSessionObservation { .. } => "close_session_observation",
         Request::RefreshSessionCatalog { .. } => "refresh_session_catalog",
         Request::AttachSessionProjectionWindow { .. } => "attach_session_projection_window",
         Request::ListPendingToolExchanges => "list_pending_tool_exchanges",
         Request::ResolveToolExchange { .. } => "resolve_tool_exchange",
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::RuntimeWorkObservations { .. } => "runtime_work_observations",
+        Request::RuntimeWorkPage { .. } => "runtime_work_page",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
         Request::ApplyWorkflowSource(_) => "apply_workflow_source",
@@ -6939,6 +7037,22 @@ async fn handle_request(
     .await
 }
 
+fn session_observation_error_response(
+    error: bcode_session_models::SessionObservationError,
+) -> ErrorResponse {
+    use bcode_session_models::SessionObservationError as E;
+    let code = match error {
+        E::UnsupportedSchema => "session_observation_unsupported_schema",
+        E::InvalidRequest => "session_observation_invalid_request",
+        E::NotFound => "session_observation_not_found",
+        E::Unavailable => "session_observation_unavailable",
+        E::Unauthorized => "session_observation_unauthorized",
+        E::Conflict => "session_observation_conflict",
+        E::LimitReached => "session_observation_limit_reached",
+    };
+    ErrorResponse::new(code, error.to_string())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_request_inner(
     request: SessionLifecycleRequest,
@@ -6947,7 +7061,82 @@ async fn handle_request_inner(
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    match request {
+    // Keep the outer reply allocation charged through serialization, writer-lock
+    // waiting, and the actual send. Cancellation drops the send future before
+    // this reservation; this path does not enqueue or clone the boxed response.
+    let mut reply_box_reservation = None;
+    let mut reply_payload_reservation = None;
+    let send_result = match request {
+        SessionLifecycleRequest::OpenSessionObservation { request } => {
+            let result = async {
+                use bcode_session_models::SessionObservationError as E;
+                if state.shutdown_requested.load(Ordering::SeqCst) {
+                    return Err(E::Unavailable);
+                }
+                if !state.clients.lock().await.contains(&client_id) {
+                    return Err(E::Unauthorized);
+                }
+                session_operations::require_selected_location(state, request.session_id)
+                    .await
+                    .map_err(|_| E::Unavailable)?;
+                if state
+                    .active_session_namespace_mismatch(request.session_id, client_id)
+                    .await
+                    .is_some()
+                {
+                    return Err(E::Unauthorized);
+                }
+                state
+                    .session_observations
+                    .open(&state.sessions, client_id, request)
+                    .await
+            }
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(session_observation_error_response(error)),
+                |handle| Response::Ok(ResponsePayload::SessionObservationOpened { handle }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::PullSessionObservation { request } => {
+            let result = async {
+                let reservation = state.session_observations.reserve_reply_box()?;
+                let (result, payload_reservation) = state
+                    .session_observations
+                    .pull_charged(client_id, request)
+                    .await?
+                    .into_parts();
+                reply_box_reservation = Some(reservation);
+                reply_payload_reservation = Some(payload_reservation);
+                Ok(Box::new(result))
+            }
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(session_observation_error_response(error)),
+                |result| Response::Ok(ResponsePayload::SessionObservationPulled { result }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::CloseSessionObservation { handle } => {
+            let result = state.session_observations.close(client_id, &handle);
+            let response = result.map_or_else(
+                |error| Response::Err(session_observation_error_response(error)),
+                |closed| Response::Ok(ResponsePayload::SessionObservationClosed { closed }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::SpawnSession { request } => {
+            use bcode_session_models::SessionApplication as _;
+            let result =
+                Box::pin(SessionApplicationHandle::new(state, client_id).spawn_session(request))
+                    .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSpawned { result }),
+            )
+            .await
+        }
         SessionLifecycleRequest::Hello {
             client_name,
             runtime_context,
@@ -6998,32 +7187,103 @@ async fn handle_request_inner(
             ))
             .await
         }
+        SessionLifecycleRequest::RuntimeStatus => {
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).runtime_status()).await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| {
+                    Response::Ok(ResponsePayload::RuntimeStatus {
+                        connected_client_count: status.connected_client_count,
+                        selected_provider_plugin_id: status.selected_provider_plugin_id,
+                        selected_model_id: status.selected_model_id,
+                        idle_shutdown_blocker: status.idle_shutdown_blocker,
+                        workflow_unavailable_reason: status.workflow_unavailable_reason,
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::ModelCatalogSnapshot => {
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).model_catalog_snapshot())
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |catalog| {
+                    Response::Ok(ResponsePayload::ModelCatalogSnapshot {
+                        catalog: Box::new(catalog),
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::RefreshModelCatalog => {
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).refresh_model_catalog())
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |diagnostics| {
+                    Response::Ok(ResponsePayload::ModelCatalogDiagnostics { diagnostics })
+                },
+            );
+            send_response(writer, request_id, response).await
+        }
         SessionLifecycleRequest::ModelCatalogDiagnostics => {
-            Box::pin(handle_model_catalog_diagnostics(request_id, state, writer)).await
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).model_catalog_diagnostics(),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |diagnostics| {
+                    Response::Ok(ResponsePayload::ModelCatalogDiagnostics { diagnostics })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::ServerStop { mode } => {
-            handle_server_stop(request_id, state, writer, mode).await
+            handle_server_stop(request_id, client_id, state, writer, mode).await
         }
         SessionLifecycleRequest::ReleaseSessionOwnership { session_id } => {
             handle_release_session_ownership(request_id, state, writer, session_id).await
         }
         SessionLifecycleRequest::SetComposerDraft { scope, text } => {
-            handle_set_composer_draft(request_id, state, writer, scope, text).await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).set_composer_draft(scope, text),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |()| Response::Ok(ResponsePayload::ComposerDraftSet),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::ComposerDraft { scope } => {
-            handle_composer_draft(request_id, state, writer, scope).await
+            let result =
+                Box::pin(SessionApplicationHandle::new(state, client_id).composer_draft(scope))
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |draft| Response::Ok(ResponsePayload::ComposerDraft { draft }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::CreateSession {
             name,
             working_directory,
         } => {
             use bcode_session_models::SessionApplication as _;
-            let result = SessionApplicationHandle::new(state, client_id)
-                .create_session(bcode_session_models::CreateSessionRequest {
-                    name,
-                    working_directory,
-                })
-                .await;
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).create_session(
+                    bcode_session_models::CreateSessionRequest {
+                        name,
+                        working_directory,
+                    },
+                ),
+            )
+            .await;
             let response = result.map_or_else(
                 |error| Response::Err(ErrorResponse::new(error.code, error.message)),
                 |session| Response::Ok(ResponsePayload::SessionCreated { session }),
@@ -7031,13 +7291,26 @@ async fn handle_request_inner(
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::CreateChildSession { request } => {
-            handle_create_child_session(request_id, state, writer, request).await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).create_child_session(request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |session| Response::Ok(ResponsePayload::SessionCreated { session }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionSummary { session_id } => {
-            Box::pin(handle_session_summary(
-                request_id, state, writer, session_id,
-            ))
-            .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).session_summary(session_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |session| Response::Ok(ResponsePayload::SessionSummary { session }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::WorkflowActivityPage { request } => {
             let response = Box::pin(workflow_representation::workflow_activity::page(
@@ -7075,15 +7348,20 @@ async fn handle_request_inner(
         }
         SessionLifecycleRequest::SessionProgressSnapshot { session_id } => {
             Box::pin(handle_session_progress(
-                request_id, state, writer, session_id,
+                request_id, client_id, state, writer, session_id,
             ))
             .await
         }
         SessionLifecycleRequest::SessionActivity { session_id, query } => {
-            Box::pin(handle_session_activity(
-                request_id, state, writer, session_id, query,
-            ))
-            .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).session_activity(session_id, query),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::SessionActivity { page }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::ReconcileSessionChildren { parent_id, apply } => {
             Box::pin(handle_reconcile_session_children(
@@ -7092,10 +7370,21 @@ async fn handle_request_inner(
             .await
         }
         SessionLifecycleRequest::SessionChildren { query } => {
-            Box::pin(handle_session_children(request_id, state, writer, query)).await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).query_child_sessions(query),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::SessionChildren { page }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::ListSessionsWithScope { scope } => {
-            Box::pin(handle_scoped_session_list(request_id, state, writer, scope)).await
+            Box::pin(handle_scoped_session_list(
+                request_id, client_id, state, writer, scope,
+            ))
+            .await
         }
         SessionLifecycleRequest::ListSessionsPageWithScope {
             scope,
@@ -7103,13 +7392,19 @@ async fn handle_request_inner(
             cursor,
             limit,
         } => {
-            Box::pin(handle_session_catalog_page(
-                request_id, state, writer, scope, query, cursor, limit,
-            ))
-            .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_catalog_page(scope, query, cursor, limit),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::SessionCatalogPage { page }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::ListSessions { working_directory } => {
-            handle_list_sessions(request_id, state, writer, &working_directory).await
+            handle_list_sessions(request_id, client_id, state, writer, &working_directory).await
         }
         SessionLifecycleRequest::SessionCompatibilityInventory { request } => {
             handle_session_compatibility_inventory(request_id, state, writer, request).await
@@ -7161,9 +7456,11 @@ async fn handle_request_inner(
             working_directory,
         } => {
             use bcode_session_models::SessionApplication as _;
-            let result = SessionApplicationHandle::new(state, client_id)
-                .change_session_working_directory(session_id, working_directory)
-                .await;
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .change_session_working_directory(session_id, working_directory),
+            )
+            .await;
             send_response(
                 writer,
                 request_id,
@@ -7180,41 +7477,97 @@ async fn handle_request_inner(
             .await
         }
         SessionLifecycleRequest::ListWorktrees(request) => {
-            handle_list_worktrees(request_id, state, writer, request).await
+            let Some(cwd) = request.cwd else {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "worktree_cwd_required",
+                        "worktree requests must include the caller working directory",
+                    )),
+                )
+                .await;
+            };
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).list_worktrees(cwd))
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| Response::Ok(ResponsePayload::WorktreeList(response)),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::WorktreeCreateStart {
             operation_id,
             request,
         } => {
-            worktree_creation::handle_start(
-                request_id,
-                Arc::clone(state),
-                writer,
-                operation_id,
-                request,
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id)
+                    .start_worktree_creation(operation_id, request),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::WorktreeCreateOperation { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::WorktreeCreateStatus { operation_id } => {
-            worktree_creation::handle_status(request_id, state, writer, &operation_id).await
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id)
+                    .worktree_creation_status(operation_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::WorktreeCreateOperation { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::WorktreeCreateWait {
             operation_id,
             after_revision,
             timeout_ms,
         } => {
-            worktree_creation::handle_wait(
-                request_id,
-                state,
-                writer,
-                &operation_id,
-                after_revision,
-                timeout_ms,
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).wait_worktree_creation(
+                    operation_id,
+                    after_revision,
+                    timeout_ms,
+                ),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::WorktreeCreateOperation { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::RemoveWorktree(request) => {
-            handle_remove_worktree(request_id, state, writer, request).await
+            let Some(cwd) = request.cwd else {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "worktree_cwd_required",
+                        "worktree requests must include the caller working directory",
+                    )),
+                )
+                .await;
+            };
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).remove_worktree(
+                    cwd,
+                    request.path,
+                    request.force,
+                ),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| Response::Ok(ResponsePayload::WorktreeRemoved(response)),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::RalphStatus(request) => {
             handle_ralph_status(request_id, state, writer, request).await
@@ -7248,9 +7601,10 @@ async fn handle_request_inner(
         }
         SessionLifecycleRequest::RenameSession { session_id, name } => {
             use bcode_session_models::SessionApplication as _;
-            let result = SessionApplicationHandle::new(state, client_id)
-                .rename_session(session_id, name)
-                .await;
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).rename_session(session_id, name),
+            )
+            .await;
             send_response(
                 writer,
                 request_id,
@@ -7262,36 +7616,48 @@ async fn handle_request_inner(
             .await
         }
         SessionLifecycleRequest::DeleteSession { session_id } => {
-            handle_delete_session(request_id, state, writer, session_id).await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).delete_session(session_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |session| Response::Ok(ResponsePayload::SessionDeleted { session }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::PrepareContextGeneration(request) => {
-            Box::pin(context_generation::handle(
-                request_id, state, writer, request,
-            ))
-            .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).prepare_context_generation(request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |prepared| Response::Ok(ResponsePayload::PreparedContextGeneration { prepared }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionWorkingDocument(request) => {
-            Box::pin(handle_working_document(request_id, state, writer, request)).await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).session_working_document(request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |document| Response::Ok(ResponsePayload::SessionWorkingDocument { document }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::ReadSessionTraceBlob(request) => {
-            match trace_operations::read_range(state, request).await {
-                Ok(range) => {
-                    send_response(
-                        writer,
-                        request_id,
-                        Response::Ok(ResponsePayload::SessionTraceBlobRange { range }),
-                    )
-                    .await
-                }
-                Err(error) => {
-                    send_response(
-                        writer,
-                        request_id,
-                        Response::Err(ErrorResponse::new(error.code(), error.to_string())),
-                    )
-                    .await
-                }
-            }
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).session_trace_blob_range(request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |range| Response::Ok(ResponsePayload::SessionTraceBlobRange { range }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::ReadSessionArtifact {
             session_id,
@@ -7300,90 +7666,162 @@ async fn handle_request_inner(
             offset,
             length,
         } => {
-            handle_read_session_artifact(
-                request_id,
-                state,
-                writer,
-                session_id,
-                artifact_id,
-                reference_key,
-                offset,
-                length,
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).session_artifact_range(
+                    session_id,
+                    artifact_id,
+                    reference_key,
+                    offset,
+                    length,
+                ),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |range| Response::Ok(ResponsePayload::SessionArtifactRange { range }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::InvocationInput { session_id, input } => {
             handle_invocation_input(request_id, client_id, state, writer, session_id, input).await
         }
         SessionLifecycleRequest::SessionMilestones { session_id, query } => {
-            let response = Box::pin(state.sessions.session_milestones(session_id, query))
-                .await
-                .map_or_else(
-                    |_| {
-                        Response::Err(ErrorResponse::new(
-                            "milestones_unavailable",
-                            "Canonical milestones unavailable; inspect session compatibility.",
-                        ))
-                    },
-                    |page| Response::Ok(ResponsePayload::SessionMilestones { page }),
-                );
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_milestones(session_id, query),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::SessionMilestones { page }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::GenerateSessionMilestone { session_id } => {
-            let generated = Box::pin(handle_explicit_session_milestone(state, session_id)).await;
-            let response = generated.map_or_else(
-                |_| Response::Err(ErrorResponse::new("milestone_generation_failed", "Milestone generation unavailable; check enabled policy and model selection.")),
-                |result| Response::Ok(ResponsePayload::SessionMilestoneGenerated { result: bcode_ipc::SessionMilestoneGenerationOutcome { success: result.success, text: result.text } }),
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .generate_session_milestone(session_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| Response::Ok(ResponsePayload::SessionMilestoneGenerated { result }),
             );
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionDerivationSnapshot { session_id } => {
-            Box::pin(handle_session_derivation_snapshot(
-                request_id, state, writer, session_id,
-            ))
-            .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_derivation_snapshot(session_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |snapshot| Response::Ok(ResponsePayload::SessionDerivationSnapshot { snapshot }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionDerivationPrompts { session_id, query } => {
-            Box::pin(handle_session_derivation_prompts(
-                request_id, state, writer, session_id, query,
-            ))
-            .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_derivation_prompts(session_id, query),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::SessionDerivationPrompts { page }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::DeriveSession { request } => {
-            Box::pin(handle_derive_session(request_id, state, writer, *request)).await
+            let result =
+                Box::pin(SessionApplicationHandle::new(state, client_id).derive_session(*request))
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |outcome| Response::Ok(ResponsePayload::SessionDerived { outcome }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionDerivationStatus { operation_id } => {
-            handle_session_derivation_status(request_id, state, writer, operation_id).await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_derivation_status(operation_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |snapshot| Response::Ok(ResponsePayload::SessionDerivationStatus { snapshot }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::CancelSessionDerivation { operation_id } => {
-            handle_cancel_session_derivation(request_id, state, writer, operation_id).await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .cancel_session_derivation(operation_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |accepted| {
+                    Response::Ok(ResponsePayload::SessionDerivationCancellationRequested {
+                        accepted,
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionHistory { session_id } => {
-            Box::pin(handle_session_history(
-                request_id, client_id, state, writer, session_id,
-            ))
-            .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).export_session_history(session_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |history| {
+                    Response::Ok(ResponsePayload::SessionHistory {
+                        session_id,
+                        history,
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::RepriceSession {
             session_id,
             range,
             catalog,
-        } => handle_reprice_session(state, writer, request_id, session_id, range, *catalog).await,
-        SessionLifecycleRequest::UsageCatalog { after } => {
-            let result = state.sessions.usage_catalog_page(after).await;
+        } => {
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .reprice_session(session_id, range, *catalog),
+            )
+            .await;
             let response = result.map_or_else(
-                |_| {
-                    Response::Err(ErrorResponse::new(
-                        "usage_catalog_unavailable",
-                        "Native catalog is incomplete; retry after discovery finishes.",
-                    ))
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |report| {
+                    Response::Ok(ResponsePayload::SessionRepriced {
+                        report: Box::new(report),
+                    })
                 },
+            );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::UsageCatalog { after } => {
+            let result =
+                Box::pin(SessionApplicationHandle::new(state, client_id).usage_catalog_page(after))
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
                 |session_ids| Response::Ok(ResponsePayload::UsageCatalog { session_ids }),
             );
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::UsageReport { query } => {
-            let result = state.usage_index.lock().await.query(&query).await;
+            use bcode_usage_models::application::UsageApplication as _;
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).usage_report(query))
+                    .await;
             let response = result.map_or_else(
                 |_| {
                     Response::Err(ErrorResponse::new(
@@ -7396,91 +7834,123 @@ async fn handle_request_inner(
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionUsage { session_id, query } => {
-            let response =
-                match Box::pin(session_operations::session_usage(state, session_id, query)).await {
-                    Ok(page) => Response::Ok(ResponsePayload::SessionUsage { page }),
-                    Err(message) => Response::Err(ErrorResponse::new("usage_unavailable", message)),
-                };
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).session_usage(session_id, query),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::SessionUsage { page }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::UsageCollect { session_id, query } => {
-            let response =
-                match Box::pin(session_operations::collect_usage(state, session_id, query)).await {
-                    Ok(page) => Response::Ok(ResponsePayload::UsageCollected { page }),
-                    Err(message) => Response::Err(ErrorResponse::new("usage_unavailable", message)),
-                };
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).collect_usage(session_id, query),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::UsageCollected { page }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionAdmission { session_id, apply } => {
-            let response =
-                match session_compression::admission_report(state, session_id, apply).await {
-                    Ok(report) => Response::Ok(ResponsePayload::SessionAdmission { report }),
-                    Err(message) => {
-                        Response::Err(ErrorResponse::new("session_admission_unavailable", message))
-                    }
-                };
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_admission(session_id, apply),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |report| Response::Ok(ResponsePayload::SessionAdmission { report }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionCompress { request } => {
-            let response = match Box::pin(session_compression::compress_page(state, request)).await
-            {
-                Ok(result) => Response::Ok(ResponsePayload::SessionCompressed { result }),
-                Err(message) => Response::Err(ErrorResponse::new(
-                    "session_compression_unavailable",
-                    message,
-                )),
-            };
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).compress_session_page(request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| Response::Ok(ResponsePayload::SessionCompressed { result }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionStorageUsage {
             session_id,
             entry_budget,
         } => {
-            let response =
-                match session_operations::storage_usage(state, session_id, entry_budget).await {
-                    Ok(usage) => Response::Ok(ResponsePayload::SessionStorageUsage { usage }),
-                    Err(message) => {
-                        Response::Err(ErrorResponse::new("session_storage_unavailable", message))
-                    }
-                };
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_storage_usage(session_id, entry_budget),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |usage| Response::Ok(ResponsePayload::SessionStorageUsage { usage }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionHistoryPage { session_id, query } => {
-            handle_session_history_page(request_id, client_id, state, writer, session_id, query)
-                .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_history_page(session_id, query),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::SessionHistoryPage { page }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionProjectionHistoryPage {
             session_id,
             request,
         } => {
-            Box::pin(handle_session_projection_history_page(
-                request_id, client_id, state, writer, session_id, *request,
-            ))
-            .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_projection_history_page(session_id, *request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::SessionProjectionHistoryPage { page }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionHistoryAround { session_id, query } => {
-            handle_session_history_around(request_id, client_id, state, writer, session_id, query)
-                .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .session_history_around(session_id, query),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |window| Response::Ok(ResponsePayload::SessionHistoryAround { window }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionCategorization { session_id } => {
-            let categorization = state
-                .advisory_categorizations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&session_id)
-                .cloned();
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionCategorization { categorization }),
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).session_categorization(session_id),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |categorization| {
+                    Response::Ok(ResponsePayload::SessionCategorization { categorization })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionInspection { session_id, query } => {
             use bcode_session_models::SessionApplication as _;
-            let result = SessionApplicationHandle::new(state, client_id)
-                .inspect_session(session_id, query)
-                .await;
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).inspect_session(session_id, query),
+            )
+            .await;
             send_response(
                 writer,
                 request_id,
@@ -7491,7 +7961,11 @@ async fn handle_request_inner(
             )
             .await
         }
-    }
+    };
+    // The send future has consumed/dropped its response on success or error.
+    drop(reply_payload_reservation);
+    drop(reply_box_reservation);
+    send_result
 }
 
 /// Dispatch session search, open/attach, import, and catalog-refresh requests.
@@ -7514,32 +7988,47 @@ async fn handle_session_search_attach_request(
             routes,
             hydrate,
         } => {
-            handle_session_search(request_id, state, writer, request, policy, routes, hydrate).await
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id)
+                    .search(request, policy, routes, hydrate),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| {
+                    Response::Ok(ResponsePayload::SessionSearch {
+                        response: result.response,
+                        hydrated_hits: result.hydrated_hits,
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::SessionSearchProviders => {
-            let response = session_search::list_providers(state).await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionSearchProviders { response }),
-            )
-            .await
+            let result =
+                Box::pin(ImportSearchApplicationHandle::new(state, client_id).search_providers())
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| Response::Ok(ResponsePayload::SessionSearchProviders { response }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::SessionSearchExplain {
             request,
             policy,
             routes,
         } => {
-            let discovery = session_search::list_providers(state).await;
-            let plan = bcode_session_search::plan_session_search_with_policy_and_routes(
-                &request, discovery, &policy, &routes,
-            );
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionSearchPlan { plan }),
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id)
+                    .explain_search(request, policy, routes),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |plan| Response::Ok(ResponsePayload::SessionSearchPlan { plan }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::SessionSearchPurge {
             provider_id,
@@ -7556,34 +8045,83 @@ async fn handle_session_search_attach_request(
             handle_session_search_maintenance(request_id, writer, result).await
         }
         SessionSearchAttachRequest::SessionSearchCompleteBackfillStart { request } => {
-            let result = start_complete_session_search_backfill(Arc::clone(state), request).await;
-            handle_complete_session_search_backfill_start(request_id, writer, result).await
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id)
+                    .start_complete_search_backfill(request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| {
+                    Response::Ok(ResponsePayload::SessionSearchCompleteBackfillStarted { response })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::SessionSearchBackfillStart { request } => {
-            let result = start_session_search_backfill(Arc::clone(state), request).await;
-            handle_session_search_backfill_start(request_id, writer, result).await
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id).start_search_backfill(request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| Response::Ok(ResponsePayload::SessionSearchBackfillStarted { response }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::SessionSearchBackfillStatus { operation_id } => {
-            let result = session_search_backfill_status(state, &operation_id).await;
-            handle_session_search_backfill_operation(request_id, writer, result).await
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id)
+                    .search_backfill_status(operation_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::SessionSearchBackfillOperation { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::SessionSearchBackfillWait {
             operation_id,
             after_revision,
             timeout_ms,
         } => {
-            let result =
-                wait_session_search_backfill(state, &operation_id, after_revision, timeout_ms)
-                    .await;
-            handle_session_search_backfill_operation(request_id, writer, result).await
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id).wait_search_backfill(
+                    operation_id,
+                    after_revision,
+                    timeout_ms,
+                ),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::SessionSearchBackfillOperation { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::SessionSearchBackfillCancel { operation_id } => {
-            let result = cancel_session_search_backfill(state, &operation_id).await;
-            handle_session_search_backfill_operation(request_id, writer, result).await
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id)
+                    .cancel_search_backfill(operation_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::SessionSearchBackfillOperation { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::SessionSearchBackfill { request } => {
-            let result = session_search::backfill_provider(state, request).await;
-            handle_session_search_backfill(request_id, writer, result).await
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id).backfill_search(request),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| Response::Ok(ResponsePayload::SessionSearchBackfill { response }),
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::PrepareSessionOpen { session_id } => {
             handle_prepare_session_open(request_id, state, writer, session_id).await
@@ -7660,15 +8198,37 @@ async fn handle_session_search_attach_request(
             external_session_id,
             working_directory,
         } => {
-            session_import::handle_import_external_session(
-                request_id,
-                state,
-                writer,
-                &source_id,
-                &external_session_id,
-                working_directory,
+            let Some(working_directory) = working_directory else {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "import_cwd_required",
+                        "session import requests must include the caller working directory",
+                    )),
+                )
+                .await;
+            };
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id).import_session(
+                    bcode_session_import::application::ApplicationImportRequest {
+                        source_id,
+                        external_session_id,
+                        working_directory,
+                    },
+                ),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| {
+                    Response::Ok(ResponsePayload::ExternalSessionImported {
+                        session: result.session,
+                        warnings: result.warnings,
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::RefreshSessionCatalog {
             working_directory,
@@ -7687,6 +8247,7 @@ async fn handle_session_search_attach_request(
             };
             handle_refresh_session_catalog(
                 request_id,
+                client_id,
                 state,
                 writer,
                 &working_directory,
@@ -7770,36 +8331,21 @@ async fn handle_turn_workflow_model_request(
             require_active_turn,
             admission,
         } => {
-            if let Some(active_namespace) = state
-                .active_session_namespace_mismatch(session_id, client_id)
-                .await
-            {
-                return send_incompatible_active_session_response(
-                    writer,
-                    request_id,
-                    &active_namespace,
-                )
-                .await;
-            }
-            let response = match enqueue_prompt_submission(
-                state,
-                session_id,
-                client_id,
-                submission_id,
-                text,
-                placement,
-                require_active_turn,
-                admission,
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).submit_prompt(
+                    session_id,
+                    submission_id,
+                    text,
+                    placement,
+                    require_active_turn,
+                    admission,
+                ),
             )
-            .await
-            {
-                Ok(receipt) => Response::Ok(ResponsePayload::SubmissionAccepted { receipt }),
-                Err(ServerError::SteeringUnavailable) => Response::Err(ErrorResponse::new(
-                    "steering_unavailable",
-                    "compatible active turn unavailable for steering",
-                )),
-                Err(error) => Response::Err(server_session_error_response(&error)),
-            };
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |receipt| Response::Ok(ResponsePayload::SubmissionAccepted { receipt }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionTurnRequest::SubmissionQueueStatus { session_id } => {
@@ -7918,49 +8464,30 @@ async fn handle_turn_workflow_model_request(
             after,
             limit,
         } => {
-            if let Some(active_namespace) = state
-                .active_session_namespace_mismatch(session_id, client_id)
-                .await
-            {
-                return send_incompatible_active_session_response(
-                    writer,
-                    request_id,
-                    &active_namespace,
-                )
-                .await;
-            }
-            let response = if (1..=128).contains(&limit) {
-                match pending_submissions_page(state, session_id, after, limit).await {
-                    Ok(page) => Response::Ok(ResponsePayload::PendingSubmissions { page }),
-                    Err(error) => Response::Err(session_error_response(&error)),
-                }
-            } else {
-                Response::Err(ErrorResponse::new(
-                    "invalid_request",
-                    "pending submissions limit must be between 1 and 128",
-                ))
-            };
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .pending_submissions(session_id, after, limit),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::PendingSubmissions { page }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionTurnRequest::GetSubmission {
             session_id,
             submission_id,
         } => {
-            if let Some(active_namespace) = state
-                .active_session_namespace_mismatch(session_id, client_id)
-                .await
-            {
-                return send_incompatible_active_session_response(
-                    writer,
-                    request_id,
-                    &active_namespace,
-                )
-                .await;
-            }
-            let response = match state.sessions.submission(session_id, submission_id).await {
-                Ok(record) => Response::Ok(ResponsePayload::Submission { record }),
-                Err(error) => Response::Err(session_error_response(&error)),
-            };
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .get_submission(session_id, submission_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |record| Response::Ok(ResponsePayload::Submission { record }),
+            );
             send_response(writer, request_id, response).await
         }
         SessionTurnRequest::InvokeSkill {
@@ -8022,14 +8549,18 @@ async fn handle_turn_workflow_model_request(
             session_id,
             work_id,
         } => {
-            let cancelled =
-                runtime_work_operations::cancel(state, session_id, work_id, Some(client_id)).await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::RuntimeWorkCancellationRequested { cancelled }),
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .cancel_runtime_work(session_id, work_id),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |cancelled| {
+                    Response::Ok(ResponsePayload::RuntimeWorkCancellationRequested { cancelled })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionTurnRequest::ApplyWorkflowSource(request) => {
             let result = bcode_workflow::WorkflowAuthoringApplication::apply_workflow_source(
@@ -9638,23 +10169,39 @@ async fn handle_core_runtime_request(
             )
             .await
         }
-        CoreRuntimeRequest::ListRuntimeWork { session_id } => {
-            let work = runtime_work_operations::list(state, session_id).await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::RuntimeWorkList { work }),
+        CoreRuntimeRequest::RuntimeWorkPage { request } => {
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).runtime_work_page(request),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |page| Response::Ok(ResponsePayload::RuntimeWorkPage { page }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::ListRuntimeWork { session_id } => {
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).list_runtime_work(session_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |work| Response::Ok(ResponsePayload::RuntimeWorkList { work }),
+            );
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::RuntimeWorkHistory { session_id, limit } => {
-            let events = runtime_work_operations::history(state, session_id, limit).await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::RuntimeWorkHistory { events }),
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .runtime_work_history(session_id, limit),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |events| Response::Ok(ResponsePayload::RuntimeWorkHistory { events }),
+            );
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::SubscribeRuntimeWork { session_id } => {
             handle_subscribe_runtime_work(request_id, client_id, state, writer, session_id).await
@@ -9668,9 +10215,14 @@ async fn handle_core_runtime_request(
             model_id,
         } => {
             use bcode_session_models::SessionApplication as _;
-            let result = SessionApplicationHandle::new(state, client_id)
-                .set_session_model(session_id, provider_plugin_id, model_id)
-                .await;
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).set_session_model(
+                    session_id,
+                    provider_plugin_id,
+                    model_id,
+                ),
+            )
+            .await;
             send_response(
                 writer,
                 request_id,
@@ -9686,8 +10238,16 @@ async fn handle_core_runtime_request(
             effort,
             summary,
         } => {
-            handle_set_session_reasoning(request_id, state, writer, session_id, effort, summary)
-                .await
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .set_session_reasoning(session_id, effort, summary),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |()| Response::Ok(ResponsePayload::SessionModelSet),
+            );
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::AppendPresentationNote {
             session_id,
@@ -9698,6 +10258,7 @@ async fn handle_core_runtime_request(
         } => {
             handle_append_presentation_note(
                 request_id,
+                client_id,
                 state,
                 writer,
                 PresentationNoteRequest {
@@ -9711,10 +10272,25 @@ async fn handle_core_runtime_request(
             .await
         }
         CoreRuntimeRequest::SessionModelStatus { session_id } => {
-            handle_session_model_status(request_id, client_id, state, writer, session_id).await
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).session_model_status(session_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::SessionModelStatus { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::DefaultModelStatus => {
-            handle_default_model_status(request_id, client_id, state, writer).await
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).default_model_status())
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::SessionModelStatus { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::CheckModels {
             check_id,
@@ -9724,19 +10300,16 @@ async fn handle_core_runtime_request(
             timeout_seconds,
             allow_provider_requests,
         } => {
-            let report = Box::pin(model_check::run(
-                state,
-                client_id,
-                model_check::CheckInput {
+            let report = ServicesApplicationHandle::new(state, client_id)
+                .check_models(bcode_model_catalog::application::ApplicationModelCheck {
                     check_id,
                     session_id,
-                    provider: provider_plugin_id,
+                    provider_plugin_id,
                     model_ids,
                     timeout_seconds,
-                    consent: allow_provider_requests,
-                },
-            ))
-            .await;
+                    allow_provider_requests,
+                })
+                .await;
             let response = match report {
                 Ok(report) => serde_json::to_string(&report).map_or_else(
                     |_| {
@@ -9747,64 +10320,60 @@ async fn handle_core_runtime_request(
                     },
                     |result_json| Response::Ok(ResponsePayload::CheckModels { result_json }),
                 ),
-                Err(message) => Response::Err(ErrorResponse::new("model_check_rejected", message)),
+                Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
             };
             send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::CancelModelCheck { check_id } => {
-            let cancelled = model_check::cancel(state, client_id, &check_id).await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::ModelCheckCancellationRequested {
-                    cancellation_requested: cancelled,
-                }),
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).cancel_model_check(check_id),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |cancellation_requested| {
+                    Response::Ok(ResponsePayload::ModelCheckCancellationRequested {
+                        cancellation_requested,
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::SessionModelListForSession {
             session_id,
             provider_plugin_id,
         } => {
-            let selection = session_model_selection_with_runtime_context(
-                state,
-                session_id,
-                state.client_runtime_context(client_id).await,
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id)
+                    .session_model_list(session_id, provider_plugin_id),
             )
             .await;
-            let provider = provider_plugin_id.or(selection.provider_plugin_id);
-            let models = resolved_provider_models_view(
-                state,
-                provider.clone(),
-                bcode_model::ModelListRequest {
-                    provider_context: selection.provider_context,
-                    selected_model_id: selection.model_id,
-                },
-                bcode_model_catalog::ModelListView::UserVisible,
-            )
-            .await;
-            let response = match models {
-                Ok(mut models) => {
-                    if let Ok(rules) = bcode_config::effective_model_ignore_rules(
-                        provider.as_deref().unwrap_or("bcode.openai-compatible"),
-                    ) {
-                        model_ignores::apply_model_ignores(&mut models.models, &rules);
-                    }
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| {
                     Response::Ok(ResponsePayload::SessionModelList {
-                        provider_plugin_id: provider,
-                        models,
+                        provider_plugin_id: result.provider_plugin_id,
+                        models: result.models,
                     })
-                }
-                Err(_) => Response::Err(ErrorResponse::new(
-                    "model_list_failed",
-                    "provider model list unavailable",
-                )),
-            };
+                },
+            );
             send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::SessionModelList { provider_plugin_id } => {
-            handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
-                .await
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).list_models(provider_plugin_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| {
+                    Response::Ok(ResponsePayload::SessionModelList {
+                        provider_plugin_id: result.provider_plugin_id,
+                        models: result.models,
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::JudgementSetup => {
             let catalog = judgement::setup_catalog(state).await;
@@ -9969,6 +10538,40 @@ async fn handle_core_runtime_request(
             };
             send_response(writer, request_id, response).await
         }
+        CoreRuntimeRequest::ListApplicationCommands { plugin_id } => {
+            let result =
+                Box::pin(CommandApplicationHandle::new(state, client_id).list_commands(plugin_id))
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |commands| Response::Ok(ResponsePayload::ApplicationCommandList { commands }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::InvokeApplicationCommand { request } => {
+            let result =
+                Box::pin(CommandApplicationHandle::new(state, client_id).invoke_command(*request))
+                    .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::ApplicationCommandInvoked {
+                    result: Box::new(result),
+                }),
+            )
+            .await
+        }
+        CoreRuntimeRequest::CancelApplicationCommand { invocation_id } => {
+            let result = Box::pin(
+                CommandApplicationHandle::new(state, client_id).cancel_command(invocation_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| Response::Ok(ResponsePayload::ApplicationCommandCancelled { result }),
+            );
+            send_response(writer, request_id, response).await
+        }
         CoreRuntimeRequest::AuthPoolList => {
             let response = match server_operations::auth_pools() {
                 Ok(pools) => Response::Ok(ResponsePayload::AuthPoolList { pools }),
@@ -10017,7 +10620,7 @@ async fn handle_contextual_plugin_request(
     request: AgentSkillPluginRequest,
     request_id: u64,
     client_id: ClientId,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     let response = match request {
@@ -10027,21 +10630,23 @@ async fn handle_contextual_plugin_request(
             interface_id,
             operation,
             payload,
-        } => plugin_service_response(
-            Box::pin(plugin_context::invoke(
-                state,
-                client_id,
-                context,
-                plugin_id,
-                interface_id,
-                operation,
-                payload,
-            ))
-            .await,
-        ),
+        } => ServicesApplicationHandle::new(state, client_id)
+            .invoke_plugin_service_contextual(context, plugin_id, interface_id, operation, payload)
+            .await
+            .map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| Response::Ok(ResponsePayload::PluginServiceResult { response }),
+            ),
         AgentSkillPluginRequest::CancelPluginServiceInvocation { invocation_id } => {
-            let accepted = plugin_context::cancel(state, client_id, &invocation_id);
-            Response::Ok(ResponsePayload::PluginServiceInvocationCancelled { accepted })
+            ServicesApplicationHandle::new(state, client_id)
+                .cancel_plugin_service_invocation(invocation_id)
+                .await
+                .map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |accepted| {
+                        Response::Ok(ResponsePayload::PluginServiceInvocationCancelled { accepted })
+                    },
+                )
         }
         _ => Response::Err(ErrorResponse::new(
             "invalid_contextual_request",
@@ -10060,9 +10665,10 @@ async fn handle_application_set_agent(
     agent_id: String,
 ) -> Result<(), ServerError> {
     use bcode_session_models::SessionApplication as _;
-    let result = SessionApplicationHandle::new(state, client_id)
-        .set_session_agent(session_id, agent_id)
-        .await;
+    let result = Box::pin(
+        SessionApplicationHandle::new(state, client_id).set_session_agent(session_id, agent_id),
+    )
+    .await;
     send_response(
         writer,
         request_id,
@@ -10096,26 +10702,61 @@ async fn handle_agent_permission_plugin_request(
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
-        AgentSkillPluginRequest::ListAgents => {
-            handle_list_agents(request_id, client_id, state, writer).await
-        }
-        AgentSkillPluginRequest::ListSkills => handle_list_skills(request_id, state, writer).await,
-        AgentSkillPluginRequest::DescribeSkill { skill_id } => {
-            handle_describe_skill(request_id, state, writer, &skill_id).await
+        request @ (AgentSkillPluginRequest::ListAgents
+        | AgentSkillPluginRequest::ListSkills
+        | AgentSkillPluginRequest::DescribeSkill { .. }) => {
+            handle_agent_skill_discovery_request(request, request_id, client_id, state, writer)
+                .await
         }
         AgentSkillPluginRequest::ActivateSkill {
             session_id,
             skill_id,
-        } => handle_activate_skill(request_id, state, writer, session_id, skill_id).await,
+        } => {
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .activate_skill(session_id, skill_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |()| Response::Ok(ResponsePayload::SessionAgentSet),
+            );
+            send_response(writer, request_id, response).await
+        }
         AgentSkillPluginRequest::DeactivateSkill {
             session_id,
             skill_id,
-        } => handle_deactivate_skill(request_id, state, writer, session_id, skill_id).await,
+        } => {
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id)
+                    .deactivate_skill(session_id, skill_id),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |()| Response::Ok(ResponsePayload::SessionAgentSet),
+            );
+            send_response(writer, request_id, response).await
+        }
         AgentSkillPluginRequest::ActiveSkills { session_id } => {
-            handle_active_skills(request_id, state, writer, session_id).await
+            let result =
+                Box::pin(SessionApplicationHandle::new(state, client_id).active_skills(session_id))
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |skills| Response::Ok(ResponsePayload::ActiveSkills { skills }),
+            );
+            send_response(writer, request_id, response).await
         }
         AgentSkillPluginRequest::AgentPolicyStatus => {
-            handle_agent_policy_status(request_id, state, writer).await
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).agent_policy_status())
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |status| Response::Ok(ResponsePayload::AgentPolicyStatus { status }),
+            );
+            send_response(writer, request_id, response).await
         }
         AgentSkillPluginRequest::SetSessionAgent {
             session_id,
@@ -10133,23 +10774,50 @@ async fn handle_agent_permission_plugin_request(
             let response = permission_rule_response(&agent_id, &category, pattern, &action);
             send_response(writer, request_id, response).await
         }
+        request @ (AgentSkillPluginRequest::ListPluginServices
+        | AgentSkillPluginRequest::ListPluginContributions
+        | AgentSkillPluginRequest::InvokePluginServiceContextual { .. }
+        | AgentSkillPluginRequest::CancelPluginServiceInvocation { .. }
+        | AgentSkillPluginRequest::InvokePluginService { .. }
+        | AgentSkillPluginRequest::CallPluginService { .. }
+        | AgentSkillPluginRequest::PublishPluginEvent { .. }) => {
+            handle_plugin_dispatch_request(request, request_id, client_id, state, writer).await
+        }
+    }
+}
+
+async fn handle_plugin_dispatch_request(
+    request: AgentSkillPluginRequest,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
         AgentSkillPluginRequest::ListPluginServices => {
-            let services = plugin_operations::list_services(state);
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::PluginServices { services }),
-            )
-            .await
+            use bcode_plugin_sdk::application::PluginApplication as _;
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).list_plugin_services())
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |services| Response::Ok(ResponsePayload::PluginServices { services }),
+            );
+            send_response(writer, request_id, response).await
         }
         AgentSkillPluginRequest::ListPluginContributions => {
-            let contributions = plugin_operations::list_contributions(state);
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::PluginContributions { contributions }),
+            use bcode_plugin_sdk::application::PluginApplication as _;
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).list_plugin_contributions(),
             )
-            .await
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |contributions| {
+                    Response::Ok(ResponsePayload::PluginContributions { contributions })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         request @ (AgentSkillPluginRequest::InvokePluginServiceContextual { .. }
         | AgentSkillPluginRequest::CancelPluginServiceInvocation { .. }) => {
@@ -10161,58 +10829,184 @@ async fn handle_agent_permission_plugin_request(
             operation,
             payload,
         } => {
-            let result = Box::pin(plugin_operations::invoke_service(
-                state,
-                &plugin_id,
-                &interface_id,
-                operation,
-                payload,
-            ))
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).invoke_plugin_service(
+                    plugin_id,
+                    interface_id,
+                    operation,
+                    payload,
+                ),
+            )
             .await;
-            send_response(writer, request_id, plugin_service_response(result)).await
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| Response::Ok(ResponsePayload::PluginServiceResult { response }),
+            );
+            send_response(writer, request_id, response).await
         }
         AgentSkillPluginRequest::CallPluginService {
             interface_id,
             operation,
             payload,
         } => {
-            handle_call_plugin_service(request_id, state, writer, &interface_id, operation, payload)
-                .await
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id).call_plugin_service(
+                    interface_id,
+                    operation,
+                    payload,
+                ),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |response| Response::Ok(ResponsePayload::PluginServiceResult { response }),
+            );
+            send_response(writer, request_id, response).await
         }
         AgentSkillPluginRequest::PublishPluginEvent { topic, payload } => {
-            let response = match plugin_operations::publish_event(state, &topic, &payload).await {
-                Ok(delivered) => Response::Ok(ResponsePayload::PluginEventPublished { delivered }),
-                Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
-            };
+            let result = Box::pin(
+                ServicesApplicationHandle::new(state, client_id)
+                    .publish_plugin_event(topic, payload),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |delivered| Response::Ok(ResponsePayload::PluginEventPublished { delivered }),
+            );
             send_response(writer, request_id, response).await
+        }
+        AgentSkillPluginRequest::ListAgents
+        | AgentSkillPluginRequest::ListSkills
+        | AgentSkillPluginRequest::DescribeSkill { .. }
+        | AgentSkillPluginRequest::ActivateSkill { .. }
+        | AgentSkillPluginRequest::DeactivateSkill { .. }
+        | AgentSkillPluginRequest::ActiveSkills { .. }
+        | AgentSkillPluginRequest::AgentPolicyStatus
+        | AgentSkillPluginRequest::SetSessionAgent { .. }
+        | AgentSkillPluginRequest::AddPermissionRule { .. } => {
+            unreachable!("non-plugin request routed to plugin dispatch")
         }
     }
 }
 
-async fn handle_call_plugin_service(
+async fn handle_agent_skill_discovery_request(
+    request: AgentSkillPluginRequest,
     request_id: u64,
-    state: &ServerState,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
-    interface_id: &str,
-    operation: String,
-    payload: Vec<u8>,
 ) -> Result<(), ServerError> {
-    let result = if interface_id == bcode_session_import::SESSION_IMPORT_INTERFACE_ID {
-        session_import::call_import_service(state, &operation, &payload).await
-    } else {
-        plugin_operations::call_service(state, interface_id, operation, payload).await
-    };
-    send_response(writer, request_id, plugin_service_response(result)).await
+    match request {
+        AgentSkillPluginRequest::ListAgents => {
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).list_agents()).await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |agents| Response::Ok(ResponsePayload::AgentList { agents }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        AgentSkillPluginRequest::ListSkills => {
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).list_skills()).await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |skills| {
+                    Response::Ok(ResponsePayload::SkillList {
+                        skills: Box::new(skills),
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
+        }
+        AgentSkillPluginRequest::DescribeSkill { skill_id } => {
+            let result =
+                Box::pin(ServicesApplicationHandle::new(state, client_id).describe_skill(skill_id))
+                    .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |skill| {
+                    Response::Ok(ResponsePayload::SkillManifest {
+                        skill: Box::new(skill),
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
+        }
+        AgentSkillPluginRequest::ListPluginServices
+        | AgentSkillPluginRequest::ListPluginContributions
+        | AgentSkillPluginRequest::InvokePluginServiceContextual { .. }
+        | AgentSkillPluginRequest::CancelPluginServiceInvocation { .. }
+        | AgentSkillPluginRequest::InvokePluginService { .. }
+        | AgentSkillPluginRequest::CallPluginService { .. }
+        | AgentSkillPluginRequest::PublishPluginEvent { .. }
+        | AgentSkillPluginRequest::ActivateSkill { .. }
+        | AgentSkillPluginRequest::DeactivateSkill { .. }
+        | AgentSkillPluginRequest::ActiveSkills { .. }
+        | AgentSkillPluginRequest::AgentPolicyStatus
+        | AgentSkillPluginRequest::SetSessionAgent { .. }
+        | AgentSkillPluginRequest::AddPermissionRule { .. } => {
+            unreachable!("non-discovery request routed to agent/skill discovery")
+        }
+    }
+}
+
+async fn send_controller_response(
+    writer: &SharedWriter,
+    request_id: u64,
+    result: Result<
+        bcode_plugin_models::interaction_controller::InteractionControllerSnapshot,
+        bcode_plugin_models::interaction_controller::InteractionControllerError,
+    >,
+) -> Result<(), ServerError> {
+    let response = result.map_or_else(
+        |error| {
+            use bcode_plugin_models::interaction_controller::InteractionControllerError as E;
+            let code = match error {
+                E::Unsupported => "interaction_controller_unsupported",
+                E::InvalidContract => "interaction_controller_invalid_contract",
+                E::Conflict => "interaction_controller_conflict",
+                E::NotPending => "interaction_controller_not_pending",
+                E::LimitExceeded => "interaction_controller_limit_exceeded",
+                E::Unavailable => "interaction_controller_unavailable",
+                E::Unauthorized => "interaction_controller_unauthorized",
+            };
+            Response::Err(ErrorResponse::new(code, error.message()))
+        },
+        |snapshot| Response::Ok(ResponsePayload::InteractionControllerSnapshot { snapshot }),
+    );
+    send_response(writer, request_id, response).await
 }
 
 async fn handle_permission_interaction_request(
     request: PermissionInteractionRequest,
     request_id: u64,
     client_id: ClientId,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
+        PermissionInteractionRequest::OpenInteractionController {
+            version,
+            exchange_id,
+        } => {
+            let result = InteractionApplicationHandle::new(state, client_id)
+                .open_controller(version, &exchange_id)
+                .await;
+            send_controller_response(writer, request_id, result).await
+        }
+        PermissionInteractionRequest::InteractionControllerSnapshot { exchange_id } => {
+            let result = InteractionApplicationHandle::new(state, client_id)
+                .controller_snapshot(&exchange_id)
+                .await;
+            send_controller_response(writer, request_id, result).await
+        }
+        PermissionInteractionRequest::InteractionControllerInput { input } => {
+            let result = InteractionApplicationHandle::new(state, client_id)
+                .controller_input(input)
+                .await;
+            send_controller_response(writer, request_id, result).await
+        }
         PermissionInteractionRequest::ListPermissions => {
             let permissions = interaction_operations::list_permissions(state).await;
             send_response(
@@ -10520,20 +11314,6 @@ async fn handle_server_status(
     .await
 }
 
-async fn handle_model_catalog_diagnostics(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let diagnostics = server_operations::model_catalog_diagnostics(state).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::ModelCatalogDiagnostics { diagnostics }),
-    )
-    .await
-}
-
 fn active_migration_shutdown_blocker(active_migrations: usize) -> Option<String> {
     (active_migrations > 0).then(|| {
         format!(
@@ -10701,60 +11481,41 @@ async fn handle_release_session_ownership(
 
 async fn handle_server_stop(
     request_id: u64,
-    state: &ServerState,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     mode: ServerStopMode,
 ) -> Result<(), ServerError> {
-    if server_operations::prepare_stop(state, mode).await.is_err() {
-        return send_response(
+    use bcode_daemon_lifecycle::application::{
+        RuntimeShutdownMode, RuntimeShutdownOperation as _,
+        RuntimeShutdownPreparationApplication as _,
+    };
+    let mode = match mode {
+        ServerStopMode::Force => RuntimeShutdownMode::Force,
+        ServerStopMode::IfIdle => RuntimeShutdownMode::IfIdle,
+    };
+    {
+        let application = &ServicesApplicationHandle::new(state, client_id);
+        let prepared = match application.prepare_runtime_shutdown(mode).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(error.code, error.message)),
+                )
+                .await;
+            }
+        };
+        send_response(
             writer,
             request_id,
-            Response::Err(ErrorResponse::new(
-                server_operations::StopBlocked::code(),
-                server_operations::StopBlocked::message(),
-            )),
+            Response::Ok(ResponsePayload::ServerStopping),
         )
-        .await;
+        .await?;
+        let _ = prepared.commit();
     }
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::ServerStopping),
-    )
-    .await?;
-    server_operations::request_shutdown(state);
     Ok(())
-}
-
-async fn handle_set_composer_draft(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    scope: bcode_session_models::ComposerDraftScope,
-    text: String,
-) -> Result<(), ServerError> {
-    session_operations::set_composer_draft(state, scope, text).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::ComposerDraftSet),
-    )
-    .await
-}
-
-async fn handle_composer_draft(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    scope: bcode_session_models::ComposerDraftScope,
-) -> Result<(), ServerError> {
-    let draft = session_operations::composer_draft(state, scope).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::ComposerDraft { draft }),
-    )
-    .await
 }
 
 async fn handle_reconcile_session_children(
@@ -10785,162 +11546,43 @@ async fn handle_reconcile_session_children(
     send_response(writer, request_id, response).await
 }
 
-async fn handle_session_summary(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-) -> Result<(), ServerError> {
-    let response = match state.sessions.session_summary_non_owning(session_id).await {
-        Ok(session) => Response::Ok(ResponsePayload::SessionSummary { session }),
-        Err(bcode_session::SessionError::NotFound(_)) => {
-            Response::Err(ErrorResponse::new("session_not_found", "session not found"))
-        }
-        Err(_) => Response::Err(ErrorResponse::new(
-            "session_summary_unavailable",
-            "session metadata unavailable; inspect session health",
-        )),
-    };
-    send_response(writer, request_id, response).await
-}
-
-fn handle_create_child_session<'a>(
-    request_id: u64,
-    state: &'a ServerState,
-    writer: &'a SharedWriter,
-    request: bcode_session_models::SessionChildCreateRequest,
-) -> ProviderCallFuture<'a, Result<(), ServerError>> {
-    Box::pin(async move {
-        let response = match Box::pin(session_operations::create_child(state, request)).await {
-            Ok(session) => Response::Ok(ResponsePayload::SessionCreated { session }),
-            Err(error) => Response::Err(ErrorResponse::new(error.code(), error.message())),
-        };
-        send_response(writer, request_id, response).await
-    })
-}
-
-fn session_observation_error_tag(error: &bcode_session::SessionError) -> &'static str {
-    error.observation_category()
-}
-
-async fn handle_session_children(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    query: bcode_session_models::SessionChildQuery,
-) -> Result<(), ServerError> {
-    let response = match state.sessions.query_child_sessions(query).await {
-        Ok(page) => Response::Ok(ResponsePayload::SessionChildren { page }),
-        Err(bcode_session::SessionError::NotFound(_)) => Response::Err(ErrorResponse::new(
-            "session_not_found",
-            "parent session not found",
-        )),
-        Err(
-            bcode_session::SessionError::ProjectionStale { .. }
-            | bcode_session::SessionError::Db(bcode_session::db::SessionDbError::ProjectionStale {
-                ..
-            }),
-        ) => Response::Err(ErrorResponse::new(
-            "session_children_temporarily_unavailable",
-            "child discovery crossed a concurrent canonical append; retry the bounded observation",
-        )),
-        Err(error) if matches!(&error, bcode_session::SessionError::Db(db) if db.is_lock_error()) => {
-            Response::Err(ErrorResponse::new(
-                "session_children_temporarily_unavailable",
-                "child discovery unavailable: database_locked; retry bounded observation",
-            ))
-        }
-        Err(error) => Response::Err(ErrorResponse::new(
-            "session_children_unavailable",
-            format!(
-                "child discovery unavailable: {}",
-                session_observation_error_tag(&error)
-            ),
-        )),
-    };
-    send_response(writer, request_id, response).await
-}
-
 async fn handle_session_progress(
     request_id: u64,
-    state: &ServerState,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let mut snapshot = state
-        .progress_observations
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .snapshot(session_id);
-    if !state.sessions.session_is_owned(session_id).await {
-        snapshot.observation = bcode_workflow_view_models::SessionProgressObservation::Unavailable {
-            reason: bcode_workflow_view_models::SessionProgressUnavailableReason::CoverageUnavailable,
-        };
-    }
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionProgressSnapshot { snapshot }),
-    )
-    .await
-}
-
-async fn handle_session_activity(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    query: bcode_session_models::SessionActivityQuery,
-) -> Result<(), ServerError> {
-    let response = match session_operations::activity(state, session_id, query).await {
-        Ok(page) => Response::Ok(ResponsePayload::SessionActivity { page }),
-        Err(bcode_session::SessionError::NotFound(_)) => {
-            Response::Err(ErrorResponse::new("session_not_found", "session not found"))
-        }
-        Err(
-            bcode_session::SessionError::ProjectionStale { .. }
-            | bcode_session::SessionError::Db(bcode_session::db::SessionDbError::ProjectionStale {
-                ..
-            }),
-        ) => Response::Err(ErrorResponse::new(
-            "session_activity_temporarily_unavailable",
-            "activity observation crossed a concurrent canonical append; retry the bounded observation",
-        )),
-        Err(error) if matches!(&error, bcode_session::SessionError::Db(db) if db.is_lock_error()) => {
-            Response::Err(ErrorResponse::new(
-                "session_activity_temporarily_unavailable",
-                "activity unavailable: database_locked; retry bounded observation",
-            ))
-        }
-        Err(error) => Response::Err(ErrorResponse::new(
-            "session_activity_unavailable",
-            format!(
-                "activity unavailable: {}",
-                session_observation_error_tag(&error)
-            ),
-        )),
-    };
+    let result =
+        Box::pin(ServicesApplicationHandle::new(state, client_id).session_progress(session_id))
+            .await;
+    let response = result.map_or_else(
+        |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+        |snapshot| Response::Ok(ResponsePayload::SessionProgressSnapshot { snapshot }),
+    );
     send_response(writer, request_id, response).await
 }
 
 async fn handle_scoped_session_list(
     request_id: u64,
+    client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
     scope: bcode_session_models::SessionDiscoveryScope,
 ) -> Result<(), ServerError> {
     match scope {
         bcode_session_models::SessionDiscoveryScope::WorkingDirectory(path) => {
-            handle_list_sessions(request_id, state, writer, &path).await
+            handle_list_sessions(request_id, client_id, state, writer, &path).await
         }
         scope @ bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories => {
-            let response = match Box::pin(state.session_catalog.page_with_scope(
-                state,
-                scope,
-                bcode_session_models::SessionCatalogQuery::default(),
-                None,
-                256,
-            ))
+            let response = match Box::pin(
+                SessionApplicationHandle::new(state, client_id).session_catalog_page(
+                    scope,
+                    bcode_session_models::SessionCatalogQuery::default(),
+                    None,
+                    256,
+                ),
+            )
             .await
             {
                 Ok(page) => Response::Ok(ResponsePayload::SessionList {
@@ -10955,56 +11597,37 @@ async fn handle_scoped_session_list(
                     catalog_sources: page.catalog_sources,
                     catalog_revision: page.catalog_revision,
                 }),
-                Err(error) => {
-                    Response::Err(ErrorResponse::new("session_catalog_page_rejected", error))
-                }
+                Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
             };
             send_response(writer, request_id, response).await
         }
     }
 }
 
-async fn handle_session_catalog_page(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    scope: bcode_session_models::SessionDiscoveryScope,
-    query: bcode_session_models::SessionCatalogQuery,
-    cursor: Option<bcode_session_models::SessionCatalogCursor>,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let response = match state
-        .session_catalog
-        .page_with_scope(state, scope, query, cursor, limit)
-        .await
-    {
-        Ok(page) => Response::Ok(ResponsePayload::SessionCatalogPage { page }),
-        Err(error) => Response::Err(ErrorResponse::new("session_catalog_page_rejected", error)),
-    };
-    send_response(writer, request_id, response).await
-}
-
 async fn handle_list_sessions(
     request_id: u64,
+    client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
     working_directory: &Path,
 ) -> Result<(), ServerError> {
-    let snapshot = match session_operations::list(state, working_directory).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return Err(ServerError::SessionStore(error)),
-    };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionList {
-            sessions: snapshot.sessions,
-            catalog_status: snapshot.status,
-            catalog_sources: snapshot.sources,
-            catalog_revision: snapshot.revision,
-        }),
+    let result = Box::pin(
+        SessionApplicationHandle::new(state, client_id)
+            .session_catalog_snapshot(working_directory.to_path_buf()),
     )
-    .await
+    .await;
+    let response = result.map_or_else(
+        |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+        |snapshot| {
+            Response::Ok(ResponsePayload::SessionList {
+                sessions: snapshot.sessions,
+                catalog_status: snapshot.catalog_status,
+                catalog_sources: snapshot.catalog_sources,
+                catalog_revision: snapshot.catalog_revision,
+            })
+        },
+    );
+    send_response(writer, request_id, response).await
 }
 
 fn summarize_session_compatibility_entries(
@@ -11329,23 +11952,31 @@ async fn classify_session_compatibility(
 
 async fn handle_refresh_session_catalog(
     request_id: u64,
+    client_id: ClientId,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
     working_directory: &Path,
     sources: Option<&[String]>,
 ) -> Result<(), ServerError> {
-    let snapshot = session_operations::refresh(state, working_directory, sources).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionCatalogRefreshed {
-            sessions: snapshot.sessions,
-            catalog_status: snapshot.status,
-            catalog_sources: snapshot.sources,
-            catalog_revision: snapshot.revision,
-        }),
+    let result = Box::pin(
+        SessionApplicationHandle::new(state, client_id).refresh_session_catalog(
+            working_directory.to_path_buf(),
+            sources.map(<[String]>::to_vec),
+        ),
     )
-    .await
+    .await;
+    let response = result.map_or_else(
+        |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+        |snapshot| {
+            Response::Ok(ResponsePayload::SessionCatalogRefreshed {
+                sessions: snapshot.sessions,
+                catalog_status: snapshot.catalog_status,
+                catalog_sources: snapshot.catalog_sources,
+                catalog_revision: snapshot.catalog_revision,
+            })
+        },
+    );
+    send_response(writer, request_id, response).await
 }
 
 async fn handle_subscribe_catalog_updates(
@@ -11391,46 +12022,6 @@ async fn validate_session_working_directory(
                 format!("session working directory cannot be resolved: {error}"),
             )
         })
-}
-
-async fn handle_list_worktrees(
-    request_id: u64,
-    _state: &ServerState,
-    writer: &SharedWriter,
-    request: WorktreeListRequest,
-) -> Result<(), ServerError> {
-    let Some(cwd) = request.cwd else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "worktree_cwd_required",
-                "worktree requests must include the caller working directory",
-            )),
-        )
-        .await;
-    };
-    match worktree_operations::list(&cwd) {
-        Ok(response) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorktreeList(response)),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "worktree_list_command_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
 }
 
 fn ralph_status(
@@ -13266,46 +13857,6 @@ async fn handle_record_ralph_lifecycle(
     }
 }
 
-async fn handle_remove_worktree(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    request: WorktreeRemoveRequest,
-) -> Result<(), ServerError> {
-    let Some(cwd) = request.cwd.clone() else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "worktree_cwd_required",
-                "worktree requests must include the caller working directory",
-            )),
-        )
-        .await;
-    };
-    match worktree_operations::remove(state, &cwd, &request.path, request.force).await {
-        Ok(response) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorktreeRemoved(response)),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "worktree_remove_command_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
-}
-
 fn path_is_inside(path: &Path, root: &Path) -> bool {
     let normalized_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let normalized_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -13541,83 +14092,6 @@ async fn handle_invocation_input(
 }
 
 use bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES as MAX_ARTIFACT_RANGE_BYTES;
-
-async fn handle_working_document(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_session_models::SessionWorkingDocumentRequest,
-) -> Result<(), ServerError> {
-    if let Some(response) = ambiguous_session_location_response(state, request.session_id).await {
-        return send_response(writer, request_id, response).await;
-    }
-    let result = async {
-        let ownership = state
-            .sessions
-            .acquire_session_ownership(
-                request.session_id,
-                bcode_session::SessionOwnershipKind::RuntimeWork,
-            )
-            .await
-            .map_err(|_| ())?;
-        let root = state.sessions.session_store_root().ok_or(())?;
-        tokio::task::spawn_blocking(move || {
-            let _ownership = ownership;
-            bcode_session::working_document::access(&root, &request).map_err(|_| ())
-        })
-        .await
-        .map_err(|_| ())?
-    }
-    .await;
-    let response = match result {
-        Ok(document) => Response::Ok(ResponsePayload::SessionWorkingDocument { document }),
-        Err(()) => Response::Err(ErrorResponse::new(
-            "working_document_unavailable",
-            "Working document unavailable: check session ownership, contract version, size and confined storage",
-        )),
-    };
-    send_response(writer, request_id, response).await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_read_session_artifact(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    artifact_id: String,
-    reference_key: String,
-    offset: u64,
-    length: u32,
-) -> Result<(), ServerError> {
-    let result = artifact_operations::read_range(
-        state,
-        session_id,
-        &artifact_id,
-        &reference_key,
-        offset,
-        length,
-    )
-    .await;
-    match result {
-        Ok(range) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionArtifactRange { range }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(error.code(), error.message())),
-            )
-            .await
-        }
-    }
-}
 
 fn read_artifact_file_range_at_length(
     path: &Path,
@@ -13957,202 +14431,6 @@ async fn read_session_artifact_range_untracked(
     Ok(response)
 }
 
-async fn handle_delete_session(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-) -> Result<(), ServerError> {
-    match session_operations::delete(state, session_id).await {
-        Ok(session) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionDeleted { session }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(error.code(), error.message())),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_derivation_snapshot(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-) -> Result<(), ServerError> {
-    match session_operations::derivation_snapshot(state, session_id).await {
-        Ok(snapshot) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionDerivationSnapshot { snapshot }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_derivation_snapshot_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_derivation_prompts(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    query: bcode_session_models::SessionDerivationPromptQuery,
-) -> Result<(), ServerError> {
-    match session_operations::derivation_prompts(state, session_id, query).await {
-        Ok(page) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionDerivationPrompts { page }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_derivation_prompts_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_derive_session(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    request: bcode_session_models::SessionDerivationRequest,
-) -> Result<(), ServerError> {
-    match session_operations::derive(state, request).await {
-        Ok(outcome) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionDerived { outcome }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_derivation_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_derivation_status(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    operation_id: bcode_session_models::SessionDerivationOperationId,
-) -> Result<(), ServerError> {
-    match session_operations::derivation_status(state, operation_id).await {
-        Ok(snapshot) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionDerivationStatus { snapshot }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_derivation_status_failed",
-                    error.to_string(),
-                )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_cancel_session_derivation(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    operation_id: bcode_session_models::SessionDerivationOperationId,
-) -> Result<(), ServerError> {
-    let accepted = session_operations::cancel_derivation(state, operation_id).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionDerivationCancellationRequested { accepted }),
-    )
-    .await
-}
-
-/// Handle an explicit full-history request.
-///
-/// This endpoint performs a complete canonical event read and is intended only for
-/// export/debug/history commands. Normal UI, attach, prompt/model-context, catalog,
-/// and maintenance flows must use bounded pages, projection windows, or typed read models.
-async fn handle_session_history(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-) -> Result<(), ServerError> {
-    match session_operations::complete_history(state, client_id, session_id).await {
-        Ok(history) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionHistory {
-                    session_id,
-                    history,
-                }),
-            )
-            .await
-        }
-        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
-            send_incompatible_active_session_response(writer, request_id, &namespace).await
-        }
-        Err(session_operations::ReadHistoryError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
-}
-
 const MAX_SESSION_OPEN_PROGRESS_WAIT: Duration = Duration::from_secs(5);
 
 fn migrating_session_open_snapshot(
@@ -14308,137 +14586,6 @@ async fn wait_session_open_snapshot(
     receiver.borrow_and_update().clone()
 }
 
-async fn handle_session_history_page(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    query: bcode_session_models::SessionHistoryQuery,
-) -> Result<(), ServerError> {
-    match session_operations::history_page(state, client_id, session_id, query).await {
-        Ok(page) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionHistoryPage { page }),
-            )
-            .await
-        }
-        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
-            send_incompatible_active_session_response(writer, request_id, &namespace).await
-        }
-        Err(session_operations::ReadHistoryError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_projection_history_page(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    request: bcode_session_models::ProjectionWindowRequest,
-) -> Result<(), ServerError> {
-    match session_operations::projection_history_page(state, client_id, session_id, request).await {
-        Ok(page) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionProjectionHistoryPage { page }),
-            )
-            .await
-        }
-        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
-            send_incompatible_active_session_response(writer, request_id, &namespace).await
-        }
-        Err(session_operations::ReadHistoryError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_history_around(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    query: bcode_session_models::SessionHistoryAroundQuery,
-) -> Result<(), ServerError> {
-    match session_operations::history_around(state, client_id, session_id, query).await {
-        Ok(window) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionHistoryAround { window }),
-            )
-            .await
-        }
-        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
-            send_incompatible_active_session_response(writer, request_id, &namespace).await
-        }
-        Err(session_operations::ReadHistoryError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_search(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    request: bcode_session_search::SessionSearchRequest,
-    policy: bcode_session_search::SessionSearchPlanPolicy,
-    routes: Vec<bcode_session_search::SessionSearchContentRoute>,
-    hydrate: bool,
-) -> Result<(), ServerError> {
-    match session_search_operations::search(state, &request, &policy, &routes, hydrate).await {
-        Ok(session_search_operations::SearchResult {
-            response,
-            hydrated_hits,
-        }) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionSearch {
-                    response,
-                    hydrated_hits,
-                }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    format!("session_search_{:?}", error.code).to_lowercase(),
-                    error.message,
-                )),
-            )
-            .await
-        }
-    }
-}
-
 async fn handle_session_search_maintenance(
     request_id: u64,
     writer: &SharedWriter,
@@ -14471,37 +14618,6 @@ async fn handle_session_search_maintenance(
 }
 
 const MAX_SESSION_SEARCH_BACKFILL_OPERATIONS: usize = 128;
-
-async fn handle_complete_session_search_backfill_start(
-    request_id: u64,
-    writer: &SharedWriter,
-    result: Result<
-        bcode_session_search::StartSessionSearchBackfillResponse,
-        bcode_session_search::SessionSearchServiceError,
-    >,
-) -> Result<(), ServerError> {
-    match result {
-        Ok(response) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionSearchCompleteBackfillStarted { response }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    format!("session_search_{:?}", error.code).to_lowercase(),
-                    error.message,
-                )),
-            )
-            .await
-        }
-    }
-}
 
 #[allow(clippy::too_many_lines)]
 async fn start_complete_session_search_backfill(
@@ -14648,37 +14764,6 @@ fn admit_session_search_backfill_operation(
             Ok(())
         },
     )
-}
-
-async fn handle_session_search_backfill_start(
-    request_id: u64,
-    writer: &SharedWriter,
-    result: Result<
-        bcode_session_search::StartSessionSearchBackfillResponse,
-        bcode_session_search::SessionSearchServiceError,
-    >,
-) -> Result<(), ServerError> {
-    match result {
-        Ok(response) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionSearchBackfillStarted { response }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    format!("session_search_{:?}", error.code).to_lowercase(),
-                    error.message,
-                )),
-            )
-            .await
-        }
-    }
 }
 
 async fn start_session_search_backfill(
@@ -14851,68 +14936,6 @@ async fn cancel_session_search_backfill(
     Ok(status)
 }
 
-async fn handle_session_search_backfill_operation(
-    request_id: u64,
-    writer: &SharedWriter,
-    result: Result<
-        bcode_session_search::SessionSearchBackfillOperationStatus,
-        bcode_session_search::SessionSearchServiceError,
-    >,
-) -> Result<(), ServerError> {
-    match result {
-        Ok(status) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionSearchBackfillOperation { status }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    format!("session_search_{:?}", error.code).to_lowercase(),
-                    error.message,
-                )),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_search_backfill(
-    request_id: u64,
-    writer: &SharedWriter,
-    result: Result<
-        bcode_session_search::SessionSearchBackfillResponse,
-        bcode_session_search::SessionSearchServiceError,
-    >,
-) -> Result<(), ServerError> {
-    match result {
-        Ok(response) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionSearchBackfill { response }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    format!("session_search_{:?}", error.code).to_lowercase(),
-                    error.message,
-                )),
-            )
-            .await
-        }
-    }
-}
-
 async fn send_incompatible_active_session_response(
     writer: &SharedWriter,
     request_id: u64,
@@ -14925,14 +14948,6 @@ async fn send_incompatible_active_session_response(
         Response::Err(ErrorResponse::new(error.code(), error.message())),
     )
     .await
-}
-
-fn server_session_error_response(error: &ServerError) -> ErrorResponse {
-    match error {
-        ServerError::Session(error) => session_error_response(error),
-        ServerError::SessionDb(error) => session_db_error_response(error),
-        _ => ErrorResponse::new("session_unavailable", error.to_string()),
-    }
 }
 
 const fn ownership_recovery_guidance() -> &'static str {
@@ -15138,30 +15153,6 @@ async fn handle_attach_session(
             Ok(())
         }
     }
-}
-
-async fn handle_reprice_session(
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request_id: u64,
-    session_id: SessionId,
-    range: bcode_session_models::SessionCostRange,
-    catalog: bcode_model_catalog_models::CatalogDocument,
-) -> Result<(), ServerError> {
-    if let Some(response) = ambiguous_session_location_response(state, session_id).await {
-        return send_response(writer, request_id, response).await;
-    }
-    let result = session_operations::reprice(state, session_id, range, catalog).await;
-    let response = match result {
-        Ok(report) => Response::Ok(ResponsePayload::SessionRepriced {
-            report: Box::new(report),
-        }),
-        Err(message) => Response::Err(ErrorResponse {
-            code: "session_reprice_failed".to_owned(),
-            message,
-        }),
-    };
-    send_response(writer, request_id, response).await
 }
 
 async fn handle_attach_session_recent(
@@ -16146,6 +16137,7 @@ async fn activate_pending_steering_inner(
     Ok(activated)
 }
 
+#[cfg(test)]
 async fn admit_turn(
     state: &ServerState,
     session_id: SessionId,
@@ -16762,6 +16754,24 @@ fn recover_pending_submission_hint_with_authority<'a>(
             + 'a,
     >,
 > {
+    if record.status != bcode_session_models::SubmissionStatus::Pending {
+        return Box::pin(async { Ok(None) });
+    }
+    recover_submission_execution_hint_with_authority(state, session_id, record, workflow_authorized)
+}
+
+fn recover_submission_execution_hint_with_authority<'a>(
+    state: &'a ServerState,
+    session_id: SessionId,
+    record: &'a bcode_session_models::SubmissionRecord,
+    workflow_authorized: bool,
+) -> Pin<
+    Box<
+        dyn Future<Output = Result<Option<FollowupCommand>, bcode_session::SessionError>>
+            + Send
+            + 'a,
+    >,
+> {
     Box::pin(recover_pending_submission_hint_with_authority_inner(
         state,
         session_id,
@@ -16781,7 +16791,11 @@ async fn recover_pending_submission_hint_with_authority_inner(
     if record.submission.admission.execution.correlation.is_some() && !workflow_authorized {
         return Ok(None);
     }
-    if record.status != bcode_session_models::SubmissionStatus::Pending {
+    if !matches!(
+        record.status,
+        bcode_session_models::SubmissionStatus::Pending
+            | bcode_session_models::SubmissionStatus::Activated { .. }
+    ) {
         return Ok(None);
     }
     if let Some(expected) = record.effective_execution_descriptor()
@@ -18084,41 +18098,33 @@ async fn handle_invoke_skill(
     display_text: String,
     execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<(), ServerError> {
-    if let Some(active_namespace) = state
-        .active_session_namespace_mismatch(session_id, client_id)
+    match SessionApplicationHandle::new(state, client_id)
+        .invoke_skill(session_id, skill_id, arguments, display_text, execution)
         .await
     {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    let result = session_operations::invoke_skill(
-        state,
-        client_id,
-        session_id,
-        skill_id,
-        arguments,
-        display_text,
-        execution,
-    )
-    .await;
-    let error = match result {
         Ok(status) => {
-            return send_message_acceptance_response(state, writer, request_id, client_id, status)
-                .await;
+            send_message_acceptance_response(
+                state,
+                writer,
+                request_id,
+                client_id,
+                MessageQueueStatus {
+                    queued: status.queued,
+                    queue_position: status.queue_position,
+                    disposition: status.disposition,
+                },
+            )
+            .await
         }
-        Err(session_operations::InvokeSkillError::Disabled) => {
-            ErrorResponse::new("skills_disabled", "skills are disabled")
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(error.code, error.message)),
+            )
+            .await
         }
-        Err(session_operations::InvokeSkillError::Unknown(skill_id)) => {
-            ErrorResponse::new("unknown_skill", format!("unknown skill: {skill_id}"))
-        }
-        Err(session_operations::InvokeSkillError::Invalid(error)) => session_error_response(&error),
-        Err(session_operations::InvokeSkillError::Ownership(error)) => return Err(error),
-        Err(session_operations::InvokeSkillError::Admission(error)) => {
-            server_session_error_response(&error)
-        }
-    };
-    send_response(writer, request_id, Response::Err(error)).await
+    }
 }
 
 async fn pending_turn_acceptance_event(
@@ -18355,6 +18361,10 @@ async fn submit_session_model_turn_admission_inner(
     ))
     .await?;
     let (receipt, accepted) = submitted_turn_receipt(admission)?;
+    #[cfg(test)]
+    if accepted {
+        let _ = tests::AFTER_TURN_ACCEPTANCE.try_with(|hook| hook());
+    }
     if !accepted {
         let event = pending_turn_acceptance_event(state, session_id, &receipt).await?;
         drop(admission_commit);
@@ -18467,9 +18477,10 @@ async fn handle_submit_turn(
     admission: bcode_session_models::TurnAdmissionMetadata,
 ) -> Result<(), ServerError> {
     use bcode_session_models::SessionApplication as _;
-    let result = SessionApplicationHandle::new(state, client_id)
-        .submit_turn(session_id, text, admission)
-        .await;
+    let result = Box::pin(
+        SessionApplicationHandle::new(state, client_id).submit_turn(session_id, text, admission),
+    )
+    .await;
     send_response(
         writer,
         request_id,
@@ -18492,32 +18503,29 @@ async fn handle_user_message(
     placement: bcode_ipc::PromptPlacement,
     execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<(), ServerError> {
-    if let Some(active_namespace) = state
-        .active_session_namespace_mismatch(session_id, client_id)
+    match SessionApplicationHandle::new(state, client_id)
+        .send_message(session_id, text, placement, execution)
         .await
     {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    match enqueue_user_message_command(
-        state,
-        session_id,
-        client_id,
-        state.client_runtime_context(client_id).await,
-        text,
-        placement,
-        execution,
-    )
-    .await
-    {
         Ok(status) => {
-            send_message_acceptance_response(state, writer, request_id, client_id, status).await
+            send_message_acceptance_response(
+                state,
+                writer,
+                request_id,
+                client_id,
+                MessageQueueStatus {
+                    queued: status.queued,
+                    queue_position: status.queue_position,
+                    disposition: status.disposition,
+                },
+            )
+            .await
         }
         Err(error) => {
             send_response(
                 writer,
                 request_id,
-                Response::Err(server_session_error_response(&error)),
+                Response::Err(ErrorResponse::new(error.code, error.message)),
             )
             .await
         }
@@ -18592,7 +18600,8 @@ struct PresentationNoteRequest {
 
 async fn handle_append_presentation_note(
     request_id: u64,
-    state: &ServerState,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     request: PresentationNoteRequest,
 ) -> Result<(), ServerError> {
@@ -18603,39 +18612,34 @@ async fn handle_append_presentation_note(
         text,
         format,
     } = request;
-    match session_operations::append_presentation_note(
-        state, session_id, source_id, note_id, text, format,
+    let format = match format {
+        bcode_command::CommandTextFormat::PlainText => {
+            bcode_session_models::SessionPresentationNoteFormat::PlainText
+        }
+        bcode_command::CommandTextFormat::Markdown => {
+            bcode_session_models::SessionPresentationNoteFormat::Markdown
+        }
+        bcode_command::CommandTextFormat::Json => {
+            bcode_session_models::SessionPresentationNoteFormat::Json
+        }
+    };
+    let result = Box::pin(
+        SessionApplicationHandle::new(state, client_id).append_presentation_note(
+            bcode_session_models::SessionPresentationNoteRequest {
+                session_id,
+                source_id,
+                note_id,
+                text,
+                format,
+            },
+        ),
     )
-    .await
-    {
-        Ok(()) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::PresentationNoteAppended),
-            )
-            .await
-        }
-        Err(session_operations::AppendPresentationNoteError::Invalid) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "invalid_presentation_note",
-                    "presentation note fields are empty or exceed their bounded limits",
-                )),
-            )
-            .await
-        }
-        Err(session_operations::AppendPresentationNoteError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
+    .await;
+    let response = result.map_or_else(
+        |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+        |()| Response::Ok(ResponsePayload::PresentationNoteAppended),
+    );
+    send_response(writer, request_id, response).await
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -18686,66 +18690,6 @@ async fn set_session_reasoning_if_changed(
     // Deliberately leave the model-selection origin untouched. Choosing a reasoning effort is not
     // a model selection, so it must not promote a resolved default into a sticky user choice.
     Ok(Some(event))
-}
-
-#[allow(clippy::significant_drop_tightening)]
-async fn handle_set_session_reasoning(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    effort: Option<String>,
-    summary: Option<String>,
-) -> Result<(), ServerError> {
-    match session_operations::set_reasoning(state, session_id, effort, summary).await {
-        Ok(_) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionModelSet),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_session_model_status(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-) -> Result<(), ServerError> {
-    let status = session_operations::model_status(state, client_id, session_id).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionModelStatus { status }),
-    )
-    .await
-}
-
-async fn handle_default_model_status(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let status = session_operations::default_model_status(state, client_id).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionModelStatus { status }),
-    )
-    .await
 }
 
 async fn provider_models(
@@ -18826,6 +18770,7 @@ const fn context_occupancy_error_message() -> &'static str {
     "request context occupancy is unavailable"
 }
 
+#[cfg(test)]
 fn compaction_provider_error_response() -> ErrorResponse {
     ErrorResponse::new(
         "provider_error",
@@ -18977,36 +18922,6 @@ async fn model_status_for_selection(
     }
 }
 
-async fn handle_session_model_list(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    provider_plugin_id: Option<String>,
-) -> Result<(), ServerError> {
-    match session_operations::list_models(state, client_id, provider_plugin_id).await {
-        Ok((selected_provider_plugin_id, models)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionModelList {
-                    provider_plugin_id: selected_provider_plugin_id,
-                    models,
-                }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(error.code(), error.message())),
-            )
-            .await
-        }
-    }
-}
-
 fn select_model_info(
     models: &[bcode_model::ModelInfo],
     selected_model_id: Option<&str>,
@@ -19025,92 +18940,6 @@ fn select_model_info(
         })
         .or_else(|| models.first())
         .cloned()
-}
-
-async fn handle_list_agents(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let agents = session_operations::list_agents(state, client_id).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AgentList { agents }),
-    )
-    .await
-}
-
-async fn handle_list_skills(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let skills = session_operations::list_skills(state);
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SkillList {
-            skills: Box::new(skills),
-        }),
-    )
-    .await
-}
-
-async fn handle_describe_skill(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    skill_id: &SkillId,
-) -> Result<(), ServerError> {
-    match session_operations::describe_skill(state, skill_id) {
-        Ok(skill) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SkillManifest {
-                    skill: Box::new(skill),
-                }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(error.code(), error.message())),
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_activate_skill(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    skill_id: SkillId,
-) -> Result<(), ServerError> {
-    match session_operations::activate_skill(state, session_id, skill_id).await {
-        Ok(()) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionAgentSet),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(error.code(), error.message())),
-            )
-            .await
-        }
-    }
 }
 
 async fn is_skill_active(state: &ServerState, session_id: SessionId, skill_id: &SkillId) -> bool {
@@ -19496,22 +19325,6 @@ async fn skill_model_exists(
     .is_ok_and(|models| models.models.iter().any(|model| model.model_id == model_id))
 }
 
-async fn handle_deactivate_skill(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    skill_id: SkillId,
-) -> Result<(), ServerError> {
-    session_operations::deactivate_skill(state, session_id, skill_id).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionAgentSet),
-    )
-    .await
-}
-
 async fn restore_skill_model_override(
     state: &ServerState,
     session_id: SessionId,
@@ -19611,35 +19424,6 @@ async fn restore_preferred_skill_model_override(
         .insert(session_id, SessionModelSelectionOrigin::Default);
     publish_session_event(state, &event).await;
     Ok(())
-}
-
-async fn handle_active_skills(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-) -> Result<(), ServerError> {
-    let skills = session_operations::active_skills(state, session_id).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::ActiveSkills { skills }),
-    )
-    .await
-}
-
-async fn handle_agent_policy_status(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let status = session_operations::agent_policy_status(state).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AgentPolicyStatus { status }),
-    )
-    .await
 }
 
 fn dispatch_provider_turn_cleanup(
@@ -19752,9 +19536,14 @@ async fn handle_cancel_session_turn(
     expected_turn_id: Option<String>,
 ) -> Result<(), ServerError> {
     use bcode_session_models::SessionApplication as _;
-    let result = SessionApplicationHandle::new(state, client_id)
-        .cancel_session_turn(session_id, clear_queue, expected_turn_id)
-        .await;
+    let result = Box::pin(
+        SessionApplicationHandle::new(state, client_id).cancel_session_turn(
+            session_id,
+            clear_queue,
+            expected_turn_id,
+        ),
+    )
+    .await;
     send_response(
         writer,
         request_id,
@@ -20515,21 +20304,6 @@ async fn send_compaction_noop_response(
     .await
 }
 
-async fn send_uncompactable_current_turn_response(
-    writer: &SharedWriter,
-    request_id: u64,
-) -> Result<(), ServerError> {
-    send_response(
-        writer,
-        request_id,
-        Response::Err(ErrorResponse::new(
-            "uncompactable_current_turn",
-            "current turn cannot fit the model input capacity and cannot be partially compacted",
-        )),
-    )
-    .await
-}
-
 async fn handle_compact_session(
     request_id: u64,
     client_id: ClientId,
@@ -20537,7 +20311,12 @@ async fn handle_compact_session(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let result = match session_operations::compact(state, client_id, session_id).await {
+    use bcode_session_models::SessionCompactionOperation as _;
+    let result = match Box::pin(
+        SessionApplicationHandle::new(state, client_id).begin_session_compaction(session_id),
+    )
+    .await
+    {
         Ok(completion) => {
             send_response(
                 writer,
@@ -20545,12 +20324,12 @@ async fn handle_compact_session(
                 Response::Ok(ResponsePayload::SessionCompactionAccepted),
             )
             .await?;
-            session_operations::complete_compaction(completion).await
+            Box::pin(completion.complete()).await
         }
         Err(error) => Err(error),
     };
     match result {
-        Ok(session_operations::CompactResult::Compacted(message)) => {
+        Ok(bcode_session_models::SessionCompactionResult::Compacted(message)) => {
             send_response(
                 writer,
                 request_id,
@@ -20561,70 +20340,14 @@ async fn handle_compact_session(
             )
             .await
         }
-        Ok(session_operations::CompactResult::Noop(message)) => {
+        Ok(bcode_session_models::SessionCompactionResult::Noop(message)) => {
             send_compaction_noop_response(writer, request_id, message).await
         }
-        Err(session_operations::CompactError::IncompatibleActiveNamespace(namespace)) => {
-            send_incompatible_active_session_response(writer, request_id, &namespace).await
-        }
-        Err(session_operations::CompactError::Server(error)) => Err(error),
-        Err(session_operations::CompactError::Compaction(CompactionError::Session(error))) => {
+        Err(error) => {
             send_response(
                 writer,
                 request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-        Err(session_operations::CompactError::Compaction(CompactionError::ProviderUnavailable)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "provider_unavailable",
-                    "model provider unavailable",
-                )),
-            )
-            .await
-        }
-        Err(session_operations::CompactError::Compaction(CompactionError::Cancelled)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "cancelled",
-                    "context compaction cancelled",
-                )),
-            )
-            .await
-        }
-        Err(session_operations::CompactError::Compaction(
-            CompactionError::UncompactableCurrentTurn { .. },
-        )) => send_uncompactable_current_turn_response(writer, request_id).await,
-        Err(session_operations::CompactError::Compaction(
-            CompactionError::RequestStillTooLarge { .. },
-        )) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "request_still_too_large",
-                    "request remains too large after context compaction",
-                )),
-            )
-            .await
-        }
-        Err(session_operations::CompactError::Compaction(CompactionError::PlanUnavailable(
-            reason,
-        ))) => send_compaction_noop_response(writer, request_id, reason.to_string()).await,
-        Err(session_operations::CompactError::Compaction(
-            CompactionError::InsufficientProgress { message, .. },
-        )) => send_compaction_noop_response(writer, request_id, message).await,
-        Err(session_operations::CompactError::Compaction(CompactionError::Provider(_))) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(compaction_provider_error_response()),
+                Response::Err(ErrorResponse::new(error.code, error.message)),
             )
             .await
         }
@@ -21557,6 +21280,14 @@ async fn run_model_turn_lifecycle(
     let terminal_lock = turn_admission_lock(state, session_id).await;
     let terminal_guard = terminal_lock.lock().await;
     set_runtime_phase(phase, SessionRuntimePhase::FinishingTurn).await;
+    // Inner tool execution has settled and the admission guard excludes the next turn.
+    // Await residual interaction cleanup before publishing any terminal turn outcome.
+    Box::pin(interaction_operations::cancel_session_tool_exchanges(
+        state, session_id,
+    ))
+    .await;
+    Box::pin(interaction_operations::cancel_pending_permissions_for_session(state, session_id))
+        .await;
     if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
         turn.execution = None;
     }
@@ -39339,7 +39070,7 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
                 },
                 result = tokio::time::timeout(timeout, async {
                     match request.activation.node.kind {
-                        bcode_workflow::NodeKind::Agent => dispatch_workflow_prompt_turn(self.state, request).await,
+                        bcode_workflow::NodeKind::Agent => Box::pin(dispatch_workflow_prompt_turn(self.state, request)).await,
                         bcode_workflow::NodeKind::PluginBlock => dispatch_workflow_plugin_block(self.state, request).await,
                         bcode_workflow::NodeKind::WorkflowCall => dispatch_workflow_child(self.state, request).await,
                         _ => Err(WorkflowStoreError::InvalidData("workflow activation has no production owner".into())),
@@ -39406,7 +39137,14 @@ async fn dispatch_workflow_child(
         }
         resolved
     } else {
-        target.definition_identity().clone()
+        target
+            .definition_identity()
+            .map_err(|_| {
+                WorkflowStoreError::InvalidData(
+                    "workflow call target requires supported immutable run-lock resolution".into(),
+                )
+            })?
+            .clone()
     };
     let now = current_unix_millis();
     let (parent, parent_link, authored_provenance, child_limits) = {
@@ -39433,6 +39171,12 @@ async fn dispatch_workflow_child(
         let _definition: bcode_workflow::WorkflowDefinition =
             serde_json::from_str(&stored.definition_json)?;
         let (provenance, limits) = match &target {
+            bcode_workflow::WorkflowCallTarget::PackageLocal { .. } => {
+                return Err(WorkflowStoreError::InvalidData(
+                    "package-local child execution requires supported immutable run-lock resolution"
+                        .into(),
+                ));
+            }
             bcode_workflow::WorkflowCallTarget::Definition { .. }
             | bcode_workflow::WorkflowCallTarget::PackageMember { .. } => (None, None),
             bcode_workflow::WorkflowCallTarget::AuthoredRevision {
@@ -39962,7 +39706,7 @@ impl ActivationDispatchOwner for WorkflowPromptTurnOwner<'_> {
         request: &'a bcode_workflow_store::PreparedActivationDispatch,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>>
     {
-        Box::pin(async move { dispatch_workflow_prompt_turn(self.state, request).await })
+        Box::pin(dispatch_workflow_prompt_turn(self.state, request))
     }
 }
 
@@ -40694,7 +40438,12 @@ async fn dispatch_workflow_prompt_turn(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    dispatch_workflow_prompt_turn_after_admission(state, request, || Ok(())).await
+    Box::pin(dispatch_workflow_prompt_turn_after_admission(
+        state,
+        request,
+        || Ok(()),
+    ))
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -41194,15 +40943,13 @@ where
         Some(&request.dispatch_identity),
         workflow_representation::fanout_stages::FanoutAdmissionStage::OwnerPersistence,
     );
+    let acceptance_time =
+        workflow_representation::owner::prompt_acceptance_time(state, request, &owner_receipt)
+            .await;
     let receipt_commit = match before_publication().await {
         Ok(()) => {
             async {
-                let admitted_at_ms = workflow_representation::owner::prompt_acceptance_time(
-                    state,
-                    request,
-                    &owner_receipt,
-                )
-                .await?;
+                let admitted_at_ms = acceptance_time?;
                 workflow_representation::owner::persist_receipt(
                     state,
                     &bcode_workflow_store::DispatchReceipt {
@@ -43115,26 +42862,6 @@ fn plugin_service_metric_labels(
     labels
 }
 
-fn plugin_service_response(
-    result: Result<
-        plugin_operations::PluginServiceOperationResult,
-        plugin_operations::PublicPluginError,
-    >,
-) -> Response {
-    match result {
-        Ok(response) => Response::Ok(ResponsePayload::PluginServiceResult {
-            response: PluginServiceResponse {
-                payload: response.payload,
-                error: response.error.map(|error| PluginServiceError {
-                    code: error.code,
-                    message: error.message,
-                }),
-            },
-        }),
-        Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
-    }
-}
-
 fn observe_substantive_stage(state: &ServerState, event: &bcode_session_models::SessionEvent) {
     let substantive_stage = matches!(
         event.kind,
@@ -44710,7 +44437,8 @@ mod tests {
     }
 
     use super::*;
-    static WORKFLOW_RUNTIME_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub static WORKFLOW_RUNTIME_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     #[test]
     fn bulk_migration_operation_not_found_requires_explicit_reinvocation() {
@@ -48532,8 +48260,75 @@ mod tests {
         assert!(sources.contains("external-034"));
     }
 
+    // Keep diagnostics bounded while draining both pipes completely, so a noisy
+    // child cannot deadlock on pipe capacity or grow the parent's retained output.
+    async fn isolated_test_output_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+        const MAX_BYTES: usize = 8192;
+        let mut tail = Vec::with_capacity(MAX_BYTES);
+        let mut buffer = [0; 4096];
+        loop {
+            let read = tokio::io::AsyncReadExt::read(&mut reader, &mut buffer)
+                .await
+                .expect("isolated test diagnostic read");
+            if read == 0 {
+                return tail;
+            }
+            let overflow = (tail.len() + read).saturating_sub(MAX_BYTES);
+            drop(tail.drain(..overflow));
+            tail.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_test_diagnostics_drain_to_eof_with_bounded_tail() {
+        let mut source = vec![b'a'; 20_000];
+        source.extend_from_slice(b"last diagnostic");
+        let tail = isolated_test_output_tail(source.as_slice()).await;
+        assert_eq!(tail.len(), 8192);
+        assert_eq!(tail, source[source.len() - tail.len()..]);
+        assert!(isolated_test_output_tail(&b""[..]).await.is_empty());
+    }
+
+    /// Runs an exact test in a fresh process, returning true in the parent process.
+    pub async fn run_in_isolated_test_process(test_name: &str) -> bool {
+        const CHILD_TEST: &str = "BCODE_SERVER_ISOLATED_TEST";
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("isolated test process");
+        let stdout = child.stdout.take().expect("isolated stdout pipe");
+        let stderr = child.stderr.take().expect("isolated stderr pipe");
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            isolated_test_output_tail(stdout),
+            isolated_test_output_tail(stderr),
+        );
+        let status = status.expect("isolated test exit");
+        assert!(
+            status.success(),
+            "isolated test {test_name} failed ({status}); stdout tail={} stderr tail={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        );
+        true
+    }
+
     #[tokio::test]
     async fn active_ipc_template_catalog_cleanup_retains_admission_until_worker_exit() {
+        if run_in_isolated_test_process(
+            "tests::active_ipc_template_catalog_cleanup_retains_admission_until_worker_exit",
+        )
+        .await
+        {
+            return;
+        }
         for (expire, cancel) in [(false, false), (false, true), (true, false), (true, true)] {
             let workspace = tempfile::tempdir().unwrap();
             let state = external_template_test_state(workspace.path());
@@ -48578,15 +48373,6 @@ mod tests {
         } else {
             page.detail_token.clone().unwrap()
         };
-        if expire {
-            state
-                .workflow_discovery_scans
-                .lock()
-                .unwrap()
-                .get_mut(&token)
-                .unwrap()
-                .expire_after(Duration::from_secs(2));
-        }
         let capacity = state.workflow_discovery_capacity.available_permits();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -48631,6 +48417,18 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            // Expiry must target an admitted, gate-held worker, not race socket
+            // setup or blocking-pool scheduling. The test hook also re-arms the
+            // active batch's real deadline wait with this same expiry instant.
+            if expire {
+                state
+                    .workflow_discovery_scans
+                    .lock()
+                    .unwrap()
+                    .get_mut(&token)
+                    .unwrap()
+                    .expire_after(Duration::from_secs(2));
+            }
             if expire && cancel {
                 state.request_shutdown();
             } else if cancel {
@@ -64037,6 +63835,11 @@ library = "test"
 
     #[tokio::test]
     async fn replacement_owner_serializes_published_task_group() {
+        if run_in_isolated_test_process("tests::replacement_owner_serializes_published_task_group")
+            .await
+        {
+            return;
+        }
         Box::pin(assert_local_publication_worker_with_replacement(
             false,
             true,
@@ -65976,7 +65779,7 @@ library = "test"
         });
         let original = Arc::new(server);
         let request = receipt_owned_publication_request(&original);
-        let receipt = dispatch_workflow_prompt_turn(&original, &request)
+        let receipt = Box::pin(dispatch_workflow_prompt_turn(&original, &request))
             .await
             .expect("dispatch");
         original
@@ -73047,6 +72850,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn admitted_workflow_staging_waits_for_original_permission() {
+        if run_in_isolated_test_process(
+            "tests::admitted_workflow_staging_waits_for_original_permission",
+        )
+        .await
+        {
+            return;
+        }
         for (approved, publication_approved) in [(false, false), (true, false), (true, true)] {
             let (mut state, session, _root) = active_edit_execution_fixture_with_graph(
                 bcode_workflow_store::DispatchSideEffect::ReadOnly,
@@ -77696,9 +77506,149 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
-    #[tokio::test]
+    async fn fairness_test_writer(
+        endpoint: &bcode_ipc::IpcEndpoint,
+        metrics: MetricsRegistry,
+    ) -> (SharedWriter, LocalIpcStream, LocalIpcListener) {
+        let listener = LocalIpcListener::bind(endpoint).expect("IPC listener");
+        let (stream, peer) = tokio::join!(
+            listener.accept(),
+            bcode_ipc::LocalIpcStream::connect(endpoint)
+        );
+        let (_, stream_writer) = split(stream.expect("accept"));
+        let writer = Arc::new(ResponseWriter {
+            writer: Mutex::new(stream_writer),
+            metrics,
+            disconnect: Notify::new(),
+            request_end: tokio::sync::watch::channel(false).0,
+        });
+        (writer, peer.expect("connect"), listener)
+    }
+
+    fn assert_forwarder_frame_metrics(snapshot: &bcode_metrics::MetricsSnapshot) {
+        for key in [
+            "server.live_state.coalesced_updates_total",
+            "server.live_state.request_draft_deltas_merged_total",
+            "server.live_state.request_draft_frames_emitted_total",
+        ] {
+            assert!(
+                snapshot.counters.get(key).copied().unwrap_or_default() > 0,
+                "{key}"
+            );
+        }
+        let maximum_frame_latency_us = snapshot
+            .histograms
+            .get("server.live_state.request_draft_frame_latency_us")
+            .and_then(|histogram| histogram.max)
+            .expect("request draft frame latency metric");
+        // This is real elapsed dwell, even in the paused-Tokio-time fixture.
+        assert!(
+            maximum_frame_latency_us < 10_000_000,
+            "maximum request draft frame latency was {maximum_frame_latency_us} us"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_forwarder_flushes_due_frame_before_ready_live_input_drains() {
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("fairness.sock"));
+        let metrics = MetricsRegistry::default();
+        let (writer, _peer, _listener) = fairness_test_writer(&endpoint, metrics.clone()).await;
+        let session_id = SessionId::new();
+        let (_invalidations, invalidations) = tokio::sync::broadcast::channel(16);
+        let (_events, events) = tokio::sync::broadcast::channel(16);
+        let (live, live_events) = tokio::sync::broadcast::channel(2048);
+        let forwarder = forward_session_events(
+            ClientEventSink::new(ClientId::new(), Arc::clone(&writer), metrics.clone()),
+            session_id,
+            invalidations,
+            events,
+            live_events,
+        );
+        let checkpoint = |call: &str, revision| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: request_draft_event(
+                    call,
+                    1,
+                    revision,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "checkpoint".into(),
+                    },
+                ),
+            },
+        };
+        live.send(checkpoint("first", 1)).expect("first key");
+        live.send(checkpoint("second", 1)).expect("second key");
+        live.send(checkpoint("first", 2))
+            .expect("coalesced checkpoint");
+        for _ in 0..100 {
+            if metrics
+                .snapshot()
+                .counters
+                .get("server.live_state.request_draft_deltas_merged_total")
+                .copied()
+                .unwrap_or_default()
+                > 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            metrics
+                .snapshot()
+                .gauges
+                .get("server.live_state.pending_subscriber_keys"),
+            Some(&2)
+        );
+        // Stop the first send after its emission metric, so the assertion observes exactly
+        // the first flush, not however much input a later scheduling turn consumed.
+        let send_guard = writer.writer.lock().await;
+        for revision in 2..=1025 {
+            live.send(checkpoint("first", revision))
+                .expect("ready input");
+        }
+        tokio::time::advance(SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL).await;
+        for _ in 0..100 {
+            if metrics
+                .snapshot()
+                .counters
+                .get("server.live_state.request_draft_frames_emitted_total")
+                .copied()
+                .unwrap_or_default()
+                > 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let snapshot = metrics.snapshot();
+        forwarder.abort();
+        drop(send_guard);
+        assert!(
+            forwarder
+                .await
+                .expect_err("aborted forwarder")
+                .is_cancelled()
+        );
+        assert_forwarder_frame_metrics(&snapshot);
+        assert!(
+            snapshot
+                .counters
+                .get("server.live_state.request_draft_deltas_merged_total")
+                .copied()
+                .unwrap_or_default()
+                < 1024,
+            "due frame must precede draining continuously ready live input"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::too_many_lines)] // One real-IPC fixture covers flood bounds, coalescing, disconnect, and checkpoint convergence.
     async fn slow_client_progress_flood_converges_to_latest_checkpoint_after_reconnect() {
+        let _workflow_runtime_guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
         let workspace = tempfile::tempdir().expect("slow client workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
             .expect("persistent session manager");
@@ -77752,44 +77702,46 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await;
         }
-        tokio::time::sleep(SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL * 2).await;
-        let metrics = state.metrics.snapshot();
-        assert!(
-            metrics
-                .counters
-                .get("server.live_state.coalesced_updates_total")
-                .copied()
-                .unwrap_or_default()
-                > 0
-        );
-        assert!(
-            metrics
-                .counters
-                .get("server.live_state.request_draft_deltas_merged_total")
-                .copied()
-                .unwrap_or_default()
-                > 0
-        );
-        assert!(
-            metrics
-                .counters
-                .get("server.live_state.request_draft_frames_emitted_total")
-                .copied()
-                .unwrap_or_default()
-                > 0
-        );
-        let maximum_frame_latency_us = metrics
+        let metrics = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = state.metrics.snapshot();
+                let frame_emitted = snapshot
+                    .counters
+                    .get("server.live_state.request_draft_frames_emitted_total")
+                    .copied()
+                    .unwrap_or_default()
+                    > 0;
+                let lag_resync = snapshot
+                    .counters
+                    .get("server.live_state.resync.live_lag_total")
+                    .copied()
+                    .unwrap_or_default()
+                    > 0;
+                let latency_recorded = snapshot
+                    .histograms
+                    .get("server.live_state.request_draft_frame_latency_us")
+                    .and_then(|histogram| histogram.max)
+                    .is_some();
+                if (frame_emitted && latency_recorded) || lag_resync {
+                    break snapshot;
+                }
+                tokio::time::sleep(SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("forwarder must emit a measured frame or explicitly request lag resync within 10 seconds");
+        // Coalescing and measured-frame latency are asserted by the controlled
+        // actual-forwarder fixture. This saturated attachment may terminate with lag resync.
+        if let Some(maximum_frame_latency_us) = metrics
             .histograms
             .get("server.live_state.request_draft_frame_latency_us")
             .and_then(|histogram| histogram.max)
-            .expect("request draft frame latency metric");
-        // A saturated debug-build loop with large checkpoints may span many 16 ms frames, but
-        // subscriber fan-out must still occur before the reconnect timeout instead of remaining
-        // starved until the entire flood drains. Focused paused-time tests cover exact cadence.
-        assert!(
-            maximum_frame_latency_us < 10_000_000,
-            "maximum request draft frame latency was {maximum_frame_latency_us} us"
-        );
+        {
+            assert!(
+                maximum_frame_latency_us < 10_000_000,
+                "maximum request draft frame latency was {maximum_frame_latency_us} us"
+            );
+        }
         assert!(
             metrics
                 .gauges
@@ -82125,7 +82077,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].dispatch_identity, before[0].dispatch_identity);
         assert!(attempts[0].has_receipt, "{attempts:?}");
-        assert_eq!(attempts[0].status, "paused");
+        assert_eq!(attempts[0].status, "paused", "{attempts:?}");
         let child = state
             .sessions
             .all_session_summaries()
@@ -82214,6 +82166,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Box::pin(verify_startup_admission_reuse(true)).await;
             panic!("child did not exit at admission");
         }
+    }
+
+    tokio::task_local! {
+        // Crash fixtures stop after canonical acceptance, before any activation is enqueued.
+        pub(super) static AFTER_TURN_ACCEPTANCE: fn();
     }
 
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]
@@ -82382,18 +82339,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .expect("prepare")
                     .expect("attempt");
                 drop(scheduler);
-                assert!(
+                let dispatch =
                     dispatch_workflow_prompt_turn_after_admission(&state, &prepared, || {
-                        if process_root.is_some() {
-                            std::process::exit(73);
-                        }
                         Err(WorkflowStoreError::InvalidData(
                             "interrupted first admission".into(),
                         ))
-                    })
-                    .await
-                    .is_err()
-                );
+                    });
+                let result = if process_root.is_some() {
+                    AFTER_TURN_ACCEPTANCE
+                        .scope(|| std::process::exit(73), Box::pin(dispatch))
+                        .await
+                } else {
+                    Box::pin(dispatch).await
+                };
+                assert!(result.is_err());
             } else {
                 assert!(
                     bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
@@ -82459,11 +82418,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .expect("attempt");
                 drop(scheduler);
                 assert!(
-                    dispatch_workflow_prompt_turn_after_admission(&state, &prepared, || {
-                        Err(WorkflowStoreError::InvalidData(
-                            "interrupted before receipt commit".into(),
-                        ))
-                    })
+                    Box::pin(dispatch_workflow_prompt_turn_after_admission(
+                        &state,
+                        &prepared,
+                        || {
+                            Err(WorkflowStoreError::InvalidData(
+                                "interrupted before receipt commit".into(),
+                            ))
+                        }
+                    ))
                     .await
                     .is_err()
                 );
@@ -86959,11 +86922,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let guard = state.workflow_store_unavailable.lock().expect("owner");
         let result = state.require_workflow_store();
         drop(guard);
-        assert!(
-            matches!(result, Err(ServerError::WorkflowStorageUnavailable(message))
-            if message.contains("readiness status is temporarily unavailable")
-                && message.contains("no initialization progress has been verified"))
-        );
+        assert!(matches!(result, Err(ServerError::WorkflowStorageBusy)));
         assert!(!state.workflow_restore_pending.load(Ordering::SeqCst));
         drop(state);
     }
@@ -86989,7 +86948,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     let result = state.require_workflow_store();
                     assert!(
                         result.is_ok()
-                            || matches!(result, Err(ServerError::WorkflowStorageUnavailable(_)))
+                            || matches!(
+                                result,
+                                Err(ServerError::WorkflowStorageUnavailable(_)
+                                    | ServerError::WorkflowStorageBusy)
+                            )
                     );
                 });
             }
@@ -102971,6 +102934,86 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn embedded_interaction_registration_is_explicit_and_cleanup_is_bounded() {
+        for mode in 0..3 {
+            let state = Arc::new(test_server_state(SessionManager::default()));
+            let root = tempfile::tempdir().unwrap();
+            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(root.path().join("consumer.sock"));
+            let listener = LocalIpcListener::bind(&endpoint).unwrap();
+            let shutdown = bcode_agent_runtime::CancellationToken::new();
+            let signal = shutdown.clone();
+            let ordinary =
+                workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
+            assert_eq!(ordinary.register_interaction_consumer(std::collections::BTreeSet::from([1])).await,
+                Err(bcode_plugin_models::interaction_controller::InteractionControllerError::Unauthorized));
+            let callback_state = Arc::clone(&state);
+            let ready: EmbeddedWorkflowReady = Box::new(move |application| {
+                Box::pin(async move {
+                    use bcode_plugin_models::interaction_controller::InteractionControllerError;
+                    use std::collections::BTreeSet;
+                    assert!(
+                        callback_state
+                            .client_runtime_contexts
+                            .lock()
+                            .await
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        application
+                            .register_interaction_consumer(BTreeSet::from([99]))
+                            .await,
+                        Err(InteractionControllerError::Unsupported)
+                    );
+                    assert!(
+                        callback_state
+                            .client_runtime_contexts
+                            .lock()
+                            .await
+                            .is_empty()
+                    );
+                    application
+                        .register_interaction_consumer(BTreeSet::from([1]))
+                        .await
+                        .unwrap();
+                    assert!(
+                        callback_state
+                            .client_runtime_contexts
+                            .lock()
+                            .await
+                            .values()
+                            .all(|context| context.interaction_controller_versions.contains(&1))
+                    );
+                    match mode {
+                        1 => panic!("exercise callback panic cleanup"),
+                        2 => {
+                            signal.cancel();
+                            std::future::pending::<()>().await;
+                        }
+                        _ => signal.cancel(),
+                    }
+                })
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_constructed_server(
+                    Arc::clone(&state),
+                    listener,
+                    &bcode_config::DaemonConfig::default(),
+                    false,
+                    &[],
+                    shutdown,
+                    Some(ready),
+                ),
+            )
+            .await
+            .expect("callback lifecycle cleanup bounded");
+            assert_eq!(result.is_err(), mode == 1);
+            assert!(state.client_runtime_contexts.lock().await.is_empty());
+            assert!(state.client_forwarders.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn constructed_server_shutdown_drains_idle_clients() {
         for cancel_from_host in [false, true] {
             let state = Arc::new(test_server_state(SessionManager::default()));
@@ -103320,6 +103363,211 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "test still owns the blocker"
         );
         drop(clients);
+        drop(state);
+    }
+
+    fn available_boxes(registry: &session_observation::SessionObservationRegistry) -> usize {
+        let mut reservations = Vec::new();
+        for _ in 0..128 {
+            match registry.reserve_reply_box() {
+                Ok(reservation) => reservations.push(reservation),
+                Err(bcode_session_models::SessionObservationError::LimitReached) => {
+                    return reservations.len();
+                }
+                Err(error) => panic!("reply-box ledger unavailable: {error}"),
+            }
+        }
+        panic!("reply-box ledger did not enforce its bounded capacity");
+    }
+
+    fn reply_box_observation_request(
+        session_id: SessionId,
+    ) -> bcode_session_models::SessionObservationRequest {
+        use bcode_session_models::SessionObservationRequest;
+        use bcode_session_models::{
+            ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
+            ProjectionWindowRequest, ProjectionWindowTarget, SessionProjectionKind,
+        };
+        SessionObservationRequest {
+            schema_version: 1,
+            session_id,
+            window: ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget::default(),
+                limits: ProjectionWindowLimits {
+                    max_items: 32,
+                    max_events_scanned: 64,
+                    max_bytes: 32 * 1024,
+                },
+            },
+            max_updates: 128,
+            max_snapshot_bytes: 128 * 1024,
+        }
+    }
+
+    async fn observation_send_fixture() -> (
+        Arc<ServerState>,
+        ClientId,
+        bcode_session_models::SessionObservationHandle,
+        SharedWriter,
+        LocalIpcStream,
+    ) {
+        let deadline = Duration::from_secs(5);
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let session = tokio::time::timeout(
+            deadline,
+            state
+                .sessions
+                .create_session(None, std::path::PathBuf::from("/")),
+        )
+        .await
+        .expect("session creation deadline")
+        .unwrap();
+        let owner = ClientId::new();
+        let handle = tokio::time::timeout(
+            deadline,
+            state.session_observations.open(
+                &state.sessions,
+                owner,
+                reply_box_observation_request(session.id),
+            ),
+        )
+        .await
+        .expect("observation open deadline")
+        .unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let endpoint =
+            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("observation.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let (peer, stream) = tokio::time::timeout(deadline, async {
+            tokio::try_join!(LocalIpcStream::connect(&endpoint), listener.accept())
+        })
+        .await
+        .expect("socket connection/accept deadline")
+        .unwrap();
+        let (_, stream_writer) = split(stream);
+        let (request_end, _) = tokio::sync::watch::channel(false);
+        let writer = Arc::new(ResponseWriter {
+            writer: Mutex::new(stream_writer),
+            metrics: state.metrics.clone(),
+            disconnect: Notify::new(),
+            request_end,
+        });
+        (state, owner, handle, writer, peer)
+    }
+
+    #[tokio::test]
+    async fn observation_reply_box_stays_charged_while_send_waits_and_releases_on_cancel() {
+        use bcode_session_models::observation::SessionObservationPullRequest;
+        use bcode_session_models::retention::ObservationRetentionUsage;
+        let deadline = Duration::from_secs(5);
+        let (state, owner, handle, writer, peer) = observation_send_fixture().await;
+        let usage = state
+            .session_observations
+            .retention_usage_probe(&handle.handle_id);
+        let (mut peer_reader, _peer_writer) = split(peer);
+        let baseline = available_boxes(&state.session_observations);
+        let blocker = tokio::time::timeout(deadline, writer.writer.lock())
+            .await
+            .expect("writer blocker acquisition deadline");
+        let request = || SessionLifecycleRequest::PullSessionObservation {
+            request: SessionObservationPullRequest {
+                schema_version: 1,
+                handle_id: handle.handle_id.clone(),
+                expected_sequence: 0,
+                wait_ms: 0,
+            },
+        };
+        let mut operation = Box::pin(handle_request_inner(request(), 1, owner, &state, &writer));
+        tokio::time::timeout(
+            deadline,
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(operation.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            }),
+        )
+        .await
+        .expect("blocked response poll deadline");
+        let blocked_usage = usage();
+        assert_eq!(available_boxes(&state.session_observations) + 1, baseline);
+        drop(operation);
+        let cached_usage = usage();
+        assert!(blocked_usage.scalar_capacity_bytes > cached_usage.scalar_capacity_bytes);
+        assert!(blocked_usage.value_nodes > cached_usage.value_nodes);
+        assert!(blocked_usage.copies > cached_usage.copies);
+        assert_eq!(available_boxes(&state.session_observations), baseline);
+        drop(blocker);
+        // Drain concurrently: a real response must not depend on socket buffer capacity.
+        let mut sink = tokio::io::sink();
+        tokio::time::timeout(deadline, async {
+            tokio::select! {
+                result = handle_request_inner(request(), 2, owner, &state, &writer) => {
+                    result.expect("successful observation reply send");
+                }
+                result = tokio::io::copy(&mut peer_reader, &mut sink) => {
+                    panic!("peer closed before response send completed: {result:?}");
+                }
+            }
+        })
+        .await
+        .expect("observation response send/drain deadline");
+        assert_eq!(usage(), cached_usage);
+        assert_eq!(available_boxes(&state.session_observations), baseline);
+        assert!(state.session_observations.close(owner, &handle).unwrap());
+        assert_eq!(usage(), ObservationRetentionUsage::default());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn observation_send_failure_releases_both_reply_guards_but_keeps_retry_cache() {
+        use bcode_session_models::{
+            SessionObservationPullRequest, retention::ObservationRetentionUsage,
+        };
+        let (state, owner, handle, writer, peer) = observation_send_fixture().await;
+        let usage = state
+            .session_observations
+            .retention_usage_probe(&handle.handle_id);
+        let baseline = available_boxes(&state.session_observations);
+        // Shut the transport down deterministically rather than relying on peer-close timing.
+        tokio::io::AsyncWriteExt::shutdown(&mut *writer.writer.lock().await)
+            .await
+            .unwrap();
+        let request = || SessionLifecycleRequest::PullSessionObservation {
+            request: SessionObservationPullRequest {
+                schema_version: 1,
+                handle_id: handle.handle_id.clone(),
+                expected_sequence: 0,
+                wait_ms: 0,
+            },
+        };
+        let mut cached_usage = None;
+        for request_id in 1..=2 {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    handle_request_inner(request(), request_id, owner, &state, &writer),
+                )
+                .await
+                .expect("failed observation send deadline")
+                .is_err()
+            );
+            assert_eq!(available_boxes(&state.session_observations), baseline);
+            if let Some(cached_usage) = cached_usage {
+                assert_eq!(
+                    usage(),
+                    cached_usage,
+                    "failed retries must not leak nested charges"
+                );
+            } else {
+                cached_usage = Some(usage());
+            }
+        }
+        assert!(usage().copies > 0, "exact retry cache remains owned");
+        assert!(state.session_observations.close(owner, &handle).unwrap());
+        assert_eq!(usage(), ObservationRetentionUsage::default());
+        drop(peer);
         drop(state);
     }
 

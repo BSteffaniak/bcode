@@ -15,6 +15,14 @@ use switchy_database::query::{
 use switchy_database::{Database, DatabaseError, DatabaseValue as V, Row, TransactionMode};
 
 impl WorkflowStore {
+    /// Read one immutable run package binding within the caller's transaction.
+    pub(super) fn package_binding_in(
+        db: &dyn Database,
+        run_id: &str,
+    ) -> Result<Option<(String, String)>, WorkflowStoreError> {
+        admission_package_binding(db, run_id)
+    }
+
     /// Idempotently create one durable workflow run using a caller-stable identity.
     ///
     /// Returns `true` when the run was created and `false` when the exact immutable request was
@@ -420,38 +428,82 @@ impl WorkflowStore {
                 "workflow child authority is stale or foreign".into(),
             ));
         }
-        let inherited_package = if let bcode_workflow::WorkflowCallTarget::PackageMember {
-            member_id,
-            definition_identity,
-        } = &configuration.target
-        {
-            if authority.is_none() {
-                return Err(WorkflowStoreError::InvalidData(
-                    "package child requires execution authority".into(),
-                ));
-            }
-            let binding =
-                admission_package_binding(transaction.as_ref(), &request.link.parent_run_id)?
+        let mut resolved_local_identity = None;
+        let inherited_package =
+            if let bcode_workflow::WorkflowCallTarget::PackageLocal { reference } =
+                &configuration.target
+            {
+                if authority.is_none() {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "package child requires execution authority".into(),
+                    ));
+                }
+                let binding =
+                    admission_package_binding(transaction.as_ref(), &request.link.parent_run_id)?
+                        .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData("local call requires bound parent".into())
+                    })?;
+                let lock = Self::package_lock_on(transaction.as_ref(), &binding.0, &binding.1)?
                     .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData("immutable package lock unavailable".into())
+                    })?;
+                let member = lock
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == reference.member_id)
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "local member absent from parent lock".into(),
+                        )
+                    })?;
+                let stored = Self::definition_in(
+                    transaction.as_ref(),
+                    &member.definition_identity.definition_id,
+                    member.definition_identity.definition_version,
+                )?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("locked child definition unavailable".into())
+                })?;
+                let definition: WorkflowDefinition = serde_json::from_str(&stored.definition_json)?;
+                resolved_local_identity = Some(
+                    reference
+                        .resolve(&lock, &definition)
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+                );
+                Some(binding)
+            } else if let bcode_workflow::WorkflowCallTarget::PackageMember {
+                member_id,
+                definition_identity,
+            } = &configuration.target
+            {
+                if authority.is_none() {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "package child requires execution authority".into(),
+                    ));
+                }
+                let binding =
+                    admission_package_binding(transaction.as_ref(), &request.link.parent_run_id)?
+                        .ok_or_else(|| {
                         WorkflowStoreError::InvalidData(
                             "package member call requires a bound parent run".into(),
                         )
                     })?;
-            let lock = Self::package_lock_on(transaction.as_ref(), &binding.0, &binding.1)?
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData("parent package is unavailable".into())
-                })?;
-            if !lock.members.iter().any(|member| {
-                member.member_id == *member_id && member.definition_identity == *definition_identity
-            }) {
-                return Err(WorkflowStoreError::InvalidData(
-                    "package member target differs from parent lock".into(),
-                ));
-            }
-            Some(binding)
-        } else {
-            None
-        };
+                let lock = Self::package_lock_on(transaction.as_ref(), &binding.0, &binding.1)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData("parent package is unavailable".into())
+                    })?;
+                if !lock.members.iter().any(|member| {
+                    member.member_id == *member_id
+                        && member.definition_identity == *definition_identity
+                }) {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "package member target differs from parent lock".into(),
+                    ));
+                }
+                Some(binding)
+            } else {
+                None
+            };
         if let Some(existing) = child_link_for_parent_attempt(transaction.as_ref(), &request.link)?
         {
             if existing == request.link {
@@ -538,7 +590,15 @@ impl WorkflowStore {
                 "workflow child descendant limit reached".to_string(),
             ));
         }
-        let target = request.link.target.definition_identity();
+        let target = if let Some(identity) = resolved_local_identity.as_ref() {
+            identity
+        } else {
+            request
+                .link
+                .target
+                .definition_identity()
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+        };
         let child_definition_json = database::text(
             &admission_required_row(
                 transaction.as_ref(),

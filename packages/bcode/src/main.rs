@@ -64,18 +64,18 @@ fn main() {
     bcode_cli::record_runtime_ready();
     runtime.block_on(async {
         let build_info = build_info();
-        #[cfg(feature = "static-bundled-plugins")]
+        #[cfg(feature = "bundled-plugins")]
         let result = bcode_cli::run_with_static_bundled(
             build_info,
             bcode_bundled_plugins::static_bundled_plugins(),
         )
         .await;
-        #[cfg(not(feature = "static-bundled-plugins"))]
+        #[cfg(not(feature = "bundled-plugins"))]
         let result = bcode_cli::run(build_info).await;
 
         if let Err(error) = result {
             if std::env::args_os().any(|argument| argument == "--json-errors") {
-                let diagnostic = bcode_cli::clierror::CliDiagnosticError::from_error(&error);
+                let diagnostic = bcode_cli::CliDiagnosticError::from_error(&error);
                 match serde_json::to_string(&diagnostic) {
                     Ok(json) => eprintln!("{json}"),
                     Err(_) => eprintln!("{{\"schema_version\":1,\"code\":\"cli_failure\",\"phase\":\"operation\",\"message\":\"CLI operation failed.\"}}"),

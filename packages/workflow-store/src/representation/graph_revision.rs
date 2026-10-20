@@ -158,6 +158,7 @@ pub(super) async fn publish_with_parent_in(
     let request = encode(batch)?;
     super::verified(tx).await?;
     let root = owned_run(tx, &batch.run_id, owner).await?;
+    super::admission_projection::package_binding(tx, &batch.run_id).await?;
     let receipt_id = encode(&(batch.run_id.as_str(), batch.mutation_id.as_str()))?;
     if let Some(revision) = duplicate(tx, &receipt_id, &request).await? {
         return Ok(revision);

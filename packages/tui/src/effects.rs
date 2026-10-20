@@ -29,6 +29,49 @@ const TRANSCRIPT_PAGE_TARGET_ROWS: usize = 24;
 const TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED: usize = 512;
 const TRANSCRIPT_PAGE_MAX_BYTES: usize = 512 * 1024;
 
+async fn invoke_plugin_command(
+    application: &impl bcode_command::application::CommandApplication,
+    plugin_id: String,
+    command_id: String,
+    args: BTreeMap<String, String>,
+    working_directory: std::path::PathBuf,
+    session_id: Option<SessionId>,
+) -> Result<bcode_command::InvokeCommandResponse, TuiError> {
+    use bcode_command::application::{CommandInvocationOutcome, CommandInvocationRequest};
+
+    let result = application
+        .invoke_command(CommandInvocationRequest {
+            plugin_id,
+            invocation_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: None,
+            launch_root: Some(working_directory.clone()),
+            deadline_ms: 30_000,
+            command: bcode_command::InvokeCommandRequest {
+                command_id,
+                args,
+                context: Some(bcode_command::CommandInvocationContext {
+                    session_id,
+                    working_directory,
+                }),
+            },
+        })
+        .await;
+    match result.outcome {
+        CommandInvocationOutcome::Completed(response) => Ok(response),
+        CommandInvocationOutcome::Failed(error) => Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        }),
+        CommandInvocationOutcome::Unknown(error) => Err(TuiError::PluginService {
+            code: error.code,
+            message: format!(
+                "Command outcome unknown: {}. Effects may have occurred; retry is not known safe.",
+                error.message,
+            ),
+        }),
+    }
+}
+
 async fn load_transcript_history_page(
     client: &BcodeClient,
     session_id: SessionId,
@@ -2350,33 +2393,14 @@ impl TuiEffect {
                 if let Some(arguments) = arguments.filter(|value| !value.is_empty()) {
                     args.insert("arguments".to_owned(), arguments);
                 }
-                let result = async {
-                    let payload = serde_json::to_vec(&bcode_command::InvokeCommandRequest {
-                        command_id,
-                        args,
-                        context: Some(bcode_command::CommandInvocationContext {
-                            session_id,
-                            working_directory,
-                        }),
-                    })?;
-                    let response = client
-                        .invoke_plugin_service(
-                            plugin_id.clone(),
-                            bcode_command::COMMAND_INTERFACE_ID.to_owned(),
-                            bcode_command::OP_INVOKE_COMMAND.to_owned(),
-                            payload,
-                        )
-                        .await?;
-                    if let Some(error) = response.error {
-                        return Err(TuiError::PluginService {
-                            code: error.code,
-                            message: error.message,
-                        });
-                    }
-                    Ok(serde_json::from_slice::<
-                        bcode_command::InvokeCommandResponse,
-                    >(&response.payload)?)
-                }
+                let result = invoke_plugin_command(
+                    &client,
+                    plugin_id.clone(),
+                    command_id,
+                    args,
+                    working_directory,
+                    session_id,
+                )
                 .await;
                 TuiEffectResult::PluginCommandInvoked { plugin_id, result }
             }
@@ -3210,6 +3234,148 @@ mod projection_paging_tests {
     }
 
     use super::*;
+
+    struct CommandOwner {
+        outcome: bcode_command::application::CommandInvocationOutcome,
+        requests: std::sync::Mutex<Vec<bcode_command::application::CommandInvocationRequest>>,
+    }
+
+    impl bcode_command::application::CommandApplication for CommandOwner {
+        fn list_commands(
+            &self,
+            _plugin_id: String,
+        ) -> impl std::future::Future<
+            Output = Result<
+                bcode_command::CommandList,
+                bcode_command::application::CommandApplicationFailure,
+            >,
+        > + Send {
+            std::future::ready(Err(bcode_command::application::CommandApplicationFailure {
+                code: "unexpected_discovery".to_owned(),
+                message: "invocation must not rediscover commands".to_owned(),
+            }))
+        }
+
+        fn invoke_command(
+            &self,
+            request: bcode_command::application::CommandInvocationRequest,
+        ) -> impl std::future::Future<Output = bcode_command::application::CommandInvocationResult> + Send
+        {
+            let invocation_id = request.invocation_id.clone();
+            self.requests.lock().unwrap().push(request);
+            std::future::ready(bcode_command::application::CommandInvocationResult {
+                invocation_id,
+                outcome: self.outcome.clone(),
+            })
+        }
+
+        fn cancel_command(
+            &self,
+            _invocation_id: String,
+        ) -> impl std::future::Future<
+            Output = Result<
+                bcode_command::application::CommandCancellationAcknowledgment,
+                bcode_command::application::CommandApplicationFailure,
+            >,
+        > + Send {
+            std::future::ready(Err(bcode_command::application::CommandApplicationFailure {
+                code: "unexpected_cancellation".to_owned(),
+                message: "settled or unknown invocation must not be silently cancelled".to_owned(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn command_adapter_routes_context_through_owner_and_preserves_failed_response() {
+        let response = bcode_command::InvokeCommandResponse {
+            success: false,
+            message: Some("plugin rejected command".to_owned()),
+            updated_model: None,
+            updated_provider: None,
+            updated_thinking: None,
+            effects: vec![bcode_command::CommandEffect::CopyText {
+                text: "literal".to_owned(),
+            }],
+        };
+        let owner = CommandOwner {
+            outcome: bcode_command::application::CommandInvocationOutcome::Completed(
+                response.clone(),
+            ),
+            requests: std::sync::Mutex::new(Vec::new()),
+        };
+        let root = std::path::PathBuf::from("/command-workspace");
+        let session_id = SessionId::new();
+        let args = BTreeMap::from([("arguments".to_owned(), "literal arguments".to_owned())]);
+        for _ in 0..2 {
+            let result = invoke_plugin_command(
+                &owner,
+                "plugin".to_owned(),
+                "command".to_owned(),
+                args.clone(),
+                root.clone(),
+                Some(session_id),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, response);
+        }
+        let requests = owner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0].invocation_id, requests[1].invocation_id);
+        for request in requests.iter() {
+            assert!(uuid::Uuid::parse_str(&request.invocation_id).is_ok());
+            assert_eq!(request.plugin_id, "plugin");
+            assert_eq!(request.agent_id, None);
+            assert_eq!(request.launch_root.as_ref(), Some(&root));
+            assert_eq!(request.deadline_ms, 30_000);
+            assert_eq!(request.command.command_id, "command");
+            assert_eq!(request.command.args, args);
+            let context = request.command.context.as_ref().unwrap();
+            assert_eq!(context.session_id, Some(session_id));
+            assert_eq!(context.working_directory, root);
+        }
+    }
+
+    #[tokio::test]
+    async fn command_adapter_does_not_retry_failed_or_unknown_outcomes() {
+        use bcode_command::application::{CommandApplicationFailure, CommandInvocationOutcome};
+        let failure = CommandApplicationFailure {
+            code: "command_unavailable".to_owned(),
+            message: "owner response unavailable".to_owned(),
+        };
+        for unknown in [false, true] {
+            let owner = CommandOwner {
+                outcome: if unknown {
+                    CommandInvocationOutcome::Unknown(failure.clone())
+                } else {
+                    CommandInvocationOutcome::Failed(failure.clone())
+                },
+                requests: std::sync::Mutex::new(Vec::new()),
+            };
+            let error = invoke_plugin_command(
+                &owner,
+                "plugin".to_owned(),
+                "command".to_owned(),
+                BTreeMap::new(),
+                std::path::PathBuf::from("/command-workspace"),
+                None,
+            )
+            .await
+            .unwrap_err();
+            let TuiError::PluginService { code, message } = error else {
+                panic!("expected normalized command error")
+            };
+            assert_eq!(code, failure.code);
+            if unknown {
+                assert!(message.contains("outcome unknown"));
+                assert!(message.contains("Effects may have occurred"));
+                assert!(message.contains("retry is not known safe"));
+            } else {
+                assert_eq!(message, failure.message);
+            }
+            assert_eq!(owner.requests.lock().unwrap().len(), 1);
+        }
+    }
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionSourceRange, ProjectionWindow,
         SessionEvent, SessionEventKind,

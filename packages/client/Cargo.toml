@@ -18,7 +18,9 @@ bcode_daemon_lifecycle     = { workspace = true }
 bcode_ipc                  = { workspace = true }
 bcode_metrics              = { workspace = true }
 bcode_model                = { workspace = true }
+bcode_model_catalog        = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
+bcode_plugin_models        = { workspace = true }
 bcode_plugin_sdk           = { workspace = true }
 bcode_provider_auth        = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
@@ -26,16 +28,23 @@ bcode_ralph_models         = { workspace = true }
 bcode_session_import       = { workspace = true }
 bcode_session_models       = { workspace = true }
 bcode_session_search       = { workspace = true }
+bcode_session_view_models  = { workspace = true }
 bcode_skill_models         = { workspace = true }
 bcode_tool                 = { workspace = true }
 bcode_usage_models         = { workspace = true }
 bcode_workflow             = { workspace = true }
 bcode_workflow_store       = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
+bcode_worktree_models      = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json                 = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, features = ["sync", "time"] }
 tracing                    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["test-util"] }
 
 [features]
 default          = []

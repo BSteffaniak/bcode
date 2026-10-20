@@ -22,8 +22,26 @@ pub const TURN_ENVIRONMENT_SNAPSHOT_PREFIX: &str = "Turn environment snapshot (h
 pub mod application;
 pub use application::*;
 
+pub mod spawning;
+pub use spawning::*;
+
 pub mod observation;
+
+/// Lightweight structural resource accounting for session observation.
+pub mod retention;
+pub use retention::{
+    ObservationRetentionExceeded, ObservationRetentionLimits, ObservationRetentionUsage,
+    SessionObservationSourceLimits,
+};
+
+/// Borrowed structural inspection of durable and live observation sources.
+pub mod retention_events;
 pub use observation::*;
+pub use retention_events::{
+    inspect_activity_presentation, inspect_durable, inspect_live, inspect_prompt_submission,
+    inspect_reasoning_activity, inspect_reasoning_event, inspect_text_stream,
+    inspect_tool_artifact,
+};
 
 mod milestone;
 pub use milestone::*;
@@ -560,10 +578,231 @@ pub fn build_tool_invocation_projections(events: &[SessionEvent]) -> Vec<ToolInv
     projections.into_values().collect()
 }
 
+/// Apply a tool projection event after caller-owned allocation admission.
+///
+/// The admission callback borrows both the existing aggregates and the event,
+/// and runs before this function inserts, clones, or changes projection state.
+/// An admission error leaves the projections unchanged. Accepted events use
+/// exactly the same semantic implementation as the unguarded projection API.
+///
+/// This hook does not itself calculate a growth bound. In particular, approving
+/// only the event's serialized length or inspecting a cloned candidate is not
+/// sufficient admission for a capacity-bounded observation. The caller must
+/// admit all affected retained and transient copies using the owning nested
+/// type utilities and the allocation policy of the projection implementation.
+///
+/// # Errors
+/// Returns the admission callback's error before applying the event.
+pub fn try_apply_tool_invocation_projection_event<E>(
+    projections: &mut BTreeMap<String, ToolInvocationProjection>,
+    event: &SessionEvent,
+    admit: impl FnOnce(&BTreeMap<String, ToolInvocationProjection>, &SessionEvent) -> Result<(), E>,
+) -> Result<(), E> {
+    admit(projections, event)?;
+    apply_tool_invocation_projection_event(projections, event);
+    Ok(())
+}
+
+/// Inspect a tool projection map without cloning keys or nested projections.
+///
+/// The root is depth one and copies are zero; callers charge their enclosing
+/// state copy separately. Each map entry charges its key, slot and projection.
+///
+/// # Errors
+/// Returns an error on resource exhaustion or checked counter overflow.
+pub fn inspect_tool_projection_map(
+    projections: &BTreeMap<String, ToolInvocationProjection>,
+    limits: &retention::ObservationRetentionLimits,
+) -> Result<retention::ObservationRetentionUsage, retention::ObservationRetentionExceeded> {
+    let mut usage = retention::ObservationRetentionUsage::collection(0, 1);
+    usage.check(*limits)?;
+    for (key, projection) in projections {
+        usage.try_add(
+            tool_projection_entry_usage(key, projection, limits)?,
+            *limits,
+        )?;
+    }
+    Ok(usage)
+}
+
+fn tool_projection_entry_usage(
+    key: &String,
+    projection: &ToolInvocationProjection,
+    limits: &retention::ObservationRetentionLimits,
+) -> Result<retention::ObservationRetentionUsage, retention::ObservationRetentionExceeded> {
+    let mut nested_limits = *limits;
+    nested_limits.depth = limits
+        .depth
+        .checked_sub(1)
+        .ok_or(retention::ObservationRetentionExceeded)?;
+    let mut usage = retention_events::inspect_tool_projection(projection, &nested_limits)?;
+    usage.depth = usage
+        .depth
+        .checked_add(1)
+        .ok_or(retention::ObservationRetentionExceeded)?;
+    usage.try_add(
+        retention::ObservationRetentionUsage::string(key, 2),
+        *limits,
+    )?;
+    usage.try_add(
+        retention::ObservationRetentionUsage {
+            collection_entries: 1,
+            ..retention::ObservationRetentionUsage::default()
+        },
+        *limits,
+    )?;
+    Ok(usage)
+}
+
+const fn tool_projection_event_key(event: &SessionEvent) -> Option<&String> {
+    match &event.kind {
+        SessionEventKind::ToolCallRequested { tool_call_id, .. }
+        | SessionEventKind::PositionedToolCallRequested { tool_call_id, .. } => Some(tool_call_id),
+        SessionEventKind::ToolInvocationLifecycle { event } => Some(&event.invocation_id),
+        SessionEventKind::ToolInvocationResultRecorded { record } => Some(&record.invocation_id),
+        _ => None,
+    }
+}
+
+fn tool_projection_peak_usage(
+    projections: &BTreeMap<String, ToolInvocationProjection>,
+    event: &SessionEvent,
+    key: &String,
+    limits: &retention::ObservationRetentionLimits,
+) -> Result<
+    (
+        retention::ObservationRetentionUsage,
+        retention::ObservationRetentionUsage,
+    ),
+    retention::ObservationRetentionExceeded,
+> {
+    let old = projections.get_key_value(key).map_or_else(
+        || Ok(retention::ObservationRetentionUsage::default()),
+        |(key, projection)| tool_projection_entry_usage(key, projection, limits),
+    )?;
+    let source_limits = retention::SessionObservationSourceLimits {
+        max_scalar_capacity_bytes: limits.scalar_capacity_bytes,
+        max_collection_entries: limits.collection_entries,
+        max_value_nodes: limits.value_nodes,
+        max_depth: limits.depth,
+        max_queued_events: limits.copies,
+        max_in_flight_events: 0,
+    };
+    let mut input = retention_events::inspect_durable(event, &source_limits)?;
+    input.copies = 0;
+    // The original entry remains charged in the ledger. Reserve one cloned
+    // candidate entry and one incoming event payload: checked replacement uses
+    // fresh clones, never clone_from's amortized growth. While replacing a
+    // field its old candidate value and fresh incoming value coexist.
+    let mut peak = retention::ObservationRetentionUsage::collection(0, 1);
+    peak.copies = 1;
+    peak.check(*limits)?;
+    peak.try_add(old, *limits)?;
+    peak.try_add(input, *limits)?;
+    if !projections.contains_key(key) {
+        // New map slot, default projection fields, and its invocation-id copy.
+        peak.try_add(
+            tool_projection_entry_usage(key, &ToolInvocationProjection::default(), limits)?,
+            *limits,
+        )?;
+        peak.try_add(
+            retention::ObservationRetentionUsage::string(key, 2),
+            *limits,
+        )?;
+    }
+    // The ordinary entry lookup constructs a transient owned key even when
+    // the candidate already contains the invocation.
+    peak.try_add(
+        retention::ObservationRetentionUsage::string(key, 2),
+        *limits,
+    )?;
+    Ok((peak, old))
+}
+
+/// Atomically apply an observation tool projection with pre-allocation admission.
+///
+/// `ledger` must already include this map's usage (as returned by
+/// [`inspect_tool_projection_map`]) plus any other caller-owned retained values.
+/// A conservative peak covers a one-entry candidate, cloned keys, nested
+/// replacements and retained/temporary overlap before any allocation. The
+/// ordinary reducer remains the semantic implementation; unrelated events are
+/// no-ops. Successful commit releases the temporary reservation and replaced
+/// entry only after their owned values have been dropped.
+///
+/// # Errors
+/// Rejects a non-current schema, structural exhaustion, arithmetic overflow,
+/// or an inconsistent caller ledger. Failure leaves the map and ledger unchanged.
+pub fn apply_tool_invocation_projection_event_bounded(
+    projections: &mut BTreeMap<String, ToolInvocationProjection>,
+    event: &SessionEvent,
+    ledger: &mut retention::ObservationRetentionUsage,
+    limits: &retention::ObservationRetentionLimits,
+) -> Result<(), retention::ObservationRetentionExceeded> {
+    if event.schema_version != CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+        return Err(retention::ObservationRetentionExceeded);
+    }
+    let Some(key) = tool_projection_event_key(event) else {
+        return Ok(());
+    };
+    let (peak, old) = tool_projection_peak_usage(projections, event, key, limits)?;
+    let original = *ledger;
+    let mut reserved = original;
+    reserved.try_add(peak, *limits)?;
+    *ledger = reserved;
+    let transaction = (|| {
+        let mut candidate = BTreeMap::new();
+        if let Some((old_key, projection)) = projections.get_key_value(key) {
+            candidate.insert(old_key.clone(), projection.clone());
+        }
+        apply_tool_invocation_projection_event_with_policy(&mut candidate, event, false);
+        let Some((new_key, projection)) = candidate.into_iter().next() else {
+            return Err(retention::ObservationRetentionExceeded);
+        };
+        // This is reconciliation of pre-admitted storage, not admission after
+        // construction. The conservative peak is still held during commit.
+        // BTreeMap::insert preserves the existing key, including spare capacity.
+        let retained_key = projections
+            .get_key_value(key)
+            .map_or(&new_key, |(key, _)| key);
+        let retained = tool_projection_entry_usage(retained_key, &projection, limits)?;
+        let mut committed = original;
+        committed.try_release(old)?;
+        committed.try_add(retained, *limits)?;
+        Ok((new_key, projection, committed))
+    })();
+    match transaction {
+        Ok((key, projection, committed)) => {
+            drop(projections.insert(key, projection));
+            *ledger = committed;
+            Ok(())
+        }
+        Err(error) => {
+            *ledger = original;
+            Err(error)
+        }
+    }
+}
+
 /// Apply one session event to a renderer-neutral tool invocation projection map.
 pub fn apply_tool_invocation_projection_event(
     projections: &mut BTreeMap<String, ToolInvocationProjection>,
     event: &SessionEvent,
+) {
+    apply_tool_invocation_projection_event_with_policy(projections, event, true);
+}
+
+fn replace_projection_value<T: Clone>(target: &mut T, source: &T, reuse_capacity: bool) {
+    if reuse_capacity {
+        target.clone_from(source);
+    } else {
+        *target = source.clone();
+    }
+}
+
+fn apply_tool_invocation_projection_event_with_policy(
+    projections: &mut BTreeMap<String, ToolInvocationProjection>,
+    event: &SessionEvent,
+    reuse_capacity: bool,
 ) {
     match &event.kind {
         SessionEventKind::ToolCallRequested {
@@ -583,10 +822,18 @@ pub fn apply_tool_invocation_projection_event(
             ..
         } => {
             let projection = tool_invocation_projection_mut(projections, tool_call_id);
-            projection.producer_plugin_id.clone_from(producer_plugin_id);
+            replace_projection_value(
+                &mut projection.producer_plugin_id,
+                producer_plugin_id,
+                reuse_capacity,
+            );
             projection.tool_name = Some(tool_name.clone());
             projection.arguments_json = Some(arguments_json.clone());
-            projection.working_directory.clone_from(working_directory);
+            replace_projection_value(
+                &mut projection.working_directory,
+                working_directory,
+                reuse_capacity,
+            );
             projection.started_at_ms.get_or_insert(event.timestamp_ms);
         }
         SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
@@ -624,40 +871,61 @@ pub fn apply_tool_invocation_projection_event(
         }
         SessionEventKind::ToolInvocationResultRecorded { record } => {
             let projection = tool_invocation_projection_mut(projections, &record.invocation_id);
-            if is_terminal_projection_status(projection.status) {
-                if projection.result_text.is_none() {
-                    projection.result_text = Some(record.model_output.clone());
-                    projection.is_error.get_or_insert(record.is_error);
-                    if projection.raw_result.is_none() {
-                        projection.raw_result.clone_from(&record.result);
-                    }
-                    projection.presentation.clone_from(&record.presentation);
-                    if projection.duration_ms.is_none() {
-                        projection.duration_ms = record
-                            .result
-                            .as_ref()
-                            .and_then(tool_result_duration_ms)
-                            .or_else(|| {
-                                projection_wall_duration_ms(projection, event.timestamp_ms)
-                            });
-                    }
-                }
-                return;
-            }
-            projection.status = ToolInvocationProjectionStatus::Finished;
-            projection.result_text = Some(record.model_output.clone());
-            projection.is_error = Some(record.is_error);
-            projection.raw_result.clone_from(&record.result);
-            projection.presentation.clone_from(&record.presentation);
-            projection.finished_at_ms = Some(event.timestamp_ms);
-            projection.duration_ms = record
-                .result
-                .as_ref()
-                .and_then(tool_result_duration_ms)
-                .or_else(|| projection_wall_duration_ms(projection, event.timestamp_ms));
+            apply_projection_result(projection, record, event.timestamp_ms, reuse_capacity);
         }
         _ => {}
     }
+}
+
+// A terminal lifecycle owns status and finish time. The first result can enrich
+// its missing payload, but repeated results cannot replace an accepted result.
+fn apply_projection_result(
+    projection: &mut ToolInvocationProjection,
+    record: &ToolInvocationResultRecord,
+    timestamp_ms: u64,
+    reuse_capacity: bool,
+) {
+    if is_terminal_projection_status(projection.status) {
+        if projection.result_text.is_none() {
+            projection.result_text = Some(record.model_output.clone());
+            projection.is_error.get_or_insert(record.is_error);
+            if projection.raw_result.is_none() {
+                replace_projection_value(
+                    &mut projection.raw_result,
+                    &record.result,
+                    reuse_capacity,
+                );
+            }
+            replace_projection_value(
+                &mut projection.presentation,
+                &record.presentation,
+                reuse_capacity,
+            );
+            if projection.duration_ms.is_none() {
+                projection.duration_ms = record
+                    .result
+                    .as_ref()
+                    .and_then(tool_result_duration_ms)
+                    .or_else(|| projection_wall_duration_ms(projection, timestamp_ms));
+            }
+        }
+        return;
+    }
+    projection.status = ToolInvocationProjectionStatus::Finished;
+    projection.result_text = Some(record.model_output.clone());
+    projection.is_error = Some(record.is_error);
+    replace_projection_value(&mut projection.raw_result, &record.result, reuse_capacity);
+    replace_projection_value(
+        &mut projection.presentation,
+        &record.presentation,
+        reuse_capacity,
+    );
+    projection.finished_at_ms = Some(timestamp_ms);
+    projection.duration_ms = record
+        .result
+        .as_ref()
+        .and_then(tool_result_duration_ms)
+        .or_else(|| projection_wall_duration_ms(projection, timestamp_ms));
 }
 
 const fn is_terminal_projection_status(status: ToolInvocationProjectionStatus) -> bool {
@@ -716,6 +984,387 @@ fn tool_invocation_projection_mut<'a>(
 /// Stable execution-checkpoint marker carried by canonical provider events.
 /// Its detail is a versioned host-owned retry checkpoint, or `None` when retired.
 pub const PROVIDER_RETRY_CHECKPOINT_EVENT: &str = "provider_retry_checkpoint_v1";
+
+#[cfg(test)]
+mod checked_tool_projection_tests {
+    use super::*;
+
+    fn policy() -> retention::ObservationRetentionLimits {
+        retention::ObservationRetentionLimits {
+            scalar_capacity_bytes: 16384,
+            collection_entries: 256,
+            value_nodes: 4096,
+            depth: 32,
+            copies: 4,
+        }
+    }
+
+    fn request(key: String, arguments: String) -> SessionEvent {
+        SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 12,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ToolCallRequested {
+                tool_call_id: key,
+                producer_plugin_id: None,
+                tool_name: "tool".into(),
+                arguments_json: arguments,
+                working_directory: None,
+            },
+        }
+    }
+
+    #[test]
+    fn bounded_projection_matches_ordinary_and_reconciles_replaced_entry() {
+        let event = request("call".into(), "{}".into());
+        let mut projections = BTreeMap::new();
+        let mut ledger = inspect_tool_projection_map(&projections, &policy()).unwrap();
+        apply_tool_invocation_projection_event_bounded(
+            &mut projections,
+            &event,
+            &mut ledger,
+            &policy(),
+        )
+        .unwrap();
+        let mut ordinary = BTreeMap::new();
+        apply_tool_invocation_projection_event(&mut ordinary, &event);
+        assert_eq!(projections, ordinary);
+        assert_eq!(ledger.copies, 0);
+        assert_eq!(
+            ledger,
+            inspect_tool_projection_map(&projections, &policy()).unwrap()
+        );
+        let replacement = request("call".into(), "replacement".into());
+        apply_tool_invocation_projection_event_bounded(
+            &mut projections,
+            &replacement,
+            &mut ledger,
+            &policy(),
+        )
+        .unwrap();
+        apply_tool_invocation_projection_event(&mut ordinary, &replacement);
+        assert_eq!(projections, ordinary);
+        assert_eq!(
+            ledger,
+            inspect_tool_projection_map(&projections, &policy()).unwrap()
+        );
+    }
+
+    #[test]
+    fn bounded_projection_rejects_key_capacity_and_nested_peak_atomically() {
+        let event = request("call".into(), "{}".into());
+        let mut projections = BTreeMap::new();
+        let mut ledger = inspect_tool_projection_map(&projections, &policy()).unwrap();
+        apply_tool_invocation_projection_event_bounded(
+            &mut projections,
+            &event,
+            &mut ledger,
+            &policy(),
+        )
+        .unwrap();
+        let before = projections.clone();
+        let original = ledger;
+        let mut key = String::with_capacity(32768);
+        key.push_str("call");
+        let oversized = request(key, "{}".into());
+        assert_eq!(
+            apply_tool_invocation_projection_event_bounded(
+                &mut projections,
+                &oversized,
+                &mut ledger,
+                &policy()
+            ),
+            Err(ObservationRetentionExceeded)
+        );
+        assert_eq!(projections, before);
+        assert_eq!(ledger, original);
+        let mut constrained = policy();
+        constrained.scalar_capacity_bytes = original.scalar_capacity_bytes + 8;
+        let replacement = request("call".into(), String::with_capacity(1024));
+        assert_eq!(
+            apply_tool_invocation_projection_event_bounded(
+                &mut projections,
+                &replacement,
+                &mut ledger,
+                &constrained
+            ),
+            Err(ObservationRetentionExceeded)
+        );
+        assert_eq!(projections, before);
+        assert_eq!(ledger, original);
+    }
+
+    #[test]
+    fn bounded_projection_rejects_artifact_spare_slots_and_future_schema() {
+        let mut projections = BTreeMap::new();
+        let mut ledger = inspect_tool_projection_map(&projections, &policy()).unwrap();
+        let original = ledger;
+        let mut event = request("call".into(), String::new());
+        event.kind = SessionEventKind::ToolInvocationResultRecorded {
+            record: ToolInvocationResultRecord {
+                invocation_id: "call".into(),
+                model_output: String::new(),
+                is_error: false,
+                content: Vec::with_capacity(1024),
+                presentation: None,
+                result: None,
+            },
+        };
+        assert_eq!(
+            apply_tool_invocation_projection_event_bounded(
+                &mut projections,
+                &event,
+                &mut ledger,
+                &policy()
+            ),
+            Err(ObservationRetentionExceeded)
+        );
+        assert!(projections.is_empty());
+        assert_eq!(ledger, original);
+        event = request("call".into(), String::new());
+        event.schema_version += 1;
+        assert_eq!(
+            apply_tool_invocation_projection_event_bounded(
+                &mut projections,
+                &event,
+                &mut ledger,
+                &policy()
+            ),
+            Err(ObservationRetentionExceeded)
+        );
+        assert!(projections.is_empty());
+        assert_eq!(ledger, original);
+    }
+
+    #[test]
+    fn existing_spare_capacity_key_is_preserved_and_charged_on_replacement() {
+        let mut key = String::with_capacity(1024);
+        key.push('x');
+        let mut projections = BTreeMap::from([(
+            key,
+            ToolInvocationProjection {
+                tool_call_id: "x".into(),
+                ..ToolInvocationProjection::default()
+            },
+        )]);
+        let event = request("x".into(), "{}".into());
+        let mut ledger = inspect_tool_projection_map(&projections, &policy()).unwrap();
+        apply_tool_invocation_projection_event_bounded(
+            &mut projections,
+            &event,
+            &mut ledger,
+            &policy(),
+        )
+        .unwrap();
+        assert_eq!(projections.first_key_value().unwrap().0.capacity(), 1024);
+        assert_eq!(
+            ledger,
+            inspect_tool_projection_map(&projections, &policy()).unwrap()
+        );
+    }
+
+    #[test]
+    fn tiny_replacements_do_not_use_amortized_clone_from_growth() {
+        let mut projections = BTreeMap::from([(
+            "x".into(),
+            ToolInvocationProjection {
+                tool_call_id: "x".into(),
+                producer_plugin_id: Some(String::new()),
+                working_directory: Some(PathBuf::new()),
+                ..ToolInvocationProjection::default()
+            },
+        )]);
+        let mut event = request("x".into(), String::new());
+        if let SessionEventKind::ToolCallRequested {
+            producer_plugin_id,
+            working_directory,
+            ..
+        } = &mut event.kind
+        {
+            *producer_plugin_id = Some("p".into());
+            *working_directory = Some(PathBuf::from("w"));
+        }
+        let original = inspect_tool_projection_map(&projections, &policy()).unwrap();
+        let (peak, _) =
+            tool_projection_peak_usage(&projections, &event, &"x".into(), &policy()).unwrap();
+        let mut limits = policy();
+        limits.scalar_capacity_bytes = original.scalar_capacity_bytes + peak.scalar_capacity_bytes;
+        let mut ledger = original;
+        let mut ordinary = projections.clone();
+        apply_tool_invocation_projection_event(&mut ordinary, &event);
+        apply_tool_invocation_projection_event_bounded(
+            &mut projections,
+            &event,
+            &mut ledger,
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(projections, ordinary);
+        assert_eq!(
+            projections["x"]
+                .producer_plugin_id
+                .as_ref()
+                .unwrap()
+                .capacity(),
+            1
+        );
+        assert_eq!(
+            projections["x"]
+                .working_directory
+                .as_ref()
+                .unwrap()
+                .capacity(),
+            1
+        );
+        assert_eq!(
+            ledger,
+            inspect_tool_projection_map(&projections, &limits).unwrap()
+        );
+    }
+
+    #[test]
+    fn terminal_lifecycle_update_preserves_projection() {
+        let mut projections = BTreeMap::from([(
+            "x".into(),
+            ToolInvocationProjection {
+                tool_call_id: "x".into(),
+                status: ToolInvocationProjectionStatus::Finished,
+                ..ToolInvocationProjection::default()
+            },
+        )]);
+        let mut event = request("x".into(), String::new());
+        event.kind = SessionEventKind::ToolInvocationLifecycle {
+            event: ToolInvocationLifecycleEvent {
+                invocation_id: "x".into(),
+                sequence: 1,
+                stage: ToolInvocationLifecycleStage::Started,
+                message: None,
+                metadata: serde_json::Value::Null,
+            },
+        };
+        let before = projections.clone();
+        let mut ledger = inspect_tool_projection_map(&projections, &policy()).unwrap();
+        let original = ledger;
+        apply_tool_invocation_projection_event_bounded(
+            &mut projections,
+            &event,
+            &mut ledger,
+            &policy(),
+        )
+        .unwrap();
+        assert_eq!(projections, before);
+        assert_eq!(ledger, original);
+    }
+
+    #[test]
+    fn nested_replacement_overlap_is_admitted_before_mutation() {
+        let mut projections = BTreeMap::from([(
+            "x".into(),
+            ToolInvocationProjection {
+                tool_call_id: "x".into(),
+                result_text: Some("old result".into()),
+                raw_result: Some(ToolInvocationResult::Json {
+                    value: serde_json::json!({"old": ["retained"]}).to_string(),
+                }),
+                ..ToolInvocationProjection::default()
+            },
+        )]);
+        let mut event = request("x".into(), String::new());
+        event.kind = SessionEventKind::ToolInvocationResultRecorded {
+            record: ToolInvocationResultRecord {
+                invocation_id: "x".into(),
+                model_output: "new result".into(),
+                is_error: false,
+                content: Vec::new(),
+                presentation: None,
+                result: Some(ToolInvocationResult::Json {
+                    value: serde_json::json!({"new": ["replacement"]}).to_string(),
+                }),
+            },
+        };
+        let mut ledger = inspect_tool_projection_map(&projections, &policy()).unwrap();
+        let original = ledger;
+        let before = projections.clone();
+        let (peak, _) =
+            tool_projection_peak_usage(&projections, &event, &"x".into(), &policy()).unwrap();
+        let mut limits = policy();
+        limits.scalar_capacity_bytes =
+            original.scalar_capacity_bytes + peak.scalar_capacity_bytes - 1;
+        assert_eq!(
+            apply_tool_invocation_projection_event_bounded(
+                &mut projections,
+                &event,
+                &mut ledger,
+                &limits
+            ),
+            Err(ObservationRetentionExceeded)
+        );
+        assert_eq!(projections, before);
+        assert_eq!(ledger, original);
+        limits.scalar_capacity_bytes += 1;
+        apply_tool_invocation_projection_event_bounded(
+            &mut projections,
+            &event,
+            &mut ledger,
+            &limits,
+        )
+        .unwrap();
+        let mut ordinary = before;
+        apply_tool_invocation_projection_event(&mut ordinary, &event);
+        assert_eq!(projections, ordinary);
+        assert_eq!(
+            ledger,
+            inspect_tool_projection_map(&projections, &limits).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejected_admission_precedes_all_projection_changes() {
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 12,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ToolCallRequested {
+                tool_call_id: "call".into(),
+                producer_plugin_id: None,
+                tool_name: "tool".into(),
+                arguments_json: "{}".into(),
+                working_directory: None,
+            },
+        };
+        let mut projections = BTreeMap::new();
+        let result = try_apply_tool_invocation_projection_event(
+            &mut projections,
+            &event,
+            |existing, borrowed| {
+                assert!(existing.is_empty());
+                assert_eq!(borrowed, &event);
+                Err(ObservationRetentionExceeded)
+            },
+        );
+        assert_eq!(result, Err(ObservationRetentionExceeded));
+        assert!(projections.is_empty());
+        try_apply_tool_invocation_projection_event(&mut projections, &event, |_, _| {
+            Ok::<(), ObservationRetentionExceeded>(())
+        })
+        .unwrap();
+        let mut ordinary = BTreeMap::new();
+        apply_tool_invocation_projection_event(&mut ordinary, &event);
+        assert_eq!(projections, ordinary);
+        let before = projections.clone();
+        assert!(
+            try_apply_tool_invocation_projection_event(&mut projections, &event, |_, _| Err(
+                ObservationRetentionExceeded
+            ))
+            .is_err()
+        );
+        assert_eq!(projections, before);
+    }
+}
 
 /// Current persisted session event schema version.
 pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 52;
@@ -4476,6 +5125,9 @@ pub enum SessionEventKind {
     ChildSessionCreated {
         /// Complete immutable creation request; child identity matches the event envelope.
         request: Box<SessionChildCreateRequest>,
+        /// Immutable composed spawn request retained in the atomic creation prefix.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawning: Option<Box<SessionSpawnRequest>>,
     },
     /// Parent-owned durable intent; unresolved child publication degrades all child pages.
     SessionChildLinked {
@@ -5418,6 +6070,90 @@ mod tests {
         assert_eq!(projection.status, ToolInvocationProjectionStatus::Cancelled);
         assert_eq!(projection.finished_at_ms, Some(200));
         assert_eq!(projection.result_text.as_deref(), Some("late"));
+    }
+
+    #[test]
+    fn checked_terminal_result_enrichment_rejects_atomically_and_matches_ordinary() {
+        let limits = retention::ObservationRetentionLimits {
+            scalar_capacity_bytes: 64 * 1024,
+            collection_entries: 4096,
+            value_nodes: 4096,
+            depth: 64,
+            copies: 4,
+        };
+        let session_id = SessionId::new();
+        let cancelled = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 100,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationLifecycle {
+                event: ToolInvocationLifecycleEvent {
+                    invocation_id: "call".to_owned(),
+                    sequence: 1,
+                    stage: ToolInvocationLifecycleStage::Cancelled,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        };
+        let result = SessionEvent {
+            sequence: 2,
+            timestamp_ms: 200,
+            kind: SessionEventKind::ToolInvocationResultRecorded {
+                record: ToolInvocationResultRecord {
+                    invocation_id: "call".to_owned(),
+                    model_output: "late result".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "late result".to_owned(),
+                    }),
+                    content: Vec::new(),
+                },
+            },
+            ..cancelled.clone()
+        };
+        let mut checked = BTreeMap::new();
+        let mut ledger = inspect_tool_projection_map(&checked, &limits).unwrap();
+        apply_tool_invocation_projection_event_bounded(
+            &mut checked,
+            &cancelled,
+            &mut ledger,
+            &limits,
+        )
+        .unwrap();
+        let before = checked.clone();
+        let original = ledger;
+        let denied = retention::ObservationRetentionLimits {
+            scalar_capacity_bytes: original.scalar_capacity_bytes,
+            ..limits
+        };
+        assert!(
+            apply_tool_invocation_projection_event_bounded(
+                &mut checked,
+                &result,
+                &mut ledger,
+                &denied,
+            )
+            .is_err()
+        );
+        assert_eq!(checked, before);
+        assert_eq!(ledger, original);
+        let mut ordinary = before;
+        apply_tool_invocation_projection_event(&mut ordinary, &result);
+        apply_tool_invocation_projection_event_bounded(&mut checked, &result, &mut ledger, &limits)
+            .unwrap();
+        assert_eq!(checked, ordinary);
+        assert_eq!(
+            ledger,
+            inspect_tool_projection_map(&checked, &limits).unwrap()
+        );
+        let accepted = checked.clone();
+        apply_tool_invocation_projection_event_bounded(&mut checked, &result, &mut ledger, &limits)
+            .unwrap();
+        assert_eq!(checked, accepted);
     }
 
     #[test]

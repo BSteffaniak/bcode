@@ -64,15 +64,8 @@ pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<
             let next = page
                 .last()
                 .map(|(activation, _)| activation.node_id.clone());
-            let progressed = Box::pin(drive_page(
-                state,
-                &db,
-                &guard.authority,
-                run_id,
-                revision,
-                page,
-            ))
-            .await?;
+            let progressed =
+                Box::pin(drive_page(state, &guard.authority, run_id, revision, page)).await?;
             leaves.finish_page(next, progressed);
         }
         let (fanout_progress, fanout_pending) = fanouts
@@ -397,11 +390,12 @@ async fn drive_activation(
 }
 
 async fn activation_ready(
+    path: &std::path::Path,
     db: &dyn switchy_database::Database,
     run_id: &str,
     activation: &representation::graph::Activation,
 ) -> Result<bool, ServerError> {
-    Ok(super::backpressure::retry(|| {
+    Ok(super::backpressure::queued(path, || {
         representation::graph::revalidate(
             db,
             run_id,
@@ -465,44 +459,61 @@ fn pending_activation(
     }
 }
 
-async fn drive_page(
-    state: &std::sync::Arc<ServerState>,
-    db: &dyn switchy_database::Database,
-    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
-    run_id: &str,
+fn drive_page<'a>(
+    state: &'a std::sync::Arc<ServerState>,
+    authority: &'a bcode_workflow_store::WorkflowExecutionAuthority,
+    run_id: &'a str,
     revision: u64,
     page: Vec<(
         representation::graph::Activation,
         bcode_workflow::NodeDefinition,
     )>,
-) -> Result<bool, ServerError> {
+) -> futures::future::BoxFuture<'a, Result<bool, ServerError>> {
+    // Erase the recursive child-driver future at the ready-page boundary.
+    Box::pin(async move {
+        // The page bounds in-flight admission work, not configured workflow capacity.
+        // Each activation still reserves durable capacity and resources before dispatch.
+        // Await every result before propagating an error: dropping a sibling admission
+        // could discard an acceptance whose side effects already happened.
+        drain_admissions(page.into_iter().map(|(activation, node)| async move {
+            let path = crate::workflow_store_path(state);
+            let activation_db = open(&path, true)?;
+            if !activation_ready(&path, &activation_db, run_id, &activation).await? {
+                return Ok(true);
+            }
+            drive_activation(
+                state,
+                &activation_db,
+                authority,
+                run_id,
+                revision,
+                activation,
+                node,
+            )
+            .await
+        }))
+        .await
+    })
+}
+
+async fn drain_admissions<F, E>(operations: impl IntoIterator<Item = F>) -> Result<bool, E>
+where
+    F: std::future::Future<Output = Result<bool, E>>,
+{
+    let results = futures::future::join_all(operations).await;
     let mut progressed = false;
-    for (activation, node) in page {
-        if !activation_ready(db, run_id, &activation).await? {
-            progressed = true;
-            continue;
-        }
-        #[cfg(test)]
-        let diagnostic_node = activation.node_id.clone();
-        let operation = drive_activation(state, db, authority, run_id, revision, activation, node);
-        #[cfg(test)]
-        let advanced = {
-            tokio::pin!(operation);
-            tokio::select! {
-                result = &mut operation => result,
-                () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    // Diagnostic only: retain and await the original operation. A slow
-                    // admission may already have effects and must not be restarted.
-                    eprintln!("workflow activation still awaiting run={run_id}, node={diagnostic_node}");
-                    operation.await
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(advanced) => progressed |= advanced,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
             }
-        };
-        #[cfg(not(test))]
-        let advanced = operation.await;
-        progressed |= advanced?;
+        }
     }
-    Ok(progressed)
+    first_error.map_or(Ok(progressed), Err)
 }
 
 async fn finish_pass(
@@ -615,6 +626,58 @@ async fn observe_existing(
 
 #[cfg(test)]
 mod advisory_fence_tests {
+    #[tokio::test]
+    async fn admission_error_drains_accepted_sibling_without_replay() {
+        let accepted = std::sync::atomic::AtomicUsize::new(0);
+        let settled = std::sync::atomic::AtomicUsize::new(0);
+        let both_entered = tokio::sync::Barrier::new(2);
+        let result = super::drain_admissions((0..2).map(|index| {
+            let accepted = &accepted;
+            let settled = &settled;
+            let both_entered = &both_entered;
+            async move {
+                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                both_entered.wait().await;
+                if index == 0 {
+                    return Err("admission failed");
+                }
+                tokio::task::yield_now().await;
+                settled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            }
+        }))
+        .await;
+        assert_eq!(result, Err("admission failed"));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(settled.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_active_admissions_is_drained_before_return() {
+        let (cancellation, cancelled) = tokio::sync::watch::channel(false);
+        let entered = tokio::sync::Barrier::new(3);
+        let settled = std::sync::atomic::AtomicUsize::new(0);
+        let admissions = super::drain_admissions((0..2).map(|_| {
+            let mut cancelled = cancelled.clone();
+            let entered = &entered;
+            let settled = &settled;
+            async move {
+                entered.wait().await;
+                cancelled.changed().await.expect("cancellation signal");
+                tokio::task::yield_now().await;
+                settled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<bool, _>("cancelled")
+            }
+        }));
+        let cancel = async {
+            entered.wait().await;
+            cancellation.send(true).expect("active admissions");
+        };
+        let (result, ()) = tokio::join!(admissions, cancel);
+        assert_eq!(result, Err("cancelled"));
+        assert_eq!(settled.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn missing_foreign_and_stale_workflow_owners_cannot_dispatch_advice() {
         let state = crate::tests::test_server_state(crate::SessionManager::default());

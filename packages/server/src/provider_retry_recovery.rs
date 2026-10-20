@@ -192,11 +192,13 @@ async fn dispatch_checkpoint(
             None
         };
     // Reuse exact execution descriptor verification, never the replacement daemon's defaults.
+    // Checkpoint recovery may restore an activated submission, but ordinary queue recovery
+    // must never reinterpret activation as permission to retry a turn.
     let Some(FollowupCommand::ExecuteSubmission {
         runtime_context,
         ownership,
         ..
-    }) = recover_pending_submission_hint_with_authority(state, session_id, &record, true).await?
+    }) = recover_submission_execution_hint_with_authority(state, session_id, &record, true).await?
     else {
         return Ok(true);
     };

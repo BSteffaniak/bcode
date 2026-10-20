@@ -199,6 +199,7 @@ async fn canonical_execution_classification_excludes_interactive_uncorrelated_tu
                     name: None,
                     working_directory: db.session_state().await.unwrap().unwrap().working_directory,
                 }),
+                spawning: None,
             },
         )
         .await;
@@ -273,6 +274,7 @@ async fn ordinary_top_level_and_user_child_conversations_remain_eligible() {
                             .unwrap()
                             .working_directory,
                     }),
+                    spawning: None,
                 },
             )
             .await;

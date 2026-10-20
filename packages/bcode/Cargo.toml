@@ -23,6 +23,10 @@ required-features = ["embedded-plugins", "static-bundled-fake-provider-plugin"]
 name              = "daemon_client"
 required-features = ["daemon-client"]
 
+[[example]]
+name              = "application_session"
+required-features = ["daemon-client"]
+
 [[bin]]
 name              = "bcode-sdk-simulation"
 path              = "src/bin/sdk_simulation.rs"
@@ -80,22 +84,24 @@ tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
-bcode_build_info       = { workspace = true }
-bcode_config           = { workspace = true }
-bcode_daemon_lifecycle = { workspace = true }
-bcode_hello_plugin     = { workspace = true }
-bcode_ipc              = { workspace = true }
-bcode_plugin           = { workspace = true }
-bcode_question_plugin  = { workspace = true, features = ["static-bundled"] }
-bcode_server           = { workspace = true }
-bcode_shell_plugin     = { workspace = true, features = ["static-bundled"] }
-bcode_workflow_store   = { workspace = true }
-sshenv_vault           = { workspace = true }
-tempfile               = { workspace = true }
-tokio                  = { workspace = true, features = ["macros", "rt", "test-util"] }
-tracing-subscriber     = { workspace = true }
-trybuild               = { workspace = true }
-zeroize                = { workspace = true }
+bcode_build_info           = { workspace = true }
+bcode_command              = { workspace = true }
+bcode_config               = { workspace = true }
+bcode_daemon_lifecycle     = { workspace = true }
+bcode_hello_plugin         = { workspace = true }
+bcode_ipc                  = { workspace = true }
+bcode_plugin               = { workspace = true }
+bcode_question_plugin      = { workspace = true, features = ["static-bundled"] }
+bcode_server               = { workspace = true }
+bcode_shell_plugin         = { workspace = true, features = ["static-bundled"] }
+bcode_workflow_store       = { workspace = true }
+bcode_workflow_view_models = { workspace = true }
+sshenv_vault               = { workspace = true }
+tempfile                   = { workspace = true }
+tokio                      = { workspace = true, features = ["macros", "rt", "test-util"] }
+tracing-subscriber         = { workspace = true }
+trybuild                   = { workspace = true }
+zeroize                    = { workspace = true }
 
 [build-dependencies]
 bcode_build_info = { workspace = true }

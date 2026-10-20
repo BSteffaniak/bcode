@@ -2,11 +2,8 @@
 
 use super::ServerState;
 
-/// One federated search result with optional bounded hydration.
-pub struct SearchResult {
-    pub response: bcode_session_search::FederatedSessionSearchResponse,
-    pub hydrated_hits: Vec<bcode_session_search::HydratedSessionSearchHit>,
-}
+/// Portable search result; compatibility name retained for existing callers.
+pub use bcode_session_search::application::ApplicationSearchResult as SearchResult;
 
 /// Execute one federated session search without transport framing.
 pub async fn search(

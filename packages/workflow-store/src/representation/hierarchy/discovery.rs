@@ -32,6 +32,7 @@ pub async fn parent_context(
     {
         return Err(Error::AuthorityConflict);
     }
+    super::super::admission_projection::package_binding(&*tx, run).await?;
     let admission: crate::NewWorkflowRun =
         serde_json::from_str(&super::text(&root, "admission_json")?)
             .map_err(|_| Error::MaintenanceRequired)?;

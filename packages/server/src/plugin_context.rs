@@ -291,6 +291,122 @@ async fn bind(
 
 /// Invoke with one validated client context; nested providers inherit its bridge.
 #[allow(clippy::too_many_arguments)]
+fn decode_command_payload(
+    payload: &[u8],
+) -> Result<bcode_command::InvokeCommandRequest, PublicPluginError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Context {
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        working_directory: PathBuf,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        command_id: String,
+        #[serde(default)]
+        args: BTreeMap<String, String>,
+        #[serde(default)]
+        context: Option<Context>,
+    }
+    let input: Input = serde_json::from_slice(payload).map_err(|_| rejected())?;
+    if input.command_id.is_empty()
+        || input.command_id.len() > 256
+        || input.command_id.chars().any(char::is_control)
+        || input.args.len() > 1024
+    {
+        return Err(rejected());
+    }
+    Ok(bcode_command::InvokeCommandRequest {
+        command_id: input.command_id,
+        args: input.args,
+        context: input
+            .context
+            .map(|context| bcode_command::CommandInvocationContext {
+                session_id: context.session_id,
+                working_directory: context.working_directory,
+            }),
+    })
+}
+
+fn canonical_command_payload(
+    mut command: bcode_command::InvokeCommandRequest,
+    bound: &BoundContext,
+) -> Result<Vec<u8>, PublicPluginError> {
+    if command
+        .context
+        .as_ref()
+        .and_then(|context| context.session_id)
+        != bound.session
+    {
+        return Err(rejected());
+    }
+    command.context = Some(bcode_command::CommandInvocationContext {
+        session_id: bound.session,
+        working_directory: bound.root.clone(),
+    });
+    let payload = serde_json::to_vec(&command).map_err(|_| rejected())?;
+    if payload.len() > 256 * 1024 {
+        return Err(rejected());
+    }
+    Ok(payload)
+}
+
+fn admitted_command(
+    state: &ServerState,
+    plugin: &str,
+    interface: &str,
+    operation: &str,
+    payload: &[u8],
+) -> Result<Option<bcode_command::InvokeCommandRequest>, PublicPluginError> {
+    let registry = state.plugins.registry();
+    if interface == bcode_command::COMMAND_INTERFACE_ID
+        && operation == bcode_command::OP_INVOKE_COMMAND
+    {
+        let command = decode_command_payload(payload)?;
+        let service_declared = declared_route(state, plugin, interface, operation);
+        let legacy_declared = state
+            .plugins
+            .command_contributions()
+            .iter()
+            .any(|owned| owned.plugin_id == plugin && owned.command.id == command.command_id);
+        let registered_declared = [
+            bcode_command::CommandSurface::Palette,
+            bcode_command::CommandSurface::Slash,
+        ]
+        .iter()
+        .flat_map(|surface| state.plugins.registered_command_contributions(surface))
+        .any(|contribution| {
+            matches!(contribution.action,
+                bcode_command::CommandAction::Plugin { plugin_id, command_id }
+                if plugin_id == plugin && command_id == command.command_id)
+        });
+        if !service_declared || !(legacy_declared || registered_declared) {
+            return Err(rejected());
+        }
+        Ok(Some(command))
+    } else {
+        if operation != bcode_plugin_sdk::composer::OP_COMPOSER_SEARCH {
+            return Err(rejected());
+        }
+        let request: bcode_plugin_sdk::composer::ComposerSearchRequest =
+            serde_json::from_slice(payload).map_err(|_| rejected())?;
+        let contributions: Vec<_> = registry
+            .composer_contributions()
+            .into_iter()
+            .filter(|owned| {
+                owned.plugin_id == plugin && owned.contribution.service_interface_id == interface
+            })
+            .map(|owned| owned.contribution)
+            .collect();
+        request
+            .validate_for_contributions(&contributions)
+            .map_err(|_| rejected())?;
+        Ok(None)
+    }
+}
+
 pub async fn invoke(
     state: &ServerState,
     client: ClientId,
@@ -303,23 +419,7 @@ pub async fn invoke(
     if !valid_lifetime(&context) || payload.len() > 256 * 1024 {
         return Err(rejected());
     }
-    let registry = state.plugins.registry();
-    if operation != bcode_plugin_sdk::composer::OP_COMPOSER_SEARCH {
-        return Err(rejected());
-    }
-    let request: bcode_plugin_sdk::composer::ComposerSearchRequest =
-        serde_json::from_slice(&payload).map_err(|_| rejected())?;
-    let contributions: Vec<_> = registry
-        .composer_contributions()
-        .into_iter()
-        .filter(|owned| {
-            owned.plugin_id == plugin && owned.contribution.service_interface_id == interface
-        })
-        .map(|owned| owned.contribution)
-        .collect();
-    request
-        .validate_for_contributions(&contributions)
-        .map_err(|_| rejected())?;
+    let command = admitted_command(state, &plugin, &interface, &operation, &payload)?;
     let (cancellation, deadline) = {
         let mut registry = state
             .contextual_plugin_invocations
@@ -349,6 +449,11 @@ pub async fn invoke(
         if !route_policy_allows(&bound, &plugin, &interface, &operation) {
             return Err(rejected());
         }
+        let payload = if let Some(command) = command {
+            canonical_command_payload(command, &bound)?
+        } else {
+            payload
+        };
         let response = route(state, &bound, &plugin, interface, operation, payload, 0).await?;
         if response.payload.len() > 2 * 1024 * 1024 {
             return Err(rejected());
@@ -811,6 +916,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_payload_is_typed_and_rejects_unknown_or_invalid_input() {
+        for payload in [
+            br#"{"command_id":"ok","unexpected":true}"#.as_slice(),
+            br#"{"command_id":""}"#.as_slice(),
+            br#"{"command_id":"bad\nroute"}"#.as_slice(),
+            br#"{"command_id":"ok","args":{"n":42}}"#.as_slice(),
+            br#"{"command_id":"ok","context":{"working_directory":"/","authority":true}}"#
+                .as_slice(),
+            br#"{"operation":"arbitrary","payload":[]}"#.as_slice(),
+        ] {
+            assert!(decode_command_payload(payload).is_err());
+        }
+        let command = decode_command_payload(
+            r#"{"command_id":"declared","args":{"literal":"λ"}}"#.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(command.command_id, "declared");
+        assert_eq!(command.args["literal"], "λ");
+    }
+
+    #[test]
+    fn command_context_uses_verified_workspace_and_rejects_session_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let bound = bound_fixture(temp.path().canonicalize().unwrap());
+        let request = bcode_command::InvokeCommandRequest {
+            command_id: "declared".to_owned(),
+            args: BTreeMap::new(),
+            context: Some(bcode_command::CommandInvocationContext {
+                session_id: bound.session,
+                working_directory: PathBuf::from("/untrusted/private"),
+            }),
+        };
+        let canonical: bcode_command::InvokeCommandRequest =
+            serde_json::from_slice(&canonical_command_payload(request.clone(), &bound).unwrap())
+                .unwrap();
+        assert_eq!(canonical.context.unwrap().working_directory, bound.root);
+        let mut foreign = request;
+        foreign.context.as_mut().unwrap().session_id = Some(SessionId::new());
+        assert!(canonical_command_payload(foreign, &bound).is_err());
+        let mut denied_bound = bound;
+        denied_bound
+            .config
+            .agent
+            .entry(denied_bound.agent.clone())
+            .or_default()
+            .tools
+            .insert(
+                route_policy_key(
+                    "owner",
+                    bcode_command::COMMAND_INTERFACE_ID,
+                    bcode_command::OP_INVOKE_COMMAND,
+                ),
+                false,
+            );
+        assert!(!route_policy_allows(
+            &denied_bound,
+            "owner",
+            bcode_command::COMMAND_INTERFACE_ID,
+            bcode_command::OP_INVOKE_COMMAND
+        ));
+    }
+
+    #[test]
     fn reserved_cancel_precedes_claim_without_changing_ownership() {
         let client = ClientId::new();
         let foreign = ClientId::new();
@@ -881,6 +1049,326 @@ abi_version = 5
 library = "libtest_composer_wait.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#;
+
+    const COMMAND_MANIFEST: &str = r#"
+id = "test.command-context"
+name = "Typed command fixture"
+version = "0.0.1"
+[[services]]
+interface_id = "bcode.command/v1"
+invocation_operations = ["invoke"]
+[[command_contributions]]
+id = "literal"
+title = "Literal fixture"
+[runtime]
+type = "native"
+abi_version = 5
+library = "libtest_command_context.dylib"
+"#;
+
+    #[derive(Default)]
+    struct CommandPlugin;
+
+    impl bcode_plugin_sdk::RustPlugin for CommandPlugin {
+        fn invoke_service(
+            &mut self,
+            context: bcode_plugin_sdk::NativeServiceContext,
+        ) -> bcode_plugin_sdk::ServiceResponse {
+            let request: bcode_command::InvokeCommandRequest =
+                serde_json::from_slice(&context.request.payload).unwrap();
+            let response = bcode_command::InvokeCommandResponse {
+                success: true,
+                message: None,
+                updated_model: None,
+                updated_provider: None,
+                updated_thinking: None,
+                effects: vec![bcode_command::CommandEffect::AppendText {
+                    text: request
+                        .context
+                        .unwrap()
+                        .working_directory
+                        .display()
+                        .to_string(),
+                    format: bcode_command::CommandTextFormat::PlainText,
+                }],
+            };
+            bcode_plugin_sdk::ServiceResponse::ok(serde_json::to_vec(&response).unwrap())
+        }
+    }
+
+    fn command_plugins() -> [bcode_plugin::StaticBundledPlugin; 2] {
+        [
+            bcode_plugin::StaticBundledPlugin::new(
+                COMMAND_MANIFEST,
+                bcode_plugin_sdk::static_plugin_vtable!(CommandPlugin, COMMAND_MANIFEST),
+            ),
+            bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+                bcode_default_agents_plugin::static_plugin(),
+            ),
+        ]
+    }
+
+    fn command_state() -> ServerState {
+        let plugins = command_plugins();
+        super::super::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::default(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: std::collections::BTreeSet::from([
+                        "test.command-context".into(),
+                        "bcode.default-agents".into(),
+                    ]),
+                    disabled: std::collections::BTreeSet::new(),
+                },
+                &plugins,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn command_payload(id: &str) -> Vec<u8> {
+        serde_json::to_vec(&bcode_command::InvokeCommandRequest {
+            command_id: id.to_owned(),
+            args: BTreeMap::new(),
+            context: Some(bcode_command::CommandInvocationContext {
+                session_id: None,
+                working_directory: PathBuf::from("/untrusted"),
+            }),
+        })
+        .unwrap()
+    }
+
+    fn command_context(root: &Path, id: &str) -> bcode_ipc::PluginServiceContext {
+        bcode_ipc::PluginServiceContext {
+            agent_id: Some("build".into()),
+            invocation_id: id.to_owned(),
+            workspace: bcode_plugin_sdk::WorkspaceContext {
+                session_id: None,
+                launch_root: Some(root.to_path_buf()),
+            },
+            deadline_ms: 1000,
+        }
+    }
+
+    async fn assert_command_context(state: &ServerState, client: ClientId, root: &Path) {
+        let result = invoke(
+            state,
+            client,
+            command_context(root, "command-1"),
+            "test.command-context".into(),
+            bcode_command::COMMAND_INTERFACE_ID.into(),
+            bcode_command::OP_INVOKE_COMMAND.into(),
+            command_payload("literal"),
+        )
+        .await
+        .unwrap();
+        let response: bcode_command::InvokeCommandResponse =
+            serde_json::from_slice(&result.payload).unwrap();
+        assert!(response.success);
+        assert_eq!(
+            response.effects,
+            vec![bcode_command::CommandEffect::AppendText {
+                text: root.display().to_string(),
+                format: bcode_command::CommandTextFormat::PlainText,
+            }]
+        );
+        assert!(
+            !cancel(state, client, "command-1"),
+            "settled invocation is not active cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_command_admission_preserves_declared_route_and_caller_lifetime() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = command_state();
+        assert!(declared_route(
+            &state,
+            "test.command-context",
+            bcode_command::COMMAND_INTERFACE_ID,
+            "invoke"
+        ));
+        assert!(!declared_route(
+            &state,
+            "test.command-context",
+            bcode_command::COMMAND_INTERFACE_ID,
+            "list"
+        ));
+        let root = temp.path().canonicalize().unwrap();
+        let client = ClientId::new();
+        state
+            .set_client_runtime_context(
+                client,
+                Some(bcode_ipc::ClientRuntimeContext {
+                    working_directory: Some(root.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert_command_context(&state, client, &root).await;
+        assert!(
+            invoke(
+                &state,
+                client,
+                command_context(&root, "command-1"),
+                "test.command-context".into(),
+                bcode_command::COMMAND_INTERFACE_ID.into(),
+                bcode_command::OP_INVOKE_COMMAND.into(),
+                command_payload("literal")
+            )
+            .await
+            .is_err(),
+            "settled identity must not dispatch again"
+        );
+        for (id, interface, operation, command) in [
+            (
+                "undeclared",
+                bcode_command::COMMAND_INTERFACE_ID,
+                "invoke",
+                "not-declared",
+            ),
+            (
+                "wrong-operation",
+                bcode_command::COMMAND_INTERFACE_ID,
+                "arbitrary",
+                "literal",
+            ),
+            ("wrong-interface", "test.arbitrary/v1", "invoke", "literal"),
+        ] {
+            assert!(
+                invoke(
+                    &state,
+                    client,
+                    command_context(&root, id),
+                    "test.command-context".into(),
+                    interface.into(),
+                    operation.into(),
+                    command_payload(command)
+                )
+                .await
+                .is_err()
+            );
+        }
+        {
+            let mut registry = state.contextual_plugin_invocations.lock().unwrap();
+            assert!(registry.reserve(client, "cancelled-command", Duration::from_secs(1)));
+            assert!(!registry.cancel(ClientId::new(), "cancelled-command"));
+            assert!(registry.cancel(client, "cancelled-command"));
+            drop(registry);
+        }
+
+        assert!(matches!(
+            invoke(
+                &state,
+                client,
+                command_context(&root, "cancelled-command"),
+                "test.command-context".into(),
+                bcode_command::COMMAND_INTERFACE_ID.into(),
+                bcode_command::OP_INVOKE_COMMAND.into(),
+                command_payload("literal")
+            )
+            .await,
+            Err(PublicPluginError {
+                code: "plugin_cancelled",
+                ..
+            })
+        ));
+        assert!(!cancel(&state, client, "cancelled-command"));
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn command_application_executes_same_owner_directly_and_over_real_ipc() {
+        use bcode_command::application::{
+            CommandApplication as _, CommandInvocationOutcome, CommandInvocationRequest,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let plugins = command_plugins();
+        let state = std::sync::Arc::new(super::super::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::default(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: std::collections::BTreeSet::from([
+                        "test.command-context".into(),
+                        "bcode.default-agents".into(),
+                    ]),
+                    disabled: std::collections::BTreeSet::new(),
+                },
+                &plugins,
+            )
+            .unwrap(),
+        ));
+        let root = temp.path().canonicalize().unwrap();
+        let direct_client = ClientId::new();
+        let runtime = bcode_ipc::ClientRuntimeContext {
+            working_directory: Some(root.clone()),
+            ..Default::default()
+        };
+        state
+            .set_client_runtime_context(direct_client, Some(runtime.clone()))
+            .await;
+        let request = CommandInvocationRequest {
+            plugin_id: "test.command-context".to_owned(),
+            invocation_id: "execute-parity".to_owned(),
+            agent_id: Some("build".to_owned()),
+            launch_root: Some(root),
+            deadline_ms: 1000,
+            command: bcode_command::InvokeCommandRequest {
+                command_id: "literal".to_owned(),
+                args: BTreeMap::new(),
+                context: None,
+            },
+        };
+        let direct = crate::CommandApplicationHandle::new(&state, direct_client)
+            .invoke_command(request.clone())
+            .await;
+        assert!(
+            matches!(&direct.outcome, CommandInvocationOutcome::Completed(response) if response.success && response.effects.len() == 1)
+        );
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(temp.path().join("command-parity.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            tokio::pin!(stopped);
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    stream = listener.accept() => {
+                        let state = server_state.clone();
+                        let stream = stream.unwrap();
+                        tasks.spawn(async move { super::super::handle_client(stream, state).await.unwrap(); });
+                    }
+                }
+            }
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        });
+        let client = bcode_client::BcodeClient::new(endpoint).with_runtime_context(Some(runtime));
+        let ipc = tokio::time::timeout(Duration::from_secs(5), client.invoke_command(request))
+            .await
+            .unwrap();
+        assert_eq!(
+            direct, ipc,
+            "same declared command owner must execute with identical typed effects and identity"
+        );
+        let ack = client
+            .cancel_command("execute-parity".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(ack.invocation_id, "execute-parity");
+        assert!(
+            !ack.accepted,
+            "terminal execution is not an active cancellation"
+        );
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        drop(state);
+    }
 
     const DISPATCH_MANIFEST: &str = r#"
 id = "test.composer-dispatch"
@@ -1042,16 +1530,15 @@ library = "libtest_wait_second.dylib"
                     },
                 );
                 return match context.bridge.request(&request) {
-                    Ok(reply) => {
-                        bcode_plugin_sdk::ServiceResponse::json(&reply).unwrap_or_else(|error| {
-                            bcode_plugin_sdk::ServiceResponse::error(
-                                "encode_failed",
-                                error.to_string(),
-                            )
-                        })
+                    Ok(response) => bcode_plugin_sdk::ServiceResponse::json(&response)
+                        .unwrap_or_else(|error| {
+                            bcode_plugin_sdk::ServiceResponse::error("encode", error.to_string())
+                        }),
+                    Err(bcode_plugin_sdk::ServiceBridgeError::Cancelled) => {
+                        bcode_plugin_sdk::ServiceResponse::error("cancelled", "cancelled")
                     }
                     Err(error) => {
-                        bcode_plugin_sdk::ServiceResponse::error("bridge_failed", error.to_string())
+                        bcode_plugin_sdk::ServiceResponse::error("bridge", error.to_string())
                     }
                 };
             }
@@ -1086,7 +1573,7 @@ library = "libtest_wait_second.dylib"
         let fixture = std::sync::Mutex::new(WaitPlugin);
         let response =
             bcode_plugin_sdk::RustPlugin::invoke_service(&mut *fixture.lock().unwrap(), context);
-        assert_eq!(response.error.unwrap().code, "bridge_failed");
+        assert_eq!(response.error.unwrap().code, "cancelled");
         assert!(
             fixture.lock().is_ok(),
             "bridge cancellation must not poison plugin lifecycle state"

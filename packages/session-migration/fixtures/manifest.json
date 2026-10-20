@@ -1074,9 +1074,9 @@
       "historical_payloads": false,
       "expected_event_count": 46,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 44
+        "current_passthrough": 43
       },
       "covered_schema_event_pairs": [
         {
@@ -5521,9 +5521,9 @@
       "historical_payloads": false,
       "expected_event_count": 48,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 46
+        "current_passthrough": 45
       },
       "covered_schema_event_pairs": [
         {
@@ -5810,9 +5810,9 @@
       "historical_payloads": false,
       "expected_event_count": 49,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 47
+        "current_passthrough": 46
       },
       "covered_schema_event_pairs": [
         {
@@ -6104,9 +6104,9 @@
       "historical_payloads": false,
       "expected_event_count": 52,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 50
+        "current_passthrough": 49
       },
       "covered_schema_event_pairs": [
         {
@@ -6413,9 +6413,9 @@
       "historical_payloads": false,
       "expected_event_count": 52,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 50
+        "current_passthrough": 49
       },
       "covered_schema_event_pairs": [
         {
@@ -6722,9 +6722,9 @@
       "historical_payloads": false,
       "expected_event_count": 52,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 50
+        "current_passthrough": 49
       },
       "covered_schema_event_pairs": [
         {
@@ -7031,9 +7031,9 @@
       "historical_payloads": false,
       "expected_event_count": 53,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 51
+        "current_passthrough": 50
       },
       "covered_schema_event_pairs": [
         {
@@ -7345,9 +7345,9 @@
       "historical_payloads": false,
       "expected_event_count": 54,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 52
+        "current_passthrough": 51
       },
       "covered_schema_event_pairs": [
         {
@@ -7664,9 +7664,9 @@
       "historical_payloads": false,
       "expected_event_count": 54,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 0,
         "retired_known": 1,
-        "current_passthrough": 52
+        "current_passthrough": 53
       },
       "covered_schema_event_pairs": [
         {
@@ -7983,9 +7983,9 @@
       "historical_payloads": false,
       "expected_event_count": 58,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 2,
         "retired_known": 1,
-        "current_passthrough": 56
+        "current_passthrough": 55
       },
       "covered_schema_event_pairs": [
         {
@@ -8322,9 +8322,9 @@
       "historical_payloads": false,
       "expected_event_count": 59,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 3,
         "retired_known": 1,
-        "current_passthrough": 57
+        "current_passthrough": 55
       },
       "covered_schema_event_pairs": [
         {
@@ -8666,9 +8666,9 @@
       "historical_payloads": false,
       "expected_event_count": 5,
       "expected_classifications": {
-        "converted": 0,
+        "converted": 1,
         "retired_known": 0,
-        "current_passthrough": 5
+        "current_passthrough": 4
       },
       "covered_schema_event_pairs": [
         {
@@ -8718,9 +8718,9 @@
       "historical_payloads": false,
       "expected_event_count": 62,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 3,
         "retired_known": 1,
-        "current_passthrough": 60
+        "current_passthrough": 58
       },
       "covered_schema_event_pairs": [
         {
@@ -9077,9 +9077,9 @@
       "historical_payloads": false,
       "expected_event_count": 67,
       "expected_classifications": {
-        "converted": 1,
+        "converted": 66,
         "retired_known": 1,
-        "current_passthrough": 65
+        "current_passthrough": 0
       },
       "covered_schema_event_pairs": [
         {

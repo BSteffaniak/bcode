@@ -617,6 +617,7 @@ pub(super) async fn settle_output_in(
     if text(&root, "authority_json")? != encode(owner)? {
         return Err(Error::AuthorityConflict);
     }
+    super::admission_projection::package_binding(tx, run_id).await?;
     if super::graph_pages::revision(tx, run_id).await? != revision {
         return Err(Error::InvalidAdmission);
     }

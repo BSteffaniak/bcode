@@ -186,20 +186,16 @@ fn verify_catalog_admission(root: &std::path::Path, base: &serde_json::Value) {
     let finished = graph_cli_json(root, &command);
     assert_eq!(finished["items"].as_array().unwrap().len(), 3);
     assert!(finished.get("discovery_token").is_none());
+    // Drain each admitted scan in one batch continuation. Serially advancing every
+    // scan through subprocesses leaves later single-use tokens idle until expiry;
+    // incremental traversal is exercised separately below. Batch delivery must reuse
+    // the admitted permit rather than acquire a second one.
     for mut request in pending {
-        let mut completed = false;
-        for _ in 0..32 {
-            write(&request);
-            let page = graph_cli_json(root, &command);
-            if let Some(token) = page.get("discovery_token") {
-                request["discovery_token"] = token.clone();
-            } else {
-                assert_eq!(page["items"].as_array().unwrap().len(), 3);
-                completed = true;
-                break;
-            }
-        }
-        assert!(completed, "admitted scan could not finish at capacity");
+        request["incremental"] = false.into();
+        write(&request);
+        let page = graph_cli_json(root, &command);
+        assert_eq!(page["items"].as_array().unwrap().len(), 3);
+        assert!(page.get("discovery_token").is_none());
     }
     // Legacy requests use the same admission pool; completion must have returned the permits.
     let mut fresh = base.clone();
@@ -210,16 +206,17 @@ fn verify_catalog_admission(root: &std::path::Path, base: &serde_json::Value) {
 }
 
 fn verify_incremental_catalog(root: &std::path::Path, sources: &std::path::Path) {
-    // Nonmatching entries force multiple bounded advances without exhausting candidate capacity.
-    for index in 0..40 {
-        std::fs::write(sources.join(format!("ignored-{index}.txt")), "ignored").unwrap();
-    }
     let mut request = serde_json::json!({
         "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
         "workspace": root, "limit": 10, "incremental": true,
         "search": "Catalog acceptance", "source_kind": "standalone_source"
     });
     verify_catalog_admission(root, &request);
+    // Keep the capacity fixture small: idle retained tokens have a bounded lifetime.
+    // Nonmatching entries exercise bounded incremental advances, not admission.
+    for index in 0..40 {
+        std::fs::write(sources.join(format!("ignored-{index}.txt")), "ignored").unwrap();
+    }
     let mut tokens = std::collections::BTreeSet::new();
     let mut consumed_request = None;
     let mut complete = false;
@@ -293,26 +290,52 @@ fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
     .unwrap();
     let mut daemon = ForegroundDaemon(
         isolated_cli(root.path())
+            .env("BCODE_CONFIG", root.path().join("bcode.toml"))
             .args(["server", "run"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
+    let daemon_stderr = LiveCliCapture::start(daemon.0.stderr.take().unwrap());
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
-        assert!(daemon.0.try_wait().unwrap().is_none(), "daemon exited");
-        let status = run_cli_at_root(
-            root.path(),
+        let daemon_status = daemon.0.try_wait().unwrap();
+        assert!(
+            daemon_status.is_none(),
+            "foreground daemon exited: {daemon_status:?}; {}",
+            daemon_stderr.diagnostic()
+        );
+        let mut probe = isolated_cli(root.path());
+        probe.env("BCODE_CONFIG", root.path().join("bcode.toml"));
+        let status = run_cli_command_observed(
+            probe,
             &["server", "status", "--verbose"],
             Stdio::piped(),
             Stdio::null(),
+            || {
+                format!(
+                    "repair fixture stage=foreground-readiness; binary={}; config=isolated-bcode.toml; state={}; foreground_pid={}; foreground_status={:?}; foreground_stderr={}",
+                    env!("CARGO_BIN_EXE_bcode"),
+                    root.path().join("bcode-state").display(),
+                    daemon.0.id(),
+                    daemon.0.try_wait(),
+                    daemon_stderr.diagnostic(),
+                )
+            },
         );
         if status.status.success() {
             break String::from_utf8(status.stdout).unwrap();
         }
-        assert!(Instant::now() < deadline, "daemon startup timed out");
+        assert!(
+            Instant::now() < deadline,
+            "repair fixture stage=foreground-readiness; status={}; stdout={}; stderr={}; foreground_stderr={}",
+            status.status,
+            capture_diagnostic(&status.stdout, false),
+            capture_diagnostic(&status.stderr, false),
+            daemon_stderr.diagnostic(),
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     let field = |prefix: &str| {
@@ -322,6 +345,16 @@ fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
             .unwrap()
             .to_string()
     };
+    assert_eq!(
+        field("pid: ").parse::<u32>().expect("daemon pid"),
+        daemon.0.id(),
+        "repair fixture must observe its foreground daemon, not a competing auto-started daemon"
+    );
+    assert_eq!(
+        field("executable identity: "),
+        field("client executable identity: "),
+        "repair fixture client and daemon must use the same binary artifact"
+    );
     let session = graph_cli_json(root.path(), &["session", "create", "repair-cli", "--json"]);
     std::fs::write(
         root.path().join("catalog.json"),
@@ -450,7 +483,11 @@ fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
                 policy_digest_sha256: "a".repeat(64),
             },
             authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
-            limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            // Repair exercises the production coexistence baseline, not uncapped admission.
+            limits: bcode_workflow_store::WorkflowRunLimits {
+                concurrency_cap: Some(7),
+                ..Default::default()
+            },
         })
         .unwrap();
     let activation = store
@@ -1157,11 +1194,16 @@ fn run_cli_at_root(
     run_cli_command(isolated_cli(root), arguments, stdout, stdin)
 }
 
-fn run_cli_command(
+fn run_cli_command(command: Command, arguments: &[&str], stdout: Stdio, stdin: Stdio) -> Output {
+    run_cli_command_observed(command, arguments, stdout, stdin, String::new)
+}
+
+fn run_cli_command_observed(
     mut command: Command,
     arguments: &[&str],
     stdout: Stdio,
     stdin: Stdio,
+    mut diagnostic: impl FnMut() -> String,
 ) -> Output {
     let mut child = command
         .args(arguments)
@@ -1171,42 +1213,123 @@ fn run_cli_command(
         .spawn()
         .expect("CLI subprocess");
     // Drain concurrently so output cannot fill a pipe and stall process completion.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take().expect("stderr pipe");
-    let drain = |pipe: Box<dyn std::io::Read + Send>| {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = sender.send(capture_output(pipe));
-        });
-        receiver
-    };
-    let stdout = stdout.map(|pipe| drain(Box::new(pipe)));
-    let stderr = drain(Box::new(stderr));
+    let stdout = child.stdout.take().map(LiveCliCapture::start);
+    let stderr = LiveCliCapture::start(child.stderr.take().expect("stderr pipe"));
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll CLI") {
             break status;
         }
         if Instant::now() >= deadline {
-            child.kill().expect("kill timed-out CLI");
-            child.wait().expect("reap timed-out CLI");
-            panic!("CLI exceeded 30 seconds: {arguments:?}");
+            let kill = child.kill();
+            let reaped = child.wait();
+            panic!(
+                "CLI exceeded 30 seconds: argument_count={}; pid={}; kill={kill:?}; reaped={reaped:?}; stdout={}; stderr={}; {}",
+                arguments.len(),
+                child.id(),
+                stdout
+                    .as_ref()
+                    .map_or_else(|| "not captured".to_owned(), LiveCliCapture::diagnostic,),
+                stderr.diagnostic(),
+                diagnostic(),
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let collect = |receiver: std::sync::mpsc::Receiver<std::io::Result<(Vec<u8>, bool)>>| {
-        let (bytes, truncated) = receiver
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("CLI output pipe did not close within deadline")
-            .expect("read CLI output");
-        assert!(!truncated, "CLI output exceeded 64 KiB capture limit");
-        bytes
+    let mut collect = |capture: LiveCliCapture| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let completed = capture.done.recv_timeout(remaining);
+        assert!(
+            completed.is_ok(),
+            "CLI output pipe did not close within deadline: status={status}; {}; {}",
+            capture.diagnostic(),
+            diagnostic(),
+        );
+        completed.unwrap().expect("read CLI output");
+        let state = capture.state.lock().unwrap();
+        assert!(!state.truncated, "CLI output exceeded 64 KiB capture limit");
+        state.bytes.clone()
     };
+    let stdout = match stdout {
+        Some(capture) => collect(capture),
+        None => Vec::new(),
+    };
+    let stderr = collect(stderr);
     Output {
         status,
-        stdout: stdout.map_or_else(Vec::new, collect),
-        stderr: collect(stderr),
+        stdout,
+        stderr,
     }
+}
+
+#[derive(Default)]
+struct CliCaptureState {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+struct LiveCliCapture {
+    state: std::sync::Arc<std::sync::Mutex<CliCaptureState>>,
+    done: std::sync::mpsc::Receiver<std::io::Result<()>>,
+}
+
+impl LiveCliCapture {
+    fn start(mut pipe: impl std::io::Read + Send + 'static) -> Self {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(CliCaptureState::default()));
+        let retained = state.clone();
+        let (sender, done) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<()> {
+                let mut buffer = [0; 4096];
+                loop {
+                    let count = pipe.read(&mut buffer)?;
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    let mut state = retained.lock().unwrap();
+                    let keep = count.min(65_536_usize.saturating_sub(state.bytes.len()));
+                    state.truncated |= keep != count;
+                    state.bytes.extend_from_slice(&buffer[..keep]);
+                }
+            })();
+            let _ = sender.send(result);
+        });
+        Self { state, done }
+    }
+
+    fn diagnostic(&self) -> String {
+        let state = self.state.lock().unwrap();
+        capture_diagnostic(&state.bytes, state.truncated)
+    }
+}
+
+// Never place arbitrary subprocess output in timeout panics: it can contain config
+// values, provider data or credentials. Retain bytes in memory, reporting only
+// lengths and fixed, recognized startup markers.
+fn capture_diagnostic(bytes: &[u8], truncated: bool) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let markers = [
+        "daemon: running",
+        "artifact identity:",
+        "executable identity:",
+        "client executable identity:",
+        "registry identity:",
+        "connected clients:",
+        "instance:",
+        "workflow storage",
+        "startup deadline",
+        "permission denied",
+        "Permission denied",
+        "Address already in use",
+        "panicked at",
+    ]
+    .into_iter()
+    .filter(|marker| text.contains(marker))
+    .collect::<Vec<_>>();
+    format!(
+        "retained_bytes={}; truncated={truncated}; recognized_markers={markers:?}; raw_output=withheld",
+        bytes.len(),
+    )
 }
 
 struct ForegroundDaemon(std::process::Child);
@@ -1261,6 +1384,7 @@ fn start_graph_test_daemon_with_setup(
     )
     .unwrap();
     setup(&plugins);
+    eprintln!("graph fixture phase: daemon_spawn_begin");
     let log = std::fs::File::create(root.path().join("daemon.log")).unwrap();
     let mut daemon = ForegroundDaemon(
         isolated_cli(root.path())
@@ -1278,18 +1402,23 @@ fn start_graph_test_daemon_with_setup(
             "daemon exited: {}",
             std::fs::read_to_string(root.path().join("daemon.log")).unwrap()
         );
-        if run_cli_at_root(
+        let status = run_cli_at_root(
             root.path(),
             &["server", "status"],
             Stdio::piped(),
             Stdio::null(),
-        )
-        .status
-        .success()
-        {
+        );
+        if status.status.success() {
+            eprintln!("graph fixture phase: daemon_status_ready");
             break;
         }
-        assert!(Instant::now() < deadline, "daemon startup timed out");
+        assert!(
+            Instant::now() < deadline,
+            "daemon startup timed out: phase=status_probe status={} stdout={} stderr={}",
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     daemon
@@ -1531,7 +1660,24 @@ fn plugin_contributions_returns_daemon_schema_without_invocation() {
     assert!(value["commands"].is_array());
     assert!(value["command_contributions"].is_array());
     assert!(value["config_extensions"].is_array());
-    assert_eq!(value.as_object().unwrap().len(), 3);
+    assert!(value["composer_contributions"].is_array());
+    assert_eq!(
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "commands",
+            "command_contributions",
+            "config_extensions",
+            "composer_contributions",
+        ])
+    );
+    let contributions: bcode_plugin_sdk::PluginContributions =
+        serde_json::from_value(value.clone()).expect("typed daemon contributions");
+    assert_eq!(serde_json::to_value(contributions).unwrap(), value);
     drop(daemon);
 }
 
@@ -1642,7 +1788,14 @@ fn waited_prompt_reports_unavailable_provider_through_live_daemon() {
         "same-job",
     ];
     let output = run_cli_at_root(root.path(), &arguments, Stdio::piped(), Stdio::null());
-    assert!(!output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "initial terminal status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("terminal JSON");
     assert_eq!(result["schema_version"], 1);
     assert_eq!(result["session_id"], id);
@@ -1650,7 +1803,14 @@ fn waited_prompt_reports_unavailable_provider_through_live_daemon() {
     assert_eq!(result["outcome"], "provider_unavailable");
     let history = graph_cli_json(root.path(), &["session", "history", id, "--json"]);
     let repeated = run_cli_at_root(root.path(), &arguments, Stdio::piped(), Stdio::null());
-    assert!(!repeated.status.success());
+    assert_eq!(
+        repeated.status.code(),
+        Some(2),
+        "repeated terminal status={} stdout={} stderr={}",
+        repeated.status,
+        String::from_utf8_lossy(&repeated.stdout),
+        String::from_utf8_lossy(&repeated.stderr)
+    );
     let repeated: serde_json::Value =
         serde_json::from_slice(&repeated.stdout).expect("repeated terminal JSON");
     assert_eq!(repeated["receipt"], result["receipt"]);
@@ -1665,16 +1825,51 @@ fn waited_prompt_reports_unavailable_provider_through_live_daemon() {
         "Different prompt for the same job",
     )
     .unwrap();
-    // Admission identity is producer/key, not prompt content. Reusing it must
-    // observe the original turn, never execute the replacement prompt. The
-    // nonzero exit alone cannot prove conflict rejection: the original turn
-    // already failed because its provider was unavailable.
+    // Queued admission binds producer/key to immutable prompt and execution facts.
+    // A changed request must be rejected; an unverified envelope is not evidence
+    // of the original terminal outcome. Check rejection and unchanged canonical
+    // history, then replay the original request to verify its settled receipt.
     let changed_prompt_replay =
         run_cli_at_root(root.path(), &arguments, Stdio::piped(), Stdio::null());
-    assert!(!changed_prompt_replay.status.success());
-    let changed_prompt_replay: serde_json::Value =
-        serde_json::from_slice(&changed_prompt_replay.stdout).expect("original terminal JSON");
-    assert_eq!(changed_prompt_replay, result);
+    assert_eq!(
+        changed_prompt_replay.status.code(),
+        Some(1),
+        "changed admission status={} stdout={} stderr={}",
+        changed_prompt_replay.status,
+        String::from_utf8_lossy(&changed_prompt_replay.stdout),
+        String::from_utf8_lossy(&changed_prompt_replay.stderr)
+    );
+    // The owner's conflicting queued identity error is normalized by the session
+    // application boundary, not the generic request-error boundary.
+    assert!(
+        String::from_utf8_lossy(&changed_prompt_replay.stderr).contains("session_unavailable"),
+        "changed immutable admission must be rejected by the owner: status={} stdout={} stderr={}",
+        changed_prompt_replay.status,
+        String::from_utf8_lossy(&changed_prompt_replay.stdout),
+        String::from_utf8_lossy(&changed_prompt_replay.stderr)
+    );
+    assert_eq!(
+        graph_cli_json(root.path(), &["session", "history", id, "--json"]),
+        history
+    );
+    std::fs::write(
+        root.path().join("prompt.txt"),
+        "Arbitrary prompt: $(touch should-not-exist) 🦀",
+    )
+    .unwrap();
+    eprintln!("waited prompt phase: original_replay_begin");
+    let original_replay = run_cli_at_root(root.path(), &arguments, Stdio::piped(), Stdio::null());
+    assert_eq!(
+        original_replay.status.code(),
+        Some(2),
+        "original replay status={} stdout={} stderr={}",
+        original_replay.status,
+        String::from_utf8_lossy(&original_replay.stdout),
+        String::from_utf8_lossy(&original_replay.stderr)
+    );
+    let original_replay: serde_json::Value =
+        serde_json::from_slice(&original_replay.stdout).expect("verified original terminal JSON");
+    assert_eq!(original_replay, result);
     assert_eq!(
         graph_cli_json(root.path(), &["session", "history", id, "--json"]),
         history
@@ -2148,11 +2343,31 @@ fn workflow_package_cli_applies_and_publishes_exact_lock() {
 }
 
 #[test]
-#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY and BCODE_WORKTREE_PLUGIN_TEST_LIBRARY pointing to built plugins"]
 fn workflow_template_cli_instantiates_and_starts_external_document() {
     use sha2::Digest as _;
     let root = tempfile::tempdir().unwrap();
-    let daemon = start_graph_test_daemon_with_setup(&root, |plugins| {
+    let daemon = start_graph_test_daemon_with_setup(&root, |_| {
+        // Static registrations take precedence over discovered manifests with the same ID.
+        // Keep the policy plugin unchanged and contribute the fixture through a native plugin.
+        let plugins = root.path().join(".bcode/plugins/worktree");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let library = std::fs::canonicalize(
+            std::env::var_os("BCODE_WORKTREE_PLUGIN_TEST_LIBRARY")
+                .expect("built worktree plugin library"),
+        )
+        .unwrap();
+        std::fs::copy(library, plugins.join("libbcode_worktree_plugin.dylib")).unwrap();
+        std::fs::write(
+            plugins.join("bcode-plugin.toml"),
+            include_str!("../../../plugins/worktree-plugin/bcode-plugin.toml"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("bcode.toml"),
+            "[plugins]\ndefault = \"none\"\nenabled = [\"bcode.default-agents\", \"bcode.worktree\"]\n",
+        )
+        .unwrap();
         let mut document: serde_json::Value = serde_json::from_str(include_str!(
             "../../../fixtures/workflows/source-defined-input.workflow.json"
         ))
@@ -2166,13 +2381,36 @@ fn workflow_template_cli_instantiates_and_starts_external_document() {
         write!(contents, "\n[[workflow_templates]]\ncontribution_version = 1\ntemplate_id = \"cli-input\"\ntemplate_version = 1\ntitle = \"CLI input\"\ndescription = \"CLI acceptance\"\n[workflow_templates.document_source]\npath = \"template.json\"\nsha256 = \"{}\"\n", hex::encode(sha2::Sha256::digest(source.as_bytes()))).unwrap();
         std::fs::write(manifest, contents).unwrap();
     });
-    let request = serde_json::json!({"owner_plugin_id":"bcode.default-agents", "template_id":"cli-input", "template_version":1, "workflow_id":"cli/template", "draft_id":"cli-draft"});
+    let template = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "template",
+            "inspect",
+            "--owner-plugin-id",
+            "bcode.worktree",
+            "--template-id",
+            "cli-input",
+            "--template-version",
+            "1",
+        ],
+    );
+    assert_eq!(template["owner_plugin_id"], "bcode.worktree");
+    assert_eq!(template["diagnostics"], serde_json::json!([]));
+    assert_eq!(template["template_id"], "cli-input");
+    assert_eq!(template["template_version"], 1);
+    assert!(template["configuration_schema"].is_object());
+    assert_eq!(
+        template["configuration_schema"],
+        template["definition"]["input"]
+    );
+    let request = serde_json::json!({"owner_plugin_id":"bcode.worktree", "template_id":"cli-input", "template_version":1, "workflow_id":"cli/template", "draft_id":"cli-draft"});
     std::fs::write(
         root.path().join("instantiate.json"),
         serde_json::to_vec(&request).unwrap(),
     )
     .unwrap();
-    let instantiated = graph_cli_json(
+    let instantiated_output = run_cli_at_root(
         root.path(),
         &[
             "workflow",
@@ -2181,14 +2419,62 @@ fn workflow_template_cli_instantiates_and_starts_external_document() {
             "--request",
             "instantiate.json",
         ],
+        Stdio::piped(),
+        Stdio::null(),
     );
+    if !instantiated_output.status.success() {
+        let template = run_cli_at_root(
+            root.path(),
+            &[
+                "workflow",
+                "template",
+                "inspect",
+                "--owner-plugin-id",
+                request["owner_plugin_id"].as_str().unwrap(),
+                "--template-id",
+                request["template_id"].as_str().unwrap(),
+                "--template-version",
+                "1",
+            ],
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        let status = run_cli_at_root(
+            root.path(),
+            &["server", "diagnose", "--json"],
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        panic!(
+            "template instantiate status={} stdout={} stderr={}; read-only template status={} stdout={} stderr={}; runtime status={} stdout={} stderr={}",
+            instantiated_output.status,
+            String::from_utf8_lossy(&instantiated_output.stdout),
+            String::from_utf8_lossy(&instantiated_output.stderr),
+            template.status,
+            String::from_utf8_lossy(&template.stdout),
+            String::from_utf8_lossy(&template.stderr),
+            status.status,
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    let instantiated: serde_json::Value = serde_json::from_slice(&instantiated_output.stdout)
+        .expect("typed template instantiation result");
     assert_eq!(instantiated["workflow"]["workflow_id"], "cli/template");
     assert_eq!(instantiated["draft"]["generation"], 1);
+    assert_eq!(
+        instantiated["draft"]["document"]["configuration_schema"],
+        template["configuration_schema"]
+    );
+    assert_eq!(
+        instantiated["draft"]["document"]["configuration_defaults"],
+        serde_json::json!({"message":"template acceptance"})
+    );
     let session = graph_cli_json(
         root.path(),
         &["session", "create", "template-parent", "--json"],
     );
-    let request = serde_json::json!({"owner_plugin_id":"bcode.default-agents", "template_id":"cli-input", "template_version":1, "parent_session_id":session["id"], "configuration":{"message":"template acceptance"}, "run_id":"cli-template-run"});
+    let request = serde_json::json!({"owner_plugin_id":"bcode.worktree", "template_id":"cli-input", "template_version":1, "parent_session_id":session["id"], "configuration":{"message":"template acceptance"}, "run_id":"cli-template-run"});
     std::fs::write(
         root.path().join("start.json"),
         serde_json::to_vec(&request).unwrap(),
@@ -2349,6 +2635,80 @@ fn workflow_draft_edit_updates_and_rejects_stale_generation() {
     assert_eq!(conflict["conflict"]["current_generation"], 2);
     assert_eq!(conflict["conflict"]["expected_generation"], 1);
     drop(daemon);
+}
+
+#[test]
+fn live_capture_retains_partial_output_before_pipe_closes() {
+    struct GatedOutput {
+        first: bool,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl std::io::Read for GatedOutput {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.first {
+                self.first = false;
+                let bytes = b"workflow storage: private-canary";
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                return Ok(bytes.len());
+            }
+            let _ = self.ready.send(());
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+    let (ready, observed) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let capture = LiveCliCapture::start(GatedOutput {
+        first: true,
+        ready,
+        release: gate,
+    });
+    observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    let diagnostic = capture.diagnostic();
+    assert!(diagnostic.contains("workflow storage"));
+    assert!(!diagnostic.contains("private-canary"));
+    assert!(matches!(
+        capture.done.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    release.send(()).unwrap();
+    capture
+        .done
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        capture.state.lock().unwrap().bytes,
+        b"workflow storage: private-canary"
+    );
+}
+
+#[test]
+fn live_capture_bounds_storage_and_drains_output() {
+    let capture = LiveCliCapture::start(std::io::repeat(b'x').take(100_000));
+    capture
+        .done
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    let state = capture.state.lock().unwrap();
+    assert_eq!(state.bytes.len(), 65_536);
+    assert!(state.truncated);
+}
+
+#[test]
+fn timeout_diagnostics_do_not_echo_untrusted_output() {
+    let diagnostic = capture_diagnostic(
+        b"panicked at secret-path\nAuthorization: Bearer private-canary\nartifact identity: secret-value",
+        true,
+    );
+    assert!(diagnostic.contains("panicked at"));
+    assert!(diagnostic.contains("artifact identity:"));
+    assert!(diagnostic.contains("truncated=true"));
+    assert!(!diagnostic.contains("private-canary"));
+    assert!(!diagnostic.contains("secret-path"));
+    assert!(!diagnostic.contains("secret-value"));
 }
 
 #[test]
@@ -3185,10 +3545,9 @@ fn catalog_status_requires_json_before_daemon_access() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        stderr,
-        "error: one or more required arguments were not provided\n"
-    );
+    assert!(stderr.starts_with("error:"), "{stderr}");
+    assert!(stderr.contains("--json"), "{stderr}");
+    assert!(!stderr.contains("daemon"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
 
@@ -3489,6 +3848,598 @@ fn invocation_input_process_reports_daemon_failure_without_acceptance() {
         assert!(!stderr.contains("private-sentinel"), "{stderr}");
         assert!(!stderr.contains("panicked"), "{stderr}");
     }
+}
+
+#[test]
+fn plugin_payload_files_reject_oversize_and_invalid_utf8_before_dispatch() {
+    for route in [
+        vec!["plugin", "invoke", "example", "example/v1", "run"],
+        vec!["plugin", "call", "example/v1", "run"],
+        vec!["plugin", "publish", "example.topic"],
+    ] {
+        for (bytes, diagnostic) in [
+            (
+                vec![b'x'; 1024 * 1024 + 1],
+                "plugin service payload exceeds",
+            ),
+            (vec![0xff], "plugin service payload must be UTF-8"),
+        ] {
+            let mut arguments = route.clone();
+            arguments.extend(["--daemon", "--json", "--payload-file", "payload.txt"]);
+            let output = run_cli_with_fixture(&arguments, true, Stdio::piped(), |root| {
+                std::fs::write(root.join("payload.txt"), &bytes).unwrap();
+            });
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{stderr}");
+            assert!(output.stdout.is_empty());
+            assert!(stderr.contains(diagnostic), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn plugin_payload_stdin_is_bounded_before_dispatch() {
+    use std::io::{Seek as _, Write as _};
+    let mut input = tempfile::tempfile().unwrap();
+    input.write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    input.rewind().unwrap();
+    let output = run_cli_with_stdio(
+        &[
+            "plugin",
+            "invoke",
+            "example",
+            "example/v1",
+            "run",
+            "--daemon",
+            "--json",
+            "--payload-file",
+            "-",
+        ],
+        true,
+        Stdio::piped(),
+        Stdio::from(input),
+        |_| {},
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("plugin service payload exceeds"));
+}
+
+#[test]
+fn session_spawn_request_rejects_oversize_and_malformed_before_dispatch() {
+    for (bytes, diagnostic) in [
+        (vec![b' '; 1024 * 1024 + 1], "session spawn request exceeds"),
+        (
+            br#"{"version":1,"private-canary":true}"#.to_vec(),
+            "invalid session spawn request",
+        ),
+    ] {
+        let output = run_cli_with_fixture(
+            &["session", "spawn", "--request", "spawn.json"],
+            true,
+            Stdio::piped(),
+            |root| {
+                std::fs::write(root.join("spawn.json"), &bytes).unwrap();
+            },
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains(diagnostic), "{stderr}");
+        assert!(!stderr.contains("private-canary"));
+    }
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to a built default-agents plugin"]
+fn session_spawn_prints_live_preparation_failure_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let parent = graph_cli_json(
+        root.path(),
+        &["session", "create", "spawn parent", "--json"],
+    );
+    let child_id = bcode_session_models::SessionId::new();
+    let request = bcode_session_models::SessionSpawnRequest {
+        version: 99,
+        creation: bcode_session_models::SessionChildCreateRequest {
+            child_id,
+            parent_id: serde_json::from_value(parent["id"].clone()).unwrap(),
+            name: Some("not created".to_owned()),
+            working_directory: root.path().canonicalize().unwrap(),
+        },
+        worktree_directory: None,
+        input: "must not execute".to_owned(),
+        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        auth_profile: None,
+    };
+    std::fs::write(
+        root.path().join("spawn.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let output = run_cli_at_root(
+        root.path(),
+        &["session", "spawn", "--request", "spawn.json"],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let result: bcode_session_models::SessionSpawnResult =
+        serde_json::from_slice(&output.stdout).unwrap();
+    result.validate().unwrap();
+    assert!(result.session.is_none());
+    assert!(result.admission.is_none());
+    let failure = result.failure.unwrap();
+    assert_eq!(
+        failure.stage,
+        bcode_session_models::SessionSpawnStage::Preparation
+    );
+    assert!(!failure.code.is_empty());
+    let absent = run_cli_at_root(
+        root.path(),
+        &[
+            "session",
+            "inspect",
+            &child_id.to_string(),
+            "selection-changes",
+            "--json",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    for (auth_profile, worktree_directory) in [
+        (Some("missing-auth-profile-reference".to_owned()), None),
+        (None, Some(root.path().join("unregistered-worktree"))),
+    ] {
+        let mut invalid = request.clone();
+        invalid.version = 1;
+        invalid.creation.child_id = bcode_session_models::SessionId::new();
+        invalid.auth_profile = auth_profile;
+        invalid.worktree_directory = worktree_directory;
+        std::fs::write(
+            root.path().join("spawn.json"),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        let output = run_cli_at_root(
+            root.path(),
+            &["session", "spawn", "--request", "spawn.json"],
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let result: bcode_session_models::SessionSpawnResult =
+            serde_json::from_slice(&output.stdout).unwrap();
+        result.validate().unwrap();
+        assert!(result.session.is_none());
+        assert!(result.admission.is_none());
+        assert_eq!(
+            result.failure.unwrap().stage,
+            bcode_session_models::SessionSpawnStage::Preparation
+        );
+        let absent = run_cli_at_root(
+            root.path(),
+            &["session", "summary", &invalid.creation.child_id.to_string()],
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        assert!(!absent.status.success());
+        assert!(absent.stdout.is_empty());
+    }
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to a built default-agents plugin"]
+fn interaction_controller_missing_exchange_reports_typed_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let output = run_cli_at_root(
+        root.path(),
+        &["interaction", "controller-open", "missing-exchange"],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["version"], 1);
+    assert_eq!(result["error"]["code"], "not_pending");
+    assert!(result["error"]["message"].is_string());
+    std::fs::write(
+        root.path().join("drive.json"),
+        br#"{"version":1,"exchange_id":"missing-exchange","inputs":[{"type":"submit"}]}"#,
+    )
+    .unwrap();
+    let output = run_cli_at_root(
+        root.path(),
+        &["interaction", "controller-drive", "--request", "drive.json"],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "not_pending");
+    drop(daemon);
+}
+
+#[test]
+fn controller_drive_process_enforces_bounds_and_typed_envelope() {
+    for (bytes, diagnostic) in [
+        (vec![b' '; 256 * 1024 + 1], "interaction JSON exceeds"),
+        (
+            br#"{"private-canary":true}"#.to_vec(),
+            "invalid interaction controller drive request",
+        ),
+    ] {
+        let output = run_cli_with_fixture(
+            &[
+                "interaction",
+                "controller-drive",
+                "--request",
+                "controller.json",
+            ],
+            true,
+            Stdio::piped(),
+            |root| {
+                std::fs::write(root.join("controller.json"), &bytes).unwrap();
+            },
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains(diagnostic), "{stderr}");
+        assert!(!stderr.contains("private-canary"));
+    }
+}
+
+#[test]
+#[ignore = "requires built default-agents and fake-provider plugin libraries"]
+fn session_spawn_live_child_retry_and_changed_request_conflict() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon_with_setup(&root, |_| {
+        let library = std::fs::canonicalize(
+            std::env::var_os("BCODE_FAKE_PROVIDER_PLUGIN_TEST_LIBRARY")
+                .expect("built fake-provider plugin library"),
+        )
+        .unwrap();
+        let plugins = root.path().join(".bcode/plugins/fake-provider");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(
+            plugins.join("bcode-plugin.toml"),
+            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+        )
+        .unwrap();
+        std::fs::copy(library, plugins.join("libbcode_fake_provider_plugin.dylib")).unwrap();
+        std::fs::write(root.path().join("bcode.toml"), "[plugins]\ndefault = \"none\"\nenabled = [\"bcode.default-agents\", \"bcode.fake-provider\"]\n[model]\nprovider_plugin_id = \"bcode.fake-provider\"\nmodel_id = \"fake-echo\"\n[model.prompt_cache]\nmode = \"off\"\n").unwrap();
+    });
+    let parent = graph_cli_json(
+        root.path(),
+        &["session", "create", "spawn parent", "--json"],
+    );
+    let child_id = bcode_session_models::SessionId::new();
+    let mut request = bcode_session_models::SessionSpawnRequest {
+        version: 1,
+        creation: bcode_session_models::SessionChildCreateRequest {
+            child_id,
+            parent_id: serde_json::from_value(parent["id"].clone()).unwrap(),
+            name: Some("spawned child".to_owned()),
+            working_directory: root.path().canonicalize().unwrap(),
+        },
+        worktree_directory: None,
+        input: "offline spawn parity 🦀".to_owned(),
+        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        auth_profile: None,
+    };
+    let args = ["session", "spawn", "--request", "spawn.json"];
+    std::fs::write(
+        root.path().join("spawn.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let first = graph_cli_json(root.path(), &args);
+    let result: bcode_session_models::SessionSpawnResult = serde_json::from_value(first).unwrap();
+    result.validate().unwrap();
+    assert!(result.failure.is_none());
+    let session = result.session.unwrap();
+    assert_eq!(session.id, child_id);
+    assert_eq!(session.parent_id, Some(request.creation.parent_id));
+    let receipt = match result.admission.unwrap() {
+        bcode_session_models::TurnAdmission::Accepted(receipt) => receipt,
+        other => panic!("first spawn was not admitted: {other:?}"),
+    };
+    let retried: bcode_session_models::SessionSpawnResult =
+        serde_json::from_value(graph_cli_json(root.path(), &args)).unwrap();
+    assert!(retried.failure.is_none());
+    let retry_receipt = match retried.admission.unwrap() {
+        bcode_session_models::TurnAdmission::Existing(receipt) => receipt,
+        other => panic!("identical retry was not existing: {other:?}"),
+    };
+    assert_eq!(receipt, retry_receipt);
+    request.input = "changed immutable spawn input".to_owned();
+    std::fs::write(
+        root.path().join("spawn.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let conflict = run_cli_at_root(root.path(), &args, Stdio::piped(), Stdio::null());
+    assert_eq!(conflict.status.code(), Some(1));
+    let conflict: bcode_session_models::SessionSpawnResult =
+        serde_json::from_slice(&conflict.stdout).unwrap();
+    conflict.validate().unwrap();
+    assert!(conflict.failure.is_some());
+    assert!(conflict.admission.is_none());
+    let history = graph_cli_json(
+        root.path(),
+        &[
+            "session",
+            "history",
+            &child_id.to_string(),
+            "--limit",
+            "100",
+            "--json",
+        ],
+    );
+    let history: bcode_session_models::SessionHistoryPage =
+        serde_json::from_value(history).expect("typed canonical child history");
+    assert_eq!(history.session_id, child_id);
+    assert!(
+        !history.has_more,
+        "fixture admission history must fit this page"
+    );
+    assert!(history.compatibility_issues.is_empty());
+    assert!(
+        history.events.iter().all(|event| !matches!(
+            event.kind,
+            bcode_session_models::SessionEventKind::UserMessage { .. }
+        )),
+        "queued spawn must not also append a legacy user-message admission"
+    );
+    let messages: Vec<_> = history
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            bcode_session_models::SessionEventKind::SubmissionAccepted { submission } => Some((
+                event.sequence,
+                submission.text.as_str(),
+                submission.target.turn_id(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "retry or changed request duplicated admission"
+    );
+    assert_eq!(messages[0].0, receipt.accepted_event_sequence);
+    assert_eq!(messages[0].1, "offline spawn parity 🦀");
+    assert_eq!(messages[0].2, &receipt.turn_id);
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to a built default-agents plugin"]
+fn session_summary_reads_canonical_metadata_without_attachment() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let created = graph_cli_json(root.path(), &["session", "create", "summary 🦀", "--json"]);
+    let id = created["id"].as_str().unwrap();
+    let summary = graph_cli_json(root.path(), &["session", "summary", id]);
+    assert_eq!(summary, created);
+    graph_cli_json(
+        root.path(),
+        &["session", "rename", id, "canonical rename", "--json"],
+    );
+    let summary = graph_cli_json(root.path(), &["session", "summary", id]);
+    assert_eq!(summary["explicit_name"], "canonical rename");
+    assert_eq!(summary["id"], id);
+    let missing = bcode_session_models::SessionId::new().to_string();
+    let output = run_cli_at_root(
+        root.path(),
+        &["session", "summary", &missing],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    drop(daemon);
+}
+
+#[test]
+fn controller_drive_process_rejects_unbounded_or_nonsemantic_batches() {
+    for request in [
+        serde_json::json!({"version":1,"exchange_id":"id","inputs":[]}),
+        serde_json::json!({"version":2,"exchange_id":"id","inputs":[{"type":"submit"}]}),
+        serde_json::json!({"version":1,"exchange_id":"id","inputs":vec![serde_json::json!({"type":"tick"});129]}),
+        serde_json::json!({"version":1,"exchange_id":"id","inputs":[{"type":"unknown-private-canary"}]}),
+    ] {
+        let output = run_cli_with_fixture(
+            &["interaction", "controller-drive", "--request", "drive.json"],
+            true,
+            Stdio::piped(),
+            |root| {
+                std::fs::write(
+                    root.join("drive.json"),
+                    serde_json::to_vec(&request).unwrap(),
+                )
+                .unwrap();
+            },
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("unknown-private-canary"));
+    }
+}
+
+#[test]
+#[ignore = "requires built default-agents, fake-provider and question plugin libraries"]
+fn controller_drive_live_question_consumes_canonical_answer() {
+    use std::io::BufRead as _;
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon_with_setup(&root, |_| {
+        for (id, variable, manifest, filename) in [
+            (
+                "fake-provider",
+                "BCODE_FAKE_PROVIDER_PLUGIN_TEST_LIBRARY",
+                include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+                "libbcode_fake_provider_plugin.dylib",
+            ),
+            (
+                "question",
+                "BCODE_QUESTION_PLUGIN_TEST_LIBRARY",
+                include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+                "libbcode_question_plugin.dylib",
+            ),
+        ] {
+            let library = std::fs::canonicalize(
+                std::env::var_os(variable).expect("built fixture plugin library"),
+            )
+            .unwrap();
+            let plugins = root.path().join(".bcode/plugins").join(id);
+            std::fs::create_dir_all(&plugins).unwrap();
+            std::fs::write(plugins.join("bcode-plugin.toml"), manifest).unwrap();
+            std::fs::copy(library, plugins.join(filename)).unwrap();
+        }
+        std::fs::write(root.path().join("bcode.toml"), "[plugins]\ndefault = \"none\"\nenabled = [\"bcode.default-agents\", \"bcode.fake-provider\", \"bcode.question\"]\n[model]\nprovider_plugin_id = \"bcode.fake-provider\"\nmodel_id = \"fake-echo\"\n[model.prompt_cache]\nmode = \"off\"\n").unwrap();
+    });
+    let session = graph_cli_json(
+        root.path(),
+        &["session", "create", "controller consumer", "--json"],
+    );
+    let id = session["id"].as_str().unwrap();
+    let mut watcher = ForegroundDaemon(
+        isolated_cli(root.path())
+            .args([
+                "session",
+                "watch",
+                id,
+                "--interaction-controller-version",
+                "1",
+                "--json",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(root.path().join("watch.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let pipe = watcher.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut pipe = std::io::BufReader::new(pipe);
+        let mut first = String::new();
+        if pipe.read_line(&mut first).is_ok() {
+            let _ = sender.send(first);
+        }
+        // Only readiness is retained. Drain later events without accumulating an
+        // unbounded test-owned event queue or blocking the daemon's writer.
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+    });
+    let first = receiver
+        .recv_timeout(Duration::from_secs(20))
+        .expect("semantic watcher ready snapshot");
+    let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(first["type"], "snapshot");
+    let prompt = r#"tool-call question {"questions":[{"header":"Pick","question":"Pick one","required":true,"custom":false,"control":"radio","selection_mode":"single","options":[{"label":"One","value":"one","description":"First"},{"label":"Two","value":"two","description":"Second"}]}]}"#;
+    graph_cli_json(
+        root.path(),
+        &[
+            "send",
+            id,
+            prompt,
+            "--json",
+            "--dangerously-bypass-all-permissions",
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let exchange = loop {
+        let pending = graph_cli_json(
+            root.path(),
+            &["interaction", "list", "--session-id", id, "--json"],
+        );
+        if let Some(exchange) = pending.as_array().unwrap().first() {
+            break exchange.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "question exchange never became pending"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let exchange_id = exchange["request"]["exchange_id"].as_str().unwrap();
+    std::fs::write(
+        root.path().join("drive.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version":1,"exchange_id":exchange_id,"inputs":[
+                {"type":"activate","control_id":"question-0.option-1"}, {"type":"submit"}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run_cli_at_root(
+        root.path(),
+        &["interaction", "controller-drive", "--request", "drive.json"],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshots: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(snapshots.len(), 3);
+    assert!(
+        snapshots
+            .windows(2)
+            .all(|pair| pair[1]["revision"].as_u64().unwrap()
+                > pair[0]["revision"].as_u64().unwrap())
+    );
+    assert_eq!(snapshots[2]["output"]["type"], "submitted");
+    assert_eq!(snapshots[2]["output"]["payload"]["status"], "answered");
+    assert_eq!(
+        snapshots[2]["output"]["payload"]["questions"][0]["selected"],
+        serde_json::json!(["two"])
+    );
+    let pending = graph_cli_json(
+        root.path(),
+        &["interaction", "list", "--session-id", id, "--json"],
+    );
+    assert!(
+        pending.as_array().unwrap().is_empty(),
+        "canonical resolution was not consumed"
+    );
+    drop(watcher);
+    drop(receiver);
+    reader.join().unwrap();
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to a built default-agents plugin"]
+fn unapplied_permission_resolution_prints_false_and_exits_nonzero() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    for decision in ["approve", "deny"] {
+        let output = run_cli_at_root(
+            root.path(),
+            &["permission", decision, "missing-permission", "--json"],
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt, serde_json::json!({"resolved":false}));
+    }
+    drop(daemon);
 }
 
 #[test]
@@ -3956,6 +4907,207 @@ fn plugin_check_rejects_future_abi_before_native_loading() {
         );
         assert!(!stderr.contains("panicked"), "{stderr}");
     }
+}
+
+#[test]
+#[ignore = "requires BCODE_WORKTREE_PLUGIN_TEST_LIBRARY and BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to built plugins"]
+fn plugin_command_consumes_live_worktree_append_effect() {
+    let root = tempfile::tempdir().unwrap();
+    let git = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(root.path())
+        .status()
+        .unwrap();
+    assert!(git.success());
+    let library = std::fs::canonicalize(
+        std::env::var_os("BCODE_WORKTREE_PLUGIN_TEST_LIBRARY")
+            .expect("built worktree plugin library"),
+    )
+    .unwrap();
+    let plugins = root.path().join(".bcode/plugins/worktree");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(
+        plugins.join("bcode-plugin.toml"),
+        include_str!("../../../plugins/worktree-plugin/bcode-plugin.toml"),
+    )
+    .unwrap();
+    std::fs::copy(library, plugins.join("libbcode_worktree_plugin.dylib")).unwrap();
+    let agents_library = std::fs::canonicalize(
+        std::env::var_os("BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY").expect(
+            "built default-agents plugin library required for contextual command admission",
+        ),
+    )
+    .unwrap();
+    let agents = root.path().join(".bcode/plugins/default-agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("bcode-plugin.toml"),
+        include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+    )
+    .unwrap();
+    std::fs::copy(
+        agents_library,
+        agents.join("libbcode_default_agents_plugin.dylib"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("bcode.toml"),
+        "[plugins]\ndefault = \"none\"\nenabled = [\"bcode.worktree\", \"bcode.default-agents\"]\n",
+    )
+    .unwrap();
+    let mut daemon = ForegroundDaemon(
+        isolated_cli(root.path())
+            .args(["server", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(root.path().join("daemon.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(daemon.0.try_wait().unwrap().is_none(), "daemon exited");
+        if run_cli_at_root(
+            root.path(),
+            &["server", "status"],
+            Stdio::piped(),
+            Stdio::null(),
+        )
+        .status
+        .success()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon startup timed out");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let directory = root.path().canonicalize().unwrap();
+    let request = |command_id: &str, args: serde_json::Value| {
+        serde_json::json!({
+            "command_id": command_id, "args": args,
+            "context": { "session_id": null, "working_directory": directory },
+        })
+    };
+    std::fs::write(
+        root.path().join("command.json"),
+        serde_json::to_vec(&request("command.work-tree.list", serde_json::json!({}))).unwrap(),
+    )
+    .unwrap();
+    let output = run_cli_at_root(
+        root.path(),
+        &[
+            "plugin",
+            "command",
+            "bcode.worktree",
+            "command.work-tree.list",
+            "--request",
+            "command.json",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "command result decode: {error}; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert!(
+        output.status.success(),
+        "command status={} structured_result={result} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result["outcome"]["status"], "completed", "{result}");
+    assert_eq!(result["outcome"]["result"]["success"], true);
+    assert_eq!(result["effect_outcomes"][0]["status"], "emitted");
+    assert_eq!(result["effect_outcomes"][0]["kind"], "transcript_text");
+    assert_eq!(result["effect_outcomes"][0]["format"], "markdown");
+    assert!(
+        result["effect_outcomes"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Worktrees for")
+    );
+    assert_eq!(
+        result["effect_outcomes"][0]["text"],
+        result["outcome"]["result"]["effects"][0]["text"]
+    );
+    // Native presentation is unsupported, but opaque plugin semantic options remain
+    // available for renderer-neutral inspection with exact owner and surface identity.
+    std::fs::write(
+        root.path().join("command.json"),
+        serde_json::to_vec(&request(
+            "command.work-tree.attach",
+            serde_json::json!({"path":"semantic-path-🦀","session":"selection-only"}),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let fallback = run_cli_at_root(
+        root.path(),
+        &[
+            "plugin",
+            "command",
+            "bcode.worktree",
+            "command.work-tree.attach",
+            "--request",
+            "command.json",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(
+        fallback.status.code(),
+        Some(1),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&fallback.stdout),
+        String::from_utf8_lossy(&fallback.stderr)
+    );
+    let fallback: serde_json::Value = serde_json::from_slice(&fallback.stdout).unwrap();
+    assert_eq!(fallback["outcome"]["status"], "completed", "{fallback}");
+    assert_eq!(fallback["outcome"]["result"]["success"], true, "{fallback}");
+    let outcome = &fallback["effect_outcomes"][0];
+    assert_eq!(outcome["status"], "unsupported");
+    assert_eq!(outcome["kind"], "plugin_surface");
+    assert_eq!(outcome["owner_plugin_id"], "bcode.worktree");
+    assert_eq!(outcome["surface_kind"], "command.work-tree.attach");
+    assert_eq!(
+        outcome["options"],
+        fallback["outcome"]["result"]["effects"][0]["options"]
+    );
+    assert_eq!(outcome["options"]["path"], "semantic-path-🦀");
+    assert!(outcome["next_action"].is_string());
+    // Undeclared commands are rejected by contextual admission before plugin execution.
+    std::fs::write(
+        root.path().join("command.json"),
+        serde_json::to_vec(&request("missing", serde_json::json!({}))).unwrap(),
+    )
+    .unwrap();
+    let failed = run_cli_at_root(
+        root.path(),
+        &[
+            "plugin",
+            "command",
+            "bcode.worktree",
+            "missing",
+            "--request",
+            "command.json",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(result["outcome"]["status"], "failed", "{result}");
+    assert_eq!(
+        result["outcome"]["result"]["code"], "plugin_context_denied",
+        "{result}"
+    );
+    assert!(result["effect_outcomes"].as_array().unwrap().is_empty());
+    drop(daemon);
 }
 
 fn metrics_plugin_fixture(root: &std::path::Path) {

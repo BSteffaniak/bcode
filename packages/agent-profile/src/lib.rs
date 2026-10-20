@@ -8,6 +8,8 @@
 //! provide profiles such as `plan`, `build`, `review`, or project-specific
 //! agents, along with prompt context and tool-call policy decisions.
 
+pub mod application;
+
 use bcode_session_models::SessionId;
 use bcode_tool::{
     ToolAuthorizationFact, ToolDefinition, ToolPreparationRequest, ToolPreparationResponse,

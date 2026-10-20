@@ -1421,6 +1421,7 @@ dependencies = [
  "bcode_bundled_plugins",
  "bcode_cli",
  "bcode_client",
+ "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",
  "bcode_eval",
@@ -1444,6 +1445,7 @@ dependencies = [
  "bcode_tool",
  "bcode_workflow",
  "bcode_workflow_store",
+ "bcode_workflow_view_models",
  "futures 0.3.34",
  "hex",
  "jsonschema",
@@ -1745,7 +1747,9 @@ dependencies = [
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",
+ "bcode_model_catalog",
  "bcode_model_catalog_models",
+ "bcode_plugin_models",
  "bcode_plugin_sdk",
  "bcode_provider_auth",
  "bcode_provider_auth_models",
@@ -1753,13 +1757,17 @@ dependencies = [
  "bcode_session_import",
  "bcode_session_models",
  "bcode_session_search",
+ "bcode_session_view_models",
  "bcode_skill_models",
  "bcode_tool",
  "bcode_usage_models",
  "bcode_workflow",
  "bcode_workflow_store",
  "bcode_workflow_view_models",
+ "bcode_worktree_models",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2157,6 +2165,7 @@ dependencies = [
  "bcode_session_import",
  "bcode_session_models",
  "bcode_session_search",
+ "bcode_session_view_models",
  "bcode_skill_models",
  "bcode_tool",
  "bcode_usage_models",
@@ -2492,7 +2501,9 @@ dependencies = [
 name = "bcode_plugin_models"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_tool_models",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2626,6 +2637,7 @@ dependencies = [
 name = "bcode_question_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_plugin_models",
  "bcode_plugin_sdk",
  "bcode_tool",
  "bcode_tui_components",
@@ -2709,6 +2721,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_pi_session_import_plugin",
  "bcode_plugin",
+ "bcode_plugin_models",
  "bcode_plugin_sdk",
  "bcode_project_instructions",
  "bcode_prompt_cache",
@@ -2824,6 +2837,7 @@ dependencies = [
 name = "bcode_session_import"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_session_models",
  "serde",
 ]
 
@@ -2870,6 +2884,7 @@ dependencies = [
 name = "bcode_session_models"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_model_catalog_models",
  "bcode_skill_models",
  "bcode_tool_models",
  "serde",
@@ -3379,6 +3394,7 @@ dependencies = [
 name = "bcode_workflow_view_models"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_session_models",
  "serde",
  "serde_json",
 ]

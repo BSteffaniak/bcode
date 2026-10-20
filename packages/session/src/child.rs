@@ -15,7 +15,7 @@ fn verify_summary_prefix(
     session_id: SessionId,
 ) -> Result<(), SessionError> {
     let relationship = prefix.iter().find_map(|event| match &event.kind {
-        SessionEventKind::ChildSessionCreated { request } => Some(request.parent_id),
+        SessionEventKind::ChildSessionCreated { request, .. } => Some(request.parent_id),
         _ => None,
     });
     if relationship != summary.parent_id {
@@ -32,25 +32,35 @@ fn verify_summary_prefix(
 fn child_staging_path(
     root: &std::path::Path,
     request: &SessionChildCreateRequest,
+    spawning: Option<&bcode_session_models::SessionSpawnRequest>,
 ) -> Result<std::path::PathBuf, SessionError> {
     let parent = root.join(".child-staging");
     if parent.exists() && !fs::symlink_metadata(&parent)?.is_dir() {
         return Err(invalid("child staging root is not a regular directory"));
     }
     let staging = parent.join(request.child_id.to_string());
-    prepare_child_staging(&staging, request)?;
+    prepare_child_staging(&staging, request, spawning)?;
     Ok(staging)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ChildStagingRequest {
+    #[serde(flatten)]
+    creation: SessionChildCreateRequest,
+    #[serde(default)]
+    spawning: Option<bcode_session_models::SessionSpawnRequest>,
 }
 
 fn prepare_child_staging(
     staging: &std::path::Path,
     request: &SessionChildCreateRequest,
+    spawning: Option<&bcode_session_models::SessionSpawnRequest>,
 ) -> Result<(), SessionError> {
     if staging.exists() {
         if fs::symlink_metadata(staging)?.file_type().is_symlink() {
             return Err(invalid("child staging path is a symlink"));
         }
-        let retained: SessionChildCreateRequest = serde_json::from_slice(&fs::read(
+        let retained: ChildStagingRequest = serde_json::from_slice(&fs::read(
             staging.join("request.json"),
         )?)
         .map_err(|_| {
@@ -58,7 +68,7 @@ fn prepare_child_staging(
                 "interrupted child staging request is unverifiable; explicit maintenance required",
             )
         })?;
-        if &retained != request {
+        if &retained.creation != request || retained.spawning.as_ref() != spawning {
             return Err(invalid(
                 "child identity conflicts with interrupted creation request",
             ));
@@ -70,7 +80,11 @@ fn prepare_child_staging(
     let request_path = staging.join("request.json");
     fs::write(
         request_path.with_extension("tmp"),
-        serde_json::to_vec(request).map_err(|error| invalid(error.to_string()))?,
+        serde_json::to_vec(&ChildStagingRequest {
+            creation: request.clone(),
+            spawning: spawning.cloned(),
+        })
+        .map_err(|error| invalid(error.to_string()))?,
     )?;
     File::open(request_path.with_extension("tmp"))?.sync_all()?;
     fs::rename(request_path.with_extension("tmp"), &request_path)?;
@@ -319,7 +333,35 @@ impl SessionManager {
         &self,
         request: SessionChildCreateRequest,
     ) -> Result<SessionSummary, SessionError> {
-        self.create_child_session_inner(request, None).await
+        self.create_child_session_inner(request, None, None).await
+    }
+
+    /// Create a fresh child with an immutable composed spawning receipt in its creation prefix.
+    ///
+    /// # Errors
+    /// Rejects conflicting composed retries, unavailable persistent storage, invalid parentage,
+    /// or unverifiable publication/ownership. Failure does not imply rollback.
+    pub async fn create_spawning_session(
+        &self,
+        mut request: bcode_session_models::SessionSpawnRequest,
+    ) -> Result<SessionSummary, SessionError> {
+        request.creation.working_directory =
+            normalize_working_directory(&request.creation.working_directory);
+        if request.version != 1 || request.creation.parent_id == request.creation.child_id {
+            return Err(invalid(
+                "invalid composed spawning request version or parentage",
+            ));
+        }
+        if request.admission.idempotency_identity().is_none() {
+            return Err(invalid(
+                "composed spawning requires a retained admission identity",
+            ));
+        }
+        if request.admission.validate().is_err() {
+            return Err(invalid("invalid composed spawning admission options"));
+        }
+        self.create_child_session_inner(request.creation.clone(), None, Some(request))
+            .await
     }
 
     /// Create a fresh background execution child with explicit immediate parent.
@@ -338,7 +380,7 @@ impl SessionManager {
                 "explicit-parent execution creation currently supports fresh isolated context only",
             ));
         }
-        self.create_child_session_inner(request, Some(provenance))
+        self.create_child_session_inner(request, Some(provenance), None)
             .await
     }
 
@@ -430,12 +472,18 @@ impl SessionManager {
         &self,
         mut request: SessionChildCreateRequest,
         execution: Option<crate::ExecutionSessionProvenance>,
+        spawning: Option<bcode_session_models::SessionSpawnRequest>,
     ) -> Result<SessionSummary, SessionError> {
         request.working_directory = normalize_working_directory(&request.working_directory);
         if request.child_id == request.parent_id {
             return Err(invalid("a child session cannot be its own parent"));
         }
         let Some(store) = &self.store else {
+            if spawning.is_some() {
+                return Err(invalid(
+                    "composed spawning requires canonical persistent storage",
+                ));
+            }
             let lock = {
                 let mut locks = self.shared_execution_locks.lock().await;
                 std::sync::Arc::clone(
@@ -454,7 +502,7 @@ impl SessionManager {
                 .cloned();
             if let Some(handle) = existing {
                 let events = handle.events_range(0, 1, 2).await?;
-                verify_request(&events, &request)?;
+                verify_composed_request(&events, &request, spawning.as_ref())?;
                 let summary = handle.snapshot().summary;
                 self.link_child_session(request.parent_id, request.child_id)
                     .await?;
@@ -475,7 +523,7 @@ impl SessionManager {
                 .await?;
             return Ok(summary);
         };
-        self.create_persistent_child(request, execution, store)
+        self.create_persistent_child(request, execution, spawning, store)
             .await
     }
 
@@ -485,6 +533,7 @@ impl SessionManager {
         handle: &crate::actor::SessionHandle,
         request: &SessionChildCreateRequest,
         execution: Option<&crate::ExecutionSessionProvenance>,
+        spawning: Option<&bcode_session_models::SessionSpawnRequest>,
     ) -> Result<SessionSummary, SessionError> {
         // Do not acquire offline maintenance ownership underneath the verified local owner.
         let _guard = handle
@@ -492,7 +541,7 @@ impl SessionManager {
             .await?;
         handle.validate_write_readiness().await?;
         let (summary, prefix) = handle.observed_summary().await?;
-        verify_request(&prefix, request)?;
+        verify_composed_request(&prefix, request, spawning)?;
         verify_summary_prefix(&summary, &prefix, request.child_id)?;
         if summary.execution.as_ref().map(|value| &value.provenance) != execution {
             return Err(invalid(
@@ -520,6 +569,7 @@ impl SessionManager {
         &self,
         request: SessionChildCreateRequest,
         execution: Option<crate::ExecutionSessionProvenance>,
+        spawning: Option<bcode_session_models::SessionSpawnRequest>,
         store: &crate::store_executor::SessionStoreExecutor,
     ) -> Result<SessionSummary, SessionError> {
         let root = store.root_path();
@@ -536,7 +586,12 @@ impl SessionManager {
                 .cloned();
             if let Some(handle) = resident {
                 return self
-                    .publish_resident_child_retry(&handle, &request, execution.as_ref())
+                    .publish_resident_child_retry(
+                        &handle,
+                        &request,
+                        execution.as_ref(),
+                        spawning.as_ref(),
+                    )
                     .await;
             }
             let child = self.session_summary_non_owning(request.child_id).await?;
@@ -560,7 +615,11 @@ impl SessionManager {
                 db::SessionDb::open_existing_turso_in_root(request.child_id, &root).await?;
             let result: Result<SessionSummary, SessionError> = async {
                 database.validate_write_readiness().await?;
-                verify_request(&database.events_range(0, 1, 2).await?, &request)?;
+                verify_composed_request(
+                    &database.events_range(0, 1, 2).await?,
+                    &request,
+                    spawning.as_ref(),
+                )?;
                 Ok(self
                     .load_db_session_state(request.child_id, &database)
                     .await?
@@ -584,29 +643,17 @@ impl SessionManager {
         // Only exact local canonical storage establishes the parent; catalog metadata is not authority.
         self.session_summary_non_owning(request.parent_id).await?;
         let stage_timer = timer(request.child_id, Stage::Staging);
-        let staging = child_staging_path(&root, &request)?;
+        let staging = child_staging_path(&root, &request, spawning.as_ref())?;
         drop(stage_timer);
-        let manager = self.clone();
-        let task_staging = staging.clone();
-        let task_request = request.clone();
-        let (mut sender, receiver) = tokio::sync::oneshot::channel();
-        // The task owns the maintenance lease until storage is closed. Closing
-        // the receiver cancels preparation, not ownership, and never publishes.
-        tokio::spawn(async move {
-            let summary = manager
-                .prepare_child_storage_cancelled(
-                    &task_staging,
-                    &task_request,
-                    execution.as_ref(),
-                    Some(&mut sender),
-                )
-                .await;
-            drop(manager);
-            let _ = sender.send(summary.map(|summary| (summary, ownership)));
-        });
-        let (summary, ownership) = receiver
-            .await
-            .map_err(|_| invalid("child preparation task ended without a handoff"))??;
+        let (summary, ownership) = self
+            .prepare_owned_child_storage(
+                staging.clone(),
+                request.clone(),
+                execution,
+                spawning,
+                ownership,
+            )
+            .await?;
         let stage_timer = timer(request.child_id, Stage::RenameAndSync);
         fs::rename(db::session_dir_path(&staging, request.child_id), &canonical)?;
         File::open(&root)?.sync_all()?;
@@ -620,14 +667,45 @@ impl SessionManager {
         Ok(summary)
     }
 
+    async fn prepare_owned_child_storage(
+        &self,
+        staging: std::path::PathBuf,
+        request: SessionChildCreateRequest,
+        execution: Option<crate::ExecutionSessionProvenance>,
+        spawning: Option<bcode_session_models::SessionSpawnRequest>,
+        ownership: lease::SessionMaintenanceGuard,
+    ) -> Result<(SessionSummary, lease::SessionMaintenanceGuard), SessionError> {
+        let manager = self.clone();
+        let (mut sender, receiver) = tokio::sync::oneshot::channel();
+        // The task owns the maintenance lease until storage is closed. Closing
+        // the receiver cancels preparation, not ownership, and never publishes.
+        tokio::spawn(async move {
+            let summary = manager
+                .prepare_child_storage_cancelled(
+                    &staging,
+                    &request,
+                    execution.as_ref(),
+                    spawning.as_ref(),
+                    Some(&mut sender),
+                )
+                .await;
+            drop(manager);
+            let _ = sender.send(summary.map(|summary| (summary, ownership)));
+        });
+        receiver
+            .await
+            .map_err(|_| invalid("child preparation task ended without a handoff"))?
+    }
+
     #[cfg(test)]
     async fn prepare_child_storage(
         &self,
         staging: &std::path::Path,
         request: &SessionChildCreateRequest,
         execution: Option<&crate::ExecutionSessionProvenance>,
+        spawning: Option<&bcode_session_models::SessionSpawnRequest>,
     ) -> Result<SessionSummary, SessionError> {
-        self.prepare_child_storage_cancelled(staging, request, execution, None)
+        self.prepare_child_storage_cancelled(staging, request, execution, spawning, None)
             .await
     }
 
@@ -636,6 +714,7 @@ impl SessionManager {
         staging: &std::path::Path,
         request: &SessionChildCreateRequest,
         execution: Option<&crate::ExecutionSessionProvenance>,
+        spawning: Option<&bcode_session_models::SessionSpawnRequest>,
         mut handoff: Option<
             &mut tokio::sync::oneshot::Sender<
                 Result<(SessionSummary, lease::SessionMaintenanceGuard), SessionError>,
@@ -676,6 +755,7 @@ impl SessionManager {
             provenance: None,
             kind: SessionEventKind::ChildSessionCreated {
                 request: Box::new(request.clone()),
+                spawning: spawning.cloned().map(Box::new),
             },
         };
         let preparation = async {
@@ -750,6 +830,29 @@ impl SessionManager {
         published: bool,
     ) -> Result<(), SessionError> {
         let handle = self.session_handle(parent).await?;
+        if self.store.is_some() {
+            let title = if published {
+                let summary = self.session_summary_non_owning(child).await?;
+                if summary.parent_id != Some(parent) {
+                    return Err(invalid("publication parent mismatch"));
+                }
+                summary
+                    .name
+                    .map(|name| crate::bounded_utf8_prefix(&name, 256).0)
+            } else {
+                None
+            };
+            handle
+                .record_child_transition(
+                    child,
+                    title,
+                    published,
+                    self.next_activity_timestamp_ms(),
+                    self.mutation_tx.clone(),
+                )
+                .await?;
+            return Ok(());
+        }
         for _ in 0..8 {
             let generation = self.current_session_generation(parent).await?;
             let receipt = if self.store.is_some() {
@@ -947,12 +1050,22 @@ fn validate_child_prefix(events: &[SessionEvent], id: SessionId) -> Result<(), S
                 name,
                 working_directory,
             },
-            SessionEventKind::ChildSessionCreated { request },
+            SessionEventKind::ChildSessionCreated { request, .. },
         ) if request.child_id == id
             && request.parent_id != id
             && &request.name == name
             && &request.working_directory == working_directory =>
         {
+            if let SessionEventKind::ChildSessionCreated {
+                spawning: Some(spawning),
+                ..
+            } = &relationship.kind
+                && (spawning.version != 1 || spawning.creation != **request)
+            {
+                return Err(invalid(
+                    "composed spawning prefix is inconsistent or unsupported",
+                ));
+            }
             Ok(())
         }
         _ => Err(invalid("child creation prefix is inconsistent")),
@@ -967,16 +1080,66 @@ fn verify_request(
         validate_child_prefix(events, request.child_id)?;
     }
     if events.iter().any(|event| event.sequence == 1 && event.session_id == request.child_id
-        && matches!(&event.kind, SessionEventKind::ChildSessionCreated { request: retained } if retained.as_ref() == request)) {
+        && matches!(&event.kind, SessionEventKind::ChildSessionCreated { request: retained, .. } if retained.as_ref() == request)) {
         Ok(())
     } else {
         Err(invalid("child identity is already used by a different creation request"))
     }
 }
 
+fn verify_composed_request(
+    events: &[SessionEvent],
+    request: &SessionChildCreateRequest,
+    spawning: Option<&bcode_session_models::SessionSpawnRequest>,
+) -> Result<(), SessionError> {
+    verify_request(events, request)?;
+    let retained = events.iter().find_map(|event| match &event.kind {
+        SessionEventKind::ChildSessionCreated { spawning, .. } if event.sequence == 1 => {
+            Some(spawning.as_deref())
+        }
+        _ => None,
+    });
+    if retained != Some(spawning) {
+        return Err(invalid(
+            "child identity conflicts with original composed spawning request",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_composed_staging_rejects_changed_input_without_discarding_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let creation = SessionChildCreateRequest {
+            child_id: SessionId::new(),
+            parent_id: SessionId::new(),
+            name: None,
+            working_directory: std::env::current_dir().unwrap(),
+        };
+        let original = bcode_session_models::SessionSpawnRequest {
+            version: 1,
+            creation: creation.clone(),
+            worktree_directory: None,
+            input: "original".into(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            auth_profile: None,
+        };
+        let staging = child_staging_path(root.path(), &creation, Some(&original)).unwrap();
+        let evidence = fs::read(staging.join("request.json")).unwrap();
+        let mut changed = original.clone();
+        changed.input = "changed".into();
+        assert!(child_staging_path(root.path(), &creation, Some(&changed)).is_err());
+        assert_eq!(fs::read(staging.join("request.json")).unwrap(), evidence);
+        assert!(child_staging_path(root.path(), &creation, None).is_err());
+        assert_eq!(
+            child_staging_path(root.path(), &creation, Some(&original)).unwrap(),
+            staging
+        );
+    }
 
     #[test]
     fn lock_retry_budget_is_bounded_and_damage_is_not_retryable() {
@@ -1182,7 +1345,7 @@ mod tests {
             .await
             .unwrap();
         let request = request(parent.id);
-        let staging = child_staging_path(root.path(), &request).unwrap();
+        let staging = child_staging_path(root.path(), &request, None).unwrap();
         let guard =
             lease::acquire_session_maintenance_guard(root.path(), request.child_id).unwrap();
         let (mut sender, receiver) = tokio::sync::oneshot::channel();
@@ -1194,7 +1357,13 @@ mod tests {
             ready_send.send(()).unwrap();
             resumed.await.unwrap();
             let result = task_manager
-                .prepare_child_storage_cancelled(&staging, &task_request, None, Some(&mut sender))
+                .prepare_child_storage_cancelled(
+                    &staging,
+                    &task_request,
+                    None,
+                    None,
+                    Some(&mut sender),
+                )
                 .await;
             assert!(result.is_err());
             // Explicit close has completed before handoff fails and drops ownership.
@@ -1249,9 +1418,9 @@ mod tests {
             .record_child_link(request.parent_id, request.child_id, false)
             .await
             .unwrap();
-        let staging = child_staging_path(root, request).unwrap();
+        let staging = child_staging_path(root, request, None).unwrap();
         let summary = manager
-            .prepare_child_storage(&staging, request, execution)
+            .prepare_child_storage(&staging, request, execution, None)
             .await
             .unwrap();
         fs::rename(
@@ -1290,7 +1459,7 @@ mod tests {
             conflict.name = Some("different child".into());
             assert!(
                 manager
-                    .create_child_session_inner(conflict, execution.clone())
+                    .create_child_session_inner(conflict, execution.clone(), None)
                     .await
                     .is_err()
             );
@@ -1299,7 +1468,7 @@ mod tests {
                 conflict.attempt += 1;
                 assert!(
                     manager
-                        .create_child_session_inner(child_request.clone(), Some(conflict))
+                        .create_child_session_inner(child_request.clone(), Some(conflict), None)
                         .await
                         .is_err()
                 );
@@ -1312,7 +1481,7 @@ mod tests {
             }
             for _ in 0..2 {
                 let retried = manager
-                    .create_child_session_inner(child_request.clone(), execution.clone())
+                    .create_child_session_inner(child_request.clone(), execution.clone(), None)
                     .await
                     .unwrap();
                 assert_eq!(retried.id, child_request.child_id);
@@ -1329,7 +1498,7 @@ mod tests {
             let foreign = SessionManager::persistent(root.path()).unwrap();
             assert!(
                 foreign
-                    .create_child_session_inner(child_request.clone(), execution.clone())
+                    .create_child_session_inner(child_request.clone(), execution.clone(), None)
                     .await
                     .is_err()
             );
@@ -1367,6 +1536,63 @@ mod tests {
             parent_id: parent,
             name: Some("child".into()),
             working_directory: std::env::current_dir().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_children_publish_exact_parent_lineage_once() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let requests: Vec<_> = (0..32).map(|_| request(parent.id)).collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        for creation in &requests {
+            let manager = manager.clone();
+            let creation = creation.clone();
+            tasks.spawn(async move {
+                let child = manager
+                    .create_child_session(creation.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(child.id, creation.child_id);
+                assert_eq!(child.parent_id, Some(creation.parent_id));
+                manager.create_child_session(creation).await.unwrap();
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        let events = manager.session_history(parent.id).await.unwrap();
+        for creation in requests {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind, SessionEventKind::SessionChildLinked { child_id }
+                            if child_id == creation.child_id
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind, SessionEventKind::SessionChildPublished { child_id, .. }
+                            if child_id == creation.child_id
+                    ))
+                    .count(),
+                1
+            );
+            let child_events = manager.session_history(creation.child_id).await.unwrap();
+            let expected_parent_id = parent.id;
+            assert_eq!(child_events.iter().filter(|event| matches!(
+                &event.kind, SessionEventKind::ChildSessionCreated { request, .. }
+                    if request.parent_id == expected_parent_id && request.child_id == creation.child_id
+            )).count(), 1);
         }
     }
 

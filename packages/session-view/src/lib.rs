@@ -36,6 +36,80 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[derive(Clone, Copy)]
+enum StreamAdmission {
+    Accepted,
+    Degraded,
+    Ignored,
+}
+
+impl StreamAdmission {
+    const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+
+    const fn is_degraded(self) -> bool {
+        matches!(self, Self::Degraded)
+    }
+}
+
+struct StagedReasoningStream {
+    stream_id: TranscriptViewItemId,
+    state: TextStreamViewState,
+    admission: StreamAdmission,
+    reset: bool,
+    activity_key: (String, String),
+    cache: Option<LiveReasoningActivity>,
+    item: Option<StagedReasoningItem>,
+    pending: StagedPendingText,
+    terminal: bool,
+}
+
+struct StagedTurnText {
+    id: TranscriptViewItemId,
+    item: Option<(usize, TranscriptViewItem)>,
+    reasoning: Option<((String, String), LiveReasoningActivity)>,
+}
+type StagedTurnTextFlush = Vec<StagedTurnText>;
+type StagedReasoningItem = (
+    Option<usize>,
+    TranscriptViewItem,
+    Option<Vec<TranscriptViewItem>>,
+);
+type StagedActivityMessage = (
+    Option<usize>,
+    TranscriptViewItem,
+    Option<Vec<TranscriptViewItem>>,
+    Option<String>,
+    Option<String>,
+);
+type StagedOrderedStream = (
+    (
+        TranscriptViewItemId,
+        TranscriptViewItemId,
+        TextStreamViewState,
+    ),
+    (
+        Option<TranscriptViewItemId>,
+        Option<bcode_session_models::TextStreamUpdate>,
+    ),
+);
+type StagedPendingText = Option<(TranscriptViewItemId, Option<PendingTextPresentation>)>;
+type StagedStreamPresentation = (Option<TranscriptViewItem>, StagedPendingText);
+type StagedStreamTranscript = (
+    Option<usize>,
+    Option<TranscriptViewItem>,
+    Option<Vec<TranscriptViewItem>>,
+    StagedPendingText,
+);
+type OrderedStreamOwners<'a> = (
+    &'a TranscriptViewItemId,
+    &'a TranscriptViewItemId,
+    Option<&'a TranscriptViewItemId>,
+    Option<&'a bcode_session_models::TextStreamUpdate>,
+);
+type OrderedTranscriptOwners<'a> = (Option<usize>, Option<&'a TranscriptViewItem>, Option<usize>);
+
 #[derive(Debug, Clone, Default)]
 struct LiveReasoningActivity {
     order: u32,
@@ -60,6 +134,18 @@ impl LiveReasoningActivity {
     }
 
     fn apply(&mut self, event: &bcode_session_models::ReasoningActivityEvent) {
+        self.apply_admitted(event, None)
+            .expect("unrestricted reasoning update cannot reject admission");
+    }
+
+    fn apply_admitted(
+        &mut self,
+        event: &bcode_session_models::ReasoningActivityEvent,
+        mut admission: Option<(
+            &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+            bcode_session_view_models::retention::ObservationRetentionLimits,
+        )>,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
         use bcode_session_models::ReasoningActivityEvent;
         self.order = event.activity_order();
         match event {
@@ -72,16 +158,27 @@ impl LiveReasoningActivity {
                 text,
                 ..
             } => {
-                self.parts
-                    .entry(part_id.clone())
-                    .and_modify(|part| part.text.push_str(text))
-                    .or_insert_with(|| bcode_session_models::ReasoningPart {
-                        part_id: part_id.clone(),
-                        kind: *kind,
-                        role: *role,
-                        order: *part_order,
-                        text: text.clone(),
-                    });
+                if let Some(part) = self.parts.get_mut(part_id) {
+                    append_observation_text(
+                        &mut part.text,
+                        text,
+                        admission
+                            .as_mut()
+                            .map(|(usage, limits)| (&mut **usage, *limits)),
+                    )?;
+                } else {
+                    let (key, part) = stage_reasoning_part(
+                        part_id,
+                        *kind,
+                        *role,
+                        *part_order,
+                        text,
+                        admission
+                            .as_mut()
+                            .map(|(usage, limits)| (&mut **usage, *limits)),
+                    )?;
+                    self.parts.insert(key, part);
+                }
             }
             ReasoningActivityEvent::PartCompleted {
                 part_id,
@@ -91,21 +188,324 @@ impl LiveReasoningActivity {
                 text,
                 ..
             } => {
-                self.parts.insert(
-                    part_id.clone(),
-                    bcode_session_models::ReasoningPart {
-                        part_id: part_id.clone(),
-                        kind: *kind,
-                        role: *role,
-                        order: *part_order,
-                        text: text.clone(),
-                    },
-                );
+                let (key, part) = stage_reasoning_part(
+                    part_id,
+                    *kind,
+                    *role,
+                    *part_order,
+                    text,
+                    admission
+                        .as_mut()
+                        .map(|(usage, limits)| (&mut **usage, *limits)),
+                )?;
+                self.parts.insert(key, part);
             }
             ReasoningActivityEvent::OpaqueObserved { .. } => self.opaque = true,
             ReasoningActivityEvent::Finished { .. } => self.finished = true,
         }
+        Ok(())
     }
+}
+
+fn stage_reasoning_part(
+    id: &str,
+    kind: bcode_session_models::ReasoningContentKind,
+    role: bcode_session_models::ReasoningContentRole,
+    order: u32,
+    text: &str,
+    admission: Option<(
+        &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionLimits,
+    )>,
+) -> Result<
+    (String, bcode_session_models::ReasoningPart),
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    let (key, part_id, text) = if let Some((next, limits)) = admission {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        next.try_add(
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                value_nodes: 6,
+                depth: 5,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        (
+            next.try_clone_string(id, 4, limits)?,
+            next.try_clone_string(id, 5, limits)?,
+            next.try_clone_string(text, 5, limits)?,
+        )
+    } else {
+        (id.to_owned(), id.to_owned(), text.to_owned())
+    };
+    Ok((
+        key,
+        bcode_session_models::ReasoningPart {
+            part_id,
+            kind,
+            role,
+            order,
+            text,
+        },
+    ))
+}
+
+fn stage_draft_placement_id(
+    id: &str,
+    placement: bcode_session_models::ToolContributionPlacement,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<TranscriptViewItemId, bcode_session_view_models::retention::ObservationRetentionExceeded>
+{
+    use bcode_session_models::ToolContributionPlacement;
+    let text = match placement {
+        ToolContributionPlacement::Hidden => format_observation_text(
+            format_args!("legacy-hidden:{id}:request-draft"),
+            next,
+            limits,
+            5,
+        )?,
+        ToolContributionPlacement::Supplemental => format_observation_text(
+            format_args!("tool:{id}:supplemental:request-draft"),
+            next,
+            limits,
+            5,
+        )?,
+        _ => format_observation_text(format_args!("tool:{id}"), next, limits, 5)?,
+    };
+    Ok(TranscriptViewItemId::new(text))
+}
+
+fn stage_contribution_id(
+    contribution: &bcode_session_models::ToolContributionEvent,
+    placement: bcode_session_models::ToolContributionPlacement,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<TranscriptViewItemId, bcode_session_view_models::retention::ObservationRetentionExceeded>
+{
+    use bcode_session_models::ToolContributionPlacement;
+    let text = match placement {
+        ToolContributionPlacement::Supplemental => format_observation_text(
+            format_args!(
+                "tool:{}:supplemental:{}",
+                contribution.invocation_id, contribution.contribution_id
+            ),
+            next,
+            limits,
+            5,
+        )?,
+        ToolContributionPlacement::Hidden => format_observation_text(
+            format_args!(
+                "legacy-hidden:{}:{}",
+                contribution.invocation_id, contribution.contribution_id
+            ),
+            next,
+            limits,
+            5,
+        )?,
+        _ => format_observation_text(
+            format_args!("tool:{}", contribution.invocation_id),
+            next,
+            limits,
+            5,
+        )?,
+    };
+    Ok(TranscriptViewItemId::new(text))
+}
+
+fn reasoning_entry_usage(
+    key: &(String, String),
+    cache: &LiveReasoningActivity,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    bcode_session_view_models::retention::ObservationRetentionUsage,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let mut usage = ObservationRetentionUsage {
+        collection_entries: 1,
+        value_nodes: 3,
+        depth: 4,
+        ..ObservationRetentionUsage::default()
+    };
+    usage.try_add(ObservationRetentionUsage::string(&key.0, 3), limits)?;
+    usage.try_add(ObservationRetentionUsage::string(&key.1, 3), limits)?;
+    usage.try_add(
+        ObservationRetentionUsage::collection(cache.parts.len(), 4),
+        limits,
+    )?;
+    for (id, part) in &cache.parts {
+        usage.try_add(ObservationRetentionUsage::string(id, 5), limits)?;
+        usage.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 3,
+                depth: 6,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        usage.try_add(ObservationRetentionUsage::string(&part.part_id, 6), limits)?;
+        usage.try_add(ObservationRetentionUsage::string(&part.text, 6), limits)?;
+    }
+    Ok(usage)
+}
+
+fn stage_complete_reasoning_cache(
+    activity: &bcode_session_models::ReasoningActivity,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<LiveReasoningActivity, bcode_session_view_models::retention::ObservationRetentionExceeded>
+{
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let mut cache = LiveReasoningActivity {
+        order: activity.order,
+        parts: BTreeMap::new(),
+        opaque: activity.opaque,
+        finished: true,
+    };
+    for part in &activity.parts {
+        let part_key = next.try_clone_string(&part.part_id, 4, limits)?;
+        admit_view_phase(
+            next,
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                value_nodes: 3,
+                depth: 5,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+            "stage_complete_reasoning_cache",
+        )?;
+        let part_id = next.try_clone_string(&part.part_id, 5, limits)?;
+        let text = next.try_clone_string(&part.text, 5, limits)?;
+        cache.parts.insert(
+            part_key,
+            bcode_session_models::ReasoningPart {
+                part_id,
+                text,
+                kind: part.kind,
+                role: part.role,
+                order: part.order,
+            },
+        );
+    }
+
+    Ok(cache)
+}
+
+fn stage_live_reasoning_view(
+    cache: &LiveReasoningActivity,
+    key: &(String, String),
+    visible: bool,
+    mode: bcode_session_view_models::ReasoningDisplayMode,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    bcode_session_view_models::ReasoningActivityView,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    let activity_id = next.try_clone_string(&key.1, 6, limits)?;
+    let turn_id = next.try_clone_string(&key.0, 6, limits)?;
+    next.try_add(
+        ObservationRetentionUsage {
+            collection_entries: cache.parts.len(),
+            value_nodes: 6,
+            depth: 8,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    let mut parts = Vec::with_capacity(cache.parts.len());
+    if parts.capacity() != cache.parts.len() {
+        return Err(ObservationRetentionExceeded);
+    }
+    for part in cache.parts.values() {
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 3,
+                depth: 8,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        parts.push(bcode_session_models::ReasoningPart {
+            part_id: next.try_clone_string(&part.part_id, 8, limits)?,
+            text: next.try_clone_string(&part.text, 8, limits)?,
+            kind: part.kind,
+            role: part.role,
+            order: part.order,
+        });
+    }
+    let finished = cache.finished;
+    let activity = bcode_session_models::ReasoningActivity {
+        activity_id,
+        order: cache.order,
+        parts,
+        status: if finished {
+            bcode_session_models::ReasoningActivityStatus::Completed
+        } else {
+            bcode_session_models::ReasoningActivityStatus::Interrupted
+        },
+        opaque: cache.opaque,
+    };
+    let mut view = reasoning_activity_view_owned(turn_id, activity, visible, mode);
+    view.finished = finished;
+
+    Ok(view)
+}
+
+fn stage_cancelled_message(
+    existing: Option<&ChatMessageView>,
+    event: &SessionEvent,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<ChatMessageView, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let mut message = if let Some(message) = existing {
+        clone_admitted(message, next, limits, |value| {
+            let mut usage = bcode_session_view_models::retention::inspect_chat(value, limits)?;
+            usage.depth = usage
+                .depth
+                .checked_add(5)
+                .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+            usage.check(limits)?;
+            Ok(usage)
+        })?
+    } else {
+        admit_view_phase(
+            next,
+            ObservationRetentionUsage {
+                value_nodes: 4,
+                depth: 7,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+            "stage_cancelled_message",
+        )?;
+        ChatMessageView::plain(next.try_clone_string("Submission cancelled", 7, limits)?)
+    };
+    let label = next.try_clone_string("Cancelled before activation", 7, limits)?;
+    admit_view_phase(
+        next,
+        ObservationRetentionUsage {
+            value_nodes: 1,
+            depth: 8,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+        "stage_cancelled_message",
+    )?;
+    message.submission_status = Some(bcode_session_models::SubmissionStatus::Cancelled {
+        event_sequence: event.sequence,
+    });
+    message.display_label = Some(label);
+
+    Ok(message)
 }
 
 const fn submission_context_label(
@@ -119,6 +519,941 @@ const fn submission_context_label(
             "Pending: execution context incompatible; restore compatible configuration before retrying recovery"
         }
     }
+}
+
+fn simple_tool_aggregate_usage(
+    key: &String,
+    projection: &ToolInvocationProjection,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    bcode_session_view_models::retention::ObservationRetentionUsage,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let mut usage =
+        bcode_session_models::retention_events::inspect_tool_projection(projection, &limits)?;
+    usage.try_add(ObservationRetentionUsage::string(key, 3), limits)?;
+    usage.try_add(
+        ObservationRetentionUsage {
+            collection_entries: 1,
+            value_nodes: 9,
+            depth: 5,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    Ok(usage)
+}
+
+fn stage_json_field(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let key = retained.try_clone_string(key, 7, limits)?;
+    retained.try_add(
+        ObservationRetentionUsage {
+            collection_entries: 1,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    fields.insert(key, value);
+    Ok(())
+}
+
+fn stage_artifact_payload(
+    artifact: &bcode_session_models::ToolArtifact,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<serde_json::Value, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let mut next = *retained;
+    next.try_add(
+        ObservationRetentionUsage {
+            value_nodes: 1,
+            depth: 6,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    let mut fields = serde_json::Map::new();
+    for (key, value) in [
+        ("artifact_id", Some(artifact.artifact_id.as_str())),
+        (
+            "producer_plugin_id",
+            Some(artifact.producer_plugin_id.as_str()),
+        ),
+        ("schema", Some(artifact.schema.as_str())),
+        ("tool_call_id", artifact.tool_call_id.as_deref()),
+        ("title", artifact.title.as_deref()),
+    ] {
+        if let Some(value) = value {
+            let value = next.try_clone_string(value, 7, limits)?;
+            stage_json_field(
+                &mut fields,
+                key,
+                serde_json::Value::String(value),
+                &mut next,
+                limits,
+            )?;
+        }
+    }
+    next.try_add(
+        ObservationRetentionUsage {
+            value_nodes: 1,
+            depth: 7,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    stage_json_field(
+        &mut fields,
+        "schema_version",
+        artifact.schema_version.into(),
+        &mut next,
+        limits,
+    )?;
+    if !artifact.metadata.is_null() {
+        let value = clone_admitted(&artifact.metadata, &mut next, limits, |value| {
+            ObservationRetentionUsage::json(value, limits)
+        })?;
+        stage_json_field(&mut fields, "metadata", value, &mut next, limits)?;
+    }
+    if !artifact.refs.is_empty() {
+        let refs = stage_artifact_references(&artifact.refs, &mut next, limits)?;
+        stage_json_field(&mut fields, "refs", refs, &mut next, limits)?;
+    }
+    *retained = next;
+    Ok(serde_json::Value::Object(fields))
+}
+
+fn stage_artifact_references(
+    refs: &[bcode_session_models::ToolArtifactRef],
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<serde_json::Value, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    next.try_add(
+        ObservationRetentionUsage {
+            collection_entries: refs.len(),
+            value_nodes: 1,
+            depth: 7,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    let mut values = Vec::with_capacity(refs.len());
+    if values.capacity() != refs.len() {
+        return Err(ObservationRetentionExceeded);
+    }
+    for reference in refs {
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 1,
+                depth: 8,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let mut fields = serde_json::Map::new();
+        for (key, value) in [
+            ("key", Some(reference.key.as_str())),
+            ("content_type", reference.content_type.as_deref()),
+            ("storage_uri", reference.storage_uri.as_deref()),
+        ] {
+            if let Some(value) = value {
+                let value = next.try_clone_string(value, 9, limits)?;
+                stage_reference_field(
+                    &mut fields,
+                    key,
+                    serde_json::Value::String(value),
+                    next,
+                    limits,
+                )?;
+            }
+        }
+        if let Some(length) = reference.byte_len {
+            next.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 1,
+                    depth: 9,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            stage_reference_field(&mut fields, "byte_len", length.into(), next, limits)?;
+        }
+        if let Some(metadata) = &reference.metadata {
+            let value = clone_admitted(metadata, next, limits, |value| {
+                let mut charge = ObservationRetentionUsage::json(value, limits)?;
+                charge.depth = charge
+                    .depth
+                    .checked_add(8)
+                    .ok_or(ObservationRetentionExceeded)?;
+                charge.check(limits)?;
+                Ok(charge)
+            })?;
+            stage_reference_field(&mut fields, "metadata", value, next, limits)?;
+        }
+        values.push(serde_json::Value::Object(fields));
+    }
+    Ok(serde_json::Value::Array(values))
+}
+
+fn stage_reference_field(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let key = next.try_clone_string(key, 9, limits)?;
+    next.try_add(
+        ObservationRetentionUsage {
+            collection_entries: 1,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    fields.insert(key, value);
+    Ok(())
+}
+
+fn stage_tool_view(
+    projection: &ToolInvocationProjection,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<ToolInvocationView, bcode_session_view_models::retention::ObservationRetentionExceeded>
+{
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    let mut next = *retained;
+    next.try_add(
+        ObservationRetentionUsage {
+            value_nodes: 12,
+            depth: 7,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    let staged = clone_admitted(projection, &mut next, limits, |value| {
+        bcode_session_models::retention_events::inspect_tool_projection(value, &limits)
+    })?;
+    let payload = match staged.raw_result.as_ref() {
+        Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }) => {
+            Some(stage_artifact_payload(artifact, &mut next, limits)?)
+        }
+        _ => None,
+    };
+    let mut staged = staged;
+    let timing = ToolTimingView {
+        started_at_ms: staged.started_at_ms,
+        finished_at_ms: staged.finished_at_ms,
+        timeout_ms: projection_timeout_ms(staged.raw_result.as_ref()),
+        timed_out: projection_timed_out(staged.raw_result.as_ref()),
+        duration_ms: staged
+            .duration_ms
+            .or_else(|| projection_duration_ms(staged.raw_result.as_ref())),
+    };
+    let raw = staged.raw_result.take();
+    let presentation =
+        staged
+            .presentation
+            .take()
+            .map(|update| bcode_session_view_models::ToolPresentationView {
+                producer_id: update.producer_id,
+                generation: update.generation,
+                revision: update.revision,
+                retention: update.retention,
+                schema: update.schema,
+                schema_version: update.schema_version,
+                artifact: update.artifact,
+                payload: update.payload,
+            });
+    let mut view = tool_invocation_view_from_projection(staged);
+    view.presentation = presentation;
+    view.timing = timing;
+    view.result = match raw {
+        Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }) => {
+            Some(ToolResultView::Artifact {
+                artifact: bcode_session_view_models::ToolArtifactView {
+                    artifact: *artifact,
+                    generic_payload: payload.ok_or(ObservationRetentionExceeded)?,
+                },
+            })
+        }
+        Some(value) => Some(ToolResultView::from(value)),
+        None => None,
+    };
+    // Projection and view have different fixed envelopes, but every scalar and
+    // nested owner above is reserved before cloning or conversion.
+    next.try_add(
+        ObservationRetentionUsage {
+            value_nodes: 12,
+            depth: 7,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    *retained = next;
+    Ok(view)
+}
+
+fn stage_terminal_interaction(
+    id: &str,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    InteractionViewSummary,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let mut next = *retained;
+    next.try_add(
+        ObservationRetentionUsage {
+            value_nodes: 13,
+            depth: 6,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    let interaction_id = next.try_clone_string(id, 6, limits)?;
+    let kind = next.try_clone_string("bcode.tool.exchange", 6, limits)?;
+    let title = next.try_clone_string("Interaction", 7, limits)?;
+    *retained = next;
+    Ok(InteractionViewSummary {
+        interaction_id,
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
+        kind,
+        tool_call_id: None,
+        title: Some(title),
+        required: false,
+        snapshot: None,
+        state: InteractionViewState::Pending,
+        status_detail: None,
+        resolved: false,
+        resolution: None,
+    })
+}
+
+fn clone_admitted<T: Clone>(
+    value: &T,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    inspect: impl Fn(
+        &T,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    >,
+) -> Result<T, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    let charge = inspect(value)?;
+    let mut next = *retained;
+    next.try_add(charge, limits)?;
+    let cloned = value.clone();
+    let actual = inspect(&cloned)?;
+    reconcile_clone_capacity(charge, actual)?;
+    next.try_release(charge)?;
+    next.try_add(actual, limits)?;
+    *retained = next;
+    Ok(cloned)
+}
+
+fn stage_interaction_request(
+    request: &bcode_session_models::ToolExchangeRequest,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    InteractionViewSummary,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let mut next = *retained;
+    next.try_add(
+        ObservationRetentionUsage {
+            value_nodes: 13,
+            depth: 6,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    let id = next.try_clone_string(&request.exchange_id, 6, limits)?;
+    let producer = next.try_clone_string(&request.producer_id, 7, limits)?;
+    let title = next.try_clone_string(&request.producer_id, 7, limits)?;
+    let schema = next.try_clone_string(&request.schema, 7, limits)?;
+    let kind = next.try_clone_string(&request.schema, 6, limits)?;
+    let invocation = next.try_clone_string(&request.invocation_id, 7, limits)?;
+    let payload = clone_admitted(&request.payload, &mut next, limits, |value| {
+        ObservationRetentionUsage::json(value, limits)
+    })?;
+    *retained = next;
+    Ok(InteractionViewSummary {
+        interaction_id: id,
+        producer_id: Some(producer),
+        exchange_schema: Some(schema),
+        exchange_schema_version: Some(request.schema_version),
+        kind,
+        tool_call_id: Some(invocation),
+        title: Some(title),
+        required: request.response_policy
+            == bcode_session_models::ToolExchangeResponsePolicy::Required,
+        snapshot: Some(payload),
+        state: InteractionViewState::Pending,
+        status_detail: None,
+        resolved: false,
+        resolution: None,
+    })
+}
+
+fn stage_skill_context_note(
+    event: &SessionEvent,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<String, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    let SessionEventKind::SkillContextLoaded {
+        skill_id,
+        bytes_loaded,
+        truncated,
+        source,
+        preview,
+        ..
+    } = &event.kind
+    else {
+        return Err(ObservationRetentionExceeded);
+    };
+    let mut next = *retained;
+    let source_text = source
+        .as_ref()
+        .map(|source| {
+            if let Some(path) = &source.path {
+                format_observation_text(
+                    format_args!("\nSource: {}\nFile: {path}", source.label),
+                    &mut next,
+                    limits,
+                    6,
+                )
+            } else {
+                format_observation_text(
+                    format_args!("\nSource: {}", source.label),
+                    &mut next,
+                    limits,
+                    6,
+                )
+            }
+        })
+        .transpose()?;
+    let preview_text = preview
+        .as_ref()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| {
+            format_observation_text(format_args!("\n\nPreview:\n{text}"), &mut next, limits, 6)
+        })
+        .transpose()?;
+    let suffix = if *truncated { " truncated" } else { "" };
+    let text = format_observation_text(
+        format_args!(
+            "loaded {skill_id}{}\nBytes: {bytes_loaded}{suffix}{}",
+            source_text.as_deref().unwrap_or(""),
+            preview_text.as_deref().unwrap_or("")
+        ),
+        &mut next,
+        limits,
+        6,
+    )?;
+    for temporary in [&source_text, &preview_text].into_iter().flatten() {
+        next.try_release(ObservationRetentionUsage::string(temporary, 6))?;
+    }
+    drop((source_text, preview_text));
+    *retained = next;
+    Ok(text)
+}
+
+type StagedInteractionOwners = (
+    InteractionViewSummary,
+    Option<usize>,
+    Option<Vec<InteractionViewSummary>>,
+    TranscriptViewItem,
+    Option<usize>,
+    Option<Vec<TranscriptViewItem>>,
+    String,
+    String,
+);
+
+type StagedPositionedSegment = (
+    TranscriptViewItemId,
+    TextStreamViewState,
+    Option<usize>,
+    TranscriptViewItem,
+    Option<Vec<TranscriptViewItem>>,
+    Option<usize>,
+    Option<TurnOutputLocation>,
+);
+
+type StagedToolItem = (
+    String,
+    ToolInvocationView,
+    TranscriptViewItem,
+    Option<Vec<TranscriptViewItem>>,
+    String,
+    TranscriptViewItemId,
+    Option<usize>,
+);
+
+type SubmissionViewFields<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>);
+
+fn submission_view_fields(
+    event: &SessionEvent,
+) -> Result<
+    SubmissionViewFields<'_>,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::ObservationRetentionExceeded;
+    match &event.kind {
+        SessionEventKind::SubmissionAccepted { submission } => Ok((
+            &submission.id.0,
+            submission.text.as_str(),
+            Some(match submission.requested_placement {
+                bcode_session_models::SubmissionPlacement::Steer => "Steering pending",
+                bcode_session_models::SubmissionPlacement::FollowUp => "Follow-up pending",
+            }),
+            None,
+        )),
+        SessionEventKind::SubmissionActivated {
+            submission_id,
+            turn_id,
+            text,
+            admission,
+            ..
+        } => Ok((
+            &submission_id.0,
+            text.as_str(),
+            admission
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.display_label.as_deref()),
+            Some(turn_id.0.as_str()),
+        )),
+        _ => Err(ObservationRetentionExceeded),
+    }
+}
+
+fn streaming_finish_target_index(
+    items: &[TranscriptViewItem],
+    kind: StreamingMessageKind,
+) -> Option<usize> {
+    match kind {
+        StreamingMessageKind::Assistant => items
+            .iter()
+            .rposition(|item| item.streaming && streaming_item_matches(&item.kind, kind)),
+        StreamingMessageKind::Reasoning => items.len().checked_sub(1).filter(|index| {
+            items[*index].streaming && streaming_item_matches(&items[*index].kind, kind)
+        }),
+    }
+}
+
+fn stage_tool_projection(
+    event: &SessionEvent,
+    id: &str,
+    old: Option<&ToolInvocationAggregate>,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    bcode_session_models::ToolInvocationProjection,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    let mut projections = BTreeMap::new();
+    if let Some(old) = old {
+        let key = next.try_clone_string(id, 3, limits)?;
+        next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+        let projection = clone_admitted(&old.projection, next, limits, |value| {
+            bcode_session_models::retention_events::inspect_tool_projection(value, &limits)
+        })?;
+        projections.insert(key, projection);
+    }
+    bcode_session_models::apply_tool_invocation_projection_event_bounded(
+        &mut projections,
+        event,
+        next,
+        &limits,
+    )?;
+    let (_, projection) = projections
+        .pop_first()
+        .ok_or(ObservationRetentionExceeded)?;
+    Ok(projection)
+}
+
+fn stage_submission_status(
+    turn_id: Option<&str>,
+    sequence: u64,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    bcode_session_models::SubmissionStatus,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    if let Some(turn_id) = turn_id {
+        let turn_id = next.try_clone_string(turn_id, 8, limits)?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 1,
+                depth: 8,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        Ok(bcode_session_models::SubmissionStatus::Activated {
+            turn_id: bcode_session_models::TurnId(turn_id),
+            conversation_sequence: sequence,
+        })
+    } else {
+        Ok(bcode_session_models::SubmissionStatus::Pending)
+    }
+}
+
+fn stage_insert_buffer<T>(
+    items: &Vec<T>,
+    insert: bool,
+    depth: usize,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<Option<Vec<T>>, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    let len = items
+        .len()
+        .checked_add(usize::from(insert))
+        .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+    stage_collection_growth(items.capacity(), len, depth, next, limits)
+}
+
+fn finish_durable_message_item(item: &mut TranscriptViewItem, event: &SessionEvent, delta: bool) {
+    if !delta {
+        item.sequence = (event.sequence != 0)
+            .then_some(event.sequence)
+            .or(item.sequence);
+        item.timestamp_ms = Some(event.timestamp_ms);
+        item.streaming = false;
+    }
+    item.revision = item.revision.saturating_add(1);
+}
+
+fn stage_output_location(
+    turn_id: &str,
+    position: bcode_session_models::TurnOutputPosition,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<TurnOutputLocation, bcode_session_view_models::retention::ObservationRetentionExceeded>
+{
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let turn_id = next.try_clone_string(turn_id, 7, limits)?;
+    next.try_add(
+        ObservationRetentionUsage {
+            value_nodes: 1,
+            depth: 7,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    Ok(TurnOutputLocation { turn_id, position })
+}
+
+fn stage_path_display(
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+    next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<String, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    let displayed = bcode_plugin_sdk::path::display_bounded(
+        path,
+        cwd,
+        bcode_plugin_sdk::path::PathDisplayLimits {
+            scalar_capacity_bytes: limits.scalar_capacity_bytes,
+            collection_entries: limits.collection_entries,
+            value_nodes: limits.value_nodes,
+            depth: limits.depth,
+        },
+        |usage| {
+            let charge = ObservationRetentionUsage {
+                scalar_capacity_bytes: usage.scalar_capacity_bytes,
+                collection_entries: usage.collection_entries,
+                value_nodes: usage.value_nodes,
+                depth: usage
+                    .depth
+                    .checked_add(5)
+                    .ok_or(ObservationRetentionExceeded)?,
+                ..ObservationRetentionUsage::default()
+            };
+            let mut admitted = *next;
+            admitted.try_add(charge, limits)?;
+            Ok::<_, ObservationRetentionExceeded>((admitted, charge))
+        },
+    )
+    .map_err(|_| ObservationRetentionExceeded)?;
+    let bcode_plugin_sdk::path::BoundedPathDisplay {
+        output,
+        admission: (mut admitted, peak),
+    } = displayed;
+    admitted.try_release(peak)?;
+    admitted.try_add(ObservationRetentionUsage::string(&output, 7), limits)?;
+    *next = admitted;
+    Ok(output)
+}
+
+fn advance_assistant_stream_state(
+    state: &mut TextStreamViewState,
+    update: &bcode_session_models::TextStreamUpdate,
+    previous: Option<&bcode_session_models::TextStreamUpdate>,
+) -> (bool, bool) {
+    use bcode_session_models::TextStreamOperation;
+    if update.revision < state.revision {
+        return (false, false);
+    }
+    if update.revision == state.revision {
+        if previous != Some(update) {
+            state.status = TextStreamViewStatus::Degraded;
+            return (false, true);
+        }
+        return (false, false);
+    }
+    if !matches!(update.operation, TextStreamOperation::Checkpoint { .. })
+        && update.first_revision != state.revision.saturating_add(1)
+    {
+        state.status = TextStreamViewStatus::Degraded;
+        return (false, true);
+    }
+    match &update.operation {
+        TextStreamOperation::Append {
+            expected_offset,
+            text,
+        } => {
+            if !matches!(
+                state.status,
+                TextStreamViewStatus::Healthy | TextStreamViewStatus::Incomplete
+            ) || state.accepted_bytes != *expected_offset
+            {
+                state.status = TextStreamViewStatus::Degraded;
+                return (false, true);
+            }
+            state.revision = update.revision;
+            state.accepted_bytes = state.accepted_bytes.saturating_add(text.len());
+        }
+        TextStreamOperation::Checkpoint {
+            start_offset,
+            text,
+            total_bytes,
+            truncated,
+        } => {
+            if start_offset.saturating_add(text.len()) > *total_bytes {
+                state.status = TextStreamViewStatus::Degraded;
+                return (false, true);
+            }
+            state.generation = update.generation;
+            state.revision = update.revision;
+            state.accepted_bytes = *total_bytes;
+            state.truncated = *truncated || *start_offset != 0;
+            state.status = if state.truncated {
+                TextStreamViewStatus::Incomplete
+            } else {
+                TextStreamViewStatus::Healthy
+            };
+        }
+        TextStreamOperation::Terminal { status } => {
+            state.revision = update.revision;
+            state.status = TextStreamViewStatus::Terminal(*status);
+        }
+    }
+    (true, false)
+}
+
+fn stage_prompt_title(
+    prompt: &str,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<String, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    struct Title<'a>(&'a str);
+    impl std::fmt::Display for Title<'_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for (index, word) in self.0.split_whitespace().take(8).enumerate() {
+                if index != 0 {
+                    formatter.write_str(" ")?;
+                }
+                formatter.write_str(word)?;
+            }
+            Ok(())
+        }
+    }
+    if prompt.split_whitespace().next().is_none() {
+        return retained.try_clone_string("Untitled session", 3, limits);
+    }
+    format_observation_text(format_args!("{}", Title(prompt)), retained, limits, 3)
+}
+
+fn release_item_text(
+    item: &TranscriptViewItem,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    let (TranscriptViewItemKind::AssistantMessage { message }
+    | TranscriptViewItemKind::ReasoningMessage { message }) = &item.kind
+    else {
+        return Err(ObservationRetentionExceeded);
+    };
+    retained.try_release(ObservationRetentionUsage::string(&message.text, 7))
+}
+
+fn clone_context_occupancy_exact(
+    value: &bcode_session_models::RequestContextOccupancy,
+) -> bcode_session_models::RequestContextOccupancy {
+    bcode_session_models::RequestContextOccupancy {
+        context_epoch: value.context_epoch,
+        observation_sequence: value.observation_sequence,
+        observation: clone_context_observation_exact(&value.observation),
+    }
+}
+
+fn clone_context_observation_exact(
+    observation: &bcode_session_models::RequestContextObservation,
+) -> bcode_session_models::RequestContextObservation {
+    let bcode_session_models::RequestContextObservation {
+        request,
+        context_through_sequence,
+        context_tokens,
+        local_estimate,
+    } = observation;
+    let bcode_session_models::ModelRequestIdentity {
+        provider_plugin_id,
+        requested_model_id,
+        effective_model_id,
+        request_id,
+        model_turn_id,
+        round,
+        request_fingerprint,
+        effective_auth_profile,
+        context_format_version,
+        compatibility_key,
+        context_epoch: request_epoch,
+    } = request;
+    let clone_text = |text: &String| Box::<str>::from(text.as_str()).into_string();
+    let request = bcode_session_models::ModelRequestIdentity {
+        provider_plugin_id: clone_text(provider_plugin_id),
+        requested_model_id: requested_model_id.as_ref().map(clone_text),
+        effective_model_id: clone_text(effective_model_id),
+        request_id: clone_text(request_id),
+        model_turn_id: clone_text(model_turn_id),
+        round: *round,
+        request_fingerprint: clone_text(request_fingerprint),
+        effective_auth_profile: effective_auth_profile.as_ref().map(clone_text),
+        context_format_version: *context_format_version,
+        compatibility_key: compatibility_key.as_ref().map(clone_text),
+        context_epoch: *request_epoch,
+    };
+    let bcode_session_models::LocalContextEstimate {
+        tokens,
+        algorithm_version,
+    } = local_estimate;
+    bcode_session_models::RequestContextObservation {
+        request,
+        context_through_sequence: *context_through_sequence,
+        context_tokens: *context_tokens,
+        local_estimate: bcode_session_models::LocalContextEstimate {
+            tokens: *tokens,
+            algorithm_version: *algorithm_version,
+        },
+    }
+}
+
+fn stage_collection_growth<T>(
+    capacity: usize,
+    required: usize,
+    depth: usize,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<Option<Vec<T>>, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    if required <= capacity {
+        return Ok(None);
+    }
+    let mut next = *retained;
+    next.try_add(
+        ObservationRetentionUsage::collection(required, depth),
+        limits,
+    )?;
+    let replacement = Vec::with_capacity(required);
+    if replacement.capacity() != required {
+        return Err(ObservationRetentionExceeded);
+    }
+    next.try_release(ObservationRetentionUsage::collection(capacity, depth))?;
+    *retained = next;
+    Ok(Some(replacement))
+}
+
+fn summary_snapshot_usage(
+    summary: &bcode_session_models::SessionSummary,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    bcode_session_view_models::retention::ObservationRetentionUsage,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::ObservationRetentionExceeded;
+    let mut usage =
+        bcode_session_models::retention_events::inspect_session_summary(summary, &limits)?;
+    usage.depth = usage
+        .depth
+        .checked_add(2)
+        .ok_or(ObservationRetentionExceeded)?;
+    usage.check(limits)?;
+    Ok(usage)
+}
+
+fn admit_view_phase(
+    ledger: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    charge: bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    phase: &'static str,
+) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    ledger.try_add(charge, limits).inspect_err(|_| {
+        #[cfg(test)]
+        eprintln!("retention phase={phase} ledger={ledger:?} charge={charge:?} limits={limits:?}");
+        let _ = phase;
+    })
+}
+
+const fn reconcile_clone_capacity(
+    admitted: bcode_session_view_models::retention::ObservationRetentionUsage,
+    actual: bcode_session_view_models::retention::ObservationRetentionUsage,
+) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::ObservationRetentionExceeded;
+    if actual.scalar_capacity_bytes > admitted.scalar_capacity_bytes
+        || actual.collection_entries > admitted.collection_entries
+        || actual.value_nodes > admitted.value_nodes
+        || actual.depth > admitted.depth
+        || actual.copies > admitted.copies
+    {
+        return Err(ObservationRetentionExceeded);
+    }
+    Ok(())
 }
 
 fn tool_invocation_id(event: &SessionEvent) -> Option<&str> {
@@ -216,23 +1551,46 @@ const fn interaction_state_for_resolution(
 fn interaction_status_detail(
     resolution: &bcode_session_models::ToolExchangeResolution,
 ) -> Option<String> {
-    match resolution {
-        bcode_session_models::ToolExchangeResolution::Responded { .. } => None,
-        bcode_session_models::ToolExchangeResolution::Cancelled => Some("cancelled".to_owned()),
-        bcode_session_models::ToolExchangeResolution::TimedOut => Some("timed out".to_owned()),
+    interaction_status_detail_admitted(resolution, None)
+        .expect("unrestricted interaction detail cannot reject admission")
+}
+
+fn interaction_status_detail_admitted(
+    resolution: &bcode_session_models::ToolExchangeResolution,
+    admission: Option<(
+        &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionLimits,
+    )>,
+) -> Result<Option<String>, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    let arguments = match resolution {
+        bcode_session_models::ToolExchangeResolution::Responded { .. } => return Ok(None),
+        bcode_session_models::ToolExchangeResolution::Cancelled => format_args!("cancelled"),
+        bcode_session_models::ToolExchangeResolution::TimedOut => format_args!("timed out"),
         bcode_session_models::ToolExchangeResolution::NoCompatibleConsumer => {
-            Some("no compatible consumer".to_owned())
+            format_args!("no compatible consumer")
         }
         bcode_session_models::ToolExchangeResolution::ConsumerDetached => {
-            Some("consumer detached".to_owned())
+            format_args!("consumer detached")
         }
         bcode_session_models::ToolExchangeResolution::Failed { code, message } => {
-            Some(format!("{code}: {message}"))
+            return match admission {
+                Some((retained, limits)) => {
+                    format_observation_text(format_args!("{code}: {message}"), retained, limits, 1)
+                        .map(Some)
+                }
+                None => Ok(Some(format!("{code}: {message}"))),
+            };
         }
+    };
+    match admission {
+        Some((retained, limits)) => {
+            format_observation_text(arguments, retained, limits, 1).map(Some)
+        }
+        None => Ok(Some(arguments.to_string())),
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ToolInvocationAggregate {
     projection: ToolInvocationProjection,
     // Draft fences survive resident history replacement without retaining old projections.
@@ -442,6 +1800,16 @@ impl PendingTextPresentation {
     }
 }
 
+struct RichToolCheckpoint {
+    tools: BTreeMap<String, ToolInvocationView>,
+    active_invocations: BTreeMap<String, bcode_session_models::ToolInvocationLifecycleEvent>,
+    contributions: BTreeMap<String, bcode_session_models::ToolContributionEvent>,
+    tool_item_ids: BTreeMap<String, TranscriptViewItemId>,
+    tool_invocations: BTreeMap<String, ToolInvocationAggregate>,
+    contribution_sequences: BTreeMap<String, u64>,
+    contribution_placements: BTreeMap<String, bcode_session_models::ToolContributionPlacement>,
+}
+
 /// Renderer-neutral session view projection.
 #[derive(Debug, Clone)]
 pub struct SessionView {
@@ -463,6 +1831,2507 @@ pub struct SessionView {
     unattributed_cost: bcode_session_view_models::SessionCostSummary,
     usage_cost_revision: u64,
     usage_checkpoint: Option<u64>,
+}
+
+// Called only after the complete selected entry graph is admitted. Originals
+// retain their capacities in the rollback owner; only selected entries are copied.
+fn checkpoint_tool_map<V: Clone>(
+    map: &mut BTreeMap<String, V>,
+    selected: impl Fn(&str, &V) -> bool,
+) -> BTreeMap<String, V> {
+    let original: BTreeMap<_, _> = map
+        .extract_if(.., |key, value| selected(key, value))
+        .collect();
+    map.extend(
+        original
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    original
+}
+
+fn checkpoint_matches<V: PartialEq>(
+    map: &BTreeMap<String, V>,
+    original: &BTreeMap<String, V>,
+    selected: impl Fn(&str, &V) -> bool,
+) -> bool {
+    map.iter()
+        .filter(|(key, value)| selected(key, value))
+        .eq(original.iter())
+}
+
+fn rich_tool_owns_key(key: &str, id: &str) -> bool {
+    key.strip_prefix(id)
+        .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn inspect_presentation_fences(
+    presentation_scope: &bcode_tool::ToolPresentationUpdateScope,
+    usage: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let fences = presentation_scope.iter_retained_revisions();
+    usage.try_add(
+        ObservationRetentionUsage::collection(fences.len(), 3),
+        limits,
+    )?;
+    for (identity, _) in fences {
+        usage.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 2,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        match identity {
+            bcode_tool::ToolPresentationIdentity::Primary => {}
+            bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+                usage.try_add(ObservationRetentionUsage::string(item_id, 5), limits)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rich_tool_owns_item(item: &TranscriptViewItem, id: &str) -> bool {
+    match &item.kind {
+        TranscriptViewItemKind::ToolInvocation { tool }
+        | TranscriptViewItemKind::ToolRequest { tool } => tool.tool_call_id == id,
+        TranscriptViewItemKind::ToolContribution { contribution, .. } => {
+            contribution.invocation_id == id
+        }
+        TranscriptViewItemKind::ToolRequestDraft { draft } => draft.tool_call_id == id,
+        _ => false,
+    }
+}
+
+fn inspect_pending_text(
+    id: &TranscriptViewItemId,
+    pending: &PendingTextPresentation,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<
+    bcode_session_view_models::retention::ObservationRetentionUsage,
+    bcode_session_view_models::retention::ObservationRetentionExceeded,
+> {
+    use bcode_session_view_models::retention::ObservationRetentionUsage;
+    let mut usage = ObservationRetentionUsage::default();
+    let PendingTextPresentation {
+        target,
+        presented_bytes: _,
+        paced_from: _,
+        presented_since_pace: _,
+        remaining_graphemes: _,
+        graphemes_per_second: _,
+        max_lag: _,
+        destination,
+    } = pending;
+    usage.try_add(id.retention_usage(2), limits)?;
+    usage.try_add(ObservationRetentionUsage::string(target, 3), limits)?;
+    usage.try_add(
+        ObservationRetentionUsage {
+            value_nodes: 7,
+            depth: 3,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    match destination {
+        PendingTextDestination::Transcript { turn_id } => {
+            usage.try_add(ObservationRetentionUsage::string(turn_id, 4), limits)?;
+        }
+        PendingTextDestination::ReasoningPart {
+            turn_id,
+            activity_id,
+            activity_order: _,
+            part_id,
+            kind: _,
+            role: _,
+            part_order: _,
+        } => {
+            for text in [turn_id, activity_id, part_id] {
+                usage.try_add(ObservationRetentionUsage::string(text, 4), limits)?;
+            }
+            usage.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 4,
+                    depth: 4,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+    }
+    Ok(usage)
+}
+
+fn format_observation_text(
+    arguments: std::fmt::Arguments<'_>,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    depth: usize,
+) -> Result<String, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_view_models::retention::{
+        ObservationRetentionExceeded, ObservationRetentionUsage,
+    };
+    struct Counter(usize);
+    impl std::fmt::Write for Counter {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    struct Buffer<'a> {
+        bytes: &'a mut [u8],
+        offset: usize,
+    }
+    impl std::fmt::Write for Buffer<'_> {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let end = self
+                .offset
+                .checked_add(value.len())
+                .ok_or(std::fmt::Error)?;
+            self.bytes
+                .get_mut(self.offset..end)
+                .ok_or(std::fmt::Error)?
+                .copy_from_slice(value.as_bytes());
+            self.offset = end;
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    std::fmt::write(&mut counter, arguments).map_err(|_| ObservationRetentionExceeded)?;
+    let mut next = *retained;
+    next.try_add(
+        ObservationRetentionUsage {
+            scalar_capacity_bytes: counter.0,
+            value_nodes: 1,
+            depth,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    let mut bytes = vec![0; counter.0].into_boxed_slice();
+    let mut buffer = Buffer {
+        bytes: &mut bytes,
+        offset: 0,
+    };
+    std::fmt::write(&mut buffer, arguments).map_err(|_| ObservationRetentionExceeded)?;
+    if buffer.offset != counter.0 {
+        return Err(ObservationRetentionExceeded);
+    }
+    let text = String::from_utf8(bytes.into_vec()).map_err(|_| ObservationRetentionExceeded)?;
+    *retained = next;
+    Ok(text)
+}
+
+fn append_observation_text(
+    target: &mut String,
+    text: &str,
+    admission: Option<(
+        &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionLimits,
+    )>,
+) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    if let Some((usage, limits)) = admission {
+        // The old scalar remains charged while fixed-size staging is admitted.
+        // Never clone the target as a trial allocation or rely on Vec growth.
+        let staged = usage.try_concat_string(target, text, 1, limits)?;
+        let old =
+            bcode_session_view_models::retention::ObservationRetentionUsage::string(target, 1);
+        if let Err(error) = usage.try_release(old) {
+            usage.try_release(
+                bcode_session_view_models::retention::ObservationRetentionUsage::string(&staged, 1),
+            )?;
+            return Err(error);
+        }
+        *target = staged;
+    } else {
+        target.push_str(text);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod text_update_retention_tests {
+    use super::*;
+    use bcode_session_view_models::retention::{
+        ObservationRetentionLimits, ObservationRetentionUsage,
+    };
+
+    #[test]
+    fn complete_projector_inventory_includes_invisible_terminal_fences() {
+        let mut view = SessionView::default();
+        let mut terminal_id = String::with_capacity(512);
+        terminal_id.push('t');
+        let capacity = terminal_id.capacity();
+        view.terminal_runtime_work
+            .insert(bcode_session_models::WorkId(terminal_id));
+        let baseline =
+            bcode_session_view_models::retention::inspect_snapshot(view.snapshot(), limits())
+                .unwrap();
+        let total = view.observation_retention_usage(limits()).unwrap();
+        assert_eq!(
+            total.scalar_capacity_bytes,
+            baseline.scalar_capacity_bytes + capacity
+        );
+        assert!(
+            view.observation_retention_usage(ObservationRetentionLimits {
+                scalar_capacity_bytes: capacity - 1,
+                ..limits()
+            })
+            .is_err()
+        );
+        view.terminal_runtime_work.clear();
+        assert_eq!(
+            view.observation_retention_usage(limits())
+                .unwrap()
+                .scalar_capacity_bytes,
+            baseline.scalar_capacity_bytes
+        );
+    }
+
+    #[test]
+    fn pending_routing_identity_capacity_is_charged_separately_from_target() {
+        let mut view = SessionView::default();
+        let id = TranscriptViewItemId::new("pending");
+        let id_capacity = id.retention_usage(1).scalar_capacity_bytes;
+        let mut turn_id = String::with_capacity(512);
+        turn_id.push('t');
+        let capacity = turn_id.capacity();
+        view.pending_text_presentations.insert(
+            id,
+            PendingTextPresentation {
+                target: String::new(),
+                presented_bytes: 0,
+                paced_from: Instant::now(),
+                presented_since_pace: 0,
+                remaining_graphemes: 0,
+                graphemes_per_second: 1,
+                max_lag: Duration::from_secs(1),
+                destination: PendingTextDestination::Transcript { turn_id },
+            },
+        );
+        assert_eq!(
+            view.pending_text_retention_usage(limits())
+                .unwrap()
+                .scalar_capacity_bytes,
+            capacity + id_capacity
+        );
+        assert!(
+            view.pending_text_retention_usage(ObservationRetentionLimits {
+                scalar_capacity_bytes: capacity - 1,
+                ..limits()
+            })
+            .is_err()
+        );
+        view.pending_text_presentations.clear();
+        assert_eq!(
+            view.pending_text_retention_usage(limits())
+                .unwrap()
+                .scalar_capacity_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn whole_view_and_snapshot_clones_admit_hidden_owners_and_rollback() {
+        let policy = ObservationRetentionLimits {
+            scalar_capacity_bytes: 64 * 1024,
+            collection_entries: 4096,
+            value_nodes: 4096,
+            depth: 64,
+            copies: 4,
+        };
+        let mut view = SessionView::new();
+        let mut title = String::with_capacity(512);
+        title.push_str("retained title");
+        view.snapshot.title = Some(title);
+        view.live_reasoning.insert(
+            ("turn".to_owned(), "activity".to_owned()),
+            LiveReasoningActivity {
+                parts: BTreeMap::from([(
+                    "part".to_owned(),
+                    bcode_session_models::ReasoningPart {
+                        part_id: "part".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        order: 0,
+                        text: "hidden reasoning".repeat(8),
+                    },
+                )]),
+                ..LiveReasoningActivity::default()
+            },
+        );
+        let source = view.observation_retention_usage(policy).unwrap();
+        let public =
+            bcode_session_view_models::retention::inspect_snapshot(view.snapshot(), policy)
+                .unwrap();
+        assert!(source.scalar_capacity_bytes > public.scalar_capacity_bytes);
+        let mut ledger = source;
+        let original = ledger;
+        let deny = ObservationRetentionLimits {
+            scalar_capacity_bytes: source.scalar_capacity_bytes,
+            ..policy
+        };
+        assert!(view.try_clone_bounded(&mut ledger, deny).is_err());
+        assert_eq!(ledger, original);
+        assert!(view.try_clone_snapshot_bounded(&mut ledger, deny).is_err());
+        assert_eq!(ledger, original);
+        assert!(
+            view.try_clone_bounded(
+                &mut ledger,
+                ObservationRetentionLimits {
+                    copies: 0,
+                    ..policy
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(ledger, original);
+        let cloned = view.try_clone_bounded(&mut ledger, policy).unwrap();
+        assert_eq!(cloned.snapshot(), view.snapshot());
+        assert_eq!(
+            cloned.live_reasoning[&("turn".to_owned(), "activity".to_owned())].parts["part"].text,
+            view.live_reasoning[&("turn".to_owned(), "activity".to_owned())].parts["part"].text
+        );
+        let mut owned = cloned.observation_retention_usage(policy).unwrap();
+        owned.copies = 1;
+        drop(cloned);
+        ledger.try_release(owned).unwrap();
+        assert_eq!(ledger, original);
+        let snapshot = view
+            .try_clone_snapshot_bounded(&mut ledger, policy)
+            .unwrap();
+        assert_eq!(&snapshot, view.snapshot());
+        let mut owned =
+            bcode_session_view_models::retention::inspect_snapshot(&snapshot, policy).unwrap();
+        owned.copies = 1;
+        drop(snapshot);
+        ledger.try_release(owned).unwrap();
+        assert_eq!(ledger, original);
+        let mut missing_source = ObservationRetentionUsage::default();
+        assert!(view.try_clone_bounded(&mut missing_source, policy).is_err());
+        assert_eq!(missing_source, ObservationRetentionUsage::default());
+    }
+
+    #[test]
+    fn bounded_summary_initialization_matches_ordinary_and_rejects_at_peak() {
+        let policy = ObservationRetentionLimits {
+            scalar_capacity_bytes: 64 * 1024,
+            collection_entries: 4096,
+            value_nodes: 4096,
+            depth: 64,
+            copies: 4,
+        };
+        let mut summary = bcode_session_models::SessionSummary {
+            parent_id: None,
+            id: SessionId::new(),
+            name: Some("legacy".to_owned()),
+            explicit_name: Some("selected title".to_owned()),
+            derived_title: None,
+            automatic_title: None,
+            automatic_title_source_sequence: None,
+            title_source: bcode_session_models::SessionTitleSource::default(),
+            client_count: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            working_directory: std::path::PathBuf::from("/workspace"),
+            import: None,
+            execution: None,
+            location: None,
+        };
+        let mut ordinary = SessionView::new();
+        let mut checked = ordinary.clone();
+        let mut ledger = checked.observation_retention_usage(policy).unwrap();
+        let before = ledger;
+        assert!(
+            checked
+                .set_session_summary_bounded(
+                    &summary,
+                    &mut ledger,
+                    ObservationRetentionLimits {
+                        scalar_capacity_bytes: before.scalar_capacity_bytes,
+                        ..policy
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(checked.snapshot(), ordinary.snapshot());
+        assert_eq!(ledger, before);
+        for no_title in [false, true] {
+            if no_title {
+                summary.name = None;
+                summary.explicit_name = None;
+            }
+            ordinary.set_session_summary(summary.clone());
+            checked
+                .set_session_summary_bounded(&summary, &mut ledger, policy)
+                .unwrap();
+            assert_eq!(checked.snapshot(), ordinary.snapshot());
+            let actual = checked.observation_retention_usage(policy).unwrap();
+            assert_eq!(ledger.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(ledger.collection_entries, actual.collection_entries);
+            assert_eq!(ledger.value_nodes, actual.value_nodes);
+            let stable = ledger;
+            checked
+                .set_session_summary_bounded(&summary, &mut ledger, policy)
+                .unwrap();
+            assert_eq!(ledger, stable);
+            assert_eq!(checked.snapshot(), ordinary.snapshot());
+        }
+    }
+
+    #[test]
+    fn rich_transaction_rolls_back_original_capacities_and_does_not_clone_other_invocations() {
+        let policy = ObservationRetentionLimits {
+            scalar_capacity_bytes: 1_000_000,
+            collection_entries: 10_000,
+            value_nodes: 10_000,
+            depth: 64,
+            copies: 2,
+        };
+        let mut view = SessionView::new();
+        let session_id = SessionId::new();
+        for (sequence, id) in [(1, "selected"), (2, "other")] {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence,
+                timestamp_ms: sequence,
+                provenance: None,
+                kind: SessionEventKind::ToolCallRequested {
+                    tool_call_id: id.into(),
+                    producer_plugin_id: None,
+                    tool_name: "tool".into(),
+                    arguments_json: "{}".into(),
+                    working_directory: None,
+                },
+            };
+            view.apply_event(&event);
+        }
+        // Large unused capacity is owned by an unrelated invocation and must
+        // remain resident exactly once throughout a selected-branch transaction.
+        let other = view.snapshot.tools.get_mut("other").unwrap();
+        let mut spare = String::with_capacity(65_536);
+        spare.push_str("{}");
+        other.arguments_json = Some(spare);
+        let before = view.observation_retention_usage(policy).unwrap();
+        let mut ledger = before;
+        let snapshot = view.snapshot().clone();
+        let selected = view.rich_tool_checkpoint_usage("selected", policy).unwrap();
+        assert!(selected.scalar_capacity_bytes < 65_536);
+        let admitted = ObservationRetentionLimits {
+            scalar_capacity_bytes: before.scalar_capacity_bytes
+                + selected.scalar_capacity_bytes
+                + 1024,
+            ..policy
+        };
+        let mut entered = false;
+        assert!(
+            view.transact_rich_tool_bounded("selected", &mut ledger, admitted, |view, _| {
+                entered = true;
+                view.snapshot.tools.remove("selected");
+                view.snapshot
+                    .transcript
+                    .items
+                    .retain(|item| !rich_tool_owns_item(item, "selected"));
+                view.snapshot.revision += 1;
+                Err(bcode_session_view_models::retention::ObservationRetentionExceeded)
+            })
+            .is_err()
+        );
+        assert!(
+            entered,
+            "selected checkpoint must fit without copying the other owner"
+        );
+        assert_eq!(ledger, before);
+        assert_eq!(view.snapshot(), &snapshot);
+        assert_eq!(view.observation_retention_usage(policy).unwrap(), before);
+        view.transact_rich_tool_bounded("selected", &mut ledger, admitted, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(ledger, before);
+    }
+
+    #[test]
+    fn bounded_paced_assistant_matches_visible_prefix_pending_target_and_checkpoint() {
+        use bcode_session_models::{TextStreamOperation, TextStreamUpdate};
+        let session_id = SessionId::new();
+        let mut checked = SessionView::new();
+        checked.set_streaming_presentation_policy(StreamingPresentationPolicy::default());
+        let mut ordinary = checked.clone();
+        for (revision, operation) in [
+            (
+                1,
+                TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "界hello".into(),
+                },
+            ),
+            (
+                2,
+                TextStreamOperation::Append {
+                    expected_offset: 8,
+                    text: " world".into(),
+                },
+            ),
+            (
+                3,
+                TextStreamOperation::Checkpoint {
+                    start_offset: 0,
+                    total_bytes: 5,
+                    truncated: false,
+                    text: "final".into(),
+                },
+            ),
+        ] {
+            let event = SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                    turn_id: "turn".into(),
+                    segment_id: "segment".into(),
+                    segment_order: 0,
+                    output_position: None,
+                    update: TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation,
+                    },
+                },
+            };
+            let allowed = measured_peak_limits(&checked, |view, usage, policy| {
+                view.apply_live_event_bounded(&event, usage, policy)
+            });
+            let mut ledger = checked.observation_retention_usage(allowed).unwrap();
+            let before = ledger;
+            let snapshot = checked.snapshot().clone();
+            let pending = checked.pending_text_retention_usage(allowed).unwrap();
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: ledger.scalar_capacity_bytes,
+                ..allowed
+            };
+            assert!(
+                checked
+                    .apply_live_event_bounded(&event, &mut ledger, denied)
+                    .is_err()
+            );
+            assert_eq!(ledger, before);
+            assert_eq!(checked.snapshot(), &snapshot);
+            assert_eq!(
+                checked.pending_text_retention_usage(allowed).unwrap(),
+                pending
+            );
+            checked
+                .apply_live_event_bounded(&event, &mut ledger, allowed)
+                .unwrap();
+            ordinary.apply_live_event(&event);
+            assert_eq!(checked.snapshot(), ordinary.snapshot());
+            for (id, pending) in &checked.pending_text_presentations {
+                let expected = &ordinary.pending_text_presentations[id];
+                assert_eq!(pending.target, expected.target);
+                assert_eq!(pending.presented_bytes, expected.presented_bytes);
+            }
+            assert_eq!(
+                checked.pending_text_presentations.len(),
+                ordinary.pending_text_presentations.len()
+            );
+            let actual = checked.observation_retention_usage(allowed).unwrap();
+            assert_eq!(ledger.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(ledger.collection_entries, actual.collection_entries);
+            assert_eq!(ledger.value_nodes, actual.value_nodes);
+        }
+        assert!(checked.pending_text_presentations.is_empty());
+    }
+
+    #[test]
+    fn bounded_paced_legacy_delta_keeps_exact_target_without_copying_unrelated_items() {
+        let session_id = SessionId::new();
+        let mut checked = SessionView::new();
+        checked.set_streaming_presentation_policy(StreamingPresentationPolicy::default());
+        let mut ordinary = checked.clone();
+        for text in ["alpha", " beta"] {
+            let event = SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "turn".into(),
+                    segment_id: "segment".into(),
+                    segment_order: 0,
+                    text: text.into(),
+                },
+            };
+            let allowed = measured_peak_limits(&checked, |view, usage, policy| {
+                view.apply_live_event_bounded(&event, usage, policy)
+            });
+            let mut ledger = checked.observation_retention_usage(allowed).unwrap();
+            checked
+                .apply_live_event_bounded(&event, &mut ledger, allowed)
+                .unwrap();
+            ordinary.apply_live_event(&event);
+            assert_eq!(checked.snapshot(), ordinary.snapshot());
+            let actual = checked.observation_retention_usage(allowed).unwrap();
+            assert_eq!(ledger.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(ledger.collection_entries, actual.collection_entries);
+            assert_eq!(ledger.value_nodes, actual.value_nodes);
+        }
+        let id = TranscriptViewItemId::new("assistant-turn:turn:segment:segment");
+        assert_eq!(checked.pending_text_presentations[&id].target, "alpha beta");
+    }
+
+    #[test]
+    fn bounded_turn_completion_flushes_paced_assistant_without_reopening_stream() {
+        let mut view = SessionView::new();
+        view.set_streaming_presentation_policy(StreamingPresentationPolicy::default());
+        let session_id = SessionId::new();
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn".into(),
+                segment_id: "segment".into(),
+                segment_order: 0,
+                text: "accepted target".into(),
+            },
+        });
+        let mut ordinary = view.clone();
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id,
+            sequence: 1,
+            timestamp_ms: 1,
+            provenance: None,
+            kind: SessionEventKind::ModelTurnFinished {
+                turn_id: "turn".into(),
+                outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                message: None,
+            },
+        };
+        let allowed = measured_peak_limits(&view, |view, usage, policy| {
+            view.apply_event_bounded(&event, usage, policy)
+        });
+        let mut ledger = view.observation_retention_usage(allowed).unwrap();
+        let before = ledger;
+        let snapshot = view.snapshot().clone();
+        let denied = ObservationRetentionLimits {
+            scalar_capacity_bytes: before.scalar_capacity_bytes,
+            ..allowed
+        };
+        assert!(
+            view.apply_event_bounded(&event, &mut ledger, denied)
+                .is_err()
+        );
+        assert_eq!(ledger, before);
+        assert_eq!(view.snapshot(), &snapshot);
+        view.apply_event_bounded(&event, &mut ledger, allowed)
+            .unwrap();
+        ordinary.apply_event(&event);
+        assert_eq!(view.snapshot(), ordinary.snapshot());
+        assert!(view.pending_text_presentations.is_empty());
+        let actual = view.observation_retention_usage(allowed).unwrap();
+        assert_eq!(ledger.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+        assert_eq!(ledger.collection_entries, actual.collection_entries);
+        assert_eq!(ledger.value_nodes, actual.value_nodes);
+    }
+
+    pub fn measured_peak_limits(
+        view: &SessionView,
+        apply: impl Fn(
+            &mut SessionView,
+            &mut ObservationRetentionUsage,
+            ObservationRetentionLimits,
+        )
+            -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded>,
+    ) -> ObservationRetentionLimits {
+        let unlimited = ObservationRetentionLimits {
+            scalar_capacity_bytes: usize::MAX,
+            collection_entries: usize::MAX,
+            value_nodes: usize::MAX,
+            depth: usize::MAX,
+            copies: usize::MAX,
+        };
+        let source = view.observation_retention_usage(unlimited).unwrap();
+        // Measure each independent primitive-admission high-water mark. These are
+        // test-only replicas; the product reducer must still stage only its branch.
+        // Denial tests use the original source budget, independently of this oracle.
+        let mut measured = unlimited;
+        for dimension in 0..5 {
+            let mut low = match dimension {
+                0 => source.scalar_capacity_bytes,
+                1 => source.collection_entries,
+                2 => source.value_nodes,
+                3 => source.depth,
+                4 => source.copies,
+                _ => unreachable!(),
+            };
+            let mut high = usize::MAX;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                let mut policy = unlimited;
+                set_peak_dimension(&mut policy, dimension, middle);
+                let mut candidate = view.clone();
+                let mut ledger = source;
+                if apply(&mut candidate, &mut ledger, policy).is_ok()
+                    && candidate.observation_retention_usage(policy).is_ok()
+                {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            assert_ne!(
+                low,
+                usize::MAX,
+                "unsupported reducer is not a fixture budget"
+            );
+            set_peak_dimension(&mut measured, dimension, low);
+        }
+        measured
+    }
+
+    fn set_peak_dimension(limits: &mut ObservationRetentionLimits, dimension: usize, value: usize) {
+        match dimension {
+            0 => limits.scalar_capacity_bytes = value,
+            1 => limits.collection_entries = value,
+            2 => limits.value_nodes = value,
+            3 => limits.depth = value,
+            4 => limits.copies = value,
+            _ => unreachable!(),
+        }
+    }
+
+    fn owner_peak_limits(view: &SessionView, event: &SessionEvent) -> ObservationRetentionLimits {
+        measured_peak_limits(view, |candidate, ledger, policy| {
+            candidate.apply_event_bounded(event, ledger, policy)
+        })
+    }
+
+    fn single_owner_limits() -> ObservationRetentionLimits {
+        limits()
+    }
+
+    fn limits() -> ObservationRetentionLimits {
+        ObservationRetentionLimits {
+            scalar_capacity_bytes: 4096,
+            collection_entries: 8,
+            value_nodes: 128,
+            depth: 16,
+            copies: 2,
+        }
+    }
+
+    #[test]
+    fn bounded_ralph_path_peak_denial_and_plaintext_parity() {
+        let mut view = SessionView::default();
+        view.snapshot.working_directory = Some(std::path::PathBuf::from("/tmp/project"));
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id: SessionId::new(),
+            sequence: 1,
+            timestamp_ms: 0,
+            provenance: None,
+            kind: SessionEventKind::RalphLifecycle {
+                loop_name: "loop".into(),
+                state_dir: std::path::PathBuf::from("/tmp/project/.bcode/ralph/loop"),
+                kind: "started".into(),
+                message: "running".into(),
+                occurred_at_ms: 0,
+            },
+        };
+        let before = retained;
+        let original = view.snapshot().clone();
+        assert!(
+            view.apply_event_bounded(
+                &event,
+                &mut retained,
+                ObservationRetentionLimits {
+                    scalar_capacity_bytes: before.scalar_capacity_bytes,
+                    ..limits()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(retained, before);
+        assert_eq!(view.snapshot(), &original);
+        ordinary.apply_event(&event);
+        view.apply_event_bounded(&event, &mut retained, limits())
+            .unwrap();
+        assert_eq!(view.snapshot(), ordinary.snapshot());
+        assert_eq!(
+            retained.scalar_capacity_bytes,
+            view.observation_retention_usage(limits())
+                .unwrap()
+                .scalar_capacity_bytes
+        );
+    }
+
+    #[test]
+    fn bounded_provider_compaction_preserves_parity_and_excludes_opaque_payload() {
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id: SessionId::new(),
+            sequence: 1,
+            timestamp_ms: 0,
+            provenance: None,
+            kind: SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence: 0,
+                snapshot: bcode_session_models::ProviderContextSnapshot {
+                    format_version: 1,
+                    request_fingerprint: None,
+                    request_id: None,
+                    provider_plugin_id: "provider".into(),
+                    model_id: "model".into(),
+                    compatibility_key: "surface".into(),
+                    auth_profile: None,
+                    origin: bcode_session_models::ProviderContextSnapshotOrigin::Explicit,
+                    messages_json: "opaque-not-retained".into(),
+                    portable_summary: "summary".into(),
+                },
+            },
+        };
+        let before = retained;
+        let original = view.snapshot().clone();
+        assert!(
+            view.apply_event_bounded(
+                &event,
+                &mut retained,
+                ObservationRetentionLimits {
+                    scalar_capacity_bytes: 0,
+                    ..limits()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(view.snapshot(), &original);
+        assert_eq!(retained, before);
+        ordinary.apply_event(&event);
+        view.apply_event_bounded(&event, &mut retained, limits())
+            .unwrap();
+        assert_eq!(view.snapshot(), ordinary.snapshot());
+        assert_eq!(
+            retained.scalar_capacity_bytes,
+            view.observation_retention_usage(limits())
+                .unwrap()
+                .scalar_capacity_bytes
+        );
+        let TranscriptViewItemKind::Compaction { compaction } =
+            &view.snapshot().transcript.items[0].kind
+        else {
+            panic!("compaction item");
+        };
+        assert!(!compaction.text.contains("opaque-not-retained"));
+    }
+
+    #[test]
+    fn bounded_compaction_stages_transcript_before_clearing_context() {
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id: SessionId::new(),
+            sequence: 1,
+            timestamp_ms: 0,
+            provenance: None,
+            kind: SessionEventKind::ContextCompacted {
+                summary: "summary".into(),
+                compacted_through_sequence: 0,
+            },
+        };
+        let before = retained;
+        let original = view.snapshot().clone();
+        assert!(
+            view.apply_event_bounded(
+                &event,
+                &mut retained,
+                ObservationRetentionLimits {
+                    collection_entries: 0,
+                    ..limits()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(view.snapshot(), &original);
+        assert_eq!(retained, before);
+        ordinary.apply_event(&event);
+        view.apply_event_bounded(&event, &mut retained, limits())
+            .unwrap();
+        assert_eq!(view.snapshot(), ordinary.snapshot());
+    }
+
+    #[test]
+    fn bounded_skill_notes_match_ordinary_with_peak_denial() {
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let kinds = [
+            SessionEventKind::SkillInvocationFailed {
+                skill_id: bcode_skill_models::SkillId::new("skill"),
+                error: "failed".into(),
+                failed_at_ms: 0,
+            },
+            SessionEventKind::SkillInvoked {
+                skill_id: bcode_skill_models::SkillId::new("skill"),
+                arguments: "args".into(),
+                source: None,
+                invoked_at_ms: 0,
+            },
+            SessionEventKind::SkillSuggested {
+                skill_id: bcode_skill_models::SkillId::new("skill"),
+                reason: Some("reason".into()),
+                suggested_at_ms: 0,
+            },
+            SessionEventKind::SkillContextLoaded {
+                skill_id: bcode_skill_models::SkillId::new("skill"),
+                bytes_loaded: 8,
+                truncated: true,
+                loaded_at_ms: 0,
+                source: None,
+                preview: Some("preview🦀".into()),
+            },
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id: SessionId::new(),
+                sequence: index as u64 + 1,
+                timestamp_ms: 0,
+                provenance: None,
+                kind,
+            };
+            let original = view.snapshot().clone();
+            let before = retained;
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: 0,
+                ..limits()
+            };
+            assert!(
+                view.apply_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            assert_eq!(
+                retained.scalar_capacity_bytes,
+                view.observation_retention_usage(limits())
+                    .unwrap()
+                    .scalar_capacity_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_skill_selection_set_growth_is_atomic_and_duplicate_safe() {
+        let mut view = SessionView::default();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id: SessionId::new(),
+            sequence: 1,
+            timestamp_ms: 0,
+            provenance: None,
+            kind: SessionEventKind::SystemMessage {
+                text: String::new(),
+            },
+        };
+        let before = retained;
+        let original = view.snapshot().clone();
+        let denied = ObservationRetentionLimits {
+            collection_entries: 0,
+            ..limits()
+        };
+        assert!(
+            view.apply_skill_selection_bounded(&event, "skill", true, &mut retained, denied)
+                .is_err()
+        );
+        assert_eq!(retained, before);
+        assert_eq!(view.snapshot(), &original);
+        view.apply_skill_selection_bounded(&event, "skill", true, &mut retained, limits())
+            .unwrap();
+        let inserted = retained;
+        let revision = view.snapshot().revision;
+        view.apply_skill_selection_bounded(&event, "skill", true, &mut retained, limits())
+            .unwrap();
+        assert_eq!(retained, inserted);
+        assert_eq!(view.snapshot().revision, revision);
+        view.apply_skill_selection_bounded(&event, "skill", false, &mut retained, limits())
+            .unwrap();
+        assert_eq!(retained.scalar_capacity_bytes, before.scalar_capacity_bytes);
+        assert_eq!(retained.collection_entries, before.collection_entries);
+    }
+
+    #[test]
+    fn bounded_permission_request_and_resolution_move_owners_with_peak_parity() {
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let kinds = [
+            SessionEventKind::PermissionRequested {
+                permission_id: "p".into(),
+                tool_call_id: "call".into(),
+                producer_plugin_id: None,
+                tool_name: "tool".into(),
+                arguments_json: "{}".into(),
+                batch: None,
+                policy_source: None,
+                policy_reason: None,
+            },
+            SessionEventKind::PermissionResolved {
+                permission_id: "p".into(),
+                approved: true,
+            },
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id: SessionId::new(),
+                sequence: index as u64 + 1,
+                timestamp_ms: 0,
+                provenance: None,
+                kind,
+            };
+            let before = retained;
+            let original = view.snapshot().clone();
+            if index == 0 {
+                let denied = ObservationRetentionLimits {
+                    collection_entries: 1,
+                    ..limits()
+                };
+                assert!(
+                    view.apply_event_bounded(&event, &mut retained, denied)
+                        .is_err()
+                );
+                assert_eq!(view.snapshot(), &original);
+                assert_eq!(retained, before);
+            }
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            let actual = view.observation_retention_usage(limits()).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+        }
+    }
+
+    #[test]
+    fn bounded_work_progress_insertion_replacement_and_duplicate_match_ordinary() {
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        for sequence in 1..=3 {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id: SessionId::new(),
+                sequence,
+                timestamp_ms: 0,
+                provenance: None,
+                kind: SessionEventKind::RuntimeWorkProgress {
+                    work_id: bcode_session_models::WorkId("work".into()),
+                    message: "working".into(),
+                    progress_at_ms: None,
+                    completed_units: None,
+                    total_units: None,
+                },
+            };
+            let original = view.snapshot().clone();
+            let before = retained;
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                ..limits()
+            };
+            assert!(
+                view.apply_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            let actual = view.observation_retention_usage(limits()).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+        }
+    }
+
+    #[test]
+    fn bounded_context_clear_matches_ordinary_without_allocating_a_replacement() {
+        let mut view = SessionView::default();
+        let event = SessionLiveEvent {
+            session_id: SessionId::new(),
+            kind: SessionLiveEventKind::RequestContextOccupancyChanged {
+                occupancy: Box::new(None),
+            },
+        };
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let before = retained;
+        let mut ordinary = view.clone();
+        ordinary.apply_live_event(&event);
+        view.apply_live_event_bounded(&event, &mut retained, limits())
+            .unwrap();
+        assert_eq!(retained, before);
+        assert_eq!(view.snapshot(), ordinary.snapshot());
+        assert_eq!(view.snapshot().session_id, Some(event.session_id));
+    }
+
+    #[test]
+    fn bounded_immediate_assistant_delta_preserves_existing_text_and_peak_denial() {
+        let mut view = SessionView {
+            streaming_presentation_policy: StreamingPresentationPolicy::immediate(),
+            ..SessionView::default()
+        };
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        for text in ["first🦀", " more"] {
+            let event = SessionLiveEvent {
+                session_id: SessionId::new(),
+                kind: SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "turn".into(),
+                    segment_id: "segment".into(),
+                    segment_order: 0,
+                    text: text.into(),
+                },
+            };
+            let before = retained;
+            let original = view.snapshot().clone();
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                ..limits()
+            };
+            assert!(
+                view.apply_live_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_live_event(&event);
+            view.apply_live_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            assert_eq!(
+                retained.scalar_capacity_bytes,
+                view.observation_retention_usage(limits())
+                    .unwrap()
+                    .scalar_capacity_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_rename_replacement_peak_and_optional_clear_match_ordinary() {
+        let mut view = SessionView::default();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let mut ordinary = view.clone();
+        for (index, name) in [Some("name🦀".to_owned()), None].into_iter().enumerate() {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id: SessionId::new(),
+                sequence: index as u64 + 1,
+                timestamp_ms: 0,
+                provenance: None,
+                kind: SessionEventKind::SessionRenamed { name },
+            };
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            assert_eq!(
+                retained.scalar_capacity_bytes,
+                view.observation_retention_usage(limits())
+                    .unwrap()
+                    .scalar_capacity_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_turn_start_and_completion_preserve_terminal_semantics_and_peak() {
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let events = [
+            SessionEventKind::ModelTurnStarted {
+                turn_id: "turn".into(),
+            },
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn".into(),
+                outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+                message: Some("cancelled".into()),
+            },
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn".into(),
+                outcome: bcode_session_models::ModelTurnOutcome::Error,
+                message: Some("failed".into()),
+            },
+        ];
+        for (index, kind) in events.into_iter().enumerate() {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id: SessionId::new(),
+                sequence: index as u64 + 1,
+                timestamp_ms: 0,
+                provenance: None,
+                kind,
+            };
+            let original = view.snapshot().clone();
+            let before = retained;
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                ..limits()
+            };
+            assert!(
+                view.apply_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            let matching_fields = [
+                (
+                    "session_id",
+                    view.snapshot().session_id == ordinary.snapshot().session_id,
+                ),
+                (
+                    "revision",
+                    view.snapshot().revision == ordinary.snapshot().revision,
+                ),
+                (
+                    "latest_sequence",
+                    view.snapshot().latest_sequence == ordinary.snapshot().latest_sequence,
+                ),
+                (
+                    "runtime",
+                    view.snapshot().runtime == ordinary.snapshot().runtime,
+                ),
+                (
+                    "transcript",
+                    view.snapshot().transcript == ordinary.snapshot().transcript,
+                ),
+                (
+                    "thinking",
+                    view.snapshot().thinking == ordinary.snapshot().thinking,
+                ),
+            ];
+            for (field, matches) in matching_fields {
+                assert!(matches, "turn parity step={index}: differing field={field}");
+            }
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            assert_eq!(
+                retained.scalar_capacity_bytes,
+                view.observation_retention_usage(limits())
+                    .unwrap()
+                    .scalar_capacity_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_system_message_vector_growth_is_prechecked_and_moves_existing_items() {
+        let mut view = SessionView::default();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let mut ordinary = view.clone();
+        for sequence in 1..=3 {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id: SessionId::new(),
+                sequence,
+                timestamp_ms: 0,
+                provenance: None,
+                kind: SessionEventKind::SystemMessage {
+                    text: "status🦀".into(),
+                },
+            };
+            let before = retained;
+            let original = view.snapshot().clone();
+            let denied = ObservationRetentionLimits {
+                collection_entries: retained.collection_entries,
+                ..limits()
+            };
+            assert!(
+                view.apply_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            let actual = view.observation_retention_usage(limits()).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+        }
+    }
+
+    #[test]
+    fn bounded_rich_presentations_contributions_and_drafts_match_live_projection() {
+        let limits = ObservationRetentionLimits {
+            scalar_capacity_bytes: 1_048_576,
+            collection_entries: 8192,
+            value_nodes: 65536,
+            depth: 64,
+            copies: 32,
+        };
+        let session_id = SessionId::new();
+        let mut bounded = SessionView::default();
+        let mut ordinary = bounded.clone();
+        let mut retained = bounded.observation_retention_usage(limits).unwrap();
+        let draft = bcode_session_models::ToolRequestDraftEvent {
+            output_position: None,
+            turn_id: "turn".into(),
+            tool_call_id: "call".into(),
+            tool_name: "tool".into(),
+            producer_plugin_id: Some("plugin".into()),
+            schema: "draft".into(),
+            schema_version: 1,
+            placement: bcode_session_models::ToolContributionPlacement::Request,
+            generation: 0,
+            revision: 1,
+            operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: "{}".into(),
+            },
+            argument_bytes: 2,
+            truncated: false,
+        };
+        let presentation = |identity| bcode_tool::ToolPresentationUpdate {
+            invocation_id: "call".into(),
+            producer_id: "plugin".into(),
+            generation: 0,
+            revision: 1,
+            identity,
+            retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+            schema: "card".into(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"text": "界"}),
+        };
+        for kind in [
+            SessionLiveEventKind::ToolRequestDraft { event: draft },
+            SessionLiveEventKind::ToolPresentationUpdated {
+                update: presentation(bcode_tool::ToolPresentationIdentity::Primary),
+            },
+            SessionLiveEventKind::ToolPresentationUpdated {
+                update: presentation(bcode_tool::ToolPresentationIdentity::Supplemental {
+                    item_id: "details".into(),
+                }),
+            },
+        ] {
+            let event = SessionLiveEvent { session_id, kind };
+            let before = retained;
+            let snapshot = bounded.snapshot().clone();
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: 0,
+                ..limits
+            };
+            assert!(
+                bounded
+                    .apply_live_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(retained, before);
+            assert_eq!(bounded.snapshot(), &snapshot);
+            ordinary.apply_live_event(&event);
+            bounded
+                .apply_live_event_bounded(&event, &mut retained, limits)
+                .unwrap();
+            assert_eq!(bounded.snapshot(), ordinary.snapshot());
+            let actual = bounded.observation_retention_usage(limits).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.value_nodes, actual.value_nodes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+        }
+    }
+
+    #[test]
+    fn bounded_live_reasoning_matches_ordinary_parts_and_terminal_cache() {
+        let limits = || ObservationRetentionLimits {
+            scalar_capacity_bytes: 65536,
+            collection_entries: 512,
+            value_nodes: 4096,
+            depth: 32,
+            copies: 8,
+        };
+        let session_id = SessionId::new();
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let events = [
+            bcode_session_models::ReasoningActivityEvent::Started {
+                activity_id: "activity".into(),
+                order: 0,
+            },
+            bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "activity".into(),
+                activity_order: 0,
+                part_id: "part".into(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "thinking".into(),
+            },
+            bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                activity_id: "activity".into(),
+                activity_order: 0,
+            },
+            bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id: "activity".into(),
+                activity_order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        ];
+        for activity in events {
+            let event = SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantReasoningActivity {
+                    turn_id: "turn".into(),
+                    output_position: None,
+                    event: activity,
+                },
+            };
+            let original = view.snapshot().clone();
+            let before = retained;
+            let denied = ObservationRetentionLimits {
+                value_nodes: retained.value_nodes,
+                ..limits()
+            };
+            assert!(
+                view.apply_live_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(retained, before);
+            assert_eq!(view.snapshot(), &original);
+            ordinary.apply_live_event(&event);
+            view.apply_live_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            let actual = view.observation_retention_usage(limits()).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.value_nodes, actual.value_nodes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+        }
+    }
+
+    #[test]
+    fn empty_projector_clone_accounts_both_semantic_roots() {
+        let view = SessionView::default();
+        let usage = view.observation_retention_usage(limits()).unwrap();
+        assert_eq!(usage.value_nodes, 77);
+        let mut ledger = usage;
+        let before = ledger;
+        assert!(view.try_clone_bounded(&mut ledger, limits()).is_err());
+        assert_eq!(ledger, before);
+        let exact_clone = ObservationRetentionLimits {
+            value_nodes: usage.value_nodes * 2,
+            ..limits()
+        };
+        let _copy = view.try_clone_bounded(&mut ledger, exact_clone).unwrap();
+        assert_eq!(ledger.value_nodes, usage.value_nodes * 2);
+    }
+
+    #[test]
+    fn bounded_complete_reasoning_preserves_parts_cache_and_rejection_atomicity() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        for sequence in 1..=2 {
+            let activity = bcode_session_models::ReasoningActivity {
+                activity_id: "reasoning".into(),
+                order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+                parts: vec![bcode_session_models::ReasoningPart {
+                    part_id: "part".into(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    order: 0,
+                    text: format!("summary {sequence}"),
+                }],
+                opaque: true,
+            };
+            let kind = if sequence == 1 {
+                SessionEventKind::AssistantReasoningActivity {
+                    turn_id: "turn".into(),
+                    activity,
+                }
+            } else {
+                SessionEventKind::PositionedAssistantReasoningActivity {
+                    turn_id: "turn".into(),
+                    activity,
+                    output_position: bcode_session_models::TurnOutputPosition::new(2),
+                }
+            };
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence,
+                timestamp_ms: sequence,
+                provenance: None,
+                kind,
+            };
+            let allowed = owner_peak_limits(&view, &event);
+            let before = retained;
+            let snapshot = view.snapshot().clone();
+            let denied = ObservationRetentionLimits {
+                value_nodes: retained.value_nodes,
+                ..allowed
+            };
+            assert!(
+                view.apply_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(retained, before);
+            assert_eq!(view.snapshot(), &snapshot);
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, allowed)
+                .unwrap_or_else(|error| {
+                    panic!("{error:?}: source={retained:?} budget={allowed:?}")
+                });
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            assert_eq!(
+                view.reasoning_retention_usage(allowed).unwrap(),
+                ordinary.reasoning_retention_usage(allowed).unwrap()
+            );
+            let actual = view.observation_retention_usage(allowed).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.value_nodes, actual.value_nodes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+        }
+    }
+
+    #[test]
+    fn bounded_positioned_tool_request_preserves_location_and_peak_rejection() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id,
+            sequence: 1,
+            timestamp_ms: 1,
+            provenance: None,
+            kind: SessionEventKind::PositionedToolCallRequested {
+                turn_id: "turn".into(),
+                output_position: bcode_session_models::TurnOutputPosition::new(4),
+                tool_call_id: "call".into(),
+                producer_plugin_id: Some("plugin".into()),
+                tool_name: "tool".into(),
+                arguments_json: "{}".into(),
+                working_directory: None,
+            },
+        };
+        let original = view.snapshot().clone();
+        let before = retained;
+        let denied = ObservationRetentionLimits {
+            scalar_capacity_bytes: retained.scalar_capacity_bytes,
+            ..limits()
+        };
+        assert!(
+            view.apply_event_bounded(&event, &mut retained, denied)
+                .is_err()
+        );
+        assert_eq!(view.snapshot(), &original);
+        assert_eq!(retained, before);
+        let allowed = owner_peak_limits(&view, &event);
+        ordinary.apply_event(&event);
+        view.apply_event_bounded(&event, &mut retained, allowed)
+            .unwrap();
+        let item = &view.snapshot().transcript.items[0];
+        assert_eq!(item.id, TranscriptViewItemId::tool("call"));
+        assert!(!item.streaming, "requested is not running without a draft");
+        assert_eq!(
+            item.output_location,
+            Some(TurnOutputLocation {
+                turn_id: "turn".into(),
+                position: bcode_session_models::TurnOutputPosition::new(4),
+            })
+        );
+        assert_eq!(view.snapshot(), ordinary.snapshot());
+        let actual = view.observation_retention_usage(allowed).unwrap();
+        assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+        assert_eq!(retained.collection_entries, actual.collection_entries);
+        assert_eq!(retained.value_nodes, actual.value_nodes);
+    }
+
+    #[test]
+    fn bounded_artifact_references_match_serde_and_reject_without_ledger_changes() {
+        // Root fields (8), metadata (1), refs slot (1), reference fields (5), nested
+        // metadata field (1) and nested array slots (2) are simultaneously owned.
+        let limits = || ObservationRetentionLimits {
+            collection_entries: 18,
+            ..single_owner_limits()
+        };
+        let artifact = bcode_session_models::ToolArtifact {
+            artifact_id: "question".into(),
+            producer_plugin_id: "question.plugin".into(),
+            schema: "question.reply".into(),
+            schema_version: 1,
+            tool_call_id: Some("call".into()),
+            title: Some("Reply".into()),
+            metadata: serde_json::json!({"answer": "yes"}),
+            refs: vec![bcode_session_models::ToolArtifactRef {
+                key: "reply".into(),
+                content_type: Some("application/json".into()),
+                storage_uri: Some("artifact://reply".into()),
+                byte_len: Some(12),
+                metadata: Some(serde_json::json!({"nested": ["value", 2]})),
+            }],
+        };
+        let mut retained = ObservationRetentionUsage::default();
+        let denied = ObservationRetentionLimits {
+            collection_entries: 0,
+            ..limits()
+        };
+        assert!(stage_artifact_payload(&artifact, &mut retained, denied).is_err());
+        assert_eq!(retained, ObservationRetentionUsage::default());
+        let payload = stage_artifact_payload(&artifact, &mut retained, limits()).unwrap();
+        assert_eq!(payload, serde_json::to_value(&artifact).unwrap());
+        let actual = ObservationRetentionUsage::json(&payload, limits()).unwrap();
+        assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+        assert_eq!(retained.collection_entries, actual.collection_entries);
+        assert_eq!(retained.value_nodes, actual.value_nodes);
+    }
+
+    #[test]
+    fn bounded_submission_cancellation_preserves_parity_and_atomicity() {
+        use bcode_session_models::{
+            ClientId, PromptSubmission, SubmissionId, SubmissionPlacement, SubmissionTarget,
+            TurnAdmissionMetadata, TurnId,
+        };
+        let session_id = SessionId::new();
+        for accepted in [false, true] {
+            let mut view = SessionView::default();
+            let id = SubmissionId("cancel".into());
+            if accepted {
+                view.apply_event(&SessionEvent {
+                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    session_id,
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    provenance: None,
+                    kind: SessionEventKind::SubmissionAccepted {
+                        submission: PromptSubmission {
+                            id: id.clone(),
+                            client_id: ClientId::new(),
+                            text: "retained prompt".into(),
+                            admission: TurnAdmissionMetadata::default(),
+                            requested_placement: SubmissionPlacement::FollowUp,
+                            target: SubmissionTarget::OwnTurn {
+                                turn_id: TurnId("turn".into()),
+                            },
+                            execution_descriptor: None,
+                        },
+                    },
+                });
+            }
+            let mut ordinary = view.clone();
+            let mut retained = view.observation_retention_usage(limits()).unwrap();
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence: 2,
+                timestamp_ms: 2,
+                provenance: None,
+                kind: SessionEventKind::SubmissionCancelled { submission_id: id },
+            };
+            let original = view.snapshot().clone();
+            let before = retained;
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                ..limits()
+            };
+            assert!(
+                view.apply_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap_or_else(|error| {
+                    panic!("{error:?}: source={retained:?} budget={:?}", limits())
+                });
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            let actual = view.observation_retention_usage(limits()).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+            assert_eq!(retained.value_nodes, actual.value_nodes);
+        }
+    }
+
+    #[test]
+    fn bounded_ordered_stream_preserves_gap_terminal_and_atomic_admission() {
+        use bcode_session_models::{
+            SessionLiveEventKind, TextStreamOperation, TextStreamTerminalStatus, TextStreamUpdate,
+        };
+        let session_id = SessionId::new();
+        let live = |revision, operation| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
+                turn_id: "turn".into(),
+                segment_id: "segment".into(),
+                segment_order: 0,
+                update: TextStreamUpdate {
+                    generation: 0,
+                    first_revision: revision,
+                    revision,
+                    operation,
+                },
+            },
+        };
+        for gap in [false, true] {
+            let mut view = SessionView::default();
+            let mut ordinary = view.clone();
+            let mut retained = view.observation_retention_usage(limits()).unwrap();
+            let events = [
+                live(
+                    1,
+                    TextStreamOperation::Append {
+                        expected_offset: 0,
+                        text: "a".into(),
+                    },
+                ),
+                live(
+                    if gap { 3 } else { 2 },
+                    if gap {
+                        TextStreamOperation::Append {
+                            expected_offset: 1,
+                            text: "b".into(),
+                        }
+                    } else {
+                        TextStreamOperation::Terminal {
+                            status: TextStreamTerminalStatus::Cancelled,
+                        }
+                    },
+                ),
+                live(
+                    3,
+                    TextStreamOperation::Append {
+                        expected_offset: 1,
+                        text: "late".into(),
+                    },
+                ),
+            ];
+            for (index, event) in events.iter().enumerate() {
+                if index == 0 {
+                    let original = view.snapshot().clone();
+                    let before = retained;
+                    let denied = ObservationRetentionLimits {
+                        scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                        ..limits()
+                    };
+                    assert!(
+                        view.apply_live_event_bounded(event, &mut retained, denied)
+                            .is_err()
+                    );
+                    assert_eq!(view.snapshot(), &original);
+                    assert_eq!(retained, before);
+                }
+                let allowed = measured_peak_limits(&view, |candidate, ledger, policy| {
+                    candidate.apply_live_event_bounded(event, ledger, policy)
+                });
+                ordinary.apply_live_event(event);
+                view.apply_live_event_bounded(event, &mut retained, allowed)
+                    .unwrap();
+                assert_eq!(view.snapshot(), ordinary.snapshot());
+                let actual = view.observation_retention_usage(allowed).unwrap();
+                assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+                assert_eq!(retained.collection_entries, actual.collection_entries);
+                assert_eq!(retained.value_nodes, actual.value_nodes);
+            }
+            let id = TranscriptViewItemId::new("assistant-turn:turn:segment:segment");
+            let expected = if gap {
+                TextStreamViewStatus::Degraded
+            } else {
+                TextStreamViewStatus::Terminal(TextStreamTerminalStatus::Cancelled)
+            };
+            assert_eq!(view.snapshot().text_streams[&id].status, expected);
+        }
+    }
+
+    fn assert_event_budget_denial(
+        view: &mut SessionView,
+        event: &SessionEvent,
+        retained: &mut ObservationRetentionUsage,
+        budget: ObservationRetentionLimits,
+    ) {
+        for denied in [
+            ObservationRetentionLimits {
+                scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                ..budget
+            },
+            ObservationRetentionLimits {
+                collection_entries: retained.collection_entries,
+                ..budget
+            },
+            ObservationRetentionLimits {
+                value_nodes: retained.value_nodes,
+                ..budget
+            },
+        ] {
+            let original = view.snapshot().clone();
+            let before = *retained;
+            assert!(view.apply_event_bounded(event, retained, denied).is_err());
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(*retained, before);
+        }
+    }
+
+    #[test]
+    fn bounded_positioned_segments_match_ordinary_and_reject_atomically() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        // Reordering, repeated durable identity, and completion of a prior stream.
+        for (sequence, kind) in [
+            (
+                14,
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: "turn".into(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(2),
+                    segment_id: "later".into(),
+                    segment_order: 1,
+                    text: "later answer".into(),
+                },
+            ),
+            (
+                15,
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: "turn".into(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    segment_id: "earlier".into(),
+                    segment_order: 0,
+                    text: "earlier answer".into(),
+                },
+            ),
+            (
+                16,
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: "turn".into(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(1),
+                    segment_id: "earlier".into(),
+                    segment_order: 0,
+                    text: "replacement".into(),
+                },
+            ),
+            (
+                17,
+                SessionEventKind::AssistantDelta {
+                    text: "partial".into(),
+                },
+            ),
+            (
+                18,
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: "turn".into(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(3),
+                    segment_id: "streamed".into(),
+                    segment_order: 2,
+                    text: "complete".into(),
+                },
+            ),
+            (
+                19,
+                SessionEventKind::AssistantResponseSegment {
+                    turn_id: "turn".into(),
+                    segment_id: "unpositioned".into(),
+                    segment_order: 3,
+                    text: "plain segment".into(),
+                },
+            ),
+        ] {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence,
+                timestamp_ms: sequence,
+                provenance: None,
+                kind,
+            };
+            let allowed = owner_peak_limits(&view, &event);
+            if matches!(
+                event.kind,
+                SessionEventKind::PositionedAssistantResponseSegment { .. }
+            ) {
+                assert_event_budget_denial(&mut view, &event, &mut retained, limits());
+            }
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, allowed)
+                .unwrap_or_else(|error| {
+                    panic!("{error:?}: source={retained:?} budget={allowed:?}")
+                });
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            let actual = view.observation_retention_usage(allowed).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+            assert_eq!(retained.value_nodes, actual.value_nodes);
+        }
+    }
+
+    #[test]
+    fn bounded_request_context_matches_ordinary_and_rejects_atomically() {
+        use bcode_session_models::{
+            LocalContextEstimate, ModelRequestIdentity, RequestContextObservation,
+            RequestContextTokenCount,
+        };
+        let session_id = SessionId::new();
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        // Replacement, stale epoch, duplicate identity, and newer observation.
+        for (sequence, epoch, tokens) in [(8, 2, 100), (9, 1, 200), (8, 2, 100), (10, 2, 300)] {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence,
+                timestamp_ms: 0,
+                provenance: None,
+                kind: SessionEventKind::RequestContextObserved {
+                    observation: RequestContextObservation {
+                        request: ModelRequestIdentity {
+                            provider_plugin_id: "provider".into(),
+                            requested_model_id: Some("alias".into()),
+                            effective_model_id: "model".into(),
+                            request_id: "request".into(),
+                            model_turn_id: "turn".into(),
+                            round: 0,
+                            request_fingerprint: "fingerprint".into(),
+                            effective_auth_profile: Some("profile".into()),
+                            context_format_version: Some(1),
+                            compatibility_key: Some("compatible".into()),
+                            context_epoch: epoch,
+                        },
+                        context_through_sequence: sequence,
+                        context_tokens: RequestContextTokenCount::Estimated(tokens),
+                        local_estimate: LocalContextEstimate {
+                            tokens,
+                            algorithm_version: 1,
+                        },
+                    },
+                },
+            };
+            let allowed = owner_peak_limits(&view, &event);
+            if sequence == 8 && view.snapshot().runtime.context_occupancy.is_none()
+                || sequence == 10
+            {
+                for denied in [
+                    ObservationRetentionLimits {
+                        scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                        ..allowed
+                    },
+                    ObservationRetentionLimits {
+                        value_nodes: retained.value_nodes,
+                        ..allowed
+                    },
+                ] {
+                    let original = view.snapshot().clone();
+                    let before = retained;
+                    assert!(
+                        view.apply_event_bounded(&event, &mut retained, denied)
+                            .is_err()
+                    );
+                    assert_eq!(view.snapshot(), &original);
+                    assert_eq!(retained, before);
+                }
+            }
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, allowed)
+                .unwrap_or_else(|error| {
+                    panic!("{error:?}: source={retained:?} budget={allowed:?}")
+                });
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            let actual = view.observation_retention_usage(allowed).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+            assert_eq!(retained.value_nodes, actual.value_nodes);
+        }
+    }
+
+    #[test]
+    fn bounded_child_creation_and_submission_context_match_ordinary_atomically() {
+        use bcode_session_models::{
+            ClientId, PromptSubmission, SessionChildCreateRequest, SubmissionContextIssue,
+            SubmissionId, SubmissionPlacement, SubmissionTarget, TurnAdmissionMetadata, TurnId,
+        };
+        let session_id = SessionId::new();
+        let submission_id = SubmissionId("pending".into());
+        let events = [
+            SessionEventKind::ChildSessionCreated {
+                request: Box::new(SessionChildCreateRequest {
+                    child_id: session_id,
+                    parent_id: SessionId::new(),
+                    name: None,
+                    working_directory: std::path::PathBuf::from("/"),
+                }),
+                spawning: None,
+            },
+            SessionEventKind::SubmissionAccepted {
+                submission: PromptSubmission {
+                    id: submission_id.clone(),
+                    client_id: ClientId::new(),
+                    text: "question".into(),
+                    admission: TurnAdmissionMetadata::default(),
+                    requested_placement: SubmissionPlacement::FollowUp,
+                    target: SubmissionTarget::OwnTurn {
+                        turn_id: TurnId("turn".into()),
+                    },
+                    execution_descriptor: None,
+                },
+            },
+            SessionEventKind::SubmissionContextObserved {
+                submission_id: submission_id.clone(),
+                issue: SubmissionContextIssue::Unavailable,
+            },
+            SessionEventKind::SubmissionContextObserved {
+                submission_id,
+                issue: SubmissionContextIssue::Incompatible,
+            },
+        ];
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        for (index, kind) in events.into_iter().enumerate() {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence: index as u64 + 1,
+                timestamp_ms: 0,
+                provenance: None,
+                kind,
+            };
+            let original = view.snapshot().clone();
+            let before = retained;
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                ..limits()
+            };
+            assert!(
+                view.apply_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            let actual = view.observation_retention_usage(limits()).unwrap();
+            assert_eq!(retained.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(retained.value_nodes, actual.value_nodes);
+            assert_eq!(retained.collection_entries, actual.collection_entries);
+        }
+    }
+
+    #[test]
+    fn bounded_selection_events_stage_all_optional_strings_before_commit() {
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let events = [
+            SessionEventKind::AgentChanged {
+                agent_id: "agent".into(),
+            },
+            SessionEventKind::ReasoningChanged {
+                effort: Some("high".into()),
+                summary: Some("auto".into()),
+                model_scope: None,
+            },
+        ];
+        for (index, kind) in events.into_iter().enumerate() {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id: SessionId::new(),
+                sequence: index as u64 + 1,
+                timestamp_ms: 0,
+                provenance: None,
+                kind,
+            };
+            let before = retained;
+            let original = view.snapshot().clone();
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                ..limits()
+            };
+            assert!(
+                view.apply_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_event(&event);
+            view.apply_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            assert_eq!(
+                retained.scalar_capacity_bytes,
+                view.observation_retention_usage(limits())
+                    .unwrap()
+                    .scalar_capacity_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_live_progress_matches_ordinary_and_rejects_at_replacement_peak() {
+        let events = [
+            bcode_session_models::ProviderStreamEvent::TurnStarted,
+            bcode_session_models::ProviderStreamEvent::ToolCallProgress {
+                tool_call_id: "id".into(),
+                tool_name: "tool🦀".into(),
+                argument_bytes: 1025,
+            },
+            bcode_session_models::ProviderStreamEvent::RetryScheduled {
+                message: "retry".into(),
+                retry_at_unix: 7,
+            },
+        ];
+        let mut view = SessionView::default();
+        let mut ordinary = view.clone();
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        for progress in events {
+            let event = SessionLiveEvent {
+                session_id: SessionId::new(),
+                kind: SessionLiveEventKind::ProviderStreamProgress {
+                    turn_id: "turn".into(),
+                    event: progress,
+                },
+            };
+            let before = retained;
+            let original = view.snapshot().clone();
+            let denied = ObservationRetentionLimits {
+                scalar_capacity_bytes: retained.scalar_capacity_bytes,
+                ..limits()
+            };
+            assert!(
+                view.apply_live_event_bounded(&event, &mut retained, denied)
+                    .is_err()
+            );
+            assert_eq!(view.snapshot(), &original);
+            assert_eq!(retained, before);
+            ordinary.apply_live_event(&event);
+            view.apply_live_event_bounded(&event, &mut retained, limits())
+                .unwrap();
+            eprintln!(
+                "live parity: session_id={} revision={} latest_sequence={} runtime={} transcript={} progress={}",
+                view.snapshot().session_id == ordinary.snapshot().session_id,
+                view.snapshot().revision == ordinary.snapshot().revision,
+                view.snapshot().latest_sequence == ordinary.snapshot().latest_sequence,
+                view.snapshot().runtime == ordinary.snapshot().runtime,
+                view.snapshot().transcript == ordinary.snapshot().transcript,
+                view.snapshot().runtime.provider_progress
+                    == ordinary.snapshot().runtime.provider_progress
+            );
+            assert_eq!(
+                view.snapshot().session_id,
+                ordinary.snapshot().session_id,
+                "live source identity parity"
+            );
+            assert_eq!(
+                view.snapshot().revision,
+                ordinary.snapshot().revision,
+                "live revision parity"
+            );
+            assert_eq!(
+                view.snapshot().runtime.provider_progress,
+                ordinary.snapshot().runtime.provider_progress,
+                "live progress parity"
+            );
+            assert_eq!(view.snapshot(), ordinary.snapshot());
+            assert_eq!(
+                retained.scalar_capacity_bytes,
+                view.observation_retention_usage(limits())
+                    .unwrap()
+                    .scalar_capacity_bytes
+            );
+        }
+        let unsupported = SessionLiveEvent {
+            session_id: SessionId::new(),
+            kind: SessionLiveEventKind::AssistantReasoningDelta {
+                turn_id: "turn".into(),
+                text: "no unchecked fallback".into(),
+            },
+        };
+        let before = retained;
+        let original = view.snapshot().clone();
+        let denied = ObservationRetentionLimits {
+            scalar_capacity_bytes: 0,
+            ..limits()
+        };
+        assert!(
+            view.apply_live_event_bounded(&unsupported, &mut retained, denied)
+                .is_err()
+        );
+        assert_eq!(retained, before);
+        assert_eq!(view.snapshot(), &original);
+    }
+
+    #[test]
+    fn bounded_metadata_event_matches_ordinary_and_peak_denial_is_atomic() {
+        let mut view = SessionView::default();
+        view.snapshot.title = Some("old".into());
+        view.snapshot.working_directory = Some(std::path::PathBuf::from("/old"));
+        let event = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id: SessionId::new(),
+            sequence: 1,
+            timestamp_ms: 0,
+            provenance: None,
+            kind: SessionEventKind::SessionCreated {
+                name: Some("new title".into()),
+                working_directory: "/new".into(),
+            },
+        };
+        let mut retained = view.observation_retention_usage(limits()).unwrap();
+        let before = retained;
+        let original = view.snapshot().clone();
+        let denied = ObservationRetentionLimits {
+            scalar_capacity_bytes: retained.scalar_capacity_bytes,
+            ..limits()
+        };
+        assert!(
+            view.apply_event_bounded(&event, &mut retained, denied)
+                .is_err()
+        );
+        assert_eq!(*view.snapshot(), original);
+        assert_eq!(retained, before);
+        let mut ordinary = view.clone();
+        ordinary.apply_event(&event);
+        view.apply_event_bounded(&event, &mut retained, limits())
+            .unwrap();
+        assert_eq!(view.snapshot(), ordinary.snapshot());
+        assert_eq!(
+            retained.scalar_capacity_bytes,
+            view.observation_retention_usage(limits())
+                .unwrap()
+                .scalar_capacity_bytes
+        );
+        let after = retained;
+        view.apply_event_bounded(&event, &mut retained, limits())
+            .unwrap();
+        assert_eq!(retained, after);
+        let mut future = event;
+        future.schema_version += 1;
+        assert!(
+            view.apply_event_bounded(&future, &mut retained, limits())
+                .is_err()
+        );
+        assert_eq!(retained, after);
+    }
+
+    #[test]
+    fn formatted_interaction_detail_admits_exact_staging_and_rolls_back_denial() {
+        let resolution = bcode_session_models::ToolExchangeResolution::Failed {
+            code: "wide🦀".into(),
+            message: "combining e\u{301}".into(),
+        };
+        let mut retained =
+            bcode_session_view_models::retention::ObservationRetentionUsage::default();
+        let expected = interaction_status_detail(&resolution).unwrap();
+        let denied = ObservationRetentionLimits {
+            scalar_capacity_bytes: expected.len() - 1,
+            ..limits()
+        };
+        assert!(
+            interaction_status_detail_admitted(&resolution, Some((&mut retained, denied))).is_err()
+        );
+        assert_eq!(
+            retained,
+            bcode_session_view_models::retention::ObservationRetentionUsage::default()
+        );
+        let actual =
+            interaction_status_detail_admitted(&resolution, Some((&mut retained, limits())))
+                .unwrap()
+                .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.capacity(), actual.len());
+        assert_eq!(retained.scalar_capacity_bytes, actual.capacity());
+    }
+
+    #[test]
+    fn transcript_append_admission_rejects_without_changing_item_or_ledger() {
+        let mut text = String::with_capacity(512);
+        text.push_str("old");
+        let mut item = TranscriptViewItem {
+            id: TranscriptViewItemId::new("item"),
+            revision: 0,
+            sequence: None,
+            timestamp_ms: None,
+            output_location: None,
+            streaming: false,
+            kind: TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::plain(text),
+            },
+        };
+        let mut usage =
+            bcode_session_view_models::retention::inspect_transcript_item(&item, limits()).unwrap();
+        let before_item = item.clone();
+        let before_usage = usage;
+        let denied = ObservationRetentionLimits {
+            scalar_capacity_bytes: usage.scalar_capacity_bytes,
+            ..limits()
+        };
+        assert!(
+            append_text_to_item_admitted(&mut item, "new", Some((&mut usage, denied))).is_err()
+        );
+        assert_eq!(item, before_item);
+        assert_eq!(usage, before_usage);
+        let mut ordinary = item.clone();
+        append_text_to_item(&mut ordinary, "new");
+        append_text_to_item_admitted(&mut item, "new", Some((&mut usage, limits()))).unwrap();
+        assert_eq!(item, ordinary);
+    }
+
+    #[test]
+    fn checked_scalar_append_matches_unrestricted_and_rejects_before_growth() {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut target = String::with_capacity(512);
+        target.push_str("old");
+        let mut ordinary = target.clone();
+        append_observation_text(&mut ordinary, "🦀", None).unwrap();
+        let mut usage = ObservationRetentionUsage::string(&target, 1);
+        let before = usage;
+        let denied = ObservationRetentionLimits {
+            scalar_capacity_bytes: target.capacity() + ordinary.len() - 1,
+            ..limits()
+        };
+        assert!(append_observation_text(&mut target, "🦀", Some((&mut usage, denied))).is_err());
+        assert_eq!(target, "old");
+        assert_eq!(target.capacity(), 512);
+        assert_eq!(usage, before);
+        append_observation_text(&mut target, "🦀", Some((&mut usage, limits()))).unwrap();
+        assert_eq!(target, ordinary);
+        assert_eq!(target.capacity(), target.len());
+        assert_eq!(usage.scalar_capacity_bytes, target.capacity());
+        usage
+            .try_release(ObservationRetentionUsage::string(&target, 1))
+            .unwrap();
+        assert_eq!(usage, ObservationRetentionUsage::default());
+    }
+
+    #[test]
+    fn checked_scalar_replace_matches_unrestricted_and_reserves_peak() {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut old = String::with_capacity(512);
+        old.push_str("old");
+        let mut view = SessionView::new();
+        view.push_item(
+            TranscriptViewItemId::new("stream"),
+            1,
+            None,
+            true,
+            TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown(old),
+            },
+        );
+        let item = &mut view.snapshot.transcript.items[0];
+        let mut ordinary = item.clone();
+        assert!(replace_text_in_item(&mut ordinary, "checkpoint"));
+        let mut usage = ObservationRetentionUsage {
+            scalar_capacity_bytes: 512,
+            value_nodes: 1,
+            depth: 1,
+            ..ObservationRetentionUsage::default()
+        };
+        let before = usage;
+        assert!(
+            replace_text_in_item_admitted(
+                item,
+                "checkpoint",
+                Some((
+                    &mut usage,
+                    ObservationRetentionLimits {
+                        scalar_capacity_bytes: 521,
+                        ..limits()
+                    }
+                ))
+            )
+            .is_err()
+        );
+        assert_eq!(usage, before);
+        assert!(
+            replace_text_in_item_admitted(item, "checkpoint", Some((&mut usage, limits())))
+                .unwrap()
+        );
+        assert_eq!(*item, ordinary);
+        assert_eq!(usage.scalar_capacity_bytes, 10);
+        let after = usage;
+        assert!(
+            !replace_text_in_item_admitted(item, "checkpoint", Some((&mut usage, limits())))
+                .unwrap()
+        );
+        assert_eq!(usage, after);
+    }
+
+    #[test]
+    fn duplicate_fence_counts_capacity_keys_and_repeated_identity() {
+        let mut view = SessionView::new();
+        let mut text = String::with_capacity(512);
+        text.push('x');
+        let capacity = text.capacity();
+        let id = TranscriptViewItemId::new("stream");
+        view.last_text_stream_updates.insert(
+            id.clone(),
+            bcode_session_models::TextStreamUpdate {
+                generation: 1,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text,
+                },
+            },
+        );
+        let usage = view.text_update_retention_usage(limits()).unwrap();
+        assert_eq!(
+            usage.scalar_capacity_bytes,
+            capacity + id.retention_usage(1).scalar_capacity_bytes
+        );
+        assert_eq!(usage.collection_entries, 1);
+        assert!(
+            view.text_update_retention_usage(ObservationRetentionLimits {
+                scalar_capacity_bytes: 128,
+                ..limits()
+            })
+            .is_err()
+        );
+        view.last_text_stream_updates.insert(
+            id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 1,
+                first_revision: 2,
+                revision: 2,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 1,
+                    text: "next".into(),
+                },
+            },
+        );
+        assert_eq!(
+            view.text_update_retention_usage(limits())
+                .unwrap()
+                .collection_entries,
+            1
+        );
+        view.last_text_stream_updates.clear();
+        let cleared = view.text_update_retention_usage(limits()).unwrap();
+        assert_eq!(cleared.scalar_capacity_bytes, 0);
+        assert_eq!(cleared.collection_entries, 0);
+    }
 }
 
 impl Default for SessionView {
@@ -494,6 +4363,461 @@ impl SessionView {
             usage_cost_revision: 0,
             usage_checkpoint: None,
         }
+    }
+
+    /// Inspect request-keyed usage retention without serializing nested metadata.
+    ///
+    /// This is one cache component; it excludes snapshot and other caches.
+    ///
+    /// # Errors
+    /// Returns an error on an owning inspector rejection or structural overflow.
+    pub fn request_usage_retention_usage(
+        &self,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let mut usage = ObservationRetentionUsage::collection(self.usage_by_request.len(), 1);
+        usage.check(limits)?;
+        for (request, tokens) in &self.usage_by_request {
+            usage.try_add(ObservationRetentionUsage::string(request, 2), limits)?;
+            let mut nested = bcode_session_models::retention_events::inspect_session_token_usage(
+                tokens, &limits,
+            )?;
+            nested.depth = nested
+                .depth
+                .checked_add(1)
+                .ok_or(ObservationRetentionExceeded)?;
+            usage.try_add(nested, limits)?;
+        }
+        Ok(usage)
+    }
+
+    /// Clone all projector state after admitting its complete retained duplicate.
+    ///
+    /// The caller ledger must include the source and all enclosing owners. The
+    /// returned view owns its measured usage plus one copy reservation until it
+    /// is dropped and released.
+    ///
+    /// # Errors
+    /// Rejects structural exhaustion, overflow, an inconsistent ledger, or a
+    /// clone exceeding its pre-admitted capacity. Rejection preserves the ledger.
+    pub fn try_clone_bounded(
+        &self,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<Self, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let mut charge = self.observation_retention_usage(limits)?;
+        let mut next = *retained;
+        // Verify the caller owns at least the source before admitting a duplicate.
+        let mut source_check = next;
+        source_check.try_release(charge)?;
+        charge.copies = 1;
+        next.try_add(charge, limits).inspect_err(|_| {
+            #[cfg(test)]
+            eprintln!("retention phase=whole_view_clone source={charge:?} ledger={retained:?} limits={limits:?}");
+        })?;
+        let cloned = self.clone();
+        let mut actual = cloned.observation_retention_usage(limits)?;
+        actual.copies = 1;
+        reconcile_clone_capacity(charge, actual)?;
+        next.try_release(charge)?;
+        next.try_add(actual, limits)?;
+        *retained = next;
+        Ok(cloned)
+    }
+
+    /// Clone the public snapshot without copying hidden projector state.
+    ///
+    /// The caller ledger must include the source snapshot and all enclosing
+    /// owners. Release the returned snapshot's usage plus one copy reservation
+    /// only after dropping it.
+    ///
+    /// # Errors
+    /// Rejects structural exhaustion, overflow, an inconsistent ledger, or a
+    /// clone exceeding its pre-admitted capacity. Rejection preserves the ledger.
+    pub fn try_clone_snapshot_bounded(
+        &self,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        SessionViewSnapshot,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        bcode_session_view_models::retention::clone_snapshot_bounded(
+            &self.snapshot,
+            retained,
+            limits,
+        )
+    }
+
+    /// Inspect all owned projector state, including the semantic snapshot and
+    /// retained fences which may outlive visible transcript items.
+    ///
+    /// # Errors
+    /// Returns an error on a nested rejection, structural limit, or overflow.
+    pub fn observation_retention_usage(
+        &self,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let Self {
+            snapshot,
+            tool_item_ids: _,
+            interaction_item_ids: _,
+            tool_invocations: _,
+            contribution_sequences: _,
+            contribution_placements: _,
+            terminal_runtime_work: _,
+            terminal_interactions: _,
+            live_reasoning: _,
+            last_text_stream_updates: _,
+            streaming_presentation_policy: _,
+            pending_text_presentations: _,
+            usage_by_request: _,
+            unattributed_metered_tokens: _,
+            unattributed_cost: _,
+            usage_cost_revision: _,
+            usage_checkpoint: _,
+        } = self;
+        let mut usage = bcode_session_view_models::retention::inspect_snapshot(snapshot, limits)?;
+        for mut nested in [
+            self.correlation_retention_usage(limits)?,
+            self.reasoning_retention_usage(limits)?,
+            self.pending_text_retention_usage(limits)?,
+            self.request_usage_retention_usage(limits)?,
+            self.tool_aggregate_retention_usage(limits)?,
+            self.text_update_retention_usage(limits)?,
+        ] {
+            nested.depth = nested
+                .depth
+                .checked_add(1)
+                .ok_or(ObservationRetentionExceeded)?;
+            usage.try_add(nested, limits)?;
+        }
+        let StreamingPresentationPolicy {
+            enabled: _,
+            curve: _,
+            graphemes_per_second: _,
+            max_lag_ms: _,
+        } = &self.streaming_presentation_policy;
+        usage.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 8,
+                depth: 2,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        Ok(usage)
+    }
+
+    /// Inspect live reasoning cache identities and all retained part text.
+    ///
+    /// # Errors
+    /// Returns an error on a structural limit or overflow.
+    pub fn reasoning_retention_usage(
+        &self,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut usage = ObservationRetentionUsage::collection(self.live_reasoning.len(), 1);
+        usage.check(limits)?;
+        for ((turn_id, activity_id), activity) in &self.live_reasoning {
+            usage.try_add(ObservationRetentionUsage::string(turn_id, 2), limits)?;
+            usage.try_add(ObservationRetentionUsage::string(activity_id, 2), limits)?;
+            let LiveReasoningActivity {
+                order: _,
+                parts,
+                opaque: _,
+                finished: _,
+            } = activity;
+            usage.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 3,
+                    depth: 3,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            usage.try_add(
+                ObservationRetentionUsage::collection(parts.len(), 3),
+                limits,
+            )?;
+            for (key, part) in parts {
+                usage.try_add(ObservationRetentionUsage::string(key, 4), limits)?;
+                let bcode_session_models::ReasoningPart {
+                    part_id,
+                    kind: _,
+                    role: _,
+                    order: _,
+                    text,
+                } = part;
+                usage.try_add(
+                    ObservationRetentionUsage {
+                        value_nodes: 3,
+                        depth: 5,
+                        ..ObservationRetentionUsage::default()
+                    },
+                    limits,
+                )?;
+                usage.try_add(ObservationRetentionUsage::string(part_id, 5), limits)?;
+                usage.try_add(ObservationRetentionUsage::string(text, 5), limits)?;
+            }
+        }
+        Ok(usage)
+    }
+
+    /// Inspect paced text staging, including its routing identities.
+    ///
+    /// # Errors
+    /// Returns an error on a structural limit or overflow.
+    pub fn pending_text_retention_usage(
+        &self,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut usage =
+            ObservationRetentionUsage::collection(self.pending_text_presentations.len(), 1);
+        usage.check(limits)?;
+        for (id, pending) in &self.pending_text_presentations {
+            usage.try_add(inspect_pending_text(id, pending, limits)?, limits)?;
+        }
+        Ok(usage)
+    }
+
+    /// Inspect projector correlation maps and terminal fences, independently
+    /// of snapshot fields and the other cache components.
+    ///
+    /// # Errors
+    /// Returns an error on any structural limit, owning inspection failure, or overflow.
+    pub fn correlation_retention_usage(
+        &self,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let mut usage = ObservationRetentionUsage::default();
+        for map in [&self.tool_item_ids, &self.interaction_item_ids] {
+            usage.try_add(ObservationRetentionUsage::collection(map.len(), 1), limits)?;
+            for (key, id) in map {
+                usage.try_add(ObservationRetentionUsage::string(key, 2), limits)?;
+                usage.try_add(id.retention_usage(2), limits)?;
+            }
+        }
+        usage.try_add(
+            ObservationRetentionUsage::collection(self.contribution_sequences.len(), 1),
+            limits,
+        )?;
+        for key in self.contribution_sequences.keys() {
+            usage.try_add(ObservationRetentionUsage::string(key, 2), limits)?;
+            usage.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 1,
+                    depth: 2,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        usage.try_add(
+            ObservationRetentionUsage::collection(self.contribution_placements.len(), 1),
+            limits,
+        )?;
+        for key in self.contribution_placements.keys() {
+            usage.try_add(ObservationRetentionUsage::string(key, 2), limits)?;
+            usage.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 1,
+                    depth: 2,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        usage.try_add(
+            ObservationRetentionUsage::collection(self.terminal_runtime_work.len(), 1),
+            limits,
+        )?;
+        for id in &self.terminal_runtime_work {
+            usage.try_add(ObservationRetentionUsage::string(&id.0, 2), limits)?;
+        }
+        usage.try_add(
+            ObservationRetentionUsage::collection(self.terminal_interactions.len(), 1),
+            limits,
+        )?;
+        for (key, resolution) in &self.terminal_interactions {
+            usage.try_add(ObservationRetentionUsage::string(key, 2), limits)?;
+            let mut nested =
+                bcode_session_models::retention_events::inspect_tool_exchange_resolution(
+                    resolution, &limits,
+                )?;
+            nested.depth = nested
+                .depth
+                .checked_add(1)
+                .ok_or(ObservationRetentionExceeded)?;
+            usage.try_add(nested, limits)?;
+        }
+        let mut cost =
+            bcode_session_view_models::retention::inspect_cost(&self.unattributed_cost, limits)?;
+        cost.depth = cost
+            .depth
+            .checked_add(1)
+            .ok_or(ObservationRetentionExceeded)?;
+        usage.try_add(cost, limits)?;
+        Ok(usage)
+    }
+
+    /// Inspect retained tool aggregates and presentation scopes by borrowed value.
+    ///
+    /// This component excludes the snapshot and the other projector caches.
+    /// Unsupported nested domains are rejected by their owning inspectors.
+    ///
+    /// # Errors
+    /// Returns an error on a limit, overflow, or unsupported nested value.
+    pub fn tool_aggregate_retention_usage(
+        &self,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        self.inspect_tool_aggregates(None, limits)
+    }
+
+    fn inspect_tool_aggregates(
+        &self,
+        selected: Option<&str>,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_models::retention_events::{
+            inspect_tool_presentation, inspect_tool_projection,
+        };
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let mut usage = ObservationRetentionUsage::collection(
+            self.tool_invocations
+                .keys()
+                .filter(|key| selected.is_none_or(|id| key.as_str() == id))
+                .count(),
+            1,
+        );
+        usage.check(limits)?;
+        for (id, aggregate) in &self.tool_invocations {
+            if selected.is_some_and(|selected| id != selected) {
+                continue;
+            }
+            usage.try_add(ObservationRetentionUsage::string(id, 2), limits)?;
+            let ToolInvocationAggregate {
+                projection,
+                request_assembled: _,
+                drafts_terminal: _,
+                terminal_status: _,
+                request_draft,
+                terminal_request_draft: _,
+                presentations,
+                presentation_scope,
+            } = aggregate;
+            if let Some(draft) = request_draft {
+                let mut nested =
+                    bcode_session_view_models::retention::inspect_tool_draft(draft, limits)?;
+                nested.depth = nested
+                    .depth
+                    .checked_add(2)
+                    .ok_or(ObservationRetentionExceeded)?;
+                usage.try_add(nested, limits)?;
+            }
+            inspect_presentation_fences(presentation_scope, &mut usage, limits)?;
+            usage.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 7,
+                    depth: 3,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            let mut nested = inspect_tool_projection(projection, &limits)?;
+            nested.depth = nested
+                .depth
+                .checked_add(2)
+                .ok_or(ObservationRetentionExceeded)?;
+            usage.try_add(nested, limits)?;
+            usage.try_add(
+                ObservationRetentionUsage::collection(presentations.len(), 3),
+                limits,
+            )?;
+            for (identity, presentation) in presentations {
+                // The identity is retained independently from the update.
+                match identity {
+                    bcode_tool::ToolPresentationIdentity::Primary => {}
+                    bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+                        usage.try_add(ObservationRetentionUsage::string(item_id, 4), limits)?;
+                    }
+                }
+                let mut nested = inspect_tool_presentation(presentation, &limits)?;
+                nested.depth = nested
+                    .depth
+                    .checked_add(3)
+                    .ok_or(ObservationRetentionExceeded)?;
+                usage.try_add(nested, limits)?;
+            }
+        }
+        Ok(usage)
+    }
+
+    /// Inspect the retained duplicate-fence text updates, including map keys.
+    ///
+    /// This is one component of projector usage, not total snapshot/cache usage.
+    /// The traversal borrows owned fields and never serializes or clones them.
+    ///
+    /// # Errors
+    /// Returns an error on a structural limit or accounting overflow.
+    pub fn text_update_retention_usage(
+        &self,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let mut usage =
+            ObservationRetentionUsage::collection(self.last_text_stream_updates.len(), 1);
+        usage.check(limits)?;
+        for (id, update) in &self.last_text_stream_updates {
+            usage.try_add(id.retention_usage(2), limits)?;
+            let mut nested = bcode_session_models::inspect_text_stream(update, &limits)?;
+            nested.depth = nested
+                .depth
+                .checked_add(1)
+                .ok_or(ObservationRetentionExceeded)?;
+            usage.try_add(nested, limits)?;
+        }
+        Ok(usage)
     }
 
     #[cfg(test)]
@@ -643,6 +4967,83 @@ impl SessionView {
     }
 
     /// Apply canonical session metadata from an attach or catalog response.
+    /// Set summary metadata with admission of the summary and display replicas.
+    ///
+    /// The ledger includes this view and enclosing retained owners. The borrowed
+    /// source summary remains owned by its caller throughout this operation.
+    ///
+    /// # Errors
+    /// Rejection preserves the view and ledger on exhaustion or inconsistent accounting.
+    pub fn set_session_summary_bounded(
+        &mut self,
+        summary: &bcode_session_models::SessionSummary,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let title = summary.title();
+        let changed = self.snapshot.session_id != Some(summary.id)
+            || title.is_some_and(|title| self.snapshot.title.as_deref() != Some(title))
+            || self.snapshot.working_directory.as_ref() != Some(&summary.working_directory)
+            || self.snapshot.session_summary.as_ref() != Some(summary);
+        if !changed {
+            return Ok(());
+        }
+        let mut next = *retained;
+        let charge = summary_snapshot_usage(summary, limits)?;
+        next.try_add(charge, limits)?;
+        let staged_summary = summary.clone();
+        let actual = summary_snapshot_usage(&staged_summary, limits)?;
+        reconcile_clone_capacity(charge, actual)?;
+        next.try_release(charge)?;
+        next.try_add(actual, limits)?;
+        let staged_title = title
+            .map(|title| next.try_clone_string(title, 3, limits))
+            .transpose()?;
+        let path_charge = ObservationRetentionUsage {
+            scalar_capacity_bytes: summary.working_directory.as_os_str().len(),
+            value_nodes: 1,
+            depth: 3,
+            ..ObservationRetentionUsage::default()
+        };
+        next.try_add(path_charge, limits)?;
+        let path = summary.working_directory.clone();
+        let path_actual = ObservationRetentionUsage {
+            scalar_capacity_bytes: path.capacity(),
+            ..path_charge
+        };
+        reconcile_clone_capacity(path_charge, path_actual)?;
+        next.try_release(path_charge)?;
+        next.try_add(path_actual, limits)?;
+        if let Some(old) = &self.snapshot.session_summary {
+            next.try_release(summary_snapshot_usage(old, limits)?)?;
+        }
+        if let Some(old) = &self.snapshot.working_directory {
+            next.try_release(ObservationRetentionUsage {
+                scalar_capacity_bytes: old.capacity(),
+                value_nodes: 1,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            })?;
+        }
+        if staged_title.is_some()
+            && let Some(old) = &self.snapshot.title
+        {
+            next.try_release(ObservationRetentionUsage::string(old, 3))?;
+        }
+        self.snapshot.session_id = Some(summary.id);
+        if staged_title.is_some() {
+            let old = std::mem::replace(&mut self.snapshot.title, staged_title);
+            drop(old);
+        }
+        drop(self.snapshot.working_directory.replace(path));
+        drop(self.snapshot.session_summary.replace(staged_summary));
+        self.bump_revision();
+        *retained = next;
+        Ok(())
+    }
+
+    /// Update display metadata from the authoritative session summary.
     pub fn set_session_summary(&mut self, summary: bcode_session_models::SessionSummary) {
         if self.snapshot.session_id != Some(summary.id) {
             self.snapshot.runtime.submission_queue = None;
@@ -1253,6 +5654,4303 @@ impl SessionView {
         }
     }
 
+    /// Apply an admitted durable update without entering the unrestricted reducer.
+    ///
+    /// The ledger must include this view and all enclosing retained owners. Event
+    /// groups without a checked implementation fail closed before mutation.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported schema/event groups, exhausted peak budget,
+    /// or accounting overflow. Rejection preserves the view and caller ledger.
+    pub fn apply_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        if event.schema_version != bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+            return Err(ObservationRetentionExceeded);
+        }
+        if event.sequence != 0
+            && self
+                .snapshot
+                .latest_sequence
+                .is_some_and(|sequence| event.sequence <= sequence)
+        {
+            return Ok(());
+        }
+        self.apply_observed_event_bounded(event, retained, limits)
+    }
+
+    fn apply_child_metadata_bounded(
+        &mut self,
+        event: &SessionEvent,
+        parent: SessionId,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut next = *retained;
+        let text = format_observation_text(
+            format_args!(
+                "Child session of [parent {parent}](bcode://session/{parent}) · fresh context; Ctrl-G then Left opens this parent; relationship is not assignment acceptance"
+            ),
+            &mut next,
+            limits,
+            7,
+        )?;
+        let (item, replacement, mut next) =
+            self.stage_system_message_bounded(event, &text, next, limits)?;
+        next.try_release(ObservationRetentionUsage::string(&text, 7))?;
+        drop(text);
+        self.commit_system_message(item, replacement);
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn stage_activity_chat(
+        source: (u64, &str),
+        admission: &bcode_session_models::TurnAdmissionMetadata,
+        presentation: &bcode_session_models::ActivityPresentation,
+        execution: &bcode_session_models::TurnExecutionCorrelation,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<ChatMessageView, bcode_session_view_models::retention::ObservationRetentionExceeded>
+    {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let (sequence, text) = source;
+        let fallback = next.try_clone_string(&presentation.fallback, 7, limits)?;
+        let label = admission
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.display_label.as_deref())
+            .map(|text| next.try_clone_string(text, 7, limits))
+            .transpose()?;
+        let presentation = clone_admitted(presentation, next, limits, |value| {
+            let mut charge = bcode_session_models::retention_events::inspect_activity_presentation(
+                value, &limits,
+            )?;
+            charge.depth = charge
+                .depth
+                .checked_add(7)
+                .ok_or(ObservationRetentionExceeded)?;
+            charge.check(limits)?;
+            Ok(charge)
+        })?;
+        let execution = bcode_session_models::TurnExecutionCorrelation {
+            execution_id: next.try_clone_string(&execution.execution_id, 10, limits)?,
+            unit_id: next.try_clone_string(&execution.unit_id, 10, limits)?,
+            attempt: execution.attempt,
+        };
+        let instructions = (text.len() <= 16_384)
+            .then(|| next.try_clone_string(text, 9, limits))
+            .transpose()?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 15,
+                depth: 10,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let mut message = ChatMessageView::plain(fallback);
+        message.display_label = label;
+        message.activity = Some(Box::new(bcode_session_view_models::ActivityMessageView {
+            source_sequence: sequence,
+            exact_instructions: instructions,
+            instruction_bytes: text.len(),
+            execution,
+            presentation,
+        }));
+
+        Ok(message)
+    }
+
+    fn project_presentation_bounded(
+        &mut self,
+        update: &bcode_tool::ToolPresentationUpdate,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        match &update.identity {
+            bcode_tool::ToolPresentationIdentity::Primary => {
+                self.project_primary_bounded(update, next, limits)
+            }
+            bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+                self.project_supplemental_bounded(update, item_id, next, limits)
+            }
+        }
+    }
+
+    fn project_primary_bounded(
+        &mut self,
+        update: &bcode_tool::ToolPresentationUpdate,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let aggregate = self
+            .tool_invocations
+            .get(&update.invocation_id)
+            .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+
+        let owned = clone_admitted(update, next, limits, |value| {
+            bcode_session_models::retention_events::inspect_tool_presentation(value, &limits)
+        })?;
+        let presentation = bcode_session_view_models::ToolPresentationView {
+            producer_id: owned.producer_id,
+            generation: owned.generation,
+            revision: owned.revision,
+            retention: owned.retention,
+            schema: owned.schema,
+            schema_version: owned.schema_version,
+            artifact: owned.artifact,
+            payload: owned.payload,
+        };
+        if let Some(tool) = self.snapshot.tools.get_mut(&update.invocation_id) {
+            tool.presentation = Some(presentation);
+            let tool = clone_admitted(tool, next, limits, |value| {
+                bcode_session_view_models::retention::inspect_tool(value, limits)
+            })?;
+            let id = self
+                .tool_item_ids
+                .get(&update.invocation_id)
+                .map(TranscriptViewItemId::get);
+            if let Some(id) = id {
+                let id = TranscriptViewItemId::new(next.try_clone_string(id, 5, limits)?);
+                let streaming = matches!(
+                    tool.status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                );
+                self.stage_rich_item_bounded(
+                    TranscriptViewItem {
+                        id,
+                        revision: 0,
+                        sequence: None,
+                        timestamp_ms: None,
+                        output_location: None,
+                        streaming,
+                        kind: TranscriptViewItemKind::ToolInvocation {
+                            tool: Box::new(tool),
+                        },
+                    },
+                    next,
+                    limits,
+                )?;
+                return Ok(());
+            }
+        } else if aggregate.projection.tool_name.is_some() {
+            let mut tool = stage_tool_view(&aggregate.projection, next, limits)?;
+            tool.presentation = Some(presentation);
+            let tool_key = next.try_clone_string(&update.invocation_id, 3, limits)?;
+            next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            self.snapshot.tools.insert(tool_key, tool);
+            self.refresh_rich_tool_bounded(&update.invocation_id, next, limits)?;
+            return Ok(());
+        }
+
+        self.bump_revision();
+        Ok(())
+    }
+    fn project_supplemental_bounded(
+        &mut self,
+        update: &bcode_tool::ToolPresentationUpdate,
+        item_id: &str,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let id = TranscriptViewItemId::new(format_observation_text(
+            format_args!("tool:{}:supplemental:{}", update.invocation_id, item_id),
+            next,
+            limits,
+            5,
+        )?);
+        let owned = clone_admitted(update, next, limits, |value| {
+            bcode_session_models::retention_events::inspect_tool_presentation(value, &limits)
+        })?;
+        let contribution_id = next.try_clone_string(item_id, 7, limits)?;
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: owned.invocation_id,
+            contribution_id,
+            sequence: owned.revision,
+            producer_id: owned.producer_id,
+            schema: owned.schema,
+            schema_version: owned.schema_version,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: if owned.retention == bcode_tool::ToolPresentationRetention::RetainLatest {
+                bcode_session_models::ToolContributionPersistence::Durable
+            } else {
+                bcode_session_models::ToolContributionPersistence::Transient
+            },
+            artifact: owned.artifact,
+            payload: owned.payload,
+        };
+        let invocation = self
+            .snapshot
+            .tools
+            .get(&update.invocation_id)
+            .map(|tool| {
+                clone_admitted(tool, next, limits, |value| {
+                    bcode_session_view_models::retention::inspect_tool(value, limits)
+                })
+                .map(Box::new)
+            })
+            .transpose()?;
+        self.stage_rich_item_bounded(
+            TranscriptViewItem {
+                id,
+                revision: 0,
+                sequence: None,
+                timestamp_ms: None,
+                output_location: None,
+                streaming: true,
+                kind: TranscriptViewItemKind::ToolContribution {
+                    invocation,
+                    contribution,
+                    placement: bcode_session_models::ToolContributionPlacement::Supplemental,
+                },
+            },
+            next,
+            limits,
+        )?;
+        Ok(())
+    }
+    fn stage_draft_seed(
+        current: Option<&ToolRequestDraftView>,
+        event: &bcode_session_models::ToolRequestDraftEvent,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        ToolRequestDraftView,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let draft = if let Some(current) =
+            current.filter(|draft| draft.generation == event.generation)
+        {
+            clone_admitted(current, next, limits, |value| {
+                bcode_session_view_models::retention::inspect_tool_draft(value, limits)
+            })?
+        } else {
+            next.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 12,
+                    depth: 5,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            ToolRequestDraftView {
+                output_location: event
+                    .output_position
+                    .map(|position| stage_output_location(&event.turn_id, position, next, limits))
+                    .transpose()?,
+                turn_id: next.try_clone_string(&event.turn_id, 4, limits)?,
+                tool_call_id: next.try_clone_string(&event.tool_call_id, 4, limits)?,
+                tool_name: next.try_clone_string(&event.tool_name, 4, limits)?,
+                producer_plugin_id: event
+                    .producer_plugin_id
+                    .as_ref()
+                    .map(|id| next.try_clone_string(id, 4, limits))
+                    .transpose()?,
+                schema: next.try_clone_string(&event.schema, 4, limits)?,
+                schema_version: event.schema_version,
+                placement: event.placement,
+                generation: event.generation,
+                revision: 0,
+                argument_bytes: 0,
+                preview_start_offset: 0,
+                preview: String::new(),
+                truncated: false,
+            }
+        };
+
+        Ok(draft)
+    }
+
+    fn update_draft_metadata(
+        draft: &mut ToolRequestDraftView,
+        event: &bcode_session_models::ToolRequestDraftEvent,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        draft.turn_id = next.try_clone_string(&event.turn_id, 4, limits)?;
+        if let Some(position) = event.output_position {
+            draft.output_location = Some(stage_output_location(
+                &event.turn_id,
+                position,
+                next,
+                limits,
+            )?);
+        }
+        draft.tool_name = next.try_clone_string(&event.tool_name, 4, limits)?;
+        draft.producer_plugin_id = event
+            .producer_plugin_id
+            .as_ref()
+            .map(|id| next.try_clone_string(id, 4, limits))
+            .transpose()?;
+        draft.schema = next.try_clone_string(&event.schema, 4, limits)?;
+        draft.schema_version = event.schema_version;
+        draft.placement = event.placement;
+        draft.revision = event.revision;
+        draft.argument_bytes = event.argument_bytes;
+        draft.truncated = event.truncated;
+
+        Ok(())
+    }
+
+    fn apply_observed_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        match &event.kind {
+            SessionEventKind::ToolContribution { .. }
+            | SessionEventKind::ToolContributionPlaced { .. } => {
+                return self.apply_rich_durable_bounded(event, retained, limits);
+            }
+            SessionEventKind::AssistantReasoningActivity { .. }
+            | SessionEventKind::PositionedAssistantReasoningActivity { .. } => {
+                return self.apply_complete_reasoning_bounded(event, retained, limits);
+            }
+            SessionEventKind::SubmissionCancelled { submission_id } => {
+                return self.apply_submission_cancelled_bounded(
+                    event,
+                    submission_id,
+                    retained,
+                    limits,
+                );
+            }
+            SessionEventKind::WorkingDirectoryChanged { .. } => {
+                return self.apply_working_directory_bounded(event, retained, limits);
+            }
+            SessionEventKind::PositionedAssistantResponseSegment { .. }
+            | SessionEventKind::AssistantResponseSegment { .. } => {
+                return self.apply_positioned_segment_bounded(event, retained, limits);
+            }
+            SessionEventKind::RequestContextObserved { observation } => {
+                return self.apply_request_context_bounded(event, observation, retained, limits);
+            }
+            SessionEventKind::ChildSessionCreated { request, .. } => {
+                return self.apply_child_metadata_bounded(
+                    event,
+                    request.parent_id,
+                    retained,
+                    limits,
+                );
+            }
+            SessionEventKind::SubmissionContextObserved {
+                submission_id,
+                issue,
+            } => {
+                return self.apply_submission_context_bounded(
+                    event,
+                    submission_id,
+                    *issue,
+                    retained,
+                    limits,
+                );
+            }
+            SessionEventKind::ClientAttached { .. }
+            | SessionEventKind::ClientDetached { .. }
+            | SessionEventKind::TraceEvent { .. }
+            | SessionEventKind::SessionImported { .. }
+            | SessionEventKind::SessionDerived { .. }
+            | SessionEventKind::InertHistory { .. }
+            | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
+            | SessionEventKind::ExecutionSessionCreated { .. }
+            | SessionEventKind::SessionChildLinked { .. }
+            | SessionEventKind::SessionChildrenReconciled { .. }
+            | SessionEventKind::MilestoneEvaluationRequested { .. }
+            | SessionEventKind::MilestonePublicationRequested { .. }
+            | SessionEventKind::MilestonePublished { .. }
+            | SessionEventKind::MilestoneEvaluationCompleted { .. } => {
+                self.snapshot.session_id = Some(event.session_id);
+                if event.sequence != 0 {
+                    self.snapshot.latest_sequence = Some(event.sequence);
+                }
+                return Ok(());
+            }
+            SessionEventKind::ModelUsage { usage, .. } => {
+                return self.apply_usage_bounded(event, usage, retained, limits);
+            }
+            SessionEventKind::SubmissionAccepted { .. }
+            | SessionEventKind::SubmissionActivated { .. } => {
+                return self.apply_submission_bounded(event, retained, limits);
+            }
+            SessionEventKind::ToolCallRequested { .. }
+            | SessionEventKind::PositionedToolCallRequested { .. }
+            | SessionEventKind::ToolInvocationLifecycle { .. }
+            | SessionEventKind::ToolInvocationResultRecorded { .. } => {
+                return self.apply_tool_event_bounded(event, retained, limits);
+            }
+            SessionEventKind::ToolExchangeRequested { request } => {
+                return self.apply_exchange_request_bounded(event, request, retained, limits);
+            }
+            SessionEventKind::ToolExchangeResolved { event: resolution } => {
+                return self.apply_exchange_resolution_bounded(event, resolution, retained, limits);
+            }
+            SessionEventKind::UserMessage { .. } => {
+                return self.apply_user_message_bounded(event, retained, limits);
+            }
+            SessionEventKind::AssistantDelta { text }
+            | SessionEventKind::AssistantMessage { text }
+            | SessionEventKind::AssistantReasoningDelta { text }
+            | SessionEventKind::AssistantReasoningMessage { text } => {
+                return self.apply_durable_text_bounded(event, text, retained, limits);
+            }
+            _ => {}
+        }
+        self.apply_routine_event_bounded(event, retained, limits)
+    }
+
+    fn apply_routine_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        match &event.kind {
+            SessionEventKind::RalphLifecycle { .. } => {
+                return self.apply_ralph_lifecycle_bounded(event, retained, limits);
+            }
+            SessionEventKind::ContextCompacted { .. }
+            | SessionEventKind::ProviderContextCompacted { .. } => {
+                return self.apply_compaction_bounded(event, retained, limits);
+            }
+            SessionEventKind::SkillInvocationFailed { .. }
+            | SessionEventKind::SkillInvoked { .. }
+            | SessionEventKind::SkillSuggested { .. }
+            | SessionEventKind::SkillContextLoaded { .. } => {
+                return self.apply_skill_note_bounded(event, retained, limits);
+            }
+            SessionEventKind::SkillActivated { skill_id, .. } => {
+                return self.apply_skill_selection_bounded(
+                    event,
+                    skill_id.as_str(),
+                    true,
+                    retained,
+                    limits,
+                );
+            }
+            SessionEventKind::SkillDeactivated { skill_id, .. } => {
+                return self.apply_skill_selection_bounded(
+                    event,
+                    skill_id.as_str(),
+                    false,
+                    retained,
+                    limits,
+                );
+            }
+            SessionEventKind::PermissionRequested { .. } => {
+                return self.apply_permission_request_bounded(event, retained, limits);
+            }
+            SessionEventKind::RuntimeWorkStarted { .. }
+            | SessionEventKind::RuntimeWorkProgress { .. }
+            | SessionEventKind::RuntimeWorkCancelRequested { .. } => {
+                return self.apply_work_update_bounded(event, retained, limits);
+            }
+            SessionEventKind::PermissionResolved {
+                permission_id,
+                approved,
+                ..
+            } => {
+                return self.apply_permission_resolution_bounded(
+                    event,
+                    permission_id,
+                    *approved,
+                    retained,
+                    limits,
+                );
+            }
+            SessionEventKind::AutomaticTitleUpdated { title, .. } => {
+                return self.apply_automatic_title_bounded(event, title, retained, limits);
+            }
+            SessionEventKind::SessionRenamed { name } => {
+                return self.apply_rename_bounded(event, name.as_ref(), retained, limits);
+            }
+            SessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+            } => {
+                return self.apply_turn_finished_bounded(
+                    event,
+                    turn_id,
+                    (*outcome, message.as_ref()),
+                    retained,
+                    limits,
+                );
+            }
+            SessionEventKind::RuntimeWorkFinished {
+                work_id, status, ..
+            } => {
+                return self.apply_work_finished_bounded(event, work_id, *status, retained, limits);
+            }
+            _ => {}
+        }
+        self.apply_selection_event_bounded(event, retained, limits)
+    }
+
+    fn apply_usage_bounded(
+        &mut self,
+        event: &SessionEvent,
+        usage: &bcode_session_models::SessionTokenUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        if self.usage_checkpoint.is_some() {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        }
+        let accepted = usage.request_id.as_ref().is_none_or(|id| {
+            self.usage_by_request.get(id).is_none_or(|current| {
+                !current.terminal
+                    && (usage.observation_ordinal > current.observation_ordinal
+                        || (usage.observation_ordinal == current.observation_ordinal
+                            && usage == current))
+            })
+        });
+        let mut next = *retained;
+        let inspect = |value: &bcode_session_models::SessionTokenUsage| {
+            bcode_session_models::retention_events::inspect_session_token_usage(value, &limits)
+        };
+        let latest = if accepted {
+            Some(clone_admitted(usage, &mut next, limits, inspect)?)
+        } else {
+            None
+        };
+        let keyed = if accepted && let Some(id) = &usage.request_id {
+            let key = next.try_clone_string(id, 3, limits)?;
+            next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            Some((key, clone_admitted(usage, &mut next, limits, inspect)?))
+        } else {
+            None
+        };
+        let mut unattributed =
+            clone_admitted(&self.unattributed_cost, &mut next, limits, |value| {
+                bcode_session_view_models::retention::inspect_cost(value, limits)
+            })?;
+        let mut metered = self.unattributed_metered_tokens;
+        if usage.request_id.is_none() {
+            metered = metered.saturating_add(u64::from(usage.metered_total_tokens().unwrap_or(0)));
+            unattributed.observe_admitted(usage, &mut next, limits)?;
+        }
+        let mut cost = clone_admitted(&unattributed, &mut next, limits, |value| {
+            bcode_session_view_models::retention::inspect_cost(value, limits)
+        })?;
+        let mut total = metered;
+        for (id, value) in &self.usage_by_request {
+            let value = keyed
+                .as_ref()
+                .filter(|(key, _)| key == id)
+                .map_or(value, |(_, value)| value);
+            total = total.saturating_add(u64::from(value.metered_total_tokens().unwrap_or(0)));
+            cost.observe_admitted(value, &mut next, limits)?;
+        }
+        if let Some((id, value)) = &keyed
+            && !self.usage_by_request.contains_key(id)
+        {
+            total = total.saturating_add(u64::from(value.metered_total_tokens().unwrap_or(0)));
+            cost.observe_admitted(value, &mut next, limits)?;
+        }
+        next.try_release(bcode_session_view_models::retention::inspect_cost(
+            &self.unattributed_cost,
+            limits,
+        )?)?;
+        next.try_release(bcode_session_view_models::retention::inspect_cost(
+            &self.snapshot.runtime.cost,
+            limits,
+        )?)?;
+        if accepted && let Some(old) = &self.snapshot.runtime.latest_usage {
+            next.try_release(inspect(old)?)?;
+        }
+        if let Some((key, _)) = &keyed
+            && let Some((old_key, old)) = self.usage_by_request.get_key_value(key)
+        {
+            next.try_release(ObservationRetentionUsage::string(old_key, 3))?;
+            next.try_release(ObservationRetentionUsage::collection(1, 2))?;
+            next.try_release(inspect(old)?)?;
+        }
+        if let Some((key, value)) = keyed {
+            self.usage_by_request.remove(&key);
+            self.usage_by_request.insert(key, value);
+        }
+        if let Some(latest) = latest {
+            drop(self.snapshot.runtime.latest_usage.replace(latest));
+        }
+        drop(std::mem::replace(&mut self.unattributed_cost, unattributed));
+        drop(std::mem::replace(&mut self.snapshot.runtime.cost, cost));
+        self.unattributed_metered_tokens = metered;
+        self.snapshot.runtime.cumulative_metered_tokens = total;
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_submission_context_bounded(
+        &mut self,
+        event: &SessionEvent,
+        submission_id: &bcode_session_models::SubmissionId,
+        issue: bcode_session_models::SubmissionContextIssue,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut next = *retained;
+        let id = format_observation_text(
+            format_args!("submission:{}", submission_id.0),
+            &mut next,
+            limits,
+            5,
+        )?;
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id.get() == id);
+        next.try_release(ObservationRetentionUsage {
+            scalar_capacity_bytes: id.capacity(),
+            value_nodes: 1,
+            depth: 5,
+            ..ObservationRetentionUsage::default()
+        })?;
+        drop(id);
+        if let Some(index) = index {
+            let item = &self.snapshot.transcript.items[index];
+            if let TranscriptViewItemKind::UserMessage { message } = &item.kind
+                && matches!(
+                    message.submission_status,
+                    Some(bcode_session_models::SubmissionStatus::Pending)
+                )
+                && message
+                    .submission_context
+                    .as_ref()
+                    .is_none_or(|current| current.event_sequence < event.sequence)
+            {
+                let label = next.try_clone_string(submission_context_label(issue), 7, limits)?;
+                if message.submission_context.is_none() {
+                    next.try_add(
+                        ObservationRetentionUsage {
+                            value_nodes: 2,
+                            depth: 8,
+                            ..ObservationRetentionUsage::default()
+                        },
+                        limits,
+                    )?;
+                }
+                if let Some(old) = &message.display_label {
+                    next.try_release(ObservationRetentionUsage {
+                        scalar_capacity_bytes: old.capacity(),
+                        value_nodes: 1,
+                        depth: 7,
+                        ..ObservationRetentionUsage::default()
+                    })?;
+                }
+                let item = &mut self.snapshot.transcript.items[index];
+                if let TranscriptViewItemKind::UserMessage { message } = &mut item.kind {
+                    message.display_label = Some(label);
+                    message.submission_context =
+                        Some(bcode_session_models::SubmissionContextObservation {
+                            issue,
+                            event_sequence: event.sequence,
+                        });
+                }
+                item.revision = item.revision.saturating_add(1);
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+                self.bump_revision();
+            }
+        }
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn stage_reasoning_public_bounded(
+        &self,
+        turn_id: &str,
+        activity: &bcode_session_models::ReasoningActivity,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::ReasoningActivityView,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        if !self.snapshot.thinking.visible {
+            admit_view_phase(
+                next,
+                ObservationRetentionUsage {
+                    value_nodes: 6,
+                    depth: 8,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+                "stage_reasoning_public_bounded",
+            )?;
+            return Ok(bcode_session_view_models::ReasoningActivityView {
+                turn_id: next.try_clone_string(turn_id, 6, limits)?,
+                activity_id: next.try_clone_string(&activity.activity_id, 6, limits)?,
+                order: activity.order,
+                status: activity.status,
+                parts: Vec::new(),
+                opaque: activity.opaque,
+                readable_parts_filtered: activity.parts.iter().any(|part| !part.text.is_empty()),
+                finished: true,
+            });
+        }
+        let public = clone_admitted(activity, next, limits, |value| {
+            let mut charge =
+                bcode_session_models::retention_events::inspect_reasoning_activity(value, &limits)?;
+            charge.depth = charge
+                .depth
+                .checked_add(5)
+                .ok_or(ObservationRetentionExceeded)?;
+            charge.check(limits)?;
+            Ok(charge)
+        })?;
+        let public_turn = next.try_clone_string(turn_id, 6, limits)?;
+        let view = reasoning_activity_view_owned(
+            public_turn,
+            public,
+            self.snapshot.thinking.visible,
+            self.snapshot.thinking.mode,
+        );
+
+        Ok(view)
+    }
+
+    fn commit_reasoning_bounded(
+        &mut self,
+        source: (
+            &SessionEvent,
+            &str,
+            Option<bcode_session_models::TurnOutputPosition>,
+        ),
+        reasoning: ((String, String), LiveReasoningActivity),
+        staged: (
+            TranscriptViewItem,
+            Option<usize>,
+            Option<Vec<TranscriptViewItem>>,
+        ),
+        mut peak: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (key, cache) = reasoning;
+        let (item, index, buffer) = staged;
+        let (event, turn_id, position) = source;
+        let next = &mut peak;
+        let mut item = item;
+        let location_changed = position.is_some_and(|position| {
+            item.output_location
+                .as_ref()
+                .is_none_or(|old| old.turn_id != *turn_id || old.position != position)
+        });
+        if let Some(position) = position {
+            item.output_location = Some(stage_output_location(turn_id, position, next, limits)?);
+        }
+        let mut committed = *retained;
+        if let Some(index) = index {
+            committed.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        if let Some((old_key, old)) = self.live_reasoning.get_key_value(&key) {
+            committed.try_release(reasoning_entry_usage(old_key, old, limits)?)?;
+        }
+        committed.try_add(reasoning_entry_usage(&key, &cache, limits)?, limits)?;
+        committed.try_add(
+            bcode_session_view_models::retention::inspect_transcript_item(&item, limits)?,
+            limits,
+        )?;
+        if let Some(buffer) = &buffer {
+            committed.try_release(ObservationRetentionUsage {
+                collection_entries: self.snapshot.transcript.items.capacity(),
+                ..ObservationRetentionUsage::default()
+            })?;
+            committed.try_add(
+                ObservationRetentionUsage {
+                    collection_entries: buffer.capacity(),
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        reconcile_clone_capacity(*next, committed)?;
+        self.live_reasoning.insert(key, cache);
+        let item_index = index.unwrap_or(self.snapshot.transcript.items.len());
+        if let Some(index) = index {
+            self.snapshot.transcript.items[index] = item;
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        } else {
+            self.commit_system_message(item, buffer);
+        }
+        self.finish_admitted_event(event);
+        if position.is_some() {
+            if location_changed {
+                self.snapshot.transcript.items[item_index].revision =
+                    self.snapshot.transcript.items[item_index]
+                        .revision
+                        .saturating_add(1);
+            }
+            self.reorder_output_item(item_index, location_changed);
+        }
+        *retained = committed;
+        Ok(())
+    }
+
+    fn apply_complete_reasoning_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let mut peak = *retained;
+        let next = &mut peak;
+        let (turn_id, activity, position) = match &event.kind {
+            SessionEventKind::AssistantReasoningActivity { turn_id, activity } => {
+                (turn_id, activity, None)
+            }
+            SessionEventKind::PositionedAssistantReasoningActivity {
+                turn_id,
+                activity,
+                output_position,
+            } => (turn_id, activity, Some(*output_position)),
+            _ => return Err(ObservationRetentionExceeded),
+        };
+        let key = (
+            next.try_clone_string(turn_id, 2, limits)?,
+            next.try_clone_string(&activity.activity_id, 2, limits)?,
+        );
+        admit_view_phase(
+            next,
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                value_nodes: 3,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+            "apply_complete_reasoning_bounded",
+        )?;
+        let cache = stage_complete_reasoning_cache(activity, next, limits)?;
+        let view = self.stage_reasoning_public_bounded(turn_id, activity, next, limits)?;
+        let id = TranscriptViewItemId::new(format_observation_text(
+            format_args!("reasoning-turn:{turn_id}:{}", activity.activity_id),
+            next,
+            limits,
+            5,
+        )?);
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == id);
+        let buffer = stage_insert_buffer(
+            &self.snapshot.transcript.items,
+            index.is_none(),
+            3,
+            next,
+            limits,
+        )?;
+        admit_view_phase(
+            next,
+            ObservationRetentionUsage {
+                value_nodes: 6,
+                depth: 8,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+            "apply_complete_reasoning_bounded",
+        )?;
+        let location = index
+            .and_then(|index| {
+                self.snapshot.transcript.items[index]
+                    .output_location
+                    .as_ref()
+            })
+            .map(|location| {
+                stage_output_location(&location.turn_id, location.position, next, limits)
+            })
+            .transpose()?;
+        let item = TranscriptViewItem {
+            id,
+            revision: index.map_or(0, |index| {
+                self.snapshot.transcript.items[index]
+                    .revision
+                    .saturating_add(1)
+            }),
+            sequence: (event.sequence != 0)
+                .then_some(event.sequence)
+                .or_else(|| index.and_then(|index| self.snapshot.transcript.items[index].sequence)),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location: location,
+            streaming: false,
+            kind: TranscriptViewItemKind::ReasoningActivity { activity: view },
+        };
+        self.commit_reasoning_bounded(
+            (event, turn_id, position),
+            (key, cache),
+            (item, index, buffer),
+            *next,
+            retained,
+            limits,
+        )
+    }
+
+    fn commit_single_item_bounded(
+        &mut self,
+        event: &SessionEvent,
+        staged: (
+            TranscriptViewItem,
+            Option<usize>,
+            Option<Vec<TranscriptViewItem>>,
+        ),
+        peak: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let (item, index, buffer) = staged;
+        let mut committed = *retained;
+        if let Some(index) = index {
+            committed.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        let mut usage =
+            bcode_session_view_models::retention::inspect_transcript_item(&item, limits)?;
+        usage.depth = usage
+            .depth
+            .checked_add(3)
+            .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+        committed.try_add(usage, limits)?;
+        if let Some(buffer) = &buffer {
+            committed.try_release(
+                bcode_session_view_models::retention::ObservationRetentionUsage {
+                    collection_entries: self.snapshot.transcript.items.capacity(),
+                    ..bcode_session_view_models::retention::ObservationRetentionUsage::default()
+                },
+            )?;
+            committed.try_add(
+                bcode_session_view_models::retention::ObservationRetentionUsage {
+                    collection_entries: buffer.capacity(),
+                    ..bcode_session_view_models::retention::ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        reconcile_clone_capacity(peak, committed)?;
+        if let Some(index) = index {
+            self.snapshot.transcript.items[index] = item;
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        } else {
+            self.commit_system_message(item, buffer);
+        }
+        self.finish_admitted_event(event);
+        *retained = committed;
+        Ok(())
+    }
+
+    fn apply_submission_cancelled_bounded(
+        &mut self,
+        event: &SessionEvent,
+        submission_id: &bcode_session_models::SubmissionId,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut next = *retained;
+        let id = TranscriptViewItemId::new(format_observation_text(
+            format_args!("submission:{}", submission_id.0),
+            &mut next,
+            limits,
+            5,
+        )?);
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == id);
+        let existing = index.and_then(|index| match &self.snapshot.transcript.items[index].kind {
+            TranscriptViewItemKind::UserMessage { message } => Some(message),
+            _ => None,
+        });
+        if existing.is_some_and(|message| {
+            matches!(
+                message.submission_status,
+                Some(
+                    bcode_session_models::SubmissionStatus::Activated { .. }
+                        | bcode_session_models::SubmissionStatus::Cancelled { .. }
+                )
+            )
+        }) {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        }
+        let message = stage_cancelled_message(existing, event, &mut next, limits)?;
+        admit_view_phase(
+            &mut next,
+            ObservationRetentionUsage {
+                value_nodes: 7,
+                depth: 7,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+            "apply_submission_cancelled_bounded",
+        )?;
+        let buffer = stage_insert_buffer(
+            &self.snapshot.transcript.items,
+            index.is_none(),
+            3,
+            &mut next,
+            limits,
+        )?;
+        // Reinspect staged owners to release replaced fields without relying on
+        // assumptions about optional activity/context payloads.
+        let output_location = index
+            .and_then(|index| {
+                self.snapshot.transcript.items[index]
+                    .output_location
+                    .as_ref()
+            })
+            .map(|location| {
+                stage_output_location(&location.turn_id, location.position, &mut next, limits)
+            })
+            .transpose()?;
+        let item = TranscriptViewItem {
+            id,
+            revision: index.map_or(0, |index| {
+                self.snapshot.transcript.items[index]
+                    .revision
+                    .saturating_add(1)
+            }),
+            sequence: (event.sequence != 0).then_some(event.sequence),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location,
+            streaming: false,
+            kind: TranscriptViewItemKind::UserMessage { message },
+        };
+        self.commit_single_item_bounded(event, (item, index, buffer), next, retained, limits)
+    }
+
+    fn apply_submission_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let mut next = *retained;
+        let (submission_id, text, label, turn_id) = submission_view_fields(event)?;
+        let id = format_observation_text(
+            format_args!("submission:{submission_id}"),
+            &mut next,
+            limits,
+            5,
+        )?;
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id.get() == id);
+        if let Some(index) = index {
+            let item = &self.snapshot.transcript.items[index];
+            if turn_id.is_none()
+                || item
+                    .sequence
+                    .is_some_and(|sequence| sequence >= event.sequence)
+                || matches!(&item.kind, TranscriptViewItemKind::UserMessage { message }
+                    if matches!(message.submission_status, Some(bcode_session_models::SubmissionStatus::Cancelled { .. })))
+            {
+                self.snapshot.session_id = Some(event.session_id);
+                if event.sequence != 0 {
+                    self.snapshot.latest_sequence = Some(event.sequence);
+                }
+                return Ok(());
+            }
+        }
+        let text = next.try_clone_string(text, 7, limits)?;
+        let display_label = label
+            .map(|label| next.try_clone_string(label, 7, limits))
+            .transpose()?;
+        let status = stage_submission_status(turn_id, event.sequence, &mut next, limits)?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 11,
+                depth: 7,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let len = self
+            .snapshot
+            .transcript
+            .items
+            .len()
+            .checked_add(usize::from(index.is_none()))
+            .ok_or(ObservationRetentionExceeded)?;
+        let buffer = stage_collection_growth(
+            self.snapshot.transcript.items.capacity(),
+            len,
+            3,
+            &mut next,
+            limits,
+        )?;
+        if let Some(index) = index {
+            next.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        let mut message = ChatMessageView::markdown(text);
+        message.display_label = display_label;
+        message.submission_status = Some(status);
+        let item = TranscriptViewItem {
+            id: TranscriptViewItemId::new(id),
+            revision: 0,
+            sequence: (event.sequence != 0).then_some(event.sequence),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location: None,
+            streaming: false,
+            kind: TranscriptViewItemKind::UserMessage { message },
+        };
+        if let Some(index) = index {
+            drop(self.snapshot.transcript.items.remove(index));
+        }
+        self.commit_system_message(item, buffer);
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_tool_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        if let Some(id) = tool_invocation_id(event)
+            && (self.tool_invocations.get(id).is_some_and(|aggregate| aggregate.request_draft.is_some()
+                || !aggregate.presentations.is_empty() || aggregate.presentation_scope.iter_retained_revisions().len() != 0)
+                || self.snapshot.transcript.items.iter().any(|item| matches!(&item.kind,
+                    TranscriptViewItemKind::ToolContribution { contribution, .. } if contribution.invocation_id == id))
+                || matches!(&event.kind, SessionEventKind::ToolInvocationResultRecorded { record } if record.presentation.is_some())) {
+            return self.apply_rich_durable_bounded(event, retained, limits);
+        }
+        self.reduce_tool_event_bounded(event, retained, limits)
+    }
+
+    fn reduce_tool_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let id = tool_invocation_id(event).ok_or(ObservationRetentionExceeded)?;
+        let old = self.tool_invocations.get(id);
+        if old.is_some_and(|value| {
+            value.request_draft.is_some()
+                || !value.presentations.is_empty()
+                || value.presentation_scope.iter_retained_revisions().len() != 0
+        }) || self.snapshot.transcript.items.iter().any(|item| {
+            matches!(&item.kind,
+                TranscriptViewItemKind::ToolContribution { contribution, .. }
+                    if contribution.invocation_id == id)
+        }) {
+            return Err(ObservationRetentionExceeded);
+        }
+        let mut next = *retained;
+        let projection = stage_tool_projection(event, id, old, &mut next, limits)?;
+        let key = next.try_clone_string(id, 3, limits)?;
+        next.try_add(
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                value_nodes: 7,
+                depth: 5,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let aggregate = ToolInvocationAggregate {
+            projection,
+            request_assembled: old.is_some_and(|value| value.request_assembled)
+                || matches!(
+                    event.kind,
+                    SessionEventKind::ToolCallRequested { .. }
+                        | SessionEventKind::PositionedToolCallRequested { .. }
+                ),
+            terminal_status: old.and_then(|value| value.terminal_status),
+            ..ToolInvocationAggregate::default()
+        };
+        self.apply_staged_tool_lifecycle(event, (key, aggregate), next, retained, limits)
+    }
+
+    fn apply_staged_tool_lifecycle(
+        &mut self,
+        event: &SessionEvent,
+        staged: (String, ToolInvocationAggregate),
+        mut next: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let id = tool_invocation_id(event).ok_or(ObservationRetentionExceeded)?;
+        let old = self.tool_invocations.get(id);
+        let (key, mut aggregate) = staged;
+        let mut active = None;
+        let mut render = true;
+        if let SessionEventKind::ToolInvocationLifecycle { event: lifecycle } = &event.kind {
+            if old.is_some_and(ToolInvocationAggregate::is_terminal) {
+                render = false;
+            } else {
+                use bcode_session_models::ToolInvocationLifecycleStage as Stage;
+                match lifecycle.stage {
+                    Stage::Started | Stage::Progress | Stage::Waiting => {
+                        let active_key = next.try_clone_string(id, 3, limits)?;
+                        next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+                        active = Some((
+                            active_key,
+                            clone_admitted(lifecycle, &mut next, limits, |value| {
+                                bcode_session_models::retention_events::inspect_tool_lifecycle(
+                                    value, &limits,
+                                )
+                            })?,
+                        ));
+                        render = aggregate.projection.tool_name.is_some();
+                    }
+                    Stage::Completed => {
+                        aggregate.terminal_status = Some(ToolInvocationViewStatus::Finished);
+                    }
+                    Stage::Cancelled => {
+                        aggregate.terminal_status = Some(ToolInvocationViewStatus::Cancelled);
+                    }
+                    Stage::Failed => {
+                        aggregate.terminal_status = Some(ToolInvocationViewStatus::Failed);
+                    }
+                }
+            }
+        }
+        if let SessionEventKind::ToolInvocationResultRecorded { record } = &event.kind {
+            if record.presentation.is_some() {
+                return Err(ObservationRetentionExceeded);
+            }
+            aggregate.terminal_status.get_or_insert(if record.is_error {
+                ToolInvocationViewStatus::Failed
+            } else {
+                ToolInvocationViewStatus::Finished
+            });
+        }
+        let mut tool = if render {
+            Some(stage_tool_view(&aggregate.projection, &mut next, limits)?)
+        } else {
+            None
+        };
+        if let SessionEventKind::ToolInvocationLifecycle { event: lifecycle } = &event.kind
+            && matches!(
+                lifecycle.stage,
+                bcode_session_models::ToolInvocationLifecycleStage::Cancelled
+                    | bcode_session_models::ToolInvocationLifecycleStage::Failed
+            )
+            && let Some(tool) = &mut tool
+        {
+            // Terminal lifecycle overlays the existing displayed tool; it does
+            // not expose aggregate-only result/timing changes until a result.
+            if let Some(existing) = self.snapshot.tools.get(id) {
+                next.try_release(bcode_session_view_models::retention::inspect_tool(
+                    tool, limits,
+                )?)?;
+                *tool = clone_admitted(existing, &mut next, limits, |value| {
+                    bcode_session_view_models::retention::inspect_tool(value, limits)
+                })?;
+            }
+            if tool.result.is_none() && tool.result_text.is_none() {
+                tool.result_text = lifecycle
+                    .message
+                    .as_ref()
+                    .map(|text| next.try_clone_string(text, 7, limits))
+                    .transpose()?;
+            }
+        }
+        if let Some(terminal_status) = aggregate.terminal_status {
+            aggregate.presentation_scope.close();
+            if matches!(
+                terminal_status,
+                ToolInvocationViewStatus::Cancelled | ToolInvocationViewStatus::Failed
+            ) && !self.snapshot.tools.contains_key(id)
+            {
+                tool = None;
+            }
+        }
+        self.commit_tool_event_bounded(
+            event,
+            (key, aggregate, tool, active),
+            next,
+            retained,
+            limits,
+        )
+    }
+
+    fn commit_tool_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        staged: (
+            String,
+            ToolInvocationAggregate,
+            Option<ToolInvocationView>,
+            Option<(String, bcode_session_models::ToolInvocationLifecycleEvent)>,
+        ),
+        mut next: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let (key, aggregate, mut tool, active) = staged;
+        let mut final_usage = *retained;
+        if let Some((old_key, old)) = self.tool_invocations.get_key_value(&key) {
+            final_usage.try_release(simple_tool_aggregate_usage(
+                old_key,
+                &old.projection,
+                limits,
+            )?)?;
+        }
+        final_usage.try_add(
+            simple_tool_aggregate_usage(&key, &aggregate.projection, limits)?,
+            limits,
+        )?;
+        let terminal = aggregate.terminal_status.is_some();
+        if (terminal || active.is_some())
+            && let Some((old_key, old)) = self.snapshot.active_invocations.get_key_value(&key)
+        {
+            final_usage.try_release(ObservationRetentionUsage::string(old_key, 3))?;
+            final_usage.try_release(ObservationRetentionUsage::collection(1, 2))?;
+            final_usage.try_release(
+                bcode_session_models::retention_events::inspect_tool_lifecycle(old, &limits)?,
+            )?;
+        }
+        if let Some((key, value)) = &active {
+            final_usage.try_add(ObservationRetentionUsage::string(key, 3), limits)?;
+            final_usage.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            final_usage.try_add(
+                bcode_session_models::retention_events::inspect_tool_lifecycle(value, &limits)?,
+                limits,
+            )?;
+        }
+        if let Some(tool) = &mut tool
+            && let Some(status) = aggregate.terminal_status
+        {
+            tool.status = status;
+            if status == ToolInvocationViewStatus::Failed {
+                tool.is_error = Some(true);
+            }
+        }
+        let staged_tool = tool
+            .map(|tool| {
+                self.stage_tool_item_bounded(event, &key, tool, &mut next, &mut final_usage, limits)
+            })
+            .transpose()?;
+        let invocation_id = tool_invocation_id(event).ok_or(ObservationRetentionExceeded)?;
+        // No fallible operation follows: every affected map, vector and replica
+        // has been staged and final accounting validated while old owners live.
+        self.tool_invocations.remove(&key);
+        self.tool_invocations.insert(key, aggregate);
+        if terminal || active.is_some() {
+            self.snapshot.active_invocations.remove(invocation_id);
+        }
+        if let Some((id, value)) = active {
+            self.snapshot.active_invocations.insert(id, value);
+        }
+        if let Some((tool_key, tool, item, buffer, map_key, map_id, index)) = staged_tool {
+            self.snapshot.tools.remove(&tool_key);
+            self.snapshot.tools.insert(tool_key, tool);
+            if let Some(index) = index {
+                drop(std::mem::replace(
+                    &mut self.snapshot.transcript.items[index],
+                    item,
+                ));
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+                if matches!(event.kind, SessionEventKind::ToolInvocationLifecycle { .. }) {
+                    self.bump_revision();
+                }
+            } else {
+                self.commit_system_message(item, buffer);
+            }
+            self.tool_item_ids.remove(&map_key);
+            if matches!(
+                event.kind,
+                SessionEventKind::PositionedToolCallRequested { .. }
+            ) {
+                let index = index.unwrap_or(self.snapshot.transcript.items.len() - 1);
+                self.reorder_output_item(index, true);
+            }
+            self.tool_item_ids.insert(map_key, map_id);
+        }
+        self.finish_admitted_event(event);
+        *retained = final_usage;
+        Ok(())
+    }
+
+    fn release_tool_item_owners_bounded(
+        &self,
+        key: &str,
+        index: Option<usize>,
+        final_usage: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        if let Some((key, value)) = self.snapshot.tools.get_key_value(key) {
+            final_usage.try_release(ObservationRetentionUsage::string(key, 3))?;
+            final_usage.try_release(ObservationRetentionUsage {
+                collection_entries: 1,
+                ..ObservationRetentionUsage::default()
+            })?;
+            final_usage.try_release(bcode_session_view_models::retention::inspect_tool(
+                value, limits,
+            )?)?;
+        }
+        if let Some(index) = index {
+            final_usage.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        if let Some((key, value)) = self.tool_item_ids.get_key_value(key) {
+            final_usage.try_release(ObservationRetentionUsage::string(key, 3))?;
+            final_usage.try_release(value.retention_usage(3))?;
+            final_usage.try_release(ObservationRetentionUsage {
+                collection_entries: 1,
+                ..ObservationRetentionUsage::default()
+            })?;
+        }
+        Ok(())
+    }
+
+    fn stage_tool_transcript_item(
+        &self,
+        event: &SessionEvent,
+        staged: (TranscriptViewItemId, ToolInvocationView, Option<usize>),
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        TranscriptViewItem,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        let (id, transcript, index) = staged;
+        let mut item = TranscriptViewItem {
+            id,
+            revision: index.map_or(0, |index| {
+                self.snapshot.transcript.items[index]
+                    .revision
+                    .saturating_add(1)
+            }),
+            sequence: (event.sequence != 0).then_some(event.sequence),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location: None,
+            streaming: transcript.request_draft.is_some()
+                || matches!(
+                    transcript.status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                ),
+            kind: TranscriptViewItemKind::ToolInvocation {
+                tool: Box::new(transcript),
+            },
+        };
+        if let SessionEventKind::PositionedToolCallRequested {
+            turn_id,
+            output_position,
+            ..
+        } = &event.kind
+        {
+            let location = stage_output_location(turn_id, *output_position, next, limits)?;
+            if item.output_location.as_ref() != Some(&location) {
+                item.output_location = Some(location);
+                item.revision = item.revision.saturating_add(1);
+            }
+        }
+        Ok(item)
+    }
+
+    fn stage_tool_item_bounded(
+        &self,
+        event: &SessionEvent,
+        key: &str,
+        tool: ToolInvocationView,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        final_usage: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<StagedToolItem, bcode_session_view_models::retention::ObservationRetentionExceeded>
+    {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let tool_key = next.try_clone_string(key, 3, limits)?;
+        next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+        let transcript = clone_admitted(&tool, next, limits, |value| {
+            bcode_session_view_models::retention::inspect_tool(value, limits)
+        })?;
+        let id = format_observation_text(format_args!("tool:{key}"), next, limits, 5)?;
+        let id = TranscriptViewItemId::new(id);
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == id);
+        let len = self
+            .snapshot
+            .transcript
+            .items
+            .len()
+            .checked_add(usize::from(index.is_none()))
+            .ok_or(ObservationRetentionExceeded)?;
+        let buffer = stage_collection_growth(
+            self.snapshot.transcript.items.capacity(),
+            len,
+            3,
+            next,
+            limits,
+        )?;
+        if buffer.is_some() {
+            final_usage.try_release(ObservationRetentionUsage::collection(
+                self.snapshot.transcript.items.capacity(),
+                3,
+            ))?;
+            final_usage.try_add(ObservationRetentionUsage::collection(len, 3), limits)?;
+        }
+        let map_key = next.try_clone_string(key, 3, limits)?;
+        let map_id = TranscriptViewItemId::new(next.try_clone_string(id.get(), 3, limits)?);
+        admit_view_phase(
+            next,
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                value_nodes: 6,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+            "stage_tool_item_bounded",
+        )?;
+        self.release_tool_item_owners_bounded(key, index, final_usage, limits)?;
+        final_usage.try_add(ObservationRetentionUsage::string(&tool_key, 3), limits)?;
+        final_usage.try_add(
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let mut tool_charge = bcode_session_view_models::retention::inspect_tool(&tool, limits)?;
+        tool_charge.depth = tool_charge
+            .depth
+            .checked_add(2)
+            .ok_or(ObservationRetentionExceeded)?;
+        tool_charge.check(limits)?;
+        final_usage.try_add(tool_charge, limits)?;
+        final_usage.try_add(ObservationRetentionUsage::string(&map_key, 3), limits)?;
+        final_usage.try_add(map_id.retention_usage(3), limits)?;
+        final_usage.try_add(
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let item = self.stage_tool_transcript_item(event, (id, transcript, index), next, limits)?;
+        let mut item_charge =
+            bcode_session_view_models::retention::inspect_transcript_item(&item, limits)?;
+        item_charge.depth = item_charge
+            .depth
+            .checked_add(3)
+            .ok_or(ObservationRetentionExceeded)?;
+        item_charge.check(limits)?;
+        final_usage.try_add(item_charge, limits)?;
+        Ok((tool_key, tool, item, buffer, map_key, map_id, index))
+    }
+
+    fn apply_exchange_request_bounded(
+        &mut self,
+        event: &SessionEvent,
+        request: &bcode_session_models::ToolExchangeRequest,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        if self
+            .terminal_interactions
+            .contains_key(&request.exchange_id)
+        {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        }
+        let mut next = *retained;
+        let key = format_observation_text(
+            format_args!("{}:{}", request.invocation_id, request.exchange_id),
+            &mut next,
+            limits,
+            3,
+        )?;
+        next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+        let staged = clone_admitted(request, &mut next, limits, |value| {
+            bcode_session_models::retention_events::inspect_tool_exchange_request(value, &limits)
+        })?;
+        let mut released = ObservationRetentionUsage::default();
+        if let Some((old_key, old)) = self.snapshot.active_exchanges.get_key_value(&key) {
+            released.try_add(ObservationRetentionUsage::string(old_key, 3), limits)?;
+            released.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            released.try_add(
+                bcode_session_models::retention_events::inspect_tool_exchange_request(
+                    old, &limits,
+                )?,
+                limits,
+            )?;
+        }
+        let interaction = stage_interaction_request(request, &mut next, limits)?;
+        let next = self.commit_interaction_bounded(event, (interaction, released), next, limits)?;
+        self.snapshot.active_exchanges.remove(&key);
+        self.snapshot.active_exchanges.insert(key, staged);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_exchange_resolution_bounded(
+        &mut self,
+        event: &SessionEvent,
+        resolution: &bcode_session_models::ToolExchangeResolutionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut next = *retained;
+        let key = format_observation_text(
+            format_args!("{}:{}", resolution.invocation_id, resolution.exchange_id),
+            &mut next,
+            limits,
+            3,
+        )?;
+        next.try_release(ObservationRetentionUsage::string(&key, 3))?;
+        let mut released = ObservationRetentionUsage::default();
+        if let Some((old_key, old)) = self.snapshot.active_exchanges.get_key_value(&key) {
+            released.try_add(ObservationRetentionUsage::string(old_key, 3), limits)?;
+            released.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            released.try_add(
+                bcode_session_models::retention_events::inspect_tool_exchange_request(
+                    old, &limits,
+                )?,
+                limits,
+            )?;
+        }
+        if self
+            .terminal_interactions
+            .contains_key(&resolution.exchange_id)
+        {
+            next.try_release(released)?;
+            self.snapshot.active_exchanges.remove(&key);
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            *retained = next;
+            return Ok(());
+        }
+        let terminal_key = next.try_clone_string(&resolution.exchange_id, 3, limits)?;
+        next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+        let terminal = clone_admitted(&resolution.resolution, &mut next, limits, |value| {
+            bcode_session_models::retention_events::inspect_tool_exchange_resolution(value, &limits)
+        })?;
+        let mut interaction = if let Some(existing) = self
+            .snapshot
+            .interactions
+            .iter()
+            .find(|value| value.interaction_id == resolution.exchange_id)
+        {
+            clone_admitted(existing, &mut next, limits, |value| {
+                bcode_session_view_models::retention::inspect_interaction(value, limits)
+            })?
+        } else {
+            stage_terminal_interaction(&resolution.exchange_id, &mut next, limits)?
+        };
+        if !interaction.resolved {
+            if let Some(old) = &interaction.status_detail {
+                next.try_release(ObservationRetentionUsage::string(old, 7))?;
+            }
+            interaction.status_detail = interaction_status_detail_admitted(
+                &resolution.resolution,
+                Some((&mut next, limits)),
+            )?;
+            interaction.resolution = Some(clone_admitted(
+                &resolution.resolution,
+                &mut next,
+                limits,
+                |value| {
+                    bcode_session_models::retention_events::inspect_tool_exchange_resolution(
+                        value, &limits,
+                    )
+                },
+            )?);
+            interaction.state = interaction_state_for_resolution(&resolution.resolution);
+            interaction.resolved = true;
+        }
+        let next = self.commit_interaction_bounded(event, (interaction, released), next, limits)?;
+        self.snapshot.active_exchanges.remove(&key);
+        self.terminal_interactions.insert(terminal_key, terminal);
+        *retained = next;
+        Ok(())
+    }
+
+    fn commit_interaction_bounded(
+        &mut self,
+        event: &SessionEvent,
+        staged: (
+            InteractionViewSummary,
+            bcode_session_view_models::retention::ObservationRetentionUsage,
+        ),
+        mut next: bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (interaction, released) = staged;
+        let index = self
+            .snapshot
+            .interactions
+            .iter()
+            .position(|value| value.interaction_id == interaction.interaction_id);
+        if let Some(index) = index
+            && (self.snapshot.interactions[index].resolved
+                || self.snapshot.interactions[index] == interaction)
+        {
+            next.try_release(bcode_session_view_models::retention::inspect_interaction(
+                &interaction,
+                limits,
+            )?)?;
+            next.try_release(released)?;
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(next);
+        }
+        let transcript = clone_admitted(&interaction, &mut next, limits, |value| {
+            bcode_session_view_models::retention::inspect_interaction(value, limits)
+        })?;
+        let id = format_observation_text(
+            format_args!("interaction:{}", interaction.interaction_id),
+            &mut next,
+            limits,
+            5,
+        )?;
+        let id = TranscriptViewItemId::new(id);
+        let transcript_index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == id);
+        let list_buffer = stage_insert_buffer(
+            &self.snapshot.interactions,
+            index.is_none(),
+            2,
+            &mut next,
+            limits,
+        )?;
+        let transcript_buffer = stage_insert_buffer(
+            &self.snapshot.transcript.items,
+            transcript_index.is_none(),
+            3,
+            &mut next,
+            limits,
+        )?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 6,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let map_key = next.try_clone_string(&interaction.interaction_id, 3, limits)?;
+        let map_id = next.try_clone_string(id.get(), 3, limits)?;
+        next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+        self.release_replaced_interaction_owners(
+            &map_key,
+            index,
+            transcript_index,
+            &mut next,
+            limits,
+        )?;
+        next.try_release(released)?;
+        let item = TranscriptViewItem {
+            id,
+            revision: 0,
+            sequence: (event.sequence != 0).then_some(event.sequence),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location: None,
+            streaming: false,
+            kind: TranscriptViewItemKind::Interaction {
+                interaction: transcript,
+            },
+        };
+        self.commit_interaction_owners(
+            event,
+            (
+                interaction,
+                index,
+                list_buffer,
+                item,
+                transcript_index,
+                transcript_buffer,
+                map_key,
+                map_id,
+            ),
+        );
+        Ok(next)
+    }
+
+    fn release_replaced_interaction_owners(
+        &self,
+        map_key: &str,
+        index: Option<usize>,
+        transcript_index: Option<usize>,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        if let Some((key, value)) = self.interaction_item_ids.get_key_value(map_key) {
+            next.try_release(ObservationRetentionUsage::string(key, 3))?;
+            next.try_release(value.retention_usage(3))?;
+            next.try_release(ObservationRetentionUsage::collection(1, 2))?;
+        }
+        if let Some(index) = index {
+            next.try_release(bcode_session_view_models::retention::inspect_interaction(
+                &self.snapshot.interactions[index],
+                limits,
+            )?)?;
+        }
+        if let Some(index) = transcript_index {
+            next.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn commit_interaction_owners(&mut self, event: &SessionEvent, staged: StagedInteractionOwners) {
+        let (
+            interaction,
+            index,
+            mut list_buffer,
+            item,
+            transcript_index,
+            transcript_buffer,
+            map_key,
+            map_id,
+        ) = staged;
+        if let Some(index) = index {
+            drop(std::mem::replace(
+                &mut self.snapshot.interactions[index],
+                interaction,
+            ));
+        } else if let Some(mut buffer) = list_buffer.take() {
+            buffer.extend(std::mem::take(&mut self.snapshot.interactions));
+            buffer.push(interaction);
+            self.snapshot.interactions = buffer;
+        } else {
+            self.snapshot.interactions.push(interaction);
+        }
+        if let Some(index) = transcript_index {
+            let mut item = item;
+            item.revision = self.snapshot.transcript.items[index]
+                .revision
+                .saturating_add(1);
+            drop(std::mem::replace(
+                &mut self.snapshot.transcript.items[index],
+                item,
+            ));
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        } else {
+            self.commit_system_message(item, transcript_buffer);
+        }
+        self.interaction_item_ids.remove(&map_key);
+        self.interaction_item_ids
+            .insert(map_key, TranscriptViewItemId::new(map_id));
+        self.finish_admitted_event(event);
+    }
+
+    fn apply_activity_message_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut peak = *retained;
+        let staged = self.stage_activity_message(event, &mut peak, limits)?;
+        let (index, item, buffer, title, agent) = staged;
+        let mut committed = *retained;
+        if let Some(index) = index {
+            committed.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        let mut charge =
+            bcode_session_view_models::retention::inspect_transcript_item(&item, limits)?;
+        charge.depth = charge
+            .depth
+            .checked_add(3)
+            .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+        committed.try_add(charge, limits)?;
+        if let Some(buffer) = &buffer {
+            committed.try_release(ObservationRetentionUsage::collection(
+                self.snapshot.transcript.items.capacity(),
+                3,
+            ))?;
+            committed.try_add(
+                ObservationRetentionUsage::collection(buffer.capacity(), 3),
+                limits,
+            )?;
+        }
+        if let Some(title) = &title {
+            committed.try_add(ObservationRetentionUsage::string(title, 3), limits)?;
+        }
+        if let Some(agent) = &agent {
+            if let Some(old) = &self.snapshot.runtime.agent_id {
+                committed.try_release(ObservationRetentionUsage::string(old, 4))?;
+            }
+            committed.try_add(ObservationRetentionUsage::string(agent, 4), limits)?;
+        }
+        reconcile_clone_capacity(peak, committed)?;
+        if let Some(title) = title {
+            self.snapshot.title = Some(title);
+        }
+        if let Some(agent) = agent {
+            self.snapshot.runtime.agent_id = Some(agent);
+        }
+        if let Some(index) = index {
+            self.snapshot.transcript.items[index] = item;
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        } else {
+            self.commit_system_message(item, buffer);
+        }
+        self.finish_admitted_event(event);
+        *retained = committed;
+        Ok(())
+    }
+
+    fn stage_activity_identity_bounded(
+        execution: &bcode_session_models::TurnExecutionCorrelation,
+        presentation: &bcode_session_models::ActivityPresentation,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        TranscriptViewItemId,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        let id = TranscriptViewItemId::new(format_observation_text(
+            format_args!(
+                "activity:{}:{}{}:{}{}:{}",
+                execution.execution_id.len(),
+                execution.execution_id,
+                presentation.producer.len(),
+                presentation.producer,
+                presentation.activity_id.len(),
+                presentation.activity_id
+            ),
+            next,
+            limits,
+            5,
+        )?);
+
+        Ok(id)
+    }
+
+    fn stage_activity_message(
+        &self,
+        event: &SessionEvent,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        StagedActivityMessage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        let SessionEventKind::UserMessage {
+            text, admission, ..
+        } = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        let presentation = admission
+            .activity
+            .as_ref()
+            .ok_or(ObservationRetentionExceeded)?;
+        let execution = admission
+            .execution
+            .correlation
+            .as_ref()
+            .ok_or(ObservationRetentionExceeded)?;
+        let id = Self::stage_activity_identity_bounded(execution, presentation, next, limits)?;
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == id);
+        let message = Self::stage_activity_chat(
+            (event.sequence, text),
+            admission,
+            presentation,
+            execution,
+            next,
+            limits,
+        )?;
+        let title = self
+            .snapshot
+            .title
+            .is_none()
+            .then(|| stage_prompt_title(text, next, limits))
+            .transpose()?;
+        let agent = admission
+            .execution
+            .agent_profile
+            .as_deref()
+            .map(|text| next.try_clone_string(text, 4, limits))
+            .transpose()?;
+        let buffer = stage_insert_buffer(
+            &self.snapshot.transcript.items,
+            index.is_none(),
+            3,
+            next,
+            limits,
+        )?;
+        let location = index
+            .and_then(|index| {
+                self.snapshot.transcript.items[index]
+                    .output_location
+                    .as_ref()
+            })
+            .map(|location| {
+                stage_output_location(&location.turn_id, location.position, next, limits)
+            })
+            .transpose()?;
+        next.try_add(
+            bcode_session_view_models::retention::ObservationRetentionUsage {
+                value_nodes: 6,
+                depth: 6,
+                ..bcode_session_view_models::retention::ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let item = TranscriptViewItem {
+            id,
+            revision: index.map_or(0, |index| {
+                self.snapshot.transcript.items[index]
+                    .revision
+                    .saturating_add(1)
+            }),
+            sequence: Some(
+                index
+                    .and_then(|index| self.snapshot.transcript.items[index].sequence)
+                    .unwrap_or(event.sequence),
+            )
+            .filter(|sequence| *sequence != 0),
+            timestamp_ms: index
+                .map_or(Some(event.timestamp_ms), |index| {
+                    self.snapshot.transcript.items[index].timestamp_ms
+                })
+                .or(Some(event.timestamp_ms)),
+            output_location: location,
+            streaming: false,
+            kind: TranscriptViewItemKind::UserMessage { message },
+        };
+        Ok((index, item, buffer, title, agent))
+    }
+
+    fn apply_user_message_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionEventKind::UserMessage {
+            text, admission, ..
+        } = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        // Activity submissions have a separate replace-in-place identity and
+        // execution envelope; never silently reinterpret them as plain messages.
+        if admission.activity.as_ref().is_some_and(|activity| {
+            activity.validate(&activity.producer).is_ok()
+                && admission.execution.correlation.is_some()
+        }) {
+            return self.apply_activity_message_bounded(event, retained, limits);
+        }
+        let (mut item, replacement, mut next) =
+            self.stage_system_message_bounded(event, text, *retained, limits)?;
+        let TranscriptViewItemKind::SystemMessage { mut message } = item.kind else {
+            return Err(ObservationRetentionExceeded);
+        };
+        message.display_label = admission
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.display_label.as_ref())
+            .map(|text| next.try_clone_string(text, 7, limits))
+            .transpose()?;
+        item.kind = TranscriptViewItemKind::UserMessage { message };
+        let agent = admission
+            .execution
+            .agent_profile
+            .as_ref()
+            .map(|text| next.try_clone_string(text, 4, limits))
+            .transpose()?;
+        let title = if self.snapshot.title.is_none() {
+            Some(stage_prompt_title(text, &mut next, limits)?)
+        } else {
+            None
+        };
+        if agent.is_some()
+            && let Some(old) = &self.snapshot.runtime.agent_id
+        {
+            next.try_release(ObservationRetentionUsage::string(old, 4))?;
+        }
+        if let Some(agent) = agent {
+            drop(self.snapshot.runtime.agent_id.replace(agent));
+        }
+        if let Some(title) = title {
+            self.snapshot.title = Some(title);
+        }
+        self.commit_system_message(item, replacement);
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn stage_completed_stream(
+        &self,
+        id: &TranscriptViewItemId,
+        accepted_bytes: usize,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        TextStreamViewState,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let stream = self.snapshot.text_streams.get(id);
+        let state = TextStreamViewState {
+            generation: stream.map_or(0, |state| state.generation),
+            revision: stream.map_or(0, |state| state.revision.saturating_add(1)),
+            accepted_bytes,
+            truncated: false,
+            status: TextStreamViewStatus::Terminal(
+                bcode_session_models::TextStreamTerminalStatus::Completed,
+            ),
+        };
+        admit_view_phase(
+            next,
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+            "stage_completed_stream",
+        )?;
+        admit_view_phase(
+            next,
+            ObservationRetentionUsage {
+                value_nodes: 5,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+            "stage_completed_stream",
+        )?;
+        Ok(state)
+    }
+
+    fn apply_positioned_segment_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        let (turn_id, segment_id, text, output_position) = match &event.kind {
+            SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id,
+                output_position,
+                segment_id,
+                text,
+                ..
+            } => (turn_id, segment_id, text, Some(*output_position)),
+            SessionEventKind::AssistantResponseSegment {
+                turn_id,
+                segment_id,
+                text,
+                ..
+            } => (turn_id, segment_id, text, None),
+            _ => return Err(ObservationRetentionExceeded),
+        };
+        if !self.pending_text_presentations.is_empty() {
+            return Err(ObservationRetentionExceeded);
+        }
+        let mut next = *retained;
+        let id = TranscriptViewItemId::new(format_observation_text(
+            format_args!("assistant-turn:{turn_id}:segment:{segment_id}"),
+            &mut next,
+            limits,
+            3,
+        )?);
+        let state = self.stage_completed_stream(&id, text.len(), &mut next, limits)?;
+        let index = self.snapshot.transcript.items.iter().rposition(|item| {
+            item.streaming && streaming_item_matches(&item.kind, StreamingMessageKind::Assistant)
+        });
+        let (mut item, replacement) = if let Some(index) = index {
+            let item = clone_admitted(
+                &self.snapshot.transcript.items[index],
+                &mut next,
+                limits,
+                |item| bcode_session_view_models::retention::inspect_transcript_item(item, limits),
+            )?;
+            (item, None)
+        } else {
+            let (mut item, replacement, staged) =
+                self.stage_system_message_bounded(event, text, next, limits)?;
+            next = staged;
+            next.try_release(item.id.retention_usage(5))?;
+            item.id = TranscriptViewItemId::new(next.try_clone_string(id.get(), 5, limits)?);
+            let TranscriptViewItemKind::SystemMessage { message } = item.kind else {
+                unreachable!()
+            };
+            item.kind = TranscriptViewItemKind::AssistantMessage { message };
+            (item, replacement)
+        };
+        if index.is_some() {
+            let target = next.try_clone_string(text, 7, limits)?;
+            release_item_text(&item, &mut next)?;
+            let TranscriptViewItemKind::AssistantMessage { message } = &mut item.kind else {
+                unreachable!()
+            };
+            message.text = target;
+            finish_durable_message_item(&mut item, event, false);
+        }
+        // Ordinary location assignment selects the first matching identity, which
+        // can differ from the streaming finish target (or the newly appended item).
+        let location_index = output_position.and_then(|_| {
+            self.snapshot
+                .transcript
+                .items
+                .iter()
+                .position(|item| item.id == id)
+                .or_else(|| {
+                    index
+                        .is_none()
+                        .then_some(self.snapshot.transcript.items.len())
+                })
+        });
+        let location = if let (Some(_), Some(output_position)) = (location_index, output_position) {
+            Some(stage_output_location(
+                turn_id,
+                output_position,
+                &mut next,
+                limits,
+            )?)
+        } else {
+            None
+        };
+        self.commit_positioned_segment_bounded(
+            event,
+            (
+                id,
+                state,
+                index,
+                item,
+                replacement,
+                location_index,
+                location,
+            ),
+            next,
+            retained,
+            limits,
+        )
+    }
+
+    fn commit_positioned_segment_bounded(
+        &mut self,
+        event: &SessionEvent,
+        staged: StagedPositionedSegment,
+        mut next: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (id, state, index, item, replacement, location_index, location) = staged;
+        if let Some(index) = index {
+            next.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        if let Some((old_id, _)) = self.snapshot.text_streams.get_key_value(&id) {
+            next.try_release(old_id.retention_usage(3))?;
+            next.try_release(ObservationRetentionUsage {
+                collection_entries: 1,
+                ..ObservationRetentionUsage::default()
+            })?;
+            next.try_release(ObservationRetentionUsage {
+                value_nodes: 5,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            })?;
+        }
+        if let Some((old_id, update)) = self.last_text_stream_updates.get_key_value(&id) {
+            next.try_release(old_id.retention_usage(2))?;
+            next.try_release(ObservationRetentionUsage::collection(1, 1))?;
+            next.try_release(bcode_session_models::inspect_text_stream(update, &limits)?)?;
+        }
+        let location_changed =
+            location_index
+                .zip(location.as_ref())
+                .is_some_and(|(target, location)| {
+                    self.snapshot
+                        .transcript
+                        .items
+                        .get(target)
+                        .and_then(|item| item.output_location.as_ref())
+                        != Some(location)
+                });
+        if let Some(target) = location_index {
+            // The staged replacement already includes its old location charge.
+            let old = if Some(target) == index {
+                item.output_location.as_ref()
+            } else {
+                self.snapshot
+                    .transcript
+                    .items
+                    .get(target)
+                    .and_then(|item| item.output_location.as_ref())
+            };
+            if let Some(old) = old {
+                next.try_release(ObservationRetentionUsage::string(&old.turn_id, 7))?;
+                next.try_release(ObservationRetentionUsage {
+                    value_nodes: 1,
+                    depth: 7,
+                    ..ObservationRetentionUsage::default()
+                })?;
+            }
+        }
+        if let Some(index) = index {
+            self.snapshot.transcript.items[index] = item;
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        } else {
+            self.commit_system_message(item, replacement);
+        }
+        self.bump_revision();
+        self.last_text_stream_updates.remove(&id);
+        self.snapshot.text_streams.remove(&id);
+        self.snapshot.text_streams.insert(id, state);
+        if let (Some(index), Some(location)) = (location_index, location) {
+            self.snapshot.transcript.items[index].output_location = Some(location);
+            if location_changed {
+                self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items
+                    [index]
+                    .revision
+                    .saturating_add(1);
+            }
+            self.reorder_output_item(index, location_changed);
+        }
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_durable_text_bounded(
+        &mut self,
+        event: &SessionEvent,
+        text: &str,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        if !self.pending_text_presentations.is_empty() {
+            return Err(ObservationRetentionExceeded);
+        }
+        let reasoning = matches!(
+            event.kind,
+            SessionEventKind::AssistantReasoningDelta { .. }
+                | SessionEventKind::AssistantReasoningMessage { .. }
+        );
+        let delta = matches!(
+            event.kind,
+            SessionEventKind::AssistantDelta { .. }
+                | SessionEventKind::AssistantReasoningDelta { .. }
+        );
+        let kind = if reasoning {
+            StreamingMessageKind::Reasoning
+        } else {
+            StreamingMessageKind::Assistant
+        };
+        let index = streaming_finish_target_index(&self.snapshot.transcript.items, kind);
+        let mut next = *retained;
+        let thinking = if reasoning {
+            Some(next.try_clone_string(text, 4, limits)?)
+        } else {
+            None
+        };
+        if reasoning && let Some(old) = &self.snapshot.thinking.active_text {
+            next.try_release(ObservationRetentionUsage::string(old, 4))?;
+        }
+        if !delta
+            && self
+                .snapshot
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.streaming && streaming_item_matches(&item.kind, kind))
+                .count()
+                > 1
+        {
+            self.finish_split_streaming_message(kind);
+        } else if let Some(index) = index {
+            let old = transcript_item_text(&self.snapshot.transcript.items[index])
+                .ok_or(ObservationRetentionExceeded)?;
+            let target = if delta {
+                next.try_concat_string(old, text, 7, limits)?
+            } else {
+                next.try_clone_string(text, 7, limits)?
+            };
+            release_item_text(&self.snapshot.transcript.items[index], &mut next)?;
+            let item = &mut self.snapshot.transcript.items[index];
+            match &mut item.kind {
+                TranscriptViewItemKind::AssistantMessage { message }
+                | TranscriptViewItemKind::ReasoningMessage { message } => {
+                    drop(std::mem::replace(&mut message.text, target));
+                }
+                _ => unreachable!("text target was checked before mutation"),
+            }
+            finish_durable_message_item(item, event, delta);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        } else {
+            let (mut item, replacement, staged) =
+                self.stage_system_message_bounded(event, text, next, limits)?;
+            next = staged;
+            let TranscriptViewItemKind::SystemMessage { message } = item.kind else {
+                return Err(ObservationRetentionExceeded);
+            };
+            item.kind = match kind {
+                StreamingMessageKind::Assistant => {
+                    TranscriptViewItemKind::AssistantMessage { message }
+                }
+                StreamingMessageKind::Reasoning => {
+                    TranscriptViewItemKind::ReasoningMessage { message }
+                }
+            };
+            item.streaming = delta;
+            self.commit_system_message(item, replacement);
+            self.bump_revision();
+        }
+        if reasoning {
+            drop(std::mem::replace(
+                &mut self.snapshot.thinking.active_text,
+                thinking,
+            ));
+            self.snapshot.thinking.streaming = delta;
+        }
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_selection_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        match &event.kind {
+            SessionEventKind::ModelChanged {
+                provider, model, ..
+            } => {
+                return self
+                    .apply_model_selection_bounded(event, provider, model, retained, limits);
+            }
+            SessionEventKind::AgentChanged { agent_id } => {
+                let mut next = *retained;
+                let staged = next.try_clone_string(agent_id, 4, limits)?;
+                if let Some(old) = &self.snapshot.runtime.agent_id {
+                    next.try_release(ObservationRetentionUsage::string(old, 4))?;
+                }
+                drop(self.snapshot.runtime.agent_id.replace(staged));
+                self.finish_admitted_event(event);
+                *retained = next;
+                return Ok(());
+            }
+            SessionEventKind::SystemMessage { text } => {
+                if text.starts_with(bcode_session_models::TURN_ENVIRONMENT_SNAPSHOT_PREFIX) {
+                    self.snapshot.session_id = Some(event.session_id);
+                    if event.sequence != 0 {
+                        self.snapshot.latest_sequence = Some(event.sequence);
+                    }
+                    return Ok(());
+                }
+                return self.apply_system_message_bounded(event, text, retained, limits);
+            }
+            SessionEventKind::ModelTurnStarted { turn_id } => {
+                return self.apply_turn_start_bounded(event, turn_id, true, retained, limits);
+            }
+            SessionEventKind::ModelTurnCancelRequested { turn_id, .. } => {
+                return self.apply_turn_start_bounded(event, turn_id, false, retained, limits);
+            }
+            SessionEventKind::ReasoningChanged {
+                effort, summary, ..
+            } => {
+                let mut next = *retained;
+                let staged_effort = effort
+                    .as_ref()
+                    .map(|text| next.try_clone_string(text, 4, limits))
+                    .transpose()?;
+                let staged_summary = summary
+                    .as_ref()
+                    .map(|text| next.try_clone_string(text, 4, limits))
+                    .transpose()?;
+                for old in [
+                    self.snapshot.runtime.reasoning_effort.as_ref(),
+                    self.snapshot.runtime.reasoning_summary.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    next.try_release(ObservationRetentionUsage::string(old, 4))?;
+                }
+                let old_effort =
+                    std::mem::replace(&mut self.snapshot.runtime.reasoning_effort, staged_effort);
+                let old_summary =
+                    std::mem::replace(&mut self.snapshot.runtime.reasoning_summary, staged_summary);
+                drop((old_effort, old_summary));
+                self.finish_admitted_event(event);
+                *retained = next;
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.apply_metadata_event_bounded(event, retained, limits)
+    }
+
+    fn apply_ralph_lifecycle_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionEventKind::RalphLifecycle {
+            loop_name,
+            state_dir,
+            kind,
+            message,
+            ..
+        } = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        // Without an authoritative directory the unrestricted reducer consults
+        // process state. This checked group deliberately fails closed instead.
+        let cwd = self
+            .snapshot
+            .working_directory
+            .as_ref()
+            .ok_or(ObservationRetentionExceeded)?;
+        let displayed = bcode_plugin_sdk::path::display_bounded(
+            state_dir,
+            cwd,
+            bcode_plugin_sdk::path::PathDisplayLimits {
+                scalar_capacity_bytes: limits.scalar_capacity_bytes,
+                collection_entries: limits.collection_entries,
+                value_nodes: limits.value_nodes,
+                depth: limits.depth,
+            },
+            |usage| {
+                let charge = ObservationRetentionUsage {
+                    scalar_capacity_bytes: usage.scalar_capacity_bytes,
+                    collection_entries: usage.collection_entries,
+                    value_nodes: usage.value_nodes,
+                    depth: usage
+                        .depth
+                        .checked_add(5)
+                        .ok_or(ObservationRetentionExceeded)?,
+                    ..ObservationRetentionUsage::default()
+                };
+                let mut admitted = *retained;
+                admitted.try_add(charge, limits)?;
+                Ok::<_, ObservationRetentionExceeded>((admitted, charge))
+            },
+        )
+        .map_err(|_| ObservationRetentionExceeded)?;
+        // The returned admission owner holds the complete temporary peak. All
+        // temporary path buffers are already dropped by display_bounded.
+        let bcode_plugin_sdk::path::BoundedPathDisplay {
+            output,
+            admission: (mut next, peak),
+        } = displayed;
+        next.try_release(peak)?;
+        next.try_add(ObservationRetentionUsage::string(&output, 7), limits)?;
+        let text = format_observation_text(
+            format_args!("Ralph {kind}\n* Loop: {loop_name}\n* {message}\n* State: {output}"),
+            &mut next,
+            limits,
+            7,
+        )?;
+        let (mut item, buffer, mut charged) =
+            self.stage_system_message_bounded(event, &text, next, limits)?;
+        if let TranscriptViewItemKind::SystemMessage { message } = &mut item.kind {
+            message.format = bcode_session_view_models::TextFormat::PlainText;
+        }
+        let text_charge = ObservationRetentionUsage::string(&text, 7);
+        let output_charge = ObservationRetentionUsage::string(&output, 7);
+        drop(text);
+        drop(output);
+        charged.try_release(text_charge)?;
+        charged.try_release(output_charge)?;
+        self.commit_system_message(item, buffer);
+        self.finish_admitted_event(event);
+        *retained = charged;
+        Ok(())
+    }
+
+    fn apply_compaction_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let mut next = *retained;
+        let (status, text, provider_plugin_id, model_id) = match &event.kind {
+            SessionEventKind::ContextCompacted { summary, .. } => (
+                CompactionViewStatus::Local,
+                format_observation_text(
+                    format_args!("local context compaction: {summary}"),
+                    &mut next,
+                    limits,
+                    6,
+                )?,
+                None,
+                None,
+            ),
+            SessionEventKind::ProviderContextCompacted { snapshot, .. } => (
+                CompactionViewStatus::Provider,
+                format_observation_text(
+                    format_args!(
+                        "{} context compaction ({})",
+                        provider_compaction_origin_label(snapshot.origin),
+                        snapshot.provider_plugin_id
+                    ),
+                    &mut next,
+                    limits,
+                    6,
+                )?,
+                Some(next.try_clone_string(&snapshot.provider_plugin_id, 7, limits)?),
+                Some(next.try_clone_string(&snapshot.model_id, 7, limits)?),
+            ),
+            _ => return Err(ObservationRetentionExceeded),
+        };
+        let id = format_observation_text(
+            format_args!("event:{}", event.sequence),
+            &mut next,
+            limits,
+            5,
+        )?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 9,
+                depth: 6,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let new_len = self
+            .snapshot
+            .transcript
+            .items
+            .len()
+            .checked_add(1)
+            .ok_or(ObservationRetentionExceeded)?;
+        let replacement = stage_collection_growth(
+            self.snapshot.transcript.items.capacity(),
+            new_len,
+            3,
+            &mut next,
+            limits,
+        )?;
+        if let Some(occupancy) = &self.snapshot.runtime.context_occupancy {
+            next.try_release(
+                bcode_session_models::retention_events::inspect_context_occupancy(
+                    occupancy, &limits,
+                )?,
+            )?;
+        }
+        let item = TranscriptViewItem {
+            id: TranscriptViewItemId::new(id),
+            revision: 0,
+            sequence: (event.sequence != 0).then_some(event.sequence),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location: None,
+            streaming: false,
+            kind: TranscriptViewItemKind::Compaction {
+                compaction: CompactionView {
+                    status,
+                    text,
+                    provider_plugin_id,
+                    model_id,
+                },
+            },
+        };
+        let cleared = self.snapshot.runtime.context_occupancy.take();
+        if cleared.is_some() {
+            self.bump_revision();
+        }
+        drop(cleared);
+        self.commit_system_message(item, replacement);
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_skill_note_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        let mut next = *retained;
+        let (skill_id, status, text) = match &event.kind {
+            SessionEventKind::SkillInvocationFailed {
+                skill_id, error, ..
+            } => (
+                skill_id.as_str(),
+                SkillViewStatus::Failed,
+                format_observation_text(format_args!("{skill_id}: {error}"), &mut next, limits, 6)?,
+            ),
+            SessionEventKind::SkillInvoked {
+                skill_id,
+                arguments,
+                source,
+                ..
+            } => {
+                let text = if let Some(source) = source {
+                    format_observation_text(
+                        format_args!(
+                            "invoked {skill_id}\nSource: {}\nArguments: {arguments}",
+                            source.label
+                        ),
+                        &mut next,
+                        limits,
+                        6,
+                    )?
+                } else {
+                    format_observation_text(
+                        format_args!("invoked {skill_id}\nArguments: {arguments}"),
+                        &mut next,
+                        limits,
+                        6,
+                    )?
+                };
+                (skill_id.as_str(), SkillViewStatus::Invoked, text)
+            }
+            SessionEventKind::SkillContextLoaded { skill_id, .. } => {
+                let text = stage_skill_context_note(event, &mut next, limits)?;
+                (skill_id.as_str(), SkillViewStatus::ContextLoaded, text)
+            }
+            SessionEventKind::SkillSuggested {
+                skill_id, reason, ..
+            } => {
+                let Some(reason) = reason else {
+                    self.snapshot.session_id = Some(event.session_id);
+                    if event.sequence != 0 {
+                        self.snapshot.latest_sequence = Some(event.sequence);
+                    }
+                    return Ok(());
+                };
+                (
+                    skill_id.as_str(),
+                    SkillViewStatus::Suggested,
+                    format_observation_text(
+                        format_args!("suggested {skill_id}\nReason: {reason}"),
+                        &mut next,
+                        limits,
+                        6,
+                    )?,
+                )
+            }
+            _ => return Err(ObservationRetentionExceeded),
+        };
+        self.commit_skill_note_bounded(event, (skill_id, status, text), next, retained, limits)
+    }
+
+    fn commit_skill_note_bounded(
+        &mut self,
+        event: &SessionEvent,
+        note: (&str, SkillViewStatus, String),
+        mut next: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let (skill_id, status, text) = note;
+        let key = next.try_clone_string(skill_id, 6, limits)?;
+        let id = format_observation_text(
+            format_args!("event:{}", event.sequence),
+            &mut next,
+            limits,
+            5,
+        )?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 7,
+                depth: 6,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let new_len = self
+            .snapshot
+            .transcript
+            .items
+            .len()
+            .checked_add(1)
+            .ok_or(ObservationRetentionExceeded)?;
+        let replacement = if new_len > self.snapshot.transcript.items.capacity() {
+            next.try_add(ObservationRetentionUsage::collection(new_len, 3), limits)?;
+            let replacement = Vec::with_capacity(new_len);
+            if replacement.capacity() != new_len {
+                return Err(ObservationRetentionExceeded);
+            }
+            next.try_release(ObservationRetentionUsage::collection(
+                self.snapshot.transcript.items.capacity(),
+                3,
+            ))?;
+            Some(replacement)
+        } else {
+            None
+        };
+        let item = TranscriptViewItem {
+            id: TranscriptViewItemId::new(id),
+            revision: 0,
+            sequence: (event.sequence != 0).then_some(event.sequence),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location: None,
+            streaming: false,
+            kind: TranscriptViewItemKind::Skill {
+                skill: SkillView {
+                    skill_id: key,
+                    status,
+                    text,
+                },
+            },
+        };
+        self.commit_system_message(item, replacement);
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_skill_selection_bounded(
+        &mut self,
+        event: &SessionEvent,
+        skill_id: &str,
+        activated: bool,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let existing = self.snapshot.active_skills.get(skill_id);
+        let changed = activated != existing.is_some();
+        let mut next = *retained;
+        if changed {
+            if activated {
+                next.try_add(
+                    ObservationRetentionUsage {
+                        collection_entries: 1,
+                        depth: 3,
+                        ..ObservationRetentionUsage::default()
+                    },
+                    limits,
+                )?;
+                let key = next.try_clone_string(skill_id, 3, limits)?;
+                self.snapshot.active_skills.insert(key);
+            } else if let Some(key) = existing {
+                next.try_release(ObservationRetentionUsage::string(key, 3))?;
+                next.try_release(ObservationRetentionUsage {
+                    collection_entries: 1,
+                    ..ObservationRetentionUsage::default()
+                })?;
+                drop(self.snapshot.active_skills.take(skill_id));
+            }
+            self.bump_revision();
+        }
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn stage_permission_bounded(
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::PermissionView,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionEventKind::PermissionRequested {
+            permission_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            policy_source,
+            batch,
+            policy_reason,
+            ..
+        } = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        retained.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 10,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let permission_id = retained.try_clone_string(permission_id, 4, limits)?;
+        let tool_call_id = retained.try_clone_string(tool_call_id, 4, limits)?;
+        let title = format_observation_text(
+            format_args!("Permission requested: {tool_name}"),
+            retained,
+            limits,
+            5,
+        )?;
+        let tool_name = retained.try_clone_string(tool_name, 4, limits)?;
+        let arguments_json = retained.try_clone_string(arguments_json, 4, limits)?;
+        let policy_source = policy_source
+            .as_ref()
+            .map(|text| retained.try_clone_string(text, 5, limits))
+            .transpose()?;
+        let detail = policy_reason
+            .as_ref()
+            .map(|text| retained.try_clone_string(text, 5, limits))
+            .transpose()?;
+        let batch = if let Some(batch) = batch {
+            retained.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 2,
+                    depth: 5,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            Some(bcode_session_view_models::PermissionBatchView {
+                batch_id: retained.try_clone_string(&batch.batch_id, 6, limits)?,
+                call_index: batch.call_index,
+                call_count: batch.call_count,
+            })
+        } else {
+            None
+        };
+        Ok(bcode_session_view_models::PermissionView {
+            permission_id,
+            session_id: Some(event.session_id),
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            batch,
+            agent_id: String::new(),
+            title: Some(title),
+            policy_source,
+            detail,
+            resolved: false,
+            approved: None,
+            can_remember: false,
+        })
+    }
+
+    fn apply_permission_request_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionEventKind::PermissionRequested { permission_id, .. } = &event.kind else {
+            return Err(ObservationRetentionExceeded);
+        };
+        let index = self
+            .snapshot
+            .permissions
+            .iter()
+            .position(|value| value.permission_id == *permission_id);
+        let mut next = *retained;
+        let pending = Self::stage_permission_bounded(event, &mut next, limits)?;
+        let transcript = Self::stage_permission_bounded(event, &mut next, limits)?;
+        let id = format_observation_text(
+            format_args!("permission:{permission_id}"),
+            &mut next,
+            limits,
+            5,
+        )?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 6,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let pending_len = self
+            .snapshot
+            .permissions
+            .len()
+            .checked_add(usize::from(index.is_none()))
+            .ok_or(ObservationRetentionExceeded)?;
+        let transcript_len = self
+            .snapshot
+            .transcript
+            .items
+            .len()
+            .checked_add(1)
+            .ok_or(ObservationRetentionExceeded)?;
+        let mut pending_buffer = stage_collection_growth(
+            self.snapshot.permissions.capacity(),
+            pending_len,
+            2,
+            &mut next,
+            limits,
+        )?;
+        let mut transcript_buffer = stage_collection_growth(
+            self.snapshot.transcript.items.capacity(),
+            transcript_len,
+            3,
+            &mut next,
+            limits,
+        )?;
+        if let Some(index) = index {
+            next.try_release(bcode_session_view_models::retention::inspect_permission(
+                &self.snapshot.permissions[index],
+                limits,
+            )?)?;
+        }
+        let item = TranscriptViewItem {
+            id: TranscriptViewItemId::new(id),
+            revision: 0,
+            sequence: (event.sequence != 0).then_some(event.sequence),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location: None,
+            streaming: false,
+            kind: TranscriptViewItemKind::Permission {
+                permission: transcript,
+            },
+        };
+        if let Some(index) = index {
+            drop(std::mem::replace(
+                &mut self.snapshot.permissions[index],
+                pending,
+            ));
+        } else if let Some(mut buffer) = pending_buffer.take() {
+            buffer.extend(std::mem::take(&mut self.snapshot.permissions));
+            buffer.push(pending);
+            self.snapshot.permissions = buffer;
+        } else {
+            self.snapshot.permissions.push(pending);
+        }
+        if let Some(mut buffer) = transcript_buffer.take() {
+            buffer.extend(std::mem::take(&mut self.snapshot.transcript.items));
+            buffer.push(item);
+            self.snapshot.transcript.items = buffer;
+        } else {
+            self.snapshot.transcript.items.push(item);
+        }
+        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_work_update_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        let (SessionEventKind::RuntimeWorkStarted { work_id, .. }
+        | SessionEventKind::RuntimeWorkProgress { work_id, .. }
+        | SessionEventKind::RuntimeWorkCancelRequested { work_id, .. }) = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        if self.terminal_runtime_work.contains(work_id) {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        }
+        let index = self
+            .snapshot
+            .runtime_work
+            .iter()
+            .position(|work| work.work_id == *work_id);
+        self.stage_work_update_bounded(event, work_id, index, retained, limits)
+    }
+
+    fn stage_work_update_bounded(
+        &mut self,
+        event: &SessionEvent,
+        work_id: &bcode_session_models::WorkId,
+        index: Option<usize>,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let existing = index.map(|index| &self.snapshot.runtime_work[index]);
+        let kind = existing.map_or(bcode_session_models::RuntimeWorkKind::Tool, |work| {
+            work.kind
+        });
+        let label = existing.map_or(work_id.0.as_str(), |work| work.label.as_str());
+        let cancellable = existing.is_some_and(|work| work.cancellable);
+        let status = existing.map_or(bcode_session_models::RuntimeWorkStatus::Running, |work| {
+            work.status
+        });
+        let (
+            kind,
+            label,
+            cancellable,
+            status,
+            message,
+            completed_units,
+            total_units,
+            updated_at_ms,
+        ) = match &event.kind {
+            SessionEventKind::RuntimeWorkStarted {
+                kind,
+                label,
+                cancellable,
+                started_at_ms,
+                ..
+            } => (
+                *kind,
+                label.as_str(),
+                *cancellable,
+                bcode_session_models::RuntimeWorkStatus::Running,
+                None,
+                None,
+                None,
+                *started_at_ms,
+            ),
+            SessionEventKind::RuntimeWorkProgress {
+                message,
+                progress_at_ms,
+                completed_units,
+                total_units,
+                ..
+            } => (
+                kind,
+                label,
+                cancellable,
+                status,
+                Some(message.as_str()),
+                *completed_units,
+                *total_units,
+                *progress_at_ms,
+            ),
+            SessionEventKind::RuntimeWorkCancelRequested {
+                requested_at_ms, ..
+            } => (
+                kind,
+                label,
+                cancellable,
+                bcode_session_models::RuntimeWorkStatus::Cancelling,
+                existing.and_then(|work| work.message.as_deref()),
+                None,
+                None,
+                *requested_at_ms,
+            ),
+            _ => return Err(ObservationRetentionExceeded),
+        };
+        let mut next = *retained;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 8,
+                depth: 5,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let staged_id = next.try_clone_string(&work_id.0, 4, limits)?;
+        let staged_label = next.try_clone_string(label, 4, limits)?;
+        let staged_message = message
+            .map(|text| next.try_clone_string(text, 5, limits))
+            .transpose()?;
+        let staged = bcode_session_view_models::RuntimeWorkView {
+            work_id: bcode_session_models::WorkId(staged_id),
+            kind,
+            label: staged_label,
+            cancellable,
+            status,
+            message: staged_message,
+            completed_units,
+            total_units,
+            updated_at_ms,
+        };
+        let unchanged = existing == Some(&staged);
+        self.commit_work_update_bounded(event, (staged, index, unchanged), next, retained, limits)
+    }
+
+    fn commit_work_update_bounded(
+        &mut self,
+        event: &SessionEvent,
+        update: (
+            bcode_session_view_models::RuntimeWorkView,
+            Option<usize>,
+            bool,
+        ),
+        mut next: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let (staged, index, unchanged) = update;
+        if let Some(index) = index {
+            next.try_release(bcode_session_view_models::retention::inspect_runtime_work(
+                &self.snapshot.runtime_work[index],
+                limits,
+            )?)?;
+            drop(std::mem::replace(
+                &mut self.snapshot.runtime_work[index],
+                staged,
+            ));
+        } else {
+            let new_len = self
+                .snapshot
+                .runtime_work
+                .len()
+                .checked_add(1)
+                .ok_or(ObservationRetentionExceeded)?;
+            if new_len > self.snapshot.runtime_work.capacity() {
+                next.try_add(ObservationRetentionUsage::collection(new_len, 2), limits)?;
+                let mut replacement = Vec::with_capacity(new_len);
+                if replacement.capacity() != new_len {
+                    return Err(ObservationRetentionExceeded);
+                }
+                next.try_release(ObservationRetentionUsage::collection(
+                    self.snapshot.runtime_work.capacity(),
+                    2,
+                ))?;
+                replacement.extend(std::mem::take(&mut self.snapshot.runtime_work));
+                replacement.push(staged);
+                self.snapshot.runtime_work = replacement;
+            } else {
+                self.snapshot.runtime_work.push(staged);
+            }
+        }
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        if !unchanged {
+            self.bump_revision();
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_permission_resolution_bounded(
+        &mut self,
+        event: &SessionEvent,
+        permission_id: &str,
+        approved: bool,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let Some(index) = self
+            .snapshot
+            .permissions
+            .iter()
+            .position(|value| value.permission_id == permission_id)
+        else {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        };
+        let transcript_index = self.snapshot.transcript.items.iter().position(|item| matches!(
+            &item.kind, TranscriptViewItemKind::Permission { permission } if permission.permission_id == permission_id));
+        let mut next = *retained;
+        // Removal transfers the pending owner to its existing transcript slot.
+        // No clone, parser, format, or collection growth is needed.
+        if let Some(transcript_index) = transcript_index {
+            if let TranscriptViewItemKind::Permission { permission } =
+                &self.snapshot.transcript.items[transcript_index].kind
+            {
+                next.try_release(bcode_session_view_models::retention::inspect_permission(
+                    permission, limits,
+                )?)?;
+            }
+        } else {
+            next.try_release(bcode_session_view_models::retention::inspect_permission(
+                &self.snapshot.permissions[index],
+                limits,
+            )?)?;
+        }
+        let mut permission = self.snapshot.permissions.remove(index);
+        permission.resolved = true;
+        permission.approved = Some(approved);
+        if let Some(index) = transcript_index {
+            let old = std::mem::replace(
+                &mut self.snapshot.transcript.items[index].kind,
+                TranscriptViewItemKind::Permission { permission },
+            );
+            drop(old);
+            self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items[index]
+                .revision
+                .saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        }
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_automatic_title_bounded(
+        &mut self,
+        event: &SessionEvent,
+        title: &str,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let Some(summary) = &self.snapshot.session_summary else {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        };
+        if summary
+            .automatic_title_source_sequence
+            .is_some_and(|sequence| sequence >= event.sequence)
+        {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        }
+        let mut next = *retained;
+        let staged_summary = next.try_clone_string(title, 4, limits)?;
+        let replace_view_title = summary.explicit_name.is_none();
+        let staged_title = if replace_view_title {
+            Some(next.try_clone_string(title, 3, limits)?)
+        } else {
+            None
+        };
+        if let Some(old) = &summary.automatic_title {
+            next.try_release(ObservationRetentionUsage::string(old, 4))?;
+        }
+        if replace_view_title && let Some(old) = &self.snapshot.title {
+            next.try_release(ObservationRetentionUsage::string(old, 3))?;
+        }
+        if let Some(summary) = &mut self.snapshot.session_summary {
+            drop(summary.automatic_title.replace(staged_summary));
+            summary.automatic_title_source_sequence = Some(event.sequence);
+            if replace_view_title {
+                summary.title_source = bcode_session_models::SessionTitleSource::AutomaticMilestone;
+            }
+        }
+        if replace_view_title {
+            drop(std::mem::replace(&mut self.snapshot.title, staged_title));
+        }
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_rename_bounded(
+        &mut self,
+        event: &SessionEvent,
+        name: Option<&String>,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut next = *retained;
+        let staged_name = if self.snapshot.session_summary.is_some() {
+            name.map(|text| next.try_clone_string(text, 4, limits))
+                .transpose()?
+        } else {
+            None
+        };
+        let staged_explicit = if self.snapshot.session_summary.is_some() {
+            name.map(|text| next.try_clone_string(text, 4, limits))
+                .transpose()?
+        } else {
+            None
+        };
+        let title_source = self.snapshot.session_summary.as_ref().map_or_else(
+            || name.map(String::as_str),
+            |summary| {
+                name.map(String::as_str)
+                    .or(summary.automatic_title.as_deref())
+                    .or(summary.derived_title.as_deref())
+            },
+        );
+        let staged_title = title_source
+            .map(|text| next.try_clone_string(text, 3, limits))
+            .transpose()?;
+        if let Some(old) = &self.snapshot.title {
+            next.try_release(ObservationRetentionUsage::string(old, 3))?;
+        }
+        if let Some(summary) = &self.snapshot.session_summary {
+            for old in [summary.name.as_ref(), summary.explicit_name.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                next.try_release(ObservationRetentionUsage::string(old, 4))?;
+            }
+        }
+        if let Some(summary) = &mut self.snapshot.session_summary {
+            drop(std::mem::replace(&mut summary.name, staged_name));
+            drop(std::mem::replace(
+                &mut summary.explicit_name,
+                staged_explicit,
+            ));
+            summary.title_source = if summary.explicit_name.is_some() {
+                bcode_session_models::SessionTitleSource::Explicit
+            } else if summary.automatic_title.is_some() {
+                bcode_session_models::SessionTitleSource::AutomaticMilestone
+            } else if summary.derived_title.is_some() {
+                bcode_session_models::SessionTitleSource::FirstUserMessage
+            } else {
+                bcode_session_models::SessionTitleSource::EmptyDraft
+            };
+        }
+        drop(std::mem::replace(&mut self.snapshot.title, staged_title));
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn stage_turn_text_flush_bounded(
+        &self,
+        turn_id: &str,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        StagedTurnTextFlush,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let count = self
+            .pending_text_presentations
+            .values()
+            .filter(|pending| pending.destination.turn_id() == turn_id)
+            .count();
+        next.try_add(
+            ObservationRetentionUsage {
+                collection_entries: count,
+                value_nodes: count,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let mut staged = Vec::with_capacity(count);
+        if staged.capacity() != count {
+            return Err(ObservationRetentionExceeded);
+        }
+        for (id, pending) in &self.pending_text_presentations {
+            if pending.destination.turn_id() != turn_id {
+                continue;
+            }
+            if let PendingTextDestination::ReasoningPart { .. } = &pending.destination {
+                let entry = self.stage_turn_reasoning_flush(id, pending, &staged, next, limits)?;
+                staged.push(entry);
+                continue;
+            }
+            let key = TranscriptViewItemId::new(next.try_clone_string(id.get(), 3, limits)?);
+            let item = self
+                .snapshot
+                .transcript
+                .items
+                .iter()
+                .position(|item| item.id == *id)
+                .map(|index| {
+                    let mut item = clone_admitted(
+                        &self.snapshot.transcript.items[index],
+                        next,
+                        limits,
+                        |item| {
+                            bcode_session_view_models::retention::inspect_transcript_item(
+                                item, limits,
+                            )
+                        },
+                    )?;
+                    let text = next.try_clone_string(&pending.target, 7, limits)?;
+                    let (TranscriptViewItemKind::AssistantMessage { message }
+                    | TranscriptViewItemKind::ReasoningMessage { message }) = &mut item.kind
+                    else {
+                        return Err(ObservationRetentionExceeded);
+                    };
+                    if message.text == text {
+                        return Ok(None);
+                    }
+                    message.text = text;
+                    item.revision = item.revision.saturating_add(1);
+                    Ok(Some((index, item)))
+                })
+                .transpose()?
+                .flatten();
+            staged.push(StagedTurnText {
+                id: key,
+                item,
+                reasoning: None,
+            });
+        }
+        Ok(staged)
+    }
+
+    fn stage_turn_reasoning_flush(
+        &self,
+        id: &TranscriptViewItemId,
+        pending: &PendingTextPresentation,
+        previous: &[StagedTurnText],
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<StagedTurnText, bcode_session_view_models::retention::ObservationRetentionExceeded>
+    {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        let PendingTextDestination::ReasoningPart {
+            turn_id,
+            activity_id,
+            activity_order,
+            part_id,
+            kind,
+            role,
+            part_order,
+        } = &pending.destination
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        let key = (
+            next.try_clone_string(turn_id, 3, limits)?,
+            next.try_clone_string(activity_id, 3, limits)?,
+        );
+        let prior = previous.iter().rev().find_map(|entry| {
+            entry
+                .reasoning
+                .as_ref()
+                .filter(|(key, _)| key.0 == *turn_id && key.1 == *activity_id)
+        });
+        let source = prior
+            .map(|(_, cache)| cache)
+            .or_else(|| self.live_reasoning.get(&key))
+            .ok_or(ObservationRetentionExceeded)?;
+        next.try_add(reasoning_entry_usage(&key, source, limits)?, limits)?;
+        let mut cache = source.clone();
+        let complete = bcode_session_models::ReasoningActivityEvent::PartCompleted {
+            activity_id: next.try_clone_string(activity_id, 4, limits)?,
+            activity_order: *activity_order,
+            part_id: next.try_clone_string(part_id, 4, limits)?,
+            kind: *kind,
+            role: *role,
+            part_order: *part_order,
+            text: next.try_clone_string(&pending.target, 5, limits)?,
+        };
+        cache.apply_admitted(&complete, Some((next, limits)))?;
+        let (index, mut item, _) = self.stage_reasoning_item_bounded(&key, &cache, next, limits)?;
+        let index = index.ok_or(ObservationRetentionExceeded)?;
+        let count = previous
+            .iter()
+            .filter(|entry| entry.reasoning.as_ref().is_some_and(|(old, _)| old == &key))
+            .count();
+        item.revision = item
+            .revision
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        Ok(StagedTurnText {
+            id: TranscriptViewItemId::new(next.try_clone_string(id.get(), 3, limits)?),
+            item: Some((index, item)),
+            reasoning: Some((key, cache)),
+        })
+    }
+
+    fn account_turn_text_flush(
+        &self,
+        flush: &[StagedTurnText],
+        flush_charge: bcode_session_view_models::retention::ObservationRetentionUsage,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        next.try_release(flush_charge)?;
+        for (position, entry) in flush.iter().enumerate() {
+            let id = &entry.id;
+            let replacement = &entry.item;
+            if let Some((key, pending)) = self.pending_text_presentations.get_key_value(id) {
+                next.try_release(inspect_pending_text(key, pending, limits)?)?;
+                next.try_release(ObservationRetentionUsage {
+                    collection_entries: 1,
+                    ..ObservationRetentionUsage::default()
+                })?;
+            }
+            if let Some((key, cache)) = &entry.reasoning {
+                let old = flush[..position]
+                    .iter()
+                    .rev()
+                    .find_map(|entry| {
+                        entry
+                            .reasoning
+                            .as_ref()
+                            .filter(|(old, _)| old == key)
+                            .map(|(_, cache)| cache)
+                    })
+                    .or_else(|| self.live_reasoning.get(key));
+                if let Some(old) = old {
+                    next.try_release(reasoning_entry_usage(key, old, limits)?)?;
+                }
+                next.try_add(reasoning_entry_usage(key, cache, limits)?, limits)?;
+            }
+            if let Some((index, item)) = replacement {
+                let old_item = flush[..position]
+                    .iter()
+                    .rev()
+                    .find_map(|entry| {
+                        entry
+                            .item
+                            .as_ref()
+                            .filter(|(old_index, _)| old_index == index)
+                            .map(|(_, item)| item)
+                    })
+                    .unwrap_or(&self.snapshot.transcript.items[*index]);
+                next.try_release(
+                    bcode_session_view_models::retention::inspect_transcript_item(
+                        old_item, limits,
+                    )?,
+                )?;
+                let mut charge =
+                    bcode_session_view_models::retention::inspect_transcript_item(item, limits)?;
+                charge.depth += 3;
+                next.try_add(charge, limits)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_turn_finished_bounded(
+        &mut self,
+        event: &SessionEvent,
+        turn_id: &str,
+        completion: (bcode_session_models::ModelTurnOutcome, Option<&String>),
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (outcome, message) = completion;
+        let mut next = *retained;
+        let flush = self.stage_turn_text_flush_bounded(turn_id, &mut next, limits)?;
+        let mut flush_charge = next;
+        flush_charge.try_release(*retained)?;
+        // Transcript staging is admitted alongside every replacement runtime
+        // scalar, with the previous content still charged throughout.
+        let staged_message = message
+            .map(|text| next.try_clone_string(text, 4, limits))
+            .transpose()?;
+        let staged_item = if outcome == bcode_session_models::ModelTurnOutcome::Error {
+            let text = format_observation_text(
+                format_args!(
+                    "Model turn failed: {}",
+                    message.map_or("no details recorded", String::as_str)
+                ),
+                &mut next,
+                limits,
+                7,
+            )?;
+            let (mut item, buffer, mut charged) =
+                self.stage_system_message_bounded(event, &text, next, limits)?;
+            if let TranscriptViewItemKind::SystemMessage { message } = &mut item.kind {
+                message.format = bcode_session_view_models::TextFormat::PlainText;
+            }
+            charged.try_release(ObservationRetentionUsage::string(&text, 7))?;
+            drop(text);
+            next = charged;
+            Some((item, buffer))
+        } else {
+            None
+        };
+        let staged = staged_message;
+        if let Some(old) = &self.snapshot.runtime.last_turn_message {
+            next.try_release(ObservationRetentionUsage::string(old, 4))?;
+        }
+        let clear_active = self.snapshot.runtime.active_turn_id.as_deref() == Some(turn_id);
+        if clear_active && let Some(old) = &self.snapshot.runtime.active_turn_id {
+            next.try_release(ObservationRetentionUsage::string(old, 4))?;
+        }
+        if let Some(progress) = &self.snapshot.runtime.provider_progress {
+            next.try_release(ObservationRetentionUsage::string(&progress.turn_id, 4))?;
+            next.try_release(ObservationRetentionUsage::string(&progress.detail, 4))?;
+            next.try_release(ObservationRetentionUsage {
+                value_nodes: 2,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            })?;
+        }
+        self.account_turn_text_flush(&flush, flush_charge, &mut next, limits)?;
+        for entry in flush {
+            self.pending_text_presentations.remove(&entry.id);
+            if let Some((key, cache)) = entry.reasoning {
+                self.live_reasoning.remove(&key);
+                self.live_reasoning.insert(key, cache);
+            }
+            let replacement = entry.item;
+            if let Some((index, item)) = replacement {
+                self.snapshot.transcript.items[index] = item;
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+                self.bump_revision();
+            }
+        }
+        drop(std::mem::replace(
+            &mut self.snapshot.runtime.last_turn_message,
+            staged,
+        ));
+        if clear_active {
+            drop(self.snapshot.runtime.active_turn_id.take());
+        }
+        drop(self.snapshot.runtime.provider_progress.take());
+        self.snapshot.runtime.cancelling = false;
+        self.snapshot.runtime.last_turn_outcome = Some(outcome);
+        if let Some((item, buffer)) = staged_item {
+            self.commit_system_message(item, buffer);
+        }
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_work_finished_bounded(
+        &mut self,
+        event: &SessionEvent,
+        work_id: &bcode_session_models::WorkId,
+        status: bcode_session_models::RuntimeWorkStatus,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let terminal = status.is_terminal();
+        if self.terminal_runtime_work.contains(work_id) {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        }
+        let mut next = *retained;
+        let staged_id = if terminal {
+            next.try_add(
+                ObservationRetentionUsage {
+                    collection_entries: 1,
+                    depth: 3,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            Some(bcode_session_models::WorkId(
+                next.try_clone_string(&work_id.0, 3, limits)?,
+            ))
+        } else {
+            None
+        };
+        let removed = self
+            .snapshot
+            .runtime_work
+            .iter()
+            .filter(|value| value.work_id == *work_id);
+        for value in removed {
+            next.try_release(bcode_session_view_models::retention::inspect_runtime_work(
+                value, limits,
+            )?)?;
+        }
+        if let Some(id) = staged_id {
+            self.terminal_runtime_work.insert(id);
+        }
+        let old_len = self.snapshot.runtime_work.len();
+        self.snapshot
+            .runtime_work
+            .retain(|value| value.work_id != *work_id);
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        if old_len != self.snapshot.runtime_work.len() {
+            self.bump_revision();
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_model_selection_bounded(
+        &mut self,
+        event: &SessionEvent,
+        provider: &str,
+        model: &str,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let provider = (!provider.is_empty() && provider != "<auto>").then_some(provider);
+        let model = (!model.is_empty() && model != "<default>").then_some(model);
+        let runtime = &self.snapshot.runtime;
+        let changed = runtime.provider_plugin_id.as_deref() != provider
+            || runtime.requested_model_id.as_deref() != model
+            || runtime.effective_model_id.as_deref() != model
+            || runtime.display_name.is_some();
+        let mut next = *retained;
+        if changed {
+            let staged_provider = provider
+                .map(|text| next.try_clone_string(text, 4, limits))
+                .transpose()?;
+            let staged_requested = model
+                .map(|text| next.try_clone_string(text, 4, limits))
+                .transpose()?;
+            let staged_effective = model
+                .map(|text| next.try_clone_string(text, 4, limits))
+                .transpose()?;
+            for old in [
+                runtime.provider_plugin_id.as_ref(),
+                runtime.requested_model_id.as_ref(),
+                runtime.effective_model_id.as_ref(),
+                runtime.display_name.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                next.try_release(ObservationRetentionUsage::string(old, 4))?;
+            }
+            drop(std::mem::replace(
+                &mut self.snapshot.runtime.provider_plugin_id,
+                staged_provider,
+            ));
+            drop(std::mem::replace(
+                &mut self.snapshot.runtime.requested_model_id,
+                staged_requested,
+            ));
+            drop(std::mem::replace(
+                &mut self.snapshot.runtime.effective_model_id,
+                staged_effective,
+            ));
+            drop(self.snapshot.runtime.display_name.take());
+            self.bump_revision();
+        }
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_system_message_bounded(
+        &mut self,
+        event: &SessionEvent,
+        text: &str,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let (item, replacement, next) =
+            self.stage_system_message_bounded(event, text, *retained, limits)?;
+        self.commit_system_message(item, replacement);
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn stage_system_message_bounded(
+        &self,
+        event: &SessionEvent,
+        text: &str,
+        mut next: bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        (
+            TranscriptViewItem,
+            Option<Vec<TranscriptViewItem>>,
+            bcode_session_view_models::retention::ObservationRetentionUsage,
+        ),
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let new_len = self
+            .snapshot
+            .transcript
+            .items
+            .len()
+            .checked_add(1)
+            .ok_or(ObservationRetentionExceeded)?;
+        let grow =
+            self.snapshot.transcript.items.len() == self.snapshot.transcript.items.capacity();
+        // A replacement vector coexists with the old buffer, but existing item
+        // owners are moved, never cloned. Charge all new slots before allocation.
+        if grow {
+            next.try_add(ObservationRetentionUsage::collection(new_len, 3), limits)?;
+        }
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 11,
+                depth: 7,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let id = format_observation_text(
+            format_args!("event:{}", event.sequence),
+            &mut next,
+            limits,
+            5,
+        )?;
+        let text = next.try_clone_string(text, 7, limits)?;
+        let item = TranscriptViewItem {
+            id: TranscriptViewItemId::new(id),
+            revision: 0,
+            sequence: (event.sequence != 0).then_some(event.sequence),
+            timestamp_ms: Some(event.timestamp_ms),
+            output_location: None,
+            streaming: false,
+            kind: TranscriptViewItemKind::SystemMessage {
+                message: ChatMessageView::markdown(text),
+            },
+        };
+        let replacement = if grow {
+            let replacement = Vec::with_capacity(new_len);
+            if replacement.capacity() != new_len {
+                return Err(ObservationRetentionExceeded);
+            }
+            next.try_release(ObservationRetentionUsage::collection(
+                self.snapshot.transcript.items.capacity(),
+                3,
+            ))?;
+            Some(replacement)
+        } else {
+            None
+        };
+        Ok((item, replacement, next))
+    }
+
+    fn commit_system_message(
+        &mut self,
+        item: TranscriptViewItem,
+        replacement: Option<Vec<TranscriptViewItem>>,
+    ) {
+        if let Some(mut replacement) = replacement {
+            replacement.extend(std::mem::take(&mut self.snapshot.transcript.items));
+            replacement.push(item);
+            self.snapshot.transcript.items = replacement;
+        } else {
+            self.snapshot.transcript.items.push(item);
+        }
+        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+    }
+
+    fn apply_turn_start_bounded(
+        &mut self,
+        event: &SessionEvent,
+        turn_id: &str,
+        started: bool,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut next = *retained;
+        let staged = next.try_clone_string(turn_id, 4, limits)?;
+        if let Some(old) = &self.snapshot.runtime.active_turn_id {
+            next.try_release(ObservationRetentionUsage::string(old, 4))?;
+        }
+        if started && let Some(progress) = &self.snapshot.runtime.provider_progress {
+            next.try_release(ObservationRetentionUsage::string(&progress.turn_id, 4))?;
+            next.try_release(ObservationRetentionUsage::string(&progress.detail, 4))?;
+            next.try_release(ObservationRetentionUsage {
+                value_nodes: 2,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            })?;
+        }
+        drop(self.snapshot.runtime.active_turn_id.replace(staged));
+        if started {
+            drop(self.snapshot.runtime.provider_progress.take());
+        }
+        self.snapshot.runtime.cancelling = !started;
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_working_directory_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionEventKind::WorkingDirectoryChanged {
+            old_working_directory,
+            new_working_directory,
+        } = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        let mut next = *retained;
+        let charge = ObservationRetentionUsage {
+            scalar_capacity_bytes: new_working_directory.capacity(),
+            value_nodes: 1,
+            depth: 3,
+            ..ObservationRetentionUsage::default()
+        };
+        next.try_add(charge, limits)?;
+        let path = std::path::PathBuf::from(
+            Box::<std::ffi::OsStr>::from(new_working_directory.as_os_str()).into_os_string(),
+        );
+        let actual = ObservationRetentionUsage {
+            scalar_capacity_bytes: path.capacity(),
+            ..charge
+        };
+        reconcile_clone_capacity(charge, actual)?;
+        next.try_release(charge)?;
+        next.try_add(actual, limits)?;
+        let old_display = stage_path_display(
+            old_working_directory,
+            old_working_directory,
+            &mut next,
+            limits,
+        )?;
+        let new_display = stage_path_display(
+            new_working_directory,
+            old_working_directory,
+            &mut next,
+            limits,
+        )?;
+        let text = format_observation_text(
+            format_args!(
+                "Working directory changed from `{old_display}` to `{new_display}`. Treat prior file/path assumptions as possibly stale unless reconfirmed."
+            ),
+            &mut next,
+            limits,
+            7,
+        )?;
+        let (item, buffer, mut next) =
+            self.stage_system_message_bounded(event, &text, next, limits)?;
+        next.try_release(ObservationRetentionUsage::string(&old_display, 7))?;
+        next.try_release(ObservationRetentionUsage::string(&new_display, 7))?;
+        next.try_release(ObservationRetentionUsage::string(&text, 7))?;
+        if let Some(old) = &self.snapshot.working_directory {
+            next.try_release(ObservationRetentionUsage {
+                scalar_capacity_bytes: old.capacity(),
+                value_nodes: 1,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            })?;
+        }
+        drop((old_display, new_display, text));
+        self.snapshot.working_directory = Some(path);
+        self.commit_system_message(item, buffer);
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_metadata_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionEventKind::SessionCreated {
+            name,
+            working_directory,
+        } = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        let mut old = ObservationRetentionUsage::default();
+        if let Some(title) = &self.snapshot.title {
+            old.try_add(ObservationRetentionUsage::string(title, 3), limits)?;
+        }
+        if let Some(path) = &self.snapshot.working_directory {
+            old.try_add(
+                ObservationRetentionUsage {
+                    scalar_capacity_bytes: path.capacity(),
+                    value_nodes: 1,
+                    depth: 3,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        let mut next = *retained;
+        // Reserve every staging owner before cloning either field. No partial
+        // metadata/sequence update is visible if the second reservation fails.
+        let title_charge = name
+            .as_ref()
+            .map_or_else(ObservationRetentionUsage::default, |title| {
+                ObservationRetentionUsage {
+                    scalar_capacity_bytes: title.len(),
+                    value_nodes: 1,
+                    depth: 3,
+                    ..ObservationRetentionUsage::default()
+                }
+            });
+        let path_charge = ObservationRetentionUsage {
+            scalar_capacity_bytes: working_directory.capacity(),
+            value_nodes: 1,
+            depth: 3,
+            ..ObservationRetentionUsage::default()
+        };
+        next.try_add(title_charge, limits)?;
+        next.try_add(path_charge, limits)?;
+        let title = name
+            .as_ref()
+            .map(|title| Box::<str>::from(title.as_str()).into_string());
+        let path = std::path::PathBuf::from(
+            Box::<std::ffi::OsStr>::from(working_directory.as_os_str()).into_os_string(),
+        );
+        let actual_path = ObservationRetentionUsage {
+            scalar_capacity_bytes: path.capacity(),
+            value_nodes: 1,
+            depth: 3,
+            ..ObservationRetentionUsage::default()
+        };
+        // Reconcile only pre-admitted storage; any unexpected capacity expansion
+        // rejects staging without touching canonical view state or its ledger.
+        if actual_path.scalar_capacity_bytes > path_charge.scalar_capacity_bytes {
+            return Err(ObservationRetentionExceeded);
+        }
+        next.try_release(path_charge)?;
+        next.try_add(actual_path, limits)?;
+        next.try_release(old)?;
+        let old_title = std::mem::replace(&mut self.snapshot.title, title);
+        let old_path = self.snapshot.working_directory.replace(path);
+        drop((old_title, old_path));
+        self.finish_admitted_event(event);
+        *retained = next;
+        Ok(())
+    }
+
+    const fn finish_admitted_event(&mut self, event: &SessionEvent) {
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        self.bump_revision();
+    }
+
     /// Apply one durable session event.
     #[allow(clippy::too_many_lines)]
     pub fn apply_event(&mut self, event: &SessionEvent) {
@@ -1329,7 +10027,7 @@ impl SessionView {
                         });
                 }
             }
-            SessionEventKind::ChildSessionCreated { request } => {
+            SessionEventKind::ChildSessionCreated { request, .. } => {
                 self.push_item(TranscriptViewItemId::event(event.sequence), event.sequence,
                     Some(event.timestamp_ms), false, TranscriptViewItemKind::SystemMessage {
                         message: ChatMessageView::markdown(format!("Child session of [parent {}](bcode://session/{}) · fresh context; Ctrl-G then Left opens this parent; relationship is not assignment acceptance", request.parent_id, request.parent_id)),
@@ -2609,9 +11307,3578 @@ impl SessionView {
         }
     }
 
+    /// Apply an admitted live update; unsupported allocation groups reject before mutation.
+    ///
+    /// The ledger must already include this view and enclosing retained owners.
+    ///
+    /// # Errors
+    /// Returns an error on an unsupported group, peak exhaustion, or accounting overflow.
+    pub fn apply_live_event_bounded(
+        &mut self,
+        event: &SessionLiveEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        self.apply_live_event_group_bounded(event, retained, limits)?;
+        // Ordinary live reduction establishes the source session even when the
+        // accepted group leaves content unchanged. Commit identity only after
+        // admission succeeds so rejection remains atomic.
+        self.snapshot.session_id = Some(event.session_id);
+        Ok(())
+    }
+
+    fn stage_ordered_duplicate(
+        id: &TranscriptViewItemId,
+        update: &bcode_session_models::TextStreamUpdate,
+        accepted: bool,
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        (
+            Option<TranscriptViewItemId>,
+            Option<bcode_session_models::TextStreamUpdate>,
+        ),
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let previous = accepted
+            .then(|| {
+                clone_admitted(update, peak, limits, |value| {
+                    bcode_session_models::inspect_text_stream(value, &limits).and_then(
+                        |mut usage| {
+                            usage.depth = usage
+                                .depth
+                                .checked_add(1)
+                                .ok_or(ObservationRetentionExceeded)?;
+                            Ok(usage)
+                        },
+                    )
+                })
+            })
+            .transpose()?;
+        let previous_key = accepted
+            .then(|| {
+                peak.try_clone_string(id.get(), 2, limits)
+                    .map(TranscriptViewItemId::new)
+            })
+            .transpose()?;
+        if accepted {
+            peak.try_add(
+                ObservationRetentionUsage {
+                    collection_entries: 1,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        Ok((previous_key, previous))
+    }
+
+    fn transcript_item_index(&self, id: &TranscriptViewItemId) -> Option<usize> {
+        self.snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| &item.id == id)
+    }
+
+    fn apply_ordered_stream_bounded(
+        &mut self,
+        event: &SessionLiveEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionLiveEventKind::AssistantTextStreamUpdated {
+            turn_id,
+            segment_id,
+            update,
+            output_position,
+            ..
+        } = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        let mut peak = *retained;
+        let id = TranscriptViewItemId::new(format_observation_text(
+            format_args!("assistant-turn:{turn_id}:segment:{segment_id}"),
+            &mut peak,
+            limits,
+            3,
+        )?);
+        let existing = self.snapshot.text_streams.get(&id);
+        if existing.is_some_and(|state| {
+            matches!(state.status, TextStreamViewStatus::Terminal(_))
+                || update.generation < state.generation
+        }) {
+            return self.commit_stream_location_bounded(
+                &id,
+                turn_id,
+                *output_position,
+                peak,
+                retained,
+                limits,
+            );
+        }
+        let reset = existing.is_some_and(|state| update.generation > state.generation);
+        let mut state = existing
+            .filter(|_| !reset)
+            .cloned()
+            .unwrap_or(TextStreamViewState {
+                generation: update.generation,
+                revision: 0,
+                accepted_bytes: 0,
+                truncated: false,
+                status: TextStreamViewStatus::Healthy,
+            });
+        let (accepted, degraded) = advance_assistant_stream_state(
+            &mut state,
+            update,
+            self.last_text_stream_updates.get(&id),
+        );
+        let index = self.transcript_item_index(&id);
+        let (mut item, pending) = self.stage_stream_presentation_bounded(
+            (&id, turn_id, index.filter(|_| !reset)),
+            accepted.then_some(&update.operation),
+            reset,
+            &mut peak,
+            limits,
+        )?;
+        let mut location_changed = false;
+        if let Some(item) = &mut item
+            && let Some(position) = output_position
+        {
+            let location = stage_output_location(turn_id, *position, &mut peak, limits)?;
+            location_changed = item.output_location.as_ref() != Some(&location);
+            item.output_location = Some(location);
+            if location_changed {
+                item.revision = item.revision.saturating_add(1);
+            }
+        }
+        peak.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 5,
+                collection_entries: usize::from(existing.is_none()),
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let state_key = TranscriptViewItemId::new(peak.try_clone_string(id.get(), 3, limits)?);
+        let (previous_key, previous) =
+            Self::stage_ordered_duplicate(&id, update, accepted, &mut peak, limits)?;
+        let buffer = stage_insert_buffer(
+            &self.snapshot.transcript.items,
+            index.is_none() && item.is_some(),
+            3,
+            &mut peak,
+            limits,
+        )?;
+        self.commit_ordered_stream_bounded(
+            ((id, state_key, state), (previous_key, previous)),
+            (index, item, buffer, pending),
+            (reset, accepted, degraded, location_changed),
+            peak,
+            retained,
+            limits,
+        )
+    }
+
+    fn commit_ordered_stream_bounded(
+        &mut self,
+        streams: StagedOrderedStream,
+        transcript: StagedStreamTranscript,
+        transition: (bool, bool, bool, bool),
+        peak: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let ((id, state_key, state), (previous_key, previous)) = streams;
+        let (index, item, buffer, pending) = transcript;
+        let (reset, accepted, degraded, location_changed) = transition;
+        let mut committed = self.ordered_stream_commit_usage(
+            (&id, &state_key, previous_key.as_ref(), previous.as_ref()),
+            (index, item.as_ref(), buffer.as_ref().map(Vec::capacity)),
+            retained,
+            limits,
+        )?;
+        self.account_pending_replacement(&mut committed, pending.as_ref(), limits)?;
+        reconcile_clone_capacity(peak, committed)?;
+        if let Some((key, value)) = pending {
+            self.pending_text_presentations.remove(&key);
+            if let Some(value) = value {
+                self.pending_text_presentations.insert(key, value);
+            }
+        }
+        self.snapshot.text_streams.remove(&id);
+        self.snapshot.text_streams.insert(state_key, state);
+        if let (Some(key), Some(value)) = (previous_key, previous) {
+            self.last_text_stream_updates.remove(&id);
+            self.last_text_stream_updates.insert(key, value);
+        }
+        let item_index = if reset {
+            self.snapshot
+                .transcript
+                .items
+                .len()
+                .saturating_sub(usize::from(index.is_some()))
+        } else {
+            index.unwrap_or(self.snapshot.transcript.items.len())
+        };
+        if reset && index.is_some() && item.is_some() {
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        }
+        if let Some(item) = item {
+            if reset && let Some(index) = index {
+                self.snapshot.transcript.items.remove(index);
+                self.commit_system_message(item, None);
+                self.bump_revision();
+            } else if let Some(index) = index {
+                let changed = self.snapshot.transcript.items[index] != item;
+                self.snapshot.transcript.items[index] = item;
+                if accepted && changed {
+                    self.snapshot.transcript.revision =
+                        self.snapshot.transcript.revision.saturating_add(1);
+                    if !matches!(
+                        self.snapshot.text_streams[&id].status,
+                        TextStreamViewStatus::Terminal(_)
+                    ) {
+                        self.bump_revision();
+                    }
+                }
+            } else {
+                self.commit_system_message(item, buffer);
+                self.bump_revision();
+            }
+        } else if reset && let Some(index) = index {
+            self.remove_transcript_item_at(index);
+            self.bump_revision();
+        }
+        if degraded
+            || (accepted
+                && matches!(
+                    self.snapshot.text_streams[&id].status,
+                    TextStreamViewStatus::Terminal(_)
+                ))
+        {
+            self.bump_revision();
+        }
+        if location_changed {
+            self.reorder_output_item(item_index, true);
+        }
+        *retained = committed;
+        Ok(())
+    }
+
+    fn account_pending_replacement(
+        &self,
+        committed: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        pending: Option<&(TranscriptViewItemId, Option<PendingTextPresentation>)>,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let Some((id, replacement)) = pending else {
+            return Ok(());
+        };
+        if let Some((key, old)) = self.pending_text_presentations.get_key_value(id) {
+            committed.try_release(inspect_pending_text(key, old, limits)?)?;
+            committed.try_release(ObservationRetentionUsage {
+                collection_entries: 1,
+                ..ObservationRetentionUsage::default()
+            })?;
+        }
+        if let Some(value) = replacement {
+            committed.try_add(inspect_pending_text(id, value, limits)?, limits)?;
+            committed.try_add(
+                ObservationRetentionUsage {
+                    collection_entries: 1,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn stage_stream_presentation_bounded(
+        &self,
+        source: (&TranscriptViewItemId, &str, Option<usize>),
+        operation: Option<&bcode_session_models::TextStreamOperation>,
+        reset: bool,
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        StagedStreamPresentation,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_models::TextStreamOperation;
+        let (id, _, index) = source;
+        let clear = reset || matches!(operation, Some(TextStreamOperation::Checkpoint { .. }));
+        if let Some(TextStreamOperation::Append { text, .. }) = operation
+            && !self.streaming_presentation_policy.is_immediate()
+        {
+            return self.stage_paced_append_bounded(source, text, reset, peak, limits);
+        }
+        let item = self.stage_ordered_stream_item(id, index, operation, peak, limits)?;
+        let pending = if clear && self.pending_text_presentations.contains_key(id) {
+            Some((
+                TranscriptViewItemId::new(peak.try_clone_string(id.get(), 2, limits)?),
+                None,
+            ))
+        } else {
+            None
+        };
+        Ok((item, pending))
+    }
+
+    fn stage_paced_append_bounded(
+        &self,
+        source: (&TranscriptViewItemId, &str, Option<usize>),
+        text: &str,
+        reset: bool,
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        StagedStreamPresentation,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_models::TextStreamOperation;
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (id, turn_id, index) = source;
+        let old = self.pending_text_presentations.get(id).filter(|_| !reset);
+        let current = index
+            .and_then(|index| transcript_item_text(&self.snapshot.transcript.items[index]))
+            .unwrap_or_default();
+        let accepted = old.map_or(current, |pending| pending.target.as_str());
+        let target = peak.try_concat_string(accepted, text, 4, limits)?;
+        let key = TranscriptViewItemId::new(peak.try_clone_string(id.get(), 2, limits)?);
+        if target.len().saturating_sub(current.len()) > MAX_RETAINED_PENDING_TEXT_BYTES {
+            let operation = TextStreamOperation::Checkpoint {
+                start_offset: 0,
+                total_bytes: target.len(),
+                truncated: false,
+                text: target,
+            };
+            let item = self.stage_ordered_stream_item(id, index, Some(&operation), peak, limits)?;
+            return Ok((item, Some((key, None))));
+        }
+        let first = if current.is_empty() {
+            target
+                .grapheme_indices(true)
+                .nth(1)
+                .map_or(target.len(), |(offset, _)| offset)
+        } else {
+            current.len()
+        };
+        let item = if current.is_empty() {
+            let visible = peak.try_clone_string(&target[..first], 7, limits)?;
+            let operation = TextStreamOperation::Checkpoint {
+                start_offset: 0,
+                total_bytes: first,
+                truncated: false,
+                text: visible,
+            };
+            self.stage_ordered_stream_item(id, index, Some(&operation), peak, limits)?
+        } else {
+            self.stage_ordered_stream_item(id, index, None, peak, limits)?
+        };
+        if current.is_empty() && first == target.len() {
+            return Ok((item, Some((key, None))));
+        }
+        peak.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 7,
+                collection_entries: 1,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let destination = PendingTextDestination::Transcript {
+            turn_id: peak.try_clone_string(turn_id, 5, limits)?,
+        };
+        let policy = self.streaming_presentation_policy;
+        let pending = if let Some(old) = old {
+            // Only fixed pacing state is copied; target and destination are already admitted.
+            PendingTextPresentation {
+                target,
+                presented_bytes: old.presented_bytes,
+                paced_from: old.paced_from,
+                presented_since_pace: old.presented_since_pace,
+                remaining_graphemes: 0,
+                graphemes_per_second: policy.graphemes_per_second,
+                max_lag: Duration::from_millis(policy.max_lag_ms),
+                destination,
+            }
+        } else {
+            PendingTextPresentation::new(
+                target,
+                first,
+                Instant::now(),
+                policy.graphemes_per_second,
+                Duration::from_millis(policy.max_lag_ms),
+                destination,
+            )
+        };
+        let mut pending = pending;
+        pending.remaining_graphemes = pending.presented_since_pace.saturating_add(
+            pending.target[pending.presented_bytes..]
+                .graphemes(true)
+                .count(),
+        );
+        Ok((item, Some((key, Some(pending)))))
+    }
+
+    fn ordered_stream_commit_usage(
+        &self,
+        streams: OrderedStreamOwners<'_>,
+        transcript: OrderedTranscriptOwners<'_>,
+        retained: &bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (id, state_key, previous_key, previous) = streams;
+        let (index, item, buffer) = transcript;
+        let mut committed = *retained;
+        let old_stream = self.snapshot.text_streams.get_key_value(id);
+        if let Some((key, _)) = old_stream {
+            committed.try_release(key.retention_usage(3))?;
+        } else {
+            committed.try_add(
+                ObservationRetentionUsage {
+                    collection_entries: 1,
+                    value_nodes: 5,
+                    depth: 4,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        committed.try_add(state_key.retention_usage(3), limits)?;
+        if let Some(value) = previous {
+            if let Some((key, old)) = self.last_text_stream_updates.get_key_value(id) {
+                committed.try_release(key.retention_usage(2))?;
+                committed.try_release(bcode_session_models::inspect_text_stream(old, &limits)?)?;
+            } else {
+                committed.try_add(
+                    ObservationRetentionUsage {
+                        collection_entries: 1,
+                        ..ObservationRetentionUsage::default()
+                    },
+                    limits,
+                )?;
+            }
+            committed.try_add(
+                previous_key
+                    .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?
+                    .retention_usage(2),
+                limits,
+            )?;
+            let mut usage = bcode_session_models::inspect_text_stream(value, &limits)?;
+            usage.depth = usage
+                .depth
+                .checked_add(1)
+                .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+            committed.try_add(usage, limits)?;
+        }
+        if let Some(index) = index {
+            committed.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        if let Some(item) = item {
+            let mut usage =
+                bcode_session_view_models::retention::inspect_transcript_item(item, limits)?;
+            usage.depth = usage
+                .depth
+                .checked_add(3)
+                .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+            committed.try_add(usage, limits)?;
+        }
+        if let Some(buffer) = buffer {
+            committed.try_release(ObservationRetentionUsage {
+                collection_entries: self.snapshot.transcript.items.capacity(),
+                ..ObservationRetentionUsage::default()
+            })?;
+            committed.try_add(
+                ObservationRetentionUsage {
+                    collection_entries: buffer,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        Ok(committed)
+    }
+
+    fn stage_ordered_stream_item(
+        &self,
+        id: &TranscriptViewItemId,
+        index: Option<usize>,
+        operation: Option<&bcode_session_models::TextStreamOperation>,
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        Option<TranscriptViewItem>,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_models::TextStreamOperation;
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let mut item = index
+            .map(|index| {
+                clone_admitted(
+                    &self.snapshot.transcript.items[index],
+                    peak,
+                    limits,
+                    |item| {
+                        bcode_session_view_models::retention::inspect_transcript_item(item, limits)
+                    },
+                )
+            })
+            .transpose()?;
+        let text = match operation {
+            Some(TextStreamOperation::Append { text, .. }) => {
+                let current = item
+                    .as_ref()
+                    .and_then(transcript_item_text)
+                    .unwrap_or_default();
+                Some(peak.try_concat_string(current, text, 7, limits)?)
+            }
+            Some(TextStreamOperation::Checkpoint { text, .. }) => {
+                Some(peak.try_clone_string(text, 7, limits)?)
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            if let Some(item) = &mut item {
+                let (TranscriptViewItemKind::AssistantMessage { message }
+                | TranscriptViewItemKind::ReasoningMessage { message }) = &mut item.kind
+                else {
+                    return Err(ObservationRetentionExceeded);
+                };
+                let changed = message.text != text;
+                message.text = text;
+                if matches!(operation, Some(TextStreamOperation::Checkpoint { .. })) || changed {
+                    item.revision = item.revision.saturating_add(1);
+                }
+                item.streaming = true;
+            } else {
+                peak.try_add(
+                    ObservationRetentionUsage {
+                        value_nodes: 11,
+                        depth: 7,
+                        ..ObservationRetentionUsage::default()
+                    },
+                    limits,
+                )?;
+                item = Some(TranscriptViewItem {
+                    id: TranscriptViewItemId::new(peak.try_clone_string(id.get(), 5, limits)?),
+                    revision: 0,
+                    sequence: None,
+                    timestamp_ms: None,
+                    output_location: None,
+                    streaming: true,
+                    kind: TranscriptViewItemKind::AssistantMessage {
+                        message: ChatMessageView::markdown(text),
+                    },
+                });
+            }
+        } else if let Some(TextStreamOperation::Terminal { .. }) = operation
+            && let Some(item) = &mut item
+        {
+            item.streaming = false;
+            item.revision = item.revision.saturating_add(1);
+        }
+        Ok(item)
+    }
+
+    fn commit_stream_location_bounded(
+        &mut self,
+        id: &TranscriptViewItemId,
+        turn_id: &str,
+        position: Option<bcode_session_models::TurnOutputPosition>,
+        mut peak: bcode_session_view_models::retention::ObservationRetentionUsage,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let Some(position) = position else {
+            return Ok(());
+        };
+        let Some(index) = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == *id)
+        else {
+            return Ok(());
+        };
+        let mut item = clone_admitted(
+            &self.snapshot.transcript.items[index],
+            &mut peak,
+            limits,
+            |item| bcode_session_view_models::retention::inspect_transcript_item(item, limits),
+        )?;
+        let location = stage_output_location(turn_id, position, &mut peak, limits)?;
+        let changed = item.output_location.as_ref() != Some(&location);
+        item.output_location = Some(location);
+        if changed {
+            item.revision = item.revision.saturating_add(1);
+        }
+        let mut committed = *retained;
+        committed.try_release(
+            bcode_session_view_models::retention::inspect_transcript_item(
+                &self.snapshot.transcript.items[index],
+                limits,
+            )?,
+        )?;
+        committed.try_add(
+            bcode_session_view_models::retention::inspect_transcript_item(&item, limits)?,
+            limits,
+        )?;
+        reconcile_clone_capacity(peak, committed)?;
+        self.snapshot.transcript.items[index] = item;
+        self.reorder_output_item(index, changed);
+        *retained = committed;
+        Ok(())
+    }
+
+    fn assign_stream_location_bounded(
+        &mut self,
+        id: &TranscriptViewItemId,
+        turn_id: &str,
+        position: Option<bcode_session_models::TurnOutputPosition>,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let Some(position) = position else {
+            return Ok(());
+        };
+        let Some(index) = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == *id)
+        else {
+            return Ok(());
+        };
+        let location = stage_output_location(turn_id, position, next, limits)?;
+        let changed = self.snapshot.transcript.items[index]
+            .output_location
+            .as_ref()
+            != Some(&location);
+        if changed {
+            self.snapshot.transcript.items[index].output_location = Some(location);
+            self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items[index]
+                .revision
+                .saturating_add(1);
+        }
+        self.reorder_output_item(index, changed);
+        Ok(())
+    }
+
+    fn stage_reasoning_stream_state(
+        existing: Option<&TextStreamViewState>,
+        update: &bcode_session_models::TextStreamUpdate,
+        previous: Option<&bcode_session_models::TextStreamUpdate>,
+    ) -> (TextStreamViewState, bool, bool, bool) {
+        use bcode_session_models::TextStreamOperation;
+        let reset = existing.is_some_and(|state| update.generation > state.generation)
+            && !existing
+                .is_some_and(|state| matches!(state.status, TextStreamViewStatus::Terminal(_)));
+        let mut state = existing
+            .filter(|_| !reset)
+            .cloned()
+            .unwrap_or(TextStreamViewState {
+                generation: update.generation,
+                revision: 0,
+                accepted_bytes: 0,
+                truncated: false,
+                status: TextStreamViewStatus::Healthy,
+            });
+        let (accepted, degraded) = if existing.is_some_and(|state| {
+            matches!(state.status, TextStreamViewStatus::Terminal(_))
+                || update.generation < state.generation
+        }) {
+            (false, false)
+        } else {
+            // Reasoning permits a later contiguous append to recover a degraded
+            // state; assistant text intentionally requires a checkpoint instead.
+            let mut candidate = state.clone();
+            if matches!(candidate.status, TextStreamViewStatus::Degraded) {
+                candidate.status = TextStreamViewStatus::Healthy;
+            }
+            let result =
+                advance_assistant_stream_state(&mut candidate, update, previous.filter(|_| !reset));
+            if result.0 && matches!(update.operation, TextStreamOperation::Append { .. }) {
+                candidate.status = TextStreamViewStatus::Healthy;
+            }
+            if result.0 || result.1 {
+                state = candidate;
+            }
+            result
+        };
+        (state, reset, accepted, degraded)
+    }
+
+    fn stage_reasoning_stream_bounded(
+        &self,
+        live: &SessionLiveEvent,
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        StagedReasoningStream,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+            turn_id,
+            activity_id,
+            part_id,
+            update,
+            ..
+        } = &live.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        let stream_id = TranscriptViewItemId::new(format_observation_text(
+            format_args!("reasoning-stream:{turn_id}:activity:{activity_id}:part:{part_id}"),
+            peak,
+            limits,
+            3,
+        )?);
+        let activity_key = (
+            peak.try_clone_string(turn_id, 3, limits)?,
+            peak.try_clone_string(activity_id, 3, limits)?,
+        );
+        let existing = self.snapshot.text_streams.get(&stream_id);
+        let (state, reset, accepted, degraded) = Self::stage_reasoning_stream_state(
+            existing,
+            update,
+            self.last_text_stream_updates.get(&stream_id),
+        );
+        peak.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 5,
+                collection_entries: 1,
+                depth: 4,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let terminal = matches!(
+            update.operation,
+            bcode_session_models::TextStreamOperation::Terminal { .. }
+        );
+        let cache = if reset
+            || (accepted && (!terminal || self.pending_text_presentations.contains_key(&stream_id)))
+        {
+            if let Some((key, old)) = self.live_reasoning.get_key_value(&activity_key) {
+                peak.try_add(reasoning_entry_usage(key, old, limits)?, limits)?;
+                let mut cache = old.clone();
+                if reset {
+                    cache.parts.remove(part_id);
+                }
+                Some(cache)
+            } else {
+                peak.try_add(
+                    ObservationRetentionUsage {
+                        collection_entries: 1,
+                        value_nodes: 4,
+                        depth: 4,
+                        ..ObservationRetentionUsage::default()
+                    },
+                    limits,
+                )?;
+                Some(LiveReasoningActivity::default())
+            }
+        } else {
+            None
+        };
+        let pending = if reset && self.pending_text_presentations.contains_key(&stream_id) {
+            Some((
+                TranscriptViewItemId::new(peak.try_clone_string(stream_id.get(), 2, limits)?),
+                None,
+            ))
+        } else {
+            None
+        };
+        Ok(StagedReasoningStream {
+            stream_id,
+            state,
+            admission: if accepted {
+                StreamAdmission::Accepted
+            } else if degraded {
+                StreamAdmission::Degraded
+            } else {
+                StreamAdmission::Ignored
+            },
+            reset,
+            activity_key,
+            cache,
+            item: None,
+            pending,
+            terminal,
+        })
+    }
+
+    fn stage_reasoning_pending(
+        &self,
+        live: &SessionLiveEvent,
+        staged: &mut StagedReasoningStream,
+        text: (&str, usize),
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(bool, usize), bcode_session_view_models::retention::ObservationRetentionExceeded>
+    {
+        use bcode_session_models::TextStreamOperation;
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+            turn_id,
+            activity_id,
+            activity_order,
+            part_id,
+            kind,
+            role,
+            part_order,
+            update,
+            ..
+        } = &live.kind
+        else {
+            unreachable!()
+        };
+        let (target, current) = text;
+        let old = self
+            .pending_text_presentations
+            .get(&staged.stream_id)
+            .filter(|_| !staged.reset);
+        let paced = matches!(update.operation, TextStreamOperation::Append { .. })
+            && !self.streaming_presentation_policy.is_immediate()
+            && target.len().saturating_sub(current) <= MAX_RETAINED_PENDING_TEXT_BYTES;
+        let visible = if paced && current == 0 {
+            target
+                .grapheme_indices(true)
+                .nth(1)
+                .map_or(target.len(), |(offset, _)| offset)
+        } else if paced {
+            current
+        } else {
+            target.len()
+        };
+        let refresh = !paced || current == 0;
+        if paced && visible < target.len() {
+            peak.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 11,
+                    collection_entries: 1,
+                    depth: 5,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            let destination = PendingTextDestination::ReasoningPart {
+                turn_id: peak.try_clone_string(turn_id, 5, limits)?,
+                activity_id: peak.try_clone_string(activity_id, 5, limits)?,
+                part_id: peak.try_clone_string(part_id, 5, limits)?,
+                activity_order: *activity_order,
+                kind: *kind,
+                role: *role,
+                part_order: *part_order,
+            };
+            let policy = self.streaming_presentation_policy;
+            let mut pending = PendingTextPresentation::new(
+                peak.try_clone_string(target, 4, limits)?,
+                visible,
+                Instant::now(),
+                policy.graphemes_per_second,
+                Duration::from_millis(policy.max_lag_ms),
+                destination,
+            );
+            if let Some(old) = old {
+                pending.paced_from = old.paced_from;
+                pending.presented_since_pace = old.presented_since_pace;
+                pending.presented_bytes = old.presented_bytes;
+                pending.remaining_graphemes = old
+                    .presented_since_pace
+                    .saturating_add(target[old.presented_bytes..].graphemes(true).count());
+            }
+            staged.pending = Some((
+                TranscriptViewItemId::new(peak.try_clone_string(
+                    staged.stream_id.get(),
+                    2,
+                    limits,
+                )?),
+                Some(pending),
+            ));
+        }
+        Ok((refresh, visible))
+    }
+
+    fn stage_reasoning_stream_content(
+        &self,
+        live: &SessionLiveEvent,
+        staged: &mut StagedReasoningStream,
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_models::{ReasoningActivityEvent, TextStreamOperation};
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        let SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+            turn_id,
+            activity_id,
+            activity_order,
+            part_id,
+            kind,
+            role,
+            part_order,
+            update,
+            output_position,
+        } = &live.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        if !staged.admission.is_accepted() {
+            return Ok(());
+        }
+        let old = self
+            .pending_text_presentations
+            .get(&staged.stream_id)
+            .filter(|_| !staged.reset);
+        let current = staged
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.parts.get(part_id))
+            .map_or("", |part| part.text.as_str());
+        let accepted_text = old.map_or(current, |pending| pending.target.as_str());
+        let target = match &update.operation {
+            TextStreamOperation::Append { text, .. } => {
+                Some(peak.try_concat_string(accepted_text, text, 5, limits)?)
+            }
+            TextStreamOperation::Checkpoint { text, .. } => {
+                Some(peak.try_clone_string(text, 5, limits)?)
+            }
+            TextStreamOperation::Terminal { .. } => old
+                .map(|pending| peak.try_clone_string(&pending.target, 5, limits))
+                .transpose()?,
+        };
+        let clear = staged.reset || !matches!(update.operation, TextStreamOperation::Append { .. });
+        if clear {
+            staged.pending = Some((
+                TranscriptViewItemId::new(peak.try_clone_string(
+                    staged.stream_id.get(),
+                    2,
+                    limits,
+                )?),
+                None,
+            ));
+        }
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let current_bytes = current.len();
+        let (refresh, visible) =
+            self.stage_reasoning_pending(live, staged, (&target, current_bytes), peak, limits)?;
+        if refresh {
+            let completed = ReasoningActivityEvent::PartCompleted {
+                activity_id: peak.try_clone_string(activity_id, 4, limits)?,
+                activity_order: *activity_order,
+                part_id: peak.try_clone_string(part_id, 4, limits)?,
+                kind: *kind,
+                role: *role,
+                part_order: *part_order,
+                text: peak.try_clone_string(&target[..visible], 6, limits)?,
+            };
+            let cache = staged.cache.as_mut().ok_or(ObservationRetentionExceeded)?;
+            cache.apply_admitted(&completed, Some((peak, limits)))?;
+            staged.item = Some(self.stage_reasoning_item_bounded(
+                &staged.activity_key,
+                cache,
+                peak,
+                limits,
+            )?);
+        }
+        if let Some((_, item, _)) = &mut staged.item
+            && let Some(position) = output_position
+        {
+            let location = stage_output_location(turn_id, *position, peak, limits)?;
+            if item.output_location.as_ref() != Some(&location) {
+                item.output_location = Some(location);
+                item.revision = item.revision.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn reasoning_stream_commit_usage(
+        &self,
+        staged: &StagedReasoningStream,
+        previous: (
+            Option<&TranscriptViewItemId>,
+            Option<&bcode_session_models::TextStreamUpdate>,
+        ),
+        mut committed: bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (previous_key, previous) = previous;
+        if staged.admission.is_accepted()
+            || staged.admission.is_degraded()
+            || !self.snapshot.text_streams.contains_key(&staged.stream_id)
+        {
+            if let Some((key, _)) = self.snapshot.text_streams.get_key_value(&staged.stream_id) {
+                committed.try_release(key.retention_usage(3))?;
+            } else {
+                committed.try_add(
+                    ObservationRetentionUsage {
+                        value_nodes: 5,
+                        collection_entries: 1,
+                        depth: 4,
+                        ..ObservationRetentionUsage::default()
+                    },
+                    limits,
+                )?;
+            }
+            committed.try_add(staged.stream_id.retention_usage(3), limits)?;
+        }
+        if let Some(value) = previous {
+            if let Some((key, old)) = self
+                .last_text_stream_updates
+                .get_key_value(&staged.stream_id)
+            {
+                committed.try_release(key.retention_usage(2))?;
+                committed.try_release(bcode_session_models::inspect_text_stream(old, &limits)?)?;
+            } else {
+                committed.try_add(
+                    ObservationRetentionUsage {
+                        collection_entries: 1,
+                        ..ObservationRetentionUsage::default()
+                    },
+                    limits,
+                )?;
+            }
+            committed.try_add(previous_key.expect("staged key").retention_usage(2), limits)?;
+            committed.try_add(
+                bcode_session_models::inspect_text_stream(value, &limits)?,
+                limits,
+            )?;
+        }
+        if let Some(cache) = &staged.cache {
+            if let Some((key, old)) = self.live_reasoning.get_key_value(&staged.activity_key) {
+                committed.try_release(reasoning_entry_usage(key, old, limits)?)?;
+            }
+            committed.try_add(
+                reasoning_entry_usage(&staged.activity_key, cache, limits)?,
+                limits,
+            )?;
+        }
+        self.account_pending_replacement(&mut committed, staged.pending.as_ref(), limits)?;
+        if let Some((index, item, buffer)) = &staged.item {
+            if let Some(index) = index {
+                committed.try_release(
+                    bcode_session_view_models::retention::inspect_transcript_item(
+                        &self.snapshot.transcript.items[*index],
+                        limits,
+                    )?,
+                )?;
+            }
+            let mut charge =
+                bcode_session_view_models::retention::inspect_transcript_item(item, limits)?;
+            charge.depth += 3;
+            committed.try_add(charge, limits)?;
+            if let Some(buffer) = buffer {
+                committed.try_release(ObservationRetentionUsage::collection(
+                    self.snapshot.transcript.items.capacity(),
+                    3,
+                ))?;
+                committed.try_add(
+                    ObservationRetentionUsage::collection(buffer.capacity(), 3),
+                    limits,
+                )?;
+            }
+        }
+        Ok(committed)
+    }
+
+    fn apply_reasoning_stream_bounded(
+        &mut self,
+        live: &SessionLiveEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut peak = *retained;
+        let mut staged = self.stage_reasoning_stream_bounded(live, &mut peak, limits)?;
+        self.stage_reasoning_stream_content(live, &mut staged, &mut peak, limits)?;
+        let SessionLiveEventKind::AssistantReasoningTextStreamUpdated { update, .. } = &live.kind
+        else {
+            unreachable!()
+        };
+        let previous = if staged.admission.is_accepted() {
+            Some(clone_admitted(update, &mut peak, limits, |value| {
+                bcode_session_models::inspect_text_stream(value, &limits)
+            })?)
+        } else {
+            None
+        };
+        let previous_key = previous
+            .as_ref()
+            .map(|_| {
+                peak.try_clone_string(staged.stream_id.get(), 2, limits)
+                    .map(TranscriptViewItemId::new)
+            })
+            .transpose()?;
+        if previous.is_some() {
+            peak.try_add(
+                ObservationRetentionUsage {
+                    collection_entries: 1,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        let committed = self.reasoning_stream_commit_usage(
+            &staged,
+            (previous_key.as_ref(), previous.as_ref()),
+            *retained,
+            limits,
+        )?;
+        reconcile_clone_capacity(peak, committed)?;
+        if let Some(cache) = staged.cache {
+            self.live_reasoning.remove(&staged.activity_key);
+            self.live_reasoning.insert(staged.activity_key, cache);
+        }
+        if let Some((key, pending)) = staged.pending {
+            self.pending_text_presentations.remove(&key);
+            if let Some(pending) = pending {
+                self.pending_text_presentations.insert(key, pending);
+            }
+        }
+        if let Some((index, item, buffer)) = staged.item {
+            let location_changed = index.is_some_and(|index| {
+                self.snapshot.transcript.items[index].output_location != item.output_location
+            }) || (index.is_none() && item.output_location.is_some());
+            let item_index = index.unwrap_or(self.snapshot.transcript.items.len());
+            if let Some(index) = index {
+                self.snapshot.transcript.items[index] = item;
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+            } else {
+                self.commit_system_message(item, buffer);
+            }
+            self.bump_revision();
+            if location_changed {
+                self.reorder_output_item(item_index, true);
+            }
+        }
+        if let (Some(key), Some(previous)) = (previous_key, previous) {
+            self.last_text_stream_updates.remove(&key);
+            self.last_text_stream_updates.insert(key, previous);
+        }
+        self.snapshot.text_streams.remove(&staged.stream_id);
+        self.snapshot
+            .text_streams
+            .insert(staged.stream_id, staged.state);
+        if staged.admission.is_degraded() || (staged.admission.is_accepted() && staged.terminal) {
+            self.bump_revision();
+        }
+        *retained = committed;
+        Ok(())
+    }
+
+    fn stage_finished_reasoning_parts(
+        &self,
+        source: (&str, &bcode_session_models::ReasoningActivityEvent),
+        cache: &mut LiveReasoningActivity,
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        Vec<TranscriptViewItemId>,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (turn_id, event) = source;
+        let pending_count = if matches!(
+            event,
+            bcode_session_models::ReasoningActivityEvent::Finished { .. }
+        ) {
+            self.pending_text_presentations
+                .values()
+                .filter(|pending| {
+                    matches!(&pending.destination,
+                PendingTextDestination::ReasoningPart { turn_id: turn, activity_id, .. }
+                    if turn == turn_id && activity_id == event.activity_id())
+                })
+                .count()
+        } else {
+            0
+        };
+        peak.try_add(
+            ObservationRetentionUsage::collection(pending_count, 2),
+            limits,
+        )?;
+        let mut removed_pending = Vec::with_capacity(pending_count);
+        if removed_pending.capacity() != pending_count {
+            return Err(bcode_session_view_models::retention::ObservationRetentionExceeded);
+        }
+        if matches!(
+            event,
+            bcode_session_models::ReasoningActivityEvent::Finished { .. }
+        ) {
+            for (id, pending) in &self.pending_text_presentations {
+                let PendingTextDestination::ReasoningPart {
+                    turn_id: turn,
+                    activity_id,
+                    activity_order,
+                    part_id,
+                    kind,
+                    role,
+                    part_order,
+                } = &pending.destination
+                else {
+                    continue;
+                };
+                if turn != turn_id || activity_id != event.activity_id() {
+                    continue;
+                }
+                let complete = bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    activity_id: peak.try_clone_string(activity_id, 4, limits)?,
+                    activity_order: *activity_order,
+                    part_id: peak.try_clone_string(part_id, 4, limits)?,
+                    kind: *kind,
+                    role: *role,
+                    part_order: *part_order,
+                    text: peak.try_clone_string(&pending.target, 4, limits)?,
+                };
+                cache.apply_admitted(&complete, Some((peak, limits)))?;
+                removed_pending.push(TranscriptViewItemId::new(peak.try_clone_string(
+                    id.get(),
+                    3,
+                    limits,
+                )?));
+            }
+        }
+        Ok(removed_pending)
+    }
+
+    fn stage_reasoning_location(
+        item: &mut TranscriptViewItem,
+        source: (&str, Option<bcode_session_models::TurnOutputPosition>),
+        peak: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<bool, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let (turn_id, position) = source;
+        let location = position
+            .map(|position| stage_output_location(turn_id, position, peak, limits))
+            .transpose()?;
+        let location_changed = location
+            .as_ref()
+            .is_some_and(|location| item.output_location.as_ref() != Some(location));
+        if let Some(location) = location {
+            item.output_location = Some(location);
+        }
+        if location_changed {
+            item.revision = item.revision.saturating_add(1);
+        }
+        Ok(location_changed)
+    }
+
+    fn apply_live_reasoning_bounded(
+        &mut self,
+        session_id: SessionId,
+        turn_id: &str,
+        event: &bcode_session_models::ReasoningActivityEvent,
+        position: Option<bcode_session_models::TurnOutputPosition>,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut peak = *retained;
+        let key = (
+            peak.try_clone_string(turn_id, 3, limits)?,
+            peak.try_clone_string(event.activity_id(), 3, limits)?,
+        );
+        let old = self.live_reasoning.get_key_value(&key);
+        let mut cache = if let Some((key, cache)) = old {
+            peak.try_add(reasoning_entry_usage(key, cache, limits)?, limits)?;
+            cache.clone()
+        } else {
+            peak.try_add(
+                ObservationRetentionUsage {
+                    collection_entries: 1,
+                    value_nodes: 4,
+                    depth: 4,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            LiveReasoningActivity::default()
+        };
+        let removed_pending =
+            self.stage_finished_reasoning_parts((turn_id, event), &mut cache, &mut peak, limits)?;
+        cache.apply_admitted(event, Some((&mut peak, limits)))?;
+        let (index, mut item, buffer) =
+            self.stage_reasoning_item_bounded(&key, &cache, &mut peak, limits)?;
+        // Each flushed part is an ordinary semantic refresh before Finished.
+        item.revision = item
+            .revision
+            .saturating_add(u64::try_from(removed_pending.len()).unwrap_or(u64::MAX));
+        let location_changed =
+            Self::stage_reasoning_location(&mut item, (turn_id, position), &mut peak, limits)?;
+        let mut committed = *retained;
+        if let Some((key, old)) = old {
+            committed.try_release(reasoning_entry_usage(key, old, limits)?)?;
+        }
+        committed.try_add(reasoning_entry_usage(&key, &cache, limits)?, limits)?;
+        if let Some(index) = index {
+            committed.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        let mut charge =
+            bcode_session_view_models::retention::inspect_transcript_item(&item, limits)?;
+        charge.depth += 3;
+        committed.try_add(charge, limits)?;
+        if let Some(buffer) = &buffer {
+            committed.try_release(ObservationRetentionUsage::collection(
+                self.snapshot.transcript.items.capacity(),
+                3,
+            ))?;
+            committed.try_add(
+                ObservationRetentionUsage::collection(buffer.capacity(), 3),
+                limits,
+            )?;
+        }
+        for id in &removed_pending {
+            let (key, pending) = self
+                .pending_text_presentations
+                .get_key_value(id)
+                .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+            committed.try_release(inspect_pending_text(key, pending, limits)?)?;
+            committed.try_release(ObservationRetentionUsage {
+                collection_entries: 1,
+                ..ObservationRetentionUsage::default()
+            })?;
+        }
+        reconcile_clone_capacity(peak, committed)?;
+        let flushes = u64::try_from(removed_pending.len()).unwrap_or(u64::MAX);
+        for id in removed_pending {
+            self.pending_text_presentations.remove(&id);
+        }
+        self.snapshot.transcript.revision =
+            self.snapshot.transcript.revision.saturating_add(flushes);
+        self.snapshot.revision = self.snapshot.revision.saturating_add(flushes);
+        self.live_reasoning.remove(&key);
+        self.live_reasoning.insert(key, cache);
+        let item_index = index.unwrap_or(self.snapshot.transcript.items.len());
+        if let Some(index) = index {
+            self.snapshot.transcript.items[index] = item;
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        } else {
+            self.commit_system_message(item, buffer);
+        }
+        self.bump_revision();
+        if location_changed {
+            self.reorder_output_item(item_index, true);
+        }
+        self.snapshot.session_id = Some(session_id);
+        *retained = committed;
+        Ok(())
+    }
+
+    fn stage_reasoning_item_bounded(
+        &self,
+        key: &(String, String),
+        cache: &LiveReasoningActivity,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        StagedReasoningItem,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let view = stage_live_reasoning_view(
+            cache,
+            key,
+            self.snapshot.thinking.visible,
+            self.snapshot.thinking.mode,
+            next,
+            limits,
+        )?;
+        let finished = cache.finished;
+        let id = TranscriptViewItemId::new(format_observation_text(
+            format_args!("reasoning-turn:{}:{}", key.0, key.1),
+            next,
+            limits,
+            5,
+        )?);
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == id);
+        let buffer = stage_insert_buffer(
+            &self.snapshot.transcript.items,
+            index.is_none(),
+            3,
+            next,
+            limits,
+        )?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 7,
+                depth: 8,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let location = index
+            .and_then(|index| {
+                self.snapshot.transcript.items[index]
+                    .output_location
+                    .as_ref()
+            })
+            .map(|location| {
+                stage_output_location(&location.turn_id, location.position, next, limits)
+            })
+            .transpose()?;
+        let item = TranscriptViewItem {
+            id,
+            revision: index.map_or(0, |index| {
+                self.snapshot.transcript.items[index]
+                    .revision
+                    .saturating_add(1)
+            }),
+            sequence: index.and_then(|index| self.snapshot.transcript.items[index].sequence),
+            timestamp_ms: index
+                .and_then(|index| self.snapshot.transcript.items[index].timestamp_ms),
+            output_location: location,
+            streaming: !finished,
+            kind: TranscriptViewItemKind::ReasoningActivity { activity: view },
+        };
+        Ok((index, item, buffer))
+    }
+
+    fn stage_rich_item_bounded(
+        &mut self,
+        mut item: TranscriptViewItem,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|old| old.id == item.id);
+        let item_usage =
+            bcode_session_view_models::retention::inspect_transcript_item(&item, limits)?;
+        let depth = item_usage
+            .depth
+            .checked_add(3)
+            .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 6,
+                depth,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let buffer = stage_insert_buffer(
+            &self.snapshot.transcript.items,
+            index.is_none(),
+            3,
+            next,
+            limits,
+        )?;
+        if let Some(index) = index {
+            let old = &self.snapshot.transcript.items[index];
+            item.revision = old.revision.saturating_add(1);
+            item.sequence = item.sequence.or(old.sequence);
+            item.timestamp_ms = item.timestamp_ms.or(old.timestamp_ms);
+            item.output_location = old
+                .output_location
+                .as_ref()
+                .map(|location| {
+                    stage_output_location(&location.turn_id, location.position, next, limits)
+                })
+                .transpose()?;
+            self.snapshot.transcript.items[index] = item;
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        } else {
+            self.commit_system_message(item, buffer);
+        }
+        self.bump_revision();
+        Ok(())
+    }
+
+    fn reduce_presentation_bounded(
+        &mut self,
+        update: &bcode_tool::ToolPresentationUpdate,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        if self
+            .tool_invocations
+            .get(&update.invocation_id)
+            .is_some_and(ToolInvocationAggregate::is_terminal)
+        {
+            return Ok(());
+        }
+        let key = next.try_clone_string(&update.invocation_id, 2, limits)?;
+        // Reserve both the independently retained fence and map identity before scope admission.
+        next.try_add(
+            ObservationRetentionUsage {
+                collection_entries: 3,
+                value_nodes: 11,
+                depth: 5,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        if let bcode_tool::ToolPresentationIdentity::Supplemental { item_id } = &update.identity {
+            next.try_add(ObservationRetentionUsage::string(item_id, 5), limits)?;
+        }
+        let identity = match &update.identity {
+            bcode_tool::ToolPresentationIdentity::Primary => {
+                bcode_tool::ToolPresentationIdentity::Primary
+            }
+            bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+                bcode_tool::ToolPresentationIdentity::Supplemental {
+                    item_id: next.try_clone_string(item_id, 4, limits)?,
+                }
+            }
+        };
+        let aggregate = self.tool_invocations.entry(key).or_default();
+        match aggregate
+            .presentation_scope
+            .accept_bounded(update, limits.scalar_capacity_bytes)
+        {
+            Ok(()) => {}
+            Err(
+                bcode_tool::ToolPresentationUpdateError::TooLarge { .. }
+                | bcode_tool::ToolPresentationUpdateError::Encode(_),
+            ) => {
+                return Err(bcode_session_view_models::retention::ObservationRetentionExceeded);
+            }
+            Err(_) => return Ok(()),
+        }
+        let stored = clone_admitted(update, next, limits, |value| {
+            bcode_session_models::retention_events::inspect_tool_presentation(value, &limits)
+        })?;
+        aggregate.presentations.insert(identity, stored);
+        self.project_presentation_bounded(update, next, limits)
+    }
+
+    fn refresh_rich_tool_bounded(
+        &mut self,
+        invocation_id: &str,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let Some(tool) = self.snapshot.tools.get(invocation_id) else {
+            return Ok(());
+        };
+        let tool = clone_admitted(tool, next, limits, |value| {
+            bcode_session_view_models::retention::inspect_tool(value, limits)
+        })?;
+        let id = TranscriptViewItemId::new(format_observation_text(
+            format_args!("tool:{invocation_id}"),
+            next,
+            limits,
+            5,
+        )?);
+        let map_id = TranscriptViewItemId::new(next.try_clone_string(id.get(), 3, limits)?);
+        let key = next.try_clone_string(invocation_id, 3, limits)?;
+        next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+        self.tool_item_ids.insert(key, map_id);
+        let terminal = is_terminal_tool_status(tool.status);
+        let streaming = !terminal
+            && (tool.request_draft.is_some()
+                || matches!(
+                    tool.status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                ));
+        if terminal
+            && let Some(index) = self
+                .snapshot
+                .transcript
+                .items
+                .iter()
+                .position(|item| item.id == id)
+            && matches!(
+                self.snapshot.transcript.items[index].kind,
+                TranscriptViewItemKind::ToolContribution { .. }
+            )
+        {
+            if let TranscriptViewItemKind::ToolContribution { invocation, .. } =
+                &mut self.snapshot.transcript.items[index].kind
+            {
+                *invocation = Some(Box::new(tool));
+            }
+            let item = &mut self.snapshot.transcript.items[index];
+            item.streaming = false;
+            item.revision = item.revision.saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        } else {
+            self.stage_rich_item_bounded(
+                TranscriptViewItem {
+                    id,
+                    revision: 0,
+                    sequence: None,
+                    timestamp_ms: None,
+                    output_location: None,
+                    streaming,
+                    kind: TranscriptViewItemKind::ToolInvocation {
+                        tool: Box::new(tool),
+                    },
+                },
+                next,
+                limits,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn sync_rich_contributions_bounded(
+        &mut self,
+        id: &str,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let streaming = self.snapshot.tools.get(id).is_some_and(|tool| {
+            matches!(
+                tool.status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            )
+        });
+        let mut changed = false;
+        for item in &mut self.snapshot.transcript.items {
+            let TranscriptViewItemKind::ToolContribution {
+                invocation,
+                contribution,
+                ..
+            } = &mut item.kind
+            else {
+                continue;
+            };
+            if contribution.invocation_id != id
+                || (invocation.as_deref() == self.snapshot.tools.get(id)
+                    && item.streaming == streaming)
+            {
+                continue;
+            }
+            *invocation = self
+                .snapshot
+                .tools
+                .get(id)
+                .map(|tool| {
+                    clone_admitted(tool, next, limits, |value| {
+                        bcode_session_view_models::retention::inspect_tool(value, limits)
+                    })
+                    .map(Box::new)
+                })
+                .transpose()?;
+            item.streaming = streaming;
+            item.revision = item.revision.saturating_add(1);
+            changed = true;
+        }
+        if changed {
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        }
+        Ok(())
+    }
+
+    fn project_contribution_bounded(
+        &mut self,
+        source: (u64, Option<u64>),
+        contribution: &bcode_session_models::ToolContributionEvent,
+        slot: (
+            bcode_session_models::ToolContributionPlacement,
+            &str,
+            TranscriptViewItemId,
+        ),
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_models::ToolContributionPersistence;
+        let (sequence, timestamp_ms) = source;
+        let (placement, key, id) = slot;
+        let contribution = clone_admitted(contribution, next, limits, |value| {
+            bcode_session_models::retention_events::inspect_tool_contribution(value, &limits)
+        })?;
+        let invocation = self
+            .snapshot
+            .tools
+            .get(&contribution.invocation_id)
+            .map(|tool| {
+                clone_admitted(tool, next, limits, |value| {
+                    bcode_session_view_models::retention::inspect_tool(value, limits)
+                })
+                .map(Box::new)
+            })
+            .transpose()?;
+        let streaming = contribution.persistence == ToolContributionPersistence::Transient
+            || invocation.as_ref().is_some_and(|tool| {
+                matches!(
+                    tool.status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                )
+            });
+        if let Some(old) = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            && let TranscriptViewItemKind::ToolContribution {
+                contribution: old, ..
+            } = &old.kind
+        {
+            let owner = format_observation_text(
+                format_args!("{}:{}", old.invocation_id, old.contribution_id),
+                next,
+                limits,
+                2,
+            )?;
+            if owner.as_str() != key {
+                self.contribution_placements.remove(&owner);
+            }
+        }
+        self.stage_rich_item_bounded(
+            TranscriptViewItem {
+                id,
+                revision: 0,
+                sequence: (sequence != 0).then_some(sequence),
+                timestamp_ms,
+                output_location: None,
+                streaming,
+                kind: TranscriptViewItemKind::ToolContribution {
+                    invocation,
+                    contribution,
+                    placement,
+                },
+            },
+            next,
+            limits,
+        )?;
+        Ok(())
+    }
+    fn reduce_contribution_bounded(
+        &mut self,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+        contribution: &bcode_session_models::ToolContributionEvent,
+        placement: bcode_session_models::ToolContributionPlacement,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_models::{
+            ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,
+        };
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        if contribution.persistence == ToolContributionPersistence::Transient
+            && self
+                .tool_invocations
+                .get(&contribution.invocation_id)
+                .is_some_and(ToolInvocationAggregate::is_terminal)
+        {
+            return Ok(());
+        }
+        let key = format_observation_text(
+            format_args!(
+                "{}:{}",
+                contribution.invocation_id, contribution.contribution_id
+            ),
+            next,
+            limits,
+            3,
+        )?;
+        if self
+            .contribution_sequences
+            .get(&key)
+            .is_some_and(|old| contribution.sequence <= *old)
+        {
+            return Ok(());
+        }
+        let fence_key = next.try_clone_string(&key, 2, limits)?;
+        next.try_add(
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                value_nodes: 1,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        self.contribution_sequences
+            .insert(fence_key, contribution.sequence);
+        let previous = self.contribution_placements.get(&key).copied();
+        let id = stage_contribution_id(contribution, placement, next, limits)?;
+        let previous_id = previous
+            .map(|previous| stage_contribution_id(contribution, previous, next, limits))
+            .transpose()?;
+        if contribution.operation == ToolContributionOperation::Remove {
+            self.snapshot.contributions.remove(&key);
+            self.contribution_placements.remove(&key);
+            if let Some(previous) = previous_id.as_ref() {
+                self.remove_owned_legacy_contribution_item(previous, &key);
+            }
+            if previous_id.as_ref() != Some(&id) {
+                self.remove_owned_legacy_contribution_item(&id, &key);
+            }
+        } else {
+            let stored_key = next.try_clone_string(&key, 3, limits)?;
+            let stored = clone_admitted(contribution, next, limits, |value| {
+                bcode_session_models::retention_events::inspect_tool_contribution(value, &limits)
+            })?;
+            next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            self.snapshot.contributions.insert(stored_key, stored);
+            let placement_key = next.try_clone_string(&key, 2, limits)?;
+            next.try_add(ObservationRetentionUsage::collection(1, 1), limits)?;
+            self.contribution_placements
+                .insert(placement_key, placement);
+            if let Some(previous) = previous_id
+                && previous != id
+            {
+                self.remove_legacy_contribution_item(&previous);
+            }
+            if placement == ToolContributionPlacement::Hidden {
+                self.remove_legacy_contribution_item(&id);
+            } else if placement == ToolContributionPlacement::Result
+                && self
+                    .snapshot
+                    .tools
+                    .get(&contribution.invocation_id)
+                    .is_some_and(|tool| is_terminal_tool_status(tool.status))
+            {
+                self.remove_owned_legacy_contribution_item(&id, &key);
+            } else {
+                self.project_contribution_bounded(
+                    (sequence, timestamp_ms),
+                    contribution,
+                    (placement, &key, id),
+                    next,
+                    limits,
+                )?;
+            }
+        }
+        self.bump_revision();
+        Ok(())
+    }
+
+    fn remove_draft_bounded(
+        &mut self,
+        event: &bcode_session_models::ToolRequestDraftEvent,
+        key: String,
+        reason: bcode_session_models::ToolRequestDraftTerminalReason,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_models::ToolRequestDraftTerminalReason;
+        let current = self
+            .tool_invocations
+            .get(&event.tool_call_id)
+            .and_then(|aggregate| aggregate.request_draft.as_ref());
+
+        let clear = reason != ToolRequestDraftTerminalReason::Completed
+            || current.is_some_and(|draft| event.generation > draft.generation);
+        let aggregate = self.tool_invocations.entry(key).or_default();
+        if clear {
+            aggregate.request_draft = None;
+        }
+        aggregate.terminal_request_draft =
+            Some((event.generation, event.revision.saturating_add(1)));
+        if reason != ToolRequestDraftTerminalReason::Completed
+            && aggregate.projection.started_at_ms.is_none()
+        {
+            self.snapshot.tools.remove(&event.tool_call_id);
+            let id = TranscriptViewItemId::new(format_observation_text(
+                format_args!("tool:{}", event.tool_call_id),
+                next,
+                limits,
+                5,
+            )?);
+            self.remove_transcript_item(&id);
+        } else {
+            self.rebuild_rich_tool_bounded(&event.tool_call_id, next, limits)?;
+        }
+        Ok(())
+    }
+    fn commit_draft_cache_bounded(
+        &mut self,
+        key: String,
+        draft: ToolRequestDraftView,
+        event: &bcode_session_models::ToolRequestDraftEvent,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let aggregate = self.tool_invocations.entry(key).or_default();
+        aggregate.terminal_request_draft = None;
+        aggregate.projection.tool_call_id =
+            next.try_clone_string(&event.tool_call_id, 4, limits)?;
+        if !aggregate.request_assembled {
+            aggregate.projection.producer_plugin_id = event
+                .producer_plugin_id
+                .as_ref()
+                .map(|id| next.try_clone_string(id, 4, limits))
+                .transpose()?;
+            aggregate.projection.tool_name =
+                Some(next.try_clone_string(&event.tool_name, 4, limits)?);
+            aggregate.projection.arguments_json =
+                Some(next.try_clone_string(&draft.preview, 4, limits)?);
+        }
+        aggregate.request_draft = Some(draft);
+
+        Ok(())
+    }
+
+    fn refresh_draft_placement_bounded(
+        &mut self,
+        event: &bcode_session_models::ToolRequestDraftEvent,
+        previous_placement: Option<bcode_session_models::ToolContributionPlacement>,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_models::ToolContributionPlacement;
+        if previous_placement.is_some_and(|previous| previous != event.placement) {
+            let id = stage_draft_placement_id(
+                &event.tool_call_id,
+                previous_placement.expect("checked placement"),
+                next,
+                limits,
+            )?;
+            self.remove_transcript_item(&id);
+        }
+        self.rebuild_rich_tool_bounded(&event.tool_call_id, next, limits)?;
+        // Drafts do not override contribution precedence in the legacy primary projection.
+        self.refresh_rich_legacy_bounded(&event.tool_call_id, event.placement, next, limits)?;
+        let id = stage_draft_placement_id(
+            &event.tool_call_id,
+            ToolContributionPlacement::Request,
+            next,
+            limits,
+        )?;
+        self.assign_stream_location_bounded(
+            &id,
+            &event.turn_id,
+            event.output_position,
+            next,
+            limits,
+        )?;
+        Ok(())
+    }
+
+    fn reduce_draft_bounded(
+        &mut self,
+        event: &bcode_session_models::ToolRequestDraftEvent,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_models::{ToolContributionPlacement, ToolRequestDraftOperation};
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let old = self.tool_invocations.get(&event.tool_call_id);
+        if old.is_some_and(|aggregate| {
+            aggregate.is_terminal()
+                || aggregate.drafts_terminal
+                || (aggregate.request_assembled
+                    && event.placement == ToolContributionPlacement::Request)
+        }) {
+            return Ok(());
+        }
+        let terminal = matches!(event.operation, ToolRequestDraftOperation::Remove { .. });
+        let current = old.and_then(|aggregate| aggregate.request_draft.as_ref());
+        if old
+            .and_then(|aggregate| aggregate.terminal_request_draft)
+            .is_some_and(|(generation, revision)| {
+                event.generation < generation
+                    || (event.generation == generation && event.revision <= revision)
+            })
+            || current.is_some_and(|draft| {
+                event.generation < draft.generation
+                    || (event.generation == draft.generation
+                        && (event.revision < draft.revision
+                            || (event.revision == draft.revision
+                                && !(terminal && event.revision == u64::MAX))))
+            })
+        {
+            return Ok(());
+        }
+        let key = next.try_clone_string(&event.tool_call_id, 2, limits)?;
+        next.try_add(
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                value_nodes: 7,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        if let ToolRequestDraftOperation::Remove { reason } = event.operation {
+            self.remove_draft_bounded(event, key, reason, next, limits)?;
+            let id = stage_draft_placement_id(
+                &event.tool_call_id,
+                ToolContributionPlacement::Request,
+                next,
+                limits,
+            )?;
+            return self.assign_stream_location_bounded(
+                &id,
+                &event.turn_id,
+                event.output_position,
+                next,
+                limits,
+            );
+        }
+        let previous_placement = current.map(|draft| draft.placement);
+        let mut draft = Self::stage_draft_seed(current, event, next, limits)?;
+        match &event.operation {
+            ToolRequestDraftOperation::Append { offset, text } => {
+                if *offset
+                    != draft
+                        .preview_start_offset
+                        .saturating_add(draft.preview.len())
+                {
+                    return Ok(());
+                }
+                append_observation_text(&mut draft.preview, text, Some((next, limits)))?;
+            }
+            ToolRequestDraftOperation::Checkpoint { start_offset, text } => {
+                draft.preview_start_offset = *start_offset;
+                draft.preview = next.try_clone_string(text, 4, limits)?;
+            }
+            ToolRequestDraftOperation::Remove { .. } => unreachable!(),
+        }
+        Self::update_draft_metadata(&mut draft, event, next, limits)?;
+        self.commit_draft_cache_bounded(key, draft, event, next, limits)?;
+        self.refresh_draft_placement_bounded(event, previous_placement, next, limits)
+    }
+
+    fn rebuild_rich_tool_bounded(
+        &mut self,
+        id: &str,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        self.build_rich_tool_bounded(id, next, limits)?;
+        self.refresh_rich_tool_bounded(id, next, limits)
+    }
+
+    fn build_rich_tool_bounded(
+        &mut self,
+        id: &str,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let Some(aggregate) = self.tool_invocations.get(id) else {
+            return Ok(());
+        };
+        let mut tool = stage_tool_view(&aggregate.projection, next, limits)?;
+        tool.request_draft = aggregate
+            .request_draft
+            .as_ref()
+            .map(|draft| {
+                clone_admitted(draft, next, limits, |value| {
+                    bcode_session_view_models::retention::inspect_tool_draft(value, limits)
+                })
+            })
+            .transpose()?;
+        if let Some(update) = aggregate
+            .presentations
+            .get(&bcode_tool::ToolPresentationIdentity::Primary)
+        {
+            let owned = clone_admitted(update, next, limits, |value| {
+                bcode_session_models::retention_events::inspect_tool_presentation(value, &limits)
+            })?;
+            tool.presentation = Some(bcode_session_view_models::ToolPresentationView {
+                producer_id: owned.producer_id,
+                generation: owned.generation,
+                revision: owned.revision,
+                retention: owned.retention,
+                schema: owned.schema,
+                schema_version: owned.schema_version,
+                artifact: owned.artifact,
+                payload: owned.payload,
+            });
+        }
+        if let Some(status) = aggregate.terminal_status {
+            tool.status = status;
+        }
+        let key = next.try_clone_string(id, 3, limits)?;
+        next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+        self.snapshot.tools.insert(key, tool);
+        Ok(())
+    }
+
+    fn refresh_rich_legacy_bounded(
+        &mut self,
+        id: &str,
+        placement: bcode_session_models::ToolContributionPlacement,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_models::ToolContributionPlacement;
+        if matches!(
+            placement,
+            ToolContributionPlacement::Hidden | ToolContributionPlacement::Supplemental
+        ) {
+            return Ok(());
+        }
+        for candidate in [
+            ToolContributionPlacement::Result,
+            ToolContributionPlacement::Progress,
+            ToolContributionPlacement::Request,
+        ] {
+            let latest = self
+                .snapshot
+                .contributions
+                .iter()
+                .filter(|(key, contribution)| {
+                    contribution.invocation_id == id
+                        && self.contribution_placements.get(*key) == Some(&candidate)
+                })
+                .max_by(|(left_key, left), (right_key, right)| {
+                    (left.sequence, left_key.as_str()).cmp(&(right.sequence, right_key.as_str()))
+                })
+                .map(|(_, value)| value);
+            if let Some(contribution) = latest {
+                let contribution = clone_admitted(contribution, next, limits, |value| {
+                    bcode_session_models::retention_events::inspect_tool_contribution(
+                        value, &limits,
+                    )
+                })?;
+                let invocation = self
+                    .snapshot
+                    .tools
+                    .get(id)
+                    .map(|tool| {
+                        clone_admitted(tool, next, limits, |value| {
+                            bcode_session_view_models::retention::inspect_tool(value, limits)
+                        })
+                        .map(Box::new)
+                    })
+                    .transpose()?;
+                let item_id = stage_contribution_id(&contribution, candidate, next, limits)?;
+                let streaming = contribution.persistence
+                    == bcode_session_models::ToolContributionPersistence::Transient
+                    || invocation.as_ref().is_some_and(|tool| {
+                        matches!(
+                            tool.status,
+                            ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                        )
+                    });
+                self.stage_rich_item_bounded(
+                    TranscriptViewItem {
+                        id: item_id,
+                        revision: 0,
+                        sequence: None,
+                        timestamp_ms: None,
+                        output_location: None,
+                        streaming,
+                        kind: TranscriptViewItemKind::ToolContribution {
+                            invocation,
+                            contribution,
+                            placement: candidate,
+                        },
+                    },
+                    next,
+                    limits,
+                )?;
+                return Ok(());
+            }
+        }
+        self.refresh_rich_tool_bounded(id, next, limits)
+    }
+
+    fn finish_rich_lifecycle_bounded(
+        &mut self,
+        id: &str,
+        status: ToolInvocationViewStatus,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        self.snapshot.active_invocations.remove(id);
+        self.snapshot.contributions.retain(|_, contribution| {
+            contribution.invocation_id != id
+                || contribution.persistence
+                    == bcode_session_models::ToolContributionPersistence::Durable
+        });
+        let prefix =
+            format_observation_text(format_args!("live-contribution:{id}:"), next, limits, 5)?;
+        let old_count = self.snapshot.transcript.items.len();
+        self.snapshot
+            .transcript
+            .items
+            .retain(|item| !item.id.get().starts_with(&prefix));
+        if old_count != self.snapshot.transcript.items.len() {
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        }
+        self.tool_invocations
+            .get_mut(id)
+            .ok_or(ObservationRetentionExceeded)?
+            .terminal_status = Some(status);
+        self.close_rich_scope_bounded(id, next, limits)?;
+        Ok(())
+    }
+    fn reduce_rich_lifecycle_bounded(
+        &mut self,
+        event: &SessionEvent,
+        id: &str,
+        lifecycle: &bcode_session_models::ToolInvocationLifecycleEvent,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_models::ToolInvocationLifecycleStage as Stage;
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let aggregate = self
+            .tool_invocations
+            .get_mut(id)
+            .ok_or(ObservationRetentionExceeded)?;
+
+        if aggregate.is_terminal() {
+            return Ok(());
+        }
+        match lifecycle.stage {
+            Stage::Started | Stage::Progress | Stage::Waiting => {
+                let key = next.try_clone_string(id, 3, limits)?;
+                let lifecycle = clone_admitted(lifecycle, next, limits, |value| {
+                    bcode_session_models::retention_events::inspect_tool_lifecycle(value, &limits)
+                })?;
+                next.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+                let render = aggregate.projection.tool_name.is_some();
+                self.snapshot.active_invocations.insert(key, lifecycle);
+                if render {
+                    self.rebuild_rich_tool_bounded(id, next, limits)?;
+                    self.stamp_rich_tool_bounded(
+                        id,
+                        event.sequence,
+                        Some(event.timestamp_ms),
+                        next,
+                        limits,
+                    )?;
+                }
+            }
+            Stage::Completed | Stage::Cancelled | Stage::Failed => {
+                let status = match lifecycle.stage {
+                    Stage::Completed => ToolInvocationViewStatus::Finished,
+                    Stage::Cancelled => ToolInvocationViewStatus::Cancelled,
+                    _ => ToolInvocationViewStatus::Failed,
+                };
+                let draft_only = aggregate.request_draft.is_some()
+                    && !aggregate.request_assembled
+                    && aggregate.projection.started_at_ms.is_none();
+                if status != ToolInvocationViewStatus::Finished {
+                    aggregate.request_draft = None;
+                    aggregate.terminal_status = Some(status);
+                }
+                if draft_only && status != ToolInvocationViewStatus::Finished {
+                    self.snapshot.tools.remove(id);
+                    let item_id = TranscriptViewItemId::new(format_observation_text(
+                        format_args!("tool:{id}"),
+                        next,
+                        limits,
+                        5,
+                    )?);
+                    self.remove_transcript_item(&item_id);
+                } else if status != ToolInvocationViewStatus::Finished {
+                    self.build_rich_tool_bounded(id, next, limits)?;
+                    if let Some(tool) = self.snapshot.tools.get_mut(id) {
+                        if status == ToolInvocationViewStatus::Failed {
+                            tool.is_error = Some(true);
+                        }
+                        if tool.result.is_none() && tool.result_text.is_none() {
+                            tool.result_text = lifecycle
+                                .message
+                                .as_ref()
+                                .map(|message| next.try_clone_string(message, 5, limits))
+                                .transpose()?;
+                        }
+                    }
+                    self.refresh_rich_tool_bounded(id, next, limits)?;
+                    self.stamp_rich_tool_bounded(
+                        id,
+                        event.sequence,
+                        Some(event.timestamp_ms),
+                        next,
+                        limits,
+                    )?;
+                } else if self
+                    .tool_invocations
+                    .get(id)
+                    .is_some_and(|aggregate| aggregate.projection.tool_name.is_some())
+                {
+                    self.build_rich_tool_bounded(id, next, limits)?;
+                    // Completion refreshes the canonical tool value without a
+                    // draft; the transcript retains the preview until result arrival.
+                    if let Some(tool) = self.snapshot.tools.get_mut(id) {
+                        tool.request_draft = None;
+                    }
+                    self.sync_rich_contributions_bounded(id, next, limits)?;
+                }
+                self.finish_rich_lifecycle_bounded(id, status, next, limits)?;
+            }
+        }
+
+        Ok(())
+    }
+    fn reduce_rich_result_bounded(
+        &mut self,
+        event: &SessionEvent,
+        id: &str,
+        record: &bcode_session_models::ToolInvocationResultRecord,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let aggregate = self
+            .tool_invocations
+            .get_mut(id)
+            .ok_or(ObservationRetentionExceeded)?;
+
+        if aggregate.is_terminal()
+            && self
+                .snapshot
+                .tools
+                .get(id)
+                .is_some_and(|tool| tool.result.is_some() || tool.result_text.is_some())
+        {
+            return Ok(());
+        }
+        if let Some(update) = &record.presentation
+            && update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+            && aggregate
+                .presentations
+                .get(&update.identity)
+                .is_none_or(|old| {
+                    (update.generation, update.revision) > (old.generation, old.revision)
+                })
+        {
+            let owned = clone_admitted(update, next, limits, |value| {
+                bcode_session_models::retention_events::inspect_tool_presentation(value, &limits)
+            })?;
+            let identity = match &update.identity {
+                bcode_tool::ToolPresentationIdentity::Primary => {
+                    bcode_tool::ToolPresentationIdentity::Primary
+                }
+                bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+                    bcode_tool::ToolPresentationIdentity::Supplemental {
+                        item_id: next.try_clone_string(item_id, 4, limits)?,
+                    }
+                }
+            };
+            next.try_add(ObservationRetentionUsage::collection(1, 3), limits)?;
+            aggregate.presentations.insert(identity, owned);
+        }
+        aggregate.terminal_status.get_or_insert(if record.is_error {
+            ToolInvocationViewStatus::Failed
+        } else {
+            ToolInvocationViewStatus::Finished
+        });
+        self.close_rich_scope_bounded(id, next, limits)?;
+        self.snapshot.active_invocations.remove(id);
+        self.rebuild_rich_tool_bounded(id, next, limits)?;
+        self.stamp_rich_tool_bounded(id, event.sequence, Some(event.timestamp_ms), next, limits)?;
+
+        Ok(())
+    }
+    fn reduce_rich_tool_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let id = tool_invocation_id(event).ok_or(ObservationRetentionExceeded)?;
+        let projection =
+            stage_tool_projection(event, id, self.tool_invocations.get(id), next, limits)?;
+        let key = next.try_clone_string(id, 2, limits)?;
+        next.try_add(
+            ObservationRetentionUsage {
+                collection_entries: 1,
+                value_nodes: 7,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let aggregate = self.tool_invocations.entry(key).or_default();
+        aggregate.projection = projection;
+        match &event.kind {
+            SessionEventKind::ToolCallRequested { .. }
+            | SessionEventKind::PositionedToolCallRequested { .. } => {
+                aggregate.request_assembled = true;
+                if aggregate.request_draft.as_ref().is_some_and(|draft| {
+                    draft.placement == bcode_session_models::ToolContributionPlacement::Request
+                }) {
+                    aggregate.request_draft = None;
+                }
+                aggregate.terminal_request_draft = None;
+                self.rebuild_rich_tool_bounded(id, next, limits)?;
+                self.sync_rich_contributions_bounded(id, next, limits)?;
+                self.stamp_rich_tool_bounded(
+                    id,
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    next,
+                    limits,
+                )?;
+                if let SessionEventKind::PositionedToolCallRequested {
+                    turn_id,
+                    output_position,
+                    ..
+                } = &event.kind
+                {
+                    let item_id = TranscriptViewItemId::new(format_observation_text(
+                        format_args!("tool:{id}"),
+                        next,
+                        limits,
+                        5,
+                    )?);
+                    self.assign_stream_location_bounded(
+                        &item_id,
+                        turn_id,
+                        Some(*output_position),
+                        next,
+                        limits,
+                    )?;
+                }
+            }
+            SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
+                self.reduce_rich_lifecycle_bounded(event, id, lifecycle, next, limits)?;
+            }
+            SessionEventKind::ToolInvocationResultRecorded { record } => {
+                self.reduce_rich_result_bounded(event, id, record, next, limits)?;
+            }
+            _ => return Err(ObservationRetentionExceeded),
+        }
+        if matches!(event.kind, SessionEventKind::ToolInvocationLifecycle { .. }) {
+            self.bump_revision();
+        }
+        Ok(())
+    }
+
+    fn stamp_rich_tool_bounded(
+        &mut self,
+        id: &str,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let item_id = format_observation_text(format_args!("tool:{id}"), next, limits, 5)?;
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id.get() == item_id)
+        {
+            item.sequence = (sequence != 0).then_some(sequence).or(item.sequence);
+            item.timestamp_ms = timestamp_ms.or(item.timestamp_ms);
+        }
+        Ok(())
+    }
+
+    fn close_rich_scope_bounded(
+        &mut self,
+        id: &str,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let Some(aggregate) = self.tool_invocations.get_mut(id) else {
+            return Ok(());
+        };
+        aggregate.presentation_scope.close();
+        let mut removed = false;
+        for (identity, update) in &aggregate.presentations {
+            if update.retention != bcode_tool::ToolPresentationRetention::ActiveOnly {
+                continue;
+            }
+            if let bcode_tool::ToolPresentationIdentity::Supplemental { item_id } = identity {
+                let item_id = format_observation_text(
+                    format_args!("tool:{id}:supplemental:{item_id}"),
+                    next,
+                    limits,
+                    5,
+                )?;
+                let old = self.snapshot.transcript.items.len();
+                self.snapshot
+                    .transcript
+                    .items
+                    .retain(|item| item.id.get() != item_id);
+                removed |= old != self.snapshot.transcript.items.len();
+            }
+        }
+        aggregate.presentations.retain(|_, update| {
+            update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+        });
+        if removed {
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn rich_tool_checkpoint_usage(
+        &self,
+        id: &str,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let mut usage = self.inspect_tool_aggregates(Some(id), limits)?;
+        for (key, value) in &self.snapshot.tools {
+            if key != id {
+                continue;
+            }
+            usage.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            usage.try_add(ObservationRetentionUsage::string(key, 3), limits)?;
+            let mut nested = bcode_session_view_models::retention::inspect_tool(value, limits)?;
+            nested.depth += 2;
+            usage.try_add(nested, limits)?;
+        }
+        for (key, value) in &self.snapshot.active_invocations {
+            if key != id {
+                continue;
+            }
+            usage.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            usage.try_add(ObservationRetentionUsage::string(key, 3), limits)?;
+            let mut nested =
+                bcode_session_models::retention_events::inspect_tool_lifecycle(value, &limits)?;
+            nested.depth += 2;
+            usage.try_add(nested, limits)?;
+        }
+        for (key, value) in &self.snapshot.contributions {
+            if value.invocation_id != id {
+                continue;
+            }
+            usage.try_add(ObservationRetentionUsage::collection(1, 2), limits)?;
+            usage.try_add(ObservationRetentionUsage::string(key, 3), limits)?;
+            let mut nested =
+                bcode_session_models::retention_events::inspect_tool_contribution(value, &limits)?;
+            nested.depth += 2;
+            usage.try_add(nested, limits)?;
+        }
+        for (key, value) in &self.tool_item_ids {
+            if key != id {
+                continue;
+            }
+            usage.try_add(ObservationRetentionUsage::collection(1, 1), limits)?;
+            usage.try_add(ObservationRetentionUsage::string(key, 2), limits)?;
+            usage.try_add(value.retention_usage(2), limits)?;
+        }
+        for key in self.contribution_sequences.keys() {
+            if !rich_tool_owns_key(key, id) {
+                continue;
+            }
+            usage.try_add(ObservationRetentionUsage::collection(1, 1), limits)?;
+            usage.try_add(ObservationRetentionUsage::string(key, 2), limits)?;
+            usage.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 1,
+                    depth: 2,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        for key in self.contribution_placements.keys() {
+            if !rich_tool_owns_key(key, id) {
+                continue;
+            }
+            usage.try_add(ObservationRetentionUsage::collection(1, 1), limits)?;
+            usage.try_add(ObservationRetentionUsage::string(key, 2), limits)?;
+            usage.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 1,
+                    depth: 2,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        Ok(usage)
+    }
+
+    fn take_rich_tool_checkpoint(&mut self, id: &str) -> RichToolCheckpoint {
+        RichToolCheckpoint {
+            tools: checkpoint_tool_map(&mut self.snapshot.tools, |key, _| key == id),
+            active_invocations: checkpoint_tool_map(
+                &mut self.snapshot.active_invocations,
+                |key, _| key == id,
+            ),
+            contributions: checkpoint_tool_map(&mut self.snapshot.contributions, |_, value| {
+                value.invocation_id == id
+            }),
+            tool_item_ids: checkpoint_tool_map(&mut self.tool_item_ids, |key, _| key == id),
+            tool_invocations: checkpoint_tool_map(&mut self.tool_invocations, |key, _| key == id),
+            contribution_sequences: checkpoint_tool_map(
+                &mut self.contribution_sequences,
+                |key, _| rich_tool_owns_key(key, id),
+            ),
+            contribution_placements: checkpoint_tool_map(
+                &mut self.contribution_placements,
+                |key, _| rich_tool_owns_key(key, id),
+            ),
+        }
+    }
+
+    fn restore_rich_tool_checkpoint(&mut self, id: &str, checkpoint: RichToolCheckpoint) {
+        self.snapshot.tools.retain(|key, _| key != id);
+        self.snapshot.tools.extend(checkpoint.tools);
+        self.snapshot.active_invocations.retain(|key, _| key != id);
+        self.snapshot
+            .active_invocations
+            .extend(checkpoint.active_invocations);
+        self.snapshot
+            .contributions
+            .retain(|_, value| value.invocation_id != id);
+        self.snapshot.contributions.extend(checkpoint.contributions);
+        self.tool_item_ids.retain(|key, _| key != id);
+        self.tool_item_ids.extend(checkpoint.tool_item_ids);
+        self.tool_invocations.retain(|key, _| key != id);
+        self.tool_invocations.extend(checkpoint.tool_invocations);
+        self.contribution_sequences
+            .retain(|key, _| !rich_tool_owns_key(key, id));
+        self.contribution_sequences
+            .extend(checkpoint.contribution_sequences);
+        self.contribution_placements
+            .retain(|key, _| !rich_tool_owns_key(key, id));
+        self.contribution_placements
+            .extend(checkpoint.contribution_placements);
+    }
+
+    fn rich_tool_checkpoint_unchanged(
+        &self,
+        id: &str,
+        checkpoint: &RichToolCheckpoint,
+        copies: &[(usize, TranscriptViewItem)],
+        metadata: (u64, u64, Option<SessionId>, Option<u64>),
+    ) -> bool {
+        metadata
+            == (
+                self.snapshot.revision,
+                self.snapshot.transcript.revision,
+                self.snapshot.session_id,
+                self.snapshot.latest_sequence,
+            )
+            && checkpoint_matches(&self.snapshot.tools, &checkpoint.tools, |key, _| key == id)
+            && checkpoint_matches(
+                &self.snapshot.active_invocations,
+                &checkpoint.active_invocations,
+                |key, _| key == id,
+            )
+            && checkpoint_matches(
+                &self.snapshot.contributions,
+                &checkpoint.contributions,
+                |_, value| value.invocation_id == id,
+            )
+            && checkpoint_matches(&self.tool_item_ids, &checkpoint.tool_item_ids, |key, _| {
+                key == id
+            })
+            && checkpoint_matches(
+                &self.tool_invocations,
+                &checkpoint.tool_invocations,
+                |key, _| key == id,
+            )
+            && checkpoint_matches(
+                &self.contribution_sequences,
+                &checkpoint.contribution_sequences,
+                |key, _| rich_tool_owns_key(key, id),
+            )
+            && checkpoint_matches(
+                &self.contribution_placements,
+                &checkpoint.contribution_placements,
+                |key, _| rich_tool_owns_key(key, id),
+            )
+            && copies
+                .iter()
+                .all(|(index, item)| self.snapshot.transcript.items.get(*index) == Some(item))
+            && self
+                .snapshot
+                .transcript
+                .items
+                .iter()
+                .filter(|item| rich_tool_owns_item(item, id))
+                .count()
+                == copies.len()
+    }
+
+    fn rollback_rich_tool(
+        &mut self,
+        id: &str,
+        checkpoint: RichToolCheckpoint,
+        transcript: (Vec<(usize, TranscriptViewItem)>, Vec<TranscriptViewItem>),
+        metadata: (u64, u64, Option<SessionId>, Option<u64>),
+    ) {
+        let (copies, mut old_buffer) = transcript;
+        self.restore_rich_tool_checkpoint(id, checkpoint);
+        self.snapshot
+            .transcript
+            .items
+            .retain(|item| !rich_tool_owns_item(item, id));
+        let mut unchanged = self.snapshot.transcript.items.drain(..);
+        let mut originals = copies.into_iter().peekable();
+        let mut index = 0;
+        while originals.peek().is_some() || unchanged.len() != 0 {
+            if originals
+                .peek()
+                .is_some_and(|(position, _)| *position == index)
+            {
+                old_buffer.push(originals.next().expect("peeked original").1);
+            } else if let Some(item) = unchanged.next() {
+                old_buffer.push(item);
+            }
+            index += 1;
+        }
+        drop(unchanged);
+        self.snapshot.transcript.items = old_buffer;
+        (
+            self.snapshot.revision,
+            self.snapshot.transcript.revision,
+            self.snapshot.session_id,
+            self.snapshot.latest_sequence,
+        ) = metadata;
+    }
+
+    fn transact_rich_tool_bounded(
+        &mut self,
+        id: &str,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+        reduce: impl FnOnce(
+            &mut Self,
+            &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        ) -> Result<
+            (),
+            bcode_session_view_models::retention::ObservationRetentionExceeded,
+        >,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let source = self.observation_retention_usage(limits)?;
+        let mut peak = *retained;
+        peak.try_add(self.rich_tool_checkpoint_usage(id, limits)?, limits)?;
+        let count = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .filter(|item| rich_tool_owns_item(item, id))
+            .count();
+        peak.try_add(
+            ObservationRetentionUsage {
+                collection_entries: count,
+                value_nodes: count,
+                depth: 2,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        peak.try_add(
+            ObservationRetentionUsage::collection(self.snapshot.transcript.items.capacity(), 3),
+            limits,
+        )?;
+        for item in &self.snapshot.transcript.items {
+            if rich_tool_owns_item(item, id) {
+                let mut charge =
+                    bcode_session_view_models::retention::inspect_transcript_item(item, limits)?;
+                charge.depth += 3;
+                peak.try_add(charge, limits)?;
+            }
+        }
+        let mut copies = Vec::with_capacity(count);
+        if copies.capacity() != count {
+            return Err(ObservationRetentionExceeded);
+        }
+        let original = Vec::with_capacity(self.snapshot.transcript.items.capacity());
+        if original.capacity() != self.snapshot.transcript.items.capacity() {
+            return Err(ObservationRetentionExceeded);
+        }
+        let mut old_buffer = std::mem::replace(&mut self.snapshot.transcript.items, original);
+        while let Some(item) = old_buffer.pop() {
+            let index = old_buffer.len();
+            if rich_tool_owns_item(&item, id) {
+                self.snapshot.transcript.items.push(item.clone());
+                copies.push((index, item));
+            } else {
+                self.snapshot.transcript.items.push(item);
+            }
+        }
+        self.snapshot.transcript.items.reverse();
+        copies.reverse();
+        let checkpoint = self.take_rich_tool_checkpoint(id);
+        let metadata = (
+            self.snapshot.revision,
+            self.snapshot.transcript.revision,
+            self.snapshot.session_id,
+            self.snapshot.latest_sequence,
+        );
+        let reduced = reduce(self, &mut peak);
+        let unchanged = reduced.is_ok()
+            && self.rich_tool_checkpoint_unchanged(id, &checkpoint, &copies, metadata);
+        let result = reduced.and_then(|()| {
+            let actual = self.observation_retention_usage(limits)?;
+            reconcile_clone_capacity(peak, actual)?;
+            let mut committed = *retained;
+            committed.try_release(source)?;
+            committed.try_add(actual, limits)?;
+            Ok(committed)
+        });
+        match result {
+            Ok(committed) if !unchanged => {
+                *retained = committed;
+                Ok(())
+            }
+            outcome => {
+                self.rollback_rich_tool(id, checkpoint, (copies, old_buffer), metadata);
+                outcome.map(|_| ())
+            }
+        }
+    }
+
+    fn apply_rich_durable_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let id = match &event.kind {
+            SessionEventKind::ToolContribution { event } => event.invocation_id.as_str(),
+            SessionEventKind::ToolContributionPlaced { envelope } => {
+                envelope.contribution.invocation_id.as_str()
+            }
+            _ => tool_invocation_id(event)
+                .ok_or(bcode_session_view_models::retention::ObservationRetentionExceeded)?,
+        };
+        self.transact_rich_tool_bounded(id, retained, limits, |view, peak| {
+            match &event.kind {
+                SessionEventKind::ToolContribution {
+                    event: contribution,
+                } => view.reduce_contribution_bounded(
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    contribution,
+                    bcode_session_models::ToolContributionPlacement::Hidden,
+                    peak,
+                    limits,
+                )?,
+                SessionEventKind::ToolContributionPlaced { envelope } => view
+                    .reduce_contribution_bounded(
+                        event.sequence,
+                        Some(event.timestamp_ms),
+                        &envelope.contribution,
+                        envelope.placement,
+                        peak,
+                        limits,
+                    )?,
+                _ => view.reduce_rich_tool_event_bounded(event, peak, limits)?,
+            }
+            view.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                view.snapshot.latest_sequence = Some(event.sequence);
+            }
+            Ok(())
+        })
+    }
+
+    fn apply_rich_live_bounded(
+        &mut self,
+        event: &SessionLiveEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let id = match &event.kind {
+            SessionLiveEventKind::ToolPresentationUpdated { update } => {
+                update.invocation_id.as_str()
+            }
+            SessionLiveEventKind::ToolContributionPlaced { envelope } => {
+                envelope.contribution.invocation_id.as_str()
+            }
+            SessionLiveEventKind::ToolRequestDraft { event } => event.tool_call_id.as_str(),
+            _ => return Err(bcode_session_view_models::retention::ObservationRetentionExceeded),
+        };
+        self.transact_rich_tool_bounded(id, retained, limits, |view, peak| {
+            match &event.kind {
+                SessionLiveEventKind::ToolPresentationUpdated { update } => {
+                    view.reduce_presentation_bounded(update, peak, limits)?;
+                }
+                SessionLiveEventKind::ToolContributionPlaced { envelope } => view
+                    .reduce_contribution_bounded(
+                        0,
+                        None,
+                        &envelope.contribution,
+                        envelope.placement,
+                        peak,
+                        limits,
+                    )?,
+                SessionLiveEventKind::ToolRequestDraft { event } => {
+                    view.reduce_draft_bounded(event, peak, limits)?;
+                }
+                _ => {
+                    return Err(bcode_session_view_models::retention::ObservationRetentionExceeded);
+                }
+            }
+            view.snapshot.session_id = Some(event.session_id);
+            Ok(())
+        })
+    }
+
+    fn apply_provider_progress_bounded(
+        &mut self,
+        event: &SessionLiveEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let SessionLiveEventKind::ProviderStreamProgress {
+            turn_id,
+            event: progress,
+        } = &event.kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        let mut old = ObservationRetentionUsage::default();
+        if let Some(progress) = &self.snapshot.runtime.provider_progress {
+            let ProviderProgressView {
+                turn_id,
+                detail,
+                retry_at_unix: _,
+            } = progress;
+            old.try_add(ObservationRetentionUsage::string(turn_id, 4), limits)?;
+            old.try_add(ObservationRetentionUsage::string(detail, 4), limits)?;
+            old.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 2,
+                    depth: 3,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+        }
+        let mut next = *retained;
+        next.try_add(
+            ObservationRetentionUsage {
+                value_nodes: 2,
+                depth: 3,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        let detail = provider_progress_detail_bounded(progress, &mut next, limits)?;
+        let turn_id = next.try_clone_string(turn_id, 4, limits)?;
+        next.try_release(old)?;
+        let retry_at_unix = match progress {
+            bcode_session_models::ProviderStreamEvent::RetryScheduled { retry_at_unix, .. } => {
+                Some(*retry_at_unix)
+            }
+            _ => None,
+        };
+        let old_progress = self
+            .snapshot
+            .runtime
+            .provider_progress
+            .replace(ProviderProgressView {
+                turn_id,
+                detail,
+                retry_at_unix,
+            });
+        drop(old_progress);
+        self.bump_revision();
+        *retained = next;
+        Ok(())
+    }
+    fn apply_live_event_group_bounded(
+        &mut self,
+        event: &SessionLiveEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        if let SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } = &event.kind {
+            return self.apply_paced_delta_bounded(turn_id, None, text, retained, limits);
+        }
+        if matches!(
+            event.kind,
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. }
+        ) {
+            return self.apply_reasoning_stream_bounded(event, retained, limits);
+        }
+        if matches!(
+            &event.kind,
+            SessionLiveEventKind::ToolPresentationUpdated { .. }
+                | SessionLiveEventKind::ToolContributionPlaced { .. }
+                | SessionLiveEventKind::ToolRequestDraft { .. }
+        ) {
+            return self.apply_rich_live_bounded(event, retained, limits);
+        }
+        if let SessionLiveEventKind::AssistantReasoningActivity {
+            turn_id,
+            event: activity_event,
+            output_position,
+        } = &event.kind
+        {
+            return self.apply_live_reasoning_bounded(
+                event.session_id,
+                turn_id,
+                activity_event,
+                *output_position,
+                retained,
+                limits,
+            );
+        }
+        if let SessionLiveEventKind::AssistantTextStreamUpdated { .. } = &event.kind {
+            return self.apply_ordered_stream_bounded(event, retained, limits);
+        }
+        if let SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } = &event.kind {
+            return self.apply_context_occupancy_bounded(
+                occupancy.as_ref().as_ref(),
+                retained,
+                limits,
+            );
+        }
+        if let SessionLiveEventKind::AssistantTextDelta {
+            turn_id,
+            segment_id,
+            text,
+            ..
+        } = &event.kind
+        {
+            return self.apply_assistant_delta_bounded(turn_id, segment_id, text, retained, limits);
+        }
+        self.apply_provider_progress_bounded(event, retained, limits)
+    }
+
+    fn apply_request_context_bounded(
+        &mut self,
+        event: &SessionEvent,
+        observation: &bcode_session_models::RequestContextObservation,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        let current = self.snapshot.runtime.context_occupancy.as_ref();
+        let identity = (observation.request.context_epoch, event.sequence);
+        if current.is_some_and(|current| {
+            identity < (current.context_epoch, current.observation_sequence)
+                || (identity == (current.context_epoch, current.observation_sequence)
+                    && current.observation == *observation)
+        }) {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        }
+        // Inspect the borrowed durable graph before cloning any nested request strings.
+        // Its envelope conservatively covers the smaller occupancy wrapper as well.
+        let source_limits = bcode_session_models::SessionObservationSourceLimits {
+            max_scalar_capacity_bytes: limits.scalar_capacity_bytes,
+            max_collection_entries: limits.collection_entries,
+            max_value_nodes: limits.value_nodes,
+            max_depth: limits.depth,
+            max_queued_events: 1,
+            max_in_flight_events: 1,
+        };
+        let charged =
+            bcode_session_models::retention_events::inspect_durable(event, &source_limits)?;
+        let mut nested_charge = charged;
+        // Durable event envelope: seven event fields plus one variant node. The
+        // retained occupancy owns three envelope fields, not an event or queue copy.
+        nested_charge.value_nodes = nested_charge
+            .value_nodes
+            .checked_sub(5)
+            .ok_or(ObservationRetentionExceeded)?;
+        nested_charge.copies = 0;
+        nested_charge.depth = nested_charge
+            .depth
+            .checked_sub(1)
+            .ok_or(ObservationRetentionExceeded)?;
+        nested_charge.depth = nested_charge
+            .depth
+            .checked_add(3)
+            .ok_or(ObservationRetentionExceeded)?;
+        let mut next = *retained;
+        admit_view_phase(&mut next, nested_charge, limits, "context_envelope")?;
+        let staged = bcode_session_models::RequestContextOccupancy {
+            context_epoch: identity.0,
+            observation_sequence: identity.1,
+            observation: clone_context_observation_exact(observation),
+        };
+        let mut actual =
+            bcode_session_models::retention_events::inspect_context_occupancy(&staged, &limits)?;
+        actual.depth = actual
+            .depth
+            .checked_add(3)
+            .ok_or(ObservationRetentionExceeded)?;
+        reconcile_clone_capacity(nested_charge, actual)?;
+        next.try_release(nested_charge)?;
+        next.try_add(actual, limits)?;
+        if let Some(current) = current {
+            next.try_release(
+                bcode_session_models::retention_events::inspect_context_occupancy(
+                    current, &limits,
+                )?,
+            )?;
+        }
+        self.snapshot.runtime.context_occupancy = Some(staged);
+        self.bump_revision();
+        self.snapshot.session_id = Some(event.session_id);
+        if event.sequence != 0 {
+            self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn apply_context_occupancy_bounded(
+        &mut self,
+        occupancy: Option<&bcode_session_models::RequestContextOccupancy>,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::ObservationRetentionExceeded;
+        let current = self.snapshot.runtime.context_occupancy.as_ref();
+        if let (Some(current), Some(next)) = (current, occupancy)
+            && (next.context_epoch, next.observation_sequence)
+                < (current.context_epoch, current.observation_sequence)
+        {
+            return Ok(());
+        }
+        if current == occupancy {
+            return Ok(());
+        }
+        let mut next = *retained;
+        if let Some(value) = occupancy {
+            let mut charge =
+                bcode_session_models::retention_events::inspect_context_occupancy(value, &limits)?;
+            charge.depth = charge
+                .depth
+                .checked_add(3)
+                .ok_or(ObservationRetentionExceeded)?;
+            next.try_add(charge, limits)?;
+        }
+        // The owning inspector covers every nested scalar capacity. Clone only
+        // after the entire replacement graph is reserved while the old graph lives.
+        let staged = occupancy.map(clone_context_occupancy_exact);
+        if let Some(value) = current {
+            next.try_release(
+                bcode_session_models::retention_events::inspect_context_occupancy(value, &limits)?,
+            )?;
+        }
+        if let Some(value) = &staged {
+            // Capacity reconciliation cannot grant new admission after cloning.
+            let actual =
+                bcode_session_models::retention_events::inspect_context_occupancy(value, &limits)?;
+            let charged = bcode_session_models::retention_events::inspect_context_occupancy(
+                occupancy.ok_or(ObservationRetentionExceeded)?,
+                &limits,
+            )?;
+            if actual.scalar_capacity_bytes > charged.scalar_capacity_bytes
+                || actual.collection_entries > charged.collection_entries
+                || actual.value_nodes > charged.value_nodes
+            {
+                return Err(ObservationRetentionExceeded);
+            }
+            next.try_release(charged)?;
+            next.try_add(actual, limits)?;
+        }
+        drop(std::mem::replace(
+            &mut self.snapshot.runtime.context_occupancy,
+            staged,
+        ));
+        self.bump_revision();
+        *retained = next;
+        Ok(())
+    }
+
+    fn paced_delta_commit_usage(
+        &self,
+        transcript: (Option<usize>, Option<&TranscriptViewItem>, Option<usize>),
+        active: Option<&String>,
+        mut committed: bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<
+        bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionExceeded,
+    > {
+        use bcode_session_view_models::retention::ObservationRetentionUsage;
+        let (index, item, buffer) = transcript;
+        if let Some(index) = index {
+            committed.try_release(
+                bcode_session_view_models::retention::inspect_transcript_item(
+                    &self.snapshot.transcript.items[index],
+                    limits,
+                )?,
+            )?;
+        }
+        if let Some(item) = item {
+            let mut charge =
+                bcode_session_view_models::retention::inspect_transcript_item(item, limits)?;
+            charge.depth += 3;
+            committed.try_add(charge, limits)?;
+        }
+        if let Some(buffer) = buffer {
+            committed.try_release(ObservationRetentionUsage::collection(
+                self.snapshot.transcript.items.capacity(),
+                3,
+            ))?;
+            committed.try_add(ObservationRetentionUsage::collection(buffer, 3), limits)?;
+        }
+        if let Some(active) = active {
+            if let Some(old) = &self.snapshot.thinking.active_text {
+                committed.try_release(ObservationRetentionUsage::string(old, 4))?;
+            }
+            committed.try_add(ObservationRetentionUsage::string(active, 4), limits)?;
+        }
+        Ok(committed)
+    }
+
+    fn apply_paced_delta_bounded(
+        &mut self,
+        turn_id: &str,
+        segment_id: Option<&str>,
+        text: &str,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        let mut peak = *retained;
+        let id = TranscriptViewItemId::new(match segment_id {
+            Some(segment_id) => format_observation_text(
+                format_args!("assistant-turn:{turn_id}:segment:{segment_id}"),
+                &mut peak,
+                limits,
+                3,
+            )?,
+            None => format_observation_text(
+                format_args!("reasoning-turn:{turn_id}"),
+                &mut peak,
+                limits,
+                3,
+            )?,
+        });
+        let index = self.transcript_item_index(&id);
+        let (mut item, pending) = if self.streaming_presentation_policy.is_immediate() {
+            (
+                self.stage_ordered_stream_item(
+                    &id,
+                    index,
+                    Some(&bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: 0,
+                        text: peak.try_clone_string(text, 7, limits)?,
+                    }),
+                    &mut peak,
+                    limits,
+                )?,
+                None,
+            )
+        } else {
+            self.stage_paced_append_bounded((&id, turn_id, index), text, false, &mut peak, limits)?
+        };
+        if segment_id.is_none()
+            && let Some(item) = &mut item
+        {
+            let kind = std::mem::replace(
+                &mut item.kind,
+                TranscriptViewItemKind::ReasoningMessage {
+                    message: ChatMessageView::markdown(String::new()),
+                },
+            );
+            item.kind = match kind {
+                TranscriptViewItemKind::AssistantMessage { message }
+                | TranscriptViewItemKind::ReasoningMessage { message } => {
+                    TranscriptViewItemKind::ReasoningMessage { message }
+                }
+                _ => {
+                    return Err(bcode_session_view_models::retention::ObservationRetentionExceeded);
+                }
+            };
+        }
+        let active = segment_id
+            .is_none()
+            .then(|| peak.try_clone_string(text, 4, limits))
+            .transpose()?;
+        let buffer = stage_insert_buffer(
+            &self.snapshot.transcript.items,
+            index.is_none() && item.is_some(),
+            3,
+            &mut peak,
+            limits,
+        )?;
+        let mut committed = self.paced_delta_commit_usage(
+            (index, item.as_ref(), buffer.as_ref().map(Vec::capacity)),
+            active.as_ref(),
+            *retained,
+            limits,
+        )?;
+        self.account_pending_replacement(&mut committed, pending.as_ref(), limits)?;
+        reconcile_clone_capacity(peak, committed)?;
+        if let Some((key, value)) = pending {
+            self.pending_text_presentations.remove(&key);
+            if let Some(value) = value {
+                self.pending_text_presentations.insert(key, value);
+            }
+        }
+        if let Some(item) = item {
+            if let Some(index) = index {
+                let changed = self.snapshot.transcript.items[index] != item;
+                self.snapshot.transcript.items[index] = item;
+                if changed {
+                    self.snapshot.transcript.revision =
+                        self.snapshot.transcript.revision.saturating_add(1);
+                    self.bump_revision();
+                }
+            } else {
+                self.commit_system_message(item, buffer);
+                self.bump_revision();
+            }
+        }
+        if let Some(active) = active {
+            self.snapshot.thinking.active_text = Some(active);
+            self.snapshot.thinking.streaming = true;
+        }
+        *retained = committed;
+        Ok(())
+    }
+
+    fn replace_assistant_text_bounded(
+        &mut self,
+        index: usize,
+        target: String,
+        id: &TranscriptViewItemId,
+        next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        // Only the assistant text variant is owned by this group. A mismatched
+        // semantic item cannot be reinterpreted into a text item.
+        let TranscriptViewItemKind::AssistantMessage { message } =
+            &self.snapshot.transcript.items[index].kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        next.try_release(ObservationRetentionUsage::string(&message.text, 7))?;
+        next.try_release(id.retention_usage(5))?;
+        let changed = message.text != target;
+        let TranscriptViewItemKind::AssistantMessage { message } =
+            &mut self.snapshot.transcript.items[index].kind
+        else {
+            return Err(ObservationRetentionExceeded);
+        };
+        drop(std::mem::replace(&mut message.text, target));
+        if changed {
+            self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items[index]
+                .revision
+                .saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        }
+        Ok(())
+    }
+
+    fn apply_assistant_delta_bounded(
+        &mut self,
+        turn_id: &str,
+        segment_id: &str,
+        text: &str,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        if !self.streaming_presentation_policy.is_immediate() {
+            return self.apply_paced_delta_bounded(
+                turn_id,
+                Some(segment_id),
+                text,
+                retained,
+                limits,
+            );
+        }
+        let mut next = *retained;
+        let id_text = format_observation_text(
+            format_args!("assistant-turn:{turn_id}:segment:{segment_id}"),
+            &mut next,
+            limits,
+            5,
+        )?;
+        let id = TranscriptViewItemId::new(id_text);
+        if self.pending_text_presentations.contains_key(&id) {
+            return Err(ObservationRetentionExceeded);
+        }
+        let index = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == id);
+        let current = index
+            .and_then(|index| transcript_item_text(&self.snapshot.transcript.items[index]))
+            .unwrap_or_default();
+        let target = next.try_concat_string(current, text, 7, limits)?;
+        if let Some(index) = index {
+            self.replace_assistant_text_bounded(index, target, &id, &mut next)?;
+        } else {
+            next.try_add(
+                ObservationRetentionUsage {
+                    value_nodes: 11,
+                    depth: 7,
+                    ..ObservationRetentionUsage::default()
+                },
+                limits,
+            )?;
+            let new_len = self
+                .snapshot
+                .transcript
+                .items
+                .len()
+                .checked_add(1)
+                .ok_or(ObservationRetentionExceeded)?;
+            let mut replacement = stage_collection_growth(
+                self.snapshot.transcript.items.capacity(),
+                new_len,
+                3,
+                &mut next,
+                limits,
+            )?;
+            let item = TranscriptViewItem {
+                id,
+                revision: 0,
+                sequence: None,
+                timestamp_ms: None,
+                output_location: None,
+                streaming: true,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: ChatMessageView::markdown(target),
+                },
+            };
+            if let Some(mut replacement) = replacement.take() {
+                replacement.extend(std::mem::take(&mut self.snapshot.transcript.items));
+                replacement.push(item);
+                self.snapshot.transcript.items = replacement;
+            } else {
+                self.snapshot.transcript.items.push(item);
+            }
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        }
+        *retained = next;
+        Ok(())
+    }
+
     /// Apply one live-only session event.
     #[allow(clippy::too_many_lines)] // Exhaustive live-event routing remains explicit at the projection boundary.
     pub fn apply_live_event(&mut self, event: &SessionLiveEvent) {
+        self.apply_live_event_at(event, Instant::now());
+    }
+
+    fn apply_live_reasoning_update(&mut self, event: &SessionLiveEvent) {
+        let SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+            output_position,
+            turn_id,
+            activity_id,
+            activity_order,
+            part_id,
+            kind,
+            role,
+            part_order,
+            update,
+        } = &event.kind
+        else {
+            return;
+        };
+        self.apply_ordered_reasoning_update(
+            turn_id,
+            activity_id,
+            *activity_order,
+            part_id,
+            *kind,
+            *role,
+            *part_order,
+            update,
+        );
+        self.assign_output_location(
+            &TranscriptViewItemId::reasoning(turn_id, activity_id),
+            turn_id,
+            *output_position,
+        );
+    }
+
+    fn apply_assistant_text_delta(&mut self, turn_id: &str, segment_id: &str, text: &str) {
+        let id =
+            TranscriptViewItemId::new(format!("assistant-turn:{turn_id}:segment:{segment_id}"));
+        let mut target = self.accepted_presentation_target(&id);
+        target.push_str(text);
+        self.present_transcript_target(
+            id,
+            target,
+            turn_id,
+            StreamingMessageKind::Assistant,
+            Instant::now(),
+        );
+    }
+
+    fn apply_live_reasoning_delta(&mut self, turn_id: &str, text: &str) {
+        self.snapshot.thinking = ThinkingViewState {
+            visible: self.snapshot.thinking.visible,
+            mode: self.snapshot.thinking.mode,
+            active_text: Some(text.to_owned()),
+            streaming: true,
+        };
+        let id = TranscriptViewItemId::new(format!("reasoning-turn:{turn_id}"));
+        let mut target = self.accepted_presentation_target(&id);
+        target.push_str(text);
+        self.present_transcript_target(
+            id,
+            target,
+            turn_id,
+            StreamingMessageKind::Reasoning,
+            Instant::now(),
+        );
+    }
+
+    fn apply_live_event_at(&mut self, event: &SessionLiveEvent, received_at: Instant) {
         if matches!(event.kind, SessionLiveEventKind::UsageSummaryChanged { .. })
             && self
                 .snapshot
@@ -2632,7 +14899,7 @@ impl SessionView {
                 let id = TranscriptViewItemId::new(format!(
                     "assistant-turn:{turn_id}:segment:{segment_id}"
                 ));
-                self.apply_ordered_assistant_update(id.clone(), turn_id, update);
+                self.apply_ordered_assistant_update(id.clone(), turn_id, update, received_at);
                 self.assign_output_location(&id, turn_id, *output_position);
             }
             SessionLiveEventKind::AssistantTextDelta {
@@ -2641,63 +14908,13 @@ impl SessionView {
                 text,
                 ..
             } => {
-                let id = TranscriptViewItemId::new(format!(
-                    "assistant-turn:{turn_id}:segment:{segment_id}"
-                ));
-                let mut target = self.accepted_presentation_target(&id);
-                target.push_str(text);
-                self.present_transcript_target(
-                    id,
-                    target,
-                    turn_id,
-                    StreamingMessageKind::Assistant,
-                    Instant::now(),
-                );
+                self.apply_assistant_text_delta(turn_id, segment_id, text);
             }
-            SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
-                output_position,
-                turn_id,
-                activity_id,
-                activity_order,
-                part_id,
-                kind,
-                role,
-                part_order,
-                update,
-            } => {
-                self.apply_ordered_reasoning_update(
-                    turn_id,
-                    activity_id,
-                    *activity_order,
-                    part_id,
-                    *kind,
-                    *role,
-                    *part_order,
-                    update,
-                );
-                self.assign_output_location(
-                    &TranscriptViewItemId::reasoning(turn_id, activity_id),
-                    turn_id,
-                    *output_position,
-                );
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. } => {
+                self.apply_live_reasoning_update(event);
             }
             SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
-                self.snapshot.thinking = ThinkingViewState {
-                    visible: self.snapshot.thinking.visible,
-                    mode: self.snapshot.thinking.mode,
-                    active_text: Some(text.clone()),
-                    streaming: true,
-                };
-                let id = TranscriptViewItemId::new(format!("reasoning-turn:{turn_id}"));
-                let mut target = self.accepted_presentation_target(&id);
-                target.push_str(text);
-                self.present_transcript_target(
-                    id,
-                    target,
-                    turn_id,
-                    StreamingMessageKind::Reasoning,
-                    Instant::now(),
-                );
+                self.apply_live_reasoning_delta(turn_id, text);
             }
             SessionLiveEventKind::AssistantReasoningActivity {
                 output_position,
@@ -3592,16 +15809,22 @@ impl SessionView {
             .as_ref()
             != Some(&location);
         if location_changed {
-            self.snapshot.transcript.items[index].output_location = Some(location.clone());
+            self.snapshot.transcript.items[index].output_location = Some(location);
             self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items[index]
                 .revision
                 .saturating_add(1);
         }
 
+        self.reorder_output_item(index, location_changed);
+    }
+
+    fn reorder_output_item(&mut self, index: usize, location_changed: bool) {
         let mut ordered_index = index;
         while ordered_index > 0
             && output_location_precedes(
-                Some(&location),
+                self.snapshot.transcript.items[ordered_index]
+                    .output_location
+                    .as_ref(),
                 self.snapshot.transcript.items[ordered_index - 1]
                     .output_location
                     .as_ref(),
@@ -3618,7 +15841,9 @@ impl SessionView {
                 self.snapshot.transcript.items[ordered_index + 1]
                     .output_location
                     .as_ref(),
-                Some(&location),
+                self.snapshot.transcript.items[ordered_index]
+                    .output_location
+                    .as_ref(),
             )
         {
             self.snapshot
@@ -4320,6 +16545,7 @@ impl SessionView {
         id: TranscriptViewItemId,
         turn_id: &str,
         update: &bcode_session_models::TextStreamUpdate,
+        received_at: Instant,
     ) {
         use bcode_session_models::TextStreamOperation;
 
@@ -4350,78 +16576,36 @@ impl SessionView {
                 truncated: false,
                 status: TextStreamViewStatus::Healthy,
             });
-        if update.revision < state.revision {
-            return;
-        }
-        if update.revision == state.revision {
-            if self.last_text_stream_updates.get(&id) != Some(update) {
-                state.status = TextStreamViewStatus::Degraded;
+        let (accepted, degraded) =
+            advance_assistant_stream_state(state, update, self.last_text_stream_updates.get(&id));
+        if !accepted {
+            if degraded {
                 self.bump_revision();
             }
             return;
         }
-        let is_checkpoint = matches!(update.operation, TextStreamOperation::Checkpoint { .. });
-        if !is_checkpoint && update.first_revision != state.revision.saturating_add(1) {
-            state.status = TextStreamViewStatus::Degraded;
-            self.bump_revision();
-            return;
-        }
 
         match &update.operation {
-            TextStreamOperation::Append {
-                expected_offset,
-                text,
-            } => {
-                if !matches!(
-                    state.status,
-                    TextStreamViewStatus::Healthy | TextStreamViewStatus::Incomplete
-                ) || state.accepted_bytes != *expected_offset
-                {
-                    state.status = TextStreamViewStatus::Degraded;
-                    self.bump_revision();
-                    return;
-                }
-                state.revision = update.revision;
-                state.accepted_bytes = state.accepted_bytes.saturating_add(text.len());
+            TextStreamOperation::Append { text, .. } => {
                 self.last_text_stream_updates
                     .insert(id.clone(), update.clone());
-                accepted_target.push_str(text);
+                append_observation_text(&mut accepted_target, text, None)
+                    .expect("unrestricted text append cannot reject admission");
                 self.present_transcript_target(
                     id,
                     accepted_target,
                     turn_id,
                     StreamingMessageKind::Assistant,
-                    Instant::now(),
+                    received_at,
                 );
             }
-            TextStreamOperation::Checkpoint {
-                start_offset,
-                text,
-                total_bytes,
-                truncated,
-            } => {
-                if start_offset.saturating_add(text.len()) > *total_bytes {
-                    state.status = TextStreamViewStatus::Degraded;
-                    self.bump_revision();
-                    return;
-                }
-                state.generation = update.generation;
-                state.revision = update.revision;
-                state.accepted_bytes = *total_bytes;
-                state.truncated = *truncated || *start_offset != 0;
-                state.status = if state.truncated {
-                    TextStreamViewStatus::Incomplete
-                } else {
-                    TextStreamViewStatus::Healthy
-                };
+            TextStreamOperation::Checkpoint { text, .. } => {
                 self.last_text_stream_updates
                     .insert(id.clone(), update.clone());
                 self.pending_text_presentations.remove(&id);
                 self.replace_streaming_message_by_id(id, text);
             }
-            TextStreamOperation::Terminal { status } => {
-                state.revision = update.revision;
-                state.status = TextStreamViewStatus::Terminal(*status);
+            TextStreamOperation::Terminal { .. } => {
                 self.last_text_stream_updates
                     .insert(id.clone(), update.clone());
                 if let Some(item) = self
@@ -4896,6 +17080,95 @@ const fn provider_compaction_origin_label(
     }
 }
 
+struct ProviderBytes(usize);
+
+impl std::fmt::Display for ProviderBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const KIB: usize = 1024;
+        const MIB: usize = KIB * 1024;
+        let bytes = self.0;
+        if bytes >= MIB {
+            write!(
+                formatter,
+                "{}.{} MiB",
+                bytes / MIB,
+                (bytes % MIB) * 10 / MIB
+            )
+        } else if bytes >= KIB {
+            write!(
+                formatter,
+                "{}.{} KiB",
+                bytes / KIB,
+                (bytes % KIB) * 10 / KIB
+            )
+        } else {
+            write!(formatter, "{bytes} B")
+        }
+    }
+}
+
+fn provider_progress_detail_bounded(
+    event: &bcode_session_models::ProviderStreamEvent,
+    retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+    limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+) -> Result<String, bcode_session_view_models::retention::ObservationRetentionExceeded> {
+    use bcode_session_models::ProviderStreamEvent as Event;
+    match event {
+        Event::TurnStarted => {
+            format_observation_text(format_args!("provider stream started"), retained, limits, 4)
+        }
+        Event::ToolCallStarted { tool_name, .. } => format_observation_text(
+            format_args!("provider stream tool started: {tool_name}"),
+            retained,
+            limits,
+            4,
+        ),
+        Event::ToolCallFinished { tool_name, .. } => format_observation_text(
+            format_args!("provider stream tool finished: {tool_name}"),
+            retained,
+            limits,
+            4,
+        ),
+        Event::ToolCallProgress {
+            tool_name,
+            argument_bytes,
+            ..
+        } => format_observation_text(
+            format_args!(
+                "assembling {tool_name} arguments ({} received)",
+                ProviderBytes(*argument_bytes)
+            ),
+            retained,
+            limits,
+            4,
+        ),
+        Event::NoProgressWarning {
+            idle_seconds,
+            active_tool_call,
+        } => {
+            if let Some(tool) = active_tool_call {
+                format_observation_text(
+                    format_args!(
+                        "provider stream idle for {idle_seconds}s while assembling {}",
+                        tool.tool_name
+                    ),
+                    retained,
+                    limits,
+                    4,
+                )
+            } else {
+                format_observation_text(
+                    format_args!("provider stream idle for {idle_seconds}s"),
+                    retained,
+                    limits,
+                    4,
+                )
+            }
+        }
+        Event::RetryScheduled { message, .. } => retained.try_clone_string(message, 4, limits),
+    }
+}
+
 fn provider_progress_detail(event: &bcode_session_models::ProviderStreamEvent) -> String {
     match event {
         bcode_session_models::ProviderStreamEvent::TurnStarted => {
@@ -5089,11 +17362,25 @@ fn streaming_finish_target_mut(
 }
 
 fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
+    append_text_to_item_admitted(item, text, None)
+        .expect("unrestricted text append cannot reject admission");
+}
+
+fn append_text_to_item_admitted(
+    item: &mut TranscriptViewItem,
+    text: &str,
+    admission: Option<(
+        &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionLimits,
+    )>,
+) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
     match &mut item.kind {
         TranscriptViewItemKind::AssistantMessage { message }
         | TranscriptViewItemKind::ReasoningMessage { message }
         | TranscriptViewItemKind::UserMessage { message }
-        | TranscriptViewItemKind::SystemMessage { message } => message.text.push_str(text),
+        | TranscriptViewItemKind::SystemMessage { message } => {
+            append_observation_text(&mut message.text, text, admission)?;
+        }
         TranscriptViewItemKind::ReasoningActivity { .. }
         | TranscriptViewItemKind::ToolInvocation { .. }
         | TranscriptViewItemKind::ToolRequestDraft { .. }
@@ -5104,6 +17391,7 @@ fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::Interaction { .. }
         | TranscriptViewItemKind::ToolContribution { .. } => {}
     }
+    Ok(())
 }
 
 fn live_reasoning_activity_view(
@@ -5114,7 +17402,9 @@ fn live_reasoning_activity_view(
     mode: bcode_session_view_models::ReasoningDisplayMode,
 ) -> bcode_session_view_models::ReasoningActivityView {
     let mut parts = activity.parts.values().cloned().collect::<Vec<_>>();
-    parts.sort_by_key(|part| (part.order, part.kind, part.part_id.clone()));
+    parts.sort_unstable_by(|left, right| {
+        (left.order, left.kind, &left.part_id).cmp(&(right.order, right.kind, &right.part_id))
+    });
     let had_readable_parts = parts.iter().any(|part| !part.text.is_empty());
     if visible {
         parts.retain(|part| reasoning_part_selected(part.kind, mode));
@@ -5162,8 +17452,34 @@ fn reasoning_activity_view(
     visible: bool,
     mode: bcode_session_view_models::ReasoningDisplayMode,
 ) -> bcode_session_view_models::ReasoningActivityView {
-    let mut parts = activity.parts.clone();
-    parts.sort_by_key(|part| (part.order, part.kind, part.part_id.clone()));
+    reasoning_activity_view_owned(turn_id.to_owned(), activity.clone(), visible, mode)
+}
+
+fn reasoning_activity_view_owned(
+    turn_id: String,
+    activity: bcode_session_models::ReasoningActivity,
+    visible: bool,
+    mode: bcode_session_view_models::ReasoningDisplayMode,
+) -> bcode_session_view_models::ReasoningActivityView {
+    let mut parts = activity.parts;
+    // Stable insertion ordering needs no auxiliary allocation.
+    for index in 1..parts.len() {
+        let mut cursor = index;
+        while cursor > 0
+            && (
+                parts[cursor].order,
+                parts[cursor].kind,
+                &parts[cursor].part_id,
+            ) < (
+                parts[cursor - 1].order,
+                parts[cursor - 1].kind,
+                &parts[cursor - 1].part_id,
+            )
+        {
+            parts.swap(cursor - 1, cursor);
+            cursor -= 1;
+        }
+    }
     let had_readable_parts = parts.iter().any(|part| !part.text.is_empty());
     if visible {
         parts.retain(|part| reasoning_part_selected(part.kind, mode));
@@ -5173,8 +17489,8 @@ fn reasoning_activity_view(
     let readable_parts_filtered =
         had_readable_parts && !parts.iter().any(|part| !part.text.is_empty());
     bcode_session_view_models::ReasoningActivityView {
-        turn_id: turn_id.to_owned(),
-        activity_id: activity.activity_id.clone(),
+        turn_id,
+        activity_id: activity.activity_id,
         order: activity.order,
         status: activity.status,
         parts,
@@ -5224,16 +17540,46 @@ const fn transcript_item_text(item: &TranscriptViewItem) -> Option<&str> {
 }
 
 fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) -> bool {
+    replace_text_in_item_admitted(item, text, None)
+        .expect("unrestricted scalar replacement cannot reject admission")
+}
+
+fn replace_text_in_item_admitted(
+    item: &mut TranscriptViewItem,
+    text: &str,
+    admission: Option<(
+        &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        bcode_session_view_models::retention::ObservationRetentionLimits,
+    )>,
+) -> Result<bool, bcode_session_view_models::retention::ObservationRetentionExceeded> {
     match &mut item.kind {
         TranscriptViewItemKind::AssistantMessage { message }
         | TranscriptViewItemKind::ReasoningMessage { message }
         | TranscriptViewItemKind::UserMessage { message }
         | TranscriptViewItemKind::SystemMessage { message } => {
             if message.text == text {
-                false
+                Ok(false)
             } else {
-                text.clone_into(&mut message.text);
-                true
+                if let Some((usage, limits)) = admission {
+                    let staged = usage.try_clone_string(text, 1, limits)?;
+                    let old =
+                        bcode_session_view_models::retention::ObservationRetentionUsage::string(
+                            &message.text,
+                            1,
+                        );
+                    if let Err(error) = usage.try_release(old) {
+                        usage.try_release(
+                            bcode_session_view_models::retention::ObservationRetentionUsage::string(
+                                &staged, 1,
+                            ),
+                        )?;
+                        return Err(error);
+                    }
+                    message.text = staged;
+                } else {
+                    text.clone_into(&mut message.text);
+                }
+                Ok(true)
             }
         }
         TranscriptViewItemKind::ReasoningActivity { .. }
@@ -5244,7 +17590,7 @@ fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) -> bool {
         | TranscriptViewItemKind::Compaction { .. }
         | TranscriptViewItemKind::Skill { .. }
         | TranscriptViewItemKind::Interaction { .. }
-        | TranscriptViewItemKind::ToolContribution { .. } => false,
+        | TranscriptViewItemKind::ToolContribution { .. } => Ok(false),
     }
 }
 
@@ -5328,6 +17674,108 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    /// Exercise existing semantic fixtures through both reducers after every update.
+    struct BoundedParityView {
+        ordinary: SessionView,
+        checked: SessionView,
+    }
+
+    impl std::ops::Deref for BoundedParityView {
+        type Target = SessionView;
+
+        fn deref(&self) -> &Self::Target {
+            &self.ordinary
+        }
+    }
+
+    impl BoundedParityView {
+        fn new() -> Self {
+            Self {
+                ordinary: SessionView::new(),
+                checked: SessionView::new(),
+            }
+        }
+
+        fn set_streaming_presentation_policy(
+            &mut self,
+            policy: StreamingPresentationPolicy,
+        ) -> bool {
+            let changed = self.ordinary.set_streaming_presentation_policy(policy);
+            assert_eq!(
+                self.checked.set_streaming_presentation_policy(policy),
+                changed
+            );
+            assert_eq!(self.checked.snapshot(), self.ordinary.snapshot());
+            changed
+        }
+
+        fn advance_streaming_presentation(&mut self, now: Instant) -> bool {
+            let changed = self.ordinary.advance_streaming_presentation(now);
+            assert_eq!(self.checked.advance_streaming_presentation(now), changed);
+            assert_eq!(self.checked.snapshot(), self.ordinary.snapshot());
+            changed
+        }
+
+        fn clear_history_window(&mut self) {
+            self.ordinary.clear_history_window();
+            self.checked.clear_history_window();
+            assert_eq!(self.checked.snapshot(), self.ordinary.snapshot());
+        }
+
+        fn apply_event(&mut self, event: &SessionEvent) {
+            self.compare(
+                |view| view.apply_event(event),
+                |view, ledger, policy| view.apply_event_bounded(event, ledger, policy),
+            );
+        }
+
+        fn apply_live_event(&mut self, event: &SessionLiveEvent) {
+            self.compare(
+                |view| view.apply_live_event(event),
+                |view, ledger, policy| view.apply_live_event_bounded(event, ledger, policy),
+            );
+        }
+
+        fn compare(
+            &mut self,
+            ordinary: impl FnOnce(&mut SessionView),
+            bounded: impl Fn(
+                &mut SessionView,
+                &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+                bcode_session_view_models::retention::ObservationRetentionLimits,
+            ) -> Result<
+                (),
+                bcode_session_view_models::retention::ObservationRetentionExceeded,
+            >,
+        ) {
+            use bcode_session_view_models::retention::ObservationRetentionLimits;
+            let allowed =
+                super::text_update_retention_tests::measured_peak_limits(&self.checked, &bounded);
+            let mut ledger = self.checked.observation_retention_usage(allowed).unwrap();
+            let before = ledger;
+            let snapshot = self.checked.snapshot().clone();
+            let denied = ObservationRetentionLimits {
+                value_nodes: before.value_nodes,
+                ..allowed
+            };
+            if bounded(&mut self.checked, &mut ledger, denied).is_err() {
+                assert_eq!(ledger, before);
+                assert_eq!(self.checked.snapshot(), &snapshot);
+            } else {
+                // No-op or allocation-free updates may fit the baseline exactly.
+                self.checked = self.ordinary.clone();
+                ledger = self.checked.observation_retention_usage(allowed).unwrap();
+            }
+            bounded(&mut self.checked, &mut ledger, allowed).unwrap();
+            ordinary(&mut self.ordinary);
+            assert_eq!(self.checked.snapshot(), self.ordinary.snapshot());
+            let actual = self.checked.observation_retention_usage(allowed).unwrap();
+            assert_eq!(ledger.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(ledger.collection_entries, actual.collection_entries);
+            assert_eq!(ledger.value_nodes, actual.value_nodes);
+        }
+    }
+
     fn ordered_assistant_update(
         session_id: SessionId,
         update: bcode_session_models::TextStreamUpdate,
@@ -5389,9 +17837,51 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reasoning_turn_finish_flushes_multiple_paced_parts() {
+        let session_id = SessionId::new();
+        let mut view = BoundedParityView::new();
+        view.set_streaming_presentation_policy(StreamingPresentationPolicy::default());
+        for part in ["part-a", "part-b"] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    turn_id: "turn-1".into(),
+                    activity_id: "activity-1".into(),
+                    activity_order: 0,
+                    part_id: part.into(),
+                    part_order: 0,
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Detail,
+                    output_position: None,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: 1,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: "pending part".into(),
+                        },
+                    },
+                },
+            });
+        }
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-1".into(),
+                outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                message: None,
+            },
+        ));
+        assert!(view.checked.pending_text_presentations.is_empty());
+        assert!(projected_reasoning_text(&view).contains("pending part"));
+    }
+
+    #[test]
     fn smoothed_reasoning_overlapping_arrivals_preserve_exact_target() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
         view.apply_live_event(&ordered_reasoning_update(session_id, 0, 1, 1, 0, "first"));
         assert_eq!(projected_reasoning_text(&view), "f");
@@ -5408,7 +17898,7 @@ mod tests {
     fn generation_replacement_discards_stale_assistant_backlog() {
         let session_id = SessionId::new();
         let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
         view.apply_live_event(&ordered_assistant_update(
             session_id,
@@ -5449,7 +17939,7 @@ mod tests {
     fn legacy_deltas_share_smoothing_and_exact_terminal_flush() {
         let session_id = SessionId::new();
         let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
         for text in ["legacy", " delta"] {
             view.apply_live_event(&SessionLiveEvent {
@@ -5629,18 +18119,21 @@ mod tests {
         let mut view = SessionView::new();
         assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
         let append_started = Instant::now();
-        view.apply_live_event(&ordered_assistant_update(
-            session_id,
-            bcode_session_models::TextStreamUpdate {
-                generation: 0,
-                first_revision: 1,
-                revision: 1,
-                operation: bcode_session_models::TextStreamOperation::Append {
-                    expected_offset: 0,
-                    text: "abcdefghijklmnopqrstuvwxyz".to_owned(),
+        view.apply_live_event_at(
+            &ordered_assistant_update(
+                session_id,
+                bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    first_revision: 1,
+                    revision: 1,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: 0,
+                        text: "abcdefghijklmnopqrstuvwxyz".to_owned(),
+                    },
                 },
-            },
-        ));
+            ),
+            append_started,
+        );
         assert_eq!(transcript_item_text(view.snapshot(), &id), Some("a"));
         assert!(append_started.elapsed() < Duration::from_millis(10));
         let next_deadline = view
@@ -5651,6 +18144,22 @@ mod tests {
             .get(&id)
             .expect("pending presentation");
         let terminal_deadline = pending.paced_from + pending.max_lag;
+        eprintln!(
+            "presentation timing: anchor_drift_us={} policy_lag_us={} terminal_from_start_us={} reducer_elapsed_us={}",
+            pending
+                .paced_from
+                .saturating_duration_since(append_started)
+                .as_micros(),
+            pending.max_lag.as_micros(),
+            terminal_deadline
+                .saturating_duration_since(append_started)
+                .as_micros(),
+            append_started.elapsed().as_micros()
+        );
+        assert!(
+            pending.paced_from == append_started,
+            "presentation receipt anchor drifted"
+        );
         assert!(next_deadline <= terminal_deadline);
         assert!(
             terminal_deadline.saturating_duration_since(append_started)
@@ -6162,7 +18671,7 @@ mod tests {
     fn smoothed_assistant_stream_exposes_first_grapheme_then_exact_target() {
         let session_id = SessionId::new();
         let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
         let started = Instant::now();
         view.apply_live_event(&ordered_assistant_update(
@@ -6222,7 +18731,7 @@ mod tests {
     fn terminal_update_flushes_pending_text_and_is_absorbing() {
         let session_id = SessionId::new();
         let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         view.apply_live_event(&ordered_assistant_update(
             session_id,
             bcode_session_models::TextStreamUpdate {
@@ -7785,7 +20294,7 @@ mod tests {
     #[test]
     fn draft_placement_change_replaces_the_same_primary_item() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         let draft = |revision, placement| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
@@ -7856,7 +20365,7 @@ mod tests {
     #[test]
     fn request_draft_live_updates_apply_append_checkpoint_and_terminal_dominance() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         let draft = |revision, operation| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
@@ -7939,7 +20448,7 @@ mod tests {
     #[test]
     fn request_draft_append_offsets_are_utf8_byte_offsets() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         let draft = |revision, offset, text: &str| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
@@ -8141,7 +20650,7 @@ mod tests {
     #[test]
     fn interleaved_request_drafts_remain_isolated() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         let draft = |tool_call_id: &str, revision, offset, text: &str| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
@@ -8322,7 +20831,7 @@ mod tests {
     fn assembled_request_and_terminal_result_reject_delayed_drafts_atomically() {
         use bcode_session_models::{ToolContributionPlacement, ToolRequestDraftOperation};
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         let checkpoint = || ToolRequestDraftOperation::Checkpoint {
             start_offset: 0,
             text: "delayed partial arguments".to_owned(),
@@ -8463,7 +20972,7 @@ mod tests {
     fn rejected_draft_offsets_and_generations_preserve_preview_fence_and_placement() {
         use bcode_session_models::{ToolContributionPlacement, ToolRequestDraftOperation};
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         let checkpoint = || ToolRequestDraftOperation::Checkpoint {
             start_offset: 0,
             text: "λ🙂".to_owned(),
@@ -8542,7 +21051,7 @@ mod tests {
     #[test]
     fn durable_tool_request_reconciles_live_draft_without_duplicate_rows() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         view.apply_live_event(&SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
@@ -8602,7 +21111,7 @@ mod tests {
     #[test]
     fn final_result_dominates_late_result_draft_and_cleanup() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         let draft = |revision, operation| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
@@ -8872,7 +21381,7 @@ mod tests {
     #[test]
     fn final_result_without_lifecycle_completion_retires_result_draft() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         view.apply_live_event(&SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
@@ -9404,7 +21913,7 @@ mod tests {
     #[test]
     fn successful_lifecycle_completion_keeps_result_draft_until_result_arrives() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         view.apply_event(&event(
             session_id,
             1,
@@ -9482,7 +21991,7 @@ mod tests {
             ),
         ] {
             let session_id = SessionId::new();
-            let mut view = SessionView::new();
+            let mut view = BoundedParityView::new();
             view.apply_event(&event(
                 session_id,
                 1,
@@ -12107,7 +24616,7 @@ mod tests {
     #[test]
     fn explicit_supplemental_presentation_materializes_without_changing_primary_identity() {
         let session_id = SessionId::new();
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         view.apply_event(&event(
             session_id,
             1,
@@ -12615,7 +25124,7 @@ mod tests {
             artifact: None,
             payload: serde_json::json!({"item": item_id}),
         };
-        let mut view = SessionView::new();
+        let mut view = BoundedParityView::new();
         view.apply_event(&event(
             session_id,
             1,

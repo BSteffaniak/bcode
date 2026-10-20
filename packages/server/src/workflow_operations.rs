@@ -70,9 +70,34 @@ pub struct WorkflowAuthoringApplication<'a> {
     state: &'a std::sync::Arc<ServerState>,
     client_id: super::ClientId,
     request_end: Option<tokio::sync::watch::Receiver<bool>>,
+    embedded_consumer_registration: bool,
 }
 
 impl<'a> WorkflowAuthoringApplication<'a> {
+    /// Access caller-bound import and search operations, including explicit maintenance.
+    #[must_use]
+    pub const fn import_search_application(&self) -> super::ImportSearchApplicationHandle<'_> {
+        super::ImportSearchApplicationHandle::new(self.state, self.client_id)
+    }
+
+    /// Access caller-bound plugin, model, agent, skill and worktree application operations.
+    #[must_use]
+    pub const fn services_application(&self) -> super::ServicesApplicationHandle<'_> {
+        super::ServicesApplicationHandle::new(self.state, self.client_id)
+    }
+
+    /// Access typed command discovery, invocation and cancellation through existing owners.
+    #[must_use]
+    pub const fn command_application(&self) -> super::CommandApplicationHandle<'_> {
+        super::CommandApplicationHandle::new(self.state, self.client_id)
+    }
+
+    /// Access caller-bound renderer-neutral pending interaction operations.
+    #[must_use]
+    pub const fn interaction_application(&self) -> super::InteractionApplicationHandle<'_> {
+        super::InteractionApplicationHandle::new(self.state, self.client_id)
+    }
+
     /// Access the same caller-bound session operations used by transport adapters.
     ///
     /// This does not create another runtime or grant additional caller authority.
@@ -108,7 +133,73 @@ impl<'a> WorkflowAuthoringApplication<'a> {
             state,
             client_id,
             request_end: None,
+            embedded_consumer_registration: false,
         }
+    }
+
+    /// Explicitly opt this embedded callback caller into semantic interaction consumption.
+    /// Existing selection and authentication context is preserved.
+    ///
+    /// # Errors
+    /// Rejects non-embedded callers, shutdown, and unsupported versions before registration.
+    pub async fn register_interaction_consumer(
+        &self,
+        versions: std::collections::BTreeSet<u32>,
+    ) -> Result<(), bcode_plugin_models::interaction_controller::InteractionControllerError> {
+        use bcode_plugin_models::interaction_controller::{
+            INTERACTION_CONTROLLER_VERSION, InteractionControllerError,
+        };
+        if !self.embedded_consumer_registration {
+            return Err(InteractionControllerError::Unauthorized);
+        }
+        if versions
+            .iter()
+            .any(|version| *version != INTERACTION_CONTROLLER_VERSION)
+        {
+            return Err(InteractionControllerError::Unsupported);
+        }
+        if self
+            .state
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(InteractionControllerError::Unavailable);
+        }
+        let mut contexts = self.state.client_runtime_contexts.lock().await;
+        if versions.is_empty() && !contexts.contains_key(&self.client_id) {
+            return Ok(());
+        }
+        if let std::collections::btree_map::Entry::Vacant(entry) = contexts.entry(self.client_id) {
+            let config = &self.state.startup_config;
+            let selection = config.resolved_model_selection();
+            let provider_context = bcode_provider_auth::try_resolve_provider_request_context(
+                bcode_provider_auth::ProviderRequestContextResolution {
+                    config,
+                    selection: selection.clone(),
+                },
+            )
+            .map_err(|_| InteractionControllerError::Unavailable)?;
+            let effective_config = bcode_config::encode_effective_config(config)
+                .map_err(|_| InteractionControllerError::Unavailable)?;
+            entry.insert(super::ClientRuntimeContext {
+                effective_config_toml: Some(Box::new(effective_config)),
+                selected_provider_plugin_id: selection.provider_plugin_id,
+                requested_model_id: selection.selected_model_id,
+                selected_model_id: selection.model_id,
+                provider_context,
+                ..Default::default()
+            });
+        }
+        if let Some(context) = contexts.get_mut(&self.client_id) {
+            context.interaction_controller_versions = versions;
+        }
+        drop(contexts);
+        Ok(())
+    }
+
+    pub(crate) const fn with_embedded_consumer_registration(mut self) -> Self {
+        self.embedded_consumer_registration = true;
+        self
     }
 
     pub(crate) fn with_request_end(
@@ -255,6 +346,21 @@ fn diagnosed_start_failure(
     failure.message =
         format!("workflow state is unavailable (start stage: {stage}; category: {category})");
     failure
+}
+
+#[cfg(test)]
+#[test]
+fn run_failure_preserves_busy_without_reclassifying_unavailable() {
+    let busy = run_operation_failure(super::ServerError::WorkflowStorageBusy);
+    assert_eq!(busy.code, "workflow_storage_busy");
+    let unavailable = run_operation_failure(super::ServerError::WorkflowStorageUnavailable(
+        "private storage diagnostic".into(),
+    ));
+    assert_eq!(unavailable.code, "workflow_capability_unavailable");
+    assert_eq!(
+        unavailable.message,
+        "a required workflow capability is unavailable"
+    );
 }
 
 #[cfg(test)]
@@ -1982,6 +2088,19 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    run_computation_with_checkpoint(state, control, fallback_operation_id, move |_| compute()).await
+}
+
+async fn run_computation_with_checkpoint<T, F>(
+    state: &ServerState,
+    control: bcode_workflow::WorkflowComputationControl,
+    fallback_operation_id: String,
+    compute: F,
+) -> Result<T, super::ServerError>
+where
+    T: Send + 'static,
+    F: FnOnce(std::sync::Arc<ComputationCancellation>) -> T + Send + 'static,
+{
     let operation_id = if control.operation_id.is_empty() {
         fallback_operation_id
     } else {
@@ -2009,7 +2128,8 @@ where
         }
         computations.insert(operation_id.clone(), std::sync::Arc::clone(&cancellation));
     }
-    let mut task = tokio::task::spawn_blocking(compute);
+    let worker_cancellation = std::sync::Arc::clone(&cancellation);
+    let mut task = tokio::task::spawn_blocking(move || compute(worker_cancellation));
     let outcome = tokio::select! {
         result = &mut task => result.map_err(super::ServerError::BlockingTask),
         () = cancellation.notify.notified() => {
@@ -2167,12 +2287,14 @@ pub async fn publish_draft(
                 request.workflow_id, request.draft_id
             ))
         })?;
-    let catalog = authoring_catalog(state).await?;
     let configuration = request.configuration.clone();
-    let preview = run_computation(state, request.control.clone(), fallback_operation_id, {
-        let document = draft.document.clone();
-        move || document.compilation_preview(&catalog, configuration.as_ref())
-    })
+    let preview = preview_compilation(
+        state,
+        draft.document.clone(),
+        configuration,
+        request.control.clone(),
+        fallback_operation_id,
+    )
     .await?;
     let compiled = preview.compiled.as_ref().ok_or_else(|| {
         super::ServerError::WorkflowDefinitionUnsupported(
@@ -2425,10 +2547,14 @@ async fn start_authored_with_package(
         .or(request.configuration)
         .or_else(|| revision.document.configuration_defaults.clone())
         .unwrap_or_else(|| serde_json::json!({}));
-    let catalog = authoring_catalog(state).await?;
-    let preview = revision
-        .document
-        .compilation_preview(&catalog, Some(&configuration));
+    let preview = preview_compilation(
+        state,
+        revision.document.clone(),
+        Some(configuration.clone()),
+        bcode_workflow::WorkflowComputationControl::default(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .await?;
     let compiled = preview.compiled.ok_or_else(|| {
         super::ServerError::WorkflowDefinitionUnsupported(
             "published authored workflow is no longer executable on this host".to_string(),
@@ -3708,12 +3834,13 @@ pub async fn launch_detail(
                         bcode_workflow::WorkflowAuthoringFailure::DiscoveryCapacity,
                     )
                 })?;
-            let catalog = authoring_catalog(state).await?;
+            let catalog = authoring_catalog_with_definitions(state, false).await?;
+            let store = std::sync::Arc::clone(&state.workflow_store);
             let source_path = source_path.clone();
             let source_format = *source_format;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                explicit_launch_detail(&source_path, source_format, &catalog)
+                explicit_launch_detail(&source_path, source_format, &catalog, &store)
             })
             .await
             .map_err(super::ServerError::BlockingTask)?
@@ -3773,6 +3900,7 @@ fn explicit_launch_detail(
     source_path: &std::path::Path,
     source_format: bcode_workflow::WorkflowSourceFormat,
     catalog: &bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    store: &std::sync::Arc<std::sync::Mutex<bcode_workflow_store::WorkflowStore>>,
 ) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
     let source = bcode_workflow_discovery::inspect_explicit_source(source_path)?;
     let bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
@@ -3793,9 +3921,14 @@ fn explicit_launch_detail(
         )
         .into());
     }
+    let targets = bcode_workflow::workflow_source_dependency_targets(&source, actual_format)?;
+    let catalog =
+        resolve_compilation_dependencies_with_checkpoint(store, catalog.clone(), targets, || {
+            Ok(())
+        })?;
     let lowering =
-        bcode_workflow::lower_workflow_authoring_source(&source, actual_format, catalog)?;
-    let preview = lowering.document.compilation_preview(catalog, None);
+        bcode_workflow::lower_workflow_authoring_source(&source, actual_format, &catalog)?;
+    let preview = lowering.document.compilation_preview(&catalog, None);
     let item = standalone_launch_item(
         "explicit".into(),
         0,
@@ -3950,7 +4083,8 @@ async fn build_launch_detail(
     ),
     super::ServerError,
 > {
-    let catalog = authoring_catalog(state).await?;
+    let catalog = authoring_catalog_with_definitions(state, false).await?;
+    let store = std::sync::Arc::clone(&state.workflow_store);
     let template_document = if let bcode_workflow::WorkflowLaunchSourceIdentity::Template {
         owner_plugin_id,
         template_id,
@@ -3970,12 +4104,18 @@ async fn build_launch_detail(
         #[cfg(test)]
         if let Some((started, release)) = barrier {
             let _ = started.send(());
-            release
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .unwrap();
+            // Sender ownership controls this gate, including assertion unwind.
+            let _ = release.recv();
         }
         let detail = run_detail_construction(&cancelled, || {
-            construct_launch_detail(&workspace, item, &catalog, template_document, &cancelled)
+            construct_launch_detail(
+                &workspace,
+                item,
+                &catalog,
+                template_document,
+                &cancelled,
+                &store,
+            )
         })?;
         // Ownership travels with blocking work, including when the awaiting request drops.
         Ok((detail, admission))
@@ -4011,6 +4151,7 @@ fn construct_launch_detail(
     catalog: &bcode_workflow::WorkflowAuthoringCatalogSnapshot,
     template_document: Option<bcode_workflow::WorkflowAuthoringDocument>,
     cancelled: &std::sync::atomic::AtomicBool,
+    store: &std::sync::Arc<std::sync::Mutex<bcode_workflow_store::WorkflowStore>>,
 ) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
     let (document, package_plan) = match &item.source {
         bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
@@ -4031,7 +4172,27 @@ fn construct_launch_detail(
                 )
                 .into());
             };
-            let plan = bcode_workflow::plan_workflow_package_closure(&closure, catalog)?;
+            let targets = bcode_workflow::workflow_package_dependency_targets(&closure)?;
+            let catalog = resolve_compilation_dependencies_with_checkpoint(
+                store,
+                catalog.clone(),
+                targets,
+                || {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        Err(bcode_workflow::WorkflowError::Build {
+                            path: "computation".into(),
+                            message: "workflow discovery cancelled".into(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            let plan = bcode_workflow::plan_workflow_package_closure_with_checkpoint(
+                &closure,
+                &catalog,
+                || compilation_checkpoint(cancelled),
+            )?;
             if plan.entry_package_id != *package_id {
                 return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
                     "package launch source identity changed".to_string(),
@@ -4108,15 +4269,32 @@ fn construct_launch_detail(
                 )
                 .into());
             }
+            let targets =
+                bcode_workflow::workflow_source_dependency_targets(&source, actual_format)?;
+            let catalog = resolve_compilation_dependencies_with_checkpoint(
+                store,
+                catalog.clone(),
+                targets,
+                || {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        Err(bcode_workflow::WorkflowError::Build {
+                            path: "computation".into(),
+                            message: "workflow discovery cancelled".into(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
             let lowering =
-                bcode_workflow::lower_workflow_authoring_source(&source, actual_format, catalog)?;
+                bcode_workflow::lower_workflow_authoring_source(&source, actual_format, &catalog)?;
             if lowering.document.workflow_id != *workflow_id {
                 return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
                     "standalone launch source identity changed".to_string(),
                 )
                 .into());
             }
-            let preview = lowering.document.compilation_preview(catalog, None);
+            let preview = lowering.document.compilation_preview(&catalog, None);
             item = standalone_launch_item(
                 item.source_label.clone(),
                 item.precedence,
@@ -4167,6 +4345,12 @@ impl PendingDiscovery {
     #[cfg(test)]
     pub(super) fn expire_after(&mut self, duration: std::time::Duration) {
         self.expires = std::time::Instant::now() + duration;
+        if let Some(batch) = &self.batch_cancellation {
+            *batch.3.lock().unwrap() = Some(self.expires);
+            // Re-arm the active wait without signalling cancellation: the real
+            // deadline branch must expire it while the worker retains admission.
+            batch.1.notify_waiters();
+        }
     }
 
     #[cfg(test)]
@@ -4214,6 +4398,8 @@ struct DiscoveryBatchCancellation(
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     std::sync::Arc<tokio::sync::Notify>,
     Option<std::time::Instant>,
+    // Tests may arm expiry only after a blocking worker acknowledges entry.
+    #[cfg(test)] std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 );
 
 impl DiscoveryBatchCancellation {
@@ -4238,7 +4424,11 @@ impl DiscoveryBatchCancellation {
             if self.0.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            if let Some(deadline) = self.2 {
+            #[cfg(not(test))]
+            let deadline = self.2;
+            #[cfg(test)]
+            let deadline = (*self.3.lock().unwrap()).or(self.2);
+            if let Some(deadline) = deadline {
                 tokio::select! {
                     () = &mut notified => {},
                     () = tokio::time::sleep_until(deadline.into()) => {
@@ -4320,6 +4510,8 @@ impl DiscoveryContinuation<'_> {
                 std::sync::Arc::clone(&cancellation.0),
                 std::sync::Arc::clone(&cancellation.1),
                 cancellation.2,
+                #[cfg(test)]
+                std::sync::Arc::clone(&cancellation.3),
             ));
         }
         Ok(cancellation)
@@ -4666,7 +4858,8 @@ mod discovery_continuation_tests {
     #[tokio::test]
     async fn cancelled_worker_wait_returns_before_admission_is_released() {
         let owner = DiscoveryBatchCancellation::default();
-        let observer = DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone(), None);
+        let observer =
+            DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone(), None, owner.3.clone());
         let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let permit = capacity.clone().try_acquire_owned().unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -4705,7 +4898,8 @@ mod discovery_continuation_tests {
     #[tokio::test]
     async fn cancellation_notification_is_sticky_and_wakes_active_waiters() {
         let owner = DiscoveryBatchCancellation::default();
-        let observer = DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone(), None);
+        let observer =
+            DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone(), None, owner.3.clone());
         let mut waiting = Box::pin(observer.cancelled());
         std::future::poll_fn(|cx| {
             assert!(waiting.as_mut().poll(cx).is_pending());
@@ -5022,7 +5216,7 @@ pub async fn launch_catalog(
     // Pin compilation inputs for the entire process-local discovery, including resumes.
     let catalog = match scan.catalog.take() {
         Some(catalog) => catalog,
-        None => std::sync::Arc::new(authoring_catalog(state).await?),
+        None => std::sync::Arc::new(authoring_catalog_with_definitions(state, false).await?),
     };
     let items = LaunchCatalogWindow {
         request,
@@ -5071,12 +5265,34 @@ pub async fn launch_catalog(
                     let cancellation = continuation.batch_cancellation()?;
                     let cancelled = std::sync::Arc::clone(&cancellation.0);
                     let planning_catalog = catalog.clone();
+                    let store = std::sync::Arc::clone(&state.workflow_store);
                     let worker = tokio::task::spawn_blocking(move || {
                         let result = run_detail_construction(&cancelled, || {
-                            let plan = bcode_workflow::plan_workflow_package_closure(
-                                &closure,
-                                &planning_catalog,
-                            )?;
+                            let targets =
+                                bcode_workflow::workflow_package_dependency_targets(&closure)?;
+                            let planning_catalog = std::sync::Arc::new(
+                                resolve_compilation_dependencies_with_checkpoint(
+                                    &store,
+                                    planning_catalog.as_ref().clone(),
+                                    targets,
+                                    || {
+                                        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                            Err(bcode_workflow::WorkflowError::Build {
+                                                path: "computation".into(),
+                                                message: "workflow discovery cancelled".into(),
+                                            })
+                                        } else {
+                                            Ok(())
+                                        }
+                                    },
+                                )?,
+                            );
+                            let plan =
+                                bcode_workflow::plan_workflow_package_closure_with_checkpoint(
+                                    &closure,
+                                    &planning_catalog,
+                                    || compilation_checkpoint(&cancelled),
+                                )?;
                             let entry_index = plan
                                 .packages
                                 .iter()
@@ -5224,17 +5440,38 @@ pub async fn launch_catalog(
                     let cancellation = continuation.batch_cancellation()?;
                     let cancelled = std::sync::Arc::clone(&cancellation.0);
                     let planning_catalog = catalog.clone();
+                    let store = std::sync::Arc::clone(&state.workflow_store);
                     #[cfg(test)]
                     let barrier = state.workflow_detail_barrier.lock().await.take();
                     let worker = tokio::task::spawn_blocking(move || {
                         #[cfg(test)]
                         if let Some((started, release)) = barrier {
                             let _ = started.send(());
-                            release
-                                .recv_timeout(std::time::Duration::from_secs(10))
-                                .unwrap();
+                            // Test ownership, not elapsed time, releases the worker.
+                            // Sender drop on assertion unwind also unblocks this receive.
+                            let _ = release.recv();
                         }
                         let result = run_detail_construction(&cancelled, || {
+                            let targets = bcode_workflow::workflow_source_dependency_targets(
+                                &source,
+                                source_format,
+                            )?;
+                            let planning_catalog =
+                                resolve_compilation_dependencies_with_checkpoint(
+                                    &store,
+                                    planning_catalog.as_ref().clone(),
+                                    targets,
+                                    || {
+                                        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                            Err(bcode_workflow::WorkflowError::Build {
+                                                path: "computation".into(),
+                                                message: "workflow discovery cancelled".into(),
+                                            })
+                                        } else {
+                                            Ok(())
+                                        }
+                                    },
+                                )?;
                             let lowering = bcode_workflow::lower_workflow_authoring_source(
                                 &source,
                                 source_format,
@@ -5333,15 +5570,16 @@ pub async fn launch_catalog(
         let cancellation = continuation.batch_cancellation()?;
         let cancelled = std::sync::Arc::clone(&cancellation.0);
         let planning_catalog = catalog.clone();
+        let store = std::sync::Arc::clone(&state.workflow_store);
         #[cfg(test)]
         let barrier = state.workflow_detail_barrier.lock().await.take();
         let worker = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some((started, release)) = barrier {
                 let _ = started.send(());
-                release
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .unwrap();
+                // Test ownership, not elapsed time, releases the worker.
+                // Sender drop on assertion unwind also unblocks this receive.
+                let _ = release.recv();
             }
             let result = run_detail_construction(&cancelled, || {
                 let mut template = template_description_with_plugins(
@@ -5352,6 +5590,23 @@ pub async fn launch_catalog(
                 let Some(document) = template.authoring_document.take() else {
                     return Ok(None);
                 };
+                let targets =
+                    bcode_workflow::workflow_definition_dependency_targets(&document.definition)?;
+                let planning_catalog = resolve_compilation_dependencies_with_checkpoint(
+                    &store,
+                    planning_catalog.as_ref().clone(),
+                    targets,
+                    || {
+                        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                            Err(bcode_workflow::WorkflowError::Build {
+                                path: "computation".into(),
+                                message: "workflow discovery cancelled".into(),
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )?;
                 let preview = run_detail_construction(&cancelled, || {
                     Ok(document.compilation_preview(&planning_catalog, None))
                 })?;
@@ -5521,7 +5776,8 @@ async fn deliver_retained_page(
         #[cfg(test)]
         if let Some((started, release)) = barrier {
             let _ = started.send(());
-            let _ = release.recv_timeout(std::time::Duration::from_secs(10));
+            // Dropping the sender on test failure releases this gate as well.
+            let _ = release.recv();
         }
         let result = run_detail_construction(&cancelled, || {
             let spool = scan.previews.as_ref().ok_or_else(|| {
@@ -5993,7 +6249,7 @@ pub async fn publish_package(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    let mut catalog = authoring_catalog(state).await?;
+    let mut catalog = authoring_catalog_with_definitions(state, false).await?;
     for draft in &drafts {
         let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
             draft.workflow_id.clone(),
@@ -6007,13 +6263,24 @@ pub async fn publish_package(
     for draft in &drafts {
         let catalog = std::sync::Arc::clone(&catalog);
         let document = draft.document.clone();
-        let preview = run_computation(
+        let store = std::sync::Arc::clone(&state.workflow_store);
+        let preview = run_computation_with_checkpoint(
             state,
             bcode_workflow::WorkflowComputationControl::default(),
             uuid::Uuid::new_v4().to_string(),
-            move || document.compilation_preview(&catalog, None),
+            move |cancellation| {
+                let targets =
+                    bcode_workflow::workflow_definition_dependency_targets(&document.definition)?;
+                let catalog = resolve_compilation_dependencies(
+                    &store,
+                    catalog.as_ref().clone(),
+                    targets,
+                    &cancellation,
+                )?;
+                Ok::<_, bcode_workflow::WorkflowError>(document.compilation_preview(&catalog, None))
+            },
         )
-        .await?;
+        .await??;
         let compiled = preview.compiled.as_ref().ok_or_else(|| {
             super::ServerError::WorkflowDefinitionUnsupported(
                 "package publication requires successful member compilation".to_string(),
@@ -6063,10 +6330,23 @@ pub async fn validate_package(
     request: bcode_workflow::WorkflowPackageComputationRequest,
     fallback_operation_id: String,
 ) -> Result<bcode_workflow::WorkflowPackageValidationResult, super::ServerError> {
-    let catalog = authoring_catalog(state).await?;
-    let plan = run_computation(state, request.control, fallback_operation_id, move || {
-        bcode_workflow::plan_workflow_package_closure(&request.closure, &catalog)
-    })
+    let catalog = authoring_catalog_with_definitions(state, false).await?;
+    let store = std::sync::Arc::clone(&state.workflow_store);
+    let plan = run_computation_with_checkpoint(
+        state,
+        request.control,
+        fallback_operation_id,
+        move |cancellation| {
+            let targets = bcode_workflow::workflow_package_dependency_targets(&request.closure)?;
+            let catalog =
+                resolve_compilation_dependencies(&store, catalog, targets, &cancellation)?;
+            bcode_workflow::plan_workflow_package_closure_with_checkpoint(
+                &request.closure,
+                &catalog,
+                || compilation_checkpoint(&cancellation.cancelled),
+            )
+        },
+    )
     .await??;
     Ok(bcode_workflow::WorkflowPackageValidationResult { plan })
 }
@@ -6077,7 +6357,7 @@ pub async fn preview_package(
     request: bcode_workflow::WorkflowPackagePreviewRequest,
     fallback_operation_id: String,
 ) -> Result<bcode_workflow::WorkflowPackagePreview, super::ServerError> {
-    let mut catalog = authoring_catalog(state).await?;
+    let mut catalog = authoring_catalog_with_definitions(state, false).await?;
     for dependency in &request.dependency_plans {
         for member in &dependency.members {
             catalog.workflow_definitions.insert(
@@ -6086,9 +6366,31 @@ pub async fn preview_package(
             );
         }
     }
-    run_computation(state, request.control, fallback_operation_id, move || {
-        bcode_workflow::preview_workflow_package(&request.plan, &catalog, &request.configurations)
-    })
+    let store = std::sync::Arc::clone(&state.workflow_store);
+    run_computation_with_checkpoint(
+        state,
+        request.control,
+        fallback_operation_id,
+        move |cancellation| {
+            let mut targets = Vec::new();
+            for member in &request.plan.members {
+                catalog.workflow_definitions.insert(
+                    member.definition_identity.definition_id.clone(),
+                    member.lowering.document.definition.clone(),
+                );
+                targets.extend(bcode_workflow::workflow_definition_dependency_targets(
+                    &member.lowering.document.definition,
+                )?);
+            }
+            let catalog =
+                resolve_compilation_dependencies(&store, catalog, targets, &cancellation)?;
+            bcode_workflow::preview_workflow_package(
+                &request.plan,
+                &catalog,
+                &request.configurations,
+            )
+        },
+    )
     .await?
     .map_err(super::ServerError::from)
 }
@@ -6099,11 +6401,25 @@ pub async fn validate_source(
     request: bcode_workflow::WorkflowSourceComputationRequest,
     fallback_operation_id: String,
 ) -> Result<bcode_workflow::WorkflowSourceValidationResult, super::ServerError> {
-    let catalog = authoring_catalog(state).await?;
+    let catalog = authoring_catalog_with_definitions(state, false).await?;
+    let store = std::sync::Arc::clone(&state.workflow_store);
     let source_format = request.source_format;
-    let lowering = run_computation(state, request.control, fallback_operation_id, move || {
-        bcode_workflow::lower_workflow_authoring_source(&request.source, source_format, &catalog)
-    })
+    let lowering = run_computation_with_checkpoint(
+        state,
+        request.control,
+        fallback_operation_id,
+        move |cancellation| {
+            let targets =
+                bcode_workflow::workflow_source_dependency_targets(&request.source, source_format)?;
+            let catalog =
+                resolve_compilation_dependencies(&store, catalog, targets, &cancellation)?;
+            bcode_workflow::lower_workflow_authoring_source(
+                &request.source,
+                source_format,
+                &catalog,
+            )
+        },
+    )
     .await??;
     Ok(bcode_workflow::WorkflowSourceValidationResult {
         source_format,
@@ -6117,11 +6433,19 @@ pub async fn preview_source(
     request: bcode_workflow::WorkflowSourcePreviewRequest,
     fallback_operation_id: String,
 ) -> Result<bcode_workflow::WorkflowSourcePreviewResult, super::ServerError> {
-    let catalog = authoring_catalog(state).await?;
+    let catalog = authoring_catalog_with_definitions(state, false).await?;
+    let store = std::sync::Arc::clone(&state.workflow_store);
     let source_format = request.source_format;
     let configuration = request.configuration;
-    let (lowering, preview) =
-        run_computation(state, request.control, fallback_operation_id, move || {
+    let (lowering, preview) = run_computation_with_checkpoint(
+        state,
+        request.control,
+        fallback_operation_id,
+        move |cancellation| {
+            let targets =
+                bcode_workflow::workflow_source_dependency_targets(&request.source, source_format)?;
+            let catalog =
+                resolve_compilation_dependencies(&store, catalog, targets, &cancellation)?;
             let lowering = bcode_workflow::lower_workflow_authoring_source(
                 &request.source,
                 source_format,
@@ -6131,8 +6455,9 @@ pub async fn preview_source(
                 .document
                 .compilation_preview(&catalog, configuration.as_ref());
             Ok::<_, bcode_workflow::WorkflowError>((lowering, preview))
-        })
-        .await??;
+        },
+    )
+    .await??;
     Ok(bcode_workflow::WorkflowSourcePreviewResult {
         source_format,
         lowering,
@@ -6170,11 +6495,23 @@ pub async fn preview_compilation(
     fallback_operation_id: String,
 ) -> Result<bcode_workflow::WorkflowCompilationPreview, super::ServerError> {
     let started_at = std::time::Instant::now();
-    let catalog = authoring_catalog(state).await?;
-    let preview = run_computation(state, control, fallback_operation_id, move || {
-        document.compilation_preview(&catalog, configuration.as_ref())
-    })
-    .await?;
+    let catalog = authoring_catalog_with_definitions(state, false).await?;
+    let store = std::sync::Arc::clone(&state.workflow_store);
+    let preview = run_computation_with_checkpoint(
+        state,
+        control,
+        fallback_operation_id,
+        move |cancellation| {
+            let targets =
+                bcode_workflow::workflow_definition_dependency_targets(&document.definition)?;
+            let catalog =
+                resolve_compilation_dependencies(&store, catalog, targets, &cancellation)?;
+            Ok::<_, bcode_workflow::WorkflowError>(
+                document.compilation_preview(&catalog, configuration.as_ref()),
+            )
+        },
+    )
+    .await??;
     record_authoring_duration(
         &state.metrics,
         "workflow.authoring.compilation.duration_ms",
@@ -6925,8 +7262,14 @@ pub async fn instantiate_template(
         source_revision: None,
     };
     document.validate()?;
-    let catalog = authoring_catalog(state).await?;
-    let preview = document.compilation_preview(&catalog, None);
+    let preview = preview_compilation(
+        state,
+        document.clone(),
+        None,
+        bcode_workflow::WorkflowComputationControl::default(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .await?;
     let compiled = preview.compiled.as_ref().ok_or_else(|| {
         super::ServerError::WorkflowDefinitionUnsupported(format!(
             "template instantiation requires a successful compilation preview: {:?}",
@@ -6983,7 +7326,11 @@ fn persist_exact_template_call_dependencies(
 ) -> Result<(), super::ServerError> {
     let dependencies = bcode_workflow::workflow_dependency_manifest(definition)?;
     for dependency in dependencies {
-        let identity = dependency.target.definition_identity();
+        let identity = dependency.target.definition_identity().map_err(|_| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "template dependency requires an exact executable identity; unresolved package-local targets are unsupported".into(),
+            )
+        })?;
         let Some((owner_plugin_id, template)) = state
             .plugins
             .registry()
@@ -7075,16 +7422,20 @@ async fn resolve_replacement_authored_selection(
         .or_else(|| request.configuration.clone())
         .or_else(|| revision.document.configuration_defaults.clone())
         .unwrap_or_else(|| serde_json::json!({}));
-    let catalog = authoring_catalog(state).await?;
-    let compiled = revision
-        .document
-        .compilation_preview(&catalog, Some(&configuration))
-        .compiled
-        .ok_or_else(|| {
-            super::ServerError::WorkflowDefinitionUnsupported(
-                "replacement authored selection is not executable".into(),
-            )
-        })?;
+    let compiled = preview_compilation(
+        state,
+        revision.document.clone(),
+        Some(configuration.clone()),
+        bcode_workflow::WorkflowComputationControl::default(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .await?
+    .compiled
+    .ok_or_else(|| {
+        super::ServerError::WorkflowDefinitionUnsupported(
+            "replacement authored selection is not executable".into(),
+        )
+    })?;
     let successor_matches = (
         &request.successor.definition_id,
         request.successor.definition_version,
@@ -7227,7 +7578,7 @@ pub async fn start_run(
     .await
 }
 
-async fn start_run_with_package(
+pub async fn start_run_with_package(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowRunStartRequest,
     authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
@@ -7404,10 +7755,17 @@ async fn start_run_with_stage(
         .map_err(|_| {
             bcode_workflow_store::WorkflowStoreError::InvalidData("invalid prepared parent".into())
         })?;
-    let represented = Box::pin(crate::workflow_representation::admit_prepared(
-        state, &new_run,
-    ))
-    .await?;
+    let represented = if package.is_some() {
+        Box::pin(crate::workflow_representation::admit_prepared_package(
+            state, &new_run, package,
+        ))
+        .await?
+    } else {
+        Box::pin(crate::workflow_representation::admit_prepared(
+            state, &new_run,
+        ))
+        .await?
+    };
     let run = if let Some(run) = represented {
         run
     } else {
@@ -10486,7 +10844,12 @@ pub async fn apply_source(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::ApplyWorkflowSourceRequest,
 ) -> Result<bcode_workflow::WorkflowSourceApplyResult, super::ServerError> {
-    let catalog = authoring_catalog(state).await?;
+    let catalog = authoring_catalog_with_definitions(state, false).await?;
+    let targets =
+        bcode_workflow::workflow_source_dependency_targets(&request.source, request.source_format)?;
+    let store = std::sync::Arc::clone(&state.workflow_store);
+    let cancellation = ComputationCancellation::new();
+    let catalog = resolve_compilation_dependencies(&store, catalog, targets, &cancellation)?;
     let lowering = bcode_workflow::lower_workflow_authoring_source(
         &request.source,
         request.source_format,
@@ -10736,6 +11099,67 @@ pub async fn register_definition(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .persist_definition(&request.definition_id, request.version, &request.definition)
         .map_err(super::ServerError::from)
+}
+
+fn compilation_checkpoint(
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), bcode_workflow::WorkflowError> {
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        Err(bcode_workflow::WorkflowError::Build {
+            path: "computation".into(),
+            message: "workflow compilation cancelled".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn resolve_compilation_dependencies(
+    store: &std::sync::Arc<std::sync::Mutex<bcode_workflow_store::WorkflowStore>>,
+    catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    targets: Vec<bcode_workflow::WorkflowCallTarget>,
+    cancellation: &ComputationCancellation,
+) -> Result<bcode_workflow::WorkflowAuthoringCatalogSnapshot, bcode_workflow::WorkflowError> {
+    resolve_compilation_dependencies_with_checkpoint(store, catalog, targets, || {
+        compilation_checkpoint(&cancellation.cancelled)
+    })
+}
+
+fn resolve_compilation_dependencies_with_checkpoint(
+    store: &std::sync::Arc<std::sync::Mutex<bcode_workflow_store::WorkflowStore>>,
+    catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    targets: Vec<bcode_workflow::WorkflowCallTarget>,
+    checkpoint: impl FnMut() -> Result<(), bcode_workflow::WorkflowError>,
+) -> Result<bcode_workflow::WorkflowAuthoringCatalogSnapshot, bcode_workflow::WorkflowError> {
+    bcode_workflow::resolve_workflow_authoring_dependencies(
+        catalog,
+        targets,
+        bcode_workflow::WorkflowResolutionBudget::default(),
+        |identity, remaining| {
+            store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .definition_with_byte_budget(
+                    &identity.definition_id,
+                    identity.definition_version,
+                    remaining,
+                )
+                .and_then(|stored| {
+                    stored.ok_or_else(|| {
+                        bcode_workflow_store::WorkflowStoreError::InvalidData(
+                            "exact workflow dependency is unavailable".into(),
+                        )
+                    })
+                })
+                .map(|stored| stored.definition_json)
+                .map_err(|_| bcode_workflow::WorkflowError::Build {
+                    path: "catalog".into(),
+                    message: "exact workflow dependency could not be read within its allowance"
+                        .into(),
+                })
+        },
+        checkpoint,
+    )
 }
 
 /// Build the validated workflow authoring catalog without transport framing.
@@ -11546,13 +11970,9 @@ pub async fn import_preview(
         producer_id: Some("workflow-import".to_string()),
         source_revision: Some(bundle.revision.identity.clone()),
     };
-    let catalog = authoring_catalog(state).await?;
-    let preview_document = document.clone();
     let started_at = std::time::Instant::now();
-    let compilation = run_computation(state, control, operation_id, move || {
-        preview_document.compilation_preview(&catalog, None)
-    })
-    .await?;
+    let compilation =
+        preview_compilation(state, document.clone(), None, control, operation_id).await?;
     record_authoring_duration(
         &state.metrics,
         "workflow.authoring.import_preview.duration_ms",

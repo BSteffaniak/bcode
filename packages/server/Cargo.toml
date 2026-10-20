@@ -25,6 +25,7 @@ bcode_model_catalog = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin = { workspace = true }
+bcode_plugin_models = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_project_instructions = { workspace = true }
 bcode_prompt_cache = { workspace = true }

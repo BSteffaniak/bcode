@@ -5,8 +5,9 @@
 //! plugin-host interface routing still requires a unique provider. Provider adapters own
 //! locator confinement and format conversion. Portable import contracts contain only data.
 
-use crate::{ErrorResponse, ServerError, ServerState, SharedWriter, send_response};
-use bcode_ipc::{Response, ResponsePayload};
+#[cfg(test)]
+use crate::ErrorResponse;
+use crate::ServerState;
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse, ImportableSessionEvent,
     ImportableSessionEventKind, LoadImportableSessionRequest, OP_DISCOVER_IMPORTABLE_SESSIONS,
@@ -16,7 +17,7 @@ use bcode_session_models::{
     ClientId, SessionEventKind, SessionEventProvenance, SessionId, SessionImportSummary,
 };
 use sha2::{Digest as _, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -1027,6 +1028,7 @@ async fn load_source_service(
     .await
 }
 
+#[cfg(test)]
 fn import_error_response(error: &str) -> ErrorResponse {
     let (code, message) = match error {
         "session import configuration is unavailable" => (
@@ -1065,50 +1067,6 @@ fn import_error_response(error: &str) -> ErrorResponse {
 ///
 /// Returns an error if the response cannot be written or the imported session
 /// summary cannot be loaded.
-pub async fn handle_import_external_session(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    source_id: &str,
-    external_session_id: &str,
-    working_directory: Option<PathBuf>,
-) -> Result<(), ServerError> {
-    let Some(working_directory) = working_directory else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "import_cwd_required",
-                "session import requests must include the caller working directory",
-            )),
-        )
-        .await;
-    };
-    match import_external_session(state, source_id, external_session_id, &working_directory).await {
-        Ok((session_id, warnings)) => {
-            let session = state.sessions.session_summary(session_id).await?;
-            state
-                .session_catalog
-                .upsert_native_session(session.clone())
-                .await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::ExternalSessionImported { session, warnings }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(import_error_response(&error)),
-            )
-            .await
-        }
-    }
-}
-
 /// Resolve a synthetic external session ID into an imported native Bcode session ID.
 pub async fn resolve_attach_session_id(
     state: &Arc<ServerState>,

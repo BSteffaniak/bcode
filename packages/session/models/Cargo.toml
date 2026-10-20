@@ -11,12 +11,13 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_skill_models = { workspace = true }
-bcode_tool_models  = { workspace = true }
-serde              = { workspace = true, features = ["derive", "std"] }
-serde_json         = { workspace = true, features = ["std"] }
-thiserror          = { workspace = true }
-uuid               = { workspace = true, features = ["serde", "std", "v4"] }
+bcode_model_catalog_models = { workspace = true }
+bcode_skill_models         = { workspace = true }
+bcode_tool_models          = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true, features = ["std"] }
+thiserror                  = { workspace = true }
+uuid                       = { workspace = true, features = ["serde", "std", "v4"] }
 
 [dev-dependencies]
 

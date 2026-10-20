@@ -4,6 +4,151 @@
 #[path = "milestone/actor_tests.rs"]
 mod milestone_actor_tests;
 
+#[cfg(test)]
+mod child_transition_notification_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_child_transition_reply_still_notifies_once() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = crate::SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, root.path().into())
+            .await
+            .unwrap();
+        let handle = manager.session_handle(parent.id).await.unwrap();
+        let child = SessionId::new();
+        let mut notifications = manager.subscribe_mutations();
+        for published in [false, true] {
+            // On this current-thread runtime the mailbox enqueue completes without
+            // yielding; abandon the reply before the actor can process the command.
+            let (reply, receiver) = oneshot::channel();
+            handle
+                .commands
+                .send(SessionCommand::RecordChildTransition {
+                    child,
+                    title: None,
+                    published,
+                    activity_timestamp_ms: manager.next_activity_timestamp_ms(),
+                    mutations: manager.mutation_tx.clone(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            drop(receiver);
+            // The actor's next command is a barrier after the abandoned request.
+            handle
+                .record_child_transition(
+                    child,
+                    None,
+                    published,
+                    manager.next_activity_timestamp_ms(),
+                    manager.mutation_tx.clone(),
+                )
+                .await
+                .unwrap();
+            let notification = notifications.try_recv().expect("committed notification");
+            assert_eq!(notification.session_id, parent.id);
+            assert_eq!(notification.summary.id, parent.id);
+            assert!(if published {
+                matches!(notification.event.kind, SessionEventKind::SessionChildPublished { child_id, .. } if child_id == child)
+            } else {
+                matches!(notification.event.kind, SessionEventKind::SessionChildLinked { child_id } if child_id == child)
+            });
+            assert!(matches!(
+                notifications.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+        let events = manager.session_history(parent.id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind,
+                    SessionEventKind::SessionChildLinked { child_id } if child_id == child
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind,
+                    SessionEventKind::SessionChildPublished { child_id, .. } if child_id == child
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_child_transition_does_not_notify() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = crate::SessionManager::persistent_with_metrics_and_lease_owner(
+            root.path(),
+            bcode_metrics::MetricsRegistry::default(),
+            crate::lease::SessionLeaseOwnerContext {
+                daemon_instance_id: Some("notification-requester".into()),
+                build_fingerprint: Some("notification-test-build".into()),
+                ..crate::lease::SessionLeaseOwnerContext::default()
+            },
+        )
+        .unwrap();
+        let parent = manager
+            .create_session(None, root.path().into())
+            .await
+            .unwrap();
+        let handle = manager.session_handle(parent.id).await.unwrap();
+        handle.release_idle_resources().await.unwrap();
+        let foreign = crate::SessionManager::persistent_with_metrics_and_lease_owner(
+            root.path(),
+            bcode_metrics::MetricsRegistry::default(),
+            crate::lease::SessionLeaseOwnerContext {
+                daemon_instance_id: Some("notification-foreign-owner".into()),
+                build_fingerprint: Some("notification-test-build".into()),
+                ..crate::lease::SessionLeaseOwnerContext::default()
+            },
+        )
+        .unwrap();
+        let foreign_handle = foreign.session_handle(parent.id).await.unwrap();
+        let _ownership = foreign_handle
+            .acquire_ownership(SessionOwnershipKind::RuntimeWork)
+            .await
+            .unwrap();
+        let mut notifications = manager.subscribe_mutations();
+        for published in [false, true] {
+            assert!(
+                handle
+                    .record_child_transition(
+                        SessionId::new(),
+                        None,
+                        published,
+                        manager.next_activity_timestamp_ms(),
+                        manager.mutation_tx.clone(),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                notifications.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+        assert!(
+            !foreign
+                .session_history(parent.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    SessionEventKind::SessionChildLinked { .. }
+                        | SessionEventKind::SessionChildPublished { .. }
+                ))
+        );
+    }
+}
+
 mod milestone;
 
 use super::{
@@ -19,7 +164,7 @@ use bcode_metrics::MetricsContext;
 use bcode_session_models::{
     ProjectionWindowAnchor, SessionHistoryAroundQuery, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
-    SessionId, SessionInspectionPage, SessionInspectionQuery,
+    SessionId, SessionInspectionPage, SessionInspectionQuery, WorkId,
 };
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -409,6 +554,26 @@ impl SessionHandle {
         .await?
     }
 
+    /// Record one exact child transition through the canonical parent writer.
+    pub(crate) async fn record_child_transition(
+        &self,
+        child: SessionId,
+        title: Option<String>,
+        published: bool,
+        activity_timestamp_ms: u64,
+        mutations: broadcast::Sender<crate::SessionMutationCommitted>,
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        self.send(|reply| SessionCommand::RecordChildTransition {
+            child,
+            title,
+            published,
+            activity_timestamp_ms,
+            mutations,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn append_event_at_generation(
         &self,
         kind: SessionEventKind,
@@ -681,6 +846,14 @@ impl SessionHandle {
         self.send(SessionCommand::SubscribeEvents).await?
     }
 
+    pub(crate) async fn subscribe_events_bounded(
+        &self,
+        limits: bcode_session_models::SessionObservationSourceLimits,
+    ) -> Result<crate::BoundedSessionEventSubscription, SessionError> {
+        self.send(|reply| SessionCommand::SubscribeEventsBounded { limits, reply })
+            .await?
+    }
+
     pub async fn detach(&self, client_id: ClientId) -> Result<bool, SessionError> {
         self.send(|reply| SessionCommand::Detach { client_id, reply })
             .await?
@@ -730,6 +903,37 @@ impl SessionHandle {
     /// projection windows, or typed read models instead.
     pub async fn history(&self) -> Result<Vec<SessionEvent>, SessionError> {
         self.send(SessionCommand::History).await?
+    }
+
+    pub async fn projection_history_page_with_decode_budget(
+        &self,
+        request: ProjectionWindowRequest,
+        budget: crate::persisted::EventDecodeBudget,
+    ) -> Result<crate::ProjectionHistoryPage, crate::InitialObservationPageError> {
+        self.send(|reply| SessionCommand::InitialProjectionHistory {
+            request,
+            budget,
+            reply,
+        })
+        .await
+        .map_err(crate::InitialObservationPageError::from)?
+    }
+
+    pub async fn history_page_with_decode_budget(
+        &self,
+        query: SessionHistoryQuery,
+        budget: crate::persisted::EventDecodeBudget,
+    ) -> Result<
+        (SessionHistoryPage, crate::persisted::EventDecodeBudget),
+        crate::InitialObservationPageError,
+    > {
+        self.send(|reply| SessionCommand::HistoryPageWithDecodeBudget {
+            query,
+            budget,
+            reply,
+        })
+        .await
+        .map_err(crate::InitialObservationPageError::from)?
     }
 
     pub async fn history_page(
@@ -842,6 +1046,19 @@ impl SessionHandle {
 
     pub async fn active_tool_runs(&self) -> Result<Vec<crate::db::ToolRun>, SessionError> {
         self.send(SessionCommand::ActiveToolRuns).await?
+    }
+
+    pub async fn runtime_work_by_ids(
+        &self,
+        ids: Vec<WorkId>,
+        max_bytes: usize,
+    ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
+        self.send(|reply| SessionCommand::RuntimeWorkByIds {
+            ids,
+            max_bytes,
+            reply,
+        })
+        .await?
     }
 
     pub async fn active_runtime_work(
@@ -1110,6 +1327,14 @@ enum SessionCommand {
         activity_timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
+    RecordChildTransition {
+        child: SessionId,
+        title: Option<String>,
+        published: bool,
+        activity_timestamp_ms: u64,
+        mutations: broadcast::Sender<crate::SessionMutationCommitted>,
+        reply: oneshot::Sender<Result<Option<SessionEvent>, SessionError>>,
+    },
     AppendEventAtGeneration {
         kind: SessionEventKind,
         expected_generation: u64,
@@ -1135,6 +1360,10 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
     },
     SubscribeEvents(oneshot::Sender<Result<SessionEventReceivers, SessionError>>),
+    SubscribeEventsBounded {
+        limits: bcode_session_models::SessionObservationSourceLimits,
+        reply: oneshot::Sender<Result<crate::BoundedSessionEventSubscription, SessionError>>,
+    },
     Detach {
         client_id: ClientId,
         reply: oneshot::Sender<Result<bool, SessionError>>,
@@ -1164,6 +1393,23 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<super::SessionHealth, SessionError>>,
     },
     History(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
+    InitialProjectionHistory {
+        request: ProjectionWindowRequest,
+        budget: crate::persisted::EventDecodeBudget,
+        reply: oneshot::Sender<
+            Result<crate::ProjectionHistoryPage, crate::InitialObservationPageError>,
+        >,
+    },
+    HistoryPageWithDecodeBudget {
+        query: SessionHistoryQuery,
+        budget: crate::persisted::EventDecodeBudget,
+        reply: oneshot::Sender<
+            Result<
+                (SessionHistoryPage, crate::persisted::EventDecodeBudget),
+                crate::InitialObservationPageError,
+            >,
+        >,
+    },
     HistoryPage {
         query: SessionHistoryQuery,
         reply: oneshot::Sender<Result<SessionHistoryPage, SessionError>>,
@@ -1208,6 +1454,11 @@ enum SessionCommand {
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     InterruptedRecoveryWork(oneshot::Sender<Result<crate::InterruptedRecoveryWork, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
+    RuntimeWorkByIds {
+        ids: Vec<WorkId>,
+        max_bytes: usize,
+        reply: oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>,
+    },
     ActiveRuntimeWork {
         reply: oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>,
         queued: bcode_metrics::startup::Phase,
@@ -1335,7 +1586,7 @@ impl SessionActor {
         }
     }
 
-    async fn handle_command(&mut self, command: SessionCommand) -> bool {
+    async fn handle_usage_command(&mut self, command: SessionCommand) -> Option<SessionCommand> {
         match command {
             SessionCommand::RenormalizeUsage {
                 range,
@@ -1365,6 +1616,16 @@ impl SessionActor {
                 self.pending_original_usage = None;
                 let _ = reply.send(result);
             }
+            command => return Some(command),
+        }
+        None
+    }
+
+    async fn handle_command(&mut self, command: SessionCommand) -> bool {
+        let Some(command) = self.handle_usage_command(command).await else {
+            return false;
+        };
+        match command {
             SessionCommand::AppendEvent {
                 kind,
                 provenance,
@@ -1375,6 +1636,25 @@ impl SessionActor {
                     self.append_event(kind, provenance, activity_timestamp_ms)
                         .await,
                 );
+            }
+            SessionCommand::RecordChildTransition {
+                child,
+                title,
+                published,
+                activity_timestamp_ms,
+                mutations,
+                reply,
+            } => {
+                let result = self
+                    .record_child_transition(
+                        child,
+                        title,
+                        published,
+                        activity_timestamp_ms,
+                        &mutations,
+                    )
+                    .await;
+                let _ = reply.send(result);
             }
             SessionCommand::AppendEventAtGeneration {
                 kind,
@@ -1460,6 +1740,7 @@ impl SessionActor {
             | SessionCommand::RepriceUsage { .. }
             | SessionCommand::AppendUsage { .. }
             | SessionCommand::AppendEvent { .. }
+            | SessionCommand::RecordChildTransition { .. }
             | SessionCommand::AppendEventAtGeneration { .. }
             | SessionCommand::AppendToolInvocationResult { .. }
             | SessionCommand::AppendUserMessage { .. }
@@ -1582,6 +1863,9 @@ impl SessionActor {
                 .await;
                 let _ = reply.send(result);
             }
+            SessionCommand::SubscribeEventsBounded { limits, reply } => {
+                let _ = reply.send(Ok(self.state.subscribe_bounded(limits)));
+            }
             SessionCommand::SubscribeEvents(reply) => {
                 let _ = reply.send(Ok(self.subscribe_events()));
             }
@@ -1662,6 +1946,206 @@ impl SessionActor {
             }
             SessionCommand::Milestones { query, reply } => {
                 let _ = reply.send(self.milestones(query).await);
+            }
+            SessionCommand::InitialProjectionHistory {
+                request,
+                mut budget,
+                reply,
+            } => {
+                let result = async {
+                    let session_id = self.state.summary.id;
+                    let limit = request
+                        .limits
+                        .max_events_scanned
+                        .clamp(1, bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS);
+                    let (direction, cursor) = match request.anchor {
+                        ProjectionWindowAnchor::BeforeSequence(sequence) => (
+                            SessionHistoryDirection::Backward,
+                            Some(SessionHistoryCursor {
+                                sequence: sequence.saturating_sub(1),
+                            }),
+                        ),
+                        ProjectionWindowAnchor::AfterSequence(sequence) => (
+                            SessionHistoryDirection::Forward,
+                            Some(SessionHistoryCursor {
+                                sequence: sequence.saturating_add(1),
+                            }),
+                        ),
+                        ProjectionWindowAnchor::AroundSequence(sequence) => (
+                            SessionHistoryDirection::Forward,
+                            Some(SessionHistoryCursor {
+                                sequence: sequence
+                                    .saturating_sub(u64::try_from(limit / 2).unwrap_or(u64::MAX)),
+                            }),
+                        ),
+                        ProjectionWindowAnchor::Latest => (SessionHistoryDirection::Backward, None),
+                    };
+                    let query = SessionHistoryQuery {
+                        cursor,
+                        limit,
+                        direction,
+                    };
+                    // Complete the persisted branch before borrowing in-memory state.
+                    if let Some(db) = self.existing_session_db().await? {
+                        let first = db
+                            .history_page_with_decode_budget(query, &mut budget)
+                            .await?;
+                        let window = if matches!(request.anchor, ProjectionWindowAnchor::Latest) {
+                            let mut window = crate::projection::projection_window_from_events(
+                                &first.events,
+                                &request,
+                            )
+                            .ok_or(SessionError::UnsupportedProjectionWindow)?;
+                            window.has_older = window.has_older || first.has_more;
+                            window.has_newer = false;
+                            window
+                        } else {
+                            crate::projection::projection_window_from_events_with_source_bounds(
+                                &first.events,
+                                db.first_event_sequence()
+                                    .await
+                                    .map_err(SessionError::from)?,
+                                db.last_event_sequence().await.map_err(SessionError::from)?,
+                                &request,
+                            )
+                            .ok_or(SessionError::UnsupportedProjectionWindow)?
+                        };
+                        let Some(range) = window.source_range else {
+                            return Ok(crate::ProjectionHistoryPage {
+                                session_id,
+                                window,
+                                events: Vec::new(),
+                            });
+                        };
+                        let page = db
+                            .history_page_with_decode_budget(
+                                SessionHistoryQuery {
+                                    cursor: Some(SessionHistoryCursor {
+                                        sequence: range.start_sequence,
+                                    }),
+                                    limit: window.scanned_events.max(1),
+                                    direction: SessionHistoryDirection::Forward,
+                                },
+                                &mut budget,
+                            )
+                            .await?;
+                        let events = page
+                            .events
+                            .into_iter()
+                            .take_while(|event| event.sequence <= range.end_sequence)
+                            .collect::<Vec<_>>();
+                        if !page.compatibility_issues.is_empty()
+                            || events.first().map(|event| event.sequence)
+                                != Some(range.start_sequence)
+                            || events.last().map(|event| event.sequence) != Some(range.end_sequence)
+                        {
+                            return Err(SessionError::UnsupportedProjectionWindow.into());
+                        }
+                        return Ok(crate::ProjectionHistoryPage {
+                            session_id,
+                            window,
+                            events,
+                        });
+                    }
+                    let source_events = self
+                        .state
+                        .events
+                        .as_ref()
+                        .ok_or(SessionError::NotFound(session_id))?;
+                    let first = history_page_from_events_with_decode_budget(
+                        session_id,
+                        source_events,
+                        query,
+                        &mut budget,
+                    )?;
+                    let window = if matches!(request.anchor, ProjectionWindowAnchor::Latest) {
+                        let mut window = crate::projection::projection_window_from_events(
+                            &first.events,
+                            &request,
+                        )
+                        .ok_or(SessionError::UnsupportedProjectionWindow)?;
+                        window.has_older = window.has_older || first.has_more;
+                        window.has_newer = false;
+                        window
+                    } else {
+                        let (first_sequence, last_sequence) = (
+                            source_events.first().map(|event| event.sequence),
+                            source_events.last().map(|event| event.sequence),
+                        );
+                        crate::projection::projection_window_from_events_with_source_bounds(
+                            &first.events,
+                            first_sequence,
+                            last_sequence,
+                            &request,
+                        )
+                        .ok_or(SessionError::UnsupportedProjectionWindow)?
+                    };
+                    let Some(range) = window.source_range else {
+                        return Ok(crate::ProjectionHistoryPage {
+                            session_id: self.state.summary.id,
+                            window,
+                            events: Vec::new(),
+                        });
+                    };
+                    let query = SessionHistoryQuery {
+                        cursor: Some(SessionHistoryCursor {
+                            sequence: range.start_sequence,
+                        }),
+                        limit: window.scanned_events.max(1),
+                        direction: SessionHistoryDirection::Forward,
+                    };
+                    let page = history_page_from_events_with_decode_budget(
+                        session_id,
+                        source_events,
+                        query,
+                        &mut budget,
+                    )?;
+                    let events = page
+                        .events
+                        .into_iter()
+                        .take_while(|event| event.sequence <= range.end_sequence)
+                        .collect::<Vec<_>>();
+                    if !page.compatibility_issues.is_empty()
+                        || events.first().map(|event| event.sequence) != Some(range.start_sequence)
+                        || events.last().map(|event| event.sequence) != Some(range.end_sequence)
+                    {
+                        return Err(SessionError::UnsupportedProjectionWindow.into());
+                    }
+                    Ok(crate::ProjectionHistoryPage {
+                        session_id: self.state.summary.id,
+                        window,
+                        events,
+                    })
+                }
+                .await;
+                let _ = reply.send(result);
+            }
+            SessionCommand::HistoryPageWithDecodeBudget {
+                query,
+                mut budget,
+                reply,
+            } => {
+                let result = async {
+                    let db = self.existing_session_db().await?;
+                    if let Some(db) = db {
+                        let page = db
+                            .history_page_with_decode_budget(query, &mut budget)
+                            .await?;
+                        return Ok((page, budget));
+                    }
+                    let Some(events) = &self.state.events else {
+                        return Err(SessionError::NotFound(self.state.summary.id).into());
+                    };
+                    let page = history_page_from_events_with_decode_budget(
+                        self.state.summary.id,
+                        events,
+                        query,
+                        &mut budget,
+                    )?;
+                    Ok((page, budget))
+                }
+                .await;
+                let _ = reply.send(result);
             }
             SessionCommand::HistoryPage { query, reply } => {
                 let _ = reply.send(self.history_page(query).await);
@@ -1757,6 +2241,13 @@ impl SessionActor {
             }
             SessionCommand::ActiveToolRuns(reply) => {
                 let _ = reply.send(self.active_tool_runs().await);
+            }
+            SessionCommand::RuntimeWorkByIds {
+                ids,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(self.runtime_work_by_ids(&ids, max_bytes).await);
             }
             SessionCommand::ActiveRuntimeWork {
                 reply,
@@ -2545,6 +3036,78 @@ impl SessionActor {
         activity_timestamp_ms: u64,
         expected_generation: Option<u64>,
     ) -> Result<SessionEvent, SessionError> {
+        self.append_event_conditionally(
+            kind,
+            provenance,
+            activity_timestamp_ms,
+            expected_generation,
+            None,
+        )
+        .await?
+        .ok_or(SessionError::DbUnavailable(self.state.summary.id))
+    }
+
+    async fn record_child_transition(
+        &mut self,
+        child: SessionId,
+        title: Option<String>,
+        published: bool,
+        activity_timestamp_ms: u64,
+        mutations: &broadcast::Sender<crate::SessionMutationCommitted>,
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        let kind = if published {
+            SessionEventKind::SessionChildPublished {
+                child_id: child,
+                title,
+            }
+        } else {
+            SessionEventKind::SessionChildLinked { child_id: child }
+        };
+        let result = self
+            .append_event_conditionally(
+                kind,
+                None,
+                activity_timestamp_ms,
+                None,
+                Some((child, published)),
+            )
+            .await;
+        if let Ok(Some(event)) = &result {
+            // The actor owns committed notification even if the requester disappeared.
+            let _ = mutations.send(crate::SessionMutationCommitted {
+                session_id: event.session_id,
+                event: event.clone(),
+                summary: self.state.summary(),
+            });
+        }
+        result
+    }
+
+    async fn child_transition_recorded(
+        &self,
+        transition: Option<(SessionId, bool)>,
+    ) -> Result<bool, SessionError> {
+        let Some((child, published)) = transition else {
+            return Ok(false);
+        };
+        let db = self
+            .db
+            .as_ref()
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        Ok(db
+            .child_publication_receipt(child)
+            .await?
+            .is_some_and(|done| !published || done))
+    }
+
+    async fn append_event_conditionally(
+        &mut self,
+        kind: SessionEventKind,
+        provenance: Option<SessionEventProvenance>,
+        activity_timestamp_ms: u64,
+        expected_generation: Option<u64>,
+        child_transition: Option<(SessionId, bool)>,
+    ) -> Result<Option<SessionEvent>, SessionError> {
         self.ensure_ownership()?;
         let total_started_at = Instant::now();
         let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
@@ -2573,6 +3136,9 @@ impl SessionActor {
             self.ensure_session_db_for_write().await?;
             self.refresh_state_from_db_for_write().await?;
             self.validate_append_generation(expected_generation)?;
+            if self.child_transition_recorded(child_transition).await? {
+                return Ok(None);
+            }
             if let Some(metrics) = &metrics {
                 metrics.record_histogram(
                     "session.actor.append_event.readiness_duration_ms",
@@ -2612,17 +3178,8 @@ impl SessionActor {
             event.provenance = provenance;
             event
         };
-        self.project_memory_submission(&event)?;
-        self.state
-            .apply_persisted_event(event.clone(), activity_timestamp_ms);
-        self.retire_live_text_checkpoint_for_durable_event(&event.kind);
-        if matches!(event.kind, SessionEventKind::ModelUsage { .. }) {
-            let summary = self.session_usage_summary().await?;
-            self.state.total_metered_tokens = summary.cumulative_metered_tokens;
-            self.publish_live_event(SessionLiveEventKind::UsageSummaryChanged {
-                summary: Box::new(summary),
-            });
-        }
+        self.apply_appended_event(&event, activity_timestamp_ms)
+            .await?;
         let manifest_started_at = Instant::now();
         self.update_manifest_and_schedule_catalog().await;
         if let Some(metrics) = &metrics {
@@ -2639,7 +3196,26 @@ impl SessionActor {
                 elapsed_ms(total_started_at),
             );
         }
-        Ok(event)
+        Ok(Some(event))
+    }
+
+    async fn apply_appended_event(
+        &mut self,
+        event: &SessionEvent,
+        activity_timestamp_ms: u64,
+    ) -> Result<(), SessionError> {
+        self.project_memory_submission(event)?;
+        self.state
+            .apply_persisted_event(event.clone(), activity_timestamp_ms);
+        self.retire_live_text_checkpoint_for_durable_event(&event.kind);
+        if matches!(event.kind, SessionEventKind::ModelUsage { .. }) {
+            let summary = self.session_usage_summary().await?;
+            self.state.total_metered_tokens = summary.cumulative_metered_tokens;
+            self.publish_live_event(SessionLiveEventKind::UsageSummaryChanged {
+                summary: Box::new(summary),
+            });
+        }
+        Ok(())
     }
 
     fn project_memory_submission_lifecycle(
@@ -3667,6 +4243,30 @@ impl SessionActor {
         })
     }
 
+    async fn runtime_work_by_ids(
+        &mut self,
+        ids: &[WorkId],
+        max_bytes: usize,
+    ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
+        let session_id = self.state.summary.id;
+        let expected = self.state.next_sequence.saturating_sub(1);
+        let Some(db) = self.existing_session_db().await? else {
+            return Err(SessionError::DbUnavailable(session_id));
+        };
+        let checkpoint = db
+            .materialized_projection_checkpoint(MaterializedProjection::RuntimeWork)
+            .await?;
+        if checkpoint.is_none_or(|checkpoint| checkpoint < expected) {
+            return Err(SessionError::ProjectionStale {
+                session_id,
+                projection: "runtime_work",
+                checkpoint,
+                expected,
+            });
+        }
+        Ok(db.runtime_work_by_ids(ids, max_bytes).await?)
+    }
+
     async fn active_runtime_work(
         &mut self,
     ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
@@ -4036,6 +4636,59 @@ fn live_text_checkpoint_bytes(
             _ => None,
         })
         .sum()
+}
+
+fn history_page_from_events_with_decode_budget(
+    session_id: bcode_session_models::SessionId,
+    events: &[SessionEvent],
+    query: SessionHistoryQuery,
+    budget: &mut crate::persisted::EventDecodeBudget,
+) -> Result<SessionHistoryPage, crate::InitialObservationPageError> {
+    let limit = query.limit.max(1);
+    if limit > bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS {
+        return Err(crate::InitialObservationPageError::Canonical(
+            crate::db::SessionDbError::HistoryReadLimitExceeded {
+                requested: limit,
+                maximum: bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS,
+            }
+            .into(),
+        ));
+    }
+    let backwards = matches!(query.direction, SessionHistoryDirection::Backward);
+    let iter: Box<dyn Iterator<Item = &SessionEvent>> = if backwards {
+        Box::new(events.iter().rev())
+    } else {
+        Box::new(events.iter())
+    };
+    let mut matching = iter.filter(|event| {
+        query.cursor.is_none_or(|cursor| {
+            if backwards {
+                event.sequence <= cursor.sequence
+            } else {
+                event.sequence >= cursor.sequence
+            }
+        })
+    });
+    let mut page_events = Vec::new();
+    for event in matching.by_ref().take(limit) {
+        budget
+            .admit_source_clone(event)
+            .map_err(|_| crate::InitialObservationPageError::ResourceLimit)?;
+        page_events.push(event.clone());
+    }
+    let next_cursor = matching.next().map(|event| SessionHistoryCursor {
+        sequence: event.sequence,
+    });
+    if backwards {
+        page_events.reverse();
+    }
+    Ok(SessionHistoryPage {
+        session_id,
+        events: page_events,
+        compatibility_issues: Vec::new(),
+        has_more: next_cursor.is_some(),
+        next_cursor,
+    })
 }
 
 fn history_page_from_events(

@@ -9,6 +9,7 @@
 //! describe plugin-owned schemas, not host implementation versions.
 
 pub mod composer;
+pub mod interaction_controller;
 pub mod keymap;
 
 use serde::{Deserialize, Serialize};

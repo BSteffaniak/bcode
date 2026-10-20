@@ -236,6 +236,17 @@ async fn discover_receipt(
     original: &bcode_config::ResolvedModelSelection,
     provider: &str,
 ) -> Result<Option<ManagedDefaultRoute>, ModelRequestTargetError> {
+    // An unrelated provider must not depend on the optional managed-auth store.
+    // Discover capability ownership before loading its durable membership state.
+    if !state
+        .plugins
+        .auth_provider_registry()
+        .providers()
+        .iter()
+        .any(|registered| registered.plugin_id == provider)
+    {
+        return Ok(None);
+    }
     let runtime = if original
         .auth_pool
         .as_ref()
@@ -265,7 +276,10 @@ async fn discover_receipt(
         let compatibility = match declaration {
             Ok(value) => value,
             Err(bcode_plugin::PluginServiceCallError::Service { code, .. })
-                if code == "unsupported_operation" || code == "unsupported_provider" =>
+                if matches!(
+                    code.as_str(),
+                    "unsupported_operation" | "unsupported_provider" | "unsupported_interface"
+                ) =>
             {
                 continue;
             }

@@ -43,6 +43,7 @@ pub async fn effective_limits(
     run_id: &str,
     baseline: &WorkflowRunLimits,
 ) -> Result<WorkflowRunLimits, Error> {
+    super::admission_projection::package_binding(db, run_id).await?;
     let rows = db
         .select(OVERRIDES)
         .where_eq("run_id", run_id)

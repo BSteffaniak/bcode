@@ -7,6 +7,49 @@ mod child_activity_tests;
 mod storage_access_tests;
 
 use super::{ServerState, session_catalog::SessionCatalogSnapshot};
+
+/// Access the canonical working document with confined storage and retained runtime ownership.
+///
+/// # Errors
+/// Returns a normalized failure for ownership conflicts, invalid contracts or unsafe storage.
+pub async fn working_document(
+    state: &ServerState,
+    request: bcode_session_models::SessionWorkingDocumentRequest,
+) -> Result<
+    Option<bcode_session_models::SessionWorkingDocument>,
+    bcode_session_models::application::SessionApplicationFailure,
+> {
+    require_selected_location(state, request.session_id).await?;
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            request.session_id,
+            bcode_session::SessionOwnershipKind::RuntimeWork,
+        )
+        .await
+        .map_err(
+            |_| bcode_session_models::application::SessionApplicationFailure {
+                code: "working_document_unavailable".to_owned(),
+                message: "working document ownership is unavailable".to_owned(),
+            },
+        )?;
+    let root = state.sessions.session_store_root().ok_or_else(|| {
+        bcode_session_models::application::SessionApplicationFailure {
+            code: "working_document_unavailable".to_owned(),
+            message: "working document storage is unavailable".to_owned(),
+        }
+    })?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
+        bcode_session::working_document::access(&root, &request)
+    })
+    .await;
+    match result {
+        Ok(Ok(document)) => Ok(document),
+        _ => Err(bcode_session_models::application::SessionApplicationFailure { code: "working_document_unavailable".to_owned(), message: "working document unavailable: check ownership, contract version, size and confined storage".to_owned() }),
+    }
+}
+
 use bcode_session_models::SessionCatalogStatus;
 use bcode_session_models::SessionSummary;
 use std::{
@@ -353,6 +396,35 @@ pub async fn submit_turn(
     admission: bcode_session_models::TurnAdmissionMetadata,
     ownership: &mut Option<bcode_session::SessionOwnershipGuard>,
 ) -> Result<bcode_session_models::TurnAdmission, SubmitTurnError> {
+    let runtime_context = state.client_runtime_context(client_id).await;
+    Box::pin(submit_turn_with_runtime_context(
+        state,
+        session_id,
+        client_id,
+        text,
+        admission,
+        ownership,
+        runtime_context,
+    ))
+    .await
+}
+
+/// Admit a turn with an already verified, request-scoped runtime context.
+///
+/// This host-only context never replaces the caller's shared context. Admission ownership,
+/// exact retries and durable receipts use the same canonical path as ordinary submission.
+/// # Errors
+/// Returns canonical admission or dispatch failures; dispatch failure does not undo admission.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_turn_with_runtime_context(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+    client_id: bcode_session_models::ClientId,
+    text: String,
+    admission: bcode_session_models::TurnAdmissionMetadata,
+    ownership: &mut Option<bcode_session::SessionOwnershipGuard>,
+    runtime_context: Option<super::ClientRuntimeContext>,
+) -> Result<bcode_session_models::TurnAdmission, SubmitTurnError> {
     let mut admission = admission;
     // Public callers cannot supply host-associated activity display metadata.
     admission.activity = None;
@@ -368,9 +440,16 @@ pub async fn submit_turn(
     );
     let admission_lock = super::turn_admission_lock(state, session_id).await;
     let admission_guard = admission_lock.lock().await;
-    let (admission, user_event) = super::admit_turn(state, session_id, client_id, text, admission)
-        .await
-        .map_err(SubmitTurnError::Admission)?;
+    let (admission, user_event) = super::admit_turn_inner(
+        state,
+        session_id,
+        client_id,
+        text,
+        admission,
+        runtime_context.clone(),
+    )
+    .await
+    .map_err(SubmitTurnError::Admission)?;
     let user_event = match &admission {
         bcode_session_models::TurnAdmission::Existing(receipt)
         | bcode_session_models::TurnAdmission::Deferred(receipt) => {
@@ -387,7 +466,7 @@ pub async fn submit_turn(
             session_id,
             super::FollowupCommand::ExecuteTurn {
                 client_id,
-                runtime_context: state.client_runtime_context(client_id).await,
+                runtime_context,
                 user_event: Box::new(user_event),
                 queued_steering: None,
                 cancel_state: None,
@@ -407,7 +486,7 @@ pub enum InvokeSkillError {
     /// Skill support is disabled for this session.
     Disabled,
     /// The requested skill is absent from the session registry.
-    Unknown(bcode_skill_models::SkillId),
+    Unknown,
     /// Execution metadata is invalid.
     Invalid(bcode_session::SessionError),
     /// Session ownership could not be acquired.
@@ -442,7 +521,7 @@ pub async fn invoke_skill(
     let summary = registry
         .summary(&skill_id)
         .cloned()
-        .ok_or_else(|| InvokeSkillError::Unknown(skill_id.clone()))?;
+        .ok_or(InvokeSkillError::Unknown)?;
     (bcode_session_models::TurnAdmissionMetadata {
         execution: execution.clone(),
         ..bcode_session_models::TurnAdmissionMetadata::default()
@@ -621,6 +700,53 @@ pub async fn model_status(
         super::session_model_selection_with_runtime_context(state, session_id, runtime_context)
             .await;
     super::model_status_for_selection(state, selection, Some(session_id), &config).await
+}
+
+/// Resolve the session's user-visible model inventory under the verified caller context.
+///
+/// # Errors
+/// Returns a normalized failure when canonical provider resolution or inventory is unavailable.
+pub async fn list_models_for_session(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+    provider_plugin_id: Option<String>,
+) -> Result<
+    bcode_model_catalog::application::ApplicationModelList,
+    bcode_model_catalog::application::ModelApplicationFailure,
+> {
+    let selection = super::session_model_selection_with_runtime_context(
+        state,
+        session_id,
+        state.client_runtime_context(client_id).await,
+    )
+    .await;
+    let provider = provider_plugin_id.or(selection.provider_plugin_id);
+    let mut models = super::resolved_provider_models_view(
+        state,
+        provider.clone(),
+        bcode_model::ModelListRequest {
+            provider_context: selection.provider_context,
+            selected_model_id: selection.model_id,
+        },
+        bcode_model_catalog::ModelListView::UserVisible,
+    )
+    .await
+    .map_err(
+        |_| bcode_model_catalog::application::ModelApplicationFailure {
+            code: "model_list_failed".to_owned(),
+            message: "provider model list unavailable".to_owned(),
+        },
+    )?;
+    if let Ok(rules) = bcode_config::effective_model_ignore_rules(
+        provider.as_deref().unwrap_or("bcode.openai-compatible"),
+    ) {
+        super::model_ignores::apply_model_ignores(&mut models.models, &rules);
+    }
+    Ok(bcode_model_catalog::application::ApplicationModelList {
+        provider_plugin_id: provider,
+        models,
+    })
 }
 
 /// Return normalized default model status for a client's runtime context.

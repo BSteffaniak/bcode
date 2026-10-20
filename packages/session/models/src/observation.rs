@@ -68,6 +68,8 @@ pub struct SessionObservationRequest {
     pub max_updates: usize,
     /// Maximum encoded bytes in one semantic snapshot or source update. Initial source history
     /// must also fit this budget. Oversized inputs are not projected and snapshots are not delivered.
+    /// Hosts additionally enforce structural retention admission across source leases, semantic
+    /// state, pending delivery, retry cache, and outstanding replies; encoded size is not heap usage.
     pub max_snapshot_bytes: usize,
 }
 
@@ -119,11 +121,16 @@ pub enum SessionObservationEnd {
         /// Broadcast-reported lost updates, or None for a sequence/integrity gap.
         skipped: Option<u64>,
     },
-    /// Configured cumulative work, source-input, or semantic snapshot size bound was reached.
+    /// Configured cumulative work, source-input, semantic snapshot size, or retained-reply
+    /// admission bound was reached. No denied snapshot is exposed. Retained-reply admission
+    /// denial does not consume the requested delivery sequence.
     /// Open a fresh bounded observation to resync; this is not an execution terminal outcome.
     LimitReached,
     /// Unsupported durable schema or inconsistent session identity encountered.
     IncompatibleSource,
+    /// The application connection was lost or its observation handle became unavailable.
+    /// A fresh observation is required; no delivery replay or durable resume is implied.
+    Unavailable,
 }
 
 /// Independent source continuity; durable and live sources do not share an ordering clock.
@@ -134,6 +141,62 @@ pub enum SessionObservationSource {
     Durable,
     /// Ephemeral semantic updates, unavailable for durable replay.
     Live,
+    /// Both durable and live updates were lost; no shared ordering is implied.
+    Both,
+}
+
+/// Maximum hosted observations across one daemon.
+pub const MAX_HOSTED_SESSION_OBSERVATIONS: usize = 64;
+/// Maximum hosted observations retained by one authenticated client.
+pub const MAX_CLIENT_SESSION_OBSERVATIONS: usize = 8;
+/// Hosted cumulative source update bound.
+pub const MAX_HOSTED_OBSERVATION_UPDATES: usize = 10_000;
+/// Hosted per-snapshot/source encoded byte bound.
+pub const MAX_HOSTED_OBSERVATION_BYTES: usize = 1024 * 1024;
+/// Hosted cumulative encoded source budget, including projection bookkeeping.
+/// This is a policy budget, not a claim that encoded and decoded heap sizes are equal.
+pub const MAX_HOSTED_OBSERVATION_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum long-poll wait; receiving no delivery does not advance sequence.
+pub const MAX_OBSERVATION_PULL_WAIT_MS: u32 = 1000;
+
+/// Ephemeral client-bound observation reference, not a durable resume token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionObservationHandle {
+    /// Contract compatibility version.
+    pub schema_version: u16,
+    /// Opaque host-generated identity; authorization also checks connection owner.
+    pub handle_id: String,
+    /// Canonical observed session.
+    pub session_id: SessionId,
+}
+
+/// Bounded pull with conflict-safe observation-local sequence admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionObservationPullRequest {
+    /// Contract compatibility version.
+    pub schema_version: u16,
+    /// Host-generated observation identity.
+    pub handle_id: String,
+    /// Next expected delivery sequence; exact previous delivery retries are safe.
+    pub expected_sequence: u64,
+    /// Maximum wait for a new semantic delivery, in milliseconds.
+    pub wait_ms: u32,
+}
+
+/// One bounded semantic pull result; no raw event projection occurs in clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionObservationPullResult<T> {
+    /// Contract compatibility version.
+    pub schema_version: u16,
+    /// Exact host-generated observation identity.
+    pub handle_id: String,
+    /// One ordered delivery, or None when the bounded wait elapsed.
+    pub delivery: Option<SessionObservationEnvelope<T>>,
+    /// No further deliveries remain; true only after terminal delivery was consumed.
+    pub finished: bool,
 }
 
 /// Normalized secret-safe observation admission failure.
@@ -152,6 +215,15 @@ pub enum SessionObservationError {
     /// Bounded canonical read could not be verified; explicit maintenance may be necessary.
     #[error("session observation unavailable; inspect session storage status")]
     Unavailable,
+    /// Observation belongs to another authenticated connection.
+    #[error("session observation caller is not authorized")]
+    Unauthorized,
+    /// Pull sequence conflicts with the retained delivery.
+    #[error("session observation delivery sequence conflict")]
+    Conflict,
+    /// Hosted resource limits prevent admission.
+    #[error("session observation resource limit reached")]
+    LimitReached,
 }
 
 #[cfg(test)]

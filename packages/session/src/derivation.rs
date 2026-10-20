@@ -576,6 +576,7 @@ impl SessionManager {
                 provenance: None,
                 kind: SessionEventKind::ChildSessionCreated {
                     request: Box::new(request.clone()),
+                    spawning: None,
                 },
             };
             db.append_event_batch(&[(event, Some(created_at_ms))])

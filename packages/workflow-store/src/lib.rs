@@ -392,6 +392,35 @@ pub enum EndedOwnerLiveness {
     NoLiveTrace,
 }
 
+/// Immutable package publication selected at represented root admission.
+///
+/// Version applies only to package execution. Generic lifecycle operations do not interpret it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunPackageBinding {
+    /// Package binding compatibility boundary; current execution supports version 1.
+    pub version: u32,
+    /// Exact immutable publication identity.
+    pub package_id: String,
+    /// Canonical SHA-256 digest of the publication lock.
+    pub lock_digest: String,
+}
+
+/// Source-compatible extension of the bare admission payload.
+///
+/// Older admission readers retain their generic lifecycle semantics. Package execution must
+/// recover and verify this binding through canonical lineage, including children written by
+/// older readers which omitted the extension. No admission is rewritten during reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepresentedWorkflowAdmission {
+    /// Existing admission fields remain at the document root.
+    #[serde(flatten)]
+    pub admission: NewWorkflowRun,
+    /// Optional package context; absence does not authorize package-local execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_binding: Option<WorkflowRunPackageBinding>,
+}
+
 /// Durable workflow run creation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewWorkflowRun {
@@ -941,6 +970,11 @@ pub enum WorkflowStoreError {
         /// Sole supported clean-break schema version.
         expected: u32,
     },
+    /// Uncapped admission cannot be represented by the retained coexistence baseline.
+    #[error(
+        "workflow store baseline requires an explicit finite concurrency_cap; uncapped admission requires a supported representation prepared through capability-validated admission or authorized maintenance"
+    )]
+    UnsupportedUncappedConcurrency,
     /// Upgrade coordination could not verify exclusive ownership within its bounded wait.
     #[error(
         "workflow storage upgrade is blocked by another owner; retry after that owner releases the store"

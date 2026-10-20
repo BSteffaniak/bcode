@@ -117,6 +117,7 @@ pub async fn snapshot_in(
         .execute(tx)
         .await?;
     let root = roots.first().ok_or(Error::InvalidAdmission)?;
+    super::admission_projection::package_binding(tx, run).await?;
     let admission: crate::NewWorkflowRun = serde_json::from_str(&text(root, "admission_json")?)
         .map_err(|_| Error::MaintenanceRequired)?;
     let mut query = tx

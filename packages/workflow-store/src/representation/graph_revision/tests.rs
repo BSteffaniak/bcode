@@ -8,6 +8,16 @@ async fn fixture() -> (
     WorkflowExecutionAuthority,
     WorkflowDefinition,
 ) {
+    fixture_with_binding(None).await
+}
+
+async fn fixture_with_binding(
+    binding: Option<&crate::WorkflowRunPackageBinding>,
+) -> (
+    Box<dyn Database>,
+    WorkflowExecutionAuthority,
+    WorkflowDefinition,
+) {
     let db = database().await;
     super::super::install(&*db).await.unwrap();
     let definition = bcode_workflow::WorkflowBuilder::new(
@@ -25,9 +35,14 @@ async fn fixture() -> (
         bcode_workflow::WorkflowDefinitionIdentity::for_definition("edit", &definition).unwrap();
     request.definition_id = id.definition_id;
     request.definition_version = id.definition_version;
-    super::super::admit(&*db, &request, &definition)
+    let tx = db.begin_transaction().await.unwrap();
+    super::super::admit_package_in(&*tx, &request, &definition, binding)
         .await
         .unwrap();
+    super::super::hierarchy::register_root(&*tx, &request)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let owner = WorkflowExecutionAuthority {
         target_artifact_id: "a".into(),
         daemon_instance_id: "d".into(),
@@ -39,6 +54,51 @@ async fn fixture() -> (
         .unwrap();
     (db, owner, definition)
 }
+#[tokio::test]
+async fn bound_revision_retries_preserve_admission_and_unknown_execution_is_rejected() {
+    let binding = crate::WorkflowRunPackageBinding {
+        version: 1,
+        package_id: "test/edit".into(),
+        lock_digest: "a".repeat(64),
+    };
+    let (db, owner, definition) = fixture_with_binding(Some(&binding)).await;
+    let batch = edit(&definition);
+    assert_eq!(publish(&*db, &owner, &batch).await.unwrap(), 2);
+    assert_eq!(publish(&*db, &owner, &batch).await.unwrap(), 2);
+    assert_eq!(
+        super::super::admission_projection::package_binding(&*db, "edit")
+            .await
+            .unwrap(),
+        Some(binding.clone())
+    );
+    let rows = db
+        .select(super::super::RUNS)
+        .columns(&["admission_json"])
+        .where_eq("run_id", "edit")
+        .limit(1)
+        .execute(&*db)
+        .await
+        .unwrap();
+    let Some(DatabaseValue::String(json)) = rows[0].get("admission_json") else {
+        panic!("admission");
+    };
+    let old_reader: crate::NewWorkflowRun = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        old_reader.definition_id,
+        bcode_workflow::WorkflowDefinitionIdentity::for_definition("edit", &definition)
+            .unwrap()
+            .definition_id
+    );
+    let mut future = binding;
+    future.version = 999;
+    let (db, owner, definition) = fixture_with_binding(Some(&future)).await;
+    assert!(matches!(
+        publish(&*db, &owner, &edit(&definition)).await,
+        Err(Error::UnsupportedLifecycle)
+    ));
+    assert_eq!(current(&*db, "edit").await.unwrap().0, 1);
+}
+
 fn edit(definition: &WorkflowDefinition) -> WorkflowRunGraphEditBatch {
     let mut node = definition.nodes["last"].clone();
     node.id = "worker".into();

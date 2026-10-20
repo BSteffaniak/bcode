@@ -7,6 +7,11 @@ description  = "Interactive read-only question/ask tool"
 interface_id = "bcode.tool/v1"
 name         = "Question Tool"
 
+[[services]]
+description  = "Renderer-neutral semantic question interaction controller"
+interface_id = "bcode.interaction-controller/v1"
+name         = "Question Interaction Controller"
+
 [[visual_adapters]]
 artifact_schema    = "bcode.question.outcome"
 id                 = "question-outcome-component"

@@ -1,7 +1,7 @@
 //! Admission from the exact immutable registered definition, checked in the admission transaction.
 use super::{
     Database, DatabaseValue, FilterableQuery, GraphAdmissionPolicy, RepresentationAdmission,
-    RepresentationError, TransactionMode, admit_in, hierarchy, verified,
+    RepresentationError, TransactionMode, hierarchy, verified,
 };
 /// Admit a run only when its supplied definition exactly matches the registered ID/version.
 ///
@@ -30,6 +30,19 @@ pub async fn admit_registered_observed(
     definition: &bcode_workflow::WorkflowDefinition,
     capture: bool,
 ) -> Result<RepresentationAdmission, RepresentationError> {
+    admit_registered_package_observed(db, run, definition, capture, None).await
+}
+
+/// Admit against the exact publication and registered definition in the same transaction.
+/// # Errors
+/// Rejects unsupported binding versions, publication/member drift and ordinary admission failures.
+pub async fn admit_registered_package_observed(
+    db: &dyn Database,
+    run: &crate::NewWorkflowRun,
+    definition: &bcode_workflow::WorkflowDefinition,
+    capture: bool,
+    package: Option<&crate::WorkflowRunPackageBinding>,
+) -> Result<RepresentationAdmission, RepresentationError> {
     let json =
         serde_json::to_string(definition).map_err(|_| RepresentationError::InvalidAdmission)?;
     GraphAdmissionPolicy::default().check(json.len())?;
@@ -37,6 +50,22 @@ pub async fn admit_registered_observed(
         .begin_transaction_with_mode(TransactionMode::Immediate)
         .await?;
     verified(&*tx).await?;
+    if definition.nodes.values().any(|node| {
+        node.kind == bcode_workflow::NodeKind::WorkflowCall
+            && serde_json::from_value::<bcode_workflow::WorkflowCallConfiguration>(
+                node.configuration.clone(),
+            )
+            .is_ok_and(|call| {
+                matches!(
+                    call.target,
+                    bcode_workflow::WorkflowCallTarget::PackageLocal { .. }
+                        | bcode_workflow::WorkflowCallTarget::PackageMember { .. }
+                )
+            })
+    }) && package.is_none()
+    {
+        return Err(RepresentationError::InvalidAdmission);
+    }
     let rows = tx
         .select("workflow_definitions")
         .columns(&["definition_json", "checksum_sha256"])
@@ -67,7 +96,10 @@ pub async fn admit_registered_observed(
     // Install/verify membership observers under the same writer transaction before any
     // admission facts. This is current-inventory fencing, not historical backfill.
     Box::pin(super::inventory::install_in(&*tx)).await?;
-    let result = admit_in(&*tx, run, definition).await?;
+    if let Some(binding) = package {
+        super::admission_projection::verify_member(&*tx, binding, run, definition).await?;
+    }
+    let result = Box::pin(super::admit_package_in(&*tx, run, definition, package)).await?;
     if !result.already_present {
         hierarchy::register_root(&*tx, run).await?;
     }

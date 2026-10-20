@@ -1,5 +1,71 @@
 use super::*;
 
+#[tokio::test]
+async fn concurrent_page_preserves_resource_exclusion_and_active_cancellation() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
+    for shared_reads in [false, true] {
+        let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+        let _gate = super::fanout::ReleaseGate(
+            state.selected_provider_context.settings["delegation_fixture_gate"].clone(),
+        );
+        let mut definition = parallel_provider_definition();
+        for id in ["left", "right"] {
+            definition.nodes.get_mut(id).expect("worker").resources =
+                vec![bcode_workflow::ResourceClaim {
+                    resource: "page-fixture".into(),
+                    access: if shared_reads {
+                        bcode_workflow::ResourceAccess::Read
+                    } else {
+                        bcode_workflow::ResourceAccess::Write
+                    },
+                }];
+        }
+        super::fanout::start_public(
+            &state,
+            "resource-page",
+            definition,
+            serde_json::json!(1),
+            None,
+        )
+        .await;
+        let db = open(&crate::workflow_store_path(&state), false).expect("db");
+        let pending = representation::attempts::pending(&db, "resource-page", None, 10)
+            .await
+            .expect("pending");
+        assert_eq!(pending.len(), if shared_reads { 2 } else { 1 });
+        assert!(pending.iter().all(|attempt| attempt.receipt.is_some()));
+        crate::workflow_operations::cancel_run(&state, "resource-page")
+            .await
+            .expect("cancel active admissions");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                crate::drive_workflow_run(&state, "resource-page")
+                    .await
+                    .expect("drive");
+                if status(&state, "resource-page")
+                    .await
+                    .expect("status")
+                    .expect("run")
+                    .status
+                    == bcode_workflow::RunStatus::Cancelled
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        stop_fixture_driver(&state).await;
+        result.expect("all active owners settle cancellation");
+        assert!(
+            representation::attempts::pending(&db, "resource-page", None, 10)
+                .await
+                .expect("settled")
+                .is_empty()
+        );
+    }
+}
+
 fn collected_definition() -> bcode_workflow::WorkflowDefinition {
     let config = |schema| {
         serde_json::from_value::<bcode_workflow::WorkflowPromptConfiguration>(
@@ -69,6 +135,7 @@ fn collected_definition() -> bcode_workflow::WorkflowDefinition {
 
 #[tokio::test]
 async fn normal_collect_outcomes_preserves_failed_worker_and_runs_integrator() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
     let mut cleanup = FixtureCleanup::new(&state);
     state.start_workflow_driver().await;
@@ -101,28 +168,13 @@ async fn normal_collect_outcomes_preserves_failed_worker_and_runs_integrator() {
 
 #[tokio::test]
 async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, mut state, _) = typed_provider_fixture_with_delegation(true).await;
     let gate = super::fanout::ReleaseGate(
         state.selected_provider_context.settings["delegation_fixture_gate"].clone(),
     );
     let marker = uuid::Uuid::new_v4().to_string();
-    let error: bcode_model::ProviderError=serde_json::from_value(serde_json::json!({"code":"fixture_failure","category":"invalid_request","message":"scripted terminal worker failure","retryable":false,"provider_message":null})).expect("error");
-    let script = bcode_fake_provider_plugin::FakeProviderEventScript {
-        steps: vec![
-            bcode_fake_provider_plugin::FakeProviderEventScriptStep {
-                gate: None,
-                delay_ms: Some(500),
-                event: bcode_model::ProviderTurnEvent::Error { error },
-            },
-            bcode_fake_provider_plugin::FakeProviderEventScriptStep {
-                gate: None,
-                delay_ms: None,
-                event: bcode_model::ProviderTurnEvent::TurnFinished {
-                    stop_reason: bcode_model::StopReason::Error,
-                },
-            },
-        ],
-    };
+    let script = delayed_failure_script();
     std::sync::Arc::get_mut(&mut state)
         .expect("unique fixture")
         .selected_provider_context
@@ -199,12 +251,38 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
         1
     );
     drop(gate);
+    // The unrelated run deliberately remains active above. Settle it explicitly before
+    // the fixture's drain-before-shutdown checkpoint.
+    crate::workflow_operations::cancel_run(&state, "new")
+        .await
+        .expect("cancel unrelated fixture run after isolation assertion");
     cleanup.finish().await;
     drop(cleanup);
 }
 
+fn delayed_failure_script() -> bcode_fake_provider_plugin::FakeProviderEventScript {
+    let error: bcode_model::ProviderError=serde_json::from_value(serde_json::json!({"code":"fixture_failure","category":"invalid_request","message":"scripted terminal worker failure","retryable":false,"provider_message":null})).expect("error");
+    bcode_fake_provider_plugin::FakeProviderEventScript {
+        steps: vec![
+            bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                gate: None,
+                delay_ms: Some(500),
+                event: bcode_model::ProviderTurnEvent::Error { error },
+            },
+            bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                gate: None,
+                delay_ms: None,
+                event: bcode_model::ProviderTurnEvent::TurnFinished {
+                    stop_reason: bcode_model::StopReason::Error,
+                },
+            },
+        ],
+    }
+}
+
 #[tokio::test]
 async fn public_retry_dispatches_exact_next_attempt_without_replaying_first() {
+    let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions, state, _) = typed_provider_fixture().await;
     let mut cleanup = FixtureCleanup::new(&state);
     let failed = collected_definition().nodes["left"].clone();

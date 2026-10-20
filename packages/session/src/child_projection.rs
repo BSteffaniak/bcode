@@ -175,18 +175,112 @@ impl SessionDb {
 
     /// Exact bounded relationship receipt lookup for idempotent publication.
     /// # Errors
-    /// Fails if the index cannot be read or the receipt is malformed.
+    /// Fails for absent/stale checkpoints, concurrent canonical changes, unreadable indexes,
+    /// or malformed receipts. Never repairs derived state.
     pub async fn child_publication_receipt(
         &self,
         child: SessionId,
     ) -> SessionDbResult<Option<bool>> {
-        self.database()
+        let database = self.database();
+        let tail = self.last_event_sequence().await?.ok_or_else(invalid)?;
+        let checkpoint = database
+            .select("session_children_checkpoint")
+            .columns(&["event_seq", "coverage"])
+            .where_eq("singleton", 1_i64)
+            .execute_first(database)
+            .await?
+            .ok_or_else(invalid)?;
+        if u64::try_from(required_i64(&checkpoint, "event_seq")?).ok() != Some(tail)
+            || !matches!(required_i64(&checkpoint, "coverage")?, 0 | 1)
+        {
+            return Err(invalid());
+        }
+        let receipt = database
             .select("session_children")
             .columns(&["published"])
             .where_eq("child_id", child.to_string())
-            .execute_first(self.database())
+            .execute_first(database)
             .await?
-            .map(|row| required_i64(&row, "published").map(|value| value == 1))
-            .transpose()
+            .map(|row| match required_i64(&row, "published")? {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(invalid()),
+            })
+            .transpose()?;
+        if self.last_event_sequence().await? != Some(tail) {
+            return Err(invalid());
+        }
+        Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_child_receipt_checkpoint_fails_without_repair_or_append() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = crate::SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, root.path().into())
+            .await
+            .unwrap();
+        let child = SessionId::new();
+        let handle = manager.session_handle(parent.id).await.unwrap();
+        handle
+            .append_event(SessionEventKind::SessionChildLinked { child_id: child }, 1)
+            .await
+            .unwrap();
+        handle
+            .append_event(
+                SessionEventKind::SessionChildPublished {
+                    child_id: child,
+                    title: None,
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(handle.release_idle_resources().await.unwrap());
+        let db = SessionDb::open_existing_turso_in_root(parent.id, root.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.child_publication_receipt(child).await.unwrap(),
+            Some(true)
+        );
+        let tail = db.last_event_sequence().await.unwrap();
+        let database = db.database();
+        database
+            .update("session_children_checkpoint")
+            .value("event_seq", 0_i64)
+            .where_eq("singleton", 1_i64)
+            .execute(database)
+            .await
+            .unwrap();
+        for id in [child, SessionId::new()] {
+            assert!(db.child_publication_receipt(id).await.is_err());
+        }
+        assert_eq!(db.last_event_sequence().await.unwrap(), tail);
+        let checkpoint = database
+            .select("session_children_checkpoint")
+            .columns(&["event_seq"])
+            .where_eq("singleton", 1_i64)
+            .execute_first(database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(required_i64(&checkpoint, "event_seq").unwrap(), 0);
+        let receipt = database
+            .select("session_children")
+            .columns(&["published"])
+            .where_eq("child_id", child.to_string())
+            .execute_first(database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(required_i64(&receipt, "published").unwrap(), 1);
+        db.close().await.unwrap();
     }
 }

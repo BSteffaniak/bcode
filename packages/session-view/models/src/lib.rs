@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+/// Structural accounting utilities for bounded semantic observation.
+pub mod retention;
+
 #[cfg(test)]
 mod renderer_fixtures;
 #[cfg(test)]
@@ -118,6 +121,12 @@ pub type ViewRevision = u64;
 pub struct TranscriptViewItemId(String);
 
 impl TranscriptViewItemId {
+    /// Inspect owned identifier capacity without allocating a serialized copy.
+    #[must_use]
+    pub const fn retention_usage(&self, depth: usize) -> retention::ObservationRetentionUsage {
+        retention::ObservationRetentionUsage::string(&self.0, depth)
+    }
+
     /// Create an identifier from a stable namespaced key.
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
@@ -1542,6 +1551,49 @@ pub struct PluginStatusView {
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
+impl PluginStatusView {
+    /// Inspect all owned status fields without cloning JSON metadata.
+    ///
+    /// # Errors
+    /// Returns an error on a structural limit or accounting overflow.
+    pub fn retention_usage(
+        &self,
+        limits: retention::ObservationRetentionLimits,
+    ) -> Result<retention::ObservationRetentionUsage, retention::ObservationRetentionExceeded> {
+        use retention::{ObservationRetentionExceeded, ObservationRetentionUsage};
+        let Self {
+            plugin_id,
+            note_id,
+            text,
+            priority: _,
+            metadata,
+        } = self;
+        let mut usage = ObservationRetentionUsage {
+            value_nodes: 2,
+            depth: 1,
+            ..ObservationRetentionUsage::default()
+        };
+        usage.check(limits)?;
+        for scalar in [plugin_id, note_id, text] {
+            usage.try_add(ObservationRetentionUsage::string(scalar, 2), limits)?;
+        }
+        usage.try_add(
+            ObservationRetentionUsage::collection(metadata.len(), 2),
+            limits,
+        )?;
+        for (key, value) in metadata {
+            usage.try_add(ObservationRetentionUsage::string(key, 3), limits)?;
+            let mut nested = ObservationRetentionUsage::json(value, limits)?;
+            nested.depth = nested
+                .depth
+                .checked_add(2)
+                .ok_or(ObservationRetentionExceeded)?;
+            usage.try_add(nested, limits)?;
+        }
+        Ok(usage)
+    }
+}
+
 /// Runtime work visible to renderers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkView {
@@ -1632,6 +1684,79 @@ impl SessionCostSummary {
             }
             None => {}
         }
+    }
+
+    /// Rebuild cost totals with new keys admitted while the previous summary remains charged.
+    ///
+    /// The returned summary remains charged to `retained`. The caller releases the
+    /// old summary only after replacement. Failure drops staging and restores the ledger.
+    ///
+    /// # Errors
+    /// Returns an error before any unadmitted allocation on a structural limit or overflow.
+    pub fn rebuild_admitted<'a>(
+        values: impl Iterator<Item = &'a SessionTokenUsage>,
+        retained: &mut retention::ObservationRetentionUsage,
+        limits: retention::ObservationRetentionLimits,
+    ) -> Result<Self, retention::ObservationRetentionExceeded> {
+        let before = *retained;
+        retained.try_add(retention::inspect_cost(&Self::default(), limits)?, limits)?;
+        let mut staged = Self::default();
+        for value in values {
+            if let Err(error) = staged.observe_admitted(value, retained, limits) {
+                drop(staged);
+                *retained = before;
+                return Err(error);
+            }
+        }
+        Ok(staged)
+    }
+
+    /// Record usage after reserving any new currency map entry and key allocation.
+    /// Existing entries require no key clone; rejection leaves both summary and ledger unchanged.
+    ///
+    /// # Errors
+    /// Returns an error before mutation on a retention limit or arithmetic overflow.
+    pub fn observe_admitted(
+        &mut self,
+        usage: &SessionTokenUsage,
+        retained: &mut retention::ObservationRetentionUsage,
+        limits: retention::ObservationRetentionLimits,
+    ) -> Result<(), retention::ObservationRetentionExceeded> {
+        use retention::{ObservationRetentionExceeded, ObservationRetentionUsage};
+        if let Some(bcode_session_models::SessionCostEstimate::Estimated {
+            currency,
+            total_micros,
+            ..
+        }) = usage.cost.as_ref()
+        {
+            if let Some(total) = self.totals_micros.get_mut(currency) {
+                *total = total.saturating_add(*total_micros);
+            } else {
+                let before = *retained;
+                retained.try_add(
+                    ObservationRetentionUsage {
+                        collection_entries: 1,
+                        value_nodes: 1,
+                        depth: 3,
+                        ..ObservationRetentionUsage::default()
+                    },
+                    limits,
+                )?;
+                let Ok(key) = retained.try_clone_string(currency, 3, limits) else {
+                    *retained = before;
+                    return Err(ObservationRetentionExceeded);
+                };
+                self.totals_micros.insert(key, *total_micros);
+            }
+            self.estimated_usage_count = self.estimated_usage_count.saturating_add(1);
+        } else if matches!(
+            usage.cost,
+            Some(bcode_session_models::SessionCostEstimate::Unavailable { .. })
+        ) {
+            self.unavailable_usage_count = self.unavailable_usage_count.saturating_add(1);
+        }
+        self.observed_usage_count = self.observed_usage_count.saturating_add(1);
+        Ok(())
     }
 
     /// Whether every observed usage record has a complete fixed estimate.

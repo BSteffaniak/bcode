@@ -3256,6 +3256,16 @@ impl BmuxApp {
         self.viewport.follow_anchor(row);
     }
 
+    /// Expire any active scroll transition; the next frame performs normal target reconciliation.
+    #[cfg(test)]
+    pub(crate) fn settle_transcript_scroll_for_test(&mut self) {
+        if let Some(animation) = &mut self.transcript_scroll_animation {
+            animation.started_at = Instant::now()
+                .checked_sub(animation.duration)
+                .expect("scroll duration must fit the test clock");
+        }
+    }
+
     /// Return the resolved top row for latest-user-message anchoring.
     #[cfg(test)]
     pub fn latest_user_message_start_row_for_test(&self) -> Option<usize> {

@@ -97,27 +97,8 @@ pub async fn run_prepared_plugin_surface<W: Write>(
 ) -> Result<Option<serde_json::Value>, TuiError> {
     let plugin_id = plugin_id.into();
     let (runtime, handle) = {
-        let InitializedTui {
-            client,
-            settings,
-            chat,
-            ..
-        } = initialize_tui_with_presentation(
-            terminal.area(),
-            None,
-            &super::static_bundled_plugins(),
-            super::TuiLaunchOptions::default(),
-            presentation,
-        );
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(DaemonAvailability::RequireRunning);
-        let loop_state =
-            chat_loop::ChatLoopState::new(&client, &passive_client, settings.metrics_enabled());
-        drop(passive_client);
-        drop(client);
-        let mut model = root_program::BcodeRuntimeModel::new(chat, settings, loop_state);
-        model.queue_standalone_plugin_surface(plugin_id.clone(), surface);
+        let model =
+            prepare_plugin_surface_model(terminal, plugin_id.clone(), surface, presentation);
         root_program::runtime(terminal, model)
     };
     let mut model = Box::pin(root_program::run(runtime, handle)).await?;
@@ -127,6 +108,36 @@ pub async fn run_prepared_plugin_surface<W: Write>(
         .and_then(|(_, outcome)| outcome);
     drop(model);
     Ok(outcome)
+}
+
+fn prepare_plugin_surface_model<W: Write>(
+    terminal: &Terminal<&mut W>,
+    plugin_id: String,
+    surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
+    presentation: PreparedPresentation,
+) -> root_program::BcodeRuntimeModel {
+    let InitializedTui {
+        client,
+        settings,
+        chat,
+        ..
+    } = initialize_tui_with_presentation(
+        terminal.area(),
+        None,
+        &super::static_bundled_plugins(),
+        super::TuiLaunchOptions::default(),
+        presentation,
+    );
+    let passive_client = client
+        .clone()
+        .with_daemon_availability(DaemonAvailability::RequireRunning);
+    let loop_state =
+        chat_loop::ChatLoopState::new(&client, &passive_client, settings.metrics_enabled());
+    drop(passive_client);
+    drop(client);
+    let mut model = root_program::BcodeRuntimeModel::new(chat, settings, loop_state);
+    model.queue_standalone_plugin_surface(plugin_id, surface);
+    model
 }
 
 /// Attach to a session, run an optional startup action, and run the active chat loop with caller-provided static bundled plugins.

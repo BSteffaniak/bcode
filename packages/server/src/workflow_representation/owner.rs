@@ -126,7 +126,7 @@ pub async fn execution_session_link(
         }
         RunLookup::Available(_) => {
             let db = open(retained.path(), false).map_err(store_error)?;
-            super::backpressure::retry(|| {
+            super::backpressure::queued(retained.path(), || {
                 owner_boundary::execution_session_link(&db, run_id, node_id, activation_id, attempt)
             })
             .await
@@ -271,45 +271,48 @@ async fn persist_receipt_inner(
     authority: &WorkflowExecutionAuthority,
 ) -> Result<(), WorkflowStoreError> {
     let retained = retained_store(state).await.map_err(store_error)?;
-    match lookup_at(retained.path(), &receipt.run_id)
+    let queue = super::backpressure::write_queue(retained.path()).map_err(store_error)?;
+    #[cfg(not(test))]
+    let publication_lock = queue.lock();
+    #[cfg(test)]
+    let key = (
+        retained.path().canonicalize().map_err(store_error)?,
+        receipt.dispatch_identity.clone(),
+    );
+    #[cfg(test)]
+    let publication_lock = async {
+        use std::future::Future as _;
+        let lock = queue.lock();
+        tokio::pin!(lock);
+        std::future::poll_fn(|cx| {
+            let result = lock.as_mut().poll(cx);
+            if result.is_pending() {
+                notify_receipt_publication_pending(&key);
+            }
+            result
+        })
         .await
-        .map_err(store_error)?
-    {
+    };
+    let _write = super::backpressure::observe_write_lock(
+        &state.metrics,
+        owner_queue_labels(
+            "receipt_publication",
+            &receipt.run_id,
+            &receipt.activation_id,
+            &receipt.dispatch_identity,
+        ),
+        publication_lock,
+    )
+    .await;
+    let lookup_db = open(retained.path(), false).map_err(store_error)?;
+    let location =
+        super::backpressure::retry(|| representation::runs::lookup(&lookup_db, &receipt.run_id))
+            .await
+            .map_err(store_error)?;
+    drop(lookup_db);
+    match location {
         RunLookup::Legacy => retained.persist_owned_dispatch_receipt(receipt, authority),
         RunLookup::Available(_) => {
-            let queue = super::backpressure::write_queue(retained.path()).map_err(store_error)?;
-            #[cfg(not(test))]
-            let publication_lock = queue.lock();
-            #[cfg(test)]
-            let key = (
-                retained.path().canonicalize().map_err(store_error)?,
-                receipt.dispatch_identity.clone(),
-            );
-            #[cfg(test)]
-            let publication_lock = async {
-                use std::future::Future as _;
-                let lock = queue.lock();
-                tokio::pin!(lock);
-                std::future::poll_fn(|cx| {
-                    let result = lock.as_mut().poll(cx);
-                    if result.is_pending() {
-                        notify_receipt_publication_pending(&key);
-                    }
-                    result
-                })
-                .await
-            };
-            let _write = super::backpressure::observe_write_lock(
-                &state.metrics,
-                owner_queue_labels(
-                    "receipt_publication",
-                    &receipt.run_id,
-                    &receipt.activation_id,
-                    &receipt.dispatch_identity,
-                ),
-                publication_lock,
-            )
-            .await;
             let db = open(retained.path(), true).map_err(store_error)?;
             if let Some(existing) = super::backpressure::retry(|| {
                 owner_boundary::receipt(&db, &receipt.dispatch_identity)
@@ -323,7 +326,10 @@ async fn persist_receipt_inner(
                     || existing.node_id != receipt.node_id
                     || existing.activation_id != receipt.activation_id
                     || existing.attempt != receipt.attempt
-                    || existing.receipt != receipt.receipt
+                    || !crate::workflow_receipts::same_admission(
+                        &existing.receipt,
+                        &receipt.receipt,
+                    )
                 {
                     return Err(store_error("conflicting owner receipt"));
                 }
@@ -451,10 +457,11 @@ async fn recorded_authority(
         RunLookup::Degraded => return Err(unavailable()),
     }
     let db = open(retained.path(), false)?;
-    let Some(authority) =
-        super::backpressure::retry(|| owner_boundary::execution_authority(&db, run_id))
-            .await
-            .map_err(|_| unavailable())?
+    let Some(authority) = super::backpressure::queued(retained.path(), || {
+        owner_boundary::execution_authority(&db, run_id)
+    })
+    .await
+    .map_err(|_| unavailable())?
     else {
         return if allow_takeover {
             Err(unsupported())
@@ -470,20 +477,24 @@ async fn recorded_authority(
             .await
             .map(Some);
     }
-    let session_id = super::backpressure::retry(|| representation::runs::association(&db, run_id))
-        .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(unsupported)?
-        .parse::<crate::SessionId>()
-        .map_err(|_| unavailable())?;
+    let session_id = super::backpressure::queued(retained.path(), || {
+        representation::runs::association(&db, run_id)
+    })
+    .await
+    .map_err(|_| unavailable())?
+    .ok_or_else(unsupported)?
+    .parse::<crate::SessionId>()
+    .map_err(|_| unavailable())?;
     let ownership = state
         .sessions
         .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
         .await
         .map_err(|_| unavailable())?;
-    super::backpressure::retry(|| owner_boundary::verify(&db, run_id, &authority))
-        .await
-        .map_err(|_| unavailable())?;
+    super::backpressure::queued(retained.path(), || {
+        owner_boundary::verify(&db, run_id, &authority)
+    })
+    .await
+    .map_err(|_| unavailable())?;
     Ok(Some(crate::workflow_operations::AuthorityGuard {
         authority,
         _session_ownership: Some(ownership),
@@ -963,7 +974,7 @@ pub async fn dispatch_intent(
         RunLookup::Legacy => retained.dispatch_intent(dispatch_identity),
         RunLookup::Available(_) => {
             let db = open(retained.path(), false).map_err(store_error)?;
-            let result = super::backpressure::retry(|| {
+            let result = super::backpressure::queued(retained.path(), || {
                 owner_boundary::dispatch_intent(&db, run_id, dispatch_identity)
             })
             .await;
@@ -997,7 +1008,7 @@ pub async fn cancellation_intended(
                 .await
                 .map_err(store_error)?
                 .ok_or_else(|| store_error("missing owner"))?;
-            super::backpressure::retry(|| {
+            super::backpressure::queued(retained.path(), || {
                 owner_boundary::cancellation_intended(
                     &db,
                     run_id,

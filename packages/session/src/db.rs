@@ -1215,6 +1215,34 @@ fn test_migration_policy_callbacks() -> bcode_session_migration_target::Migratio
     }
 }
 
+fn runtime_work_metadata_bytes(row: &switchy::database::Row) -> SessionDbResult<usize> {
+    let mut bytes = 128_usize;
+    for column in [
+        "work_id",
+        "kind",
+        "label",
+        "status",
+        "parent_work_id",
+        "message",
+    ] {
+        let length = match row.get(column) {
+            Some(DatabaseValue::Null) if matches!(column, "parent_work_id" | "message") => 0,
+            Some(_) => required_i64(row, column)?,
+            None => {
+                return Err(SessionDbError::InvalidRow {
+                    column: column.to_owned(),
+                });
+            }
+        };
+        let length = usize::try_from(length)
+            .map_err(|_| std::io::Error::other("invalid runtime work length"))?;
+        bytes = bytes
+            .checked_add(length)
+            .ok_or_else(|| std::io::Error::other("runtime work length overflow"))?;
+    }
+    Ok(bytes)
+}
+
 impl SessionDb {
     /// Open an existing session database without applying migrations or rebuilding projections.
     ///
@@ -1806,6 +1834,96 @@ impl SessionDb {
         }
         let rows = query.execute(&**self.db).await?;
         rows.iter().map(runtime_work_from_row).collect()
+    }
+
+    /// Read exact current runtime-work rows for a bounded explicit identity set.
+    ///
+    /// Variable-width columns are measured with typed metadata queries before fetching rows.
+    /// Missing identities and malformed/future projection values fail closed; no repair occurs.
+    ///
+    /// # Errors
+    /// Rejects excessive identities/bytes, missing rows, stale values, or database failures.
+    pub async fn runtime_work_by_ids(
+        &self,
+        ids: &[WorkId],
+        max_bytes: usize,
+    ) -> SessionDbResult<Vec<RuntimeWorkProjection>> {
+        if ids.len() > 200
+            || !(1..=262_144).contains(&max_bytes)
+            || ids.iter().any(|id| id.0.len() > 512)
+            || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+        {
+            return Err(std::io::Error::other("invalid runtime work lookup bounds").into());
+        }
+        let mut remaining = max_bytes;
+        let mut result = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mut metadata = self.db.select("runtime_work");
+            for column in [
+                "work_id",
+                "kind",
+                "label",
+                "status",
+                "parent_work_id",
+                "message",
+            ] {
+                metadata = metadata.project_as(
+                    switchy::database::query::byte_length(switchy::database::query::identifier(
+                        column,
+                    )),
+                    column,
+                );
+            }
+            let rows = metadata
+                .where_eq("work_id", id.0.clone())
+                .limit(1)
+                .execute(&**self.db)
+                .await?;
+            let row = rows
+                .first()
+                .ok_or_else(|| std::io::Error::other("runtime work identity unavailable"))?;
+            let bytes = runtime_work_metadata_bytes(row)?;
+            remaining = remaining
+                .checked_sub(bytes)
+                .ok_or_else(|| std::io::Error::other("runtime work lookup byte budget exceeded"))?;
+            let rows = self
+                .db
+                .select("runtime_work")
+                .columns(&[
+                    "work_id",
+                    "event_seq_start",
+                    "event_seq_end",
+                    "kind",
+                    "label",
+                    "status",
+                    "parent_work_id",
+                    "started_at_ms",
+                    "finished_at_ms",
+                    "message",
+                    "cancellable",
+                ])
+                .where_eq("work_id", id.0.clone())
+                .limit(1)
+                .execute(&**self.db)
+                .await?;
+            let row = rows
+                .first()
+                .ok_or_else(|| std::io::Error::other("runtime work identity unavailable"))?;
+            let work = runtime_work_from_row(row)?;
+            // Recheck fetched lengths to fail closed if a concurrent writer changed the row.
+            let actual = 128
+                + work.work_id.0.len()
+                + work.label.len()
+                + work.parent_work_id.as_ref().map_or(0, |id| id.0.len())
+                + work.message.as_ref().map_or(0, String::len);
+            if actual > bytes {
+                return Err(
+                    std::io::Error::other("runtime work changed during bounded lookup").into(),
+                );
+            }
+            result.push(work);
+        }
+        Ok(result)
     }
 
     /// Return latest runtime-work projection rows.
@@ -3265,6 +3383,84 @@ impl SessionDb {
     /// # Errors
     ///
     /// Returns an error if event queries or deserialization fail.
+    /// Read an initial observation page with aggregate decode admission.
+    /// Ordinary history reads retain their existing API and policy.
+    /// # Errors
+    /// Resource admission is distinct from canonical row, sequence and version failures.
+    pub async fn history_page_with_decode_budget(
+        &self,
+        query: SessionHistoryQuery,
+        budget: &mut crate::persisted::EventDecodeBudget,
+    ) -> Result<SessionHistoryPage, crate::db_event_store::BudgetedEventRowError> {
+        let limit = query.limit.max(1);
+        if limit > MAX_SESSION_HISTORY_READ_EVENTS {
+            return Err(SessionDbError::HistoryReadLimitExceeded {
+                requested: limit,
+                maximum: MAX_SESSION_HISTORY_READ_EVENTS,
+            }
+            .into());
+        }
+        let mut select = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .limit(limit.saturating_add(1));
+        select = match query.direction {
+            SessionHistoryDirection::Forward => {
+                let select = if let Some(cursor) = query.cursor {
+                    select.where_gte("event_seq", seq_to_value(cursor.sequence))
+                } else {
+                    select
+                };
+                select.sort("event_seq", SortDirection::Asc)
+            }
+            SessionHistoryDirection::Backward => {
+                let select = if let Some(cursor) = query.cursor {
+                    select.where_lte("event_seq", seq_to_value(cursor.sequence))
+                } else {
+                    select
+                };
+                select.sort("event_seq", SortDirection::Desc)
+            }
+        };
+        let rows = select
+            .execute(&**self.db)
+            .await
+            .map_err(SessionDbError::from)?;
+        let has_more = rows.len() > limit;
+        let next_cursor = rows
+            .get(limit)
+            .map(|row| -> SessionDbResult<SessionHistoryCursor> {
+                Ok(SessionHistoryCursor {
+                    sequence: required_non_negative_u64(row, "event_seq")?,
+                })
+            })
+            .transpose()?;
+        let mut events = Vec::new();
+        for row in rows.iter().take(limit) {
+            events.push(crate::db_event_store::strict_event_from_row_with_budget(
+                row,
+                self.session_id,
+                budget,
+            )?);
+        }
+        if matches!(query.direction, SessionHistoryDirection::Backward) {
+            events.reverse();
+        }
+        Ok(SessionHistoryPage {
+            session_id: self.session_id,
+            events,
+            compatibility_issues: Vec::new(),
+            next_cursor,
+            has_more,
+        })
+    }
+
+    /// Return a bounded canonical history page without repair or migration.
+    ///
+    /// # Errors
+    /// Returns an error when the requested limit is excessive, the database query fails,
+    /// or canonical event rows, sequence numbers, or session identities are invalid.
     pub async fn history_page(
         &self,
         query: SessionHistoryQuery,
@@ -5771,7 +5967,7 @@ async fn project_event(
                 .execute(db)
                 .await?;
         }
-        SessionEventKind::ChildSessionCreated { request } => {
+        SessionEventKind::ChildSessionCreated { request, .. } => {
             if request.child_id != event.session_id
                 || request.parent_id == event.session_id
                 || event.sequence != 1
@@ -8825,6 +9021,78 @@ mod tests {
                 .await
                 .expect("restore timestamp fixture");
         }
+    }
+
+    #[tokio::test]
+    async fn exact_runtime_work_lookup_is_count_byte_bounded_and_preserves_old_owned_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .unwrap();
+        for sequence in 0..205 {
+            db.append_event(&event(
+                id,
+                sequence,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: WorkId::new(format!("work-{sequence}")),
+                    kind: RuntimeWorkKind::Tool,
+                    label: "label 🦀".to_owned(),
+                    tool_call_id: None,
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(sequence),
+                    cancellable: true,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+        let wanted = [WorkId::new("work-0"), WorkId::new("work-204")];
+        let rows = db.runtime_work_by_ids(&wanted, 4096).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.work_id.clone())
+                .collect::<Vec<_>>(),
+            wanted
+        );
+        assert_eq!(rows[0].event_seq_start, 0);
+        assert!(db.runtime_work_by_ids(&wanted, 1).await.is_err());
+        assert!(
+            db.runtime_work_by_ids(&[WorkId::new("missing")], 4096)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.runtime_work_by_ids(&[wanted[0].clone(), wanted[0].clone()], 4096)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.runtime_work_by_ids(&vec![WorkId::new("work-0"); 201], 4096)
+                .await
+                .is_err()
+        );
+        assert!(db.runtime_work_by_ids(&[], 0).await.is_err());
+        assert!(db.runtime_work_by_ids(&[], 4096).await.unwrap().is_empty());
+        // Corrupt only the disposable projection with the existing structured query API.
+        db.db
+            .update("runtime_work")
+            .value("status", "future-status")
+            .where_eq("work_id", "work-0")
+            .execute(&**db.db)
+            .await
+            .unwrap();
+        assert!(db.runtime_work_by_ids(&wanted, 4096).await.is_err());
+        // Unrelated damaged rows must not affect a valid exact lookup or cause repair.
+        let valid = db
+            .runtime_work_by_ids(&[wanted[1].clone()], 4096)
+            .await
+            .unwrap();
+        assert_eq!(valid[0].work_id, wanted[1]);
+        db.close().await.unwrap();
     }
 
     #[tokio::test]

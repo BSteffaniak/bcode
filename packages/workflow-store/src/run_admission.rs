@@ -5,6 +5,7 @@ use switchy_database::{Database, DatabaseValue as V};
 
 pub fn create(db: &dyn Database, run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
     validate_run(run)?;
+    validate_concurrency_representation(db, run)?;
     if !database::rows(
         db,
         &select("workflow_replacement_intents")
@@ -31,6 +32,26 @@ pub fn create(db: &dyn Database, run: &NewWorkflowRun) -> Result<(), WorkflowSto
         run.created_at_ms,
     )?;
     seed_entry_activations(db, run, &definition)?;
+    Ok(())
+}
+
+fn validate_concurrency_representation(
+    db: &dyn Database,
+    run: &NewWorkflowRun,
+) -> Result<(), WorkflowStoreError> {
+    if run.limits.concurrency_cap.is_some() {
+        return Ok(());
+    }
+    let columns = database::block_on(db.get_table_columns("workflow_runs"))?;
+    let column = columns
+        .iter()
+        .find(|column| column.name == "concurrency_cap")
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow concurrency policy column missing".into())
+        })?;
+    if !column.nullable {
+        return Err(WorkflowStoreError::UnsupportedUncappedConcurrency);
+    }
     Ok(())
 }
 

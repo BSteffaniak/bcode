@@ -10,6 +10,55 @@ use tokio::sync::Mutex;
 
 use crate::TurnCancelState;
 
+/// Host policy bounds shared by bounded owner reads and initial watch admission.
+pub const MAX_RUNTIME_WORK_PAGE_ITEMS: usize = 200;
+pub const MAX_RUNTIME_WORK_PAGE_BYTES: usize = 262_144;
+pub const MAX_RUNTIME_WORK_CURSOR_BYTES: usize = 512;
+
+#[derive(serde::Serialize)]
+struct RuntimeWorkSnapshotRef<'a> {
+    work_id: &'a WorkId,
+    kind: RuntimeWorkKind,
+    label: &'a str,
+    tool_call_id: Option<&'a str>,
+    status: RuntimeWorkStatus,
+    cancellable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation: Option<&'a RuntimeWorkObservation>,
+}
+
+fn page_failure(code: &str, message: &str) -> bcode_session_models::SessionApplicationFailure {
+    bcode_session_models::SessionApplicationFailure {
+        code: code.to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+/// Measure JSON with bounded work and no temporary payload allocation.
+pub fn encoded_len(value: &impl serde::Serialize, limit: usize) -> Option<usize> {
+    struct Budget {
+        used: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let used = self
+                .used
+                .checked_add(bytes.len())
+                .filter(|used| *used <= self.limit)
+                .ok_or_else(|| std::io::Error::other("runtime work byte budget exceeded"))?;
+            self.used = used;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut budget = Budget { used: 0, limit };
+    serde_json::to_writer(&mut budget, value).ok()?;
+    Some(budget.used)
+}
+
 /// Server-owned cancellation handle for active runtime work.
 #[derive(Debug, Clone)]
 pub enum CancellationHandle {
@@ -625,6 +674,103 @@ impl RuntimeWorkManager {
         result
     }
 
+    /// Read one ephemeral, work-ID-ordered page from the local execution owner.
+    ///
+    /// This does not read persistence or confer execution authority. Concurrent changes may
+    /// occur between pages; a missing continuation means range exhaustion, not session idleness.
+    /// `max_bytes` bounds the serialized item array, not a transport envelope.
+    ///
+    /// # Errors
+    /// Rejects invalid bounds/cursors and an indivisible item exceeding the byte budget.
+    pub async fn active_page(
+        &self,
+        session_id: SessionId,
+        after: Option<&WorkId>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<
+        (Vec<RuntimeWorkSnapshot>, Option<WorkId>),
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        if limit == 0
+            || limit > MAX_RUNTIME_WORK_PAGE_ITEMS
+            || !(2..=MAX_RUNTIME_WORK_PAGE_BYTES).contains(&max_bytes)
+            || after.is_some_and(|id| id.0.len() > MAX_RUNTIME_WORK_CURSOR_BYTES)
+        {
+            return Err(page_failure(
+                "runtime_work_page_invalid",
+                "invalid runtime work page bounds or cursor",
+            ));
+        }
+        let lower = after.map_or_else(
+            || Included((session_id, WorkId::new(""))),
+            |id| Excluded((session_id, id.clone())),
+        );
+        let active = self.active.lock().await;
+        let mut rows = active
+            .range((lower, Unbounded))
+            .take_while(|((id, _), _)| *id == session_id)
+            .peekable();
+        let mut items = Vec::new();
+        let mut used = 2_usize;
+        let now = std::time::Instant::now();
+        while items.len() < limit {
+            let Some(((_, work_id), work)) = rows.peek() else {
+                break;
+            };
+            let status = if work.cancelled {
+                RuntimeWorkStatus::Cancelling
+            } else {
+                RuntimeWorkStatus::Running
+            };
+            let observation = observed_work_at(work, now);
+            // Measure borrowed fields before allocating an owned label or tool identity.
+            let borrowed = RuntimeWorkSnapshotRef {
+                work_id,
+                kind: work.spec.kind,
+                label: &work.spec.label,
+                tool_call_id: work.spec.tool_call_id.as_deref(),
+                status,
+                cancellable: work.spec.cancellation.is_cancellable(),
+                observation: observation.as_ref(),
+            };
+            let available = max_bytes.saturating_sub(used + usize::from(!items.is_empty()));
+            let Some(bytes) = encoded_len(&borrowed, available) else {
+                if items.is_empty() {
+                    return Err(page_failure(
+                        "runtime_work_page_item_too_large",
+                        "runtime work item exceeds the requested byte budget",
+                    ));
+                }
+                break;
+            };
+            if work_id.0.len() > MAX_RUNTIME_WORK_CURSOR_BYTES {
+                return Err(page_failure(
+                    "runtime_work_page_item_too_large",
+                    "runtime work identity exceeds the cursor budget",
+                ));
+            }
+            used += bytes + usize::from(!items.is_empty());
+            items.push(RuntimeWorkSnapshot {
+                work_id: (*work_id).clone(),
+                kind: work.spec.kind,
+                label: work.spec.label.clone(),
+                tool_call_id: work.spec.tool_call_id.clone(),
+                status,
+                cancellable: work.spec.cancellation.is_cancellable(),
+                observation,
+            });
+            rows.next();
+        }
+        let next_after = rows
+            .peek()
+            .and_then(|_| items.last().map(|item| item.work_id.clone()));
+        drop(active);
+        Ok((items, next_after))
+    }
+
+    /// Compatibility inventory; materializes all local work and is not a bounded read.
     pub async fn active_for_session(&self, session_id: SessionId) -> Vec<RuntimeWorkSnapshot> {
         let active = self.active.lock().await;
         let now = std::time::Instant::now();
@@ -841,6 +987,121 @@ mod tests {
                 .entries
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn active_pages_are_session_scoped_ordered_and_byte_bounded() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        let unrelated = SessionId::new();
+        for (id, owner) in [
+            ("c", session),
+            ("a", session),
+            ("b", session),
+            ("other", unrelated),
+        ] {
+            manager
+                .start(
+                    owner,
+                    RuntimeWorkSpec::new(
+                        WorkId::new(id),
+                        RuntimeWorkKind::Tool,
+                        "label 🦀".into(),
+                        CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                    ),
+                )
+                .await;
+        }
+        let (first, cursor) = manager.active_page(session, None, 2, 4096).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|item| item.work_id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(cursor, Some(WorkId::new("b")));
+        let (last, cursor) = manager
+            .active_page(session, cursor.as_ref(), 2, 4096)
+            .await
+            .unwrap();
+        assert_eq!(last[0].work_id, WorkId::new("c"));
+        assert!(cursor.is_none());
+        let budget = serde_json::to_vec(&first[..1]).unwrap().len();
+        let (bounded, cursor) = manager.active_page(session, None, 2, budget).await.unwrap();
+        assert_eq!(bounded, first[..1]);
+        assert_eq!(serde_json::to_vec(&bounded).unwrap().len(), budget);
+        assert_eq!(cursor, Some(WorkId::new("a")));
+        assert_eq!(
+            manager
+                .active_page(session, None, 2, budget - 1)
+                .await
+                .unwrap_err()
+                .code,
+            "runtime_work_page_item_too_large"
+        );
+        assert!(manager.active_page(session, None, 0, 4096).await.is_err());
+        assert!(manager.active_page(session, None, 1, 0).await.is_err());
+        assert!(
+            manager
+                .active_page(session, Some(&WorkId::new("x".repeat(513))), 1, 4096)
+                .await
+                .is_err()
+        );
+        let (empty, cursor) = manager
+            .active_page(SessionId::new(), None, 2, 4096)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+        assert!(cursor.is_none());
+        // Page cursors remain valid when the preceding registration disappears.
+        manager.finish(session, &WorkId::new("a")).await;
+        let (after_removed, _) = manager
+            .active_page(session, Some(&WorkId::new("a")), 2, 4096)
+            .await
+            .unwrap();
+        assert_eq!(after_removed[0].work_id, WorkId::new("b"));
+    }
+
+    #[tokio::test]
+    async fn active_page_reports_cancellation_and_refuses_oversized_owner() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        let id = WorkId::new("cancel");
+        manager
+            .start(
+                session,
+                RuntimeWorkSpec::new(
+                    id.clone(),
+                    RuntimeWorkKind::Tool,
+                    "cancel me".into(),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                ),
+            )
+            .await;
+        manager.cancel_with_children(session, &id).await;
+        let (items, _) = manager.active_page(session, None, 1, 4096).await.unwrap();
+        assert_eq!(items[0].status, RuntimeWorkStatus::Cancelling);
+        manager.finish(session, &id).await;
+        manager
+            .start(
+                session,
+                RuntimeWorkSpec::new(
+                    WorkId::new("oversized"),
+                    RuntimeWorkKind::Tool,
+                    "x".repeat(MAX_RUNTIME_WORK_PAGE_BYTES + 1),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                ),
+            )
+            .await;
+        assert_eq!(
+            manager
+                .active_page(session, None, 1, MAX_RUNTIME_WORK_PAGE_BYTES)
+                .await
+                .unwrap_err()
+                .code,
+            "runtime_work_page_item_too_large"
         );
     }
 

@@ -180,6 +180,7 @@ pub(super) async fn retry_facts_in(
     super::super::verified(tx).await?;
     let root = run(tx, run_id).await?;
     authority(&root, owner)?;
+    super::super::admission_projection::package_binding(tx, run_id).await?;
     super::super::safety::ensure_admission_allowed(tx, run_id).await?;
     if !matches!(text(&root, "status")?.as_str(), "paused" | "failed") {
         return Err(Error::InvalidAdmission);

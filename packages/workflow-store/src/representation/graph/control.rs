@@ -25,6 +25,7 @@ pub async fn settle(
         .await?;
     super::super::verified(&*tx).await?;
     let root = owned_run(&*tx, run_id, owner).await?;
+    super::super::admission_projection::package_binding(&*tx, run_id).await?;
     let current = super::super::graph_pages::revision(&*tx, run_id).await?;
     if current != revision {
         return Err(Error::InvalidAdmission);

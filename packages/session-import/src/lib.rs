@@ -4,6 +4,8 @@
 
 //! Contract types for session import provider plugins.
 
+pub mod application;
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

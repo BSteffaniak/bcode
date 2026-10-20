@@ -76,9 +76,13 @@ pub async fn dispatch(
     let config: bcode_workflow::WorkflowCallConfiguration =
         serde_json::from_value(request.activation.node.configuration.clone())
             .map_err(|_| unsupported())?;
-    let bcode_workflow::WorkflowCallTarget::Definition { identity } = &config.target else {
-        return Err(unsupported());
-    };
+    let binding =
+        representation::admission_projection::package_binding(&db, &request.activation.run_id)
+            .await
+            .map_err(|_| unsupported())?;
+    let identity = representation::hierarchy::resolve_call(&db, binding.as_ref(), &config.target)
+        .await
+        .map_err(|_| unsupported())?;
     let stored = retained
         .definition(&identity.definition_id, identity.definition_version)?
         .ok_or_else(unavailable)?;

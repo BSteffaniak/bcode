@@ -4,6 +4,11 @@
 
 //! Daemon lifecycle registry and cleanup models.
 
+pub mod application;
+
+mod target;
+pub use target::{DaemonTarget, DaemonTargetError};
+
 mod execution_lifetime;
 pub use execution_lifetime::{
     ExecutionLifetime, ExecutionLifetimeStatus, ExecutionMaintenance, execution_lifetime_status,
@@ -4736,7 +4741,7 @@ mod startup_lock_tests {
             // Model the daemon's lifetime stdin: release only after cleanup settles.
             drop(inherited);
         };
-        tokio::pin!(cleanup);
+        let mut cleanup = Box::pin(cleanup);
         std::future::poll_fn(|cx| {
             assert!(std::future::Future::poll(cleanup.as_mut(), cx).is_pending());
             std::task::Poll::Ready(())

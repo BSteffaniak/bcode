@@ -4,6 +4,8 @@
 
 //! Shared worktree models for Bcode.
 
+pub mod application;
+
 use bcode_session_models::{SessionId, SessionSummary};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

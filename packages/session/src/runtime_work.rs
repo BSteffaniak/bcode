@@ -14,6 +14,28 @@ pub struct InterruptedRecoveryWork {
 }
 
 impl SessionManager {
+    /// Read current runtime-work projections for bounded exact owner identities.
+    /// The actor retains its existing connection and validates projection freshness.
+    ///
+    /// # Errors
+    /// Rejects unavailable/stale storage, missing identities, and count/byte budget overflow.
+    pub async fn runtime_work_by_ids(
+        &self,
+        session_id: SessionId,
+        ids: Vec<WorkId>,
+        max_bytes: usize,
+    ) -> Result<Vec<db::RuntimeWorkProjection>, SessionError> {
+        if ids.len() > 200
+            || !(1..=262_144).contains(&max_bytes)
+            || ids.iter().any(|id| id.0.len() > 512)
+        {
+            return Err(SessionError::UnsupportedProjectionWindow);
+        }
+        self.session_handle(session_id)
+            .await?
+            .runtime_work_by_ids(ids, max_bytes)
+            .await
+    }
     /// Return active runtime-work rows through the session actor's DB connection.
     ///
     /// # Errors

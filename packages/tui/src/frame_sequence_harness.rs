@@ -84,6 +84,7 @@ pub enum TranscriptFrameInput {
     ScrollUp(usize),
     ScrollDown(usize),
     ScrollToBottom,
+    SettleScrollTransition,
     ReasoningDisplayMode(bcode_config::TuiThinkingMode),
     ThinkingConfig(bcode_config::TuiThinkingConfig),
     AdvanceStreaming(std::time::Duration),
@@ -179,6 +180,9 @@ impl<'a> TranscriptFrameSequence<'a> {
                 }
                 TranscriptFrameInput::ScrollToBottom => {
                     self.app.scroll_transcript_to_bottom();
+                }
+                TranscriptFrameInput::SettleScrollTransition => {
+                    self.app.settle_transcript_scroll_for_test();
                 }
                 TranscriptFrameInput::ScrollUp(rows) => {
                     let _ = self.app.scroll_transcript_up(rows);
@@ -525,6 +529,54 @@ mod tests {
     }
 
     #[test]
+    fn centered_newer_page_without_boundary_movement_preserves_reader_anchor() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[event(40)], &[], true);
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "reader inside centered history",
+                input: TranscriptFrameInput::CenterHistory {
+                    events: (10..30).map(event).collect(),
+                    anchor_sequence: 17,
+                    has_older: true,
+                    has_newer: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "reader anchor accepted",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "newer page without boundary movement",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: (30..36).map(event).collect(),
+                    has_more: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "newer page accepted again",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        let before = &frames[1].observation;
+        let after = &frames[2].observation;
+        assert!(before.anchor.is_some());
+        assert_eq!(after.anchor, before.anchor);
+        assert_eq!(after.viewport_top, before.viewport_top);
+        assert!(after.semantic_items.len() > before.semantic_items.len());
+        assert_eq!(after, &frames[3].observation);
+    }
+
+    #[test]
     fn centered_newer_page_preserves_reader_and_reaches_tail() {
         let session_id = SessionId::new();
         let event = |sequence| {
@@ -578,11 +630,25 @@ mod tests {
                 input: TranscriptFrameInput::Durable(Box::new(event(40))),
             },
             TranscriptFrameStep {
+                label: "settle live arrival transition",
+                input: TranscriptFrameInput::SettleScrollTransition,
+            },
+            TranscriptFrameStep {
                 label: "live tail settled",
                 input: TranscriptFrameInput::Observe,
             },
         ]);
-        assert_eq!(tail[1].observation, tail[2].observation);
+        assert_eq!(tail[2].observation, tail[3].observation);
+        assert_ne!(tail[2].observation.scroll_mode, "transition_to_entry");
+        assert_eq!(
+            tail[1].observation.semantic_items,
+            tail[2].observation.semantic_items
+        );
+        assert_eq!(
+            tail[1].observation.terminal_rows,
+            tail[2].observation.terminal_rows
+        );
+        assert!(tail[2].observation.viewport_top >= tail[0].observation.viewport_top);
         assert!(
             tail[1].observation.semantic_items.len() > tail[0].observation.semantic_items.len()
         );

@@ -6,6 +6,8 @@
 //!
 //! This crate intentionally contains only leaf data types for the skill domain.
 
+pub mod application;
+
 use bcode_tool::UnresolvedToolReference;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

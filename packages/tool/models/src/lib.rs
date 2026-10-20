@@ -4,6 +4,8 @@
 
 //! Serializable leaf-model types for neutral tool runtime contracts.
 
+pub mod interaction;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -121,6 +123,91 @@ pub struct ToolPresentationUpdateScope {
     highest_revisions: BTreeMap<ToolPresentationIdentity, u64>,
 }
 
+#[cfg(test)]
+mod retained_revision_iterator_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_accept_counts_escaped_json_and_rolls_back_generation_on_denial() {
+        let update = ToolPresentationUpdate {
+            invocation_id: "call".into(),
+            producer_id: "producer".into(),
+            generation: 1,
+            revision: 1,
+            identity: ToolPresentationIdentity::Primary,
+            retention: ToolPresentationRetention::RetainLatest,
+            schema: "schema".into(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"text": "\"\\\n界"}),
+        };
+        let encoded_len = serde_json::to_vec(&update).unwrap().len();
+        let mut scope = ToolPresentationUpdateScope::default();
+        let before = scope.clone();
+        assert!(matches!(
+            scope.accept_bounded(&update, encoded_len - 1),
+            Err(ToolPresentationUpdateError::TooLarge { .. })
+        ));
+        assert_eq!(scope, before);
+        scope.accept_bounded(&update, encoded_len).unwrap();
+        let accepted = scope.clone();
+        assert_eq!(
+            scope.accept_bounded(&update, encoded_len),
+            Err(ToolPresentationUpdateError::StaleRevision)
+        );
+        assert_eq!(scope, accepted);
+        let mut normal = before;
+        normal.accept(&update, encoded_len).unwrap();
+        assert_eq!(normal, scope);
+        scope.close();
+        assert_eq!(
+            scope.accept_bounded(&update, encoded_len),
+            Err(ToolPresentationUpdateError::Closed)
+        );
+    }
+
+    #[test]
+    fn bounded_writer_rejects_without_retaining_encoded_bytes() {
+        use std::io::Write;
+        let mut writer = BoundedJsonSizeWriter {
+            written: 0,
+            limit: 4,
+            exceeded: false,
+        };
+        writer.write_all(b"1234").unwrap();
+        assert!(writer.write_all(b"5").is_err());
+        assert!(writer.exceeded);
+        assert_eq!(writer.written, 5);
+    }
+
+    #[test]
+    fn iteration_borrows_fences_without_changing_scope() {
+        let mut scope = ToolPresentationUpdateScope::default();
+        scope
+            .highest_revisions
+            .insert(ToolPresentationIdentity::Primary, 3);
+        scope.highest_revisions.insert(
+            ToolPresentationIdentity::Supplemental {
+                item_id: "retired".into(),
+            },
+            8,
+        );
+        let before = scope.clone();
+        let retained: Vec<_> = scope.iter_retained_revisions().collect();
+        assert_eq!(retained.len(), 2);
+        assert!(retained.iter().any(|(identity, revision)| **identity
+            == ToolPresentationIdentity::Primary
+            && *revision == 3));
+        assert_eq!(scope, before);
+        assert_eq!(
+            scope.highest_revision(&ToolPresentationIdentity::Supplemental {
+                item_id: "retired".into()
+            }),
+            Some(8)
+        );
+    }
+}
+
 impl ToolPresentationUpdateScope {
     #[must_use]
     pub const fn state(&self) -> ToolPresentationScopeState {
@@ -137,6 +224,19 @@ impl ToolPresentationUpdateScope {
         self.highest_revisions.get(identity).copied()
     }
 
+    /// Borrow retained revision fences without cloning identities or exposing storage.
+    ///
+    /// Includes fences for presentations no longer retained by a consumer. Iteration
+    /// does not change scope state, generation, or duplicate acceptance semantics.
+    #[must_use]
+    pub fn iter_retained_revisions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&ToolPresentationIdentity, u64)> {
+        self.highest_revisions
+            .iter()
+            .map(|(identity, revision)| (identity, *revision))
+    }
+
     /// Accept a bounded update and advance authoritative revision state.
     ///
     /// # Errors
@@ -147,6 +247,33 @@ impl ToolPresentationUpdateScope {
         &mut self,
         update: &ToolPresentationUpdate,
         max_encoded_bytes: usize,
+    ) -> Result<(), ToolPresentationUpdateError> {
+        self.accept_with_writer_limit(update, max_encoded_bytes, usize::MAX, false)
+    }
+
+    /// Accept an update without allocating its encoded representation.
+    ///
+    /// Serialization stops as soon as the encoded size exceeds `max_encoded_bytes`.
+    /// `TooLarge::actual` is therefore a lower bound, not necessarily the complete size.
+    /// Callers retaining the update must separately admit the identity fence and payload clone.
+    ///
+    /// # Errors
+    /// Returns the same validation errors as [`Self::accept`]. Size and encoding failures
+    /// preserve the revision fences, including the current generation.
+    pub fn accept_bounded(
+        &mut self,
+        update: &ToolPresentationUpdate,
+        max_encoded_bytes: usize,
+    ) -> Result<(), ToolPresentationUpdateError> {
+        self.accept_with_writer_limit(update, max_encoded_bytes, max_encoded_bytes, true)
+    }
+
+    fn accept_with_writer_limit(
+        &mut self,
+        update: &ToolPresentationUpdate,
+        max_encoded_bytes: usize,
+        writer_limit: usize,
+        atomic: bool,
     ) -> Result<(), ToolPresentationUpdateError> {
         if self.state == ToolPresentationScopeState::Closed {
             return Err(ToolPresentationUpdateError::Closed);
@@ -172,24 +299,43 @@ impl ToolPresentationUpdateScope {
         if update.generation > self.generation.saturating_add(1) {
             return Err(ToolPresentationUpdateError::FutureGeneration);
         }
-        if update.generation > self.generation {
+        // The unrestricted API historically advances generation before payload validation.
+        // Bounded admission is atomic and advances only after successful serialization.
+        if !atomic && update.generation > self.generation {
             self.generation = update.generation;
             self.highest_revisions.clear();
         }
-        if self
-            .highest_revisions
-            .get(&update.identity)
-            .is_some_and(|revision| update.revision <= *revision)
+        if update.generation == self.generation
+            && self
+                .highest_revisions
+                .get(&update.identity)
+                .is_some_and(|revision| update.revision <= *revision)
         {
             return Err(ToolPresentationUpdateError::StaleRevision);
         }
-        let encoded = serde_json::to_vec(update)
-            .map_err(|error| ToolPresentationUpdateError::Encode(error.to_string()))?;
-        if encoded.len() > max_encoded_bytes {
+        let mut encoded = BoundedJsonSizeWriter {
+            written: 0,
+            limit: writer_limit,
+            exceeded: false,
+        };
+        if let Err(error) = serde_json::to_writer(&mut encoded, update) {
+            if encoded.exceeded {
+                return Err(ToolPresentationUpdateError::TooLarge {
+                    actual: encoded.written,
+                    maximum: max_encoded_bytes,
+                });
+            }
+            return Err(ToolPresentationUpdateError::Encode(error.to_string()));
+        }
+        if encoded.written > max_encoded_bytes {
             return Err(ToolPresentationUpdateError::TooLarge {
-                actual: encoded.len(),
+                actual: encoded.written,
                 maximum: max_encoded_bytes,
             });
+        }
+        if update.generation > self.generation {
+            self.generation = update.generation;
+            self.highest_revisions.clear();
         }
         self.highest_revisions
             .insert(update.identity.clone(), update.revision);
@@ -199,6 +345,28 @@ impl ToolPresentationUpdateScope {
     /// Close the scope. Repeated closure is idempotent.
     pub const fn close(&mut self) {
         self.state = ToolPresentationScopeState::Closed;
+    }
+}
+
+/// Allocation-free JSON byte-counting sink with an explicit write limit.
+struct BoundedJsonSizeWriter {
+    written: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedJsonSizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.written = self.written.saturating_add(bytes.len());
+        if self.written > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("encoded size limit exceeded"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

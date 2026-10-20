@@ -2876,6 +2876,8 @@ pub(crate) mod tests {
     static APPLY_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SLOW_APPLY_STARTED: AtomicBool = AtomicBool::new(false);
     static SLOW_APPLY_CANCELLED: AtomicBool = AtomicBool::new(false);
+    static SLOW_APPLY_ACK: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>> =
+        std::sync::Mutex::new(None);
     static REMOVE_SESSION_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SEARCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -3244,6 +3246,13 @@ pub(crate) mod tests {
                     let cancelled = cancellation_callback
                         .is_some_and(|callback| callback(5_000, cancellation_user_data));
                     SLOW_APPLY_CANCELLED.store(cancelled, Ordering::SeqCst);
+                    let acknowledgment = {
+                        let mut sender = SLOW_APPLY_ACK.lock().unwrap();
+                        sender.take()
+                    };
+                    if let Some(acknowledgment) = acknowledgment {
+                        let _ = acknowledgment.send(cancelled);
+                    }
                     return bcode_plugin_sdk::write_service_response(
                         &if cancelled {
                             ServiceResponse::error("cancelled", "cancelled by host")
@@ -5080,6 +5089,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn backfill_caller_cancellation_cancels_inflight_provider_ingestion() {
         let _guard = SEARCH_TEST_LOCK.lock().await;
+        let (acknowledgment, observed_cancellation) = tokio::sync::oneshot::channel();
+        *SLOW_APPLY_ACK.lock().unwrap() = Some(acknowledgment);
         SLOW_APPLY_STARTED.store(false, Ordering::SeqCst);
         SLOW_APPLY_CANCELLED.store(false, Ordering::SeqCst);
         let state = state_with_providers(&[(SLOW_PROVIDER_ID, TestProviderBehavior::Slow)]);
@@ -5122,6 +5133,12 @@ pub(crate) mod tests {
         .expect("backfill returns terminal caller-cancellation progress");
         drop(state);
         cancel_task.await.expect("cancellation task");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), observed_cancellation)
+                .await
+                .expect("native provider must acknowledge caller cancellation")
+                .expect("native provider acknowledgment sender")
+        );
 
         assert!(SLOW_APPLY_CANCELLED.load(Ordering::SeqCst));
         assert_eq!(response.failed_sessions, 1);

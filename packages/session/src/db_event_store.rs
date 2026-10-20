@@ -63,6 +63,63 @@ pub async fn strict_events(db: &dyn Database) -> SessionDbResult<Vec<SessionEven
         .collect()
 }
 
+/// A budgeted initial-page row failed resource admission or canonical verification.
+#[derive(Debug, thiserror::Error)]
+pub enum BudgetedEventRowError {
+    /// Explicit observation decode budget was exhausted; this is not storage damage.
+    #[error("initial observation event decode resource limit exceeded")]
+    ResourceLimit,
+    /// Existing row identity, sequence and canonical damage classifications.
+    #[error(transparent)]
+    Canonical(#[from] crate::db::SessionDbError),
+}
+
+/// Decode one initial-observation row with a page-shared budget before JSON tree allocation.
+/// # Errors
+/// Rejects resource exhaustion separately from canonical damage, identity or sequence errors.
+pub fn strict_event_from_row_with_budget(
+    row: &switchy::database::Row,
+    session_id: SessionId,
+    budget: &mut crate::persisted::EventDecodeBudget,
+) -> Result<SessionEvent, BudgetedEventRowError> {
+    let event_seq = required_non_negative_u64(row, "event_seq")?;
+    let payload_value = row
+        .get("payload")
+        .ok_or_else(|| SessionDbError::InvalidRow {
+            column: "payload".to_owned(),
+        })?;
+    let payload = payload_value
+        .as_str()
+        .ok_or_else(|| SessionDbError::InvalidRow {
+            column: "payload".to_owned(),
+        })?;
+    let event =
+        crate::persisted::decode_session_event_with_budget(payload, budget).map_err(|error| {
+            match error {
+                crate::persisted::EventDecodeError::ResourceLimit => {
+                    BudgetedEventRowError::ResourceLimit
+                }
+                crate::persisted::EventDecodeError::Canonical(error) => {
+                    BudgetedEventRowError::Canonical(error.into())
+                }
+            }
+        })?;
+    if event.sequence != event_seq {
+        return Err(SessionDbError::InvalidCanonicalSequence {
+            expected: event_seq,
+            actual: event.sequence,
+        }
+        .into());
+    }
+    if event.session_id != session_id {
+        return Err(SessionDbError::InvalidRow {
+            column: "events.session_id".to_owned(),
+        }
+        .into());
+    }
+    Ok(event)
+}
+
 pub fn strict_event_from_row(
     row: &switchy::database::Row,
     session_id: SessionId,

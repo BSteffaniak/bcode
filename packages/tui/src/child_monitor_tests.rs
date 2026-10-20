@@ -142,6 +142,7 @@ fn canonical_child_relationship_is_projected_once_without_parent_transcript_copy
                 name: None,
                 working_directory: "/tmp".into(),
             }),
+            spawning: None,
         },
     );
     let mut app = BmuxApp::new_with_history(

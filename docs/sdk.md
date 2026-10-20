@@ -111,6 +111,204 @@ The public frontend event and snapshot contracts are renderer-neutral. Terminal,
 
 Enable `daemon-client` to use `BcodeClient` with a local Bcode daemon. This is separate from embedded execution and does not enable the TUI. See [Frontend contracts](frontend-contracts.md) and the [`daemon_client`](../packages/bcode/examples/daemon_client.rs) example.
 
+## Portable application operations
+
+Daemon-backed Rust consumers use domain-owned traits implemented by `BcodeClient`,
+including session/runtime-work and observation, workflow run/authoring/observation,
+plugin services and interactions, typed commands, worktree, model/agent/skill, usage,
+import/search, auth-pool and runtime-lifecycle access. See the
+[operation boundary](application-operation-boundary.md) and
+[parity inventory](application-operation-parity.md) for implemented paths and gaps;
+trait availability alone does not certify CLI or renderer parity.
+
+### Complete session consumer
+
+[`application_session.rs`](../packages/bcode/examples/application_session.rs) contains
+an implemented consumer of `SessionApplication`, `SessionObservationApplication` and
+`InteractionApplication`: create, select an agent/model, admit a turn, observe bounded
+semantic snapshots, deny requested permissions without remembering decisions, apply
+explicit caller-supplied controller inputs with revision fencing, cancel an exact turn
+on supervision failure, and spawn/supervise a canonical child. It does not construct a
+server or open persistence. It does not change the ordinary low-level generation API.
+
+Use the owning domain crates for traits; `daemon-client` does not re-export every
+application contract. For development against this **uncommitted** implementation, the
+honest dependency recipe is a checkout path, not a published version or an older Git
+commit that lacks these APIs:
+
+```toml
+[dependencies]
+bcode = { path = "/absolute/path/to/bcode/packages/bcode", default-features = false, features = ["daemon-client"] }
+bcode_session_models = { path = "/absolute/path/to/bcode/packages/session/models", default-features = false }
+bcode_plugin_sdk = { path = "/absolute/path/to/bcode/packages/plugin-sdk", default-features = false }
+serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
+tokio = { version = "1.45.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+```
+
+The example's imports name the exact modules. For a reproducible Git consumer, replace
+**all three** path entries with `git = "https://github.com/BSteffaniak/bcode"` and the
+**same full `rev` containing this implementation**, and commit the consumer's lockfile.
+There is not yet a published/pinned source revision for the working-tree additions;
+`6a24977fe468f36db8c821bbb870ad29ec047199` is the base, not a sufficient API pin.
+Upstream workspace patches are not inherited by a Git dependency; reproduce any
+required upstream patches deliberately in the consumer root rather than assuming
+Bcode's development checkout configuration is portable.
+
+**Explicit independent-process targeting.** Use
+`DaemonTarget::verify(executable, expected_sha256, location, config_directory).await`,
+then `BcodeClient::for_daemon(target, &config, absolute_working_directory)`. The
+lifecycle domain verifies the absolute executable's bytes before and after its bounded
+`artifact-id` probe, selects one exact running daemon in the state/configuration scope,
+and verifies live artifact, executable hash, namespace, protocol and storage contracts.
+The client uses those selected handshake facts on every connection, including retained
+controller/observation connections, and rechecks executable bytes and live status.
+There is no fallback to the consumer's executable or another state location.
+Select a trusted, immutable/content-addressed executable path: repeated pathname hashing
+detects ordinary replacement, but is not a claim of adversarial replace-and-restore race
+immunity during executable probing. Discovery currently uses a strict bounded registry
+inventory (4096 entries, 64 KiB per record); exhaustion or unverifiable foreign records
+fails closed rather than guessing that the selected daemon is absent.
+
+This explicit constructor is **RequireRunning-only**, including after availability
+policy changes. Start the selected Bcode artifact separately using its supported
+lifecycle CLI; the consumer never starts, replaces or stops a daemon. Configuration
+is supplied as a resolved `BcodeConfig`; its selected model profile and authentication
+are resolved through the existing configuration/provider-auth owners, not daemon
+defaults. No private IPC setup, persistence handle or extra hosting framework is needed.
+The request-only effective configuration is not written to a configuration file.
+
+For the repository example, supply existing absolute paths and a trusted SHA-256:
+
+```sh
+# In another terminal, start the selected daemon if it is not already running.
+# These paths are explicit selections, not PATH discovery or consumer executable aliases.
+XDG_CONFIG_HOME="$CONFIG_HOME" "$DAEMON_EXE" --config-only "$CONFIG_FILE" \
+  --profile "$MODEL_PROFILE" --state-root "$STATE_ROOT" server run
+
+BCODE_STATE_DIR="$STATE_ROOT" XDG_CONFIG_HOME="$CONFIG_HOME" \
+  cargo run -p bcode --features daemon-client --example application_session -- \
+  "$DAEMON_EXE" "$EXPECTED_SHA256" "$STATE_ROOT" "$CONFIG_DIRECTORY" \
+  "$CONFIG_FILE" "$MODEL_PROFILE" "$ABSOLUTE_CWD" build \
+  'Reply briefly without tools.' "$ABSOLUTE_INPUTS_JSON_FILE"
+```
+
+`CONFIG_DIRECTORY` is `$CONFIG_HOME/bcode` when using `XDG_CONFIG_HOME`; select
+the same existing configuration-directory scope used by the daemon.
+`CONFIG_FILE` is loaded exclusively and the model profile is explicitly overlaid.
+The constructor also requires the consumer's process authentication scope
+(`BCODE_STATE_DIR` and `XDG_CONFIG_HOME`) to match the target. This fails closed rather
+than reading authentication subscriptions from an unrelated default state root; it
+never changes process-global selection on behalf of another concurrent consumer. The
+example prints the resolved provider/model before admitting work. Use a trusted input
+file containing `[]` for a no-interaction run; actual provider work can incur charges.
+A missing/incompatible target fails closed without starting a different daemon. The
+external consumer manifest also needs the domain dependencies below (all Bcode paths
+or Git revisions must identify the same source tree):
+
+```toml
+bcode_config = { path = "/absolute/path/to/bcode/packages/config", default-features = false }
+bcode_daemon_lifecycle = { path = "/absolute/path/to/bcode/packages/daemon-lifecycle", default-features = false }
+```
+
+The repository example target is gated by `required-features = ["daemon-client"]`;
+its config/lifecycle imports use existing development dependencies. Ordinary embedded
+or direct low-level generation remains unchanged.
+
+Controller inputs are a bounded JSON array (64 KiB and at most 32 inputs). `[]` means
+no interaction resolution is authorized. Inputs must correspond to the plugin-owned
+snapshot; the consumer does not invent an answer or grant tool permissions. The
+retained controller connection is opened before admission and kept throughout the
+turn. Unsupported controllers and second exchanges fail closed; the example cancels
+rather than waiting indefinitely. A generic production consumer can present the
+plugin-owned schema and accept fresh user decisions instead of a preselected array.
+
+The observation path now exists on `BcodeClient` in
+`packages/client/src/session_observation.rs`. `observe_session` returns the portable
+semantic envelopes with a server-owned `SessionViewSnapshot`, rather than making a
+consumer reinterpret raw event logs. Initial snapshot is sequence zero and precedes
+ordered updates. Delivery sequence is local to one observation; source sequence is
+not a durable acknowledgement/resume cursor. Update, source-input and snapshot bounds
+can terminate observation. Gap, invalid source, limit and disconnect are explicit
+terminal reasons; no subsequent snapshots are delivered. Resync opens a fresh bounded
+observation, not replay of a previous stream. Dropping/closing releases observation
+resources without cancelling execution; cancelling a `recv` future retains its pending
+pull. The older `watch_session` APIs remain separate event/projection adapters.
+
+The example limits supervision to 30 seconds and requests exact-turn cancellation on
+timeout/error, then observes canonical completion for at most five more seconds.
+Cancellation acknowledgement is not terminal completion or rollback. A bounded history
+page that lacks the exact `ModelTurnFinished` leaves outcome unknown; it does not
+fabricate success. Admission or spawn failure can follow committed effects: retain
+session/child identity and inspect before retrying. Existing/deferred receipts are
+supervised, not resubmitted. Disconnect never authorizes replay of controller inputs.
+
+`packages/bcode/tests/application_complete_path.rs` supplies persistent IPC lifecycle,
+controller and observation acceptance cases. The explicit-target domain/client tests
+cover identity, hash, state/configuration separation and handshake propagation. These
+cases do not certify every CLI/renderer path or replace an independent-process runtime
+acceptance run. The `independent_explicit_daemon_consumer_process` test in
+`application_complete_path.rs` builds the real Bcode binary as a distinct Cargo artifact,
+then runs an env-cleared consumer test process against a copied, hash-recorded test
+image in isolated state/configuration. It loads only fake-provider/default-agent/question
+plugins, exercises retained controller/semantic observation and canonical lifecycle, and
+rejects mismatched hash/state/configuration/artifact and replaced executable bytes.
+It has inner/outer watchdogs, graceful shutdown and fixture-child-only kill/reap cleanup.
+Run it with no provider credentials or active-session management:
+
+```sh
+cargo test -p bcode --test application_complete_path \
+  --features app,daemon-client,static-bundled-fake-provider-plugin,static-bundled-default-agents-plugin,static-bundled-question-plugin \
+  -- independent_explicit_daemon_consumer_process --exact --nocapture
+```
+
+Cargo supplies `CARGO_BIN_EXE_bcode`; no PATH binary, installed runtime or guessed test
+artifact ID is used. Defining this acceptance test is not a claim it has passed; report
+its observed result separately. See the parity inventory for remaining qualifications.
+
+Usage reporting is query-only; import material loading is not canonical import.
+Search reads do not repair indexes. Maintenance and mutations remain explicit, with
+confirmation, caller/location checks and domain cancellation. Plugin service callers
+must inspect both the outer application result and `PluginServiceResponse::error`;
+opaque payload success does not establish command-effect completion. Unknown versions,
+unknown failure categories and ambiguous effects must not become permissive defaults.
+
+### Typed commands, cancellation, and native effects
+
+Import `bcode_command::application::{CommandApplication, CommandInvocationRequest,
+CommandInvocationOutcome}` alongside `BcodeClient` (add `bcode_command` from
+`packages/command` at the same checkout/revision as the other Bcode dependencies).
+`list_commands`, `invoke_command`, and `cancel_command` use the typed command owner;
+opaque plugin service success is not a substitute for a command outcome.
+
+Retain the same client or a clone for cancellation. Invocation and control share one
+caller-bound socket; a separately constructed client cannot cancel another caller's work
+by supplying its ID. `cancel_command` returns acceptance, not proof of terminal cancellation,
+rollback, or no effects. Keep awaiting the invocation result when possible. Dropping its
+future or losing the connection does not establish a safe retry.
+
+Handle every `CommandInvocationOutcome` explicitly:
+
+* `Completed(response)`: inspect the command owner's `success` before applying effects.
+* `Failed(error)`: known application failure, not an automatic replay instruction.
+* `Unknown(error)`: no trustworthy settled response; effects may have committed. Report
+  uncertainty and do not retry automatically or fabricate a terminal failed command.
+
+CLI and TUI consume typed command results and adapt effects natively. Failed commands do
+not drive success effects; unknown outcomes supply none. Status/copy presentation is
+not implicit canonical persistence. TUI explicitly routes `AppendText` through the canonical
+presentation-note operation; CLI emits it without that mutation. Session navigation uses
+canonical access, while clipboard,
+focus and surfaces remain frontend presentation. CLI emits structured fallback for unsupported
+native surfaces rather than claiming they opened. This is source wiring, not certification of
+every plugin or renderer. HyperChad's session/interaction support alone does not establish
+command invocation/effect parity. Active cancellation, isolation, transport-loss and native-effect
+regressions require separately recorded integrated test results; no merge-ready claim follows
+from these APIs or test definitions.
+
+`RuntimeApplication` (from `bcode_daemon_lifecycle::application`) provides typed status and
+explicit shutdown. Its acknowledgement is admission, not proof of daemon exit or drained work.
+The host-only borrowed preparation/commit operation is not a serializable remote token.
+
 ## Feature selection
 
 The default feature set is deliberately empty.

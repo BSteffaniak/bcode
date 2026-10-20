@@ -214,8 +214,11 @@ fn maintenance_excludes_execution_and_publishes_released_coordinator() {
     drop(maintenance);
     let mut daemon = record;
     daemon.instance_id = "new-daemon".into();
-    ExecutionLifetime::begin(root.path(), &daemon)
-        .expect("released maintenance owner must permit new execution admission");
+    let resumed = ExecutionLifetime::begin(root.path(), &daemon);
+    assert!(
+        resumed.is_ok(),
+        "execution admission after maintenance release: {resumed:?}"
+    );
 }
 
 #[cfg(unix)]

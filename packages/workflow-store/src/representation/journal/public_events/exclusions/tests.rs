@@ -74,6 +74,7 @@ async fn fixture() -> Fixture {
         run.definition_id = identity.definition_id;
         run.definition_version = identity.definition_version;
         rep::admit_in(&*tx, &run, &definition).await.unwrap();
+        rep::hierarchy::register_root(&*tx, &run).await.unwrap();
     }
     tx.commit().await.unwrap();
     (temp, db, definition)

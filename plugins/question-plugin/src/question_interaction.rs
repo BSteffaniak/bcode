@@ -79,6 +79,7 @@ pub struct QuestionSnapshot {
 }
 
 /// Renderer-neutral question controller.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct QuestionInteractionController {
     request: NormalizedQuestionRequest,
     revision: u64,
@@ -116,6 +117,35 @@ impl QuestionInteractionController {
             invalid_question_index: None,
             validation_error: None,
         }
+    }
+
+    /// Validate reconstructed state before applying semantic input. State is ephemeral,
+    /// but serialized service input must not permit malformed vector/index combinations.
+    pub(super) fn validate_ephemeral_state(&self) -> Result<(), ()> {
+        if self.request.questions.is_empty()
+            || self.request.questions.len() > super::MAX_QUESTIONS
+            || self.answers.len() != self.request.questions.len()
+            || self.selected_option_indices.len() != self.request.questions.len()
+            || focus_target_index(&self.request, self.focus).is_none()
+        {
+            return Err(());
+        }
+        for (index, question) in self.request.questions.iter().enumerate() {
+            if question.options.len() > super::MAX_OPTIONS_PER_QUESTION
+                || question.text.len() > super::MAX_QUESTION_TEXT_BYTES
+                || self.answers[index].question_index != index
+                || self.selected_option_indices[index]
+                    .iter()
+                    .any(|selected| *selected >= question.options.len())
+                || self.answers[index]
+                    .custom
+                    .as_ref()
+                    .is_some_and(|text| text.len() > super::MAX_CUSTOM_ANSWER_BYTES)
+            {
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
     fn navigate(&mut self, direction: InteractionNavigation) {

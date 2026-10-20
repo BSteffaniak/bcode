@@ -11,6 +11,18 @@
 
 /// Authenticated model-only contributor evidence operation contracts.
 pub mod contributor_evidence;
+mod package_compilation;
+pub use package_compilation::{
+    WorkflowPackageLocalCall, lower_workflow_package_local_references,
+    plan_workflow_package_recursive, workflow_package_local_interfaces,
+    workflow_package_recursive_closure,
+};
+mod source_resolution;
+pub use source_resolution::{
+    WorkflowResolutionBudget, resolve_workflow_authoring_dependencies,
+    workflow_definition_dependency_targets, workflow_package_dependency_targets,
+    workflow_source_dependency_targets,
+};
 mod scheduling_page;
 pub use scheduling_page::{
     WORKFLOW_SCHEDULING_PAGE_VERSION, WorkflowSchedulingPage, WorkflowSchedulingPageRequest,
@@ -6170,7 +6182,44 @@ pub fn plan_workflow_package(
     manifest: &WorkflowPackageManifest,
     catalog: &WorkflowAuthoringCatalogSnapshot,
 ) -> Result<WorkflowPackagePlan, WorkflowError> {
+    plan_workflow_package_with_checkpoint(manifest, catalog, || Ok(()))
+}
+
+/// Plan a package with cooperative cancellation or resource checks between bounded phases.
+///
+/// The callback runs before validation, member lowering/compilation and final assembly.
+/// Individual synchronous parsing and compilation steps are not interruptible.
+/// No partial plan is returned when a checkpoint fails.
+///
+/// # Errors
+/// Returns package planning errors or the unchanged error returned by the checkpoint.
+pub fn plan_workflow_package_with_checkpoint(
+    manifest: &WorkflowPackageManifest,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    mut checkpoint: impl FnMut() -> Result<(), WorkflowError>,
+) -> Result<WorkflowPackagePlan, WorkflowError> {
+    checkpoint()?;
+    if workflow_package_local_interfaces(manifest).is_ok() {
+        package_compilation::plan_recursive_with_checkpoint(manifest, catalog, &mut checkpoint)
+    } else {
+        plan_workflow_package_inferred(manifest, catalog, &mut checkpoint)
+    }
+}
+
+fn plan_workflow_package_inferred(
+    manifest: &WorkflowPackageManifest,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    checkpoint: &mut dyn FnMut() -> Result<(), WorkflowError>,
+) -> Result<WorkflowPackagePlan, WorkflowError> {
+    checkpoint()?;
     manifest.validate()?;
+    validate_workflow_package_dag(
+        &manifest
+            .members
+            .iter()
+            .map(|member| (member.member_id.as_str(), member))
+            .collect(),
+    )?;
     if manifest
         .imports
         .iter()
@@ -6190,6 +6239,7 @@ pub fn plan_workflow_package(
     let mut sources = BTreeMap::new();
     let mut interfaces = BTreeMap::new();
     for (member_id, member) in &members {
+        checkpoint()?;
         let value = decode_workflow_source_value(&member.source, member.format)
             .map_err(|error| qualify_workflow_package_member_error(member, error))?;
         let interface = WorkflowPackageSourceInterface::from_source(&value)
@@ -6211,7 +6261,7 @@ pub fn plan_workflow_package(
         .collect::<BTreeMap<_, _>>();
     let mut resolved_catalog = catalog.clone();
     for target in external_targets.values() {
-        let identity = target.definition_identity();
+        let identity = target.definition_identity()?;
         if !resolved_catalog
             .workflow_definitions
             .contains_key(&identity.definition_id)
@@ -6225,10 +6275,41 @@ pub fn plan_workflow_package(
             ));
         }
     }
+    let (planned, locked) = compile_inferred_package_members(
+        &members,
+        sources,
+        &interfaces,
+        order,
+        &external_targets,
+        &mut resolved_catalog,
+        checkpoint,
+    )?;
+    checkpoint()?;
+    let plan = assemble_inferred_package_plan(manifest, planned, locked)?;
+    checkpoint()?;
+    Ok(plan)
+}
+
+fn compile_inferred_package_members(
+    members: &BTreeMap<&str, &WorkflowPackageMember>,
+    mut sources: BTreeMap<&str, serde_json::Value>,
+    interfaces: &BTreeMap<&str, WorkflowPackageSourceInterface>,
+    order: Vec<&str>,
+    external_targets: &BTreeMap<String, WorkflowCallTarget>,
+    resolved_catalog: &mut WorkflowAuthoringCatalogSnapshot,
+    checkpoint: &mut dyn FnMut() -> Result<(), WorkflowError>,
+) -> Result<
+    (
+        Vec<WorkflowPackagePlannedMember>,
+        Vec<WorkflowPackageLockedMember>,
+    ),
+    WorkflowError,
+> {
     let mut identities = BTreeMap::<String, WorkflowDefinitionIdentity>::new();
     let mut planned = Vec::with_capacity(order.len());
     let mut locked = Vec::with_capacity(order.len());
     for member_id in order {
+        checkpoint()?;
         let member = members[member_id];
         let member_source_path =
             |path: &str| format!("package.members.{}.source.{path}", member.member_id);
@@ -6238,7 +6319,7 @@ pub fn plan_workflow_package(
                 "member source was not collected",
             )
         })?;
-        resolve_package_calls(&mut value, member, &identities, &external_targets)?;
+        resolve_package_calls(&mut value, member, &identities, external_targets)?;
         let normalized = serde_json::to_string(&value).map_err(|error| {
             authoring_error(
                 member_source_path("normalized"),
@@ -6248,16 +6329,17 @@ pub fn plan_workflow_package(
         let validated = lower_workflow_authoring_source_for_compilation(
             &normalized,
             WorkflowSourceFormat::Json,
-            &resolved_catalog,
+            resolved_catalog,
         )
         .map_err(|error| qualify_workflow_package_member_error(member, error))?;
         interfaces[member_id]
             .validate_definition(&validated.result.document.definition)
             .map_err(|error| qualify_workflow_package_member_error(member, error))?;
+        checkpoint()?;
         let compiled = validated
             .result
             .document
-            .compile_normalized_for_preview(validated.normalized, &resolved_catalog, None)
+            .compile_normalized_for_preview(validated.normalized, resolved_catalog, None)
             .map_err(|error| {
                 qualify_workflow_package_member_error(
                     member,
@@ -6267,7 +6349,8 @@ pub fn plan_workflow_package(
         let mut lowering = validated.result;
         let identity = compiled.definition_identity;
         lowering.document.definition = compiled.definition.clone();
-        let closure = workflow_package_member_closure(member, &members)?;
+        checkpoint()?;
+        let closure = workflow_package_member_closure(member, members, checkpoint)?;
         let normalized_document = lowering.document.normalized()?;
         let source_digest = canonical_sha256(&normalized_document, "workflow")?;
         let executable_digest = canonical_sha256(
@@ -6299,6 +6382,14 @@ pub fn plan_workflow_package(
             dependency_closure: closure,
         });
     }
+    Ok((planned, locked))
+}
+
+fn assemble_inferred_package_plan(
+    manifest: &WorkflowPackageManifest,
+    planned: Vec<WorkflowPackagePlannedMember>,
+    mut locked: Vec<WorkflowPackageLockedMember>,
+) -> Result<WorkflowPackagePlan, WorkflowError> {
     locked.sort_by(|left, right| left.member_id.cmp(&right.member_id));
     let mut locked_imports = manifest
         .imports
@@ -6366,6 +6457,7 @@ pub fn plan_workflow_package(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_workflow_package_closure(
     package_id: &str,
     depth: usize,
@@ -6374,7 +6466,9 @@ fn visit_workflow_package_closure(
     planned: &mut BTreeMap<String, WorkflowPackagePlan>,
     order: &mut Vec<String>,
     catalog: &mut WorkflowAuthoringCatalogSnapshot,
+    checkpoint: &mut dyn FnMut() -> Result<(), WorkflowError>,
 ) -> Result<(), WorkflowError> {
+    checkpoint()?;
     if planned.contains_key(package_id) {
         return Ok(());
     }
@@ -6405,11 +6499,34 @@ fn visit_workflow_package_closure(
             planned,
             order,
             catalog,
+            checkpoint,
         )?;
     }
 
-    let mut resolved = (*source).clone();
+    let resolved = resolve_workflow_package_closure_imports(source, sources, planned, checkpoint)?;
+    let plan = plan_workflow_package_with_checkpoint(&resolved, catalog, &mut *checkpoint)?;
+    for member in &plan.members {
+        checkpoint()?;
+        catalog.workflow_definitions.insert(
+            member.definition_identity.definition_id.clone(),
+            member.lowering.document.definition.clone(),
+        );
+    }
+    visiting.remove(package_id);
+    order.push(package_id.to_string());
+    planned.insert(package_id.to_string(), plan);
+    Ok(())
+}
+
+fn resolve_workflow_package_closure_imports(
+    source: &WorkflowPackageManifest,
+    sources: &BTreeMap<&str, &WorkflowPackageManifest>,
+    planned: &BTreeMap<String, WorkflowPackagePlan>,
+    checkpoint: &mut dyn FnMut() -> Result<(), WorkflowError>,
+) -> Result<WorkflowPackageManifest, WorkflowError> {
+    let mut resolved = source.clone();
     for import in &mut resolved.imports {
+        checkpoint()?;
         if let Some(imported) = planned.get(&import.package_id) {
             let imported_source = sources
                 .get(import.package_id.as_str())
@@ -6463,17 +6580,7 @@ fn visit_workflow_package_closure(
             ));
         }
     }
-    let plan = plan_workflow_package(&resolved, catalog)?;
-    for member in &plan.members {
-        catalog.workflow_definitions.insert(
-            member.definition_identity.definition_id.clone(),
-            member.lowering.document.definition.clone(),
-        );
-    }
-    visiting.remove(package_id);
-    order.push(package_id.to_string());
-    planned.insert(package_id.to_string(), plan);
-    Ok(())
+    Ok(resolved)
 }
 
 /// Resolve and plan one complete bounded transitive package closure from an explicit entry.
@@ -6493,6 +6600,23 @@ pub fn plan_workflow_package_closure(
     closure: &WorkflowPackageClosure,
     catalog: &WorkflowAuthoringCatalogSnapshot,
 ) -> Result<WorkflowPackageClosurePlan, WorkflowError> {
+    plan_workflow_package_closure_with_checkpoint(closure, catalog, || Ok(()))
+}
+
+/// Plan a transitive package closure with cooperative checks between bounded phases.
+///
+/// Checkpoints are shared with each member package planner. Individual synchronous
+/// validation, parsing and compilation operations remain non-interruptible.
+///
+/// # Errors
+/// Returns closure/package planning errors or the unchanged checkpoint error.
+#[allow(clippy::too_many_lines)]
+pub fn plan_workflow_package_closure_with_checkpoint(
+    closure: &WorkflowPackageClosure,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    mut checkpoint: impl FnMut() -> Result<(), WorkflowError>,
+) -> Result<WorkflowPackageClosurePlan, WorkflowError> {
+    checkpoint()?;
     if closure.version != WORKFLOW_PACKAGE_CLOSURE_VERSION {
         return Err(authoring_error(
             "package_closure.version",
@@ -6521,6 +6645,7 @@ pub fn plan_workflow_package_closure(
     let mut total_bytes = 0_usize;
     let mut total_edges = 0_usize;
     for (index, source) in closure.packages.iter().enumerate() {
+        checkpoint()?;
         validate_authoring_id(
             &format!("package_closure.packages[{index}].package_id"),
             &source.package_id,
@@ -6602,6 +6727,7 @@ pub fn plan_workflow_package_closure(
         &mut planned,
         &mut order,
         &mut resolved_catalog,
+        &mut checkpoint,
     )?;
     if planned.len() != sources.len() {
         return Err(authoring_error(
@@ -6621,6 +6747,7 @@ pub fn plan_workflow_package_closure(
             Ok(WorkflowPackageClosurePlanEntry { package_id, plan })
         })
         .collect::<Result<Vec<_>, WorkflowError>>()?;
+    checkpoint()?;
     Ok(WorkflowPackageClosurePlan {
         version: WORKFLOW_PACKAGE_CLOSURE_VERSION,
         entry_package_id: closure.entry_package_id.clone(),
@@ -6743,12 +6870,15 @@ fn workflow_package_topological_order<'a>(
 fn workflow_package_member_closure(
     member: &WorkflowPackageMember,
     members: &BTreeMap<&str, &WorkflowPackageMember>,
+    checkpoint: &mut dyn FnMut() -> Result<(), WorkflowError>,
 ) -> Result<Vec<String>, WorkflowError> {
     fn collect(
         id: &str,
         members: &BTreeMap<&str, &WorkflowPackageMember>,
         closure: &mut BTreeSet<String>,
+        checkpoint: &mut dyn FnMut() -> Result<(), WorkflowError>,
     ) -> Result<(), WorkflowError> {
+        checkpoint()?;
         let member = members.get(id).ok_or_else(|| {
             authoring_error(
                 "package.members.dependencies",
@@ -6757,7 +6887,7 @@ fn workflow_package_member_closure(
         })?;
         for dependency in &member.dependencies {
             if closure.insert(dependency.clone()) {
-                collect(dependency, members, closure)?;
+                collect(dependency, members, closure, checkpoint)?;
             }
         }
         Ok(())
@@ -6765,7 +6895,7 @@ fn workflow_package_member_closure(
     let mut closure = BTreeSet::new();
     for dependency in &member.dependencies {
         closure.insert(dependency.clone());
-        collect(dependency, members, &mut closure)?;
+        collect(dependency, members, &mut closure, checkpoint)?;
     }
     Ok(closure.into_iter().collect())
 }
@@ -7744,7 +7874,13 @@ impl WorkflowPackageManifest {
                 ));
             }
         }
-        validate_workflow_package_dag(&by_id)
+        for id in by_id.keys() {
+            workflow_package_recursive_closure(self, id, self.members.len(), || Ok(()))?;
+        }
+        if workflow_package_local_interfaces(self).is_err() {
+            validate_workflow_package_dag(&by_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -10985,7 +11121,15 @@ pub fn workflow_definition_policy_summaries_with_lookup(
                 serde_json::from_value(node.configuration.clone())
                     .map_err(|_| authoring_error(node_id, "invalid workflow call configuration"))?;
             call.validate()?;
-            let identity = call.target.definition_identity();
+            if let WorkflowCallTarget::PackageLocal { .. } = &call.target {
+                let (_, child) = resolve_authoring_workflow_call(node_id, node, &catalog)?;
+                let key = digest_serializable(child)?;
+                if resolved.insert(key) {
+                    pending.push(child.clone());
+                }
+                continue;
+            }
+            let identity = call.target.definition_identity()?;
             if resolved.contains(&identity.definition_id) {
                 // Repeated references still verify the complete identity, not just its key.
                 resolve_authoring_workflow_call(node_id, node, &catalog)?;
@@ -11271,7 +11415,11 @@ fn resolve_authoring_workflow_call<'a>(
             )
         })?;
     call.validate()?;
-    let identity = call.target.definition_identity();
+    if let WorkflowCallTarget::PackageLocal { reference } = &call.target {
+        let child = reference.definition(catalog)?;
+        return Ok((digest_serializable(child)?, child));
+    }
+    let identity = call.target.definition_identity()?;
     let child = catalog
         .workflow_definitions
         .get(&identity.definition_id)
@@ -12975,6 +13123,11 @@ pub struct WorkflowCallPreset {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkflowCallTarget {
+    /// A local interface reference resolved only against the caller's immutable package lock.
+    PackageLocal {
+        /// Versioned declaration independent of compiled child identities.
+        reference: WorkflowPackageLocalCall,
+    },
     /// An exact member of the calling run's immutable package publication.
     PackageMember {
         /// Package-local member identity, resolved against the parent's lock.
@@ -13002,11 +13155,17 @@ pub enum WorkflowCallTarget {
 }
 
 impl WorkflowCallTarget {
-    /// Return the exact compiled definition identity required at child admission.
-    #[must_use]
-    pub const fn definition_identity(&self) -> &WorkflowDefinitionIdentity {
+    /// Return an exact identity, or reject a local reference requiring run-owned resolution.
+    ///
+    /// # Errors
+    /// Returns an error for package-local references before immutable lock admission.
+    pub fn definition_identity(&self) -> Result<&WorkflowDefinitionIdentity, WorkflowError> {
         match self {
-            Self::Definition { identity } => identity,
+            Self::PackageLocal { .. } => Err(authoring_error(
+                "workflow_call.target",
+                "package-local target requires immutable run lock resolution",
+            )),
+            Self::Definition { identity } => Ok(identity),
             Self::PackageMember {
                 definition_identity,
                 ..
@@ -13014,7 +13173,7 @@ impl WorkflowCallTarget {
             | Self::AuthoredRevision {
                 definition_identity,
                 ..
-            } => definition_identity,
+            } => Ok(definition_identity),
         }
     }
 
@@ -13025,10 +13184,13 @@ impl WorkflowCallTarget {
     /// Returns an error for unsupported versions, malformed identities, zero revisions or preset
     /// generations, or authored/compiled logical identity mismatch.
     pub fn validate(&self) -> Result<(), WorkflowError> {
+        if let Self::PackageLocal { reference } = self {
+            return reference.validate();
+        }
         if let Self::PackageMember { member_id, .. } = self {
             validate_workflow_call_id("workflow_call.target.member_id", member_id)?;
         }
-        let identity = self.definition_identity();
+        let identity = self.definition_identity()?;
         validate_workflow_call_id("workflow_call.target.kind", &identity.kind)?;
         validate_workflow_call_id(
             "workflow_call.target.definition_id",
@@ -13129,7 +13291,24 @@ fn resolve_workflow_call_interface(
     catalog: &WorkflowAuthoringCatalogSnapshot,
 ) -> Result<(ValueSchema, ValueSchema), WorkflowError> {
     call.validate()?;
-    let identity = call.target.definition_identity();
+    if let WorkflowCallTarget::PackageLocal { reference } = &call.target {
+        if let Some(input) = &call.input
+            && input.output != reference.input
+        {
+            return Err(authoring_error(
+                "workflow_call.input",
+                "local call input mapping differs from declared interface",
+            ));
+        }
+        return Ok((
+            reference.input.clone(),
+            call.output.as_ref().map_or_else(
+                || reference.output.clone(),
+                |mapping| mapping.output.clone(),
+            ),
+        ));
+    }
+    let identity = call.target.definition_identity()?;
     let child = catalog
         .workflow_definitions
         .get(&identity.definition_id)
@@ -18368,7 +18547,7 @@ mod tests {
                 .clone(),
         )
         .expect("call");
-        assert_eq!(call.target.definition_identity(), &identity);
+        assert_eq!(call.target.definition_identity().unwrap(), &identity);
 
         let mut undeclared = manifest;
         undeclared.members[0].external_dependencies.clear();
@@ -20536,7 +20715,10 @@ steps:
         assert_eq!(node.kind, NodeKind::WorkflowCall);
         let call: WorkflowCallConfiguration =
             serde_json::from_value(node.configuration.clone()).expect("call");
-        assert_eq!(call.target.definition_identity().kind, "example/child");
+        assert_eq!(
+            call.target.definition_identity().unwrap().kind,
+            "example/child"
+        );
         let preview = lowered.document.compilation_preview(&catalog, None);
         assert!(preview.compiled.is_some());
     }

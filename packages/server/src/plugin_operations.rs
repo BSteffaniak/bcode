@@ -101,18 +101,22 @@ impl RouteInvocationInputError {
 }
 
 /// Return the current plugin service inventory without transport framing.
-pub fn list_services(state: &ServerState) -> Vec<bcode_ipc::PluginServiceSummary> {
+pub fn list_services(
+    state: &ServerState,
+) -> Vec<bcode_plugin_sdk::application::PluginServiceSummary> {
     state
         .plugins
         .service_summaries()
         .into_iter()
-        .map(|(plugin_id, service)| bcode_ipc::PluginServiceSummary {
-            plugin_id,
-            interface_id: service.interface_id,
-            name: service.name,
-            description: service.description,
-            workflow_blocks: service.workflow_blocks,
-        })
+        .map(
+            |(plugin_id, service)| bcode_plugin_sdk::application::PluginServiceSummary {
+                plugin_id,
+                interface_id: service.interface_id,
+                name: service.name,
+                description: service.description,
+                workflow_blocks: service.workflow_blocks,
+            },
+        )
         .collect()
 }
 
@@ -272,23 +276,10 @@ fn enqueue_validated_invocation_input(
     })
 }
 
-/// Normalized plugin service result returned by application operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginServiceOperationResult {
-    /// Opaque plugin-owned response payload.
-    pub payload: Vec<u8>,
-    /// Optional normalized plugin service error.
-    pub error: Option<PluginServiceOperationError>,
-}
-
-/// Normalized plugin service error without implementation details.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginServiceOperationError {
-    /// Stable plugin-owned error code.
-    pub code: String,
-    /// Secret-safe public error message.
-    pub message: String,
-}
+/// Portable plugin-owned service error; compatibility name retained for existing owners.
+pub use bcode_plugin_sdk::application::PluginServiceError as PluginServiceOperationError;
+/// Portable normalized service result; compatibility name retained for existing owners.
+pub use bcode_plugin_sdk::application::PluginServiceResponse as PluginServiceOperationResult;
 
 /// Convert one internal plugin response into the normalized operation result.
 #[must_use]

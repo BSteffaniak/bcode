@@ -127,6 +127,10 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
             .expect("revision"),
         2
     );
+    // The fixture's original run is still gated; settle it before draining callbacks.
+    crate::workflow_operations::cancel_run(&state, "new")
+        .await
+        .expect("cancel original fixture run");
     cleanup.finish().await;
     drop(cleanup);
 }

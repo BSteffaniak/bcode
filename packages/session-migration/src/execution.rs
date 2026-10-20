@@ -328,6 +328,34 @@ fn decode_for_migration(
         });
     }
     let source_kind = envelope.source_kind_name()?;
+    if source_kind == "child_session_created"
+        && crate::is_released_event_kind_schema(source_kind, envelope.schema_version())
+    {
+        return envelope.decode_child_session_created();
+    }
+    // Schema 51 is losslessly representation-compatible except for child creation above.
+    // Preserve recorded usage and all admission identities rather than applying older policy.
+    if envelope.schema_version() == 51
+        && crate::is_released_event_kind_schema(source_kind, 51)
+        && crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
+            variant.kind == source_kind
+                && variant.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
+        })
+    {
+        return current
+            .map(|event| HistoricalDecode::Converted {
+                event,
+                metadata: HistoricalEventMetadata {
+                    source_schema: 51,
+                    source_kind: source_kind.to_owned(),
+                },
+            })
+            .map_err(|reason| HistoricalSessionEventError::InvalidEvent {
+                schema_version: 51,
+                event_kind: source_kind.to_owned(),
+                reason,
+            });
+    }
     // Epoch-11 schema 47 is representation-compatible. Preserve its semantics, including
     // historical user-message visibility and receipt identities; create no submissions.
     if envelope.schema_version() == 47
@@ -342,6 +370,16 @@ fn decode_for_migration(
             }
         });
     }
+    decode_released_event(&envelope, source_kind, current)
+}
+
+// Historical family dispatch stays in the migration domain after schema
+// classification and representation-compatible exceptions have been resolved.
+fn decode_released_event(
+    envelope: &HistoricalEnvelope,
+    source_kind: &str,
+    current: Result<SessionEvent, String>,
+) -> Result<HistoricalDecode, HistoricalSessionEventError> {
     if source_kind == "model_usage" {
         return match current {
             Ok(mut event) => {
@@ -371,16 +409,16 @@ fn decode_for_migration(
     if source_kind == "execution_session_created"
         && envelope.schema_version() <= crate::LATEST_HISTORICAL_EVENT_SCHEMA
     {
-        return historical_event_families::decode_execution_session_created(&envelope);
+        return historical_event_families::decode_execution_session_created(envelope);
     }
     if source_kind == "tool_call_finished" && envelope.schema_version() <= 39 {
-        return historical_event_families::decode_tool_call_finished(&envelope);
+        return historical_event_families::decode_tool_call_finished(envelope);
     }
     if source_kind == "context_usage_observed" && envelope.schema_version() <= 31 {
-        return historical_event_families::decode_context_usage_observed(&envelope);
+        return historical_event_families::decode_context_usage_observed(envelope);
     }
     if envelope.schema_version() == 28 && source_kind == "tool_invocation_stream" {
-        return historical_event_families::decode_schema_28(&envelope);
+        return historical_event_families::decode_schema_28(envelope);
     }
     let descriptor = crate::RELEASED_EVENT_VARIANTS
         .iter()
@@ -454,6 +492,65 @@ mod tests {
             )
         );
         assert!(!normalized.retired_known);
+    }
+
+    #[test]
+    fn schema_47_usage_and_execution_rows_preserve_recorded_authority() {
+        let fixture = include_str!("../fixtures/stores/epoch-11-schema-47-events.jsonl");
+        let mut checked = BTreeSet::new();
+        for payload in fixture.lines() {
+            let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let kind = value["kind"].as_object().unwrap().keys().next().unwrap();
+            if !matches!(kind.as_str(), "model_usage" | "execution_session_created") {
+                continue;
+            }
+            let source: SessionEvent = serde_json::from_str(payload).unwrap();
+            let decoded = decode_for_migration(payload, |payload| {
+                serde_json::from_str(payload).map_err(|error| error.to_string())
+            })
+            .expect("released schema-47 representation");
+            assert!(matches!(&decoded, HistoricalDecode::Current(_)));
+            assert_eq!(decoded.event(), &source);
+            assert_eq!(decoded.metadata(), None);
+            let normalized =
+                normalize_canonical_event(payload, crate::CURRENT_EVENT_SCHEMA, |payload| {
+                    serde_json::from_str(payload).map_err(|error| error.to_string())
+                })
+                .unwrap();
+            let mut expected = source;
+            expected.schema_version = crate::CURRENT_EVENT_SCHEMA;
+            assert_eq!(normalized.event, expected);
+            assert!(normalized.historical.is_none());
+            assert!(!normalized.retired_known);
+            match &normalized.event.kind {
+                SessionEventKind::ModelUsage { usage, .. } => {
+                    assert_eq!(usage.cost, None);
+                    assert_eq!(usage.request_id, None);
+                    assert_eq!(usage.request, None);
+                    assert_eq!(usage.total_tokens, Some(3));
+                }
+                SessionEventKind::ExecutionSessionCreated {
+                    provenance,
+                    visibility,
+                } => {
+                    assert_eq!(provenance.version, 2);
+                    assert_eq!(provenance.owner, "fixture");
+                    assert_eq!(
+                        *visibility,
+                        bcode_session_models::SessionVisibility::Background
+                    );
+                }
+                _ => unreachable!(),
+            }
+            checked.insert(kind.clone());
+        }
+        assert_eq!(
+            checked,
+            BTreeSet::from([
+                "model_usage".to_owned(),
+                "execution_session_created".to_owned()
+            ])
+        );
     }
 
     #[test]
@@ -719,45 +816,39 @@ mod tests {
                 );
             }
 
-            let historical_payloads = payloads
+            let decoded = payloads
                 .iter()
-                .zip(&envelopes)
-                .filter(|(_, event)| {
-                    event.kind.keys().any(|kind| {
-                        crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
-                            variant.kind == kind
-                                && variant.treatment
-                                    != crate::ReleasedEventTreatment::CurrentEquivalent
-                        })
+                .map(|payload| {
+                    decode_for_migration(payload, |payload| {
+                        serde_json::from_str::<SessionEvent>(payload)
+                            .map_err(|error| error.to_string())
                     })
                 })
-                .map(|(payload, _)| *payload)
-                .collect::<Vec<_>>();
-            for (payload, envelope) in payloads.iter().zip(&envelopes) {
-                if !historical_payloads.contains(payload) {
-                    let event = serde_json::from_str::<SessionEvent>(payload)
-                        .expect("current-equivalent fixture payload must strictly decode");
-                    let actual_kind = serde_json::to_value(&event.kind)
-                        .expect("strictly decoded event kind must serialize")
-                        .as_object()
-                        .and_then(|kind| kind.keys().next())
-                        .cloned()
-                        .expect("strictly decoded event kind");
-                    assert!(
-                        envelope.kind.contains_key(&actual_kind),
-                        "strict current decoding changed fixture event kind {actual_kind}"
-                    );
-                }
-            }
-            assert_eq!(
-                payloads.len() - historical_payloads.len(),
-                fixture.expected_classifications.current_passthrough
-            );
-            let decoded = historical_payloads
-                .iter()
-                .map(|payload| decode_for_migration(payload, reject_current))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("fixture migration classifications");
+            for (event, envelope) in decoded.iter().zip(&envelopes) {
+                let actual_kind = serde_json::to_value(&event.event().kind)
+                    .expect("normalized fixture event kind")
+                    .as_object()
+                    .and_then(|kind| kind.keys().next())
+                    .cloned()
+                    .expect("normalized event kind");
+                assert!(
+                    !matches!(event, HistoricalDecode::Current(_))
+                        || envelope.kind.contains_key(&actual_kind),
+                    "current-equivalent decoding changed fixture event kind {actual_kind}"
+                );
+                assert_eq!(event.event().sequence, envelope.sequence);
+            }
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|event| matches!(event, HistoricalDecode::Current(_)))
+                    .count(),
+                fixture.expected_classifications.current_passthrough,
+                "fixture {}",
+                fixture.path.display()
+            );
             let converted = decoded
                 .iter()
                 .filter(|event| matches!(event, HistoricalDecode::Converted { .. }))
@@ -1189,6 +1280,88 @@ mod tests {
                 schema_version: 1,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn schema_51_child_creation_upgrade_retains_identity_without_inventing_spawning() {
+        let payload = serde_json::json!({
+            "schema_version": 51, "sequence": 1, "timestamp_ms": 13,
+            "session_id": SESSION_ID,
+            "kind": { "child_session_created": { "request": {
+                "child_id": SESSION_ID,
+                "parent_id": "00000000-0000-0000-0000-000000000002",
+                "name": "historical child", "working_directory": "/tmp"
+            } } }
+        });
+        let normalized = normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+            sequence: 1,
+            event_kind: "child_session_created".to_owned(),
+            schema_version: 51,
+            payload: payload.to_string(),
+        })
+        .expect("supported schema-51 creation");
+        assert_eq!(normalized.event.schema_version, crate::CURRENT_EVENT_SCHEMA);
+        assert_eq!(normalized.event.sequence, 1);
+        assert_eq!(normalized.event.timestamp_ms, 13);
+        let SessionEventKind::ChildSessionCreated { request, spawning } = normalized.event.kind
+        else {
+            panic!("creation identity must stay active");
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            payload["kind"]["child_session_created"]["request"]
+        );
+        assert_eq!(spawning, None);
+        assert_eq!(
+            normalized.historical_source.as_deref(),
+            Some("51:child_session_created")
+        );
+        assert!(!normalized.retired_known);
+    }
+
+    #[test]
+    fn schema_51_upgrade_preserves_other_events_and_rejects_fabricated_composition() {
+        let payload = serde_json::json!({
+            "schema_version": 51, "sequence": 7, "timestamp_ms": 13,
+            "session_id": SESSION_ID,
+            "kind": { "assistant_message": { "text": "preserved" } }
+        });
+        let normalized = normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+            sequence: 7,
+            event_kind: "assistant_message".to_owned(),
+            schema_version: 51,
+            payload: payload.to_string(),
+        })
+        .unwrap();
+        let mut expected = payload.clone();
+        expected["schema_version"] = crate::CURRENT_EVENT_SCHEMA.into();
+        expected["provenance"] = serde_json::Value::Null;
+        assert_eq!(serde_json::to_value(normalized.event).unwrap(), expected);
+        assert_eq!(
+            normalized.historical_source.as_deref(),
+            Some("51:assistant_message")
+        );
+        let invalid = serde_json::json!({
+            "schema_version": 51, "sequence": 1, "session_id": SESSION_ID,
+            "kind": { "child_session_created": { "request": {
+                "child_id": SESSION_ID,
+                "parent_id": "00000000-0000-0000-0000-000000000002",
+                "name": null, "working_directory": "/tmp"
+            }, "spawning": null } }
+        });
+        assert!(matches!(
+            decode_for_migration(&invalid.to_string(), reject_current),
+            Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: 51,
+                ..
+            })
+        ));
+        let mut future = payload;
+        future["schema_version"] = (crate::CURRENT_EVENT_SCHEMA + 1).into();
+        assert!(matches!(
+            decode_for_migration(&future.to_string(), reject_current),
+            Err(HistoricalSessionEventError::UnsupportedSchema { .. })
         ));
     }
 

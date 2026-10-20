@@ -3716,6 +3716,81 @@ fn retained_handle_preserves_fence_after_origin_drop_and_rejects_missing_databas
     );
 }
 
+#[test]
+fn baseline_uncapped_admission_is_typed_and_non_mutating() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut store = WorkflowStore::create_coexistence_baseline(temp.path()).expect("baseline");
+    store
+        .persist_definition("example", 1, &definition("example"))
+        .expect("definition");
+    let mut run = new_run();
+    assert_eq!(run.limits.concurrency_cap, None);
+    let before = fixture_changes(&store.connection);
+    let columns = block_on(store.connection.get_table_columns("workflow_runs")).unwrap();
+    assert!(
+        columns
+            .iter()
+            .any(|column| column.name == "concurrency_cap" && !column.nullable)
+    );
+    assert_eq!(detected_typed_store_schema(&store.connection), Some(42));
+    assert!(matches!(
+        store.create_run(&run),
+        Err(WorkflowStoreError::UnsupportedUncappedConcurrency)
+    ));
+    assert_eq!(fixture_changes(&store.connection), before);
+    assert!(matches!(
+        store.create_run_idempotent(&run),
+        Err(WorkflowStoreError::UnsupportedUncappedConcurrency)
+    ));
+    assert_eq!(fixture_changes(&store.connection), before);
+    assert!(store.run_limits(&run.run_id).unwrap().is_none());
+    assert_eq!(
+        block_on(store.connection.get_table_columns("workflow_runs")).unwrap(),
+        columns
+    );
+    assert_eq!(detected_typed_store_schema(&store.connection), Some(42));
+
+    // A compatible request still succeeds while an independent handle retains ownership.
+    let observer = WorkflowStore::open_in_state_dir(temp.path()).expect("observer");
+    run.limits.concurrency_cap = Some(7);
+    store.create_run(&run).expect("finite baseline admission");
+    assert_eq!(
+        observer.run_limits(&run.run_id).unwrap().unwrap(),
+        run.limits
+    );
+    assert_eq!(detected_typed_store_schema(&observer.connection), Some(42));
+}
+
+#[test]
+fn current_schema_accepts_uncapped_default_limits_without_rewriting_policy() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("current store");
+    store
+        .persist_definition("example", 1, &definition("example"))
+        .expect("definition");
+    assert_eq!(detected_typed_store_schema(&store.connection), Some(43));
+    let run = new_run();
+    assert_eq!(run.limits.concurrency_cap, None);
+    store.create_run(&run).expect("uncapped admission");
+    let before_duplicate = fixture_changes(&store.connection);
+    assert!(!store.create_run_idempotent(&run).expect("exact duplicate"));
+    assert_eq!(fixture_changes(&store.connection), before_duplicate);
+    drop(store);
+    let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+    assert_eq!(
+        reopened.run_limits(&run.run_id).unwrap().unwrap(),
+        run.limits
+    );
+    assert_eq!(
+        reopened
+            .concurrency_snapshot(&run.run_id)
+            .unwrap()
+            .concurrency_cap,
+        None
+    );
+    assert_eq!(detected_typed_store_schema(&reopened.connection), Some(43));
+}
+
 fn initialized_store() -> (tempfile::TempDir, WorkflowStore) {
     let temp = tempfile::tempdir().expect("temp");
     let store = initialized_store_at(temp.path());
@@ -13733,8 +13808,17 @@ fn flagship_restart_preserves_wait_approval_repeat_and_composed_status() {
             link: link.clone(),
             run: NewWorkflowRun {
                 run_id: child_run_id.clone(),
-                definition_id: link.target.definition_identity().definition_id.clone(),
-                definition_version: link.target.definition_identity().definition_version,
+                definition_id: link
+                    .target
+                    .definition_identity()
+                    .unwrap()
+                    .definition_id
+                    .clone(),
+                definition_version: link
+                    .target
+                    .definition_identity()
+                    .unwrap()
+                    .definition_version,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 parent_session_generation: None,
@@ -25473,6 +25557,7 @@ fn definition_identity_conflicts_fail_closed() {
 
 #[path = "tests/authoring_packages.rs"]
 mod authoring_packages;
+mod bound_package_children;
 #[path = "tests/graph_integrity.rs"]
 mod graph_integrity;
 #[path = "tests/storage_compatibility.rs"]

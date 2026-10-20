@@ -5,6 +5,8 @@
 //! Programmatic client API for Bcode.
 
 mod generation;
+mod session_observation;
+pub use session_observation::ClientSessionObservation;
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
@@ -29,12 +31,11 @@ use bcode_ralph_models::{
 };
 use bcode_session_import::ImportWarning as SessionImportWarning;
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, SessionCatalogSourceStatus, SessionCatalogStatus,
-    SessionDerivationPromptPage, SessionDerivationPromptQuery, SessionDerivationRequest,
-    SessionDerivationSourceSnapshot, SessionDerivationTerminalOutcome, SessionEvent,
-    SessionEventKind, SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery,
-    SessionHistoryWindow, SessionId, SessionInputHistoryEntry, SessionInspectionPage,
-    SessionInspectionQuery, SessionSummary, WorkId,
+    ClientId, ProjectionWindowRequest, SessionDerivationPromptPage, SessionDerivationPromptQuery,
+    SessionDerivationRequest, SessionDerivationSourceSnapshot, SessionDerivationTerminalOutcome,
+    SessionEvent, SessionEventKind, SessionHistoryAroundQuery, SessionHistoryPage,
+    SessionHistoryQuery, SessionHistoryWindow, SessionId, SessionInputHistoryEntry,
+    SessionInspectionPage, SessionInspectionQuery, SessionSummary, WorkId,
 };
 use bcode_session_models::{PendingToolExchangeSummary, PermissionSummary};
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
@@ -504,15 +505,867 @@ fn session_application_failure(
     }
 }
 
+fn model_application_failure(
+    error: ClientError,
+) -> bcode_model_catalog::application::ModelApplicationFailure {
+    let error = session_application_failure(error);
+    bcode_model_catalog::application::ModelApplicationFailure {
+        code: error.code,
+        message: error.message,
+    }
+}
+
+impl bcode_command::application::CommandApplication for BcodeClient {
+    async fn list_commands(
+        &self,
+        plugin_id: String,
+    ) -> Result<bcode_command::CommandList, bcode_command::application::CommandApplicationFailure>
+    {
+        match self
+            .send_request(Request::ListApplicationCommands { plugin_id })
+            .await
+        {
+            Ok(ResponsePayload::ApplicationCommandList { commands }) => Ok(commands),
+            result => Err(command_application_failure(
+                result.err().unwrap_or(ClientError::UnexpectedResponse),
+            )),
+        }
+    }
+    async fn invoke_command(
+        &self,
+        request: bcode_command::application::CommandInvocationRequest,
+    ) -> bcode_command::application::CommandInvocationResult {
+        let invocation_id = request.invocation_id.clone();
+        match Box::pin(command_control::invoke(self, request)).await {
+            Ok(result) if result.invocation_id == invocation_id => result,
+            _ => bcode_command::application::CommandInvocationResult {
+                invocation_id,
+                outcome: bcode_command::application::CommandInvocationOutcome::Unknown(
+                    bcode_command::application::CommandApplicationFailure {
+                        code: "command_outcome_unknown".into(),
+                        message: "No trustworthy command result arrived; effects may have committed. Do not retry automatically.".into(),
+                    },
+                ),
+            },
+        }
+    }
+
+    async fn cancel_command(
+        &self,
+        invocation_id: String,
+    ) -> Result<
+        bcode_command::application::CommandCancellationAcknowledgment,
+        bcode_command::application::CommandApplicationFailure,
+    > {
+        let accepted = command_control::cancel(self, &invocation_id)
+            .await
+            .map_err(command_application_failure)?;
+        Ok(
+            bcode_command::application::CommandCancellationAcknowledgment {
+                invocation_id,
+                accepted,
+            },
+        )
+    }
+}
+
+fn command_application_failure(
+    error: ClientError,
+) -> bcode_command::application::CommandApplicationFailure {
+    let error = session_application_failure(error);
+    bcode_command::application::CommandApplicationFailure {
+        code: error.code,
+        message: error.message,
+    }
+}
+
+impl bcode_provider_auth_models::application::AuthPoolApplication for BcodeClient {
+    async fn auth_pool_list(
+        &self,
+    ) -> Result<
+        Vec<bcode_provider_auth_models::AuthPoolSummary>,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        Self::auth_pool_list(self).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn auth_pool_preference(
+        &self,
+        pool: String,
+    ) -> Result<
+        bcode_provider_auth_models::application::AuthPoolPreference,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let pools =
+            <Self as bcode_provider_auth_models::application::AuthPoolApplication>::auth_pool_list(
+                self,
+            )
+            .await?;
+        let summary = pools
+            .into_iter()
+            .find(|summary| summary.pool == pool)
+            .ok_or_else(
+                || bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                    code: "auth_pool_not_found".into(),
+                    message: "auth pool is unavailable".into(),
+                },
+            )?;
+        Ok(
+            bcode_provider_auth_models::application::AuthPoolPreference {
+                pool,
+                profile: summary.preferred_profile,
+            },
+        )
+    }
+    async fn apply_auth_pool_preference(
+        &self,
+        request: bcode_provider_auth_models::SetAuthPoolPreferenceRequest,
+    ) -> Result<(), bcode_provider_auth_models::application::AuthPoolApplicationFailure> {
+        Self::apply_auth_pool_preference(self, request)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+}
+
+impl bcode_daemon_lifecycle::application::RuntimeApplication for BcodeClient {
+    async fn runtime_status(
+        &self,
+    ) -> Result<
+        bcode_daemon_lifecycle::application::RuntimeStatus,
+        bcode_daemon_lifecycle::application::RuntimeApplicationFailure,
+    > {
+        match self.send_request(Request::RuntimeStatus).await {
+            Ok(ResponsePayload::RuntimeStatus {
+                connected_client_count,
+                selected_provider_plugin_id,
+                selected_model_id,
+                idle_shutdown_blocker,
+                workflow_unavailable_reason,
+            }) => Ok(bcode_daemon_lifecycle::application::RuntimeStatus {
+                connected_client_count,
+                selected_provider_plugin_id,
+                selected_model_id,
+                idle_shutdown_blocker,
+                workflow_unavailable_reason,
+            }),
+            result => {
+                let error = session_application_failure(
+                    result.err().unwrap_or(ClientError::UnexpectedResponse),
+                );
+                Err(
+                    bcode_daemon_lifecycle::application::RuntimeApplicationFailure {
+                        code: error.code,
+                        message: error.message,
+                    },
+                )
+            }
+        }
+    }
+    async fn request_runtime_shutdown(
+        &self,
+        mode: bcode_daemon_lifecycle::application::RuntimeShutdownMode,
+    ) -> Result<
+        bcode_daemon_lifecycle::application::RuntimeShutdownAccepted,
+        bcode_daemon_lifecycle::application::RuntimeApplicationFailure,
+    > {
+        let result = match mode {
+            bcode_daemon_lifecycle::application::RuntimeShutdownMode::Force => {
+                Self::server_stop(self).await
+            }
+            bcode_daemon_lifecycle::application::RuntimeShutdownMode::IfIdle => {
+                Self::server_stop_if_idle(self).await
+            }
+        };
+        result
+            .map(|()| bcode_daemon_lifecycle::application::RuntimeShutdownAccepted { mode })
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_daemon_lifecycle::application::RuntimeApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+}
+
+impl bcode_workflow_view_models::application::SessionProgressApplication for BcodeClient {
+    async fn session_progress(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        bcode_workflow_view_models::SessionProgressSnapshot,
+        bcode_workflow_view_models::application::SessionProgressApplicationFailure,
+    > {
+        Self::session_progress(self, session_id)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_workflow_view_models::application::SessionProgressApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+}
+
+/// An admitted compaction on one non-reconnecting IPC connection.
+/// Dropping this value releases observation, not canonical provider execution.
+pub struct ClientSessionCompactionOperation {
+    connection: ClientConnection,
+    request_id: u64,
+}
+
+impl bcode_session_models::SessionCompactionOperation for ClientSessionCompactionOperation {
+    async fn complete(
+        mut self,
+    ) -> Result<
+        bcode_session_models::SessionCompactionResult,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        loop {
+            let envelope = recv_envelope(&mut self.connection.stream)
+                .await
+                .map_err(ClientError::from)
+                .map_err(session_application_failure)?;
+            if envelope.kind != EnvelopeKind::Response || envelope.request_id != self.request_id {
+                continue;
+            }
+            let response = decode_response(&envelope.payload)
+                .map_err(ClientError::from)
+                .map_err(session_application_failure)?;
+            return match response {
+                Response::Ok(ResponsePayload::SessionCompacted { message, compacted }) => {
+                    Ok(if compacted {
+                        bcode_session_models::SessionCompactionResult::Compacted(message)
+                    } else {
+                        bcode_session_models::SessionCompactionResult::Noop(message)
+                    })
+                }
+                Response::Err(error) => Err(session_application_failure(error.into())),
+                Response::Ok(_) => {
+                    Err(session_application_failure(ClientError::UnexpectedResponse))
+                }
+            };
+        }
+    }
+}
+
 impl bcode_session_models::SessionApplication for BcodeClient {
+    type CompactionOperation = ClientSessionCompactionOperation;
+
+    async fn begin_session_compaction(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Self::CompactionOperation, bcode_session_models::SessionApplicationFailure> {
+        let mut connection = self
+            .connect("bcode-compaction")
+            .await
+            .map_err(session_application_failure)?;
+        let request_id = connection.next_request_id;
+        connection.next_request_id += 1;
+        let envelope = request_envelope(request_id, &Request::CompactSession { session_id })
+            .map_err(ClientError::from)
+            .map_err(session_application_failure)?;
+        send_envelope(&mut connection.stream, &envelope)
+            .await
+            .map_err(ClientError::from)
+            .map_err(session_application_failure)?;
+        let deadline = tokio::time::Instant::now() + connection.request_timeout;
+        loop {
+            let envelope = tokio::time::timeout_at(deadline, recv_envelope(&mut connection.stream))
+                .await
+                .map_err(|_| {
+                    session_application_failure(ClientError::RequestTimeout {
+                        timeout: connection.request_timeout,
+                    })
+                })?
+                .map_err(ClientError::from)
+                .map_err(session_application_failure)?;
+            if envelope.kind != EnvelopeKind::Response || envelope.request_id != request_id {
+                continue;
+            }
+            match decode_response(&envelope.payload)
+                .map_err(ClientError::from)
+                .map_err(session_application_failure)?
+            {
+                Response::Ok(ResponsePayload::SessionCompactionAccepted) => {
+                    return Ok(ClientSessionCompactionOperation {
+                        connection,
+                        request_id,
+                    });
+                }
+                Response::Err(error) => return Err(session_application_failure(error.into())),
+                Response::Ok(_) => {
+                    return Err(session_application_failure(ClientError::UnexpectedResponse));
+                }
+            }
+        }
+    }
+    async fn session_catalog_snapshot(
+        &self,
+        working_directory: PathBuf,
+    ) -> Result<
+        bcode_session_models::SessionCatalogSnapshot,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::list_sessions_in_working_directory(self, working_directory)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn refresh_session_catalog(
+        &self,
+        working_directory: PathBuf,
+        sources: Option<Vec<String>>,
+    ) -> Result<
+        bcode_session_models::SessionCatalogSnapshot,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::refresh_session_catalog_in_working_directory(self, working_directory, sources)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn export_session_history(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        Vec<bcode_session_models::SessionEvent>,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_history(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn spawn_session(
+        &self,
+        request: bcode_session_models::SessionSpawnRequest,
+    ) -> bcode_session_models::SessionSpawnResult {
+        Self::spawn_session(self, request).await.unwrap_or_else(|error| {
+ let error = session_application_failure(error);
+ bcode_session_models::SessionSpawnResult { session: None, admission: None, failure: Some(bcode_session_models::SessionSpawnFailure { stage: bcode_session_models::SessionSpawnStage::Preparation, code: error.code, message: "spawn response unavailable; effects are unknown, inspect canonical state before retrying".into() }) }
+})
+    }
+    async fn reprice_session(
+        &self,
+        session_id: SessionId,
+        range: bcode_session_models::SessionCostRange,
+        catalog: bcode_model_catalog_models::CatalogDocument,
+    ) -> Result<
+        bcode_session_models::SessionRepriceReport,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::reprice_session(self, session_id, range, catalog)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_categorization(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        Option<bcode_session_models::SessionCategorization>,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_categorization(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn usage_catalog_page(
+        &self,
+        after: Option<SessionId>,
+    ) -> Result<Vec<SessionId>, bcode_session_models::SessionApplicationFailure> {
+        Self::usage_catalog(self, after)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn collect_usage(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    ) -> Result<
+        bcode_session_models::SessionUsagePage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::collect_usage(self, session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn prepare_context_generation(
+        &self,
+        request: bcode_session_models::PrepareContextGeneration,
+    ) -> Result<
+        bcode_session_models::PreparedContextGeneration,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::prepare_context_generation(self, request)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_trace_blob_range(
+        &self,
+        request: bcode_session_models::ReadSessionTraceBlobRequest,
+    ) -> Result<
+        bcode_session_models::SessionTraceBlobRange,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_trace_blob_range(self, request)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_projection_history_page(
+        &self,
+        session_id: SessionId,
+        request: bcode_session_models::ProjectionWindowRequest,
+    ) -> Result<
+        bcode_session_models::ProjectionHistoryPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_projection_history_page(self, session_id, request)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn submit_prompt(
+        &self,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        text: String,
+        placement: bcode_session_models::SubmissionPlacement,
+        require_active_turn: bool,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    ) -> Result<
+        bcode_session_models::SubmissionReceipt,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        match self
+            .send_request(Request::SubmitPrompt {
+                session_id,
+                submission_id,
+                text,
+                placement,
+                require_active_turn,
+                admission,
+            })
+            .await
+            .map_err(session_application_failure)?
+        {
+            ResponsePayload::SubmissionAccepted { receipt } => Ok(receipt),
+            _ => Err(session_application_failure(ClientError::UnexpectedResponse)),
+        }
+    }
+    async fn pending_submissions(
+        &self,
+        session_id: SessionId,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<
+        bcode_session_models::PendingSubmissionsPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::pending_submissions(self, session_id, after, limit)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn get_submission(
+        &self,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+    ) -> Result<
+        Option<bcode_session_models::SubmissionRecord>,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::get_submission(self, session_id, submission_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn generate_session_milestone(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        bcode_session_models::SessionMilestoneGenerationOutcome,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::generate_session_milestone(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn send_message(
+        &self,
+        session_id: SessionId,
+        text: String,
+        placement: bcode_session_models::PromptPlacement,
+        execution: bcode_session_models::TurnExecutionOptions,
+    ) -> Result<
+        bcode_session_models::MessageAcceptance,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::send_user_message_with_execution(self, session_id, text, placement, execution)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn create_child_session(
+        &self,
+        request: bcode_session_models::SessionChildCreateRequest,
+    ) -> Result<SessionSummary, bcode_session_models::SessionApplicationFailure> {
+        Self::create_child_session(self, request)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn append_presentation_note(
+        &self,
+        request: bcode_session_models::application::SessionPresentationNoteRequest,
+    ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
+        let format = match request.format {
+            bcode_session_models::application::SessionPresentationNoteFormat::PlainText => {
+                bcode_command::CommandTextFormat::PlainText
+            }
+            bcode_session_models::application::SessionPresentationNoteFormat::Markdown => {
+                bcode_command::CommandTextFormat::Markdown
+            }
+            bcode_session_models::application::SessionPresentationNoteFormat::Json => {
+                bcode_command::CommandTextFormat::Json
+            }
+        };
+        Self::append_presentation_note(
+            self,
+            request.session_id,
+            request.source_id,
+            request.note_id,
+            request.text,
+            format,
+        )
+        .await
+        .map_err(session_application_failure)
+    }
+    async fn compact_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        bcode_session_models::SessionCompactionResult,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        match self
+            .send_request(Request::CompactSession { session_id })
+            .await
+            .map_err(session_application_failure)?
+        {
+            ResponsePayload::SessionCompacted { message, compacted } => Ok(if compacted {
+                bcode_session_models::SessionCompactionResult::Compacted(message)
+            } else {
+                bcode_session_models::SessionCompactionResult::Noop(message)
+            }),
+            _ => Err(session_application_failure(ClientError::UnexpectedResponse)),
+        }
+    }
+    async fn query_child_sessions(
+        &self,
+        query: bcode_session_models::SessionChildQuery,
+    ) -> Result<
+        bcode_session_models::SessionChildPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::query_child_sessions(self, query)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_milestones(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionMilestoneQuery,
+    ) -> Result<
+        bcode_session_models::SessionMilestonePage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_milestones(self, session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_artifact_range(
+        &self,
+        session_id: SessionId,
+        artifact_id: String,
+        reference_key: String,
+        offset: u64,
+        length: u32,
+    ) -> Result<
+        bcode_session_models::SessionArtifactRange,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_artifact_range(self, session_id, artifact_id, reference_key, offset, length)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_working_document(
+        &self,
+        request: bcode_session_models::SessionWorkingDocumentRequest,
+    ) -> Result<
+        Option<bcode_session_models::SessionWorkingDocument>,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_working_document(self, request)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_admission(
+        &self,
+        session_id: SessionId,
+        apply: bool,
+    ) -> Result<
+        bcode_session_models::StorageAdmissionReport,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_admission(self, session_id, apply)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn compress_session_page(
+        &self,
+        request: bcode_session_models::StorageCompressionRequest,
+    ) -> Result<
+        bcode_session_models::StorageCompressionResult,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::compress_session_page(self, request)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn invoke_skill(
+        &self,
+        session_id: SessionId,
+        skill_id: bcode_skill_models::SkillId,
+        arguments: String,
+        display_text: String,
+        execution: bcode_session_models::TurnExecutionOptions,
+    ) -> Result<
+        bcode_session_models::MessageAcceptance,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::invoke_skill_with_execution(
+            self,
+            session_id,
+            skill_id,
+            arguments,
+            display_text,
+            execution,
+        )
+        .await
+        .map_err(session_application_failure)
+    }
+    async fn session_catalog_page(
+        &self,
+        scope: bcode_session_models::SessionDiscoveryScope,
+        query: bcode_session_models::SessionCatalogQuery,
+        cursor: Option<bcode_session_models::SessionCatalogCursor>,
+        limit: usize,
+    ) -> Result<
+        bcode_session_models::SessionCatalogPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::list_sessions_page_with_scope(self, scope, query, cursor, limit)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_summary(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, bcode_session_models::SessionApplicationFailure> {
+        Self::session_summary(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn delete_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, bcode_session_models::SessionApplicationFailure> {
+        Self::delete_session(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_history_page(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionHistoryQuery,
+    ) -> Result<
+        bcode_session_models::SessionHistoryPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_history_page(self, session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_history_around(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionHistoryAroundQuery,
+    ) -> Result<
+        bcode_session_models::SessionHistoryWindow,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_history_around(self, session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_usage(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    ) -> Result<
+        bcode_session_models::SessionUsagePage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_usage(self, session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_storage_usage(
+        &self,
+        session_id: SessionId,
+        entry_budget: u32,
+    ) -> Result<
+        bcode_session_models::SessionStorageUsage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_storage_usage(self, session_id, entry_budget)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn composer_draft(
+        &self,
+        scope: bcode_session_models::ComposerDraftScope,
+    ) -> Result<Option<String>, bcode_session_models::SessionApplicationFailure> {
+        Self::composer_draft(self, scope)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn set_composer_draft(
+        &self,
+        scope: bcode_session_models::ComposerDraftScope,
+        text: String,
+    ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
+        Self::set_composer_draft(self, scope, text)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn set_session_reasoning(
+        &self,
+        session_id: SessionId,
+        effort: Option<String>,
+        summary: Option<String>,
+    ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
+        Self::set_session_reasoning(self, session_id, effort, summary)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn activate_skill(
+        &self,
+        session_id: SessionId,
+        skill_id: bcode_skill_models::SkillId,
+    ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
+        Self::activate_skill(self, session_id, skill_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn deactivate_skill(
+        &self,
+        session_id: SessionId,
+        skill_id: bcode_skill_models::SkillId,
+    ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
+        Self::deactivate_skill(self, session_id, skill_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn active_skills(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        Vec<bcode_skill_models::SkillContextResponse>,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::active_skills(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_derivation_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        bcode_session_models::SessionDerivationSourceSnapshot,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_derivation_snapshot(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_derivation_prompts(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionDerivationPromptQuery,
+    ) -> Result<
+        bcode_session_models::SessionDerivationPromptPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_derivation_prompts(self, session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn derive_session(
+        &self,
+        request: bcode_session_models::SessionDerivationRequest,
+    ) -> Result<
+        bcode_session_models::SessionDerivationTerminalOutcome,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::derive_session(self, request)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_derivation_status(
+        &self,
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    ) -> Result<
+        bcode_session_models::SessionDerivationOperationSnapshot,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_derivation_status(self, operation_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn cancel_session_derivation(
+        &self,
+        operation_id: bcode_session_models::SessionDerivationOperationId,
+    ) -> Result<bool, bcode_session_models::SessionApplicationFailure> {
+        Self::cancel_session_derivation(self, operation_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn session_activity(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionActivityQuery,
+    ) -> Result<
+        bcode_session_models::SessionActivityPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_activity(self, session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
     async fn create_session(
         &self,
         request: bcode_session_models::CreateSessionRequest,
     ) -> Result<SessionSummary, bcode_session_models::SessionApplicationFailure> {
         if !request.working_directory.is_absolute() {
             return Err(bcode_session_models::SessionApplicationFailure {
-                code: "invalid_working_directory".into(),
-                message: "Working directory must be absolute".into(),
+                code: "session_working_directory_must_be_absolute".into(),
+                message: "session working directory must be absolute".into(),
             });
         }
         Self::create_session_in_working_directory(self, request.name, request.working_directory)
@@ -547,8 +1400,8 @@ impl bcode_session_models::SessionApplication for BcodeClient {
     > {
         if !working_directory.is_absolute() {
             return Err(bcode_session_models::SessionApplicationFailure {
-                code: "invalid_working_directory".into(),
-                message: "Working directory must be absolute".into(),
+                code: "session_working_directory_must_be_absolute".into(),
+                message: "session working directory must be absolute".into(),
             });
         }
         match self
@@ -1360,14 +2213,8 @@ pub struct SessionOpenProgressObserver {
     pub task: tokio::task::JoinHandle<Result<(), ClientError>>,
 }
 
-/// Session list response with persistent catalog status.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionList {
-    pub sessions: Vec<SessionSummary>,
-    pub catalog_status: SessionCatalogStatus,
-    pub catalog_sources: Vec<SessionCatalogSourceStatus>,
-    pub catalog_revision: u64,
-}
+/// Full compatibility session catalog response; use the page API for bounded discovery.
+pub type SessionList = bcode_session_models::SessionCatalogSnapshot;
 
 /// History returned when attaching to a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1523,8 +2370,17 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
                     .to_owned(),
             )
         })?;
+    let mut context = configured_runtime_context(&config, working_directory)?;
+    context.config_launch = Some(Box::new(launch));
+    Ok(context)
+}
+
+fn configured_runtime_context(
+    config: &bcode_config::BcodeConfig,
+    working_directory: PathBuf,
+) -> Result<ClientRuntimeContext, ClientError> {
     let effective_config_toml =
-        Some(bcode_config::encode_effective_config(&config).map_err(|_| {
+        Some(bcode_config::encode_effective_config(config).map_err(|_| {
             ClientError::Protocol(
                 "Client configuration could not be encoded; daemon defaults were not substituted."
                     .to_owned(),
@@ -1532,7 +2388,7 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
         })?);
     let resolved = config.resolved_model_selection();
     let selected_environment = bcode_provider_auth::startup::selected_environment_for_selection(
-        &config,
+        config,
         &resolved,
     )
     .map_err(|_| ClientError::Protocol(
@@ -1546,20 +2402,23 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
     );
     let provider_context = bcode_provider_auth::try_resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
-            config: &config,
+            config,
             selection: resolved.clone(),
         },
     ).map_err(|_| ClientError::Protocol(
         "Authentication selection could not be verified. Inspect the selected account, pool membership, and authentication metadata before connecting. No substitute account was selected.".to_owned(),
     ))?;
-    Ok(runtime_context_from_selection(
+    let mut context = runtime_context_from_selection(
         working_directory,
         effective_config_toml,
         resolved,
         provider_context,
         env,
-        Some(launch),
-    ))
+        None,
+    );
+    // A resolved object does not prove that this process's file layers produced it.
+    context.config_launch = None;
+    Ok(context)
 }
 
 fn runtime_context_from_selection(
@@ -1589,6 +2448,7 @@ fn runtime_context_from_selection(
         provider_context,
         process_env,
         interaction_adapters: Vec::new(),
+        interaction_controller_versions: std::collections::BTreeSet::new(),
         env_keys,
     }
 }
@@ -1816,6 +2676,7 @@ fn decode_scoped_session_list(response: ResponsePayload) -> Result<SessionList, 
 /// Client configured for a local Bcode server endpoint.
 #[derive(Debug, Clone)]
 pub struct BcodeClient {
+    explicit_daemon_target: Option<bcode_daemon_lifecycle::DaemonTarget>,
     expected_state_location: Option<bcode_config::StateLocationId>,
     endpoint: IpcEndpoint,
     runtime_context: Option<ClientRuntimeContext>,
@@ -1824,6 +2685,7 @@ pub struct BcodeClient {
     connect_timeout: Duration,
     startup_timeout: Duration,
     startup_gate: Arc<tokio::sync::Mutex<()>>,
+    command_invocations: command_control::Controls,
     contextual_invocations: contextual::Controls,
     request_timeout: Duration,
 }
@@ -2200,6 +3062,48 @@ fn configured_request_timeout() -> Duration {
 }
 
 impl BcodeClient {
+    /// Construct an independent consumer for an explicitly verified running daemon.
+    ///
+    /// Configuration and authentication are resolved from the supplied configuration, not
+    /// daemon defaults. This client never launches the consumer executable as a daemon,
+    /// even if its availability policy is later changed. Start the selected Bcode artifact
+    /// separately using its supported lifecycle command before verifying the target.
+    ///
+    /// # Errors
+    /// Rejects non-absolute/nonexistent working directories, a different process authentication
+    /// state/configuration scope, and unverifiable configuration or authentication selections.
+    /// Select `BCODE_STATE_DIR` and `XDG_CONFIG_HOME` before launching this consumer process.
+    /// Construction does not admit session work.
+    pub fn for_daemon(
+        target: bcode_daemon_lifecycle::DaemonTarget,
+        config: &bcode_config::BcodeConfig,
+        working_directory: PathBuf,
+    ) -> Result<Self, ClientError> {
+        if !working_directory.is_absolute() || !working_directory.is_dir() {
+            return Err(ClientError::Protocol(
+                "consumer working directory must be an existing absolute directory".into(),
+            ));
+        }
+        let caller_scope = bcode_config::runtime_scope_id(
+            &bcode_config::default_state_dir(),
+            &bcode_config::default_config_dir(),
+        );
+        if caller_scope != target.state_scope_id() {
+            return Err(ClientError::Protocol("consumer authentication state/configuration scope differs from the selected daemon; select BCODE_STATE_DIR and XDG_CONFIG_HOME explicitly before process launch".into()));
+        }
+        target
+            .verify_executable()
+            .map_err(|error| ClientError::IncompatibleDaemon {
+                message: error.to_string(),
+            })?;
+        let context = configured_runtime_context(config, working_directory)?;
+        let mut client = Self::new(target.endpoint().clone());
+        client.runtime_context = Some(context);
+        client.request_timeout = Duration::from_secs(config.client.request_timeout_secs);
+        client.explicit_daemon_target = Some(target);
+        Ok(client)
+    }
+
     /// Create a client that connects to the default endpoint.
     #[must_use]
     pub fn default_endpoint() -> Self {
@@ -2208,6 +3112,7 @@ impl BcodeClient {
             Err(error) => (None, Some(error.to_string())),
         };
         Self {
+            explicit_daemon_target: None,
             expected_state_location: None,
             endpoint: default_endpoint(),
             runtime_context,
@@ -2216,6 +3121,7 @@ impl BcodeClient {
             connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
             startup_timeout: DEFAULT_CLIENT_DAEMON_START_TIMEOUT,
             startup_gate: Arc::new(tokio::sync::Mutex::new(())),
+            command_invocations: command_control::Controls::default(),
             contextual_invocations: contextual::Controls::default(),
             request_timeout: configured_request_timeout(),
         }
@@ -2225,6 +3131,7 @@ impl BcodeClient {
     #[must_use]
     pub fn new(endpoint: IpcEndpoint) -> Self {
         Self {
+            explicit_daemon_target: None,
             expected_state_location: None,
             endpoint,
             runtime_context: None,
@@ -2233,6 +3140,7 @@ impl BcodeClient {
             connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
             startup_timeout: DEFAULT_CLIENT_DAEMON_START_TIMEOUT,
             startup_gate: Arc::new(tokio::sync::Mutex::new(())),
+            command_invocations: command_control::Controls::default(),
             contextual_invocations: contextual::Controls::default(),
             request_timeout: DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT,
         }
@@ -2258,6 +3166,21 @@ impl BcodeClient {
     pub fn with_runtime_context(mut self, runtime_context: Option<ClientRuntimeContext>) -> Self {
         self.runtime_context = runtime_context;
         self.runtime_context_error = None;
+        self
+    }
+
+    /// Opt in to renderer-neutral controller contracts on future connections.
+    ///
+    /// An empty set is the default. Unknown versions do not establish support, and these
+    /// declarations never create producer/schema adapters for opaque exchange resolution.
+    #[must_use]
+    pub fn with_interaction_controller_versions(
+        mut self,
+        versions: std::collections::BTreeSet<u32>,
+    ) -> Self {
+        self.runtime_context
+            .get_or_insert_default()
+            .interaction_controller_versions = versions;
         self
     }
 
@@ -2343,7 +3266,8 @@ impl BcodeClient {
     /// Returns an error when daemon acquisition fails or this client is configured
     /// to require an already-running daemon.
     pub async fn ensure_daemon_available(&self) -> Result<(), ClientError> {
-        if self.daemon_availability == DaemonAvailability::RequireRunning
+        if self.explicit_daemon_target.is_some()
+            || self.daemon_availability == DaemonAvailability::RequireRunning
             || self.expected_state_location.is_some()
         {
             return Ok(());
@@ -2546,6 +3470,13 @@ impl BcodeClient {
     }
 
     fn verify_server_identity(&self, status: &bcode_ipc::DaemonStatus) -> Result<(), ClientError> {
+        if let Some(target) = &self.explicit_daemon_target {
+            return target
+                .verify_status(status)
+                .map_err(|error| ClientError::IncompatibleDaemon {
+                    message: error.to_string(),
+                });
+        }
         let expected = self
             .expected_state_location
             .as_ref()
@@ -8205,6 +9136,13 @@ impl BcodeClient {
     }
 
     async fn connect_once(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
+        if let Some(target) = &self.explicit_daemon_target {
+            target
+                .verify_executable()
+                .map_err(|error| ClientError::IncompatibleDaemon {
+                    message: error.to_string(),
+                })?;
+        }
         let phase = bcode_metrics::startup::phase("client.transport_connect");
         let transport_started = std::time::Instant::now();
         let stream = LocalIpcStream::connect(&self.endpoint).await;
@@ -8235,14 +9173,31 @@ impl BcodeClient {
             .send_request(Request::Hello {
                 client_name: format!("{client_name};cap=message_accepted"),
                 runtime_context: self.runtime_context.clone(),
-                daemon_namespace: bcode_ipc::daemon_namespace(),
-                artifact_id: Some(bcode_ipc::ArtifactId::current()),
-                build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
-                state_location_id: Some(
-                    self.expected_state_location
+                daemon_namespace: self
+                    .explicit_daemon_target
+                    .as_ref()
+                    .map_or_else(bcode_ipc::daemon_namespace, |target| {
+                        target.namespace().to_owned()
+                    }),
+                artifact_id: Some(
+                    self.explicit_daemon_target
                         .as_ref()
-                        .map_or_else(bcode_ipc::state_location_id, |id| id.as_str().to_owned()),
+                        .map_or_else(bcode_ipc::ArtifactId::current, |target| {
+                            target.artifact_id().clone()
+                        }),
                 ),
+                build_fingerprint: self.explicit_daemon_target.as_ref().map_or_else(
+                    || bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+                    |target| target.build_fingerprint().to_owned(),
+                ),
+                state_location_id: Some(self.explicit_daemon_target.as_ref().map_or_else(
+                    || {
+                        self.expected_state_location
+                            .as_ref()
+                            .map_or_else(bcode_ipc::state_location_id, |id| id.as_str().to_owned())
+                    },
+                    |target| target.state_scope_id().to_owned(),
+                )),
             })
             .await?
         {
@@ -9716,6 +10671,75 @@ mod client_timeout_tests {
             );
             server.await.expect("server");
         }
+    }
+
+    #[tokio::test]
+    async fn typed_command_transport_loss_is_unknown_without_automatic_replay() {
+        use bcode_command::application::{
+            CommandApplication as _, CommandInvocationOutcome, CommandInvocationRequest,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("command.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon: matching_daemon_status(),
+            });
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+            )
+            .await
+            .unwrap();
+            let invoke = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+            assert!(matches!(
+                bcode_ipc::decode_request(&invoke.payload).unwrap(),
+                bcode_ipc::Request::InvokeApplicationCommand { .. }
+            ));
+            // The owner could have committed effects here; deliberately lose its response.
+            drop(stream);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "uncertain commands must not be replayed automatically"
+            );
+        });
+        let client = BcodeClient::new(endpoint).with_runtime_context(None);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.invoke_command(CommandInvocationRequest {
+                plugin_id: "test.command".into(),
+                invocation_id: "lost-response".into(),
+                agent_id: None,
+                launch_root: None,
+                deadline_ms: 1000,
+                command: bcode_command::InvokeCommandRequest {
+                    command_id: "effect".into(),
+                    args: std::collections::BTreeMap::new(),
+                    context: None,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.invocation_id, "lost-response");
+        assert!(matches!(
+            result.outcome,
+            CommandInvocationOutcome::Unknown(_)
+        ));
+        assert!(
+            !client
+                .cancel_command("lost-response".into())
+                .await
+                .unwrap()
+                .accepted
+        );
+        server.await.unwrap();
     }
 
     fn matching_daemon_status() -> bcode_ipc::DaemonStatus {
@@ -11398,8 +12422,18 @@ mod client_timeout_tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bulk_migration_wait_longer_than_default_request_timeout_receives_quiet_response() {
+        // Keep a task runnable so paused time cannot auto-advance to the Hello
+        // deadline while the real socket waits for readiness. Only this test
+        // advances time, after the server has received the long-poll request.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let (poll_received, poll_ready) = tokio::sync::oneshot::channel();
+        let (respond, response_allowed) = tokio::sync::oneshot::channel();
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcmw-{}", SessionOpenOperationId::new()));
         std::fs::create_dir_all(&socket_dir).expect("socket directory");
@@ -11433,7 +12467,10 @@ mod client_timeout_tests {
                     timeout_ms: 80,
                 } if operation_id == expected_operation_id
             ));
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            poll_received
+                .send(tokio::time::Instant::now())
+                .expect("signal poll phase");
+            response_allowed.await.expect("allow quiet response");
             let response = bcode_ipc::Response::Ok(
                 bcode_ipc::ResponsePayload::SessionBulkMigrationOperation {
                     status: bcode_ipc::SessionBulkMigrationOperationStatus {
@@ -11461,14 +12498,34 @@ mod client_timeout_tests {
             .with_daemon_availability(super::DaemonAvailability::RequireRunning)
             .with_request_timeout(Duration::from_millis(10));
 
-        let status = client
-            .wait_session_bulk_migration(operation_id, 2, 80)
+        let poll = client.wait_session_bulk_migration(operation_id, 2, 80);
+        tokio::pin!(poll);
+        let poll_started = tokio::select! {
+            ready = poll_ready => ready.expect("Hello completed and poll received"),
+            result = &mut poll => panic!("wait completed before quiet poll phase: {result:?}"),
+        };
+        tokio::time::advance(Duration::from_millis(40)).await;
+        assert!(poll_started.elapsed() > Duration::from_millis(10));
+        // Poll explicitly after advancing time: a generic 10ms timeout must
+        // fail here before the server is permitted to make its response ready.
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(poll.as_mut(), cx).is_pending(),
+                "poll must remain pending beyond 10ms"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        respond.send(()).expect("release quiet response");
+        let status = poll
             .await
             .expect("long poll must outlive generic request timeout");
 
         assert_eq!(status.revision, 2);
         assert_eq!(status.state, bcode_ipc::SessionBulkMigrationState::Running);
         server.await.expect("server task");
+        clock_guard.abort();
+        let _ = clock_guard.await;
         std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
     }
 
@@ -11477,5 +12534,1700 @@ mod client_timeout_tests {
         let client = BcodeClient::default_endpoint().with_request_timeout(Duration::from_secs(17));
 
         assert_eq!(client.request_timeout(), Duration::from_secs(17));
+    }
+}
+
+impl bcode_session_models::application::RuntimeWorkApplication for BcodeClient {
+    async fn runtime_work_page(
+        &self,
+        request: bcode_session_models::RuntimeWorkPageRequest,
+    ) -> Result<
+        bcode_session_models::RuntimeWorkPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        match self
+            .send_request(Request::RuntimeWorkPage { request })
+            .await
+            .map_err(session_application_failure)?
+        {
+            ResponsePayload::RuntimeWorkPage { page } => Ok(page),
+            _ => Err(session_application_failure(ClientError::UnexpectedResponse)),
+        }
+    }
+
+    async fn list_runtime_work(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        Vec<bcode_session_models::RuntimeWorkSnapshot>,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::list_runtime_work(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn runtime_work_history(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<
+        Vec<bcode_session_models::SessionEvent>,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::runtime_work_history(self, session_id, limit)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn cancel_runtime_work(
+        &self,
+        session_id: SessionId,
+        work_id: bcode_session_models::WorkId,
+    ) -> Result<bool, bcode_session_models::SessionApplicationFailure> {
+        Self::cancel_runtime_work(self, session_id, work_id)
+            .await
+            .map_err(session_application_failure)
+    }
+}
+
+impl BcodeClient {
+    /// Spawn through the canonical application operation, retaining partial receipts.
+    /// # Errors
+    /// Returns transport failure without claiming the remote operation had no effects.
+    pub async fn spawn_session(
+        &self,
+        request: bcode_session_models::SessionSpawnRequest,
+    ) -> Result<bcode_session_models::SessionSpawnResult, ClientError> {
+        match self.send_request(Request::SpawnSession { request }).await? {
+            ResponsePayload::SessionSpawned { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+}
+
+impl bcode_agent_profile::application::AgentApplication for BcodeClient {
+    async fn list_agents(
+        &self,
+    ) -> Result<
+        Vec<bcode_agent_profile::AgentInfo>,
+        bcode_agent_profile::application::AgentApplicationFailure,
+    > {
+        Self::list_agents(self).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_agent_profile::application::AgentApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn agent_policy_status(
+        &self,
+    ) -> Result<
+        bcode_agent_profile::PolicyStatusResponse,
+        bcode_agent_profile::application::AgentApplicationFailure,
+    > {
+        Self::agent_policy_status(self).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_agent_profile::application::AgentApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+}
+
+impl bcode_skill_models::application::SkillApplication for BcodeClient {
+    async fn list_skills(
+        &self,
+    ) -> Result<
+        bcode_skill_models::SkillList,
+        bcode_skill_models::application::SkillApplicationFailure,
+    > {
+        Self::list_skills(self).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_skill_models::application::SkillApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn describe_skill(
+        &self,
+        skill_id: bcode_skill_models::SkillId,
+    ) -> Result<
+        bcode_skill_models::SkillManifest,
+        bcode_skill_models::application::SkillApplicationFailure,
+    > {
+        Self::describe_skill(self, skill_id).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_skill_models::application::SkillApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+}
+
+impl bcode_model_catalog::application::ModelApplication for BcodeClient {
+    async fn list_models(
+        &self,
+        provider_plugin_id: Option<String>,
+    ) -> Result<
+        bcode_model_catalog::application::ApplicationModelList,
+        bcode_model_catalog::application::ModelApplicationFailure,
+    > {
+        match self
+            .send_request(Request::SessionModelList { provider_plugin_id })
+            .await
+        {
+            Ok(ResponsePayload::SessionModelList {
+                provider_plugin_id,
+                models,
+            }) => Ok(bcode_model_catalog::application::ApplicationModelList {
+                provider_plugin_id,
+                models,
+            }),
+            Ok(_) => Err(ClientError::UnexpectedResponse),
+            Err(error) => Err(error),
+        }
+        .map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_model_catalog::application::ModelApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn session_model_list(
+        &self,
+        session_id: bcode_session_models::SessionId,
+        provider_plugin_id: Option<String>,
+    ) -> Result<
+        bcode_model_catalog::application::ApplicationModelList,
+        bcode_model_catalog::application::ModelApplicationFailure,
+    > {
+        match self
+            .send_request(Request::SessionModelListForSession {
+                session_id,
+                provider_plugin_id,
+            })
+            .await
+        {
+            Ok(ResponsePayload::SessionModelList {
+                provider_plugin_id,
+                models,
+            }) => Ok(bcode_model_catalog::application::ApplicationModelList {
+                provider_plugin_id,
+                models,
+            }),
+            Ok(_) => Err(ClientError::UnexpectedResponse),
+            Err(error) => Err(error),
+        }
+        .map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_model_catalog::application::ModelApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn check_models(
+        &self,
+        request: bcode_model_catalog::application::ApplicationModelCheck,
+    ) -> Result<
+        bcode_model::ModelCheckReport,
+        bcode_model_catalog::application::ModelApplicationFailure,
+    > {
+        Self::check_models_with_id(
+            self,
+            request.check_id,
+            request.session_id,
+            request.provider_plugin_id,
+            request.model_ids,
+            request.timeout_seconds,
+            request.allow_provider_requests,
+        )
+        .await
+        .map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_model_catalog::application::ModelApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn cancel_model_check(
+        &self,
+        check_id: String,
+    ) -> Result<bool, bcode_model_catalog::application::ModelApplicationFailure> {
+        Self::cancel_model_check(self, check_id)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_model_catalog::application::ModelApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn session_model_status(
+        &self,
+        session_id: bcode_session_models::SessionId,
+    ) -> Result<
+        bcode_model::SessionModelStatus,
+        bcode_model_catalog::application::ModelApplicationFailure,
+    > {
+        Self::session_model_status(self, session_id)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_model_catalog::application::ModelApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn default_model_status(
+        &self,
+    ) -> Result<
+        bcode_model::SessionModelStatus,
+        bcode_model_catalog::application::ModelApplicationFailure,
+    > {
+        Self::default_model_status(self).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_model_catalog::application::ModelApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn model_catalog_snapshot(
+        &self,
+    ) -> Result<
+        bcode_model_catalog_models::CatalogDocument,
+        bcode_model_catalog::application::ModelApplicationFailure,
+    > {
+        match self.send_request(Request::ModelCatalogSnapshot).await {
+            Ok(ResponsePayload::ModelCatalogSnapshot { catalog }) => Ok(*catalog),
+            Ok(_) => Err(model_application_failure(ClientError::UnexpectedResponse)),
+            Err(error) => Err(model_application_failure(error)),
+        }
+    }
+    async fn refresh_model_catalog(
+        &self,
+    ) -> Result<
+        bcode_model_catalog_models::ModelCatalogDiagnostics,
+        bcode_model_catalog::application::ModelApplicationFailure,
+    > {
+        match self.send_request(Request::RefreshModelCatalog).await {
+            Ok(ResponsePayload::ModelCatalogDiagnostics { diagnostics }) => Ok(diagnostics),
+            Ok(_) => Err(model_application_failure(ClientError::UnexpectedResponse)),
+            Err(error) => Err(model_application_failure(error)),
+        }
+    }
+    async fn model_catalog_diagnostics(
+        &self,
+    ) -> Result<
+        bcode_model_catalog_models::ModelCatalogDiagnostics,
+        bcode_model_catalog::application::ModelApplicationFailure,
+    > {
+        Self::model_catalog_diagnostics(self)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_model_catalog::application::ModelApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+}
+
+impl bcode_plugin_sdk::application::PluginApplication for BcodeClient {
+    async fn list_plugin_services(
+        &self,
+    ) -> Result<
+        Vec<bcode_plugin_sdk::application::PluginServiceSummary>,
+        bcode_plugin_sdk::application::PluginApplicationFailure,
+    > {
+        Self::plugin_services(self).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_plugin_sdk::application::PluginApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn list_plugin_contributions(
+        &self,
+    ) -> Result<
+        bcode_plugin_sdk::PluginContributions,
+        bcode_plugin_sdk::application::PluginApplicationFailure,
+    > {
+        Self::plugin_contributions(self).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_plugin_sdk::application::PluginApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn invoke_plugin_service(
+        &self,
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    ) -> Result<
+        bcode_plugin_sdk::application::PluginServiceResponse,
+        bcode_plugin_sdk::application::PluginApplicationFailure,
+    > {
+        Self::invoke_plugin_service(self, plugin_id, interface_id, operation, payload)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_plugin_sdk::application::PluginApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn call_plugin_service(
+        &self,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    ) -> Result<
+        bcode_plugin_sdk::application::PluginServiceResponse,
+        bcode_plugin_sdk::application::PluginApplicationFailure,
+    > {
+        Self::call_plugin_service(self, interface_id, operation, payload)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_plugin_sdk::application::PluginApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn invoke_plugin_service_contextual(
+        &self,
+        context: bcode_plugin_sdk::application::PluginServiceContext,
+        plugin_id: String,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    ) -> Result<
+        bcode_plugin_sdk::application::PluginServiceResponse,
+        bcode_plugin_sdk::application::PluginApplicationFailure,
+    > {
+        Self::invoke_plugin_service_contextual(
+            self,
+            context,
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+        )
+        .await
+        .map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_plugin_sdk::application::PluginApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn cancel_plugin_service_invocation(
+        &self,
+        invocation_id: String,
+    ) -> Result<bool, bcode_plugin_sdk::application::PluginApplicationFailure> {
+        Self::cancel_plugin_service_invocation(self, invocation_id)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_plugin_sdk::application::PluginApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn publish_plugin_event(
+        &self,
+        topic: String,
+        payload: Vec<u8>,
+    ) -> Result<usize, bcode_plugin_sdk::application::PluginApplicationFailure> {
+        Self::publish_plugin_event(self, topic, payload)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_plugin_sdk::application::PluginApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn send_plugin_invocation_input(
+        &self,
+        session_id: SessionId,
+        input: bcode_tool::ToolInvocationInput,
+    ) -> Result<(), bcode_plugin_sdk::application::PluginApplicationFailure> {
+        Self::send_invocation_input(self, session_id, input)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_plugin_sdk::application::PluginApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+}
+
+/// Renderer-neutral controller consumer retaining one authenticated connection.
+///
+/// Connection loss is surfaced; operations are never automatically replayed or rebound
+/// to a new caller. Dropping this consumer releases its ephemeral controller ownership.
+pub struct InteractionControllerConsumer {
+    connection: tokio::sync::Mutex<ClientConnection>,
+}
+
+impl BcodeClient {
+    /// Connect an explicitly opted-in semantic consumer without claiming renderer adapters.
+    /// # Errors
+    /// Returns verified connection or runtime-context failure.
+    pub async fn interaction_controller_consumer(
+        &self,
+    ) -> Result<InteractionControllerConsumer, ClientError> {
+        let client = self
+            .clone()
+            .with_interaction_controller_versions(std::collections::BTreeSet::from([1]));
+        Ok(InteractionControllerConsumer {
+            connection: tokio::sync::Mutex::new(client.connect("bcode-semantic-controller").await?),
+        })
+    }
+}
+
+impl InteractionControllerConsumer {
+    /// Open one pending exchange on this retained caller connection.
+    /// # Errors
+    /// Returns normalized authorization, compatibility, lifecycle or transport failure.
+    pub async fn open(
+        &self,
+        version: u32,
+        exchange_id: &str,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::InteractionControllerSnapshot,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        use bcode_plugin_sdk::interaction_application::InteractionApplication as _;
+        self.open_controller(version, exchange_id).await
+    }
+    /// Read current semantics without reconnecting or replaying history.
+    /// # Errors
+    /// Returns normalized ownership, lifecycle or transport failure.
+    pub async fn snapshot(
+        &self,
+        exchange_id: &str,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::InteractionControllerSnapshot,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        use bcode_plugin_sdk::interaction_application::InteractionApplication as _;
+        self.controller_snapshot(exchange_id).await
+    }
+    /// Apply typed input with server-owned revision fencing on the same connection.
+    /// # Errors
+    /// Returns normalized conflicting input, ownership, lifecycle or transport failure.
+    pub async fn input(
+        &self,
+        input: bcode_plugin_sdk::interaction_application::InteractionControllerInput,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::InteractionControllerSnapshot,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        use bcode_plugin_sdk::interaction_application::InteractionApplication as _;
+        self.controller_input(input).await
+    }
+}
+
+impl bcode_plugin_sdk::interaction_application::InteractionApplication
+    for InteractionControllerConsumer
+{
+    async fn pending_exchanges(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        Vec<bcode_session_models::PendingToolExchangeSummary>,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        match self
+            .connection
+            .lock()
+            .await
+            .send_request(Request::ListPendingToolExchanges)
+            .await
+            .map_err(interaction_application_failure)?
+        {
+            ResponsePayload::PendingToolExchangeList { exchanges } => Ok(exchanges
+                .into_iter()
+                .filter(|exchange| exchange.session_id == session_id)
+                .collect()),
+            _ => Err(
+                bcode_plugin_sdk::interaction_application::InteractionControllerError::Unavailable,
+            ),
+        }
+    }
+    async fn pending_permissions(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        Vec<bcode_session_models::PermissionSummary>,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        match self
+            .connection
+            .lock()
+            .await
+            .send_request(Request::ListPermissions)
+            .await
+            .map_err(interaction_application_failure)?
+        {
+            ResponsePayload::PermissionList { permissions } => Ok(permissions
+                .into_iter()
+                .filter(|permission| permission.session_id == session_id)
+                .collect()),
+            _ => Err(
+                bcode_plugin_sdk::interaction_application::InteractionControllerError::Unavailable,
+            ),
+        }
+    }
+    async fn resolve_permission(
+        &self,
+        session_id: SessionId,
+        permission_id: &str,
+        approved: bool,
+        remember: bool,
+    ) -> Result<bool, bcode_plugin_sdk::interaction_application::InteractionControllerError> {
+        use bcode_plugin_sdk::interaction_application::InteractionControllerError as Error;
+        let mut connection = self.connection.lock().await;
+        let ResponsePayload::PermissionList {
+            permissions: pending,
+        } = connection
+            .send_request(Request::ListPermissions)
+            .await
+            .map_err(interaction_application_failure)?
+        else {
+            return Err(Error::Unavailable);
+        };
+        let Some(permission) = pending
+            .iter()
+            .find(|permission| permission.permission_id == permission_id)
+        else {
+            return Ok(false);
+        };
+        if permission.session_id != session_id {
+            return Err(Error::Unauthorized);
+        }
+        match connection
+            .send_request(Request::ResolvePermission {
+                permission_id: permission_id.into(),
+                approved,
+                remember,
+            })
+            .await
+            .map_err(interaction_application_failure)?
+        {
+            ResponsePayload::PermissionResolved { resolved } => Ok(resolved),
+            _ => Err(Error::Unavailable),
+        }
+    }
+    async fn open_controller(
+        &self,
+        version: u32,
+        exchange_id: &str,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::InteractionControllerSnapshot,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        controller_response(
+            self.connection
+                .lock()
+                .await
+                .send_request(Request::OpenInteractionController {
+                    version,
+                    exchange_id: exchange_id.into(),
+                })
+                .await,
+        )
+    }
+    async fn controller_snapshot(
+        &self,
+        exchange_id: &str,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::InteractionControllerSnapshot,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        controller_response(
+            self.connection
+                .lock()
+                .await
+                .send_request(Request::InteractionControllerSnapshot {
+                    exchange_id: exchange_id.into(),
+                })
+                .await,
+        )
+    }
+    async fn controller_input(
+        &self,
+        input: bcode_plugin_sdk::interaction_application::InteractionControllerInput,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::InteractionControllerSnapshot,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        controller_response(
+            self.connection
+                .lock()
+                .await
+                .send_request(Request::InteractionControllerInput { input })
+                .await,
+        )
+    }
+    async fn resolve_exchange(
+        &self,
+        exchange_id: &str,
+        resolution: bcode_tool::ToolExchangeResolution,
+    ) -> Result<bool, bcode_plugin_sdk::interaction_application::InteractionControllerError> {
+        let resolution_json = serde_json::to_value(resolution).map_err(|_| {
+            bcode_plugin_sdk::interaction_application::InteractionControllerError::InvalidContract
+        })?;
+        match self
+            .connection
+            .lock()
+            .await
+            .send_request(Request::ResolveToolExchange {
+                exchange_id: exchange_id.into(),
+                resolution_json,
+            })
+            .await
+            .map_err(interaction_application_failure)?
+        {
+            ResponsePayload::ToolExchangeResolved { resolved } => Ok(resolved),
+            _ => Err(
+                bcode_plugin_sdk::interaction_application::InteractionControllerError::Unavailable,
+            ),
+        }
+    }
+}
+
+fn controller_response(
+    response: Result<ResponsePayload, ClientError>,
+) -> Result<
+    bcode_plugin_sdk::interaction_application::InteractionControllerSnapshot,
+    bcode_plugin_sdk::interaction_application::InteractionControllerError,
+> {
+    match response.map_err(interaction_application_failure)? {
+        ResponsePayload::InteractionControllerSnapshot { snapshot } => Ok(snapshot),
+        _ => {
+            Err(bcode_plugin_sdk::interaction_application::InteractionControllerError::Unavailable)
+        }
+    }
+}
+
+fn interaction_application_failure(
+    error: ClientError,
+) -> bcode_plugin_sdk::interaction_application::InteractionControllerError {
+    use bcode_plugin_sdk::interaction_application::InteractionControllerError as Error;
+    match error {
+        ClientError::Server { code, .. } => match code.as_str() {
+            "interaction_controller_unsupported" => Error::Unsupported,
+            "interaction_controller_invalid_contract" => Error::InvalidContract,
+            "interaction_controller_conflict" => Error::Conflict,
+            "interaction_controller_not_pending" => Error::NotPending,
+            "interaction_controller_limit_exceeded" => Error::LimitExceeded,
+            "interaction_controller_unauthorized" => Error::Unauthorized,
+            _ => Error::Unavailable,
+        },
+        _ => Error::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod portable_application_adapter_tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_target_propagates_to_every_connection_and_rechecks_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::Builder::new()
+            .prefix("bct-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let executable = directory.path().join("bcode");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf 'external-consumer-test-artifact\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let digest = bcode_daemon_lifecycle::executable_sha256(&executable).unwrap();
+        let config_directory = bcode_config::default_config_dir();
+        let config = bcode_config::BcodeConfig::default();
+        let location = bcode_config::resolve_state_location_set(
+            &config.state,
+            &bcode_config::StateLocationSelection {
+                root: Some(directory.path().to_path_buf()),
+                profile: None,
+            },
+        )
+        .unwrap()
+        .primary()
+        .clone();
+        let _state_guard = bcode_config::push_process_state_location(&location);
+        let scope = bcode_config::runtime_scope_id(location.root(), &config_directory);
+        let artifact = bcode_ipc::ArtifactId::parse("external-consumer-test-artifact").unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("external.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let mut record = bcode_daemon_lifecycle::DaemonRecord::current_with_digest(
+            &endpoint,
+            directory.path().join("daemon.log"),
+            Some(executable.clone()),
+            Some(digest.clone()),
+            "external-instance".into(),
+        )
+        .unwrap();
+        record.storage_writer_epoch = Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
+        record.artifact_id = Some(artifact.clone());
+        record.namespace = bcode_ipc::daemon_namespace_for(&artifact);
+        record.build_fingerprint = "selected-external-build".into();
+        record.state_location_id = Some(scope.clone());
+        bcode_daemon_lifecycle::write_record(directory.path(), &record).unwrap();
+        let status = bcode_ipc::DaemonStatus {
+            namespace: record.namespace.clone(),
+            protocol_version: record.protocol_version,
+            artifact_id: Some(artifact.clone()),
+            build_fingerprint: record.build_fingerprint.clone(),
+            executable_digest: Some(digest.clone()),
+            storage_writer_epoch: record.storage_writer_epoch,
+            state_location_id: Some(scope.clone()),
+            session_event_schema_version: Some(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            ),
+            pid: record.pid,
+            instance_id: record.instance_id.clone(),
+            started_at_unix_ms: record.started_at_unix_ms,
+        };
+        let server = tokio::spawn(assert_explicit_target_handshakes(
+            listener, status, artifact, scope,
+        ));
+        let target = bcode_daemon_lifecycle::DaemonTarget::verify(
+            executable.clone(),
+            digest,
+            location,
+            config_directory,
+        )
+        .await
+        .unwrap();
+        let client =
+            super::BcodeClient::for_daemon(target, &config, directory.path().to_path_buf())
+                .unwrap()
+                .with_daemon_availability(super::DaemonAvailability::AutoStart);
+        client.ensure_daemon_available().await.unwrap(); // Never launches the consumer.
+        drop(client.connect_once("external-observer").await.unwrap());
+        drop(client.interaction_controller_consumer().await.unwrap());
+        std::fs::write(&executable, b"substituted").unwrap();
+        assert!(client.connect_once("changed-executable").await.is_err());
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn assert_explicit_target_handshakes(
+        listener: bcode_ipc::LocalIpcListener,
+        status: bcode_ipc::DaemonStatus,
+        artifact: bcode_ipc::ArtifactId,
+        scope: String,
+    ) {
+        // Target verification, ordinary consumer and retained controller.
+        for index in 0..3 {
+            let mut stream = listener.accept().await.unwrap();
+            let envelope = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+            let request: bcode_ipc::Request = bcode_ipc::decode_request(&envelope.payload).unwrap();
+            let bcode_ipc::Request::Hello {
+                artifact_id,
+                daemon_namespace,
+                build_fingerprint,
+                state_location_id,
+                runtime_context,
+                ..
+            } = request
+            else {
+                panic!("expected hello");
+            };
+            assert_eq!(artifact_id, Some(artifact.clone()));
+            assert_eq!(daemon_namespace, status.namespace);
+            assert_eq!(build_fingerprint, status.build_fingerprint);
+            assert_eq!(state_location_id.as_deref(), Some(scope.as_str()));
+            if index > 0 {
+                assert!(runtime_context.is_some());
+            }
+            if index == 2 {
+                assert!(
+                    runtime_context
+                        .unwrap()
+                        .interaction_controller_versions
+                        .contains(&1)
+                );
+            }
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion::current(),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon: status.clone(),
+            });
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(envelope.request_id, &response).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_configuration_does_not_claim_process_launch_provenance() {
+        let directory = std::env::current_dir().unwrap();
+        let config = bcode_config::BcodeConfig::default();
+        let context = super::configured_runtime_context(&config, directory.clone()).unwrap();
+        assert_eq!(context.working_directory, Some(directory));
+        assert!(context.effective_config_toml.is_some());
+        assert!(context.config_launch.is_none());
+        assert!(!context.effective_config_toml.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn relative_session_directories_use_canonical_failure_without_transport() {
+        let client = super::BcodeClient::default_endpoint();
+        let created = bcode_session_models::SessionApplication::create_session(
+            &client,
+            bcode_session_models::CreateSessionRequest {
+                name: None,
+                working_directory: std::path::PathBuf::from("relative"),
+            },
+        )
+        .await
+        .unwrap_err();
+        let changed = bcode_session_models::SessionApplication::change_session_working_directory(
+            &client,
+            bcode_session_models::SessionId::new(),
+            std::path::PathBuf::from("relative"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(created.code, "session_working_directory_must_be_absolute");
+        assert_eq!(created, changed);
+    }
+
+    #[test]
+    fn unknown_server_codes_are_preserved_and_transport_errors_are_secret_safe() {
+        let failure = super::session_application_failure(super::ClientError::Server {
+            code: "future_code".into(),
+            message: "normalized future message".into(),
+        });
+        assert_eq!(failure.code, "future_code");
+        assert_eq!(failure.message, "normalized future message");
+        let failure = super::session_application_failure(super::ClientError::Protocol(
+            "secret wire contents".into(),
+        ));
+        assert_eq!(failure.code, "session_transport_unavailable");
+        assert!(!failure.message.contains("secret"));
+    }
+    #[test]
+    fn interaction_failure_discriminants_survive_transport() {
+        use bcode_plugin_sdk::interaction_application::InteractionControllerError as Error;
+        for (code, expected) in [
+            ("interaction_controller_unsupported", Error::Unsupported),
+            (
+                "interaction_controller_invalid_contract",
+                Error::InvalidContract,
+            ),
+            ("interaction_controller_conflict", Error::Conflict),
+            ("interaction_controller_not_pending", Error::NotPending),
+            (
+                "interaction_controller_limit_exceeded",
+                Error::LimitExceeded,
+            ),
+            ("interaction_controller_unauthorized", Error::Unauthorized),
+            ("future_controller_error", Error::Unavailable),
+        ] {
+            assert_eq!(
+                super::interaction_application_failure(super::ClientError::Server {
+                    code: code.into(),
+                    message: "ignored presentation".into()
+                }),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn semantic_opt_in_preserves_resolved_context_and_configuration_failure() {
+        let context = bcode_ipc::ClientRuntimeContext {
+            selected_provider_plugin_id: Some("provider".into()),
+            selected_model_id: Some("model".into()),
+            effective_config_toml: Some(Box::new("selected configuration".into())),
+            ..Default::default()
+        };
+        let mut client =
+            super::BcodeClient::default_endpoint().with_runtime_context(Some(context.clone()));
+        client.runtime_context_error = Some("configuration unavailable".into());
+        let client =
+            client.with_interaction_controller_versions(std::collections::BTreeSet::from([1]));
+        let mut expected = context;
+        expected.interaction_controller_versions.insert(1);
+        assert_eq!(client.runtime_context, Some(expected));
+        assert_eq!(
+            client.runtime_context_error.as_deref(),
+            Some("configuration unavailable")
+        );
+    }
+
+    #[test]
+    fn semantic_controller_opt_in_does_not_forge_renderer_adapters() {
+        let client = super::BcodeClient::default_endpoint()
+            .with_runtime_context(Some(bcode_ipc::ClientRuntimeContext::default()));
+        assert!(
+            client
+                .runtime_context
+                .as_ref()
+                .unwrap()
+                .interaction_controller_versions
+                .is_empty()
+        );
+        let client =
+            client.with_interaction_controller_versions(std::collections::BTreeSet::from([1, 99]));
+        let context = client.runtime_context.as_ref().unwrap();
+        assert_eq!(
+            context.interaction_controller_versions,
+            std::collections::BTreeSet::from([1, 99])
+        );
+        assert!(context.interaction_adapters.is_empty());
+    }
+    #[cfg(unix)]
+    fn semantic_consumer_fixture_daemon() -> bcode_ipc::DaemonStatus {
+        let (_, digest) = bcode_daemon_lifecycle::current_executable_identity().unwrap();
+        bcode_ipc::DaemonStatus {
+            namespace: bcode_ipc::daemon_namespace(),
+            protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
+            build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+            executable_digest: Some(digest),
+            storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            session_event_schema_version: Some(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            ),
+            state_location_id: Some(bcode_ipc::state_location_id()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_consumer_retains_one_connection_and_surfaces_failure_without_reconnect() {
+        use bcode_plugin_sdk::interaction_application::InteractionControllerError as Error;
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/bcc-{}",
+            bcode_session_models::SessionId::new()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("consumer.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let daemon = semantic_consumer_fixture_daemon();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+            let request: bcode_ipc::Request = bcode_ipc::decode_request(&hello.payload).unwrap();
+            let bcode_ipc::Request::Hello {
+                runtime_context: Some(context),
+                ..
+            } = request
+            else {
+                panic!("expected hello runtime context");
+            };
+            assert_eq!(
+                context.interaction_controller_versions,
+                std::collections::BTreeSet::from([1])
+            );
+            assert!(context.interaction_adapters.is_empty());
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion::current(),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon,
+            });
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+            )
+            .await
+            .unwrap();
+            let mut last_id = hello.request_id;
+            for expected in ["open", "snapshot"] {
+                let envelope = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                assert!(envelope.request_id > last_id);
+                last_id = envelope.request_id;
+                let request: bcode_ipc::Request =
+                    bcode_ipc::decode_request(&envelope.payload).unwrap();
+                assert!(matches!(
+                    (expected, request),
+                    ("open", bcode_ipc::Request::OpenInteractionController { .. })
+                        | (
+                            "snapshot",
+                            bcode_ipc::Request::InteractionControllerSnapshot { .. }
+                        )
+                ));
+                let response = bcode_ipc::Response::Err(bcode_ipc::ErrorResponse::new(
+                    "interaction_controller_not_pending",
+                    "no longer pending",
+                ));
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(envelope.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let consumer = super::BcodeClient::new(endpoint)
+            .with_runtime_context(Some(bcode_ipc::ClientRuntimeContext::default()))
+            .interaction_controller_consumer()
+            .await
+            .unwrap();
+        assert_eq!(
+            consumer.open(1, "one").await.unwrap_err(),
+            Error::NotPending
+        );
+        assert_eq!(
+            consumer.snapshot("one").await.unwrap_err(),
+            Error::NotPending
+        );
+        server.await.unwrap();
+        assert_eq!(
+            consumer.snapshot("one").await.unwrap_err(),
+            Error::Unavailable
+        );
+        drop(consumer);
+        match std::fs::remove_file(directory.join("consumer.sock")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to remove fixture socket: {error}"),
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn client_exposes_every_portable_domain_contract() {
+        fn require<
+            T: bcode_session_models::SessionApplication
+                + bcode_session_models::application::RuntimeWorkApplication
+                + bcode_agent_profile::application::AgentApplication
+                + bcode_skill_models::application::SkillApplication
+                + bcode_model_catalog::application::ModelApplication
+                + bcode_plugin_sdk::application::PluginApplication
+                + bcode_worktree_models::application::WorktreeApplication,
+        >() {
+        }
+        fn require_controller<
+            T: bcode_plugin_sdk::interaction_application::InteractionApplication,
+        >() {
+        }
+        require::<super::BcodeClient>();
+        require_controller::<super::InteractionControllerConsumer>();
+    }
+}
+
+impl bcode_usage_models::application::UsageApplication for BcodeClient {
+    async fn usage_report(
+        &self,
+        query: bcode_usage_models::UsageQuery,
+    ) -> Result<
+        bcode_usage_models::UsageReport,
+        bcode_usage_models::application::UsageApplicationFailure,
+    > {
+        Self::usage_report(self, query).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_usage_models::application::UsageApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+}
+
+impl bcode_worktree_models::application::WorktreeApplication for BcodeClient {
+    async fn list_worktrees(
+        &self,
+        cwd: PathBuf,
+    ) -> Result<
+        bcode_worktree_models::WorktreeListResponse,
+        bcode_worktree_models::application::WorktreeApplicationFailure,
+    > {
+        Self::list_worktrees(self, bcode_ipc::WorktreeListRequest { cwd: Some(cwd) })
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_worktree_models::application::WorktreeApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn remove_worktree(
+        &self,
+        cwd: PathBuf,
+        path: PathBuf,
+        force: bool,
+    ) -> Result<
+        bcode_worktree_models::WorktreeRemoveResponse,
+        bcode_worktree_models::application::WorktreeApplicationFailure,
+    > {
+        Self::remove_worktree(
+            self,
+            bcode_ipc::WorktreeRemoveRequest {
+                cwd: Some(cwd),
+                path,
+                force,
+            },
+        )
+        .await
+        .map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_worktree_models::application::WorktreeApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn start_worktree_creation(
+        &self,
+        operation_id: String,
+        request: bcode_worktree_models::WorktreeCreateRequest,
+    ) -> Result<
+        bcode_worktree_models::WorktreeCreateOperationStatus,
+        bcode_worktree_models::application::WorktreeApplicationFailure,
+    > {
+        Self::start_worktree_create(self, operation_id, request)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_worktree_models::application::WorktreeApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn worktree_creation_status(
+        &self,
+        operation_id: String,
+    ) -> Result<
+        bcode_worktree_models::WorktreeCreateOperationStatus,
+        bcode_worktree_models::application::WorktreeApplicationFailure,
+    > {
+        Self::worktree_create_status(self, operation_id)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_worktree_models::application::WorktreeApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn wait_worktree_creation(
+        &self,
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    ) -> Result<
+        bcode_worktree_models::WorktreeCreateOperationStatus,
+        bcode_worktree_models::application::WorktreeApplicationFailure,
+    > {
+        Self::wait_worktree_create(self, operation_id, after_revision, timeout_ms)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_worktree_models::application::WorktreeApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+}
+
+impl bcode_session_search::application::SearchApplication for BcodeClient {
+    async fn search_providers(
+        &self,
+    ) -> Result<
+        bcode_session_search::ListSessionSearchProvidersResponse,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_providers(self).await.map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_session_search::application::SearchApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+    async fn explain_search(
+        &self,
+        request: bcode_session_search::SessionSearchRequest,
+        policy: bcode_session_search::SessionSearchPlanPolicy,
+        routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+    ) -> Result<
+        bcode_session_search::SessionSearchPlan,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_explain(self, request, policy, routes)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn search(
+        &self,
+        request: bcode_session_search::SessionSearchRequest,
+        policy: bcode_session_search::SessionSearchPlanPolicy,
+        routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+        hydrate: bool,
+    ) -> Result<
+        bcode_session_search::application::ApplicationSearchResult,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search(self, request, policy, routes, hydrate)
+            .await
+            .map(|(response, hydrated_hits)| {
+                bcode_session_search::application::ApplicationSearchResult {
+                    response,
+                    hydrated_hits,
+                }
+            })
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn purge_search(
+        &self,
+        provider_id: String,
+        confirmation: String,
+    ) -> Result<
+        bcode_session_search::SessionSearchMaintenanceResponse,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_purge(self, provider_id, confirmation)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn rebuild_search(
+        &self,
+        provider_id: String,
+        confirmation: String,
+    ) -> Result<
+        bcode_session_search::SessionSearchMaintenanceResponse,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_rebuild(self, provider_id, confirmation)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn start_complete_search_backfill(
+        &self,
+        request: bcode_session_search::CompleteSessionSearchBackfillRequest,
+    ) -> Result<
+        bcode_session_search::StartSessionSearchBackfillResponse,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_complete_backfill_start(self, request)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn start_search_backfill(
+        &self,
+        request: bcode_session_search::BackfillSessionSearchRequest,
+    ) -> Result<
+        bcode_session_search::StartSessionSearchBackfillResponse,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_backfill_start(self, request)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn search_backfill_status(
+        &self,
+        operation_id: String,
+    ) -> Result<
+        bcode_session_search::SessionSearchBackfillOperationStatus,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_backfill_status(self, operation_id)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn wait_search_backfill(
+        &self,
+        operation_id: String,
+        after_revision: u64,
+        timeout_ms: u64,
+    ) -> Result<
+        bcode_session_search::SessionSearchBackfillOperationStatus,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_backfill_wait(self, operation_id, after_revision, timeout_ms)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn cancel_search_backfill(
+        &self,
+        operation_id: String,
+    ) -> Result<
+        bcode_session_search::SessionSearchBackfillOperationStatus,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_backfill_cancel(self, operation_id)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn backfill_search(
+        &self,
+        request: bcode_session_search::BackfillSessionSearchRequest,
+    ) -> Result<
+        bcode_session_search::SessionSearchBackfillResponse,
+        bcode_session_search::application::SearchApplicationFailure,
+    > {
+        Self::session_search_backfill(self, request)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_session_search::application::SearchApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+}
+
+impl BcodeClient {
+    async fn typed_import_service<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        operation: &str,
+        request: T,
+    ) -> Result<R, bcode_session_import::application::ImportApplicationFailure> {
+        let payload = serde_json::to_vec(&request).map_err(|_| {
+            bcode_session_import::application::ImportApplicationFailure {
+                code: "import_invalid_request".into(),
+                message: "import request could not be encoded".into(),
+            }
+        })?;
+        let response = Self::call_plugin_service(
+            self,
+            bcode_session_import::SESSION_IMPORT_INTERFACE_ID.into(),
+            operation.into(),
+            payload,
+        )
+        .await
+        .map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_session_import::application::ImportApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })?;
+        if let Some(error) = response.error {
+            return Err(
+                bcode_session_import::application::ImportApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                },
+            );
+        }
+        serde_json::from_slice(&response.payload).map_err(|_| {
+            bcode_session_import::application::ImportApplicationFailure {
+                code: "import_invalid_response".into(),
+                message: "import source response is incompatible".into(),
+            }
+        })
+    }
+}
+impl bcode_session_import::application::ImportApplication for BcodeClient {
+    async fn import_sources(
+        &self,
+    ) -> Result<
+        bcode_session_import::ListImportSourcesResponse,
+        bcode_session_import::application::ImportApplicationFailure,
+    > {
+        self.typed_import_service(
+            bcode_session_import::OP_LIST_IMPORT_SOURCES,
+            serde_json::json!({}),
+        )
+        .await
+    }
+    async fn discover_importable_sessions(
+        &self,
+        request: bcode_session_import::DiscoverImportableSessionsRequest,
+    ) -> Result<
+        bcode_session_import::DiscoverImportableSessionsResponse,
+        bcode_session_import::application::ImportApplicationFailure,
+    > {
+        self.typed_import_service(
+            bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS,
+            request,
+        )
+        .await
+    }
+    async fn load_importable_session(
+        &self,
+        request: bcode_session_import::LoadImportableSessionRequest,
+    ) -> Result<
+        bcode_session_import::ImportableSession,
+        bcode_session_import::application::ImportApplicationFailure,
+    > {
+        self.typed_import_service(bcode_session_import::OP_LOAD_IMPORTABLE_SESSION, request)
+            .await
+    }
+    async fn import_session(
+        &self,
+        request: bcode_session_import::application::ApplicationImportRequest,
+    ) -> Result<
+        bcode_session_import::application::ApplicationImportResult,
+        bcode_session_import::application::ImportApplicationFailure,
+    > {
+        match self
+            .send_request(Request::ImportExternalSession {
+                source_id: request.source_id,
+                external_session_id: request.external_session_id,
+                working_directory: Some(request.working_directory),
+            })
+            .await
+        {
+            Ok(ResponsePayload::ExternalSessionImported { session, warnings }) => Ok(
+                bcode_session_import::application::ApplicationImportResult { session, warnings },
+            ),
+            Ok(_) => Err(ClientError::UnexpectedResponse),
+            Err(error) => Err(error),
+        }
+        .map_err(|error| {
+            let error = session_application_failure(error);
+            bcode_session_import::application::ImportApplicationFailure {
+                code: error.code,
+                message: error.message,
+            }
+        })
+    }
+}
+
+// Connection-local command control; no caller authority crosses sockets.
+mod command_control {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::{BcodeClient, ClientError};
+    use bcode_ipc::{
+        EnvelopeKind, Request, Response, ResponsePayload, decode_response, recv_envelope,
+        request_envelope, send_envelope,
+    };
+
+    type CancelReply = oneshot::Sender<bool>;
+    #[derive(Debug, Clone, Default)]
+    pub struct Controls(Arc<Mutex<BTreeMap<String, Option<mpsc::Sender<CancelReply>>>>>);
+
+    struct Registration {
+        controls: Controls,
+        id: String,
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            if let Ok(mut entries) = self.controls.0.lock() {
+                entries.remove(&self.id);
+            }
+        }
+    }
+
+    pub async fn cancel(client: &BcodeClient, id: &str) -> Result<bool, ClientError> {
+        let sender = client
+            .command_invocations
+            .0
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(id).cloned().flatten());
+        let Some(sender) = sender else {
+            return Ok(false);
+        };
+        let (reply, result) = oneshot::channel();
+        if sender.try_send(reply).is_err() {
+            return Ok(false);
+        }
+        result.await.map_err(|_| ClientError::UnexpectedResponse)
+    }
+
+    fn project(
+        response: Response,
+    ) -> Result<bcode_command::application::CommandInvocationResult, ClientError> {
+        match response {
+            Response::Ok(ResponsePayload::ApplicationCommandInvoked { result }) => Ok(*result),
+            Response::Err(error) => Err(ClientError::Server {
+                code: error.code,
+                message: error.message,
+            }),
+            Response::Ok(_) => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn invoke(
+        client: &BcodeClient,
+        request: bcode_command::application::CommandInvocationRequest,
+    ) -> Result<bcode_command::application::CommandInvocationResult, ClientError> {
+        let (sender, mut controls) = mpsc::channel(1);
+        {
+            let mut entries = client
+                .command_invocations
+                .0
+                .lock()
+                .map_err(|_| ClientError::UnexpectedResponse)?;
+            if entries.len() >= 4096
+                || entries.values().filter(|entry| entry.is_some()).count() >= 64
+                || entries.contains_key(&request.invocation_id)
+            {
+                return Err(ClientError::UnexpectedResponse);
+            }
+            entries.insert(request.invocation_id.clone(), Some(sender));
+        }
+        let registration = Registration {
+            controls: client.command_invocations.clone(),
+            id: request.invocation_id.clone(),
+        };
+        let timeout = Duration::from_millis(request.deadline_ms.min(30_000))
+            .saturating_add(Duration::from_secs(2));
+        let work = async {
+            let mut connection = client.connect("bcode-command-context").await?;
+            if let Some(session) = request
+                .command
+                .context
+                .as_ref()
+                .and_then(|context| context.session_id)
+            {
+                connection.attach_session_recent(session, 1).await?;
+            }
+            let invoke_id = connection.next_request_id;
+            let cancel_id = invoke_id
+                .checked_add(1)
+                .ok_or(ClientError::UnexpectedResponse)?;
+            let request = Request::InvokeApplicationCommand {
+                request: Box::new(request),
+            };
+            let (mut reader, mut writer) = tokio::io::split(connection.stream);
+            send_envelope(&mut writer, &request_envelope(invoke_id, &request)?).await?;
+            let mut cancel_reply = None;
+            let mut cancel_sent = false;
+            let mut terminal = None;
+            loop {
+                // Keep this future alive when control arrives: frame reads are not
+                // cancellation-safe after partially receiving a chunked envelope.
+                let receive = recv_envelope(&mut reader);
+                tokio::pin!(receive);
+                let envelope = loop {
+                    tokio::select! {
+                        result = &mut receive => break result?,
+                        Some(reply) = controls.recv(), if !cancel_sent => {
+                            cancel_sent = true;
+                            cancel_reply = Some(reply);
+                            let request = Request::CancelApplicationCommand { invocation_id: registration.id.clone() };
+                            send_envelope(&mut writer, &request_envelope(cancel_id, &request)?).await?;
+                        }
+                    }
+                };
+                if envelope.kind == EnvelopeKind::Event {
+                    continue;
+                }
+                if envelope.kind != EnvelopeKind::Response {
+                    return Err(ClientError::UnexpectedResponse);
+                }
+                let response = decode_response(&envelope.payload)?;
+                if envelope.request_id == cancel_id && cancel_sent {
+                    let accepted =
+                        match response {
+                            Response::Ok(ResponsePayload::ApplicationCommandCancelled {
+                                result,
+                            }) if result.invocation_id == registration.id => result.accepted,
+                            _ => return Err(ClientError::UnexpectedResponse),
+                        };
+                    if let Some(reply) = cancel_reply.take() {
+                        let _sent = reply.send(accepted);
+                    }
+                    if let Some(response) = terminal.take() {
+                        return project(response);
+                    }
+                    continue;
+                }
+                if envelope.request_id != invoke_id {
+                    return Err(ClientError::UnexpectedResponse);
+                }
+                if cancel_reply.is_some() {
+                    terminal = Some(response);
+                    continue;
+                }
+                return project(response);
+            }
+        };
+        tokio::time::timeout(timeout, work)
+            .await
+            .map_err(|_| ClientError::RequestTimeout { timeout })?
     }
 }

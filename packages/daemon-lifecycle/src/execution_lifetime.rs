@@ -66,7 +66,8 @@ impl Drop for ExecutionMaintenance {
         // Only the acquiring process relinquishes maintenance authority. A
         // fork descendant closing its inherited handle must not unlock the
         // parent's shared open file description. Owner release must not wait
-        // for unrelated descendants to exec or exit.
+        // for unrelated descendants to exec or exit. Borrowed coordinator
+        // lifetimes must not release this maintenance fence.
         if self.owner_pid == std::process::id() {
             let _ = self.file.unlock();
         }

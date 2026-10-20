@@ -8,6 +8,7 @@
 //! derived-record ingestion without exposing a backend query language, schema, score type, or
 //! pagination token. Providers never receive canonical storage paths or raw session event payloads.
 
+pub mod application;
 pub mod projection;
 
 use bcode_session_models::{SessionId, SessionInspectionCategory};

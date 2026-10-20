@@ -70,6 +70,40 @@ impl HistoricalEnvelope {
         })
     }
 
+    /// Decode the released creation shape without inventing a composed spawn request.
+    ///
+    /// # Errors
+    /// Returns an error when the historical kind envelope is malformed or its
+    /// child-creation payload does not match the released request-only shape.
+    pub fn decode_child_session_created(
+        &self,
+    ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ChildSessionCreated {
+            request: Box<bcode_session_models::SessionChildCreateRequest>,
+        }
+        let (event_kind, payload) = source_kind(self)?;
+        let child =
+            serde_json::from_value::<ChildSessionCreated>(payload.clone()).map_err(|error| {
+                HistoricalSessionEventError::InvalidEvent {
+                    schema_version: self.schema_version,
+                    event_kind: event_kind.to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+        Ok(HistoricalDecode::Converted {
+            event: self.materialize(SessionEventKind::ChildSessionCreated {
+                request: child.request,
+                spawning: None,
+            }),
+            metadata: HistoricalEventMetadata {
+                source_schema: self.schema_version,
+                source_kind: event_kind.to_owned(),
+            },
+        })
+    }
+
     fn materialize(&self, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,

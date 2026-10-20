@@ -1,8 +1,5 @@
 //! Pinned request-only context for isolated, tool-free generation.
-use super::{
-    Arc, ErrorResponse, Response, ResponsePayload, ServerError, ServerState, SessionEventKind,
-    SessionId, SharedWriter, ambiguous_session_location_response, send_response,
-};
+use super::{Arc, ServerState, SessionEventKind, SessionId};
 
 #[derive(Debug)]
 pub struct CapturedContext {
@@ -17,28 +14,6 @@ mod tests;
 const MAX_CAPTURES: usize = 32;
 const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const LIFETIME: std::time::Duration = std::time::Duration::from_mins(10);
-
-pub async fn handle(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_session_models::PrepareContextGeneration,
-) -> Result<(), ServerError> {
-    if let Some(response) =
-        ambiguous_session_location_response(state, request.source_session_id).await
-    {
-        return send_response(writer, request_id, response).await;
-    }
-    let result = prepare(state, request).await;
-    let response = match result {
-        Ok(prepared) => Response::Ok(ResponsePayload::PreparedContextGeneration { prepared }),
-        Err(message) => Response::Err(ErrorResponse::new(
-            "generation_context_unavailable",
-            message,
-        )),
-    };
-    send_response(writer, request_id, response).await
-}
 
 /// Capture a stable bounded source prefix without copying it into destination history.
 pub async fn prepare(
