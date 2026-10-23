@@ -176,6 +176,46 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         Ok(ServerSessionCompactionOperation { completion })
     }
 
+    async fn begin_session_summary_rebuild(
+        &self,
+        request: bcode_session_models::SessionSummaryRebuildRequest,
+    ) -> Result<Self::CompactionOperation, SessionApplicationFailure> {
+        self.selected_location(request.session_id).await?;
+        if !request.budget.is_valid() {
+            return Err(failure(
+                "invalid_summary_rebuild_budget",
+                "invalid summary reconstruction allowance",
+            ));
+        }
+        if self
+            .state
+            .active_session_namespace_mismatch(request.session_id, self.client_id)
+            .await
+            .is_some()
+        {
+            return Err(failure(
+                "incompatible_session_namespace",
+                "session belongs to another active execution namespace",
+            ));
+        }
+        let selection = super::session_model_selection_with_runtime_context(
+            self.state,
+            request.session_id,
+            self.state.client_runtime_context(self.client_id).await,
+        )
+        .await;
+        let completion =
+            super::enqueue_rebuild_summary_command(self.state, self.client_id, selection, request)
+                .await
+                .map_err(|_| {
+                    failure(
+                        "summary_rebuild_admission_failed",
+                        "summary reconstruction could not be queued",
+                    )
+                })?;
+        Ok(ServerSessionCompactionOperation { completion })
+    }
+
     async fn session_catalog_snapshot(
         &self,
         working_directory: PathBuf,

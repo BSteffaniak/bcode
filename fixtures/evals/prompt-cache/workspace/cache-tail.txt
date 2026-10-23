@@ -1,0 +1,2 @@
+Stable small payload for the post-compaction cache-reuse tail.
+Repeated reads exercise sustained prefix reuse without forcing another compaction.

@@ -4,6 +4,7 @@
 
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
+mod compaction_fixture;
 mod judgement;
 pub mod prompt_cache;
 mod vision;
@@ -620,7 +621,12 @@ impl FakeProviderPlugin {
                 provider_turn_id: insert_fake_error_turn(&self.state, error),
             });
         }
-        if let Some(profile) = prompt_cache::profile_for(&request.model_id) {
+        if let Some(profile) = prompt_cache::profile_for(&request.model_id)
+            && request
+                .metadata
+                .get("bcode_request_kind")
+                .is_none_or(|kind| kind != "compaction")
+        {
             return self.start_cache_model_turn(
                 &profile,
                 &request,
@@ -1116,13 +1122,76 @@ fn validate_fake_compaction_summary(summary: &str) -> Result<&str, ProviderError
     Ok(summary)
 }
 
+// Deterministic simulation of the host's structured compaction protocol, not semantic LLM proof.
+fn fake_compaction_synthesis(
+    request: &ModelTurnRequest,
+    prompt: &str,
+) -> Result<String, ProviderError> {
+    if let Some(protocol) = request
+        .provider_context
+        .settings
+        .get("fake_compaction_fixture")
+    {
+        if protocol != "scope-v1" {
+            return Err(fake_structured_output_error(
+                &"unsupported fake compaction fixture protocol",
+            ));
+        }
+        return compaction_fixture::synthesize(prompt)
+            .map_err(|error| fake_structured_output_error(&error));
+    }
+    let prior = prompt
+        .split_once("Prior structured synthesis: ")
+        .and_then(|(_, rest)| rest.split_once("\n\nSource fragments (JSON lines):"))
+        .and_then(|(value, _)| serde_json::from_str::<serde_json::Value>(value).ok());
+    let mut value = prior.unwrap_or_else(|| {
+        serde_json::json!({
+            "format": "bcode.compaction.scope.v2",
+            "current_scope": [],
+            "continuation": "Deterministic fake-provider compaction simulation."
+        })
+    });
+    if let Some(summary) = configured_fake_compaction_summary(request) {
+        validate_fake_compaction_summary(summary)?;
+        value["continuation"] = serde_json::Value::String(summary.to_owned());
+    } else if prompt_cache::profile_for(&request.model_id).is_some()
+        && let Some(continuation) = prompt_cache::compact_read_task(prompt, &value)
+    {
+        value["continuation"] = serde_json::Value::String(continuation);
+    } else if value["continuation"]
+        .as_str()
+        .is_none_or(|text| text.trim().is_empty())
+    {
+        value["continuation"] = serde_json::Value::String(
+            "Deterministic fake-provider compaction simulation.".to_owned(),
+        );
+    }
+    serde_json::to_string(&value).map_err(|error| fake_structured_output_error(&error))
+}
+
+fn fake_compaction_response(
+    request: &ModelTurnRequest,
+    user_text: &str,
+) -> Option<Result<String, ProviderError>> {
+    if request
+        .metadata
+        .get("bcode_request_kind")
+        .is_some_and(|kind| kind == "compaction")
+        && user_text.contains("Prior structured synthesis:")
+    {
+        return Some(fake_compaction_synthesis(request, user_text));
+    }
+    configured_fake_compaction_summary(request)
+        .map(|summary| validate_fake_compaction_summary(summary).map(str::to_owned))
+}
+
 fn fake_response_text(
     request: &ModelTurnRequest,
     tool_result: Option<&str>,
     user_text: &str,
 ) -> Result<String, ProviderError> {
-    if let Some(summary) = configured_fake_compaction_summary(request) {
-        return validate_fake_compaction_summary(summary).map(str::to_owned);
+    if let Some(summary) = fake_compaction_response(request, user_text) {
+        return summary;
     }
     if request.model_id == vision::MODEL {
         return vision::answer(request, user_text)
@@ -3975,6 +4044,59 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
         }
         let maximum = "界".repeat(900);
         assert_eq!(validate_fake_compaction_summary(&maximum).unwrap(), maximum);
+    }
+
+    #[test]
+    fn cache_model_compaction_uses_opt_in_attributed_fixture_not_cache_simulation() {
+        let prompt = concat!(
+            "Prior structured synthesis: {\"format\":\"bcode.compaction.scope.v2\",\"current_scope\":[],\"continuation\":\"initial\"}",
+            "\n\nSource fragments (JSON lines):\n",
+            "{\"sequence\":7,\"provenance\":\"user\",\"byte_offset\":0,\"final_fragment\":true,\"text\":\"BCODE_FIXTURE_SCOPE {\\\"key\\\":\\\"role\\\",\\\"statement\\\":\\\"read only\\\"}\"}",
+        );
+        let request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "turn_id": "fixture-compact", "model_id": "fake-cache-explicit",
+            "provider_context": {"settings":{"fake_compaction_fixture":"scope-v1"}},
+            "metadata": {"bcode_request_kind":"compaction"},
+            "messages":[{"role":"user","content":[{"type":"text","text":prompt}]}],
+        }))
+        .expect("fixture request");
+        let context: NativeServiceContext = serde_json::from_value(serde_json::json!({
+            "plugin_id":"bcode.fake-provider",
+            "request":{"interface_id":MODEL_PROVIDER_INTERFACE_ID,"operation":OP_START_TURN,
+                "payload":serde_json::to_vec(&request).expect("payload")},
+        }))
+        .expect("context");
+        let plugin = FakeProviderPlugin::default();
+        let response = plugin.start_turn(&context, false);
+        assert!(response.error.is_none());
+        let started: StartTurnResponse =
+            serde_json::from_slice(&response.payload).expect("started");
+        let mut events = Vec::new();
+        for _ in 0..1000 {
+            events.extend(
+                plugin.state.lock().expect("state").turns[&started.provider_turn_id].drain(),
+            );
+            if events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::TurnFinished { .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let summary: serde_json::Value =
+            serde_json::from_str(&text).expect("structured synthesis, not cache response");
+        assert_eq!(summary["current_scope"][0]["statement"], "read only");
+        assert_eq!(summary["current_scope"][0]["source_sequence"], 7);
+        assert!(fake_compaction_synthesis(&request, "malformed fixture source").is_err());
     }
 
     #[test]

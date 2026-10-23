@@ -158,6 +158,9 @@ pub enum CliError {
     Sshenv(String),
     #[error("session history accepts only one of --after or --before")]
     InvalidSessionHistoryRange,
+    /// Invalid explicit summary reconstruction selection or allowance.
+    #[error("summary reconstruction requires --expected-marker and valid bounded allowances")]
+    InvalidSummaryRebuild,
     /// I/O failure, including signal-listener setup failures (not a received signal).
     #[error("I/O error: {0}")]
     Signal(#[from] std::io::Error),
@@ -250,6 +253,7 @@ impl CliError {
             Self::WorkflowInspection { source } => workflow_inspection_exit_code(source),
             Self::InvalidArguments(_)
             | Self::InvalidSessionHistoryRange
+            | Self::InvalidSummaryRebuild
             | Self::NewSessionWithCommand
             | Self::SessionRepairUsage(_)
             | Self::InvalidExchangeResolution
@@ -6479,6 +6483,22 @@ enum SessionCommand {
     /// Explicitly compact one session's model context.
     Compact {
         session_id: SessionId,
+        /// Reconstruct the selected summary from bounded canonical history.
+        #[arg(long, requires = "expected_marker")]
+        rebuild_summary: bool,
+        /// Exact latest marker selected for replacement.
+        #[arg(long, requires = "rebuild_summary")]
+        expected_marker: Option<u64>,
+        #[arg(long, default_value_t = 8192)]
+        rebuild_max_events: u32,
+        #[arg(long, default_value_t = 128)]
+        rebuild_max_pages: u32,
+        #[arg(long, default_value_t = 8388608)]
+        rebuild_max_decoded_bytes: u32,
+        #[arg(long, default_value_t = 512)]
+        rebuild_max_provider_requests: u32,
+        #[arg(long, default_value_t = 300000)]
+        rebuild_timeout_ms: u32,
         #[arg(long)]
         json: bool,
     },
@@ -9033,8 +9053,36 @@ async fn dispatch_non_ranking_session_command(
             skill_id,
             json,
         } => Box::pin(set_session_skill(session_id, skill_id, false, json)).await?,
-        SessionCommand::Compact { session_id, json } => {
-            Box::pin(compact_session(session_id, json)).await?;
+        SessionCommand::Compact {
+            session_id,
+            json,
+            rebuild_summary,
+            expected_marker,
+            rebuild_max_events,
+            rebuild_max_pages,
+            rebuild_max_decoded_bytes,
+            rebuild_max_provider_requests,
+            rebuild_timeout_ms,
+        } => {
+            if rebuild_summary {
+                Box::pin(rebuild_session_summary(
+                    bcode_session_models::SessionSummaryRebuildRequest {
+                        session_id,
+                        expected_marker: expected_marker.ok_or(CliError::InvalidSummaryRebuild)?,
+                        budget: bcode_session_models::SessionSummaryRebuildBudget {
+                            max_events: rebuild_max_events,
+                            max_pages: rebuild_max_pages,
+                            max_decoded_bytes: rebuild_max_decoded_bytes,
+                            max_provider_requests: rebuild_max_provider_requests,
+                            timeout_ms: rebuild_timeout_ms,
+                        },
+                    },
+                    json,
+                ))
+                .await?;
+            } else {
+                Box::pin(compact_session(session_id, json)).await?;
+            }
         }
         SessionCommand::Watch {
             session_id,
@@ -17297,6 +17345,48 @@ async fn set_session_skill(
         session_id,
         json,
     )
+}
+
+async fn rebuild_session_summary(
+    request: bcode_session_models::SessionSummaryRebuildRequest,
+    json: bool,
+) -> Result<(), CliError> {
+    use bcode_session_models::{SessionApplication as _, SessionCompactionOperation as _};
+    if !request.budget.is_valid() {
+        return Err(CliError::InvalidSummaryRebuild);
+    }
+    let client = BcodeClient::default_endpoint();
+    let operation = client
+        .begin_session_summary_rebuild(request)
+        .await
+        .map_err(|failure| bcode_client::ClientError::Server {
+            code: failure.code,
+            message: failure.message,
+        })?;
+    let outcome =
+        operation
+            .complete()
+            .await
+            .map_err(|failure| bcode_client::ClientError::Server {
+                code: failure.code,
+                message: failure.message,
+            })?;
+    let (status, message) = match outcome {
+        bcode_session_models::SessionCompactionResult::Compacted(message) => {
+            ("summary_rebuilt", message)
+        }
+        bcode_session_models::SessionCompactionResult::Noop(message) => {
+            ("summary_rebuild_noop", message)
+        }
+    };
+    if json {
+        print_json(
+            &serde_json::json!({"status": status, "session_id": request.session_id, "message": message}),
+        )
+    } else {
+        println!("{message}");
+        Ok(())
+    }
 }
 
 async fn compact_session(session_id: SessionId, json: bool) -> Result<(), CliError> {
@@ -28625,6 +28715,46 @@ mod session_configuration_cli_tests {
         assert!(matches!(
             error,
             CliError::InvalidArguments(message) if message == "session deletion requires --yes"
+        ));
+    }
+
+    #[test]
+    fn summary_rebuild_requires_exact_marker_and_preserves_ordinary_compact() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        assert!(
+            Cli::try_parse_from(["bcode", "session", "compact", &session, "--rebuild-summary"])
+                .is_err()
+        );
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "compact",
+            &session,
+            "--rebuild-summary",
+            "--expected-marker",
+            "42",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::Compact {
+                    rebuild_summary: true,
+                    expected_marker: Some(42),
+                    ..
+                },
+            })
+        ));
+        let ordinary = Cli::try_parse_from(["bcode", "session", "compact", &session]).unwrap();
+        assert!(matches!(
+            ordinary.command,
+            Some(Commands::Session {
+                command: SessionCommand::Compact {
+                    rebuild_summary: false,
+                    expected_marker: None,
+                    ..
+                },
+            })
         ));
     }
 

@@ -812,6 +812,55 @@ impl bcode_session_models::SessionApplication for BcodeClient {
             }
         }
     }
+    async fn begin_session_summary_rebuild(
+        &self,
+        request: bcode_session_models::SessionSummaryRebuildRequest,
+    ) -> Result<Self::CompactionOperation, bcode_session_models::SessionApplicationFailure> {
+        let mut connection = self
+            .connect("bcode-summary-rebuild")
+            .await
+            .map_err(session_application_failure)?;
+        let request_id = connection.next_request_id;
+        connection.next_request_id += 1;
+        let envelope = request_envelope(request_id, &Request::RebuildSessionSummary { request })
+            .map_err(ClientError::from)
+            .map_err(session_application_failure)?;
+        send_envelope(&mut connection.stream, &envelope)
+            .await
+            .map_err(ClientError::from)
+            .map_err(session_application_failure)?;
+        let deadline = tokio::time::Instant::now() + connection.request_timeout;
+        loop {
+            let envelope = tokio::time::timeout_at(deadline, recv_envelope(&mut connection.stream))
+                .await
+                .map_err(|_| {
+                    session_application_failure(ClientError::RequestTimeout {
+                        timeout: connection.request_timeout,
+                    })
+                })?
+                .map_err(ClientError::from)
+                .map_err(session_application_failure)?;
+            if envelope.kind != EnvelopeKind::Response || envelope.request_id != request_id {
+                continue;
+            }
+            match decode_response(&envelope.payload)
+                .map_err(ClientError::from)
+                .map_err(session_application_failure)?
+            {
+                Response::Ok(ResponsePayload::SessionCompactionAccepted) => {
+                    return Ok(ClientSessionCompactionOperation {
+                        connection,
+                        request_id,
+                    });
+                }
+                Response::Err(error) => return Err(session_application_failure(error.into())),
+                Response::Ok(_) => {
+                    return Err(session_application_failure(ClientError::UnexpectedResponse));
+                }
+            }
+        }
+    }
+
     async fn session_catalog_snapshot(
         &self,
         working_directory: PathBuf,

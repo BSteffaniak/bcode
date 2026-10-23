@@ -19,6 +19,61 @@ pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 16;
 /// Keep this prefix stable so previously retained snapshots have the same presentation.
 pub const TURN_ENVIRONMENT_SNAPSHOT_PREFIX: &str = "Turn environment snapshot (historical observations, not enduring instructions). Later snapshots and tool observations supersede these facts.\n\n";
 
+/// Explicit, bounded reconstruction of a stale compaction summary from canonical history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummaryRebuildRequest {
+    /// Canonical session in the selected state location.
+    pub session_id: SessionId,
+    /// Exact latest compaction marker the caller intends to replace.
+    pub expected_marker: u64,
+    /// Explicit resource and provider-work allowance for this operation.
+    pub budget: SessionSummaryRebuildBudget,
+}
+
+/// Hard-bounded work allowance; exhaustion leaves the existing summary unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummaryRebuildBudget {
+    /// Maximum canonical events examined, including excluded lifecycle records.
+    pub max_events: u32,
+    /// Maximum pages examined.
+    pub max_pages: u32,
+    /// Aggregate admitted canonical decoded bytes.
+    pub max_decoded_bytes: u32,
+    /// Upper bound on summary requests, including bounded repair attempts.
+    pub max_provider_requests: u32,
+    /// Maximum elapsed operation time in milliseconds.
+    pub timeout_ms: u32,
+}
+
+impl Default for SessionSummaryRebuildBudget {
+    fn default() -> Self {
+        Self {
+            max_events: 8_192,
+            max_pages: 128,
+            max_decoded_bytes: 8 * 1_024 * 1_024,
+            max_provider_requests: 512,
+            timeout_ms: 300_000,
+        }
+    }
+}
+
+impl SessionSummaryRebuildBudget {
+    /// Check explicit allowances against the supported operation ceilings.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.max_events > 0
+            && self.max_events <= 65_536
+            && self.max_pages > 0
+            && self.max_pages <= 1_024
+            && self.max_decoded_bytes > 0
+            && self.max_decoded_bytes <= 64 * 1_024 * 1_024
+            && self.max_provider_requests > 0
+            && self.max_provider_requests <= 2_048
+            && self.timeout_ms > 0
+            && self.timeout_ms <= 600_000
+    }
+}
+
 pub mod application;
 pub use application::*;
 

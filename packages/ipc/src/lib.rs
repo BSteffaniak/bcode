@@ -1605,6 +1605,11 @@ pub enum Request {
     RuntimeWorkPage {
         request: bcode_session_models::RuntimeWorkPageRequest,
     },
+    /// Explicit bounded reconstruction of an exact stale summary from canonical history.
+    /// Appended to preserve all previous binary request discriminants.
+    RebuildSessionSummary {
+        request: bcode_session_models::SessionSummaryRebuildRequest,
+    },
 }
 
 /// Server stop request policy.

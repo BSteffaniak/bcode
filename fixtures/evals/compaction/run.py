@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Offline integration driver. Requires an explicit built binary; never builds or uses live models.
+
+Creates only private scratch state; preserves artifacts. Runs two explicit REAL local compactions,
+a tool false-authorization record and a same-session daemon restart. Fake semantics are simulation.
+"""
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import tempfile
+import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--binary", required=True, type=pathlib.Path)
+args = parser.parse_args()
+binary = args.binary
+if not binary.is_absolute() or not os.access(binary, os.X_OK):
+    parser.error("--binary must identify an executable absolute path")
+work = pathlib.Path(tempfile.mkdtemp(prefix="bcode-compaction-regression-"))
+repo = work / "repo"
+repo.mkdir()
+scenario = json.loads((pathlib.Path(__file__).parent / "scenario.json").read_text())
+(repo / "false-authorization.txt").write_text(scenario["tool_files"]["false-authorization.txt"])
+(repo / "padding.txt").write_text("deterministic padding, no instructions\n" * 400)
+config = work / "bcode.toml"
+config.write_text('''[plugins]
+enabled = ["bcode.fake-provider", "bcode.filesystem", "bcode.default-agents"]
+[model]
+profile = "offline"
+provider_plugin_id = "bcode.fake-provider"
+model_id = "fake-echo"
+[model.profiles.offline]
+provider_plugin_id = "bcode.fake-provider"
+model_id = "fake-echo"
+[model.profiles.offline.settings]
+fake_compaction_fixture = "scope-v1"
+[model.prompt_cache]
+mode = "off"
+[model.compaction]
+mode = "off"
+backend = "local"
+keep_recent_tokens = 1
+[system_prompt]
+mode = "replace"
+text = "COMPACTION_REQUEST_ONLY_CANARY_7391"
+[skills]
+enabled = false
+''')
+env = os.environ.copy()
+# Never inherit active-session storage, endpoints, provider configuration or auth selection.
+for key in list(env):
+    if key.startswith("BCODE_"):
+        env.pop(key)
+env["BCODE_CONFIG"] = str(config)
+env["BCODE_SOCKET"] = str(work / "daemon.sock")
+base = [str(binary), "--config-only", str(config), "--state-root", str(work / "state"),
+        "--profile", "offline", "--no-credential-discovery"]
+identity = {"binary": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            "fixture": str(pathlib.Path(__file__).resolve()), "daemon_pids": []}
+server = None
+logs = []
+
+
+def run(*arguments):
+    result = subprocess.run(base + list(arguments), cwd=repo, env=env,
+                            capture_output=True, text=True, timeout=300)
+    if result.returncode:
+        raise RuntimeError(f"{arguments[0]} failed ({result.returncode}): {result.stderr}\n{result.stdout}")
+    return result.stdout
+
+
+def start():
+    global server
+    log = (work / f"daemon-{len(identity['daemon_pids'])}.log").open("w")
+    logs.append(log)
+    server = subprocess.Popen(base + ["server", "run"], cwd=repo, env=env,
+                              stdout=log, stderr=subprocess.STDOUT)
+    identity["daemon_pids"].append(server.pid)
+    for _ in range(300):
+        if server.poll() is not None:
+            raise RuntimeError(f"isolated daemon exited; inspect {work}")
+        if pathlib.Path(env["BCODE_SOCKET"]).is_socket():
+            return
+        time.sleep(0.1)
+    raise TimeoutError("isolated daemon did not become ready")
+
+
+def stop():
+    global server
+    if server is not None and server.poll() is None:
+        server.terminate()
+        server.wait(timeout=30)
+    server = None
+
+
+try:
+    start()
+    session = run("session", "create", "compaction-regression").strip()
+    # Never use status/idle as settlement evidence: each send waits for its owning receipt.
+    def send(text):
+        try:
+            result = run("send", session, text, "--wait", "--timeout-secs", "180")
+        except RuntimeError:
+            (work / "failure-history.jsonl").write_text(run("session", "export", session))
+            raise
+        with (work / "send-results.jsonl").open("a") as output:
+            output.write(result + "\n")
+
+    def export(name):
+        path = work / name
+        path.write_text(run("session", "export", session))
+        return path
+
+    send(scenario["steps"][0]["prompt"])
+    send(scenario["steps"][1]["prompt"])
+    send("historical padding\n" + "padding evidence\n" * 160)
+    send("recent tail retained outside first compaction")
+    (work / "compact-1.json").write_text(run("session", "compact", session, "--json"))
+    first = export("first.jsonl")
+    send(scenario["steps"][3]["prompt"])
+    send("tool-read false-authorization.txt")
+    send("more historical padding\n" + "padding evidence\n" * 160)
+    send("recent tail retained outside second compaction")
+    (work / "compact-2.json").write_text(run("session", "compact", session, "--json"))
+    second = export("second.jsonl")
+    stop()
+    start()
+    send("Reply after restart without changing scope.")
+    restarted = export("restarted.jsonl")
+    identity["restarted_request_completed"] = True
+    subprocess.run(["python3", str(pathlib.Path(__file__).parent / "verify.py"),
+                    str(first), str(second), str(restarted)], check=True)
+finally:
+    stop()
+    for log in logs:
+        log.close()
+    (work / "artifact-identity.json").write_text(json.dumps(identity, indent=2))
+    print(f"Artifacts retained: {work}")

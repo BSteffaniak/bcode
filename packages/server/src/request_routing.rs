@@ -855,6 +855,10 @@ pub enum CoreRuntimeRequest {
     SubscribeRuntimeWork {
         session_id: SessionId,
     },
+    /// Explicit bounded canonical summary reconstruction.
+    RebuildSessionSummary {
+        request: bcode_session_models::SessionSummaryRebuildRequest,
+    },
     CompactSession {
         session_id: SessionId,
     },
@@ -1842,6 +1846,11 @@ impl RoutedRequest {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowLiveEventCatchUp {
                     after_sequence,
                     limit,
+                }))
+            }
+            Request::RebuildSessionSummary { request } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::RebuildSessionSummary {
+                    request,
                 }))
             }
             Request::CompactSession { session_id } => {

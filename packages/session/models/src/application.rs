@@ -210,6 +210,26 @@ pub trait SessionApplication: Sync {
         session_id: SessionId,
     ) -> impl Future<Output = Result<Self::CompactionOperation, SessionApplicationFailure>> + Send;
 
+    /// Admit explicit reconstruction from canonical history, never the stale summary.
+    ///
+    /// The runtime must serialize this with model turns and ordinary compaction.
+    /// Dropping the completion observer does not cancel admitted work.
+    /// # Errors
+    /// Rejects unsupported implementations, stale marker identity, unavailable authority,
+    /// invalid budgets, or failed queue admission.
+    fn begin_session_summary_rebuild(
+        &self,
+        _request: crate::SessionSummaryRebuildRequest,
+    ) -> impl Future<Output = Result<Self::CompactionOperation, SessionApplicationFailure>> + Send
+    {
+        async {
+            Err(SessionApplicationFailure {
+                code: "summary_rebuild_unavailable".into(),
+                message: "explicit summary reconstruction is unavailable".into(),
+            })
+        }
+    }
+
     /// Read the full aggregate compatibility snapshot for an explicit discovery directory.
     /// Waits while the snapshot is empty and loading, matching legacy list semantics.
     /// Use `session_catalog_page` for bounded query/cursor access instead.

@@ -49,6 +49,7 @@ mod child;
 pub mod child_creation_observation;
 mod child_projection;
 mod context;
+pub mod context_recovery;
 mod current_schema;
 pub mod db;
 pub(crate) mod db_artifact;
