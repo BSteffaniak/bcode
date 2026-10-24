@@ -58,7 +58,8 @@ async fn transient_storage_recovery_drives_canonical_run_once() {
     .expect("background retry completes");
     // Starting again must reuse the original singleton, not replace it after recovery.
     state.start_workflow_driver().await;
-    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+    let completed = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             let status = state
                 .workflow_store
@@ -71,7 +72,7 @@ async fn transient_storage_recovery_drives_canonical_run_once() {
             if status == bcode_workflow_store::RunStatus::Completed {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await;
@@ -147,7 +148,8 @@ async fn admission_fixture_with_capability(
     create_admission_run(&mut store, "admission-run", session.id);
     let (mut state,) =
         (tests::test_server_state_with_fake_provider_and_workflow_store(sessions, store),);
-    state.startup_config.workflows.admission_timeout_ms = std::num::NonZeroU64::new(50).unwrap();
+    // Keep the ordinary admission policy. Only the blocked-permit scenario below
+    // advances virtual time, after observing the actual admission boundary.
     state
         .selected_provider_context
         .settings
@@ -213,16 +215,29 @@ async fn workflow_admission_timeout_recovers_without_daemon_restart() {
     let (_root, state, session_id) = admission_fixture().await;
     // Hold the same shared-session permit that a previous execution can retain.
     let permit = hold_shared_session(&state, session_id).await;
-    let error = tokio::time::timeout(
-        Duration::from_secs(2),
-        drive_workflow_run(&state, "admission-run"),
-    )
-    .await
-    .unwrap()
-    .unwrap_err();
+    let mut admission = state.workflow_test_shared_admission.subscribe();
+    let drive = drive_workflow_run(&state, "admission-run");
+    tokio::pin!(drive);
+    // Real storage/session setup runs on real time. Freeze only once the owner is
+    // about to await the permit we hold, so CPU speed cannot manufacture the timeout.
+    tokio::select! {
+        result = &mut drive => panic!("admission ended before blocked boundary: {result:?}"),
+        () = async {
+            loop {
+                if admission.borrow_and_update().as_deref() == Some("admission-run") {
+                    break;
+                }
+                admission.changed().await.unwrap();
+            }
+        } => {},
+    }
+    tokio::time::pause();
+    let error = drive.await.unwrap_err();
+    tokio::time::resume();
     assert!(error.to_string().contains("admission timed out"));
     drop(permit);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             restore_workflow_runs(&state, vec!["admission-run".into()]).await;
             let status = state
@@ -236,7 +251,7 @@ async fn workflow_admission_timeout_recovers_without_daemon_restart() {
             if status == bcode_workflow_store::RunStatus::Completed {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -321,7 +336,8 @@ async fn workflow_admission_recovery_reuses_accepted_turn() {
             .is_err()
     );
     drop(guard);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             restore_workflow_runs(&state, vec!["admission-run".into()]).await;
             if store.run_summary("admission-run").unwrap().unwrap().status
@@ -329,7 +345,7 @@ async fn workflow_admission_recovery_reuses_accepted_turn() {
             {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -461,7 +477,8 @@ async fn workflow_admission_blocked_run_does_not_block_other_runs() {
     let sender = state.workflow_driver_sender.get().unwrap();
     sender.send("admission-run".into()).await.unwrap();
     sender.send("other-run".into()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             let status = state
                 .workflow_store
@@ -474,7 +491,7 @@ async fn workflow_admission_blocked_run_does_not_block_other_runs() {
             if status == bcode_workflow_store::RunStatus::Completed {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            progress.changed().await;
         }
     })
     .await

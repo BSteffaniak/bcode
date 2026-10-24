@@ -443,8 +443,9 @@ async fn definition_child_uses_common_owner_and_returns_provider_output() {
         .await
         .expect("fixture admission; capability remains gated");
     Box::pin(tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        crate::workflow_test_support::WATCHDOG,
         async {
+            let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
             loop {
                 driver::drive(&state, "child-parent")
                     .await
@@ -457,6 +458,7 @@ async fn definition_child_uses_common_owner_and_returns_provider_output() {
                         .await
                         .expect("child drive");
                 }
+                progress.drove();
                 if status(&state, "child-parent")
                     .await
                     .expect("status")
@@ -466,7 +468,7 @@ async fn definition_child_uses_common_owner_and_returns_provider_output() {
                 {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                progress.changed().await;
             }
         },
     ))

@@ -34,14 +34,24 @@ async fn concurrent_page_preserves_resource_exclusion_and_active_cancellation() 
             .expect("pending");
         assert_eq!(pending.len(), if shared_reads { 2 } else { 1 });
         assert!(pending.iter().all(|attempt| attempt.receipt.is_some()));
+        tokio::time::timeout(
+            crate::workflow_test_support::WATCHDOG,
+            bcode_fake_provider_plugin::wait_for_fake_event_script_gate_ready(
+                &state.selected_provider_context.settings["delegation_fixture_gate"],
+            ),
+        )
+        .await
+        .expect("provider reached cancellation gate");
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         crate::workflow_operations::cancel_run(&state, "resource-page")
             .await
             .expect("cancel active admissions");
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let result = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
             loop {
                 crate::drive_workflow_run(&state, "resource-page")
                     .await
                     .expect("drive");
+                progress.drove();
                 if status(&state, "resource-page")
                     .await
                     .expect("status")
@@ -51,7 +61,7 @@ async fn concurrent_page_preserves_resource_exclusion_and_active_cancellation() 
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                progress.changed().await;
             }
         })
         .await;

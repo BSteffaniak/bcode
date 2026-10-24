@@ -708,15 +708,17 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
         .unwrap()
         .parent_session_id
         .unwrap();
-    fixture_observed_timeout(&state, std::time::Duration::from_secs(6), async {
+    fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             crate::drive_workflow_run(&state, "new").await.unwrap();
+            progress.drove();
             if status(&state, "new").await.unwrap().unwrap().status
                 == bcode_workflow::RunStatus::Completed
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -904,7 +906,8 @@ async fn typed_agent_test_harness_uses_real_prompt_owner_and_fake_provider() {
         .expect("actual provider admission");
     assert!(receipt.get("turn_id").is_some());
     if let Err(error) =
-        fixture_observed_timeout(&state, std::time::Duration::from_secs(15), async {
+        fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
+            let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
             loop {
                 if status(&state, "new")
                     .await
@@ -915,7 +918,7 @@ async fn typed_agent_test_harness_uses_real_prompt_owner_and_fake_provider() {
                 {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                progress.changed().await;
             }
         })
         .await
@@ -995,11 +998,13 @@ async fn normal_start_uses_typed_family_and_rescans_two_running_agents_without_d
     crate::drive_workflow_run(&state, "parallel-provider")
         .await
         .expect("second scan");
-    fixture_observed_timeout(&state, std::time::Duration::from_secs(15), async {
+    fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             crate::drive_workflow_run(&state, "parallel-provider")
                 .await
                 .expect("drive");
+            progress.drove();
             if status(&state, "parallel-provider")
                 .await
                 .expect("status")
@@ -1009,7 +1014,7 @@ async fn normal_start_uses_typed_family_and_rescans_two_running_agents_without_d
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -1108,11 +1113,13 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
     .await
     .expect("normal plugin start");
     assert_eq!(response.run.run_id, run_id);
-    fixture_observed_timeout(&state, std::time::Duration::from_secs(20), async {
+    fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             crate::drive_workflow_run(&state, &run_id)
                 .await
                 .expect("production drive");
+            progress.drove();
             if status(&state, &run_id)
                 .await
                 .expect("status")
@@ -1122,7 +1129,7 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -1476,24 +1483,27 @@ async fn run_typed_delegation() {
     bcode_fake_provider_plugin::release_fake_event_script_gate(
         &state.selected_provider_context.settings["delegation_fixture_gate"],
     );
-    let finished = fixture_observed_timeout(&state, std::time::Duration::from_secs(20), async {
-        loop {
-            crate::drive_workflow_run(&state, "new")
-                .await
-                .expect("drive revised run");
-            if status(&state, "new")
-                .await
-                .expect("status")
-                .expect("run")
-                .status
-                == bcode_workflow::RunStatus::Completed
-            {
-                break;
+    let finished =
+        fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
+            let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
+            loop {
+                crate::drive_workflow_run(&state, "new")
+                    .await
+                    .expect("drive revised run");
+                progress.drove();
+                if status(&state, "new")
+                    .await
+                    .expect("status")
+                    .expect("run")
+                    .status
+                    == bcode_workflow::RunStatus::Completed
+                {
+                    break;
+                }
+                progress.changed().await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await;
+        })
+        .await;
     finished.expect("delegated completion");
     assert_delegation_sessions_are_unique(&state).await;
     cleanup.finish().await;
@@ -1577,7 +1587,8 @@ async fn public_cancellation_settles_real_gated_provider_without_late_reopen() {
             .await
             .expect("normal cancel")
     );
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
         loop {
             if status(&state, "new")
                 .await
@@ -1588,7 +1599,7 @@ async fn public_cancellation_settles_real_gated_provider_without_late_reopen() {
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -2373,9 +2384,10 @@ async fn stop_fixture_driver(state: &std::sync::Arc<ServerState>) {
     {
         bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
     }
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(state);
+    let drained = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
         while !state.runtime_work.active_all().await.is_empty() {
-            tokio::task::yield_now().await;
+            progress.changed().await;
         }
     })
     .await;

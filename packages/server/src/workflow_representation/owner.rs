@@ -262,6 +262,8 @@ pub async fn persist_receipt(
     );
     let result = persist_receipt_inner(state, receipt, authority).await;
     span.finish_result(&result);
+    #[cfg(test)]
+    state.workflow_test_progress.send_replace(());
     result
 }
 

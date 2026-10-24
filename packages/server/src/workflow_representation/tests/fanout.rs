@@ -309,14 +309,7 @@ async fn normal_start_fanout_respects_cap8_and_uncapped32() {
         );
         state.start_workflow_driver().await;
         drop(gate);
-        // Up to 24 members still need session setup after the cap8 gate releases.
-        // Budget by the configured 32-member workload, not a production retry limit.
-        let result = wait_public_with_budget(
-            &state,
-            "normal-fanout",
-            std::time::Duration::from_secs(32 * 2),
-        )
-        .await;
+        let result = wait_public(&state, "normal-fanout").await;
         let diagnostic = if result.is_err() {
             bounded_run_diagnostic(&state, "normal-fanout").await
         } else {
@@ -762,15 +755,8 @@ pub(super) async fn wait_public(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
 ) -> Result<(), tokio::time::error::Elapsed> {
-    wait_public_with_budget(state, run_id, std::time::Duration::from_secs(30)).await
-}
-
-async fn wait_public_with_budget(
-    state: &std::sync::Arc<ServerState>,
-    run_id: &str,
-    budget: std::time::Duration,
-) -> Result<(), tokio::time::error::Elapsed> {
-    tokio::time::timeout(budget, async {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(state);
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
         loop {
             let application = crate::workflow_operations::WorkflowAuthoringApplication::new(
                 state,
@@ -784,7 +770,7 @@ async fn wait_public_with_budget(
             {
                 Err(error) if error.code == "workflow_storage_busy" => {
                     drop(application);
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    progress.changed().await;
                     continue;
                 }
                 result => result.expect("public status").expect("run"),
@@ -797,7 +783,7 @@ async fn wait_public_with_budget(
                 let diagnostic = bounded_run_diagnostic(state, run_id).await;
                 panic!("workflow run failed run={run_id}: {diagnostic}");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await

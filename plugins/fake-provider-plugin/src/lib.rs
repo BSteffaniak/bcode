@@ -40,6 +40,9 @@ static FAKE_COMPACTION_SUMMARY_SIGNALS: LazyLock<Mutex<BTreeSet<String>>> =
 #[cfg(feature = "static-bundled")]
 static FAKE_SCRIPT_WAITERS: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
+#[cfg(feature = "static-bundled")]
+static FAKE_SCRIPT_PROGRESS: LazyLock<tokio::sync::watch::Sender<()>> =
+    LazyLock::new(|| tokio::sync::watch::channel(()).0);
 static FAKE_SCRIPT_GATES: LazyLock<(Mutex<BTreeSet<String>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
 
@@ -84,6 +87,22 @@ pub fn fake_event_script_gate_ready(gate: &str) -> bool {
     FAKE_SCRIPT_WAITERS
         .lock()
         .is_ok_and(|waiters| waiters.contains(gate))
+}
+
+/// Wait for a script to acknowledge reaching a gate, including a prior acknowledgement.
+/// The caller owns release and cleanup of the uniquely named gate.
+///
+/// # Panics
+/// Panics if the process-global readiness notification channel closes unexpectedly.
+#[cfg(feature = "static-bundled")]
+pub async fn wait_for_fake_event_script_gate_ready(gate: &str) {
+    let mut progress = FAKE_SCRIPT_PROGRESS.subscribe();
+    loop {
+        if fake_event_script_gate_ready(gate) {
+            return;
+        }
+        progress.changed().await.expect("static gate observer");
+    }
 }
 
 /// Forget the readiness handshake for one test-owned gate.
@@ -1033,6 +1052,7 @@ fn wait_for_fake_event_script_gate(turn: &FakeTurn, gate: &str) -> bool {
         // Readiness is retained until explicit test cleanup; cap memory in non-test use.
         if waiters.len() < 256 {
             waiters.insert(gate.to_owned());
+            FAKE_SCRIPT_PROGRESS.send_replace(());
         }
     }
     let (gates, ready) = &*FAKE_SCRIPT_GATES;

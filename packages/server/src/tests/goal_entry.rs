@@ -722,7 +722,8 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.as_ref().unwrap();
     let mut denied = false;
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             for permission in interaction_operations::list_permissions(&state).await {
                 assert!(permission.is_addressed_to(session.id));
@@ -764,7 +765,7 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
                 );
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -807,7 +808,8 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
     state.start_workflow_driver().await;
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.as_ref().unwrap();
-    let wait = tokio::time::timeout(Duration::from_secs(20), async {
+    let wait = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             for permission in interaction_operations::list_permissions(&state).await {
                 assert!(permission.is_addressed_to(session.id));
@@ -832,7 +834,7 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
             if let Some(wait) = wait {
                 break wait;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -844,13 +846,14 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
         .expect("authorized approval must resume the existing goal");
     // Resume approval does not approve tools: each resumed call still passes
     // through the normal permission boundary before integrated verification.
-    tokio::time::timeout(Duration::from_mins(1), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
             if resumed_goal_reached_completion(&state, run_id, root.path(), &request.input) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -877,7 +880,8 @@ async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.as_ref().unwrap();
     let mut denied_verification = false;
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             for permission in interaction_operations::list_permissions(&state).await {
                 assert!(permission.is_addressed_to(session.id));
@@ -927,7 +931,7 @@ async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
                     break;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -1254,7 +1258,8 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     let run_id = request.run_id.unwrap();
     let (client, server) = goal_ipc_client(root.path(), &state);
     assert_goal_config_mismatch_rejected(&client, &state.startup_config, &run_id).await;
-    let observation = tokio::time::timeout(Duration::from_secs(20), async {
+    let observation = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
             let inspection = client
@@ -1265,7 +1270,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
             if allowance.exhausted() == Some(true) {
                 break allowance;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -1298,13 +1303,14 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
         .await
         .unwrap();
     assert_eq!(inspection.execution_allowance.unwrap().run_cap, 100);
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
             if resumed_goal_reached_completion(&state, &run_id, root.path(), &request.input) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -1376,7 +1382,8 @@ async fn assert_goal_integration_conflict(stale_marker: bool) {
     state.start_workflow_driver().await;
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
             let outputs = state
@@ -1392,7 +1399,7 @@ async fn assert_goal_integration_conflict(stale_marker: bool) {
                 assert_eq!(evaluation.value["condition_met"], false);
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await
@@ -1448,7 +1455,8 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
     assert!(objective.contains("Implement two collaborating contributions"));
     let run_id = request.run_id.unwrap();
     // Admission is not execution: observe the real production driver settlement.
-    tokio::time::timeout(Duration::from_mins(1), async {
+    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
             let attempts = state
@@ -1475,7 +1483,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                     output.value["results"].get("left").is_some()
                         && output.value.get("source").is_some()
                 }) else {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    progress.changed().await;
                     continue;
                 };
                 assert_named_contributions(&outputs, collected);
@@ -1488,7 +1496,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                     .iter()
                     .any(|output| output.node_id == "loop.judgement.evaluate")
                 {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    progress.changed().await;
                     continue;
                 }
                 if state
@@ -1499,7 +1507,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                     .unwrap()
                     .is_none()
                 {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    progress.changed().await;
                     continue;
                 }
                 assert_corrected_contributions(root.path(), &outputs, collected);
@@ -1513,7 +1521,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                     .all(|attempt| attempt.status != "failed" || attempt.node_id == "right"),
                 "goal execution failed before coordinator settlement: {attempts:?}"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await

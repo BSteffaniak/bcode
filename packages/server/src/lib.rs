@@ -73,6 +73,8 @@ mod workflow_diagnostics;
 mod workflow_operations;
 mod workflow_receipts;
 mod workflow_representation;
+#[cfg(test)]
+mod workflow_test_support;
 pub use workflow_operations::{
     WorkflowApplicationAuthorizationDecision, WorkflowRunGraphEditPolicy,
     WorkflowRunGraphPublicationPolicy,
@@ -557,6 +559,10 @@ pub struct ServerState {
     workflow_event_forwarder_failed: std::sync::atomic::AtomicBool,
     workflow_driver_sender: std::sync::OnceLock<mpsc::Sender<String>>,
     workflow_driver_task: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    workflow_test_progress: tokio::sync::watch::Sender<()>,
+    #[cfg(test)]
+    workflow_test_shared_admission: tokio::sync::watch::Sender<Option<String>>,
     workflow_drive_gates: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     catalog_events_started: std::sync::atomic::AtomicBool,
     catalog_workers: Mutex<Vec<JoinHandle<()>>>,
@@ -2694,6 +2700,10 @@ impl ServerState {
             workflow_event_forwarder_failed: std::sync::atomic::AtomicBool::new(false),
             workflow_driver_sender: std::sync::OnceLock::new(),
             workflow_driver_task: Mutex::new(None),
+            #[cfg(test)]
+            workflow_test_progress: tokio::sync::watch::channel(()).0,
+            #[cfg(test)]
+            workflow_test_shared_admission: tokio::sync::watch::channel(None).0,
             workflow_drive_gates: std::sync::Mutex::new(BTreeMap::new()),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             catalog_workers: Mutex::new(Vec::new()),
@@ -19771,6 +19781,8 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
     let result = Box::pin(drive_workflow_run_exclusive(state, run_id)).await;
     drop(guard);
     held.finish_result(&result);
+    #[cfg(test)]
+    state.workflow_test_progress.send_replace(());
     result
 }
 
@@ -41018,6 +41030,10 @@ where
             (child.id, None)
         }
         bcode_workflow::PromptContextTarget::SharedParentSequential => {
+            #[cfg(test)]
+            state
+                .workflow_test_shared_admission
+                .send_replace(Some(request.activation.run_id.clone()));
             let permit = state
                 .sessions
                 .admit_shared_execution_session(parent_session_id, &provenance)
@@ -64454,7 +64470,8 @@ library = "test"
             .take();
         replace_receipt_fixture_owner(&mut state, owner.is_replacement()).await;
         state.start_workflow_driver().await;
-        let dispatched = tokio::time::timeout(Duration::from_secs(10), async {
+        let dispatched = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+            let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
             loop {
                 let attempts = state
                     .workflow_store
@@ -64467,18 +64484,11 @@ library = "test"
                 }) {
                     break attempt.clone();
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                progress.changed().await;
             }
         })
         .await;
-        let task = state
-            .workflow_driver_task
-            .lock()
-            .await
-            .take()
-            .expect("driver");
-        task.abort();
-        let _ = task.await;
+        crate::workflow_test_support::stop_driver(&state).await;
         let outputs = state
             .workflow_store
             .lock()
@@ -73466,9 +73476,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 )
                 .await
                 .unwrap();
-                tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+                    let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
                     loop {
                         drive_workflow_run(&state, "edit-run").await.unwrap();
+                        progress.drove();
                         let attempts = state
                             .workflow_store
                             .lock()
@@ -73489,7 +73501,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             );
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        progress.changed().await;
                     }
                 })
                 .await

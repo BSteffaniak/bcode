@@ -100,7 +100,8 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
         1
     );
     state.start_workflow_driver().await;
-    let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let finished = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         let dispatch = bcode_workflow_store::dispatch_identity("cancel-edit", "right", &target, 1);
         loop {
             if representation::attempts::owner_boundary::terminal_outcome(
@@ -114,7 +115,7 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await;

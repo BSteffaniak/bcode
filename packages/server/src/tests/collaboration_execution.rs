@@ -190,7 +190,8 @@ async fn verify_worker_directories(state: &ServerState, root: &Path, trees: &Pat
 }
 
 async fn wait_for_contributions(state: &Arc<ServerState>) {
-    let completed = tokio::time::timeout(Duration::from_secs(20), async {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(state);
+    let completed = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
         loop {
             // Resolve ordinary permission requests instead of bypassing policy.
             let pending: Vec<_> = state
@@ -224,7 +225,7 @@ async fn wait_for_contributions(state: &Arc<ServerState>) {
                 );
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await;

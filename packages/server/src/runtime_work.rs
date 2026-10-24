@@ -238,6 +238,8 @@ pub struct CancelledRuntimeWork {
 pub struct RuntimeWorkManager {
     active: Mutex<BTreeMap<(SessionId, WorkId), ActiveRuntimeWork>>,
     metrics: MetricsRegistry,
+    #[cfg(test)]
+    pub(super) progress: tokio::sync::watch::Sender<()>,
 }
 
 impl RuntimeWorkManager {
@@ -332,6 +334,8 @@ impl RuntimeWorkManager {
         Self {
             active: Mutex::default(),
             metrics,
+            #[cfg(test)]
+            progress: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -605,11 +609,14 @@ impl RuntimeWorkManager {
 
     /// Remove active work and return the owned registration, if present.
     pub async fn take(&self, session_id: SessionId, work_id: &WorkId) -> Option<RuntimeWorkSpec> {
-        self.active
+        let removed = self
+            .active
             .lock()
             .await
-            .remove(&(session_id, work_id.clone()))
-            .map(|work| work.spec)
+            .remove(&(session_id, work_id.clone()));
+        #[cfg(test)]
+        self.progress.send_replace(());
+        removed.map(|work| work.spec)
     }
 
     /// Remove active work and return whether this manager owned it.
