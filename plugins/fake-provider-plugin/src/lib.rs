@@ -38,8 +38,8 @@ static FAKE_COMPACTION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 static FAKE_COMPACTION_SUMMARY_SIGNALS: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
 #[cfg(feature = "static-bundled")]
-static FAKE_SCRIPT_WAITERS: LazyLock<Mutex<BTreeSet<String>>> =
-    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+static FAKE_SCRIPT_WAITERS: LazyLock<Mutex<BTreeMap<String, BTreeSet<usize>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 #[cfg(feature = "static-bundled")]
 static FAKE_SCRIPT_PROGRESS: LazyLock<tokio::sync::watch::Sender<()>> =
     LazyLock::new(|| tokio::sync::watch::channel(()).0);
@@ -86,7 +86,7 @@ pub fn release_fake_event_script_gate(gate: &str) {
 pub fn fake_event_script_gate_ready(gate: &str) -> bool {
     FAKE_SCRIPT_WAITERS
         .lock()
-        .is_ok_and(|waiters| waiters.contains(gate))
+        .is_ok_and(|waiters| waiters.get(gate).is_some_and(|turns| !turns.is_empty()))
 }
 
 /// Wait for a script to acknowledge reaching a gate, including a prior acknowledgement.
@@ -96,9 +96,22 @@ pub fn fake_event_script_gate_ready(gate: &str) -> bool {
 /// Panics if the process-global readiness notification channel closes unexpectedly.
 #[cfg(feature = "static-bundled")]
 pub async fn wait_for_fake_event_script_gate_ready(gate: &str) {
+    wait_for_fake_event_script_gate_members(gate, 1).await;
+}
+
+/// Wait until distinct provider turns have acknowledged the held gate.
+/// Repeated steps in one turn do not count as additional members.
+///
+/// # Panics
+/// Panics if the process-global notification channel closes unexpectedly.
+#[cfg(feature = "static-bundled")]
+pub async fn wait_for_fake_event_script_gate_members(gate: &str, count: usize) {
     let mut progress = FAKE_SCRIPT_PROGRESS.subscribe();
     loop {
-        if fake_event_script_gate_ready(gate) {
+        if FAKE_SCRIPT_WAITERS
+            .lock()
+            .is_ok_and(|waiters| waiters.get(gate).map_or(0, BTreeSet::len) >= count)
+        {
             return;
         }
         progress.changed().await.expect("static gate observer");
@@ -1051,7 +1064,12 @@ fn wait_for_fake_event_script_gate(turn: &FakeTurn, gate: &str) -> bool {
     if let Ok(mut waiters) = FAKE_SCRIPT_WAITERS.lock() {
         // Readiness is retained until explicit test cleanup; cap memory in non-test use.
         if waiters.len() < 256 {
-            waiters.insert(gate.to_owned());
+            // The Arc remains alive while this turn is held; identity is unique among
+            // concurrent gate participants, including cloned handles of the same turn.
+            waiters
+                .entry(gate.to_owned())
+                .or_default()
+                .insert(Arc::as_ptr(&turn.cancelled) as usize);
             FAKE_SCRIPT_PROGRESS.send_replace(());
         }
     }
@@ -3016,6 +3034,29 @@ bcode_plugin_sdk::export_concurrent_plugin!(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "static-bundled")]
+    #[tokio::test]
+    async fn gate_members_acknowledge_distinct_held_turns_without_deadlines() {
+        let gate = format!("member-handshake-{:?}", std::thread::current().id());
+        let turns = [super::FakeTurn::default(), super::FakeTurn::default()];
+        let mut tasks = Vec::new();
+        for turn in turns {
+            let gate = gate.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                assert!(super::wait_for_fake_event_script_gate(&turn, &gate));
+            }));
+        }
+        super::wait_for_fake_event_script_gate_members(&gate, 2).await;
+        // Acknowledgement is retained even before subscribing a second time.
+        super::wait_for_fake_event_script_gate_members(&gate, 2).await;
+        assert!(tasks.iter().all(|task| !task.is_finished()));
+        super::release_fake_event_script_gate(&gate);
+        for task in tasks {
+            task.await.expect("gate participant");
+        }
+        super::forget_fake_event_script_gate_ready(&gate);
+    }
+
     use super::*;
     use bcode_model::{
         CapabilitySupport, ModelParameterKey, ProviderOutputEvent, RequestedModelFeature,

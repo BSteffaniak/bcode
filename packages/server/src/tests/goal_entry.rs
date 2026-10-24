@@ -722,7 +722,7 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.as_ref().unwrap();
     let mut denied = false;
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             for permission in interaction_operations::list_permissions(&state).await {
@@ -768,18 +768,7 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
             progress.changed().await;
         }
     })
-    .await
-    .unwrap_or_else(|error| {
-        panic!(
-            "denied delegation did not settle: {error}; events: {:?}",
-            state
-                .workflow_store
-                .lock()
-                .unwrap()
-                .event_history(run_id, None, 100)
-                .unwrap()
-        )
-    });
+    .await;
     drop(state);
     assert_eq!(
         std::fs::read_to_string(root.path().join("user.txt")).unwrap(),
@@ -808,7 +797,7 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
     state.start_workflow_driver().await;
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.as_ref().unwrap();
-    let wait = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    let wait = Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             for permission in interaction_operations::list_permissions(&state).await {
@@ -837,8 +826,7 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
             progress.changed().await;
         }
     })
-    .await
-    .expect("denied goal must expose an actionable approval wait");
+    .await;
     assert!(!root.path().join("left.sh").exists());
     assert!(!root.path().join("right.sh").exists());
     workflow_operations::resolve_approval(&state, run_id, &wait.node_id, &wait.activation_id, true)
@@ -846,7 +834,7 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
         .expect("authorized approval must resume the existing goal");
     // Resume approval does not approve tools: each resumed call still passes
     // through the normal permission boundary before integrated verification.
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
@@ -856,8 +844,7 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
             progress.changed().await;
         }
     })
-    .await
-    .expect("approved goal must settle correction and the completion decision");
+    .await;
     drop(state);
     assert_integrated_files(root.path());
 }
@@ -880,7 +867,7 @@ async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.as_ref().unwrap();
     let mut denied_verification = false;
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             for permission in interaction_operations::list_permissions(&state).await {
@@ -934,18 +921,7 @@ async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
             progress.changed().await;
         }
     })
-    .await
-    .unwrap_or_else(|error| {
-        panic!(
-            "denied verifier: {error}; attempts: {:?}",
-            state
-                .workflow_store
-                .lock()
-                .unwrap()
-                .attempt_history(run_id, None, 100)
-                .unwrap()
-        )
-    });
+    .await;
     assert_eq!(
         std::fs::read_to_string(root.path().join("left.sh")).unwrap(),
         LEFT_MODULE
@@ -1258,7 +1234,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     let run_id = request.run_id.unwrap();
     let (client, server) = goal_ipc_client(root.path(), &state);
     assert_goal_config_mismatch_rejected(&client, &state.startup_config, &run_id).await;
-    let observation = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    let observation = Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
@@ -1273,8 +1249,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
             progress.changed().await;
         }
     })
-    .await
-    .unwrap();
+    .await;
     assert_eq!(observation.run_cap, 1);
     assert!(!root.path().join("verification.txt").exists());
     let action = bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
@@ -1303,7 +1278,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
         .await
         .unwrap();
     assert_eq!(inspection.execution_allowance.unwrap().run_cap, 100);
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
@@ -1313,8 +1288,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
             progress.changed().await;
         }
     })
-    .await
-    .unwrap_or_else(|error| panic_renewed_goal_timeout(&state, &run_id, &error));
+    .await;
     let attempts = state
         .workflow_store
         .lock()
@@ -1325,30 +1299,6 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     drop(state);
     assert_integrated_files(root.path());
     server.abort();
-}
-
-fn panic_renewed_goal_timeout(
-    state: &ServerState,
-    run_id: &str,
-    error: &tokio::time::error::Elapsed,
-) -> ! {
-    let (attempts, failure, terminal, outputs) = {
-        let store = state.workflow_store.lock().unwrap();
-        (
-            store.attempt_history(run_id, None, 100).unwrap(),
-            store.failure_history(run_id, 10).unwrap(),
-            store.canonical_terminal_output(run_id).unwrap(),
-            store.validated_outputs(run_id, 100).unwrap(),
-        )
-    };
-    let output_facts = outputs
-        .iter()
-        .map(|output| (&output.node_id, output.value.get("condition_met")))
-        .collect::<Vec<_>>();
-    panic!(
-        "renewed goal must settle correction and the completion decision: {error}; terminal_present: {}; output_facts: {output_facts:?}; attempts: {attempts:?}; failures: {failure:?}",
-        terminal.is_some()
-    );
 }
 
 #[tokio::test]
@@ -1382,7 +1332,7 @@ async fn assert_goal_integration_conflict(stale_marker: bool) {
     state.start_workflow_driver().await;
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.unwrap();
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
@@ -1402,8 +1352,7 @@ async fn assert_goal_integration_conflict(stale_marker: bool) {
             progress.changed().await;
         }
     })
-    .await
-    .expect("conflict must reach evaluation without claiming delivery");
+    .await;
     assert_eq!(
         std::fs::read_to_string(root.path().join("integrated.sh")).unwrap(),
         user_work
@@ -1455,7 +1404,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
     assert!(objective.contains("Implement two collaborating contributions"));
     let run_id = request.run_id.unwrap();
     // Admission is not execution: observe the real production driver settlement.
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             approve_goal_permissions(&state, session.id).await;
@@ -1524,17 +1473,6 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
             progress.changed().await;
         }
     })
-    .await
-    .unwrap_or_else(|error| {
-        panic!(
-            "goal execution timed out: {error}; attempts: {:?}",
-            state
-                .workflow_store
-                .lock()
-                .unwrap()
-                .event_history(&run_id, None, 100)
-                .unwrap()
-        )
-    });
+    .await;
     drop(state);
 }

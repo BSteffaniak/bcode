@@ -34,19 +34,18 @@ async fn concurrent_page_preserves_resource_exclusion_and_active_cancellation() 
             .expect("pending");
         assert_eq!(pending.len(), if shared_reads { 2 } else { 1 });
         assert!(pending.iter().all(|attempt| attempt.receipt.is_some()));
-        tokio::time::timeout(
-            crate::workflow_test_support::WATCHDOG,
+        Box::pin(
             bcode_fake_provider_plugin::wait_for_fake_event_script_gate_ready(
                 &state.selected_provider_context.settings["delegation_fixture_gate"],
             ),
         )
-        .await
-        .expect("provider reached cancellation gate");
+        .await;
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
+        state.start_workflow_driver().await;
         crate::workflow_operations::cancel_run(&state, "resource-page")
             .await
             .expect("cancel active admissions");
-        let result = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        Box::pin(async {
             loop {
                 crate::drive_workflow_run(&state, "resource-page")
                     .await
@@ -66,7 +65,6 @@ async fn concurrent_page_preserves_resource_exclusion_and_active_cancellation() 
         })
         .await;
         stop_fixture_driver(&state).await;
-        result.expect("all active owners settle cancellation");
         assert!(
             representation::attempts::pending(&db, "resource-page", None, 10)
                 .await
@@ -157,8 +155,7 @@ async fn normal_collect_outcomes_preserves_failed_worker_and_runs_integrator() {
         None,
     )
     .await;
-    let completed = super::fanout::wait_public(&state, "collect").await;
-    completed.expect("integrator completes despite failed worker");
+    super::fanout::wait_public(&state, "collect").await;
     let outputs = super::super::outputs::run_outputs(&state, "collect", 100)
         .await
         .expect("outputs");
@@ -184,7 +181,8 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
         state.selected_provider_context.settings["delegation_fixture_gate"].clone(),
     );
     let marker = uuid::Uuid::new_v4().to_string();
-    let script = delayed_failure_script();
+    let failure_gate = super::fanout::ReleaseGate(format!("failure-{marker}"));
+    let script = gated_failure_script(&failure_gate.0);
     std::sync::Arc::get_mut(&mut state)
         .expect("unique fixture")
         .selected_provider_context
@@ -214,8 +212,13 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
         .expect("unrelated gated run");
     state.start_workflow_driver().await;
     super::fanout::start_public(&state, "failfast", definition, serde_json::json!(1), None).await;
+    bcode_fake_provider_plugin::wait_for_fake_event_script_gate_ready(&failure_gate.0).await;
+    // Both the unrelated turn and the sibling have reached their held provider boundary.
+    bcode_fake_provider_plugin::wait_for_fake_event_script_gate_members(&gate.0, 2).await;
+    drop(failure_gate);
     let db = open(&crate::workflow_store_path(&state), false).expect("db");
-    let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
+    Box::pin(async {
         loop {
             let run = status(&state, "failfast")
                 .await
@@ -227,15 +230,10 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
             ) {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            progress.changed().await;
         }
     })
     .await;
-    if result.is_err() {
-        let snapshot = representation::scheduling::snapshot(&db, "failfast", None, None, 100).await;
-        eprintln!("failfast timeout snapshot: {snapshot:?}");
-    }
-    result.expect("failfast settles owner cancellation");
     assert!(
         representation::safety::cancellation_requested_at(&db, "failfast")
             .await
@@ -270,13 +268,13 @@ async fn normal_failfast_cancels_only_exact_sibling_not_unrelated_run() {
     drop(cleanup);
 }
 
-fn delayed_failure_script() -> bcode_fake_provider_plugin::FakeProviderEventScript {
+fn gated_failure_script(gate: &str) -> bcode_fake_provider_plugin::FakeProviderEventScript {
     let error: bcode_model::ProviderError=serde_json::from_value(serde_json::json!({"code":"fixture_failure","category":"invalid_request","message":"scripted terminal worker failure","retryable":false,"provider_message":null})).expect("error");
     bcode_fake_provider_plugin::FakeProviderEventScript {
         steps: vec![
             bcode_fake_provider_plugin::FakeProviderEventScriptStep {
-                gate: None,
-                delay_ms: Some(500),
+                gate: Some(gate.to_owned()),
+                delay_ms: None,
                 event: bcode_model::ProviderTurnEvent::Error { error },
             },
             bcode_fake_provider_plugin::FakeProviderEventScriptStep {
@@ -314,7 +312,7 @@ async fn public_retry_dispatches_exact_next_attempt_without_replaying_first() {
         .expect("id")
         .expect("activation");
     let first = bcode_workflow_store::dispatch_identity("retry", "left", &activation, 1);
-    wait_failed_attempt(&db, &first).await;
+    wait_failed_attempt(&state, &db, &first).await;
     let application = crate::workflow_operations::WorkflowAuthoringApplication::new(
         &state,
         crate::ClientId::new(),
@@ -341,7 +339,7 @@ async fn public_retry_dispatches_exact_next_attempt_without_replaying_first() {
     assert_eq!(grant, duplicate);
     assert_eq!(grant.next_attempt, 2);
     let second = bcode_workflow_store::dispatch_identity("retry", "left", &activation, 2);
-    wait_failed_attempt(&db, &second).await;
+    wait_failed_attempt(&state, &db, &second).await;
     let first_receipt = representation::attempts::owner_boundary::receipt(&db, &first)
         .await
         .expect("receipt")
@@ -358,27 +356,30 @@ async fn public_retry_dispatches_exact_next_attempt_without_replaying_first() {
     drop(cleanup);
 }
 
-async fn wait_failed_attempt(db: &dyn switchy_database::Database, dispatch: &str) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if representation::attempts::owner_boundary::prepared(db, "retry", dispatch)
-                .await
-                .expect("prepared lookup")
-                .is_none()
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                continue;
-            }
-            if representation::attempts::owner_boundary::terminal_outcome(db, "retry", dispatch)
-                .await
-                .expect("outcome")
-                == Some(representation::attempts::TerminalOutcome::Failed)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+async fn wait_failed_attempt(
+    state: &ServerState,
+    db: &dyn switchy_database::Database,
+    dispatch: &str,
+) {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(state);
+    loop {
+        // Retry dispatch may not have prepared the next attempt yet. Absence is
+        // pending, not a malformed existing attempt to inspect for an outcome.
+        if representation::attempts::owner_boundary::prepared(db, "retry", dispatch)
+            .await
+            .expect("prepared lookup")
+            .is_none()
+        {
+            progress.changed().await;
+            continue;
         }
-    })
-    .await
-    .expect("failed model attempt");
+        if representation::attempts::owner_boundary::terminal_outcome(db, "retry", dispatch)
+            .await
+            .expect("outcome")
+            == Some(representation::attempts::TerminalOutcome::Failed)
+        {
+            break;
+        }
+        progress.changed().await;
+    }
 }

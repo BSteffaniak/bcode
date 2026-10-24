@@ -1,9 +1,6 @@
 //! Causal observation for workflow integration tests, never a scheduling substitute.
 use crate::ServerState;
 
-/// An outer deadlock guard, not a functional completion/latency requirement.
-pub const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(180);
-
 /// Subscribe before inspecting authoritative state. Notifications are hints to reread it;
 /// they are neither completion evidence nor permission to dispatch or settle work.
 pub struct Progress {

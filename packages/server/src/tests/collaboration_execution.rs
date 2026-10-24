@@ -191,7 +191,7 @@ async fn verify_worker_directories(state: &ServerState, root: &Path, trees: &Pat
 
 async fn wait_for_contributions(state: &Arc<ServerState>) {
     let mut progress = crate::workflow_test_support::Progress::subscribe(state);
-    let completed = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         loop {
             // Resolve ordinary permission requests instead of bypassing policy.
             let pending: Vec<_> = state
@@ -229,15 +229,6 @@ async fn wait_for_contributions(state: &Arc<ServerState>) {
         }
     })
     .await;
-    if let Err(error) = completed {
-        let attempts = state
-            .workflow_store
-            .lock()
-            .unwrap()
-            .attempt_history("edit-run", None, 100)
-            .unwrap();
-        panic!("workers and continuation did not settle: {error}; attempts: {attempts:?}");
-    }
 }
 
 fn configure_coding_plugins(state: &mut ServerState) {

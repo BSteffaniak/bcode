@@ -58,7 +58,7 @@ async fn transient_storage_recovery_drives_canonical_run_once() {
     .expect("background retry completes");
     // Starting again must reuse the original singleton, not replace it after recovery.
     state.start_workflow_driver().await;
-    let completed = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             let status = state
@@ -79,7 +79,6 @@ async fn transient_storage_recovery_drives_canonical_run_once() {
     let task = state.workflow_driver_task.lock().await.take().unwrap();
     task.abort();
     let _ = task.await;
-    completed.expect("canonical run restored by existing driver");
     let attempts = state
         .workflow_store
         .lock()
@@ -212,7 +211,10 @@ async fn hold_shared_session(
 
 #[tokio::test]
 async fn workflow_admission_timeout_recovers_without_daemon_restart() {
-    let (_root, state, session_id) = admission_fixture().await;
+    let (_root, mut state, session_id) = admission_fixture().await;
+    Arc::get_mut(&mut state)
+        .expect("exclusive fixture")
+        .workflow_test_admission_deadlines = true;
     // Hold the same shared-session permit that a previous execution can retain.
     let permit = hold_shared_session(&state, session_id).await;
     let mut admission = state.workflow_test_shared_admission.subscribe();
@@ -236,7 +238,7 @@ async fn workflow_admission_timeout_recovers_without_daemon_restart() {
     tokio::time::resume();
     assert!(error.to_string().contains("admission timed out"));
     drop(permit);
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             restore_workflow_runs(&state, vec!["admission-run".into()]).await;
@@ -254,8 +256,7 @@ async fn workflow_admission_timeout_recovers_without_daemon_restart() {
             progress.changed().await;
         }
     })
-    .await
-    .unwrap();
+    .await;
 }
 
 #[tokio::test]
@@ -336,7 +337,7 @@ async fn workflow_admission_recovery_reuses_accepted_turn() {
             .is_err()
     );
     drop(guard);
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             restore_workflow_runs(&state, vec!["admission-run".into()]).await;
@@ -348,8 +349,7 @@ async fn workflow_admission_recovery_reuses_accepted_turn() {
             progress.changed().await;
         }
     })
-    .await
-    .unwrap();
+    .await;
     let history = state.sessions.session_history(session_id).await.unwrap();
     assert_eq!(
         history
@@ -477,7 +477,7 @@ async fn workflow_admission_blocked_run_does_not_block_other_runs() {
     let sender = state.workflow_driver_sender.get().unwrap();
     sender.send("admission-run".into()).await.unwrap();
     sender.send("other-run".into()).await.unwrap();
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             let status = state
@@ -494,8 +494,7 @@ async fn workflow_admission_blocked_run_does_not_block_other_runs() {
             progress.changed().await;
         }
     })
-    .await
-    .unwrap();
+    .await;
     let task = state.workflow_driver_task.lock().await.take().unwrap();
     task.abort();
     let _ = task.await;

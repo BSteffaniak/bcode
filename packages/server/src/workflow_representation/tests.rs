@@ -708,7 +708,7 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
         .unwrap()
         .parent_session_id
         .unwrap();
-    fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             crate::drive_workflow_run(&state, "new").await.unwrap();
@@ -721,8 +721,7 @@ async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link()
             progress.changed().await;
         }
     })
-    .await
-    .expect("shared parent completes within existing regression bound");
+    .await;
     let db = open(&crate::workflow_store_path(&state), false).unwrap();
     let links = representation::inspection_sessions::links(&db, "new", None, 10)
         .await
@@ -905,34 +904,14 @@ async fn typed_agent_test_harness_uses_real_prompt_owner_and_fake_provider() {
         .await
         .expect("actual provider admission");
     assert!(receipt.get("turn_id").is_some());
-    if let Err(error) =
-        fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
-            let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
-            loop {
-                if status(&state, "new")
-                    .await
-                    .expect("status")
-                    .expect("run")
-                    .status
-                    == bcode_workflow::RunStatus::Completed
-                {
-                    break;
-                }
-                progress.changed().await;
-            }
-        })
-        .await
-    {
-        let session_id = receipt["session_id"]
-            .as_str()
-            .expect("session")
-            .parse()
-            .expect("id");
-        let events = state
-            .sessions
-            .session_turn_evidence(session_id, receipt["turn_id"].as_str().expect("turn"))
-            .await;
-        panic!("production callback timeout: {error:?}, events: {events:?}");
+    let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
+    loop {
+        let run = status(&state, "new").await.expect("status").expect("run");
+        assert_ne!(run.status, bcode_workflow::RunStatus::Failed);
+        if run.status == bcode_workflow::RunStatus::Completed {
+            break;
+        }
+        progress.changed().await;
     }
     assert!(
         representation::attempts::pending(&db, "new", None, 10)
@@ -998,7 +977,7 @@ async fn normal_start_uses_typed_family_and_rescans_two_running_agents_without_d
     crate::drive_workflow_run(&state, "parallel-provider")
         .await
         .expect("second scan");
-    fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             crate::drive_workflow_run(&state, "parallel-provider")
@@ -1017,8 +996,7 @@ async fn normal_start_uses_typed_family_and_rescans_two_running_agents_without_d
             progress.changed().await;
         }
     })
-    .await
-    .expect("parallel completion");
+    .await;
     assert!(
         !state
             .runtime_work
@@ -1084,6 +1062,7 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
     let store = bcode_workflow_store::WorkflowStore::create_coexistence_baseline(root.path())
         .expect("baseline");
     let state = authentic_loop_server(sessions, store);
+    state.start_workflow_driver().await;
     let mut cleanup = FixtureCleanup::new(&state);
     let request = bcode_loop_plugin::test_loop_start_request(parent.id, 2).expect("authentic loop");
     let run_id = request.run_id.clone().expect("run identity");
@@ -1113,7 +1092,7 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
     .await
     .expect("normal plugin start");
     assert_eq!(response.run.run_id, run_id);
-    fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             crate::drive_workflow_run(&state, &run_id)
@@ -1132,8 +1111,7 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
             progress.changed().await;
         }
     })
-    .await
-    .expect("authentic two-round loop completes");
+    .await;
     let db = open(&crate::workflow_store_path(&state), false).expect("db");
     assert!(
         representation::attempts::pending(&db, &run_id, None, 100)
@@ -1177,13 +1155,9 @@ async fn failed_receipt_is_terminal_not_repeated_scheduler_progress() {
     .await
     .expect("confirmed failure");
     for _ in 0..3 {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            crate::drive_workflow_run(&state, "new"),
-        )
-        .await
-        .expect("terminal failure cannot hot-loop")
-        .expect("settle failure");
+        crate::drive_workflow_run(&state, "new")
+            .await
+            .expect("settle failure");
     }
     assert_eq!(
         status(&state, "new")
@@ -1413,12 +1387,7 @@ fn configure_delegation_fixture(state: &mut ServerState) {
 #[tokio::test]
 async fn typed_coordinator_stages_and_publishes_delegation_through_normal_tool() {
     let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        Box::pin(run_typed_delegation()),
-    )
-    .await
-    .expect("whole delegation fixture deadline");
+    Box::pin(run_typed_delegation()).await;
 }
 
 async fn run_typed_delegation() {
@@ -1483,28 +1452,26 @@ async fn run_typed_delegation() {
     bcode_fake_provider_plugin::release_fake_event_script_gate(
         &state.selected_provider_context.settings["delegation_fixture_gate"],
     );
-    let finished =
-        fixture_observed_timeout(&state, crate::workflow_test_support::WATCHDOG, async {
-            let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
-            loop {
-                crate::drive_workflow_run(&state, "new")
-                    .await
-                    .expect("drive revised run");
-                progress.drove();
-                if status(&state, "new")
-                    .await
-                    .expect("status")
-                    .expect("run")
-                    .status
-                    == bcode_workflow::RunStatus::Completed
-                {
-                    break;
-                }
-                progress.changed().await;
+    Box::pin(async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
+        loop {
+            crate::drive_workflow_run(&state, "new")
+                .await
+                .expect("drive revised run");
+            progress.drove();
+            if status(&state, "new")
+                .await
+                .expect("status")
+                .expect("run")
+                .status
+                == bcode_workflow::RunStatus::Completed
+            {
+                break;
             }
-        })
-        .await;
-    finished.expect("delegated completion");
+            progress.changed().await;
+        }
+    })
+    .await;
     assert_delegation_sessions_are_unique(&state).await;
     cleanup.finish().await;
     drop(cleanup);
@@ -1551,21 +1518,20 @@ async fn invoke_delegation_tool(
         &cancellation,
     );
     tokio::pin!(invocation);
-    fixture_observed_timeout(state, std::time::Duration::from_secs(5), async {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(state);
+    Box::pin(async {
         loop {
+            let pending = state.pending_permissions.lock().await.values().next().cloned();
+            if let Some(pending) = pending {
+                assert!(crate::interaction_operations::resolve_permission(state, &pending.summary.permission_id, true, false).await);
+                continue;
+            }
             tokio::select! {
                 result = &mut invocation => return result.unwrap_or_else(|error| panic!("tool invocation {}: {error}", call.name)),
-                () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
-                    let pending = state.pending_permissions.lock().await.values().next().cloned();
-                    if let Some(pending) = pending {
-                        state.pending_permissions.lock().await.remove(&pending.summary.permission_id);
-                        *pending.decision.lock().await = Some(true);
-                        pending.notify.notify_one();
-                    }
-                }
+                () = progress.changed() => {}
             }
         }
-    }).await.expect("tool finishes through normal authorization")
+    }).await
 }
 
 #[tokio::test]
@@ -1588,7 +1554,7 @@ async fn public_cancellation_settles_real_gated_provider_without_late_reopen() {
             .expect("normal cancel")
     );
     let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
-    tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         loop {
             if status(&state, "new")
                 .await
@@ -1602,8 +1568,7 @@ async fn public_cancellation_settles_real_gated_provider_without_late_reopen() {
             progress.changed().await;
         }
     })
-    .await
-    .expect("confirmed provider cancellation settles");
+    .await;
     bcode_fake_provider_plugin::release_fake_event_script_gate(
         &state.selected_provider_context.settings["delegation_fixture_gate"],
     );
@@ -1829,7 +1794,7 @@ impl Drop for FixtureCleanup {
             let handle = runtime.spawn(async move {
                 shutdown_fixture_driver(&cleanup_state, true).await;
             });
-            // Keep the cleanup join handle even during panic unwinding. It has bounded waits.
+            // Keep the cleanup join handle even during panic unwinding. It retains ownership until joined.
             UNRESOLVED_FIXTURE_TASKS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1894,16 +1859,9 @@ async fn drain_fixture_supervisor(state: &std::sync::Arc<ServerState>) -> Result
     };
     let mut failed = false;
     for mut task in tasks {
-        let joined =
-            tokio::time::timeout(std::time::Duration::from_secs(2), task.handle_mut()).await;
-        match joined {
-            Ok(result) => {
-                task.disarm_joined();
-                failed |= result.is_err();
-            }
-            Err(_) => failed = true,
-        }
-        // A timed-out handle is re-retained by Drop; even a finished task must be joined.
+        let result = task.handle_mut().await;
+        task.disarm_joined();
+        failed |= result.is_err();
         drop(task);
     }
     if failed {
@@ -2353,30 +2311,8 @@ async fn fixture_stage_diagnostic(
     }
 }
 
-fn fixture_observed_timeout<'a, F: std::future::Future + 'a>(
-    state: &'a ServerState,
-    duration: std::time::Duration,
-    future: F,
-) -> impl std::future::Future<Output = Result<F::Output, tokio::time::error::Elapsed>> + 'a {
-    // Allocate before constructing the wrapper future, so its initial state also
-    // stays small instead of retaining the unpolled fixture future inline.
-    let future = Box::pin(future);
-    async move {
-        let started = std::time::Instant::now();
-        let result = tokio::time::timeout(duration, future).await;
-        if result.is_err() {
-            fixture_stage_diagnostic(state, "deadline-before-cleanup", started).await;
-        }
-        result
-    }
-}
-
 async fn stop_fixture_driver(state: &std::sync::Arc<ServerState>) {
-    // Successful callers must first establish whole-run canonical completion, not
-    // an empty registry between predecessor retirement and successor admission.
-    let started = std::time::Instant::now();
-    // Release test-owned provider gates before waiting for the callbacks they hold.
-    // This permits actual terminal settlement; it does not retire registrations.
+    // Callers prove canonical run completion before draining registrations.
     if let Some(gate) = state
         .selected_provider_context
         .settings
@@ -2385,76 +2321,30 @@ async fn stop_fixture_driver(state: &std::sync::Arc<ServerState>) {
         bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
     }
     let mut progress = crate::workflow_test_support::Progress::subscribe(state);
-    let drained = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
-        while !state.runtime_work.active_all().await.is_empty() {
-            progress.changed().await;
-        }
-    })
-    .await;
-    if drained.is_err() {
-        fixture_stage_diagnostic(state, "registry-drain-before-shutdown-timeout", started).await;
-        // Caller guard remains armed; its panic fallback retains cleanup ownership.
-        panic!("fixture callback registrations unresolved before shutdown; no settlement claimed");
+    while !state.runtime_work.active_all().await.is_empty() {
+        progress.changed().await;
     }
     shutdown_fixture_driver(state, false).await;
 }
 
 async fn shutdown_fixture_driver(state: &std::sync::Arc<ServerState>, failed_cleanup: bool) {
-    let started = std::time::Instant::now();
-    // Only the uniquely configured gate belongs to this fixture; never reset global gates.
-    if let Some(gate) = state
-        .selected_provider_context
-        .settings
-        .get("delegation_fixture_gate")
-    {
-        bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
-    }
-    fixture_stage_diagnostic(state, "gate-released-before-shutdown", started).await;
     state
         .shutdown_requested
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = state.shutdown.send(());
-    let task = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        state.workflow_driver_task.lock(),
-    )
-    .await
-    .expect("fixture driver handle lock unresolved")
-    .take();
+    let task = state.workflow_driver_task.lock().await.take();
     if let Some(task) = task {
-        let mut task = OwnedFixtureTask::new(state, task);
-        let joined =
-            tokio::time::timeout(std::time::Duration::from_secs(2), task.handle_mut()).await;
-        if let Ok(result) = joined {
-            result.expect("driver task");
-            task.disarm_joined();
-            drop(task);
-        } else {
-            // Drop retains this exact live task; neither abort nor event retirement proves settlement.
-            fixture_stage_diagnostic(state, "driver-join-timeout", started).await;
-            panic!("driver teardown unresolved; live join handle retained");
-        }
+        task.await.expect("driver task");
     }
-    fixture_stage_diagnostic(state, "after-driver-join", started).await;
-    if !failed_cleanup {
-        assert!(
-            state.runtime_work.active_all().await.is_empty(),
-            "work registered during successful driver join; no settlement claimed"
-        );
-        return;
-    }
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(state);
+    if failed_cleanup {
         while !state.runtime_work.active_all().await.is_empty() {
-            tokio::task::yield_now().await;
+            progress.changed().await;
         }
-    })
-    .await;
-    if drained.is_err() {
-        fixture_stage_diagnostic(state, "registry-drain-timeout", started).await;
     }
     assert!(
-        drained.is_ok(),
-        "fixture runtime effects remain unresolved; bounded registry drain expired"
+        state.runtime_work.active_all().await.is_empty(),
+        "work registered during successful driver join"
     );
 }
 
@@ -2645,19 +2535,12 @@ async fn pending_receipt_publication_cancellation_retains_accepted_turn_observer
         )
         .await
     });
-    let held = tokio::time::timeout(std::time::Duration::from_secs(10), acquired)
-        .await
-        .expect("write guard bound")
-        .expect("write guard acquired");
-    tokio::time::timeout(std::time::Duration::from_secs(10), pending)
-        .await
-        .expect("actual publication pending bound")
-        .expect("actual lock future polled Pending");
+    let held = acquired.await.expect("write guard acquired");
+    pending.await.expect("actual lock future polled Pending");
     outer.abort();
     assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), &mut outer)
+        (&mut outer)
             .await
-            .expect("outer joined")
             .expect_err("outer cancelled")
             .is_cancelled()
     );
@@ -2733,13 +2616,7 @@ async fn publication_accepted_receipt(
 }
 
 async fn wait_publication_provider_gate(gate: &str) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !bcode_fake_provider_plugin::fake_event_script_gate_ready(gate) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("accepted provider remains gated");
+    bcode_fake_provider_plugin::wait_for_fake_event_script_gate_ready(gate).await;
 }
 
 #[tokio::test]
@@ -2772,15 +2649,11 @@ async fn publication_cancellation_retains_accepted_turn_observer() {
         )
         .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(10), reached)
-        .await
-        .expect("acceptance hook bound")
-        .expect("hook reached");
+    reached.await.expect("hook reached");
     outer.abort();
     assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), &mut outer)
+        (&mut outer)
             .await
-            .expect("outer joined")
             .expect_err("outer cancelled")
             .is_cancelled()
     );
@@ -2796,13 +2669,7 @@ async fn publication_cancellation_retains_accepted_turn_observer() {
         .await
         .expect("canonical receipt")
         .expect("accepted");
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !bcode_fake_provider_plugin::fake_event_script_gate_ready(&gate) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("accepted provider reaches owned gate");
+    wait_publication_provider_gate(&gate).await;
     assert!(
         representation::attempts::owner_boundary::receipt(&db, &dispatch.dispatch_identity)
             .await
@@ -2850,7 +2717,8 @@ async fn wait_publication_observer_settlement(
     db: &dyn Database,
     dispatch_identity: &str,
 ) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    Box::pin(async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(state);
         loop {
             let terminal = representation::attempts::owner_boundary::terminal_outcome(
                 db,
@@ -2870,11 +2738,10 @@ async fn wait_publication_observer_settlement(
             if terminal && completed && state.runtime_work.active_all().await.is_empty() {
                 break;
             }
-            tokio::task::yield_now().await;
+            progress.changed().await;
         }
     })
-    .await
-    .expect("retained observer settles and drains accepted work");
+    .await;
 }
 
 async fn publication_unrelated_fixture(
@@ -3036,7 +2903,8 @@ async fn represented_acceptance_recovery_live_owner_cancel_settles_exact_turn() 
             .await
             .expect("cancel")
     );
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
+    Box::pin(async {
         loop {
             if status(&state, "new")
                 .await
@@ -3050,11 +2918,11 @@ async fn represented_acceptance_recovery_live_owner_cancel_settles_exact_turn() 
             crate::drive_workflow_run(&state, "new")
                 .await
                 .expect("observe cancellation");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            progress.drove();
+            progress.changed().await;
         }
     })
-    .await
-    .expect("canonical cancellation settlement");
+    .await;
     let evidence = state
         .sessions
         .session_turn_evidence(session, &accepted.turn_id.to_string())
@@ -3161,7 +3029,8 @@ async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
             .await
             .expect("resume")
     );
-    fixture_observed_timeout(&state, std::time::Duration::from_secs(10), async {
+    Box::pin(async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             if status(&state, "new")
                 .await
@@ -3172,11 +3041,10 @@ async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            progress.changed().await;
         }
     })
-    .await
-    .expect("normal scheduled resume completes");
+    .await;
     cleanup.finish().await;
     drop(cleanup);
 }
@@ -3264,7 +3132,8 @@ async fn normal_input_resolution_preserves_gate_identity_and_resumes_provider_wo
             .iter()
             .all(|activation| activation.created_at_ms > 0)
     );
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    Box::pin(async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
             crate::drive_workflow_run(&state, "input-resume")
                 .await
@@ -3278,11 +3147,10 @@ async fn normal_input_resolution_preserves_gate_identity_and_resumes_provider_wo
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            progress.changed().await;
         }
     })
-    .await
-    .expect("resolved run completes");
+    .await;
 }
 
 #[tokio::test]

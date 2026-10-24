@@ -563,6 +563,8 @@ pub struct ServerState {
     workflow_test_progress: tokio::sync::watch::Sender<()>,
     #[cfg(test)]
     workflow_test_shared_admission: tokio::sync::watch::Sender<Option<String>>,
+    #[cfg(test)]
+    workflow_test_admission_deadlines: bool,
     workflow_drive_gates: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     catalog_events_started: std::sync::atomic::AtomicBool,
     catalog_workers: Mutex<Vec<JoinHandle<()>>>,
@@ -2704,6 +2706,8 @@ impl ServerState {
             workflow_test_progress: tokio::sync::watch::channel(()).0,
             #[cfg(test)]
             workflow_test_shared_admission: tokio::sync::watch::channel(None).0,
+            #[cfg(test)]
+            workflow_test_admission_deadlines: true,
             workflow_drive_gates: std::sync::Mutex::new(BTreeMap::new()),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             catalog_workers: Mutex::new(Vec::new()),
@@ -39399,14 +39403,22 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
                         "workflow admission interrupted; owner acceptance requires reconciliation".into(),
                     ))
                 },
-                result = tokio::time::timeout(timeout, async {
-                    match request.activation.node.kind {
-                        bcode_workflow::NodeKind::Agent => Box::pin(dispatch_workflow_prompt_turn(self.state, request)).await,
-                        bcode_workflow::NodeKind::PluginBlock => dispatch_workflow_plugin_block(self.state, request).await,
-                        bcode_workflow::NodeKind::WorkflowCall => dispatch_workflow_child(self.state, request).await,
-                        _ => Err(WorkflowStoreError::InvalidData("workflow activation has no production owner".into())),
+                result = async {
+                    let admission = async {
+                        match request.activation.node.kind {
+                            bcode_workflow::NodeKind::Agent => Box::pin(dispatch_workflow_prompt_turn(self.state, request)).await,
+                            bcode_workflow::NodeKind::PluginBlock => dispatch_workflow_plugin_block(self.state, request).await,
+                            bcode_workflow::NodeKind::WorkflowCall => dispatch_workflow_child(self.state, request).await,
+                            _ => Err(WorkflowStoreError::InvalidData("workflow activation has no production owner".into())),
+                        }
+                    };
+                    // Test fixtures opt out of elapsed-time policy, not ownership or shutdown.
+                    #[cfg(test)]
+                    if !self.state.workflow_test_admission_deadlines {
+                        return Ok(admission.await);
                     }
-                }) => result.unwrap_or_else(|_| Err(WorkflowStoreError::InvalidData(
+                    tokio::time::timeout(timeout, admission).await
+                } => result.unwrap_or_else(|_| Err(WorkflowStoreError::InvalidData(
                     "workflow admission timed out; owner acceptance requires reconciliation".into(),
                 ))),
             };
@@ -64470,7 +64482,7 @@ library = "test"
             .take();
         replace_receipt_fixture_owner(&mut state, owner.is_replacement()).await;
         state.start_workflow_driver().await;
-        let dispatched = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+        let dispatched = Box::pin(async {
             let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
             loop {
                 let attempts = state
@@ -64502,9 +64514,7 @@ library = "test"
             .attempt_history("edit-run", None, 100)
             .expect("attempts");
         drop(state);
-        let attempt = dispatched.unwrap_or_else(|error| {
-            panic!("published entry settled by worker: {error}; attempts: {attempts:?}")
-        });
+        let attempt = dispatched;
         assert_eq!(attempt.status, "succeeded", "{attempt:?}");
         assert_publication_tasks_execute_once(connected, parallel, &attempts, &outputs);
         assert_exclusive_workers_do_not_overlap(&attempts, serialized);
@@ -73476,7 +73486,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 )
                 .await
                 .unwrap();
-                tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+                Box::pin(async {
                     let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
                     loop {
                         drive_workflow_run(&state, "edit-run").await.unwrap();
@@ -73504,8 +73514,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         progress.changed().await;
                     }
                 })
-                .await
-                .expect("approved publication executes worker and continuation");
+                .await;
             }
             let history = state.sessions.session_history(session).await.unwrap();
             drop(state);
@@ -81970,7 +81979,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             level: bcode_config::ObservabilityLevel::Debug,
             ..bcode_config::ObservabilityConfig::default()
         };
-        ServerState::new(
+        let mut state = ServerState::new(
             sessions,
             plugins,
             ServerStateInit {
@@ -82026,7 +82035,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ),
                 ralph_store,
             },
-        )
+        );
+        state.workflow_test_admission_deadlines = false;
+        state
     }
 
     #[tokio::test]

@@ -356,9 +356,8 @@ async fn assert_recursive_completion(
     // Ordinary driver scheduling, not direct child construction or an in-process SDK runner.
     state.start_workflow_driver().await;
     drive_if_represented(state, &root.run_id).await.unwrap();
-    let result = super::fanout::wait_public(state, &root.run_id).await;
+    super::fanout::wait_public(state, &root.run_id).await;
     stop_fixture_driver(state).await;
-    result.expect("finite recursive package reaches provider-backed base case");
     let first = representation::hierarchy::children(db, &root.run_id, None, 10)
         .await
         .unwrap();
@@ -442,38 +441,34 @@ async fn definition_child_uses_common_owner_and_returns_provider_output() {
     representation::admit(&db, &parent, &parent_definition)
         .await
         .expect("fixture admission; capability remains gated");
-    Box::pin(tokio::time::timeout(
-        crate::workflow_test_support::WATCHDOG,
-        async {
-            let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
-            loop {
-                driver::drive(&state, "child-parent")
+    Box::pin(Box::pin(async {
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
+        loop {
+            driver::drive(&state, "child-parent")
+                .await
+                .expect("parent drive");
+            let page = representation::hierarchy::children(&db, "child-parent", None, 32)
+                .await
+                .expect("children");
+            for link in page.children {
+                driver::drive(&state, &link.child_run_id)
                     .await
-                    .expect("parent drive");
-                let page = representation::hierarchy::children(&db, "child-parent", None, 32)
-                    .await
-                    .expect("children");
-                for link in page.children {
-                    driver::drive(&state, &link.child_run_id)
-                        .await
-                        .expect("child drive");
-                }
-                progress.drove();
-                if status(&state, "child-parent")
-                    .await
-                    .expect("status")
-                    .expect("parent")
-                    .status
-                    == bcode_workflow::RunStatus::Completed
-                {
-                    break;
-                }
-                progress.changed().await;
+                    .expect("child drive");
             }
-        },
-    ))
-    .await
-    .expect("child completes without recursive parent lock");
+            progress.drove();
+            if status(&state, "child-parent")
+                .await
+                .expect("status")
+                .expect("parent")
+                .status
+                == bcode_workflow::RunStatus::Completed
+            {
+                break;
+            }
+            progress.changed().await;
+        }
+    }))
+    .await;
     let children = representation::hierarchy::children(&db, "child-parent", None, 32)
         .await
         .expect("children");
@@ -513,8 +508,7 @@ async fn normal_definition_child_completion_wakes_parent() {
     .expect("call config");
     state.start_workflow_driver().await;
     super::fanout::start_public(&state, "normal-parent", parent, serde_json::json!(1), None).await;
-    let result = super::fanout::wait_public(&state, "normal-parent").await;
-    result.expect("child result reaches parent through ordinary scheduler");
+    super::fanout::wait_public(&state, "normal-parent").await;
     cleanup.finish().await;
     drop(cleanup);
 }

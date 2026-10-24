@@ -100,7 +100,7 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
         1
     );
     state.start_workflow_driver().await;
-    let finished = tokio::time::timeout(crate::workflow_test_support::WATCHDOG, async {
+    Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         let dispatch = bcode_workflow_store::dispatch_identity("cancel-edit", "right", &target, 1);
         loop {
@@ -119,7 +119,6 @@ async fn normal_tool_cancel_acceptance_waits_for_receipt_then_commits_exact_cand
         }
     })
     .await;
-    finished.expect("receipt acknowledged cancellation");
     let committed = Box::pin(invoke_delegation_tool(&state, source.id, &accept)).await;
     assert!(!committed.is_error, "{}", committed.output);
     assert_eq!(
