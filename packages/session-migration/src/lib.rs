@@ -23,12 +23,13 @@ mod target;
 mod validation;
 
 pub use backup::{
-    BackupProgressCallback, MigrationBackupCanonicalEvidence, MigrationBackupError,
-    MigrationBackupFileEvidence, MigrationBackupManifest, MigrationBackupRequest,
-    MigrationBackupRequestError, MigrationBackupRequestPlan, MigrationSourceEvidence,
-    RetainedMigrationBackup, RetainedMigrationBackupDiagnosis, VerifiedMigrationBackup,
-    build_migration_backup_request, create_retained_migration_backup,
-    create_verified_migration_backup, latest_retained_migration_backup,
+    BackupProgressCallback, BackupSpacePreflight, MigrationBackupCanonicalEvidence,
+    MigrationBackupError, MigrationBackupFileEvidence, MigrationBackupManifest,
+    MigrationBackupRequest, MigrationBackupRequestError, MigrationBackupRequestPlan,
+    MigrationSourceEvidence, RetainedMigrationBackup, RetainedMigrationBackupDiagnosis,
+    RetainedMigrationBackupInventory, VerifiedMigrationBackup, build_migration_backup_request,
+    create_retained_migration_backup, create_retained_migration_backup_with_preflight,
+    create_verified_migration_backup, latest_retained_migration_backup, retained_migration_backups,
 };
 pub use operation::{
     SessionMigrationOperation, SessionMigrationOperations, SessionMigrationProgressReporter,

@@ -159,7 +159,9 @@ async fn manual_sweep_continues_after_missing_artifact_through_history() {
     drop(root);
 }
 
-async fn fixture(count: usize) -> (tempfile::TempDir, ServerState, SessionId, PathBuf, Vec<u8>) {
+pub(super) async fn fixture(
+    count: usize,
+) -> (tempfile::TempDir, ServerState, SessionId, PathBuf, Vec<u8>) {
     let root = tempfile::tempdir().expect("root");
     let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
     let summary = sessions
@@ -685,10 +687,11 @@ async fn scheduler_respects_disable_and_live_ownership() {
         .acquire_session_ownership(id, bcode_session::SessionOwnershipKind::RuntimeWork)
         .await
         .expect("owner");
-    assert!(
+    assert_eq!(
         maintain_session_at(&state, root.path(), id, None, future)
             .await
-            .is_err()
+            .expect("owned session skipped"),
+        None
     );
     drop(owner);
     drop(state);

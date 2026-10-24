@@ -128,7 +128,9 @@ pub enum ArtifactStorageOutcome {
     Unchanged,
     /// The candidate was published at the original path.
     Compressed {
-        /// File-byte savings, excluding filesystem allocation rounding.
+        /// File-byte reduction at the authoritative path, excluding filesystem allocation rounding.
+        /// Not reclaimed disk: retained prior representations and open readers can keep the source
+        /// allocated, while the candidate and filesystem metadata consume additional blocks.
         saved_bytes: u64,
         /// Retained prior representation if post-publication cleanup failed. Never authoritative.
         retained_backup: Option<PathBuf>,
@@ -164,21 +166,50 @@ pub async fn initialize_maintenance_access(
     session_id: SessionId,
     now_ms: u64,
 ) -> io::Result<()> {
+    initialize_maintenance_access_cancellable(
+        root,
+        session_id,
+        now_ms,
+        ArtifactMaintenanceCancellation::default(),
+    )
+    .await
+}
+
+/// Initialize unknown age while retaining registered-reader admission and daemon health.
+///
+/// Existing records are never refreshed. Cancellation is cooperative: callers must await this
+/// future after requesting cancellation so admission outlives the final blocking metadata write.
+///
+/// # Errors
+/// Refuses active ownership/readers, unhealthy acknowledgement, cancellation, incompatible or
+/// damaged storage/access metadata, and IO failures. No metadata is initialized on refusal.
+pub async fn initialize_maintenance_access_cancellable(
+    root: &Path,
+    session_id: SessionId,
+    now_ms: u64,
+    cancellation: ArtifactMaintenanceCancellation,
+) -> io::Result<()> {
+    cancellation.check()?;
     let maintenance = acquire_maintenance(root, session_id).await?;
+    let admission = cancellation.admit_tracking(root, session_id).await?;
     let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, root)
         .await
         .map_err(io::Error::other)?;
     let valid = db.artifact_maintenance_page(None).await;
-    db.database().close().await.map_err(io::Error::other)?;
+    let closed = db.database().close().await;
+    closed.map_err(io::Error::other)?;
     valid.map_err(io::Error::other)?;
+    drop(db);
+    cancellation.check()?;
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let result = crate::storage_access::initialize_session_access(&root, session_id, now_ms);
-        drop(maintenance);
-        result
+    run_cancellable_artifact_work(cancellation.clone(), move || {
+        // These capabilities move into the blocking task, not its cancellable async waiter.
+        let _maintenance = maintenance;
+        let _admission = admission;
+        cancellation.check()?;
+        crate::storage_access::initialize_session_access(&root, session_id, now_ms)
     })
     .await
-    .map_err(|_| io::Error::other("access initialization failed"))?
 }
 
 /// One finite artifact sweep page; subsequent pages retain `through_sequence`.
@@ -308,16 +339,27 @@ impl ArtifactMaintenanceCancellation {
         self.check()
     }
 
-    pub(crate) async fn admit_tracking(
+    /// Acquire reader-excluding admission for an actual maintenance operation.
+    ///
+    /// Retain the returned guard through database closure and all blocking I/O. This does not
+    /// acquire exclusive session ownership; the caller must independently hold that ownership.
+    ///
+    /// # Errors
+    /// Returns cancellation, unhealthy acknowledgement, busy readers, or invalid tracking evidence.
+    pub async fn admit_tracking(
         &self,
         root: &Path,
         id: SessionId,
-    ) -> io::Result<TrackingAdmission> {
+    ) -> io::Result<crate::storage_admission::StorageMaintenanceAdmission> {
         self.check()?;
         acquire_tracking_admission(root, id).await
     }
 
-    pub(crate) fn check(&self) -> io::Result<()> {
+    /// Check cooperative cancellation and the retained daemon acknowledgement.
+    ///
+    /// # Errors
+    /// Returns an error when cancellation was requested or acknowledgement is no longer healthy.
+    pub fn check(&self) -> io::Result<()> {
         if let Some(acknowledgement) = &self.acknowledgement {
             acknowledgement.check()?;
         }
@@ -697,6 +739,22 @@ pub fn compress_session_artifact(
     )
 }
 
+/// Deliberately conservative scratch allowance, not a prediction of compression ratio or codec
+/// layout. Keep the complete source, allow twice the logical content for candidate expansion, and
+/// leave a filesystem cushion. Checked arithmetic rejects impossible work before staging exists.
+#[cfg(unix)]
+fn artifact_scratch_bytes(logical_bytes: u64) -> io::Result<u64> {
+    logical_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(crate::storage_usage::MIN_MAINTENANCE_HEADROOM_BYTES))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "artifact scratch allowance overflow",
+            )
+        })
+}
+
 #[cfg(unix)]
 fn compress_artifact_with_maintenance(
     sessions_root: &Path,
@@ -735,6 +793,8 @@ fn compress_artifact_with_maintenance(
     if !confined::same_object(&original, &source_content)? {
         return Err(invalid());
     }
+    ensure_artifact_headroom(&parent_handle, &mut original, encoding)?;
+    check_cancelled()?;
     let (staging_object, mut candidate) =
         confined::create_candidate(&parent_handle, &staging_name)?;
     let result = (|| {
@@ -804,6 +864,17 @@ fn compress_artifact_with_maintenance(
         saved_bytes,
         retained_backup,
     })
+}
+
+#[cfg(unix)]
+fn ensure_artifact_headroom(
+    parent: &File,
+    original: &mut File,
+    encoding: ArtifactEncoding,
+) -> io::Result<()> {
+    let scratch_bytes =
+        artifact_scratch_bytes(ArtifactReader::new(original, encoding)?.logical_bytes())?;
+    crate::storage_usage::ensure_storage_headroom(parent, scratch_bytes)
 }
 
 #[cfg(not(unix))]
@@ -881,6 +952,23 @@ fn exchange(parent: &File, parent_path: &Path, left: &Path, right: &Path) -> io:
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_allowance_keeps_source_and_rejects_overflow() {
+        let cushion = crate::storage_usage::MIN_MAINTENANCE_HEADROOM_BYTES;
+        assert_eq!(artifact_scratch_bytes(0).expect("empty"), cushion);
+        assert_eq!(
+            artifact_scratch_bytes(4096).expect("allowance"),
+            8192 + cushion
+        );
+        assert_eq!(
+            artifact_scratch_bytes(u64::MAX)
+                .expect_err("overflow")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn artifact_diagnostics_are_typed_and_secret_safe() {

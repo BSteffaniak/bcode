@@ -84,6 +84,7 @@ pub struct SessionMigrationOperation {
     publication: std::sync::Mutex<()>,
     completed_at: Mutex<Option<Instant>>,
     history: std::sync::Mutex<Vec<SessionOpenOperationSnapshot>>,
+    retry_after_completion: std::sync::atomic::AtomicBool,
 }
 
 impl SessionMigrationOperation {
@@ -93,7 +94,15 @@ impl SessionMigrationOperation {
             publication: std::sync::Mutex::new(()),
             completed_at: Mutex::new(None),
             history: std::sync::Mutex::new(Vec::new()),
+            retry_after_completion: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Permit fresh admission after this runner settles a safe pre-mutation cancellation.
+    /// Active work remains joinable until its terminal acknowledgement is published.
+    pub fn retry_after_completion(&self) {
+        self.retry_after_completion
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Return the latest published snapshot.
@@ -226,14 +235,33 @@ impl SessionMigrationOperations {
         F: FnOnce(Arc<SessionMigrationOperation>) -> Fut + Send + 'static,
         Fut: Future<Output = SessionOpenTerminalOutcome> + Send + 'static,
     {
+        self.start_or_join_with_admission(initial, run).await.0
+    }
+
+    /// Start or join shared work and report whether this caller supplied the admitted runner.
+    ///
+    /// A joined caller must not cancel work owned by the admitted caller.
+    pub async fn start_or_join_with_admission<F, Fut>(
+        &self,
+        initial: SessionOpenOperationSnapshot,
+        run: F,
+    ) -> (Arc<SessionMigrationOperation>, bool)
+    where
+        F: FnOnce(Arc<SessionMigrationOperation>) -> Fut + Send + 'static,
+        Fut: Future<Output = SessionOpenTerminalOutcome> + Send + 'static,
+    {
         self.prune().await;
         let session_id = initial.session_id;
         let operation = {
             let mut entries = self.entries.lock().await;
             if let Some(existing) = entries.get(&session_id)
                 && should_reuse_operation(&existing.snapshot())
+                && !(existing.is_terminal()
+                    && existing
+                        .retry_after_completion
+                        .load(std::sync::atomic::Ordering::Acquire))
             {
-                return Arc::clone(existing);
+                return (Arc::clone(existing), false);
             }
             let operation = Arc::new(SessionMigrationOperation::new(initial));
             entries.insert(session_id, Arc::clone(&operation));
@@ -260,7 +288,7 @@ impl SessionMigrationOperations {
             });
             task_operation.complete(outcome).await;
         });
-        operation
+        (operation, true)
     }
 
     /// Return an operation only when session and operation identities both match.
@@ -378,6 +406,73 @@ mod tests {
             outcome: None,
             backup_path: None,
         }
+    }
+
+    #[tokio::test]
+    async fn admission_acknowledges_only_the_runner_and_joins_foreground_work() {
+        let operations = SessionMigrationOperations::default();
+        let id = SessionId::new();
+        let blocker = Arc::new(tokio::sync::Notify::new());
+        let runner_blocker = blocker.clone();
+        let (first, admitted) = operations
+            .start_or_join_with_admission(snapshot(id), move |_| async move {
+                runner_blocker.notified().await;
+                SessionOpenTerminalOutcome::Ready
+            })
+            .await;
+        assert!(admitted);
+        let (joined, admitted) = operations
+            .start_or_join_with_admission(snapshot(id), |_| async move {
+                panic!("joined runner must never execute")
+            })
+            .await;
+        assert!(!admitted);
+        assert!(Arc::ptr_eq(&first, &joined));
+        assert!(operations.is_active(id).await);
+        let mut receiver = first.subscribe();
+        blocker.notify_one();
+        receiver
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("terminal acknowledgement");
+        assert!(!operations.is_active(id).await);
+    }
+
+    #[tokio::test]
+    async fn safe_cancellation_is_joined_until_acknowledged_then_allows_retry() {
+        let operations = SessionMigrationOperations::default();
+        let id = SessionId::new();
+        let blocker = Arc::new(tokio::sync::Notify::new());
+        let task_blocker = blocker.clone();
+        let first = operations
+            .start_or_join(snapshot(id), move |operation| async move {
+                operation.retry_after_completion();
+                task_blocker.notified().await;
+                SessionOpenTerminalOutcome::Failed {
+                    kind: SessionOpenFailureKind::MigrationFailed,
+                    backup_path: None,
+                    message: "cancelled before mutation".to_owned(),
+                }
+            })
+            .await;
+        let (joined, admitted) = operations
+            .start_or_join_with_admission(snapshot(id), |_| async { panic!("still active") })
+            .await;
+        assert!(!admitted);
+        assert!(Arc::ptr_eq(&first, &joined));
+        let mut updates = first.subscribe();
+        blocker.notify_one();
+        updates
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("acknowledged");
+        let (retried, admitted) = operations
+            .start_or_join_with_admission(snapshot(id), |_| async {
+                SessionOpenTerminalOutcome::Ready
+            })
+            .await;
+        assert!(admitted);
+        assert!(!Arc::ptr_eq(&first, &retried));
     }
 
     #[test]

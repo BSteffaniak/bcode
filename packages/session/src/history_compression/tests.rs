@@ -140,6 +140,8 @@ async fn verify_history_compression(directory_format: bool) {
     if directory_format {
         directory_fixture(&path);
     }
+    let access_before = crate::storage_access::observe_session_access(root.path(), id)
+        .expect("access before maintenance");
     let mut cursor = 0;
     let mut pages = 0;
     let mut saved = 0;
@@ -161,6 +163,12 @@ async fn verify_history_compression(directory_format: bool) {
     assert!(pages >= 4);
     assert_eq!(inspected, expected.len());
     assert!(saved > 4 * 1024 * 1024);
+    assert_eq!(
+        crate::storage_access::observe_session_access(root.path(), id)
+            .expect("access after maintenance"),
+        access_before,
+        "maintenance must not refresh meaningful access age"
+    );
     let reopened = crate::SessionManager::persistent(root.path()).expect("reopen");
     assert_eq!(
         reopened.session_history(id).await.expect("same history"),

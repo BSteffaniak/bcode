@@ -3,17 +3,21 @@
 use bcode_session_models::{SessionId, SessionStorageBytes, SessionStorageUsage};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Maximum directory entries inspected by a single explicit storage measurement.
 pub const MAX_STORAGE_MEASUREMENT_ENTRIES: u32 = 100_000;
 const MAX_DEPTH: usize = 32;
+
+/// Minimum free-space cushion before starting a maintenance write, not a WAL-size guarantee.
+pub const MIN_MAINTENANCE_HEADROOM_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum Category {
     Session,
     Database,
     Artifact,
+    RetainedBackup,
 }
 
 /// Measure one session and its artifacts without loading, repairing, or replaying history.
@@ -21,7 +25,9 @@ enum Category {
 /// Symlinks and special files are skipped, never followed. Work and retained traversal state are
 /// bounded by the entry budget and depth, respectively. The result is a best-effort observation,
 /// not a consistent snapshot. Missing artifact directories are allowed; missing canonical storage
-/// is not. This does not inspect search-provider state or distinguish database tables.
+/// is not. This does not inspect search-provider state or distinguish database tables. External
+/// recovery backups are excluded; use `measure_session_storage_with_backups` with a migration-owned
+/// inventory to include them.
 ///
 /// # Errors
 ///
@@ -31,6 +37,27 @@ pub fn measure_session_storage(
     root: &Path,
     session_id: SessionId,
     entry_budget: u32,
+) -> io::Result<SessionStorageUsage> {
+    measure_session_storage_with_backups(root, session_id, entry_budget, &[])
+}
+
+/// Measure storage plus migration-owned, retained recovery directories with one shared budget.
+///
+/// The caller must supply an exhaustive, bounded inventory for this session from the migration
+/// domain. This function never discovers, classifies, validates, or deletes recovery copies. An
+/// empty list means no supplied backups, not proof that none exist. Discovery incompleteness must
+/// be surfaced separately by the caller. Paths must be absolute immediate children of the sibling
+/// `session-migration-backups` directory; each supplied root consumes one traversal entry. Backup
+/// contents are opaque files, even if their format is unknown or corrupt.
+///
+/// # Errors
+/// Returns ordinary measurement failures, or rejects duplicate, nested, linked, missing or foreign
+/// backup roots. Entries beyond the shared budget are not inspected and set `budget_exhausted`.
+pub fn measure_session_storage_with_backups(
+    root: &Path,
+    session_id: SessionId,
+    entry_budget: u32,
+    retained_backup_paths: &[PathBuf],
 ) -> io::Result<SessionStorageUsage> {
     if !(1..=MAX_STORAGE_MEASUREMENT_ENTRIES).contains(&entry_budget) {
         return Err(io::Error::new(
@@ -76,7 +103,108 @@ pub fn measure_session_storage(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
+    if !retained_backup_paths.is_empty() {
+        let backup_root = root
+            .parent()
+            .unwrap_or(&root)
+            .join("session-migration-backups");
+        let mut seen = std::collections::BTreeSet::new();
+        for backup in retained_backup_paths {
+            if usage.visited_entries == entry_budget {
+                usage.budget_exhausted = true;
+                break;
+            }
+            usage.visited_entries += 1;
+            require_directory(&backup_root)?;
+            require_confined(&backup_root, root.parent().unwrap_or(&root))?;
+            if backup.parent() != Some(backup_root.as_path())
+                || !seen.insert(backup.clone())
+                || backup
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid retained backup root",
+                ));
+            }
+            require_directory(backup)?;
+            require_confined(backup, &backup_root)?;
+            if backup.canonicalize()?.parent() != Some(backup_root.as_path()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "retained backup must be an immediate child",
+                ));
+            }
+            visit(
+                backup,
+                &backup_root,
+                Category::RetainedBackup,
+                entry_budget,
+                0,
+                &mut usage,
+            )?;
+        }
+    }
     Ok(usage)
+}
+
+/// Check available destination space without counting bytes occupied by the source as free.
+///
+/// `additional_bytes` is caller-owned scratch-space policy, including any desired safety margin.
+/// This is an observation, not a reservation: concurrent writers, filesystem metadata, quotas and
+/// copy-on-write behavior can still make a later write fail. The directory descriptor pins the
+/// destination filesystem, avoiding a path re-resolution between admission and the check.
+///
+/// # Errors
+/// Rejects non-directory handles, unsupported platforms, failed filesystem queries, unrepresentable
+/// measurements, or insufficient space available to the current user.
+pub fn ensure_storage_headroom(destination: &fs::File, additional_bytes: u64) -> io::Result<()> {
+    if !destination.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage destination is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let mut statistics = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: destination remains open and statistics points to writable, correctly sized memory.
+        if unsafe { libc::fstatvfs(destination.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatvfs initialized the entire result.
+        let statistics = unsafe { statistics.assume_init() };
+        if statistics.f_frsize == 0 {
+            return Err(io::Error::other("unknown filesystem allocation unit"));
+        }
+        let available = u128::from(statistics.f_bavail)
+            .checked_mul(u128::from(statistics.f_frsize))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| io::Error::other("invalid available storage measurement"))?;
+        check_available_storage(available, additional_bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = additional_bytes;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "storage headroom query unavailable",
+        ))
+    }
+}
+
+#[cfg(any(unix, test))]
+fn check_available_storage(available: u64, required: u64) -> io::Result<()> {
+    if available < required {
+        Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "insufficient maintenance scratch space",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn require_directory(path: &Path) -> io::Result<()> {
@@ -153,6 +281,7 @@ fn visit(
         } else if metadata.is_file() {
             let bucket = match category {
                 Category::Artifact => &mut usage.artifacts,
+                Category::RetainedBackup => &mut usage.retained_backups,
                 Category::Database => &mut usage.database,
                 Category::Session
                     if depth == 0
@@ -196,6 +325,139 @@ fn add_file(bucket: &mut SessionStorageBytes, metadata: &fs::Metadata) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backup_fixture() -> (tempfile::TempDir, PathBuf, SessionId, PathBuf) {
+        let state = tempfile::tempdir().expect("state");
+        let root = state.path().join("sessions");
+        let id = SessionId::new();
+        fs::create_dir_all(root.join(id.to_string())).expect("session");
+        fs::write(root.join(id.to_string()).join("session.db"), b"canonical").expect("database");
+        let backup = state.path().join("session-migration-backups/recovery");
+        fs::create_dir_all(&backup).expect("backup");
+        fs::write(backup.join("session.db"), b"opaque historical backup").expect("backup bytes");
+        (state, root, id, backup)
+    }
+
+    #[test]
+    fn supplied_external_backups_are_separate_and_never_interpreted() {
+        let (_state, root, id, backup) = backup_fixture();
+        fs::create_dir(backup.join("nested")).expect("nested");
+        fs::write(backup.join("nested/wal"), b"wal").expect("wal");
+        let before = fs::read(backup.join("session.db")).expect("before");
+        let usage =
+            measure_session_storage_with_backups(&root, id, 100, std::slice::from_ref(&backup))
+                .expect("measurement");
+        assert_eq!(usage.database.file_bytes, 9);
+        assert_eq!(usage.other.files, 0);
+        assert_eq!(usage.retained_backups.files, 2);
+        assert_eq!(usage.retained_backups.file_bytes, before.len() as u64 + 3);
+        assert_eq!(usage.skipped_entries, 0);
+        assert!(!usage.budget_exhausted);
+        assert_eq!(fs::read(backup.join("session.db")).expect("after"), before);
+        assert_eq!(
+            measure_session_storage(&root, id, 100)
+                .expect("base")
+                .retained_backups
+                .files,
+            0
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let expected = fs::metadata(backup.join("session.db"))
+                .expect("metadata")
+                .blocks()
+                + fs::metadata(backup.join("nested/wal"))
+                    .expect("metadata")
+                    .blocks();
+            assert_eq!(usage.retained_backups.allocated_bytes, Some(expected * 512));
+        }
+    }
+
+    #[test]
+    fn backup_roots_and_contents_share_the_overall_budget() {
+        let (_state, root, id, backup) = backup_fixture();
+        let paths = [backup];
+        let usage = measure_session_storage_with_backups(&root, id, 2, &paths).expect("bounded");
+        assert_eq!(usage.visited_entries, 2);
+        assert!(usage.budget_exhausted);
+        assert_eq!(usage.database.files, 1);
+        assert_eq!(usage.retained_backups.files, 0);
+        let complete =
+            measure_session_storage_with_backups(&root, id, 3, &paths).expect("complete");
+        assert_eq!(complete.visited_entries, 3);
+        assert!(!complete.budget_exhausted);
+        assert_eq!(complete.retained_backups.files, 1);
+    }
+
+    #[test]
+    fn backup_inventory_rejects_duplicates_foreign_and_ancestor_paths() {
+        let (_state, root, id, backup) = backup_fixture();
+        assert!(
+            measure_session_storage_with_backups(&root, id, 100, &[backup.clone(), backup.clone()])
+                .is_err()
+        );
+        assert!(
+            measure_session_storage_with_backups(&root, id, 100, std::slice::from_ref(&root))
+                .is_err()
+        );
+        let ancestor = backup.parent().expect("backup root").join(".");
+        assert!(measure_session_storage_with_backups(&root, id, 100, &[ancestor]).is_err());
+        let nested = backup.join("nested");
+        fs::create_dir(&nested).expect("nested");
+        assert!(measure_session_storage_with_backups(&root, id, 100, &[nested]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_backup_roots_are_rejected_and_linked_contents_are_skipped() {
+        use std::os::unix::fs::symlink;
+        let (_state, root, id, backup) = backup_fixture();
+        let linked = backup.with_file_name("linked");
+        symlink(&backup, &linked).expect("linked root");
+        assert!(measure_session_storage_with_backups(&root, id, 100, &[linked]).is_err());
+        symlink(root.join(id.to_string()), backup.join("escape")).expect("linked content");
+        let usage =
+            measure_session_storage_with_backups(&root, id, 100, &[backup]).expect("measurement");
+        assert_eq!(usage.skipped_entries, 1);
+        assert_eq!(usage.retained_backups.files, 1);
+    }
+
+    #[test]
+    fn scratch_admission_does_not_credit_payload_savings() {
+        assert!(check_available_storage(4096, 4096).is_ok());
+        assert!(check_available_storage(0, 0).is_ok());
+        assert_eq!(
+            check_available_storage(4095, 4096)
+                .expect_err("space")
+                .kind(),
+            io::ErrorKind::StorageFull
+        );
+        assert_eq!(
+            check_available_storage(0, u64::MAX)
+                .expect_err("space")
+                .kind(),
+            io::ErrorKind::StorageFull
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headroom_query_uses_directory_handle_and_does_not_mutate_storage() {
+        let directory = tempfile::tempdir().expect("directory");
+        let handle = fs::File::open(directory.path()).expect("handle");
+        ensure_storage_headroom(&handle, 0).expect("query");
+        assert_eq!(fs::read_dir(directory.path()).expect("entries").count(), 0);
+        let file = directory.path().join("file");
+        fs::write(&file, b"unchanged").expect("file");
+        assert_eq!(
+            ensure_storage_headroom(&fs::File::open(&file).expect("file handle"), 0)
+                .expect_err("not directory")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(file).expect("content"), b"unchanged");
+    }
 
     fn fixture() -> (tempfile::TempDir, SessionId) {
         let root = tempfile::tempdir().expect("root");

@@ -161,7 +161,7 @@ pub use trace_export::*;
 mod storage_compression;
 pub use storage_compression::*;
 mod storage;
-pub use storage::{SessionStorageBytes, SessionStorageUsage};
+pub use storage::{SessionStorageBytes, SessionStorageUsage, StorageMaintenanceStatus};
 
 mod original_usage;
 pub use original_usage::{

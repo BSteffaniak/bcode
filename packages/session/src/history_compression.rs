@@ -158,6 +158,23 @@ pub async fn compress_history_page_through(
         } else {
             None
         };
+        // A conservative admission floor, not an estimate of transaction/WAL growth. Payload
+        // savings do not release allocated pages, and other writers can consume space afterward.
+        #[cfg(unix)]
+        {
+            let database = crate::db_path::resolve_existing_session_db(
+                &root.join(id.to_string()).join("session.db"),
+            )?;
+            let directory = std::fs::File::open(
+                database
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("missing database directory"))?,
+            )?;
+            crate::storage_usage::ensure_storage_headroom(
+                &directory,
+                crate::storage_usage::MIN_MAINTENANCE_HEADROOM_BYTES,
+            )?;
+        }
         let db = SessionDb::open_existing_turso_in_root(id, &root).await?;
         let result = db
             .compress_history_payload_page_through(

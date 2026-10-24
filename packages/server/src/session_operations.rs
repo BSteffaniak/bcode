@@ -1183,11 +1183,66 @@ pub async fn storage_usage(
     {
         return Err("session storage location is ambiguous");
     }
-    state
+    if !(1..=bcode_session::storage_usage::MAX_STORAGE_MEASUREMENT_ENTRIES).contains(&entry_budget)
+    {
+        return Err("invalid storage measurement budget");
+    }
+    let root = state
         .sessions
-        .storage_usage(session_id, entry_budget)
+        .session_store_root()
+        .ok_or("persistent storage unavailable")?;
+    // Validate and measure a bounded canonical prefix before external discovery can consume the
+    // budget. A missing/unsafe canonical session must never look like a successful zero total.
+    let prefix = tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || bcode_session::storage_usage::measure_session_storage(&root, session_id, 1)
+    })
+    .await
+    .map_err(|_| "storage validation task unavailable")?
+    .map_err(|_| "canonical session storage unavailable")?;
+    let discovery_budget = entry_budget.saturating_sub(prefix.visited_entries);
+    let prefix_entries = prefix.visited_entries;
+    let inventory = tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || {
+            bcode_session_migration::retained_migration_backups(
+                &root,
+                session_id,
+                discovery_budget as usize,
+            )
+        }
+    })
+    .await
+    .map_err(|_| "backup discovery task unavailable")?
+    .map_err(|_| "retained backup discovery unavailable")?;
+    let discovered = u32::try_from(inventory.inspected_entries)
+        .map_err(|_| "backup discovery budget invalid")?;
+    let remaining = discovery_budget.saturating_sub(discovered);
+    let mut usage = if remaining == 0 {
+        prefix
+    } else {
+        let paths = inventory
+            .backups
+            .into_iter()
+            .map(|backup| backup.path)
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            bcode_session::storage_usage::measure_session_storage_with_backups(
+                &root, session_id, remaining, &paths,
+            )
+        })
         .await
-        .map_err(|_| "session storage measurement is unavailable or the entry budget is invalid")
+        .map_err(|_| "storage measurement task unavailable")?
+        .map_err(|_| "session storage measurement is unavailable or the entry budget is invalid")?
+    };
+    usage.visited_entries = usage
+        .visited_entries
+        .saturating_add(discovered)
+        .saturating_add(if remaining == 0 { 0 } else { prefix_entries });
+    usage.budget_exhausted |= remaining == 0;
+    usage.backup_discovery_complete = Some(inventory.complete);
+    usage.maintenance = Some(state.storage_worker.status(session_id));
+    Ok(usage)
 }
 
 /// Return one bounded session history page without transport framing.

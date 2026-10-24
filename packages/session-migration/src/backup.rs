@@ -232,6 +232,83 @@ pub fn latest_retained_migration_backup(
     Ok(newest)
 }
 
+/// Bounded retained-backup discovery. Incomplete results must not be treated as total usage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedMigrationBackupInventory {
+    /// Matching manifests, including historical manifests accepted by diagnosis policy.
+    pub backups: Vec<RetainedMigrationBackupDiagnosis>,
+    /// False if entry/manifest limits or unverifiable matching entries prevented full discovery.
+    pub complete: bool,
+    /// Directory entries inspected, including unrelated sessions.
+    pub inspected_entries: usize,
+}
+
+/// Discover backup directories without opening canonical storage or following symlinks.
+///
+/// The entry budget bounds filesystem work globally, not just matching sessions. Malformed or
+/// oversized manifests are preserved and make the result incomplete. No path is deleted.
+/// # Errors
+/// Returns an error if the backup directory cannot be enumerated.
+pub fn retained_migration_backups(
+    sessions_root: &Path,
+    session_id: SessionId,
+    max_entries: usize,
+) -> Result<RetainedMigrationBackupInventory, MigrationBackupError> {
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    let root = sessions_root
+        .parent()
+        .unwrap_or(sessions_root)
+        .join(MIGRATION_BACKUPS_DIRECTORY);
+    let mut result = RetainedMigrationBackupInventory {
+        backups: Vec::new(),
+        complete: true,
+        inspected_entries: 0,
+    };
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(result),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        if result.inspected_entries >= max_entries {
+            result.complete = false;
+            break;
+        }
+        result.inspected_entries += 1;
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            result.complete &= !entry.file_type()?.is_symlink();
+            continue;
+        }
+        let path = entry.path();
+        let manifest_path = path.join(MIGRATION_BACKUP_MANIFEST_FILE);
+        let metadata = match fs::symlink_metadata(&manifest_path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_MANIFEST_BYTES => metadata,
+            _ => {
+                result.complete = false;
+                continue;
+            }
+        };
+        let mut bytes = Vec::new();
+        File::open(manifest_path)?
+            .take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len() {
+            result.complete = false;
+            continue;
+        }
+        match serde_json::from_slice::<MigrationBackupManifest>(&bytes) {
+            Ok(manifest) if manifest.session_id == session_id => result
+                .backups
+                .push(RetainedMigrationBackupDiagnosis { path, manifest }),
+            Ok(_) => {}
+            Err(_) => result.complete = false,
+        }
+    }
+    result.backups.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(result)
+}
+
 /// Timing, size, and retained path for one verified migration backup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedMigrationBackup {
@@ -309,11 +386,18 @@ async fn write_backup_manifest(
 ) -> Result<(), MigrationBackupError> {
     let destination = destination.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let result = fs::write(destination.join(MIGRATION_BACKUP_MANIFEST_FILE), manifest);
-        if result.is_err() && destination.exists() {
-            let _ = fs::remove_dir_all(&destination);
+        let path = destination.join(MIGRATION_BACKUP_MANIFEST_FILE);
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(&manifest)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            File::open(&destination)?.sync_all()?;
+            if let Some(parent) = destination.parent() {
+                File::open(parent)?.sync_all()?;
+            }
         }
-        result
+        Ok::<(), std::io::Error>(())
     })
     .await??;
     Ok(())
@@ -351,6 +435,32 @@ pub async fn create_retained_migration_backup(
     request: MigrationBackupRequest,
     progress: Option<BackupProgressCallback>,
 ) -> Result<RetainedMigrationBackup, MigrationBackupError> {
+    create_retained_migration_backup_with_preflight(request, progress, None).await
+}
+
+/// Optional platform-owned capacity check, invoked after reuse verification and before copying.
+pub type BackupSpacePreflight = Arc<dyn Fn(u64, bool, &Path) -> std::io::Result<()> + Send + Sync>;
+
+/// Create or reuse a verified backup, checking platform capacity only when copying is required.
+///
+/// # Errors
+/// Returns backup errors or a capacity-preflight failure without beginning migration.
+pub async fn create_retained_migration_backup_with_preflight(
+    request: MigrationBackupRequest,
+    progress: Option<BackupProgressCallback>,
+    preflight: Option<BackupSpacePreflight>,
+) -> Result<RetainedMigrationBackup, MigrationBackupError> {
+    let reuse_request = request.clone();
+    if let Some(reused) =
+        tokio::task::spawn_blocking(move || reusable_backup(&reuse_request)).await??
+    {
+        if let Some(preflight) = preflight {
+            let root = request.sessions_root.clone();
+            let bytes = reused.bytes;
+            tokio::task::spawn_blocking(move || preflight(bytes, false, &root)).await??;
+        }
+        return Ok(reused);
+    }
     let created_at_ms = current_unix_timestamp_ms()?;
     let source = request.sessions_root.join(request.session_id.to_string());
     let destination = request
@@ -362,6 +472,29 @@ pub async fn create_retained_migration_backup(
             "{}-{}-epoch-{}",
             created_at_ms, request.session_id, request.source_writer_epoch
         ));
+    if let Some(preflight) = preflight {
+        let source = source.clone();
+        let parent = destination
+            .parent()
+            .unwrap_or(&request.sessions_root)
+            .to_path_buf();
+        let fallback = request
+            .sessions_root
+            .parent()
+            .unwrap_or(&request.sessions_root)
+            .to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let bytes = migration_backup_files(&source, &source)?
+                .iter()
+                .fold(0_u64, |total, file| total.saturating_add(file.bytes));
+            preflight(
+                bytes,
+                true,
+                if parent.exists() { &parent } else { &fallback },
+            )
+        })
+        .await??;
+    }
     let evidence =
         create_verified_migration_backup_evidence(&source, &destination, progress).await?;
     let manifest = MigrationBackupManifest {
@@ -390,13 +523,76 @@ pub async fn create_retained_migration_backup(
     })
 }
 
+fn reusable_backup(
+    request: &MigrationBackupRequest,
+) -> Result<Option<RetainedMigrationBackup>, MigrationBackupError> {
+    let inventory = retained_migration_backups(&request.sessions_root, request.session_id, 1024)?;
+    let source = request.sessions_root.join(request.session_id.to_string());
+    for candidate in inventory.backups {
+        let manifest = &candidate.manifest;
+        if manifest.verified_at_ms == 0
+            || manifest.canonical_source.classified_event_count
+                != manifest.canonical_source.event_count
+            || manifest.canonical_source.payload_digest_sha256.len() != 64
+            || manifest.source_writer_epoch != request.source_writer_epoch
+            || manifest.target_writer_epoch != request.target_writer_epoch
+            || manifest.migration_step_ids != request.migration_step_ids
+            || manifest.canonical_source != request.canonical_source
+            || manifest.converted_events != request.converted_events
+            || manifest.retired_known_events != request.retired_known_events
+        {
+            continue;
+        }
+        let started = Instant::now();
+        let files = migration_backup_files(&source, &source)?;
+        if migration_backup_files_inner(&candidate.path, &candidate.path, true)
+            .ok()
+            .as_ref()
+            != Some(&files)
+        {
+            continue;
+        }
+        let verified = files.iter().try_fold(0_u64, |bytes, file| {
+            let source_path = source.join(&file.relative_path);
+            let backup_path = candidate.path.join(&file.relative_path);
+            if fs::symlink_metadata(&backup_path)?.file_type().is_symlink()
+                || fs::metadata(&backup_path)?.len() != file.bytes
+                || hash_file(&source_path)? != hash_file(&backup_path)?
+            {
+                return Err(std::io::Error::other(
+                    "retained backup no longer matches source",
+                ));
+            }
+            Ok(bytes.saturating_add(file.bytes))
+        });
+        if let Ok(bytes) = verified {
+            // The manifest's main database evidence must still describe the retained bytes.
+            let database = candidate.path.join("session.db");
+            if fs::metadata(&database)?.len() != manifest.database.bytes
+                || hex_digest(hash_file(&database)?) != manifest.database.sha256
+            {
+                continue;
+            }
+            return Ok(Some(RetainedMigrationBackup {
+                path: candidate.path,
+                files: u64::try_from(files.len()).unwrap_or(u64::MAX),
+                bytes,
+                plan_duration: Duration::ZERO,
+                copy_duration: Duration::ZERO,
+                verify_duration: started.elapsed(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// Create and hash-verify a retained physical migration backup off the async runtime worker.
 ///
 /// # Errors
 ///
 /// Returns an error if the blocking worker cannot run, the destination already exists, a source
 /// file cannot be copied, the destination does not match the source, or the manifest cannot be
-/// written. Incomplete destinations are removed on failure.
+/// written. Incomplete destinations are retained for diagnosis.
 pub async fn create_verified_migration_backup(
     source: &Path,
     destination: &Path,
@@ -536,32 +732,47 @@ fn create_verified_migration_backup_blocking(
             verified_at_ms,
         })
     })();
-    if result.is_err() && destination.exists() {
-        let _ = fs::remove_dir_all(destination);
-    }
+    // Partial backups are retained for diagnosis; no backup deletion policy is implied.
     result
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct BackupFile {
     relative_path: PathBuf,
     bytes: u64,
 }
 
 fn migration_backup_files(root: &Path, directory: &Path) -> std::io::Result<Vec<BackupFile>> {
+    migration_backup_files_inner(root, directory, false)
+}
+
+fn migration_backup_files_inner(
+    root: &Path,
+    directory: &Path,
+    retained: bool,
+) -> std::io::Result<Vec<BackupFile>> {
     let mut files = Vec::new();
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
-        let metadata = entry.metadata()?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "backup source contains a symlink or special file",
+            ));
+        }
         if metadata.is_dir() {
-            files.extend(migration_backup_files(root, &path)?);
+            files.extend(migration_backup_files_inner(root, &path, retained)?);
         } else if metadata.is_file() {
             let relative_path = path
                 .strip_prefix(root)
                 .map_err(|error| std::io::Error::other(error.to_string()))?
                 .to_path_buf();
+            if retained && relative_path == Path::new(MIGRATION_BACKUP_MANIFEST_FILE) {
+                continue;
+            }
             if relative_path.starts_with(Path::new(MIGRATION_BACKUP_MANIFEST_FILE)) {
                 return Err(std::io::Error::new(
                     ErrorKind::AlreadyExists,
@@ -647,6 +858,7 @@ fn copy_and_hash_backup_files(
             hasher.update(&buffer[..read]);
         }
         writer.flush()?;
+        writer.get_ref().sync_all()?;
         fs::set_permissions(&destination_path, fs::metadata(&source_path)?.permissions())?;
         source_digests.insert(file.relative_path.clone(), hasher.finalize().into());
     }
@@ -1128,8 +1340,121 @@ mod tests {
         assert!(!destination.exists());
     }
 
+    #[tokio::test]
+    async fn failed_capacity_preflight_does_not_begin_copying() {
+        let temp = tempfile::tempdir().expect("temp");
+        let sessions_root = temp.path().join("sessions");
+        let session_id = SessionId::new();
+        let source = sessions_root.join(session_id.to_string());
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("session.db"), b"canonical").expect("database");
+        let request = MigrationBackupRequest {
+            sessions_root: sessions_root.clone(),
+            session_id,
+            operation_id: "no-space".to_owned(),
+            source_writer_epoch: 2,
+            target_writer_epoch: 5,
+            migration_step_ids: vec![],
+            canonical_source: MigrationBackupCanonicalEvidence::default(),
+            converted_events: BTreeMap::new(),
+            retired_known_events: BTreeMap::new(),
+        };
+        let error = create_retained_migration_backup_with_preflight(
+            request,
+            None,
+            Some(Arc::new(|bytes, copy_required, parent| {
+                assert!(copy_required);
+                assert_eq!(bytes, 9);
+                assert!(parent.exists());
+                Err(std::io::Error::new(ErrorKind::StorageFull, "no space"))
+            })),
+        )
+        .await
+        .expect_err("preflight rejected");
+        assert!(
+            matches!(error, MigrationBackupError::Io(error) if error.kind() == ErrorKind::StorageFull)
+        );
+        assert!(!temp.path().join(MIGRATION_BACKUPS_DIRECTORY).exists());
+        assert_eq!(
+            fs::read(source.join("session.db")).expect("source"),
+            b"canonical"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_backup_retry_reverifies_bytes_and_bounded_discovery_reports_truncation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let sessions_root = temp.path().join("sessions");
+        let session_id = SessionId::new();
+        let source = sessions_root.join(session_id.to_string());
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("session.db"), b"canonical").expect("database");
+        let request = MigrationBackupRequest {
+            sessions_root: sessions_root.clone(),
+            session_id,
+            operation_id: "first".to_owned(),
+            source_writer_epoch: 2,
+            target_writer_epoch: 5,
+            migration_step_ids: vec!["step".to_owned()],
+            canonical_source: MigrationBackupCanonicalEvidence {
+                payload_digest_sha256: "0".repeat(64),
+                ..MigrationBackupCanonicalEvidence::default()
+            },
+            converted_events: BTreeMap::new(),
+            retired_known_events: BTreeMap::new(),
+        };
+        let first = create_retained_migration_backup(request.clone(), None)
+            .await
+            .expect("first backup");
+        let mut retry = request;
+        retry.operation_id = "retry".to_owned();
+        let reused = create_retained_migration_backup(retry.clone(), None)
+            .await
+            .expect("verified reuse");
+        assert_eq!(first.path, reused.path);
+        let bypassed = create_retained_migration_backup_with_preflight(
+            retry.clone(),
+            None,
+            Some(Arc::new(|_, copy_required, _| {
+                assert!(!copy_required);
+                Ok(())
+            })),
+        )
+        .await
+        .expect("verified backup reuse needs no spare copy capacity");
+        assert_eq!(first.path, bypassed.path);
+        assert_eq!(reused.copy_duration, Duration::ZERO);
+        let inventory =
+            retained_migration_backups(&sessions_root, session_id, 1).expect("inventory");
+        assert!(inventory.complete);
+        assert_eq!(inventory.backups.len(), 1);
+        assert!(
+            !retained_migration_backups(&sessions_root, session_id, 0)
+                .expect("bounded")
+                .complete
+        );
+        fs::write(first.path.join("session.db"), b"corrupted").expect("damage backup");
+        assert!(reusable_backup(&retry).expect("reverify").is_none());
+        assert!(first.path.exists());
+        assert_eq!(
+            fs::read(source.join("session.db")).expect("source"),
+            b"canonical"
+        );
+        fs::create_dir(
+            temp.path()
+                .join(MIGRATION_BACKUPS_DIRECTORY)
+                .join("partial"),
+        )
+        .expect("partial");
+        assert!(
+            !retained_migration_backups(&sessions_root, session_id, 10)
+                .expect("partial inventory")
+                .complete
+        );
+    }
+
     #[test]
-    fn backup_faults_are_deterministic_and_cleanup_partial_output() {
+    fn backup_faults_are_deterministic_and_retain_partial_output() {
         let temp = tempfile::tempdir().expect("temp dir");
         let source = temp.path().join("source");
         fs::create_dir_all(&source).expect("source");
@@ -1151,7 +1476,8 @@ mod tests {
                 create_verified_migration_backup_blocking(&source, &destination, fault, None)
                     .expect_err("fault");
             assert_eq!(error.kind(), expected);
-            assert!(!destination.exists());
+            assert!(destination.exists());
+            assert!(!destination.join(MIGRATION_BACKUP_MANIFEST_FILE).exists());
         }
     }
 }

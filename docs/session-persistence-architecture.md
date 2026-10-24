@@ -631,6 +631,18 @@ must not reacquire after epoch advancement.
 
 ## Automatic known-legacy migration
 
+Known lossless upgrades are separate domain-owned maintenance operations, not mutations performed
+by bounded catalog/history/model-context reads. The background storage worker now invokes that same
+upgrade coordinator for supported historical sessions before current-only compression or access-age
+initialization. Its completion path closes storage and releases exclusive ownership without a
+runtime actor, attached client, runtime lease handoff, or meaningful-access update. Normal read
+paths must continue to report migration-required state rather than executing this work themselves.
+
+The first-load handoff description below documents the existing foreground adapter; it does not
+authorize adding migration side effects to normal read APIs. Foreground upgrade coordination and
+background maintenance share the operation registry, so concurrent requests do not start duplicate
+upgrades. A background observer never cancels an upgrade admitted by another caller.
+
 Normal first load is serialized per session. The manager inspects the migration ledger and durable
 storage contract without mutation, then follows one of these paths:
 

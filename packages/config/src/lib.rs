@@ -279,7 +279,7 @@ pub struct BcodeConfig {
     pub session_import: SessionImportConfig,
     #[serde(default)]
     pub session_search: SessionSearchConfig,
-    /// Lossless storage tiering policy (automatic transitions are not activated yet).
+    /// Lossless storage tiering policy for daemon-owned background maintenance.
     #[serde(default)]
     pub session_storage: SessionStorageConfig,
     /// Durable state location selection.
@@ -413,7 +413,7 @@ impl ConfigDocSchema for BcodeConfig {
             ),
             schema_section_doc::<SessionStorageConfig>(
                 "session_storage",
-                "Lossless storage tiering policy; automatic transitions are not activated yet.",
+                "Lossless storage tiering policy for daemon-owned background maintenance.",
             ),
             schema_section_doc::<StateConfig>(
                 "state",
@@ -2348,7 +2348,8 @@ impl Default for SessionSearchConfig {
 
 /// Declarative lossless session-storage policy.
 ///
-/// Automatic transitions are not activated yet. Disabling scheduling must never disable decoding
+/// Automatic maintenance uses this policy after verifying storage tracking readiness.
+/// Disabling scheduling must never disable decoding
 /// existing compressed storage. Days are fixed 24-hour durations, not calendar boundaries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "session_storage")]

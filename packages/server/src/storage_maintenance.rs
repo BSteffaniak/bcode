@@ -2,10 +2,24 @@
 //!
 //! Scheduling is optional; failures are isolated from canonical session reads and daemon startup.
 //! Each tick advances a retained directory iterator by at most sixteen entries and processes one
-//! bounded reference page. No canonical history is replayed or search index rebuilt.
+//! bounded reference page. Current storage never replays history or rebuilds search indexes;
+//! supported historical storage delegates exclusive, backed-up conversion to the migration domain.
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod admission_tests;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod fail_closed_tests;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) mod historical_tests;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod initialization_tests;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests;
+
+mod scheduler;
+mod upgrade;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod worker_historical_tests;
 
 use super::ServerState;
 use bcode_session::artifact_compression::ArtifactCompression;
@@ -69,8 +83,7 @@ async fn run_with_clock(state: Arc<ServerState>, now_ms: fn() -> u64) {
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(cadence)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut directories = None;
-    let mut pending: std::collections::VecDeque<(SessionId, MaintenanceCursor)> =
-        std::collections::VecDeque::new();
+    let mut scheduler = scheduler::Scheduler::default();
     loop {
         tokio::select! {
             biased;
@@ -86,48 +99,36 @@ async fn run_with_clock(state: Arc<ServerState>, now_ms: fn() -> u64) {
         if !state.startup_config.session_storage.enabled {
             continue;
         }
-        if pending.is_empty() {
-            let result = tokio::task::spawn_blocking({
-                let root = root.clone();
-                let mut current = directories.take();
-                move || -> std::io::Result<_> {
-                    if current.is_none() {
-                        current = Some(std::fs::read_dir(root)?);
-                    }
-                    let mut ids = Vec::new();
-                    for _ in 0..16 {
-                        let Some(entry) = current.as_mut().and_then(Iterator::next) else {
-                            current = None;
-                            break;
-                        };
-                        let entry = entry?;
-                        if entry.file_type()?.is_dir()
-                            && let Some(name) = entry.file_name().to_str()
-                            && let Ok(id) = name.parse::<SessionId>()
-                        {
-                            ids.push(id);
-                        }
-                    }
-                    Ok((current, ids))
-                }
-            })
-            .await;
-            let Ok(Ok((next, ids))) = result else {
+        if scheduler.needs_discovery() {
+            let result = discover_sessions(root.clone(), directories.take()).await;
+            if let Ok(Ok((next, ids))) = result {
+                directories = next;
+                scheduler.discover(ids, now_ms());
+            } else {
+                state
+                    .metrics
+                    .increment_counter("storage.maintenance.reason.discovery_unavailable");
                 tracing::warn!("automatic artifact maintenance discovery unavailable");
-                continue;
-            };
-            directories = next;
-            pending.extend(
-                ids.into_iter()
-                    .map(|id| (id, MaintenanceCursor::Artifacts(None))),
-            );
+                // Discovery failure must not starve already-admitted page continuations.
+            }
         }
-        if let Some((id, cursor)) = pending.pop_front() {
+        if let Some((id, cursor)) = scheduler.next() {
+            let now = now_ms();
+            state
+                .storage_worker
+                .record_attempt(id, now, "running", "compression", None);
             let outcome = match cursor {
                 MaintenanceCursor::Artifacts(after) => {
                     maintain_session_at(&state, &root, id, after, now_ms())
                         .await
                         .map(|next| {
+                            if state
+                                .storage_worker
+                                .latest_outcome(id)
+                                .is_some_and(|(outcome, _)| outcome == "skipped")
+                            {
+                                return None;
+                            }
                             Some(next.map_or(
                                 MaintenanceCursor::History {
                                     start: 0,
@@ -141,15 +142,92 @@ async fn run_with_clock(state: Arc<ServerState>, now_ms: fn() -> u64) {
                     maintain_history(&state, &root, id, start, through, now_ms()).await
                 }
             };
-            match outcome {
-                Ok(Some(next)) => pending.push_back((id, next)),
-                Ok(None) => {}
-                Err(_) => tracing::debug!(
-                    "automatic artifact maintenance deferred: ownership or storage evidence unavailable"
-                ),
-            }
+            let (label, reason) = match &outcome {
+                Ok(Some(_)) => ("continued", "page_complete"),
+                Ok(None) => state
+                    .storage_worker
+                    .latest_outcome(id)
+                    .filter(|(outcome, _)| *outcome == "skipped")
+                    .unwrap_or(("completed", "sweep_complete")),
+                Err(error) => ("deferred", normalized_reason(error)),
+            };
+            let next_retry = scheduler.finish(id, outcome, now_ms());
+            state
+                .storage_worker
+                .record_attempt(id, now, label, reason, next_retry);
+            state
+                .metrics
+                .increment_counter(format!("storage.maintenance.outcome.{label}"));
+            state
+                .metrics
+                .increment_counter(format!("storage.maintenance.reason.{reason}"));
         }
     }
+}
+
+type DiscoveredSessions = (Option<std::fs::ReadDir>, Vec<SessionId>);
+
+async fn discover_sessions(
+    root: std::path::PathBuf,
+    mut current: Option<std::fs::ReadDir>,
+) -> Result<std::io::Result<DiscoveredSessions>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        if current.is_none() {
+            current = Some(std::fs::read_dir(root)?);
+        }
+        let mut ids = Vec::new();
+        for _ in 0..16 {
+            let Some(entry) = current.as_mut().and_then(Iterator::next) else {
+                current = None;
+                break;
+            };
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && let Ok(id) = name.parse::<SessionId>()
+            {
+                ids.push(id);
+            }
+        }
+        Ok((current, ids))
+    })
+    .await
+}
+
+fn normalized_reason(error: &str) -> &'static str {
+    match error {
+        "storage tracking failed"
+        | "registration lock unavailable"
+        | "storage daemon registration unavailable"
+        | "unhealthy storage registration"
+        | "tracking_unavailable" => "tracking_unavailable",
+        "access task failed"
+        | "access unavailable"
+        | "history access task"
+        | "history access unavailable" => "access_unavailable",
+        "access initialization deferred" => "access_initialization_deferred",
+        "references unavailable" => "references_unavailable",
+        "projection_stale" => "projection_stale",
+        "backup_failed" => "backup_failed",
+        "storage_missing" => "storage_missing",
+        "future_writer" => "future_writer",
+        "unsupported_schema" => "unsupported_schema",
+        "history_or_corruption" => "history_or_corruption",
+        "classification_unavailable" => "classification_unavailable",
+        "upgrade_deferred" => "upgrade_deferred",
+        "upgrade_unavailable" => "upgrade_unavailable",
+        "cancelled" => "cancelled",
+        "ownership_unavailable" => "ownership_unavailable",
+        "artifact_compression_deferred" => "artifact_compression_deferred",
+        "history compression deferred" => "history_compression_deferred",
+        _ => "storage_unavailable",
+    }
+}
+
+fn skipped(state: &ServerState, id: SessionId, now: u64, reason: &'static str) {
+    state
+        .storage_worker
+        .record_attempt(id, now, "skipped", reason, None);
 }
 
 fn tracking_readiness(state: &ServerState) -> bool {
@@ -208,6 +286,11 @@ async fn maintain_history(
     }
     let policy = state.session_config(id).await.session_storage;
     if !policy.enabled {
+        skipped(state, id, now, "policy_disabled");
+        return Ok(None);
+    }
+    if upgrade::foreground_pending(state, id).await {
+        skipped(state, id, now, "foreground_pending");
         return Ok(None);
     }
     let access_root = root.to_path_buf();
@@ -284,21 +367,28 @@ async fn maintain_session_at(
         .await
         .is_empty()
     {
+        skipped(state, id, now, "ambiguous_location");
         return Ok(None);
     }
     let config = state.session_config(id).await.session_storage;
     if !config.enabled {
+        skipped(state, id, now, "policy_disabled");
         return Ok(None);
     }
+    // Validate optional age metadata before any upgrade. Missing age is conservative and
+    // supported, but a corrupt/future record is not permission to mutate canonical storage.
     let access_root = root.to_path_buf();
     let observation = observe_access_for_sweep(access_root, id).await?;
+    if !upgrade::prepare(state, root, id, now, config.artifact_timeout_secs).await? {
+        return Ok(None);
+    }
     let StorageAccessObservation::Recorded(record) = observation else {
-        bcode_session::artifact_storage::initialize_maintenance_access(root, id, now)
-            .await
-            .map_err(|_| "access initialization deferred")?;
+        initialize_access(state, root, id, now, config.artifact_timeout_secs).await?;
+        skipped(state, id, now, "access_initialized");
         return Ok(None);
     };
     let Some(age) = now.checked_sub(record.observed_at_ms) else {
+        skipped(state, id, now, "clock_before_access");
         return Ok(None);
     };
     let light = u64::from(config.light_after_days) * 86_400_000;
@@ -308,6 +398,7 @@ async fn maintain_session_at(
     } else if age >= light {
         (ArtifactCompression::Light, light)
     } else {
+        skipped(state, id, now, "recent_access");
         return Ok(None);
     };
     let mut cursor = after.as_ref().map(|cursor| cursor.after.clone());
@@ -356,9 +447,7 @@ async fn maintain_session_at(
                 }
                 outcome = &mut conversion => outcome,
             };
-            if outcome.is_err() {
-                tracing::debug!("automatic artifact candidate deferred");
-            }
+            record_artifact_outcome(state, id, now, outcome)?;
         }
         Ok(ArtifactSweepCursor::continuation(
             cursor,
@@ -366,4 +455,80 @@ async fn maintain_session_at(
             has_more,
         ))
     }
+}
+
+fn record_artifact_outcome(
+    state: &ServerState,
+    id: SessionId,
+    now: u64,
+    outcome: std::io::Result<bcode_session::artifact_storage::ArtifactStorageOutcome>,
+) -> Result<(), String> {
+    match outcome {
+        Ok(bcode_session::artifact_storage::ArtifactStorageOutcome::Compressed {
+            saved_bytes,
+            ..
+        }) => {
+            state
+                .metrics
+                .add_counter("storage.maintenance.artifact_bytes_saved", saved_bytes);
+            state
+                .metrics
+                .increment_counter("storage.maintenance.artifact_compressed");
+        }
+        Ok(bcode_session::artifact_storage::ArtifactStorageOutcome::Unchanged) => {
+            state
+                .metrics
+                .increment_counter("storage.maintenance.artifact_unchanged");
+        }
+        Err(error) => {
+            state
+                .metrics
+                .increment_counter("storage.maintenance.artifact_deferred");
+            // Preserve error categories only; storage paths are not diagnostic API values.
+            let reason = match error.kind() {
+                std::io::ErrorKind::Interrupted => return Err("cancelled".into()),
+                std::io::ErrorKind::WouldBlock => "ownership_unavailable",
+                std::io::ErrorKind::NotFound => "artifact_missing",
+                _ => "artifact_compression_deferred",
+            };
+            state
+                .metrics
+                .increment_counter(format!("storage.maintenance.reason.{reason}"));
+            state
+                .storage_worker
+                .record_attempt(id, now, "partial", reason, None);
+            // One missing/busy artifact must not starve the rest of the finite page
+            // or history compression. A later sweep retries it with fresh evidence.
+        }
+    }
+    Ok(())
+}
+
+async fn initialize_access(
+    state: &ServerState,
+    root: &std::path::Path,
+    id: SessionId,
+    now: u64,
+    timeout_secs: u32,
+) -> Result<(), String> {
+    let cancellation = operation_cancellation(state)?;
+    let mut shutdown = state.subscribe_shutdown();
+    let initialize = bcode_session::artifact_storage::initialize_maintenance_access_cancellable(
+        root,
+        id,
+        now,
+        cancellation.clone(),
+    );
+    tokio::pin!(initialize);
+    tokio::select! {
+        biased;
+        _ = shutdown.recv() => { cancellation.cancel(); initialize.await }
+        () = tokio::time::sleep(Duration::from_secs(u64::from(timeout_secs))) => {
+            cancellation.cancel(); initialize.await
+        }
+        result = &mut initialize => result,
+    }
+    .map_err(|_| "access initialization deferred")?;
+
+    Ok(())
 }

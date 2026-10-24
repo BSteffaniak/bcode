@@ -1419,80 +1419,98 @@ impl SessionDb {
     ) -> SessionDbResult<Self> {
         let path = session_db_path(root, session_id);
         let db = Self::open_existing_turso_observed(session_id, &path, metrics.clone()).await?;
-        let source_writer_epoch = db.storage_writer_epoch().await?;
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("before_transaction");
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("transaction_start");
-        let tx = db.db.begin_transaction().await?;
-        configure_turso_connection(&*tx).await?;
-        let mut target = SessionMigrationTarget::new(&*tx, &metrics);
-        report_migration_stage(
-            progress.as_ref(),
-            bcode_session_models::SessionMigrationStage::PreparingSchema,
-            "Preparing session storage schema",
-        );
-        let schema_timer = metrics.timer();
-        target.materialize_current_schema().await?;
-        metrics.record_histogram(
-            "session.migration.schema_duration_ms",
-            schema_timer.elapsed_ms(),
-        );
-        let migration_outcome = migrate_session_storage(
-            &mut target,
-            session_id,
-            &metrics,
-            progress.as_ref(),
-            &policy.normalize,
-            fault,
-        )
-        .await?;
-        let receipt = build_target_migration_receipt(
-            &*tx,
-            session_id,
-            source_writer_epoch,
-            operation_id,
-            &migration_outcome,
-            &policy.build_receipt,
-        )
-        .await?;
-        inject_migration_fault(fault, MigrationFaultPhase::Receipt)?;
-        target.persist_migration_receipt(&receipt).await?;
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("before_epoch_update");
-        inject_migration_fault(fault, MigrationFaultPhase::WriterEpochFinalization)?;
-        if CURRENT_SESSION_STORAGE_WRITER_EPOCH == 0 {
-            return Err(SessionDbError::MigrationHistoryIncompatible {
-                reason: "current writer epoch must be non-zero".to_owned(),
-            });
+        let result = async {
+            let source_writer_epoch = db.storage_writer_epoch().await?;
+            #[cfg(test)]
+            abort_at_migration_crash_boundary("before_transaction");
+            #[cfg(test)]
+            abort_at_migration_crash_boundary("transaction_start");
+            let tx = db.db.begin_transaction().await?;
+            let preparation = async {
+                configure_turso_connection(&*tx).await?;
+                let mut target = SessionMigrationTarget::new(&*tx, &metrics);
+                report_migration_stage(
+                    progress.as_ref(),
+                    bcode_session_models::SessionMigrationStage::PreparingSchema,
+                    "Preparing session storage schema",
+                );
+                let schema_timer = metrics.timer();
+                target.materialize_current_schema().await?;
+                metrics.record_histogram(
+                    "session.migration.schema_duration_ms",
+                    schema_timer.elapsed_ms(),
+                );
+                let migration_outcome = migrate_session_storage(
+                    &mut target,
+                    session_id,
+                    &metrics,
+                    progress.as_ref(),
+                    &policy.normalize,
+                    fault,
+                )
+                .await?;
+                let receipt = build_target_migration_receipt(
+                    &*tx,
+                    session_id,
+                    source_writer_epoch,
+                    operation_id,
+                    &migration_outcome,
+                    &policy.build_receipt,
+                )
+                .await?;
+                inject_migration_fault(fault, MigrationFaultPhase::Receipt)?;
+                target.persist_migration_receipt(&receipt).await?;
+                #[cfg(test)]
+                abort_at_migration_crash_boundary("before_epoch_update");
+                inject_migration_fault(fault, MigrationFaultPhase::WriterEpochFinalization)?;
+                if CURRENT_SESSION_STORAGE_WRITER_EPOCH == 0 {
+                    return Err(SessionDbError::MigrationHistoryIncompatible {
+                        reason: "current writer epoch must be non-zero".to_owned(),
+                    });
+                }
+                target.finalize_writer_contract().await?;
+                #[cfg(test)]
+                abort_at_migration_crash_boundary("after_epoch_update_before_commit");
+                validate_storage_writer_contract(&*tx).await?;
+                Ok::<(), SessionDbError>(())
+            }
+            .await;
+            if let Err(error) = preparation {
+                // Do not let async transaction Drop race maintenance-guard release.
+                tx.rollback().await?;
+                return Err(error);
+            }
+            #[cfg(test)]
+            abort_at_migration_crash_boundary("during_transaction");
+            report_migration_stage(
+                progress.as_ref(),
+                bcode_session_models::SessionMigrationStage::Committing,
+                "Committing session migration",
+            );
+            let commit_timer = metrics.timer();
+            tx.commit().await?;
+            #[cfg(test)]
+            abort_at_migration_crash_boundary("after_commit");
+            #[cfg(test)]
+            abort_at_migration_crash_boundary("post_commit_checkpoint");
+            metrics.record_histogram(
+                "session.migration.commit_duration_ms",
+                commit_timer.elapsed_ms(),
+            );
+            let checkpoint_timer = metrics.timer();
+            db.db.sqlite_checkpoint_truncate().await?;
+            metrics.record_histogram(
+                "session.migration.wal_checkpoint_duration_ms",
+                checkpoint_timer.elapsed_ms(),
+            );
+            Ok::<(), SessionDbError>(())
         }
-        target.finalize_writer_contract().await?;
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("after_epoch_update_before_commit");
-        validate_storage_writer_contract(&*tx).await?;
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("during_transaction");
-        report_migration_stage(
-            progress.as_ref(),
-            bcode_session_models::SessionMigrationStage::Committing,
-            "Committing session migration",
-        );
-        let commit_timer = metrics.timer();
-        tx.commit().await?;
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("after_commit");
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("post_commit_checkpoint");
-        metrics.record_histogram(
-            "session.migration.commit_duration_ms",
-            commit_timer.elapsed_ms(),
-        );
-        let checkpoint_timer = metrics.timer();
-        db.db.sqlite_checkpoint_truncate().await?;
-        metrics.record_histogram(
-            "session.migration.wal_checkpoint_duration_ms",
-            checkpoint_timer.elapsed_ms(),
-        );
+        .await;
+        if let Err(error) = result {
+            // Close awaits backend shutdown even for begin/commit/checkpoint failures.
+            db.database().close().await?;
+            return Err(error);
+        }
         Ok(db)
     }
 
@@ -2366,6 +2384,37 @@ impl SessionDb {
             }
         }
         Ok(None)
+    }
+
+    /// Read at most 256 canonical schema envelopes in primary-key order without payload decoding.
+    ///
+    /// # Errors
+    /// Returns query errors or malformed sequence/schema columns.
+    pub async fn event_schema_page(&self, start: u64) -> SessionDbResult<Vec<(u64, u16)>> {
+        let start = i64::try_from(start).map_err(|_| SessionDbError::InvalidRow {
+            column: "events.event_seq".into(),
+        })?;
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "schema_version"])
+            .where_gte("event_seq", start)
+            .sort("event_seq", SortDirection::Asc)
+            .limit(256)
+            .execute(&**self.db)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    required_non_negative_u64(row, "event_seq")?,
+                    u16::try_from(required_i64(row, "schema_version")?).map_err(|_| {
+                        SessionDbError::InvalidRow {
+                            column: "events.schema_version".into(),
+                        }
+                    })?,
+                ))
+            })
+            .collect()
     }
 
     /// Return the oldest non-current canonical event schema, if any.

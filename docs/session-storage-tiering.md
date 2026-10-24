@@ -1,5 +1,38 @@
 # Session storage tiering
 
+## Current automatic maintenance
+
+The daemon schedules bounded, single-session background maintenance when storage tracking is
+healthy and `session_storage.enabled` is true. Defaults are light compression after five elapsed
+inactive days and deep compression after thirty. Meaningful access, not session creation or file
+mtime, determines age. Maintenance itself does not make a session recently used.
+
+Known released historical formats are classified without mutation and upgraded through the shared
+migration coordinator before current-only maintenance. Execution rechecks compatibility under
+exclusive maintenance ownership, retains a verified recovery copy, validates canonical authority,
+and releases database handles without creating a runtime actor or attached client. Foreground
+ownership and pending work defer background maintenance. Unsupported or ambiguous storage is not
+repaired by compression.
+
+Each sweep has bounded discovery, queue, retry, and diagnostic memory. Large sessions yield between
+pages. Shutdown and timeouts request cooperative cancellation and wait for actual operation
+settlement before releasing authority; a transactional migration is not interrupted by dropping
+its waiter. Joined foreground upgrade operations are observed, not cancelled by maintenance.
+
+`session storage-usage SESSION_ID` includes a disposable `maintenance` observation and separately
+accounts for retained migration backups. `backup_discovery_complete: false` or an exhausted entry
+budget means totals are partial. Observations may be evicted or lost on restart; they are not
+recovery receipts. Reason-specific server metrics distinguish ordinary skips from blocked work.
+There are no routine transcript messages or success notifications.
+
+Compression savings describe representation/payload bytes, not guaranteed filesystem reclamation.
+Retained recovery copies consume additional space and are not automatically deleted by this policy.
+Available-space checks are conservative admission checks, not reservations against concurrent disk
+use. History compression does not claim database free-page reclamation.
+
+The sections below include historical implementation notes. Where they describe maintenance as
+unactivated or require an explicit upgrade, this current behavior supersedes those rollout notes.
+
 ## Completed failures versus abandoned reads
 
 Application read operations retire their own admission participant after an ordinary error returns,
