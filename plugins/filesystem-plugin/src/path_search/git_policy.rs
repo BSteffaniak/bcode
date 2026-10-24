@@ -417,6 +417,36 @@ mod tests {
         assert!(ignored(&changed, "changed.tmp"));
     }
     #[test]
+    fn metadata_reads_require_canonical_no_follow_sources() {
+        let fixture = Fixture::new();
+        fixture.write("home/.gitconfig", "[core]\n excludesFile=ignored\n");
+        let alias = fixture.0.join("home-alias");
+        std::os::unix::fs::symlink(fixture.0.join("home"), &alias).unwrap();
+        let grant = fixture.grant();
+        let authorize = |path: &str| {
+            Some(WorkspaceResourceGrant {
+                workspace_root: grant.workspace_root.clone(),
+                path: path.into(),
+            })
+        };
+        let canonical = fixture.0.join("home/.gitconfig");
+        assert_eq!(
+            read(&canonical, &grant, &authorize, &external, &mut || Ok(())),
+            Ok(Some(b"[core]\n excludesFile=ignored\n".to_vec()))
+        );
+        assert_eq!(
+            read(
+                &alias.join(".gitconfig"),
+                &grant,
+                &authorize,
+                &external,
+                &mut || Ok(())
+            ),
+            Err("git_metadata_unavailable")
+        );
+    }
+
+    #[test]
     fn denied_include_missing_and_stale_policy_are_distinct() {
         let fixture = Fixture::new();
         fixture.write("home/.gitconfig", "[include]\n path=include.cfg\n");

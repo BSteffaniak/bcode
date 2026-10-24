@@ -1652,6 +1652,7 @@ impl std::fmt::Debug for PendingToolExchange {
 }
 
 struct ServerStateInit {
+    bcode_runtime_context: String,
     model_catalog: Option<bcode_model_catalog::ModelCatalogResolver>,
     startup_plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
@@ -2536,16 +2537,7 @@ impl ServerState {
             .run_publication_plugins
             .clone();
         let run_edit_plugins = init.startup_config.workflows.run_edit_plugins.clone();
-        let bcode_runtime_context = bcode_daemon_lifecycle::pinned_bcode_executable()
-            .map_or_else(
-                |_| "Bcode runtime:\n* Canonical executable: unavailable (verification failed; no replacement selected)".to_owned(),
-                |executable| format_bcode_runtime_context(
-                    executable.path(),
-                    executable.digest(),
-                    &executable.artifact_id().to_string(),
-                    &state_root,
-                ),
-            );
+        let bcode_runtime_context = init.bcode_runtime_context;
         Self {
             usage_index: Mutex::new(bcode_usage::index::UsageIndex::in_state_root(&state_root)),
             locations: None,
@@ -5384,6 +5376,10 @@ async fn run_with_services(
         sessions,
         plugins,
         ServerStateInit {
+            bcode_runtime_context: bcode_daemon_lifecycle::pinned_bcode_executable().map_or_else(
+                |_| "Bcode runtime:\n* Canonical executable: unavailable (verification failed; no replacement selected)".to_owned(),
+                |executable| format_bcode_runtime_context(executable.path(), executable.digest(), &executable.artifact_id().to_string(), &state_root),
+            ),
             model_catalog: Some(model_catalog),
             startup_plugin_selection: plugin_selection,
             default_plugin_ids,
@@ -9083,6 +9079,40 @@ async fn handle_workflow_validation_request(
     state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
+    // Starting a template synchronously reaches child-session validation and the SQL parser.
+    // Do not keep every catalog/authoring arm's debug polling temporaries on that call stack.
+    match request {
+        WorkflowDefinitionRequest::StartWorkflowTemplate(request) => {
+            let started = Box::pin(
+                bcode_workflow::WorkflowRunApplication::start_workflow_template(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    request,
+                ),
+            )
+            .await;
+            let response = match started {
+                Ok(started) => Response::Ok(ResponsePayload::WorkflowTemplateStarted(started)),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        request => {
+            Box::pin(handle_workflow_definition_catalog_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_workflow_definition_catalog_request(
+    request: WorkflowDefinitionRequest,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
     match request {
         WorkflowDefinitionRequest::WorkflowAuthoringCatalog => {
             let catalog = bcode_workflow::WorkflowAuthoringApplication::workflow_authoring_catalog(
@@ -9385,19 +9415,8 @@ async fn handle_workflow_validation_request(
             };
             send_response(writer, request_id, response).await
         }
-        WorkflowDefinitionRequest::StartWorkflowTemplate(request) => {
-            let started = Box::pin(
-                bcode_workflow::WorkflowRunApplication::start_workflow_template(
-                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
-                    request,
-                ),
-            )
-            .await;
-            let response = match started {
-                Ok(started) => Response::Ok(ResponsePayload::WorkflowTemplateStarted(started)),
-                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
-            };
-            send_response(writer, request_id, response).await
+        WorkflowDefinitionRequest::StartWorkflowTemplate(_) => {
+            unreachable!("template starts are handled before catalog dispatch")
         }
         WorkflowDefinitionRequest::RegisterWorkflowDefinition(request) => {
             let definition =
@@ -19704,7 +19723,7 @@ fn workflow_drive_gate(state: &ServerState, run_id: &str) -> Arc<Mutex<()>> {
 // dispatch identities and checking authority at handoff and commit.
 async fn retry_prepared_workflow_dispatches(
     state: &Arc<ServerState>,
-    store_path: &Path,
+    retained: &bcode_workflow_store::WorkflowStore,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     cursor: &mut Option<String>,
@@ -19712,7 +19731,7 @@ async fn retry_prepared_workflow_dispatches(
     if state.shutdown_requested.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let mut store = bcode_workflow_store::WorkflowStore::open_at_path(store_path)?;
+    let mut store = retained.retained_handle()?;
     let (_, next) = store
         .redispatch_owned_prepared_read_only_page_for_run(
             &WorkflowActivationOwner { state },
@@ -19795,6 +19814,16 @@ async fn drive_represented_workflow_phase(
     Ok(true)
 }
 
+fn retained_workflow_store(
+    state: &ServerState,
+) -> Result<bcode_workflow_store::WorkflowStore, WorkflowStoreError> {
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retained_handle()
+}
+
 async fn drive_workflow_run_exclusive(
     state: &Arc<ServerState>,
     run_id: &str,
@@ -19805,7 +19834,7 @@ async fn drive_workflow_run_exclusive(
     }
     let authority = required_workflow_drive_authority(state, run_id).await?;
     let started_at = std::time::Instant::now();
-    let store_path = workflow_store_path(state);
+    let store = retained_workflow_store(state)?;
     let mut retry_preparations = true;
     let mut prepared_cursor = None;
     let mut control_cursor = None;
@@ -19824,19 +19853,19 @@ async fn drive_workflow_run_exclusive(
             state,
             run_id,
             &authority.authority,
-            &store_path,
+            &store,
             &mut cancellation_cursor,
             &mut run_cancellation_cursor,
             cancellation_sweep_complete,
         )
         .await?;
-        if workflow_scheduling_stopped(&store_path, run_id, now_ms)? {
+        if workflow_scheduling_stopped(&store, run_id, now_ms)? {
             break;
         }
         if retry_preparations && cancellation_sweep_complete {
             retry_prepared_workflow_dispatches(
                 state,
-                &store_path,
+                &store,
                 run_id,
                 &authority.authority,
                 &mut prepared_cursor,
@@ -19846,7 +19875,7 @@ async fn drive_workflow_run_exclusive(
         }
         let (settled, dispatched) = dispatch_workflow_pending_page(
             state,
-            &store_path,
+            &store,
             run_id,
             &authority.authority,
             (&mut control_cursor, &mut pending_cursor),
@@ -19855,7 +19884,7 @@ async fn drive_workflow_run_exclusive(
         .await?;
         let reconciled = reconcile_workflow_receipt_page(
             state,
-            &store_path,
+            &store,
             run_id,
             &authority.authority,
             &mut receipt_cursor,
@@ -19863,13 +19892,14 @@ async fn drive_workflow_run_exclusive(
         )
         .await?;
         let published = finalize_workflow_publication_page(
-            &store_path,
+            &store,
             run_id,
             &authority.authority,
             &mut publication_cursor,
             now_ms,
         )?;
-        let retried = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+        let retried = store
+            .retained_handle()?
             .consume_next_due_automatic_retry_for_run(run_id, now_ms)?;
         log_unsupported_workflow_activations(run_id, &dispatched.unsupported);
         record_workflow_iteration_duration(state, iteration_started_at);
@@ -19900,11 +19930,11 @@ async fn drive_workflow_run_exclusive(
 }
 
 fn workflow_scheduling_stopped(
-    path: &Path,
+    retained: &bcode_workflow_store::WorkflowStore,
     run_id: &str,
     now_ms: u64,
 ) -> Result<bool, WorkflowStoreError> {
-    let mut store = bcode_workflow_store::WorkflowStore::open_at_path(path)?;
+    let mut store = retained.retained_handle()?;
     // Short-circuit before deadline mutation: recovery-only runs may observe/cancel
     // existing work, but cannot enter ordinary scheduling or terminalization.
     Ok(store.is_recovery_only(run_id)? || store.expire_run_deadline(run_id, now_ms)?)
@@ -19912,7 +19942,7 @@ fn workflow_scheduling_stopped(
 
 async fn dispatch_workflow_pending_page(
     state: &Arc<ServerState>,
-    path: &Path,
+    retained: &bcode_workflow_store::WorkflowStore,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     cursors: (&mut Option<String>, &mut Option<String>),
@@ -19929,14 +19959,14 @@ async fn dispatch_workflow_pending_page(
         state,
         &labels,
         "workflow.driver.pending_dispatch",
-        dispatch_workflow_pending_page_inner(state, path, run_id, authority, cursors, now_ms),
+        dispatch_workflow_pending_page_inner(state, retained, run_id, authority, cursors, now_ms),
     )
     .await
 }
 
 async fn dispatch_workflow_pending_page_inner(
     state: &Arc<ServerState>,
-    path: &Path,
+    retained: &bcode_workflow_store::WorkflowStore,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     cursors: (&mut Option<String>, &mut Option<String>),
@@ -19949,7 +19979,8 @@ async fn dispatch_workflow_pending_page_inner(
     ServerError,
 > {
     let (control_cursor, pending_cursor) = cursors;
-    let (settled, next_control) = bcode_workflow_store::WorkflowStore::open_at_path(path)?
+    let (settled, next_control) = retained
+        .retained_handle()?
         .settle_owned_pending_control_nodes_page(
             run_id,
             authority,
@@ -19957,7 +19988,8 @@ async fn dispatch_workflow_pending_page_inner(
             now_ms,
         )?;
     *control_cursor = next_control;
-    let (dispatched, next_pending) = bcode_workflow_store::WorkflowStore::open_at_path(path)?
+    let (dispatched, next_pending) = retained
+        .retained_handle()?
         .dispatch_owned_pending_activations_page_for_run(
             &WorkflowActivationOwner { state },
             run_id,
@@ -19972,13 +20004,14 @@ async fn dispatch_workflow_pending_page_inner(
 
 async fn reconcile_workflow_receipt_page(
     state: &Arc<ServerState>,
-    path: &Path,
+    retained: &bcode_workflow_store::WorkflowStore,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     cursor: &mut Option<String>,
     now_ms: u64,
 ) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, ServerError> {
-    let (summary, next) = bcode_workflow_store::WorkflowStore::open_at_path(path)?
+    let (summary, next) = retained
+        .retained_handle()?
         .reconcile_owned_receipts_page_async(
             &WorkflowTurnReceiptObserver { state },
             run_id,
@@ -20005,12 +20038,13 @@ async fn refresh_cancellation_sweep(
     state: &ServerState,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
-    store_path: &Path,
+    retained: &bcode_workflow_store::WorkflowStore,
     publication_cursor: &mut Option<String>,
     run_cursor: &mut Option<String>,
     complete: bool,
 ) -> Result<bool, WorkflowStoreError> {
-    let inherited = bcode_workflow_store::WorkflowStore::open_at_path(store_path)?
+    let inherited = retained
+        .retained_handle()?
         .inherit_parent_cancellation_owned(run_id, authority, current_unix_millis())?;
     // A completed sweep must not hide later cancellation or prevent signal retries.
     if complete {
@@ -20083,14 +20117,14 @@ fn record_workflow_iteration_duration(state: &ServerState, started: std::time::I
 }
 
 fn finalize_workflow_publication_page(
-    path: &std::path::Path,
+    retained: &bcode_workflow_store::WorkflowStore,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     cursor: &mut Option<String>,
     now_ms: u64,
 ) -> Result<bool, WorkflowStoreError> {
     use bcode_workflow::WorkflowRunGraphPublicationStatus as Status;
-    let store = bcode_workflow_store::WorkflowStore::open_at_path(path)?;
+    let store = retained.retained_handle()?;
     let candidates =
         store.accepted_run_graph_publication_page(run_id, authority, cursor.as_deref(), 32)?;
     *cursor = candidates.last().cloned();
@@ -65176,21 +65210,32 @@ library = "test"
             drop(state);
             return;
         }
-        let mut cursor = None;
-        assert!(
-            !finalize_workflow_publication_page(&path, "edit-run", &authority, &mut cursor, 5)
-                .expect("not settled")
-        );
-        settle_reopened_publication_attempt(&path, &identity);
-        cursor = None;
-        assert!(
-            finalize_workflow_publication_page(&path, "edit-run", &authority, &mut cursor, 7)
-                .expect("finalize")
-        );
-        assert_reopened_publication_work(&path);
+        assert_reopened_publication_finalization(&state, &path, &identity, &authority);
         drive_workflow_run(&state, "edit-run")
             .await
             .expect("execute revised graph");
+        drop(state);
+    }
+
+    fn assert_reopened_publication_finalization(
+        state: &ServerState,
+        path: &Path,
+        identity: &str,
+        authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    ) {
+        let retained = retained_workflow_store(state).expect("retain");
+        let mut cursor = None;
+        assert!(
+            !finalize_workflow_publication_page(&retained, "edit-run", authority, &mut cursor, 5)
+                .expect("not settled")
+        );
+        settle_reopened_publication_attempt(path, identity);
+        cursor = None;
+        assert!(
+            finalize_workflow_publication_page(&retained, "edit-run", authority, &mut cursor, 7)
+                .expect("finalize")
+        );
+        assert_reopened_publication_work(path);
     }
 
     async fn release_publication_owner(state: &mut Arc<ServerState>) {
@@ -81917,6 +81962,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             sessions,
             plugins,
             ServerStateInit {
+                bcode_runtime_context:
+                    "Bcode runtime: isolated test; no operational executable selected".into(),
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
                 startup_plugin_selection: bcode_plugin::PluginSelection::default(),
                 default_plugin_ids: Vec::new(),
@@ -88417,13 +88464,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .execution_authority("agent-cancel-run")
             .expect("authority query")
             .expect("authority");
+        let retained = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .retained_handle()
+            .expect("retain");
         let (mut publication_cursor, mut run_cursor) = (None, None);
         assert!(
             refresh_cancellation_sweep(
                 &state,
                 "agent-cancel-run",
                 &authority,
-                &store_path,
+                &retained,
                 &mut publication_cursor,
                 &mut run_cursor,
                 false,
@@ -88453,7 +88506,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     &state,
                     "agent-cancel-run",
                     &authority,
-                    &store_path,
+                    &retained,
                     &mut publication_cursor,
                     &mut run_cursor,
                     true,
@@ -100413,6 +100466,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             sessions,
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
+                bcode_runtime_context:
+                    "Bcode runtime: isolated test; no operational executable selected".into(),
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
                 startup_plugin_selection: bcode_plugin::PluginSelection::default(),
                 default_plugin_ids: Vec::new(),
@@ -101302,6 +101357,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             sessions,
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
+                bcode_runtime_context:
+                    "Bcode runtime: isolated test; no operational executable selected".into(),
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
                 startup_plugin_selection: bcode_plugin::PluginSelection::default(),
                 default_plugin_ids: Vec::new(),

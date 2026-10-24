@@ -371,8 +371,8 @@ pub fn read_records_strict(
         if record.schema_version != DAEMON_RECORD_SCHEMA_VERSION
             || record.namespace.is_empty()
             || record.instance_id.is_empty()
-            || (path != scoped_record_path(state_dir, &record)
-                && path != record_path(state_dir, &record.namespace))
+            || (path != scoped_record_path(&root, &record)
+                && path != record_path(&root, &record.namespace))
             || !namespaces.insert((record.namespace.clone(), record.state_location_id.clone()))
             || !instances.insert(record.instance_id.clone())
         {
@@ -787,6 +787,7 @@ pub struct ArtifactBootstrap {
 }
 
 static ARTIFACT_BOOTSTRAP: OnceLock<ArtifactBootstrap> = OnceLock::new();
+static ARTIFACT_BOOTSTRAP_INITIALIZATION: Mutex<()> = Mutex::new(());
 
 /// Capture and retain the running artifact before its original pathname can be replaced.
 ///
@@ -803,6 +804,16 @@ static ARTIFACT_BOOTSTRAP: OnceLock<ArtifactBootstrap> = OnceLock::new();
 ///
 /// Returns an error when the current executable cannot be located or opened.
 pub fn initialize_artifact_bootstrap() -> Result<&'static ArtifactBootstrap, DaemonLifecycleError> {
+    if let Some(bootstrap) = ARTIFACT_BOOTSTRAP.get() {
+        return Ok(bootstrap);
+    }
+    let _initialization =
+        ARTIFACT_BOOTSTRAP_INITIALIZATION
+            .lock()
+            .map_err(|_| DaemonLifecycleError::Io {
+                path: PathBuf::from("<current_exe>"),
+                source: std::io::Error::other("artifact bootstrap initialization lock poisoned"),
+            })?;
     if let Some(bootstrap) = ARTIFACT_BOOTSTRAP.get() {
         return Ok(bootstrap);
     }
@@ -905,9 +916,14 @@ impl ArtifactBootstrap {
             path: self.source_path.clone(),
             source: error,
         })?;
+        // A caller ahead of us may have populated the cache while we waited for the file.
+        if let Some(digest) = self.executable_digest.get() {
+            return Ok(digest.clone());
+        }
         let digest = sha256_reader(&mut *source, &self.source_path)?;
-        drop(source);
+        // Publish before releasing the file lock so queued callers do not hash again.
         let _ = self.executable_digest.set(digest.clone());
+        drop(source);
         Ok(digest)
     }
 
@@ -1696,6 +1712,22 @@ mod tests {
         assert!(read_records_strict(root.path(), 16).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn strict_inventory_accepts_symlinked_state_root_without_accepting_foreign_records() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&state, &alias).unwrap();
+        let record = record_with_writer_epoch(Some(10));
+        let record_path = write_record(&state, &record).unwrap();
+        assert_eq!(read_records_strict(&alias, 16).unwrap(), vec![record]);
+        let foreign = registry_dir(&state).join("foreign.json");
+        fs::write(&foreign, fs::read(record_path).unwrap()).unwrap();
+        assert!(read_records_strict(&alias, 16).is_err());
+    }
+
     #[test]
     fn registry_preserves_distinct_config_scopes_in_one_state_root() {
         let directory = tempfile::tempdir().unwrap();
@@ -2334,6 +2366,33 @@ mod tests {
                 .join("abc123")
                 .join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
         );
+    }
+
+    #[test]
+    fn concurrent_bootstrap_digest_callers_share_verified_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("bcode");
+        let bytes = vec![0x5a; 1024 * 1024];
+        fs::write(&path, &bytes).unwrap();
+        let identity = bcode_ipc::ArtifactId::for_executable(&mut bytes.as_slice()).unwrap();
+        let bootstrap = ArtifactBootstrap::open_verified(path.clone(), identity).unwrap();
+        let expected = executable_sha256(&path).unwrap();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        bootstrap.digest().unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), expected);
+            }
+        });
+        assert_eq!(bootstrap.executable_digest.get(), Some(&expected));
+        assert_eq!(bootstrap.digest().unwrap(), expected);
     }
 
     #[test]

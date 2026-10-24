@@ -228,7 +228,15 @@ async fn wait_for_contributions(state: &Arc<ServerState>) {
         }
     })
     .await;
-    completed.expect("workers and continuation settled");
+    if let Err(error) = completed {
+        let attempts = state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .attempt_history("edit-run", None, 100)
+            .unwrap();
+        panic!("workers and continuation did not settle: {error}; attempts: {attempts:?}");
+    }
 }
 
 fn configure_coding_plugins(state: &mut ServerState) {

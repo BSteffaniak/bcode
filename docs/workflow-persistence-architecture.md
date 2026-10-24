@@ -12,6 +12,13 @@ Baseline daemon instances share one canonical workflow database. Idle shared han
 protect destructive maintenance, not admission or execution by other baseline owners.
 Execution authority remains per run, with foreign and stale owners fenced out.
 
+Scheduler pages derive independent connections from the server's verified workflow
+store with `retained_handle`, rather than reopening and traversing the full schema
+for each scheduling phase. Retention preserves the maintenance fence and checks
+process ownership and database file identity before and after opening a connection.
+It does not replace per-operation execution-authority checks or share connection-local
+publication read fences. Missing or replaced files fail closed, without initialization.
+
 A server regression admits independent agent workflows through production `start_run`
 using two distinct daemon instance identities and store handles, then runs both existing
 drivers to completion. It uses the fake provider and one process; it is not yet a

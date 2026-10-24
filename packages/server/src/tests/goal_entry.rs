@@ -384,6 +384,9 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
     // The shared server fixture deliberately truncates tool results at 1,000 characters.
     // Exercise the shipped goal with the production budget, not that truncation fixture.
     server.startup_config.model.tool_output = bcode_config::ToolOutputConfig::default();
+    // The child command must select this fixture's provider, not the user's remembered
+    // startup account. An absent selection permits the normal startup fallback.
+    server.startup_config.model.provider_plugin_id = Some("bcode.fake-provider".into());
     server.daemon_status.instance_id = test_workflow_execution_authority().daemon_instance_id;
     server.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
         &bcode_plugin::PluginSelection {
@@ -973,18 +976,99 @@ fn goal_ipc_client(
     (bcode_client::BcodeClient::new(endpoint), server)
 }
 
+fn goal_command_config_overrides(path: PathBuf) -> bcode_config::ConfigLoadOverrides {
+    bcode_config::ConfigLoadOverrides {
+        exclusive_config_path: Some(path),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn goal_command_config_excludes_ambient_accounts_and_startup_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let environment = bcode_config::ConfigEnvironmentSnapshot::isolated(root.path());
+    let mut fixture = bcode_config::BcodeConfig::default();
+    fixture.model.provider_plugin_id = Some("bcode.fake-provider".into());
+    let path = root.path().join("goal-command.toml");
+    std::fs::write(
+        &path,
+        bcode_config::encode_effective_config(&fixture).unwrap(),
+    )
+    .unwrap();
+    let ambient = root.path().join("bcode.toml");
+    std::fs::write(
+        &ambient,
+        "[model]\nprovider_plugin_id = 'ambient.provider'\nauth_profile = 'ambient-account'\nauth_pool = 'ambient-pool'\n",
+    )
+    .unwrap();
+    let remembered: bcode_config::startup::StartupSelection =
+        serde_json::from_value(serde_json::json!({
+            "provider_plugin_id": "remembered.provider",
+            "model_id": "remembered-model",
+            "auth_profile": "remembered-account"
+        }))
+        .unwrap();
+    bcode_config::startup::save_to(
+        &bcode_config::startup::path_with_environment(&environment),
+        &remembered,
+    )
+    .unwrap();
+    let (leaked, _) = bcode_config::recovery::load_config_with_recovery_context(
+        &environment,
+        &bcode_config::ConfigLoadOverrides {
+            env_config_toml: Some(bcode_config::encode_effective_config(&fixture).unwrap()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        leaked.model.auth_profile.as_deref(),
+        Some("ambient-account")
+    );
+    assert_eq!(leaked.model.auth_pool.as_deref(), Some("ambient-pool"));
+
+    let (loaded, _) = bcode_config::recovery::load_config_with_recovery_context(
+        &environment,
+        &goal_command_config_overrides(path),
+    )
+    .unwrap();
+    let selection = loaded.resolved_model_selection_with_environment(&environment);
+    assert_eq!(
+        selection.provider_plugin_id,
+        fixture.model.provider_plugin_id
+    );
+    assert!(selection.auth_profile.is_none());
+    assert!(selection.auth_pool.is_none());
+    assert!(!loaded.startup_selection_applied);
+    assert!(
+        bcode_provider_auth::inspect_auth_selection(
+            &bcode_provider_auth::ProviderRequestContextResolution {
+                config: &loaded,
+                selection,
+            },
+        )
+        .is_ok()
+    );
+}
+
 // Isolate the default-endpoint environment from concurrently running server tests.
 async fn invoke_goal_allowance_command(
     root: &Path,
     session: SessionId,
     config: &bcode_config::BcodeConfig,
 ) {
+    let config_path = root.join("goal-command.toml");
+    std::fs::write(
+        &config_path,
+        bcode_config::encode_effective_config(config).unwrap(),
+    )
+    .unwrap();
     let output = tokio::process::Command::new(std::env::current_exe().unwrap())
         .env_clear()
         .current_dir(root)
         .env("HOME", root.join("home"))
-        // Keep the daemon's routing scope while replacing ambient configuration with the
-        // fixture's complete effective configuration. Changing XDG paths changes scope identity.
+        // Keep the daemon's routing scope, but do not merge ambient config keys that
+        // are absent from the fixture (notably model profile/account selection).
         .env(
             "XDG_CONFIG_HOME",
             bcode_config::default_config_dir().parent().unwrap(),
@@ -993,10 +1077,7 @@ async fn invoke_goal_allowance_command(
             bcode_config::BCODE_STATE_DIR_ENV,
             bcode_config::default_state_dir(),
         )
-        .env(
-            bcode_config::BCODE_CONFIG_TOML_ENV,
-            bcode_config::encode_effective_config(config).unwrap(),
-        )
+        .env("BCODE_GOAL_COMMAND_CONFIG", &config_path)
         .args([
             "--exact",
             "tests::goal_entry::goal_allowance_command_subprocess",
@@ -1024,6 +1105,11 @@ async fn goal_allowance_command_subprocess() {
     let Ok(session) = std::env::var("BCODE_GOAL_COMMAND_SESSION") else {
         return;
     };
+    let _config = bcode_config::push_process_config_overrides(goal_command_config_overrides(
+        std::env::var_os("BCODE_GOAL_COMMAND_CONFIG")
+            .expect("fixture config path")
+            .into(),
+    ));
     let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
@@ -1052,26 +1138,7 @@ async fn goal_allowance_command_subprocess() {
         .await
         .unwrap();
     assert!(status.success, "{:?}", status.message);
-    let message = status.message.unwrap();
-    assert!(
-        message.contains("Goal execution (bounded snapshot"),
-        "{message}"
-    );
-    assert!(
-        message.contains("Execution allowance exhausted"),
-        "{message}"
-    );
-    assert!(
-        message.contains("/goal.continue --worker-attempts"),
-        "{message}"
-    );
-    // This fixture has no usable working-document store. Optional notes must not
-    // erase the execution snapshot or the exact allowance recovery action.
-    assert!(
-        message.contains("Progress document unavailable:"),
-        "{message}"
-    );
-    assert!(!message.contains("Goal status unavailable"), "{message}");
+    assert_goal_status_message(&status.message.unwrap());
     let unrelated_worker: bcode_command::InvokeCommandResponse = plugins
         .invoke_service_json(
             "bcode.loop",
@@ -1125,6 +1192,19 @@ async fn goal_allowance_command_subprocess() {
             .unwrap()
             .contains("Granted 99 execution attempts")
     );
+}
+
+fn assert_goal_status_message(message: &str) {
+    for expected in [
+        "Goal execution (bounded snapshot",
+        "Execution allowance exhausted",
+        "/goal.continue --worker-attempts",
+        // Optional notes must not erase the snapshot or exact recovery action.
+        "Progress document unavailable:",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    assert!(!message.contains("Goal status unavailable"), "{message}");
 }
 
 async fn assert_goal_config_mismatch_rejected(

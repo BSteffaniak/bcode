@@ -1910,8 +1910,11 @@ library = "libtest_wait_second.dylib"
             return false;
         }
         let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join(".config/git")).unwrap();
-        let config = home.path().join("gitconfig");
+        // macOS temporary roots can contain /var or /tmp symlink aliases. The
+        // filesystem plugin intentionally requires no-follow metadata paths.
+        let home_root = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home_root.join(".config/git")).unwrap();
+        let config = home_root.join("gitconfig");
         std::fs::write(&config, "").unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
         for (name, _) in std::env::vars_os() {
@@ -1922,8 +1925,8 @@ library = "libtest_wait_second.dylib"
         let output = child
             .args(["--exact", test, "--nocapture"])
             .env(MARKER, test)
-            .env("HOME", home.path())
-            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("HOME", &home_root)
+            .env("XDG_CONFIG_HOME", home_root.join(".config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", config)
             .output()
@@ -2327,7 +2330,12 @@ library = "libtest_wait_second.dylib"
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(workspace.join("visible.rs"), "not read by discovery").unwrap();
-        stage_fixture_paths(&workspace, &["visible.rs"]);
+        std::fs::write(workspace.join("visible-tracked.rs"), "also not read").unwrap();
+        std::fs::write(workspace.join("visible-excluded.rs"), "also not read").unwrap();
+        stage_fixture_paths(&workspace, &["visible.rs", "visible-tracked.rs"]);
+        let xdg = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+        // Ignore rules suppress untracked paths, not paths already in the index.
+        std::fs::write(xdg.join("git/ignore"), "visible-*.rs\n").unwrap();
         let state = bridge_state(&temp.path().join("sessions"));
         let bound = bound_fixture(workspace.canonicalize().unwrap());
         let request = bcode_tool::ToolInvocationServiceRequest {
@@ -2342,7 +2350,16 @@ library = "libtest_wait_second.dylib"
         let ToolInvocationServiceResolution::Responded { payload } = result else {
             panic!("nested discovery did not respond: {result:?}");
         };
+        assert_eq!(payload["state"], "complete", "{payload}");
         assert!(payload.to_string().contains("visible.rs"), "{payload}");
+        assert!(
+            payload.to_string().contains("visible-tracked.rs"),
+            "{payload}"
+        );
+        assert!(
+            !payload.to_string().contains("visible-excluded.rs"),
+            "{payload}"
+        );
         let mut undeclared = request;
         undeclared.operation = "write".into();
         assert!(matches!(

@@ -31,17 +31,12 @@ fn verify_columns(
     table: &str,
     columns: &[&str],
 ) -> Result<(), WorkflowStoreError> {
-    let info = block_on(connection.get_table_info(table))?.ok_or_else(|| {
-        WorkflowStoreError::InvalidData(format!("{table} is missing; maintenance required"))
-    })?;
-    if columns
-        .iter()
-        .any(|column| !info.columns.contains_key(*column))
-    {
-        return Err(WorkflowStoreError::InvalidData(format!(
-            "{table} is missing required recovery columns; maintenance required"
-        )));
-    }
+    // Validate only the contract we need. Full table introspection also loads foreign
+    // keys, indexes and autoincrement metadata on every dispatch transaction.
+    let query = columns.iter().fold(select(table), |query, column| {
+        query.project(switchy_database::query::qualified_column(table, column))
+    });
+    block_on(connection.validate_select(&query))?;
     Ok(())
 }
 
@@ -434,6 +429,22 @@ pub fn initialize(connection: &dyn Database) -> Result<(), WorkflowStoreError> {
 mod tests {
     use super::*;
     use switchy_database::schema::{create_index, drop_index};
+
+    #[test]
+    fn required_columns_reject_missing_columns_and_tables() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::WorkflowStore::initialize_in_state_dir(temp.path(), 1).unwrap();
+        let db: &dyn Database = &store.connection;
+        verify_columns(
+            db,
+            "workflow_recovery_barriers",
+            &["run_id", "source_artifact_id"],
+        )
+        .unwrap();
+        assert!(verify_columns(db, "workflow_recovery_barriers", &["absent_column"]).is_err());
+        assert!(verify_columns(db, "absent_table", &["run_id"]).is_err());
+        assert!(store.list_runs(10).unwrap().is_empty());
+    }
 
     #[test]
     fn existing_in_receipt_index_remains_usable_and_incompatible_index_is_rejected() {
