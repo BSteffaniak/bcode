@@ -1506,11 +1506,11 @@ impl SessionDb {
             Ok::<(), SessionDbError>(())
         }
         .await;
-        if let Err(error) = result {
-            // Close awaits backend shutdown even for begin/commit/checkpoint failures.
-            db.database().close().await?;
-            return Err(error);
-        }
+        // Failed preparation has already awaited transaction rollback. This connection is
+        // local and has never escaped: dropping it releases its handles without invoking
+        // `Database::close`, whose checkpoint would rewrite the pre-existing DB/WAL even
+        // when the migration rolled back. Preserve the original failure as well.
+        result?;
         Ok(db)
     }
 
@@ -12063,14 +12063,14 @@ mod tests {
                 Err(SessionDbError::MigrationHistoryIncompatible { ref reason })
                     if reason.contains("injected migration fault")
             ));
-            drop(write);
-            drop(maintenance);
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Check preservation at settlement, before releasing exclusive ownership.
             assert_eq!(
                 session_storage_files(temp_dir.path(), session_id),
                 storage_before,
                 "fault {fault:?} must roll back every storage byte"
             );
+            drop(write);
+            drop(maintenance);
             let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
                 .await
                 .expect("reopen rolled-back store");
@@ -12173,14 +12173,13 @@ mod tests {
                 actual: 3
             }
         ));
-        drop(write);
-        drop(maintenance);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
             session_storage_files(temp_dir.path(), session_id),
             storage_before,
             "failed migration must preserve every session storage file byte-for-byte"
         );
+        drop(write);
+        drop(maintenance);
 
         let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
             .await

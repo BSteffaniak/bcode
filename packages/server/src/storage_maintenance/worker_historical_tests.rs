@@ -51,6 +51,14 @@ async fn worker_loop_upgrades_released_history_then_compresses_both_tiers() {
             )
         })
         .unwrap_or_else(|error| panic!("{error}"));
+    let usage = crate::session_operations::storage_usage(&state, id, 4096)
+        .await
+        .expect("application storage observation");
+    assert!(usage.retained_backups.file_bytes > 0);
+    assert_eq!(usage.backup_discovery_complete, Some(true));
+    assert!(!usage.budget_exhausted);
+    assert!(usage.maintenance.is_some());
+    // Inspecting maintenance and backup diagnostics must not make the session recently used.
     assert_eq!(std::fs::read(&access).expect("unchanged age"), before);
     assert!(
         !bcode_session_migration::retained_migration_backups(root.path(), id, 256)

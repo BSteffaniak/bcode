@@ -750,6 +750,11 @@ Read-only and diagnostic paths deliberately do not close. Closing checkpoints th
 `session.db` and `session.db-wal`, which would make a normal read mutate canonical storage. Those
 paths drop their local handle instead, which releases the connection without mutation.
 
+Failed migration preparation likewise awaits transaction rollback but does not call checkpointing
+close on its private, unshared connection. Dropping that local handle preserves the pre-existing
+database and WAL bytes and the original migration error. Successful migration still commits and
+checkpoints explicitly; releasing a shared runtime connection still uses verified terminal close.
+
 `bcode session diagnose` does not dead-end when the canonical database is locked. It reports the
 lock error together with lease observations and every verified live daemon candidate (namespace,
 artifact, instance id, pid, build fingerprint, writer epoch, classification, and whether a lease
