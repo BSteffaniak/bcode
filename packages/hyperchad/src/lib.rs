@@ -4,13 +4,15 @@
 
 //! `HyperChad` application host for Bcode sessions.
 
+mod browser_api;
+
 #[cfg(feature = "renderer-html-actix")]
 mod html_actix;
 
 #[cfg(feature = "renderer-html-actix")]
 pub use html_actix::{
-    DEFAULT_BIND_ADDRESS, VIEWPORT, build_app, build_app_with_runtime, build_launch_url, init,
-    init_with_snapshot, validate_bind_address,
+    DEFAULT_BIND_ADDRESS, TUI_ASSET_FILES, TuiAssets, VIEWPORT, build_app, build_app_with_runtime,
+    build_launch_url, build_tui_launch_url, init, init_with_snapshot, validate_bind_address,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +45,7 @@ const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_mil
 /// `HyperChad` application state shared by route and action handlers.
 #[derive(Clone)]
 pub struct HyperChadAppState {
+    browser_api: Arc<tokio::sync::Mutex<browser_api::BrowserApiState>>,
     client: BcodeClient,
     access_token: Arc<str>,
     launch_working_directory: Arc<std::path::PathBuf>,
@@ -59,6 +62,7 @@ impl std::fmt::Debug for HyperChadAppState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HyperChadAppState")
+            .field("browser_api", &"[bounded observation cache]")
             .field("client", &self.client)
             .field("access_token", &"[REDACTED]")
             .field("launch_working_directory", &self.launch_working_directory)
@@ -472,6 +476,9 @@ impl HyperChadAppState {
             .canonicalize()
             .unwrap_or(launch_working_directory);
         Self {
+            browser_api: Arc::new(tokio::sync::Mutex::new(
+                browser_api::BrowserApiState::default(),
+            )),
             client,
             access_token: access_token.into(),
             launch_working_directory: Arc::new(launch_working_directory),
@@ -1083,8 +1090,8 @@ pub fn router_from_state(state: HyperChadAppState) -> Router {
     let prepare_resume_state = state.clone();
     let resume_state = state.clone();
     let cancel_pending_state = state.clone();
-    let interaction_state = state;
-    let router = Router::new()
+    let interaction_state = state.clone();
+    let router = browser_api::with_routes(Router::new(), state)
         .with_route("/", move |request| {
             let state = root_state.clone();
             async move {

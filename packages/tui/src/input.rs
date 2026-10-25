@@ -1,5 +1,8 @@
 //! TUI input handling.
 
+use bcode_tui_components::session_ui::bindings::{
+    SessionKeyBinding, SessionKeyBindings, apply_editor_binding,
+};
 use bmux_keyboard::KeyStroke;
 use bmux_tui_components::text_input::{TextInputControl, TextInputOutcome};
 
@@ -53,7 +56,8 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
             }
         }
     }
-    if let Some(motion) = keymap.editor_selection_motion_for_key(stroke) {
+    let binding = keymap.resolve(stroke);
+    if let SessionKeyBinding::Selection(motion) = binding {
         app.clear_pending_key_activation();
         app.extend_composer_selection(motion);
         return KeyOutcome {
@@ -61,30 +65,19 @@ pub fn handle_key(app: &mut BmuxApp, keymap: &BmuxKeyMap, stroke: KeyStroke) -> 
             request: KeyRequest::None,
         };
     }
-    if let Some(command) = keymap.editor_command_for_key(stroke) {
+    if matches!(binding, SessionKeyBinding::Editor(_)) {
         app.clear_pending_key_activation();
         app.reset_input_history_navigation();
-        app.composer_mut().apply_command(command);
+        let _ = apply_editor_binding(app.composer_state_mut(), binding);
         app.wake_cursor();
         return KeyOutcome {
             redraw: true,
             request: KeyRequest::None,
         };
     }
-
-    let Some(text) = bcode_plugin_sdk::tui::keymap::controls::LiteralText::from_stroke(stroke)
-        .filter(|_| {
-            keymap.action("chat", stroke).is_none()
-                && !keymap.registry().is_overridden_key("chat", stroke)
-        })
-    else {
+    let Some(outcome) = apply_editor_binding(app.composer_state_mut(), binding) else {
         return KeyOutcome::default();
     };
-    let outcome = TextInputControl::new(&composer_policy()).handle_key_with_history_action(
-        app.composer_state_mut(),
-        text.native_stroke(),
-        None,
-    );
     match outcome {
         TextInputOutcome::Submitted => {
             app.clear_pending_key_activation();

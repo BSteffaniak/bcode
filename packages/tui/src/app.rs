@@ -429,7 +429,7 @@ pub struct BmuxApp {
     reasoning_default_effort: Option<String>,
     reasoning_default_summary: Option<String>,
     token_usage: TokenUsageMeter,
-    composer: TextInputState,
+    session_ui: bcode_tui_components::session_ui::SessionUi,
     input_history: InputHistory,
     transcript: TranscriptDocument,
     transcript_projection_revision: u64,
@@ -447,7 +447,6 @@ pub struct BmuxApp {
     elapsed_layout_revision: u64,
     elapsed_dirty_visuals: BTreeSet<String>,
     transcript_dirty_items: BTreeSet<TranscriptPresentationEntryId>,
-    viewport: TranscriptViewport,
     manual_transcript_scroll_until: Option<Instant>,
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
     transcript_scroll_clock: TranscriptScrollClock,
@@ -668,7 +667,7 @@ impl BmuxApp {
             reasoning_default_effort: None,
             reasoning_default_summary: None,
             token_usage: TokenUsageMeter::default(),
-            composer: TextInputState::new(TextEditBuffer::new()),
+            session_ui: bcode_tui_components::session_ui::SessionUi::new(),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
             transcript_projection_revision: 0,
@@ -685,7 +684,6 @@ impl BmuxApp {
             elapsed_layout_revision: 0,
             elapsed_dirty_visuals: BTreeSet::new(),
             transcript_dirty_items: BTreeSet::new(),
-            viewport: TranscriptViewport::default(),
             manual_transcript_scroll_until: None,
             transcript_scroll_animation: None,
             transcript_scroll_clock: TranscriptScrollClock::default(),
@@ -752,7 +750,10 @@ impl BmuxApp {
             && let Some(session_id) = source.session_id
             && let Some(line) = source
                 .transcript_layout
-                .visible_lines_from_top(source.transcript_top_row(source.viewport.height()), 1)
+                .visible_lines_from_top(
+                    source.transcript_top_row(source.session_ui.viewport.height()),
+                    1,
+                )
                 .first()
             && line.source == VisibleTranscriptSource::Transcript
             && let Some(sequence) = source
@@ -821,7 +822,7 @@ impl BmuxApp {
         // A newly attached app starts in follow-bottom mode, which deliberately ignores
         // correspondence. Returning to an explicit reading position is anchored navigation;
         // the accepted BMUX source mapping resolves its exact row during preparation.
-        self.viewport.follow_anchor(0);
+        self.session_ui.viewport.follow_anchor(0);
         self.pending_stable_transcript_anchor = Some(StableTranscriptAnchor {
             item_id,
             fallback_index: index,
@@ -997,8 +998,8 @@ impl BmuxApp {
         };
         self.transcript_scroll_animation = None;
         self.pending_visual_overflow_bottom = None;
-        self.viewport.detach();
-        self.viewport.follow_anchor(row);
+        self.session_ui.viewport.detach();
+        self.session_ui.viewport.follow_anchor(row);
         self.presented_transcript_anchor = None;
         self.pending_stable_transcript_anchor = None;
         self.pending_markdown_focus = Some(contribution_id.to_owned());
@@ -1018,8 +1019,8 @@ impl BmuxApp {
         };
         self.transcript_scroll_animation = None;
         self.pending_visual_overflow_bottom = None;
-        self.viewport.detach();
-        self.viewport.follow_anchor(row);
+        self.session_ui.viewport.detach();
+        self.session_ui.viewport.follow_anchor(row);
         self.presented_transcript_anchor = None;
         self.pending_stable_transcript_anchor = None;
         self.set_status("Navigated to Markdown section".to_owned());
@@ -1084,7 +1085,7 @@ impl BmuxApp {
         viewport_height: u16,
         scroll_up: usize,
     ) {
-        self.viewport.sync_max(
+        self.session_ui.viewport.sync_max(
             total_rows.saturating_sub(usize::from(viewport_height)),
             0,
             total_rows,
@@ -1092,7 +1093,9 @@ impl BmuxApp {
             false,
             &mut self.older_history,
         );
-        self.viewport.scroll_up(scroll_up, &mut self.older_history);
+        self.session_ui
+            .viewport
+            .scroll_up(scroll_up, &mut self.older_history);
     }
 
     #[cfg(test)]
@@ -1101,7 +1104,9 @@ impl BmuxApp {
         total_rows: usize,
         viewport_height: u16,
     ) -> usize {
-        self.viewport.top_row(total_rows, viewport_height)
+        self.session_ui
+            .viewport
+            .top_row(total_rows, viewport_height)
     }
 
     /// Capture the visible reader's position, including a banner row when it
@@ -1109,10 +1114,13 @@ impl BmuxApp {
     #[cfg(test)]
     pub(crate) fn frame_observation(&self) -> TranscriptFrameObservation {
         let total_rows = self.transcript_layout.total_rows();
-        let viewport_top = self.viewport.top_row(total_rows, self.viewport.height());
+        let viewport_top = self
+            .session_ui
+            .viewport
+            .top_row(total_rows, self.session_ui.viewport.height());
         let anchor = self
             .transcript_layout
-            .visible_lines_from_top(viewport_top, self.viewport.height().max(1))
+            .visible_lines_from_top(viewport_top, self.session_ui.viewport.height().max(1))
             .into_iter()
             .find(|line| line.source == VisibleTranscriptSource::Transcript)
             .and_then(|line| {
@@ -1172,7 +1180,7 @@ impl BmuxApp {
             scroll_mode: if self.transcript_scroll_animation.is_some() {
                 "transition_to_entry"
             } else {
-                self.viewport.intent_name()
+                self.session_ui.viewport.intent_name()
             },
             anchor,
         }
@@ -1181,11 +1189,12 @@ impl BmuxApp {
     fn preserve_transcript_anchor_for_disclosure(&mut self) {
         self.transcript_scroll_animation = None;
         self.pending_visual_overflow_bottom = None;
-        self.viewport.detach();
-        let top_row = self
-            .viewport
-            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
-        self.viewport.materialize_top_row(top_row);
+        self.session_ui.viewport.detach();
+        let top_row = self.session_ui.viewport.top_row(
+            self.transcript_layout.total_rows(),
+            self.session_ui.viewport.height(),
+        );
+        self.session_ui.viewport.materialize_top_row(top_row);
     }
 
     /// Activate a currently visible Markdown contribution through its typed payload.
@@ -1405,7 +1414,7 @@ impl BmuxApp {
         self.navigation_checkpoint = None;
         self.pending_transcript_top_anchor_sequence = Some(sequence);
         self.transcript_scroll_animation = None;
-        self.viewport.detach();
+        self.session_ui.viewport.detach();
     }
 
     /// Jump to a committed transcript item and top-anchor it in the viewport.
@@ -1418,8 +1427,8 @@ impl BmuxApp {
             return false;
         };
         self.transcript_scroll_animation = None;
-        self.viewport.detach();
-        self.viewport.follow_anchor(top_row);
+        self.session_ui.viewport.detach();
+        self.session_ui.viewport.follow_anchor(top_row);
         true
     }
 
@@ -2593,22 +2602,25 @@ impl BmuxApp {
     /// Return the composer content area from the latest render.
     #[must_use]
     pub const fn composer_content_area(&self) -> Rect {
-        self.composer.content_area()
+        self.session_ui.composer.content_area()
     }
 
     /// Store the composer content area from the latest render.
     pub fn set_composer_content_area(&mut self, area: Rect) {
-        self.composer.set_content_area(area, &composer_policy());
+        self.session_ui
+            .composer
+            .set_content_area(area, &composer_policy());
     }
 
     /// Return the composer scroll offset that should be used for the latest content area.
     pub fn composer_scroll_offset_for_render(&self) -> usize {
-        let offset = if self.composer.vertical_scroll() == u64::MAX {
-            self.composer
+        let offset = if self.session_ui.composer.vertical_scroll() == u64::MAX {
+            self.session_ui
+                .composer
                 .cursor_scroll_offset(&composer_policy())
                 .unwrap_or(0)
         } else {
-            self.composer.vertical_scroll()
+            self.session_ui.composer.vertical_scroll()
         };
         usize::try_from(offset).unwrap_or(usize::MAX)
     }
@@ -2616,28 +2628,31 @@ impl BmuxApp {
     /// Return the composer text input state.
     #[must_use]
     pub const fn composer_state(&self) -> &TextInputState {
-        &self.composer
+        &self.session_ui.composer
     }
 
     /// Return the composer text input state mutably.
     pub const fn composer_state_mut(&mut self) -> &mut TextInputState {
-        &mut self.composer
+        &mut self.session_ui.composer
     }
 
     /// Return the composer buffer.
     #[must_use]
     pub const fn composer(&self) -> &TextEditBuffer {
-        self.composer.buffer()
+        self.session_ui.composer.buffer()
     }
 
     /// Return the composer buffer mutably.
     pub fn composer_mut(&mut self) -> &mut TextEditBuffer {
-        self.composer.buffer_mut()
+        self.session_ui.composer.buffer_mut()
     }
 
     /// Insert pasted text into the composer.
     pub fn paste_composer_text(&mut self, text: &str) {
-        TextInputControl::new(&composer_policy()).handle_paste(&mut self.composer, text);
+        self.session_ui.update(
+            bcode_tui_components::session_ui::SessionUiAction::Paste(text.to_owned()),
+            &mut self.older_history,
+        );
     }
 
     /// Accept bounded queue status through the shared semantic projection.
@@ -2799,11 +2814,12 @@ impl BmuxApp {
     /// Extend composer selection with an editor motion.
     pub fn extend_composer_selection(&mut self, motion: TextMotion) {
         self.input_history.reset_navigation();
-        let width = usize::from(self.composer.content_area().width.max(1));
+        let width = usize::from(self.session_ui.composer.content_area().width.max(1));
         match motion {
             TextMotion::VisualUp => self.extend_composer_selection_to_visual_delta(width, -1),
             TextMotion::VisualDown => self.extend_composer_selection_to_visual_delta(width, 1),
             motion => self
+                .session_ui
                 .composer
                 .buffer_mut()
                 .move_cursor_with_selection(motion, SelectionMode::Extend),
@@ -2813,8 +2829,8 @@ impl BmuxApp {
 
     /// Handle a composer mouse event through the reusable text-input component.
     pub fn handle_composer_mouse(&mut self, mouse: MouseEvent) -> TextInputOutcome {
-        let outcome =
-            TextInputControl::new(&composer_policy()).handle_mouse(&mut self.composer, mouse);
+        let outcome = TextInputControl::new(&composer_policy())
+            .handle_mouse(&mut self.session_ui.composer, mouse);
         if matches!(outcome, TextInputOutcome::Edited | TextInputOutcome::Redraw) {
             self.input_history.reset_navigation();
             self.wake_cursor();
@@ -2825,7 +2841,7 @@ impl BmuxApp {
     /// Return whether a composer mouse selection is active.
     #[must_use]
     pub const fn composer_mouse_selection_active(&self) -> bool {
-        self.composer.mouse_selection_active()
+        self.session_ui.composer.mouse_selection_active()
     }
 
     /// Move the composer cursor one rendered row up, if possible.
@@ -2849,37 +2865,43 @@ impl BmuxApp {
     }
 
     fn move_composer_visual_up_with_history_reset(&mut self, reset_history: bool) -> bool {
-        let width = usize::from(self.composer.content_area().width.max(1));
-        let layout = self.composer.buffer().wrapped_layout(width);
+        let width = usize::from(self.session_ui.composer.content_area().width.max(1));
+        let layout = self.session_ui.composer.buffer().wrapped_layout(width);
         if layout.cursor.row == 0 {
             return false;
         }
         if reset_history {
             self.input_history.reset_navigation();
         }
-        self.composer.buffer_mut().move_cursor_to_wrapped_position(
-            width,
-            layout.cursor.row.saturating_sub(1),
-            layout.cursor.col,
-        );
+        self.session_ui
+            .composer
+            .buffer_mut()
+            .move_cursor_to_wrapped_position(
+                width,
+                layout.cursor.row.saturating_sub(1),
+                layout.cursor.col,
+            );
         self.wake_cursor();
         true
     }
 
     fn move_composer_visual_down_with_history_reset(&mut self, reset_history: bool) -> bool {
-        let width = usize::from(self.composer.content_area().width.max(1));
-        let layout = self.composer.buffer().wrapped_layout(width);
+        let width = usize::from(self.session_ui.composer.content_area().width.max(1));
+        let layout = self.session_ui.composer.buffer().wrapped_layout(width);
         if layout.cursor.row.saturating_add(1) >= layout.lines.len() {
             return false;
         }
         if reset_history {
             self.input_history.reset_navigation();
         }
-        self.composer.buffer_mut().move_cursor_to_wrapped_position(
-            width,
-            layout.cursor.row.saturating_add(1),
-            layout.cursor.col,
-        );
+        self.session_ui
+            .composer
+            .buffer_mut()
+            .move_cursor_to_wrapped_position(
+                width,
+                layout.cursor.row.saturating_add(1),
+                layout.cursor.col,
+            );
         self.wake_cursor();
         true
     }
@@ -3053,13 +3075,13 @@ impl BmuxApp {
     /// Return the number of transcript rows hidden below the viewport.
     #[must_use]
     pub const fn scroll_offset(&self) -> usize {
-        self.viewport.offset()
+        self.session_ui.viewport.offset()
     }
 
     /// Return the number of virtual transcript rows below the newest content.
     #[must_use]
     pub const fn bottom_overscroll(&self) -> usize {
-        self.viewport.bottom_overscroll()
+        self.session_ui.viewport.bottom_overscroll()
     }
 
     /// Return whether there is a newer transcript entry fully below the viewport.
@@ -3099,7 +3121,7 @@ impl BmuxApp {
     /// Measure latest-content chrome without consuming navigation state.
     pub(crate) fn needs_latest_bar_at_height(&self, height: u16) -> bool {
         let total_rows = self.transcript_layout.total_rows();
-        let mut viewport = self.viewport;
+        let mut viewport = self.session_ui.viewport;
         let mut history = self.older_history.clone();
         let anchor = self.resolve_pending_transcript_anchor();
         viewport.sync_with_anchor(
@@ -3126,7 +3148,7 @@ impl BmuxApp {
 
     fn hidden_entry_start_row_below_viewport(&self) -> Option<usize> {
         let total_rows = self.transcript_layout.total_rows();
-        let viewport_bottom = self.viewport.bottom_row(total_rows);
+        let viewport_bottom = self.session_ui.viewport.bottom_row(total_rows);
         if viewport_bottom >= total_rows {
             return None;
         }
@@ -3180,7 +3202,7 @@ impl BmuxApp {
 
     #[cfg(test)]
     pub fn stable_transcript_anchor(&self) -> Option<(TranscriptPresentationEntryId, usize)> {
-        let top_row = self.transcript_top_row(self.viewport.height());
+        let top_row = self.transcript_top_row(self.session_ui.viewport.height());
         let line = self
             .transcript_layout
             .visible_lines_from_top(top_row, 1)
@@ -3211,7 +3233,7 @@ impl BmuxApp {
 
     #[cfg(test)]
     pub fn stable_transcript_source_position_for_test(&self) -> Option<(u64, usize)> {
-        let top_row = self.transcript_top_row(self.viewport.height());
+        let top_row = self.transcript_top_row(self.session_ui.viewport.height());
         let line = self
             .transcript_layout
             .visible_lines_from_top(top_row, 1)
@@ -3251,9 +3273,9 @@ impl BmuxApp {
     /// Detach the viewport and anchor it at one absolute transcript row.
     #[cfg(test)]
     pub fn scroll_transcript_to_row_for_test(&mut self, row: usize) {
-        self.viewport.detach();
+        self.session_ui.viewport.detach();
         self.transcript_scroll_animation = None;
-        self.viewport.follow_anchor(row);
+        self.session_ui.viewport.follow_anchor(row);
     }
 
     /// Expire any active scroll transition; the next frame performs normal target reconciliation.
@@ -3276,7 +3298,7 @@ impl BmuxApp {
     #[cfg(test)]
     #[must_use]
     pub const fn transcript_viewport_height_for_test(&self) -> u16 {
-        self.viewport.height()
+        self.session_ui.viewport.height()
     }
 
     fn transcript_scroll_animation_now(&self) -> Instant {
@@ -3311,7 +3333,8 @@ impl BmuxApp {
         if let Some(animation) = self.transcript_scroll_animation {
             return animation.top_row_at(self.transcript_scroll_animation_now());
         }
-        self.viewport
+        self.session_ui
+            .viewport
             .top_row(self.transcript_layout.total_rows(), viewport_height)
     }
 
@@ -3336,8 +3359,8 @@ impl BmuxApp {
             return false;
         };
         self.transcript_scroll_animation = None;
-        self.viewport.detach();
-        self.viewport.follow_anchor(top_row);
+        self.session_ui.viewport.detach();
+        self.session_ui.viewport.follow_anchor(top_row);
         true
     }
 
@@ -3980,15 +4003,15 @@ impl BmuxApp {
         self.restore_uncommitted_navigation();
         // Freeze the displayed top before clearing the composer changes body height.
         // This is an automatic hold, not a manual detach; acceptance owns its reveal.
-        if self.viewport.allows_reveal() {
-            self.viewport.reveal(true);
+        if self.session_ui.viewport.allows_reveal() {
+            self.session_ui.viewport.reveal(true);
         }
-        let text = self.composer.buffer().text().to_owned();
+        let text = self.session_ui.composer.buffer().text().to_owned();
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_submissions.stage(text);
         self.input_history.reset_navigation();
-        self.composer.buffer_mut().clear();
+        self.session_ui.composer.buffer_mut().clear();
     }
 
     /// Return the currently pending submission.
@@ -4001,7 +4024,9 @@ impl BmuxApp {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
-        self.viewport.scroll_to_bottom(&mut self.older_history);
+        self.session_ui
+            .viewport
+            .scroll_to_bottom(&mut self.older_history);
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_assistant_stream_anchor = false;
     }
@@ -4021,16 +4046,21 @@ impl BmuxApp {
         self.pending_submissions.clear_staged_if(text);
         self.remove_pending_submission(text);
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
-        self.viewport.scroll_to_bottom(&mut self.older_history);
+        self.session_ui
+            .viewport
+            .scroll_to_bottom(&mut self.older_history);
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_assistant_stream_anchor = false;
-        self.composer.buffer_mut().insert_str(text);
+        self.session_ui.composer.buffer_mut().insert_str(text);
         self.wake_cursor();
     }
 
     /// Show the previous input-history entry, if available.
     pub fn previous_input_history(&mut self) -> bool {
-        match self.input_history.previous(self.composer.buffer().text()) {
+        match self
+            .input_history
+            .previous(self.session_ui.composer.buffer().text())
+        {
             InputHistoryOutcome::Entry { index, total, text } => {
                 self.replace_composer_from_history(&text);
                 self.status = format!("input history {index}/{total}");
@@ -4086,7 +4116,9 @@ impl BmuxApp {
         self.navigation_checkpoint = None;
         self.cancel_transcript_scroll_animation_for_manual_scroll();
         self.mark_manual_transcript_scroll();
-        self.viewport.scroll_up(rows, &mut self.older_history)
+        self.session_ui
+            .viewport
+            .scroll_up(rows, &mut self.older_history)
     }
 
     /// Scroll transcript down by rendered rows.
@@ -4094,14 +4126,19 @@ impl BmuxApp {
         self.navigation_checkpoint = None;
         self.cancel_transcript_scroll_animation_for_manual_scroll();
         self.mark_manual_transcript_scroll();
-        let changed = self.viewport.scroll_down(rows, &mut self.older_history);
-        if self.viewport.at_bottom_threshold() {
-            self.viewport.scroll_to_bottom(&mut self.older_history);
+        let changed = self
+            .session_ui
+            .viewport
+            .scroll_down(rows, &mut self.older_history);
+        if self.session_ui.viewport.at_bottom_threshold() {
+            self.session_ui
+                .viewport
+                .scroll_to_bottom(&mut self.older_history);
             self.latest_hidden_activity_at = None;
             self.latest_hidden_activity_burst = 0;
             self.latest_bar_next_frame_at = None;
         } else {
-            self.viewport.detach();
+            self.session_ui.viewport.detach();
         }
         changed
     }
@@ -4122,7 +4159,9 @@ impl BmuxApp {
         self.pending_visual_overflow_bottom = None;
         self.pending_transcript_top_anchor_sequence = None;
         self.pending_submissions.cancel_reveals();
-        self.viewport.scroll_to_bottom(&mut self.older_history)
+        self.session_ui
+            .viewport
+            .scroll_to_bottom(&mut self.older_history)
     }
 
     /// Animate transcript to the newest rows.
@@ -4130,19 +4169,22 @@ impl BmuxApp {
         self.pending_transcript_top_anchor_sequence = None;
         self.pending_submissions.cancel_reveals();
         self.navigation_checkpoint = None;
-        let start_top_row = self
-            .viewport
-            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
+        let start_top_row = self.session_ui.viewport.top_row(
+            self.transcript_layout.total_rows(),
+            self.session_ui.viewport.height(),
+        );
         self.presented_transcript_anchor = None;
         self.pending_stable_transcript_anchor = None;
         self.manual_transcript_scroll_until = None;
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
-        self.viewport.scroll_to_bottom(&mut self.older_history);
+        self.session_ui
+            .viewport
+            .scroll_to_bottom(&mut self.older_history);
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_assistant_stream_anchor = false;
         self.pending_visual_overflow_bottom = None;
         let total_rows = self.transcript_layout.total_rows();
-        let viewport_height = self.viewport.height();
+        let viewport_height = self.session_ui.viewport.height();
         let target_top_row = total_rows.saturating_sub(usize::from(viewport_height));
         if start_top_row == target_top_row {
             return self.scroll_transcript_to_bottom();
@@ -4166,7 +4208,7 @@ impl BmuxApp {
             return;
         };
         let top_row = animation.top_row_at(self.transcript_scroll_animation_now());
-        self.viewport.materialize_top_row(top_row);
+        self.session_ui.viewport.materialize_top_row(top_row);
     }
 
     fn mark_manual_transcript_scroll(&mut self) {
@@ -4193,7 +4235,8 @@ impl BmuxApp {
     /// Capture the geometry boundary once per preparation, irrespective of event kind.
     pub(crate) fn begin_transcript_geometry_update(&mut self) {
         self.pending_visual_overflow_bottom = Some(
-            self.viewport
+            self.session_ui
+                .viewport
                 .bottom_row(self.transcript_layout.total_rows()),
         );
     }
@@ -4225,7 +4268,9 @@ impl BmuxApp {
                 self.transcript_scroll_animation = None;
                 let follows_tail = animation.target == TranscriptAnimationTarget::LatestBottom;
                 if follows_tail {
-                    self.viewport.scroll_to_bottom(&mut self.older_history);
+                    self.session_ui
+                        .viewport
+                        .scroll_to_bottom(&mut self.older_history);
                 } else {
                     animated_top = Some(animation.target_top_row);
                 }
@@ -4238,7 +4283,7 @@ impl BmuxApp {
         let older_page_rows = self.older_history_page_rows();
         let anchor = self.resolve_pending_transcript_anchor();
         self.pending_stable_transcript_anchor = None;
-        self.viewport.sync_with_anchor(
+        self.session_ui.viewport.sync_with_anchor(
             (
                 max_scroll_offset,
                 max_bottom_overscroll,
@@ -4251,7 +4296,7 @@ impl BmuxApp {
             &mut self.older_history,
         );
         if let Some(top_row) = animated_top {
-            self.viewport.materialize_top_row(top_row);
+            self.session_ui.viewport.materialize_top_row(top_row);
         }
         self.resolve_visual_overflow_follow(total_rows, now);
     }
@@ -4314,14 +4359,17 @@ impl BmuxApp {
             != SubmittedUserMessageFollowing::PendingAnchor
             && !self.manual_transcript_scroll_active()
             && self.transcript_scroll_animation.is_none()
-            && self.viewport.allows_overflow();
-        if self.viewport.reconcile_overflow(
-            self.viewport
+            && self.session_ui.viewport.allows_overflow();
+        if self.session_ui.viewport.reconcile_overflow(
+            self.session_ui
+                .viewport
                 .bottom_row(self.transcript_layout.total_rows()),
             allowed,
             &mut self.older_history,
         ) {
-            self.viewport.scroll_to_bottom(&mut self.older_history);
+            self.session_ui
+                .viewport
+                .scroll_to_bottom(&mut self.older_history);
         }
         if !self.newer_transcript_content_below() {
             self.latest_hidden_activity_at = None;
@@ -4377,7 +4425,7 @@ impl BmuxApp {
             .filter(|(_, item)| !self.admitted_items.contains(&item.id()))
             .map(|(index, item)| (index, item.id(), item.role() == "Assistant"))
             .next_back();
-        if self.automatic_item.is_none() || !self.viewport.allows_reveal() {
+        if self.automatic_item.is_none() || !self.session_ui.viewport.allows_reveal() {
             self.admitted_items.extend(
                 self.transcript
                     .iter()
@@ -4387,11 +4435,11 @@ impl BmuxApp {
         }
         if let Some((index, id, assistant)) = newest {
             let changed = self.automatic_item.is_some();
-            if self.automatic_item.is_none() || !self.viewport.allows_reveal() {
+            if self.automatic_item.is_none() || !self.session_ui.viewport.allows_reveal() {
                 self.automatic_item = Some(id);
             }
             if changed
-                && self.viewport.allows_reveal()
+                && self.session_ui.viewport.allows_reveal()
                 && !self.manual_transcript_scroll_active()
                 && self.submitted_user_message_following
                     != SubmittedUserMessageFollowing::PendingAnchor
@@ -4439,7 +4487,7 @@ impl BmuxApp {
                     == SubmittedUserMessageFollowing::PendingAnchor
                 {
                     self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
-                    self.viewport.reveal(false);
+                    self.session_ui.viewport.reveal(false);
                     self.start_transcript_scroll_animation(top_row);
                     self.set_animation_item_target(index);
                     self.admitted_items.extend(
@@ -4453,8 +4501,8 @@ impl BmuxApp {
                         .get(index)
                         .map(super::transcript::TranscriptItem::id);
                 } else {
-                    self.viewport.detach();
-                    self.viewport.follow_anchor(top_row);
+                    self.session_ui.viewport.detach();
+                    self.session_ui.viewport.follow_anchor(top_row);
                 }
                 self.presented_transcript_anchor = None;
                 self.pending_stable_transcript_anchor = None;
@@ -4465,7 +4513,7 @@ impl BmuxApp {
             && let Some(top_row) = self.latest_user_message_start_row()
         {
             self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
-            self.viewport.reveal(false);
+            self.session_ui.viewport.reveal(false);
             self.start_transcript_scroll_animation(top_row);
         }
     }
@@ -4481,9 +4529,11 @@ impl BmuxApp {
 
     /// Enable overflow following without consuming the space below a short item.
     fn release_item_hold_for_overflow(&mut self) {
-        self.viewport.release_sticky_reveal();
+        self.session_ui.viewport.release_sticky_reveal();
         let total = self.transcript_layout.total_rows();
-        if self.transcript_scroll_animation.is_none() && total > self.viewport.bottom_row(total) {
+        if self.transcript_scroll_animation.is_none()
+            && total > self.session_ui.viewport.bottom_row(total)
+        {
             let checkpoint = self.navigation_checkpoint.take();
             self.transition_transcript_to_bottom();
             self.navigation_checkpoint = checkpoint;
@@ -4508,12 +4558,12 @@ impl BmuxApp {
                 TranscriptAnimationTarget::ItemTop,
             );
         }
-        self.viewport.reveal(true);
+        self.session_ui.viewport.reveal(true);
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Anchored { index };
     }
 
     const fn downgrade_sticky_entry_anchor(&mut self) {
-        self.viewport.release_sticky_reveal();
+        self.session_ui.viewport.release_sticky_reveal();
     }
 
     fn interrupt_current_assistant_anchor(&mut self) {
@@ -4552,7 +4602,7 @@ impl BmuxApp {
 
     #[cfg(test)]
     pub const fn manually_detached(&self) -> bool {
-        !self.viewport.allows_reveal()
+        !self.session_ui.viewport.allows_reveal()
     }
 
     fn active_tool_loop(&self) -> bool {
@@ -4569,8 +4619,10 @@ impl BmuxApp {
     fn start_transcript_scroll_animation(&mut self, top_row: usize) {
         self.presented_transcript_anchor = None;
         self.pending_stable_transcript_anchor = None;
-        if let Some((start_top_row, target_top_row)) =
-            self.viewport.start_follow_anchor_animation(top_row)
+        if let Some((start_top_row, target_top_row)) = self
+            .session_ui
+            .viewport
+            .start_follow_anchor_animation(top_row)
         {
             let mut animation = TranscriptScrollAnimation::new(
                 start_top_row,
@@ -4639,16 +4691,17 @@ impl BmuxApp {
             || self.transcript_selection_pinned
             || self.transcript_scroll_animation.is_some()
             || self.older_history.loading()
-            || self.viewport.follows_bottom()
+            || self.session_ui.viewport.follows_bottom()
         {
             return;
         }
-        let top = self
-            .viewport
-            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
+        let top = self.session_ui.viewport.top_row(
+            self.transcript_layout.total_rows(),
+            self.session_ui.viewport.height(),
+        );
         let Some(first_visible_sequence) = self
             .transcript_layout
-            .visible_lines_from_top(top, self.viewport.height().max(1))
+            .visible_lines_from_top(top, self.session_ui.viewport.height().max(1))
             .iter()
             .filter(|line| line.source == VisibleTranscriptSource::Transcript)
             .filter_map(|line| self.transcript.get(line.entry_index))
@@ -4661,7 +4714,7 @@ impl BmuxApp {
             RESIDENT_TRANSCRIPT_MAX_EVENTS,
             RESIDENT_TRANSCRIPT_TARGET_EVENTS,
             first_visible_sequence,
-            usize::from(self.viewport.height()).saturating_mul(4),
+            usize::from(self.session_ui.viewport.height()).saturating_mul(4),
         ) {
             self.capture_stable_transcript_anchor();
             self.older_history
@@ -4678,16 +4731,17 @@ impl BmuxApp {
             || self.transcript_selection_pinned
             || self.transcript_scroll_animation.is_some()
             || self.older_history.loading_newer()
-            || self.viewport.follows_bottom()
+            || self.session_ui.viewport.follows_bottom()
         {
             return;
         }
-        let top = self
-            .viewport
-            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
+        let top = self.session_ui.viewport.top_row(
+            self.transcript_layout.total_rows(),
+            self.session_ui.viewport.height(),
+        );
         let visible = self
             .transcript_layout
-            .visible_lines_from_top(top, self.viewport.height().max(1));
+            .visible_lines_from_top(top, self.session_ui.viewport.height().max(1));
         let Some(last_visible_sequence) = visible
             .iter()
             .filter(|line| line.source == VisibleTranscriptSource::Transcript)
@@ -4703,7 +4757,7 @@ impl BmuxApp {
             RESIDENT_TRANSCRIPT_MAX_EVENTS,
             RESIDENT_TRANSCRIPT_TARGET_EVENTS,
             last_visible_sequence,
-            usize::from(self.viewport.height()).saturating_mul(4),
+            usize::from(self.session_ui.viewport.height()).saturating_mul(4),
         );
         if let Some(first_dropped) = first_dropped {
             self.capture_stable_transcript_anchor();
@@ -4725,7 +4779,9 @@ impl BmuxApp {
                 .mark_dropped_history_before(new_oldest_sequence);
         }
         self.rebuild_transcript_from_history(true);
-        self.viewport.scroll_to_bottom(&mut self.older_history);
+        self.session_ui
+            .viewport
+            .scroll_to_bottom(&mut self.older_history);
         self.pending_visual_overflow_bottom = None;
     }
 
@@ -4746,8 +4802,8 @@ impl BmuxApp {
     }
 
     fn can_trim_resident_transcript_window(&self) -> bool {
-        self.viewport.follows_bottom()
-            && self.viewport.at_bottom_threshold()
+        self.session_ui.viewport.follows_bottom()
+            && self.session_ui.viewport.at_bottom_threshold()
             && self.transcript_scroll_animation.is_none()
             && !self.manual_transcript_scroll_active()
             && !self.transcript_selection_pinned
@@ -5257,8 +5313,8 @@ impl BmuxApp {
         if reset_history {
             self.input_history.reset_navigation();
         }
-        self.composer.buffer_mut().clear();
-        self.composer.buffer_mut().insert_str(text);
+        self.session_ui.composer.buffer_mut().clear();
+        self.session_ui.composer.buffer_mut().insert_str(text);
         self.wake_cursor();
     }
 
@@ -5302,7 +5358,7 @@ impl BmuxApp {
     }
 
     fn visible_transcript_entry_indexes(&self) -> BTreeSet<usize> {
-        let height = self.viewport.height();
+        let height = self.session_ui.viewport.height();
         if height == 0 {
             return (0..self.transcript().len()).collect();
         }
@@ -5344,7 +5400,7 @@ impl BmuxApp {
     }
 
     fn extend_composer_selection_to_visual_delta(&mut self, width: usize, delta: isize) {
-        let layout = self.composer.buffer().wrapped_layout(width);
+        let layout = self.session_ui.composer.buffer().wrapped_layout(width);
         let target_row = if delta.is_negative() {
             layout.cursor.row.saturating_sub(delta.unsigned_abs())
         } else {
@@ -5354,7 +5410,8 @@ impl BmuxApp {
                 .saturating_add(delta.unsigned_abs())
                 .min(layout.lines.len().saturating_sub(1))
         };
-        self.composer
+        self.session_ui
+            .composer
             .buffer_mut()
             .select_to_wrapped_position(width, target_row, layout.cursor.col);
     }
@@ -5410,7 +5467,7 @@ impl BmuxApp {
         self.remove_pending_submission(&text);
         if accepted_pending_submission {
             self.submitted_user_message_following = SubmittedUserMessageFollowing::PendingAnchor;
-            self.viewport.reveal(false);
+            self.session_ui.viewport.reveal(false);
             self.pending_transcript_top_anchor_sequence = Some(sequence);
         }
         if application.live_activity() {
@@ -5431,7 +5488,7 @@ impl BmuxApp {
     /// Repeated or failed preparations never consume reveal requests twice.
     fn restore_uncommitted_navigation(&mut self) {
         if let Some(checkpoint) = self.navigation_checkpoint.take() {
-            self.viewport = checkpoint.viewport;
+            self.session_ui.viewport = checkpoint.viewport;
             self.transcript_scroll_animation = checkpoint.animation;
             self.pending_stable_transcript_anchor = checkpoint.anchor;
             self.submitted_user_message_following = checkpoint.submitted;
@@ -5456,7 +5513,7 @@ impl BmuxApp {
         self.navigation_checkpoint = Some(TranscriptNavigationCheckpoint {
             automatic_item: self.automatic_item,
             admitted_items: self.admitted_items.clone(),
-            viewport: self.viewport,
+            viewport: self.session_ui.viewport,
             animation: self.transcript_scroll_animation,
             anchor: self.pending_stable_transcript_anchor.clone(),
             submitted: self.submitted_user_message_following,
@@ -5495,7 +5552,7 @@ impl BmuxApp {
     }
 
     pub(crate) fn capture_stable_transcript_anchor(&mut self) {
-        if self.viewport.follows_bottom() {
+        if self.session_ui.viewport.follows_bottom() {
             if let Some(presentation) = &self.plugin_presentation {
                 presentation.clear_content_positions();
             }
@@ -5517,12 +5574,13 @@ impl BmuxApp {
             }
             return;
         }
-        let top_row = self
-            .viewport
-            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
+        let top_row = self.session_ui.viewport.top_row(
+            self.transcript_layout.total_rows(),
+            self.session_ui.viewport.height(),
+        );
         let Some(line) = self
             .transcript_layout
-            .visible_lines_from_top(top_row, self.viewport.height().max(1))
+            .visible_lines_from_top(top_row, self.session_ui.viewport.height().max(1))
             .into_iter()
             .find(|line| line.source == VisibleTranscriptSource::Transcript)
         else {
@@ -6110,7 +6168,7 @@ impl BmuxApp {
 }
 
 pub const fn composer_policy() -> TextInputPolicy {
-    TextInputPolicy::chat_composer()
+    bcode_tui_components::session_ui::composer_policy()
 }
 
 fn next_periodic_deadline(started_at: Instant, now: Instant, interval: Duration) -> Instant {
@@ -6673,27 +6731,29 @@ mod tests {
             .push_ephemeral("test".to_owned(), assistant.clone());
         app.automatic_item = Some(assistant.id());
         app.admitted_items.extend([old.id(), assistant.id()]);
-        app.viewport
+        app.session_ui
+            .viewport
             .sync_max(20, 9, 30, 10, false, &mut app.older_history);
-        app.viewport.reveal(true);
-        app.viewport.materialize_top_row(10);
+        app.session_ui.viewport.reveal(true);
+        app.session_ui.viewport.materialize_top_row(10);
         // Reconciliation removes the tail; the previously admitted user item is
         // now last. This is not a newly arrived user message or a tail request.
         app.transcript = super::super::transcript_document::TranscriptDocument::default();
         app.transcript.push_ephemeral("test".to_owned(), old);
         app.sync_transcript_anchor_requests();
         assert!(app.transcript_scroll_animation.is_none());
-        assert!(!app.viewport.allows_overflow());
-        assert_eq!(app.viewport.top_row(30, 10), 10);
+        assert!(!app.session_ui.viewport.allows_overflow());
+        assert_eq!(app.session_ui.viewport.top_row(30, 10), 10);
         drop(app);
     }
 
     #[test]
     fn completed_row_animation_preserves_hold_without_item_correspondence() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
-        app.viewport
+        app.session_ui
+            .viewport
             .sync_max(20, 9, 30, 10, false, &mut app.older_history);
-        app.viewport.reveal(true);
+        app.session_ui.viewport.reveal(true);
         let now = std::time::Instant::now();
         let mut animation = super::TranscriptScrollAnimation::new(0, 12, now);
         // Missing correspondence remains a row target, not a tail command.
@@ -6702,17 +6762,18 @@ mod tests {
             .expect("clock permits test offset");
         app.transcript_scroll_animation = Some(animation);
         app.sync_transcript_scroll_max(20, 9, 30, 10);
-        assert_eq!(app.viewport.top_row(30, 10), 12);
-        assert!(!app.viewport.allows_overflow());
+        assert_eq!(app.session_ui.viewport.top_row(30, 10), 12);
+        assert!(!app.session_ui.viewport.allows_overflow());
         app.sync_transcript_scroll_max(25, 9, 35, 10);
-        assert_eq!(app.viewport.top_row(35, 10), 12);
+        assert_eq!(app.session_ui.viewport.top_row(35, 10), 12);
         drop(app);
     }
 
     #[test]
     fn manual_scroll_cancels_deferred_sequence_and_submission_reveals() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
-        app.viewport
+        app.session_ui
+            .viewport
             .sync_max(20, 9, 30, 10, false, &mut app.older_history);
         app.pending_submissions.stage("pending".to_owned());
         app.request_transcript_top_anchor_sequence(42);
@@ -6831,24 +6892,35 @@ mod tests {
             },
         };
         app.older_history.replace_centered(&[event], true, true, 10);
-        app.viewport
+        app.session_ui
+            .viewport
             .sync_max(20, 9, 30, 10, false, &mut app.older_history);
-        app.viewport.follow_anchor(18);
+        app.session_ui.viewport.follow_anchor(18);
         assert!(app.scroll_transcript_down(3));
-        assert_eq!(app.viewport.top_row(30, 10), 20);
+        assert_eq!(app.session_ui.viewport.top_row(30, 10), 20);
         assert!(app.should_load_newer_history());
         app.older_history.set_loading_newer(true);
         assert!(app.scroll_transcript_down(2));
-        app.viewport
-            .sync_with_anchor((20, 9, 30, 10), Some(20), 10, 0, &mut app.older_history);
+        app.session_ui.viewport.sync_with_anchor(
+            (20, 9, 30, 10),
+            Some(20),
+            10,
+            0,
+            &mut app.older_history,
+        );
         assert_eq!(app.older_history.newer_reveal_request(), Some(3));
         app.older_history.update_newer_cursor(&[], false);
         app.older_history.set_loading_newer(false);
-        app.viewport
-            .sync_with_anchor((30, 9, 40, 10), Some(20), 10, 0, &mut app.older_history);
+        app.session_ui.viewport.sync_with_anchor(
+            (30, 9, 40, 10),
+            Some(20),
+            10,
+            0,
+            &mut app.older_history,
+        );
         // The terminal empty page adds no navigable rows. Unrelated layout
         // growth cannot satisfy the outstanding boundary movement.
-        assert_eq!(app.viewport.top_row(40, 10), 20);
+        assert_eq!(app.session_ui.viewport.top_row(40, 10), 20);
         assert_eq!(app.older_history.newer_reveal_request(), None);
         drop(app);
     }
@@ -6869,36 +6941,50 @@ mod tests {
     #[test]
     fn manual_scroll_supersedes_uncommitted_navigation() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
-        app.viewport
+        app.session_ui
+            .viewport
             .sync_max(20, 9, 30, 10, false, &mut app.older_history);
         app.begin_transcript_presentation();
-        app.viewport.reveal(true);
+        app.session_ui.viewport.reveal(true);
         assert!(app.scroll_transcript_up(2));
-        let manual = app.viewport;
+        let manual = app.session_ui.viewport;
         app.begin_transcript_presentation();
-        assert_eq!(app.viewport, manual);
-        assert!(!app.viewport.allows_reveal());
+        assert_eq!(app.session_ui.viewport, manual);
+        assert!(!app.session_ui.viewport.allows_reveal());
         drop(app);
     }
 
     #[test]
     fn uncommitted_navigation_retries_do_not_consume_reveal_intent() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
-        app.viewport
+        app.session_ui
+            .viewport
             .sync_max(20, 9, 30, 10, false, &mut app.older_history);
-        app.viewport.scroll_down(4, &mut app.older_history);
-        let before = app.viewport;
+        app.session_ui
+            .viewport
+            .scroll_down(4, &mut app.older_history);
+        let before = app.session_ui.viewport;
         app.begin_transcript_presentation();
-        app.viewport
-            .sync_with_anchor((30, 9, 40, 10), None, 10, 0, &mut app.older_history);
-        assert!(app.viewport.follows_bottom());
+        app.session_ui.viewport.sync_with_anchor(
+            (30, 9, 40, 10),
+            None,
+            10,
+            0,
+            &mut app.older_history,
+        );
+        assert!(app.session_ui.viewport.follows_bottom());
         app.begin_transcript_presentation();
-        assert_eq!(app.viewport, before);
-        app.viewport
-            .sync_with_anchor((30, 9, 40, 10), None, 10, 0, &mut app.older_history);
+        assert_eq!(app.session_ui.viewport, before);
+        app.session_ui.viewport.sync_with_anchor(
+            (30, 9, 40, 10),
+            None,
+            10,
+            0,
+            &mut app.older_history,
+        );
         app.commit_transcript_presentation();
         app.begin_transcript_presentation();
-        assert!(app.viewport.follows_bottom());
+        assert!(app.session_ui.viewport.follows_bottom());
         drop(app);
     }
 

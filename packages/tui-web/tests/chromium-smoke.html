@@ -1,0 +1,39 @@
+<!doctype html><meta charset="utf-8"><div id="host" style="position:relative;width:720px;height:360px"><canvas id="canvas" style="width:720px;height:360px"></canvas></div><pre id="result">pending</pre>
+<script type="module">
+import init, { BrowserSession } from '../artifacts/consumer-3/bcode_tui_web.js';
+import { mountInteractiveSurface } from '../artifacts/consumer-3/interactive-surface.js';
+const result = document.getElementById('result');
+try {
+  await init();
+  const rust = new BrowserSession('00000000-0000-4000-8000-000000000001', 'canvas', 80, 20, 9, 18);
+  let queue = Promise.resolve();
+  const bridge = mountInteractiveSurface({
+    container: document.getElementById('host'), canvas: document.getElementById('canvas'),
+    mapPoint: ({x,y}) => ({x:x/9,y:y/18}),
+    onInput: input => { queue = queue.then(async () => { rust.input(JSON.stringify(input)); await rust.present(); }); },
+  });
+  await rust.present();
+  bridge.focus();
+  const input = document.querySelector('[data-bmux-input]');
+  input.value = '日本語🦀é';
+  input.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: '日本語🦀é', bubbles: true }));
+  await queue;
+  if (rust.draft() !== '日本語🦀é') throw new Error('real editor text mismatch');
+  input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', code: 'Backspace', bubbles: true, cancelable: true }));
+  await queue;
+  if (rust.draft() !== '日本語🦀') throw new Error('grapheme editing mismatch');
+  const enter = {type:'key',key:'Enter',code:'Enter',ctrl:false,alt:false,shift:false,meta:false,repeat:false};
+  rust.configure_bindings(JSON.stringify({'enter':'newline','ctrl+enter':'submit'}));
+  if (rust.input(JSON.stringify(enter))) throw new Error('configured Enter submitted');
+  if (!rust.draft().endsWith('\n')) throw new Error('configured Enter did not insert newline');
+  if (!rust.input(JSON.stringify({...enter,ctrl:true}))) throw new Error('configured Ctrl Enter did not submit');
+  rust.configure_bindings('{}');
+  for (const [w,h] of [[0,0],[1,1],[2,2],[80,20]]) { rust.resize(w,h,9,18,'14px monospace',14); await rust.present(); }
+  bridge.dispose();
+  await queue;
+  rust.cancel_pointer();
+  rust.dispose();
+  rust.free();
+  result.textContent = 'PASS real wasm Canvas + BMUX input/editor graphemes + zero/tiny resize + disposal';
+} catch (error) { result.textContent = `FAIL ${error?.message ?? String(error)}`; }
+</script>

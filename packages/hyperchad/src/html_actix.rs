@@ -1,6 +1,9 @@
 //! HTML/Actix backend construction for the Bcode `HyperChad` application.
 
 mod context;
+mod tui_assets;
+
+pub use tui_assets::{TUI_ASSET_FILES, TuiAssets, build_tui_launch_url};
 
 pub use self::context::HtmlActixPresentationContext;
 use std::net::IpAddr;
@@ -201,6 +204,12 @@ pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad:
     use hyperchad::renderer::Renderer as _;
 
     let mut app = builder.build_default()?;
+    // Launch URLs and semantic API responses carry session capabilities/content.
+    // The upstream hook bounds streamed bodies before extraction and disables
+    // built-in URL/body logging, not merely application-level JSON parsing.
+    app.renderer.app.set_http_policy(
+        hyperchad::renderer_html_actix::HttpPolicy::new(64 * 1024).with_sensitive_path_prefix("/"),
+    );
     app.renderer.add_responsive_trigger(
         "narrow".to_owned(),
         hyperchad::renderer::transformer::ResponsiveTrigger::MaxWidth(

@@ -16,11 +16,14 @@ path              = "src/bin/bcode_terminal_grid_probe.rs"
 required-features = ["terminal-viewer"]
 
 [dependencies]
-bcode_syntax_render = { workspace = true, optional = true }
-bmux_terminal_grid  = { workspace = true, optional = true }
-bmux_tui            = { workspace = true }
-bmux_tui_components = { workspace = true }
-unicode-width       = { workspace = true, optional = true }
+bcode_markdown_render = { workspace = true, optional = true }
+bcode_syntax_render   = { workspace = true, optional = true }
+bmux_keyboard         = { workspace = true, optional = true }
+bmux_terminal_grid    = { workspace = true, optional = true }
+bmux_text_edit        = { workspace = true, optional = true }
+bmux_tui              = { workspace = true }
+bmux_tui_components   = { workspace = true }
+unicode-width         = { workspace = true, optional = true }
 
 [features]
 activity = []
@@ -31,12 +34,14 @@ all = [
     "compact",
     "diff-viewer",
     "permission",
+    "session-ui",
     "setup",
     "source-preview",
     "source-viewer",
     "terminal-viewer",
     "tool-card",
     "transcript",
+    "transcript-markdown",
 ]
 chrome = []
 compact = ["bmux_tui_components/compact"]
@@ -45,6 +50,13 @@ default = []
 diff-viewer = ["bmux_tui_components/diff-viewer"]
 fail-on-warnings = []
 permission = ["bmux_tui_components/modal-frame"]
+session-ui = [
+    "composer",
+    "transcript",
+    "bmux_tui_components/text-input",
+    "dep:bmux_keyboard",
+    "dep:bmux_text_edit",
+]
 setup = []
 source-preview = ["source-viewer", "dep:unicode-width"]
 source-viewer = ["bmux_tui_components/source-viewer"]
@@ -60,3 +72,4 @@ terminal-viewer = [
 ]
 tool-card = ["compact"]
 transcript = []
+transcript-markdown = ["transcript", "dep:bcode_markdown_render"]

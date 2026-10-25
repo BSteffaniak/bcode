@@ -779,6 +779,13 @@ fn validate_cli_execution_mode(
     Ok(())
 }
 
+fn write_artifact_id() -> Result<(), CliError> {
+    let mut output = std::io::stdout().lock();
+    writeln!(output, "{}", bcode_ipc::ArtifactId::current())?;
+    output.flush()?;
+    Ok(())
+}
+
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     let _ = (&cli.profile, cli.request_timeout_secs);
     let _ = (&cli.state_root, &cli.state_profile);
@@ -837,11 +844,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             )
             .await?;
         }
-        Commands::ArtifactId => {
-            let mut output = std::io::stdout().lock();
-            writeln!(output, "{}", bcode_ipc::ArtifactId::current())?;
-            output.flush()?;
-        }
+        Commands::ArtifactId => write_artifact_id()?,
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(Box::new(command)).await?,
         Commands::State { command } => handle_state_command(
@@ -856,7 +859,8 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             bind,
             port,
             allow_non_loopback,
-        } => handle_web_command(bind, port, allow_non_loopback).await?,
+            tui_assets,
+        } => handle_web_command(bind, port, allow_non_loopback, tui_assets.as_deref()).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
         Commands::Theme { command } => handle_theme_command(command)?,
         Commands::Judgement { command } => Box::pin(handle_judgement_command(command)).await?,
@@ -4038,7 +4042,14 @@ async fn handle_web_command(
     bind: std::net::IpAddr,
     requested_port: Option<u16>,
     allow_non_loopback: bool,
+    tui_assets: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
+    // Validate the entire concrete distribution before daemon discovery or binding.
+    let tui_assets = tui_assets
+        .map(bcode_hyperchad::TuiAssets::load)
+        .transpose()
+        .map_err(CliError::HyperChadRender)?;
+    let launch_tui = tui_assets.is_some();
     let bind = bcode_hyperchad::validate_bind_address(bind, allow_non_loopback)
         .map_err(|error| CliError::HyperChadRender(error.to_owned()))?;
     let port = requested_port.unwrap_or(0);
@@ -4052,19 +4063,29 @@ async fn handle_web_command(
             config.presentation.streaming.policy(),
         );
     let builder = bcode_hyperchad::init(&state).await?;
+    let builder = if let Some(assets) = tui_assets {
+        assets.with_routes(builder)
+    } else {
+        builder
+    };
     let launch_token = access_token;
     let builder = builder
         .with_actix_bind_address(bind.to_string())
         .with_actix_port(port)
         .with_actix_on_bound(move |address| {
-            let launch_url = bcode_hyperchad::build_launch_url(address, &launch_token, None);
+            let launch_url = if launch_tui {
+                bcode_hyperchad::build_tui_launch_url(address, &launch_token)
+            } else {
+                bcode_hyperchad::build_launch_url(address, &launch_token, None)
+            };
             if open::that_detached(&launch_url).is_err() {
                 eprintln!("Bcode could not open the HyperChad application in a browser.");
                 eprintln!(
                     "Restart `bcode web` after checking that a graphical browser is available. The private launch capability was not printed."
                 );
             } else {
-                println!("Bcode HyperChad application opened at http://{address}/");
+                let route = if launch_tui { "tui/index.html" } else { "" };
+                println!("Bcode HyperChad application opened at http://{address}/{route}");
             }
         });
     let (app, renderer_runtime) = bcode_hyperchad::build_app_with_runtime(builder)
@@ -4961,6 +4982,9 @@ enum Commands {
         /// Explicitly allow binding to a non-loopback address.
         #[arg(long, requires = "bind")]
         allow_non_loopback: bool,
+        /// Serve the browser-local WASM TUI from a complete built distribution.
+        #[arg(long, value_name = "DIR")]
+        tui_assets: Option<std::path::PathBuf>,
     },
     Plugin {
         #[command(subcommand)]
@@ -26083,6 +26107,7 @@ mod web_command_tests {
             bind,
             port,
             allow_non_loopback,
+            tui_assets,
         }) = cli.command
         else {
             panic!("expected web command");
@@ -26091,6 +26116,35 @@ mod web_command_tests {
         assert_eq!(bind, bcode_hyperchad::DEFAULT_BIND_ADDRESS);
         assert_eq!(port, None);
         assert!(!allow_non_loopback);
+        assert_eq!(tui_assets, None);
+    }
+
+    #[cfg(feature = "web-renderer")]
+    #[test]
+    fn web_command_parses_optional_tui_assets() {
+        let cli = Cli::try_parse_from(["bcode", "web", "--tui-assets", "/tmp/tui-dist"])
+            .expect("WASM asset option should parse");
+        let Some(Commands::Web { tui_assets, .. }) = cli.command else {
+            panic!("expected web command");
+        };
+        assert_eq!(tui_assets, Some(std::path::PathBuf::from("/tmp/tui-dist")));
+    }
+
+    #[cfg(feature = "web-renderer")]
+    #[tokio::test]
+    async fn web_command_rejects_missing_assets_before_daemon_initialization() {
+        let directory = tempfile::tempdir().expect("temporary empty distribution");
+        let error = handle_web_command(
+            bcode_hyperchad::DEFAULT_BIND_ADDRESS,
+            None,
+            false,
+            Some(directory.path()),
+        )
+        .await
+        .expect_err("empty assets must fail before startup");
+        assert!(
+            matches!(error, CliError::HyperChadRender(message) if message == "missing TUI asset: index.html")
+        );
     }
 
     #[cfg(feature = "web-renderer")]
@@ -26110,6 +26164,7 @@ mod web_command_tests {
             bind,
             port,
             allow_non_loopback,
+            ..
         }) = cli.command
         else {
             panic!("expected web command");

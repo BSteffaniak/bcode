@@ -39,6 +39,15 @@ pub fn composer_panel<'a>(style: ComposerStyle, child: impl Component + 'a) -> C
     }
 }
 
+impl ComposerPanel<'_> {
+    /// Set caller-owned identity, allowing multiple composers in one retained tree.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<bmux_tui::component::LayoutId>) -> Self {
+        self.surface = self.surface.id(id);
+        self
+    }
+}
+
 impl Component for ComposerPanel<'_> {
     fn revision(&self) -> ComponentRevision {
         self.surface.revision()

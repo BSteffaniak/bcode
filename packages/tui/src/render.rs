@@ -311,7 +311,6 @@ use bmux_tui::prelude::{Line, Span, Style};
 #[cfg(test)]
 use bmux_tui::style::Color;
 use bmux_tui::style::Modifier;
-use bmux_tui_components::text_input::TextInputComponent;
 use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
@@ -2308,24 +2307,7 @@ fn markdown_hit_regions_for_item(
         .collect()
 }
 
-const fn markdown_contribution_actionable(kind: &MarkdownContributionKind) -> bool {
-    match kind {
-        MarkdownContributionKind::Link { destination, .. }
-        | MarkdownContributionKind::GitHubIssue { destination, .. } => matches!(
-            destination,
-            bcode_markdown_render::MarkdownDestination::Web(_)
-                | bcode_markdown_render::MarkdownDestination::LocalPath(_)
-                | bcode_markdown_render::MarkdownDestination::Fragment(_)
-        ),
-        MarkdownContributionKind::Details { .. }
-        | MarkdownContributionKind::FootnoteReference { .. }
-        | MarkdownContributionKind::FootnoteDefinition { .. }
-        | MarkdownContributionKind::Mermaid { .. } => true,
-        MarkdownContributionKind::Image { .. }
-        | MarkdownContributionKind::InlineMath { .. }
-        | MarkdownContributionKind::DisplayMath { .. } => false,
-    }
-}
+use bcode_tui_components::transcript_markdown::contribution_actionable as markdown_contribution_actionable;
 
 #[cfg(test)]
 #[test]
@@ -3048,35 +3030,18 @@ fn push_markdown_projection_block(
     width: u16,
     prominent: bool,
 ) {
-    let heading_style = if prominent {
-        heading_style.add_modifier(Modifier::BOLD)
-    } else {
-        heading_style
-    };
-    push_wrapped_styled_text(rows, Vec::new(), title, width, heading_style, heading_style);
-    if rendered.lines.is_empty() {
-        rows.push(Line::from_spans(vec![
-            Span::styled("  ", muted_style()),
-            Span::styled(
-                "·",
-                if prominent {
-                    Style::new()
-                } else {
-                    muted_style()
-                },
-            ),
-        ]));
-    } else {
-        for line in &rendered.lines {
-            let mut spans = vec![Span::styled(
-                " ".repeat(usize::from(MARKDOWN_BODY_INDENT)),
-                muted_style(),
-            )];
-            spans.extend(line.spans.iter().cloned());
-            rows.push(Line::from_spans(spans));
-        }
-    }
-    rows.push(Line::default());
+    bcode_tui_components::transcript_markdown::append_markdown_block(
+        rows,
+        title,
+        rendered,
+        width,
+        bcode_tui_components::transcript_markdown::MarkdownBlockStyle {
+            heading: heading_style,
+            muted: muted_style(),
+            prominent,
+            body_indent: MARKDOWN_BODY_INDENT,
+        },
+    );
 }
 
 fn push_markdown_block_with_streaming(
@@ -5486,39 +5451,14 @@ fn push_wrapped_styled_text(
     body_style: Style,
     continuation_style: Style,
 ) {
-    let max_width = usize::from(width.max(1));
-    let prefix_width = spans_width(&prefix);
-    if prefix_width >= max_width || max_width <= 2 {
-        let mut spans = prefix;
-        spans.push(Span::styled(text, body_style));
-        rows.extend(bmux_tui::text::wrap_line_bounded(
-            &Line::from_spans(spans),
-            bmux_tui::text::TextWrapGeometry::uniform(max_width),
-            bmux_tui::text::TextWrap::Word,
-        ));
-        return;
-    }
-    let available_first = max_width.saturating_sub(prefix_width).max(1);
-    let available_next = max_width.saturating_sub(2).max(1);
-    let continuation_prefix = Span::styled("  ", continuation_style);
-
-    let chunks = wrap_text_with_continuation(text, available_first, available_next);
-    for (chunk_index, chunk) in chunks.iter().enumerate() {
-        if chunk_index == 0 {
-            let mut spans = prefix.clone();
-            spans.push(Span::styled(chunk.clone(), body_style));
-            rows.push(Line::from_spans(spans));
-        } else {
-            rows.push(Line::from_spans(vec![
-                continuation_prefix.clone(),
-                Span::styled(chunk.clone(), body_style),
-            ]));
-        }
-    }
-
-    if chunks.is_empty() {
-        rows.push(Line::from_spans(prefix));
-    }
+    bcode_tui_components::transcript_markdown::append_styled_text(
+        rows,
+        prefix,
+        text,
+        width,
+        body_style,
+        continuation_style,
+    );
 }
 
 /// Wrap `text` at word boundaries using an explicit per-row geometry.
@@ -5541,21 +5481,7 @@ fn prefixed_unicode_text_fits_tiny_widths() {
     }
 }
 
-fn wrap_text_with_continuation(
-    text: &str,
-    first_width: usize,
-    continuation_width: usize,
-) -> Vec<String> {
-    bmux_tui::text::wrap_line_bounded(
-        &Line::raw(text),
-        bmux_tui::text::TextWrapGeometry::with_continuation(first_width, continuation_width),
-        bmux_tui::text::TextWrap::Word,
-    )
-    .iter()
-    .map(Line::plain_text)
-    .collect()
-}
-
+#[cfg(test)]
 fn spans_width(spans: &[Span]) -> usize {
     spans
         .iter()
@@ -5874,17 +5800,25 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
     }
     let state = RefCell::new(app.composer_state().clone());
     let policy = composer_policy();
-    let input = TextInputComponent::new("composer.editor", &state, &policy)
-        .placeholder("Ask Bcode…", theme.muted)
-        .style(theme.text)
-        .selection_style(theme.selection)
-        .focused(app.cursor_visible());
-    let panel = bcode_tui_components::composer::composer_panel(
-        bcode_tui_components::composer::ComposerStyle {
-            border: theme.focused,
-            surface: theme.raised,
+    let panel = bcode_tui_components::session_ui::composer(
+        &bcode_tui_components::session_ui::SessionUiIds {
+            root: "chat",
+            composer: "bcode.composer",
+            editor: "composer.editor",
+            composer_size: "composer.size",
         },
-        input,
+        &state,
+        &policy,
+        bcode_tui_components::session_ui::SessionComposerStyle {
+            panel: bcode_tui_components::composer::ComposerStyle {
+                border: theme.focused,
+                surface: theme.raised,
+            },
+            text: theme.text,
+            selection: theme.selection,
+            muted: theme.muted,
+        },
+        app.cursor_visible(),
     );
     let layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
     frame.with_child(

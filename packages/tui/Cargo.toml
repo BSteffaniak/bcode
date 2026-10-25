@@ -44,11 +44,13 @@ bcode_tui_components = { workspace = true, features = [
     "composer",
     "diff-viewer",
     "permission",
+    "session-ui",
     "setup",
     "source-preview",
     "source-viewer",
     "terminal-viewer",
     "transcript",
+    "transcript-markdown",
 ] }
 bcode_usage_models = { workspace = true }
 bcode_workflow = { workspace = true }

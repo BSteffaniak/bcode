@@ -103,6 +103,7 @@ members = [
     "packages/tool-runtime",
     "packages/tui",
     "packages/tui-components",
+    "packages/tui-web",
     "packages/hyperchad",
     "packages/hyperchad/ui",
     "packages/vim-edit",
@@ -263,6 +264,7 @@ bcode_tool_models                       = { version = "0.0.1-alpha.0", default-f
 bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 bcode_tui_components                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }
+bcode_tui_web                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-web" }
 bcode_usage                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/usage" }
 bcode_usage_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/usage/models" }
 bcode_usage_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/usage-plugin" }
@@ -306,6 +308,7 @@ bmux_tui_components = { default-features = false, version = "0.0.1-alpha.4", fea
     "scroll-view",
 ] }
 bmux_tui_runtime = { default-features = false, version = "0.0.1-alpha.4" }
+bmux_web_renderer = { default-features = false, version = "0.0.1-alpha.4" }
 
 # External dependencies
 anyhow = { version = "1.0.102", default-features = false }
@@ -478,6 +481,7 @@ tree-sitter-javascript = { version = "0.25.0", default-features = false }
 tree-sitter-python = { version = "0.25.0", default-features = false }
 # Maintenance must use the same engine artifact as Switchy's canonical session connections.
 # Intentionally pinned to the existing lockfile version rather than introducing a second engine.
+js-sys = { version = "0.3.106", default-features = false }
 tokio = { version = "1.45.1", default-features = false }
 tokio-stream = { version = "0.1.18", default-features = false }
 toml = { version = "1.1.2", default-features = false, features = [
@@ -510,6 +514,9 @@ url = { version = "2.5.7", default-features = false, features = ["std"] }
 uuid = { version = "1.21.0", default-features = false }
 vte = { version = "0.15.0", default-features = false, features = ["std"] }
 wait-timeout = { version = "0.2.1", default-features = false }
+wasm-bindgen = { version = "0.2.129", default-features = false }
+wasm-bindgen-futures = { version = "0.4.79", default-features = false }
+web-sys = { version = "0.3.106", default-features = false }
 webbrowser = { version = "1.2.4", default-features = false, features = [
     "hardened",
 ] }
@@ -557,3 +564,82 @@ opt-level = "z"
 [profile.fast]
 inherits  = "dev"
 opt-level = 0
+
+# Development integration with the sibling BMUX worktree. Keep the resolved
+# BMUX dependency closure on one source so public primitive types stay identical.
+[patch.crates-io]
+# Pin framework contracts and their dependency closure to the pushed upstream commits.
+# Keep each upstream on one source; crates.io versions have not yet been bumped.
+bmux_attach_image_protocol         = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_codec                         = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_fonts                         = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_image                         = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_ipc                           = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_keyboard                      = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_markdown                      = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_mermaid_render                = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_perf_telemetry                = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_plugin                        = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_plugin_runtime                = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_plugin_schema                 = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_plugin_sdk                    = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_syntax_render                 = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_terminal_grid                 = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_text_edit                     = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_tui                           = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_tui_components                = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_tui_runtime                   = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+bmux_web_renderer                  = { git = "https://github.com/BSteffaniak/bmux.git", rev = "5be0ed17385252035e03db874cf33f81d5dd713c" }
+hyperchad                          = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_actions                  = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_app                      = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_color                    = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_js_bundler               = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_markdown                 = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_renderer                 = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_renderer_html            = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_renderer_html_actix      = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_renderer_html_http       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_renderer_html_lambda     = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_renderer_html_web_server = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_renderer_vanilla_js      = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_renderer_vanilla_js_hash = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_router                   = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_simulator                = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_template                 = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_template_actions_dsl     = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_template_macros          = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_transformer              = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+hyperchad_transformer_models       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+moosicbox_arb                      = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+moosicbox_assert                   = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+moosicbox_env_utils                = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+moosicbox_json_utils               = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+moosicbox_log_runtime              = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+moosicbox_logging                  = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+moosicbox_middleware               = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+moosicbox_profiles                 = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+simvar                             = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+simvar_harness                     = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+simvar_utils                       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy                            = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_async                      = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_async_macros               = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_database                   = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_database_connection        = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_env                        = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_fs                         = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_http                       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_http_models                = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_mdns                       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_random                     = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_schema                     = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_tcp                        = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_telemetry                  = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_time                       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_upnp                       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_uuid                       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_web_server                 = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_web_server_core            = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_web_server_cors            = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }
+switchy_web_server_simulator       = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "c95a698190fd1e2a6aa5e8f32a687bb433e2857d" }

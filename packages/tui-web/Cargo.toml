@@ -1,0 +1,51 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "wasm"]
+description = "Browser-local WASM host for Bcode's BMUX TUI adapter"
+edition     = { workspace = true }
+keywords    = ["bcode", "tui", "wasm", "browser"]
+license     = { workspace = true }
+name        = "bcode_tui_web"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+bcode_markdown_render = { workspace = true }
+bcode_session_view_models = { workspace = true }
+bcode_tui_components = { workspace = true, features = [
+    "session-ui",
+    "transcript-markdown",
+] }
+bmux_keyboard = { workspace = true }
+bmux_text_edit = { workspace = true }
+bmux_tui = { workspace = true }
+bmux_tui_components = { workspace = true, features = [
+    "text-input",
+    "text-view",
+    "scroll-view",
+] }
+bmux_web_renderer = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen         = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+
+[features]
+default = []
+fail-on-warnings = []
+wasm = [
+    "bmux_web_renderer/wasm",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+]
+
+[package.metadata.cargo-machete]
+# Async wasm-bindgen exports generate calls into this crate.
+ignored = ["wasm-bindgen-futures"]

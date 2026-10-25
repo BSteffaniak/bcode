@@ -36,6 +36,7 @@ hyperchad = { workspace = true, features = [
 ] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 switchy = { workspace = true, features = ["async", "async-tokio"] }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }

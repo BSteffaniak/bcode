@@ -1336,6 +1336,30 @@ fn parse_key(input: &str) -> Option<KeyStroke> {
     parse_key_stroke(input).ok()
 }
 
+impl bcode_tui_components::session_ui::bindings::SessionKeyBindings for BmuxKeyMap {
+    fn resolve(
+        &self,
+        stroke: KeyStroke,
+    ) -> bcode_tui_components::session_ui::bindings::SessionKeyBinding {
+        use bcode_tui_components::session_ui::bindings::SessionKeyBinding;
+        if let Some(motion) = self.editor_selection_motion_for_key(stroke) {
+            return SessionKeyBinding::Selection(motion);
+        }
+        if let Some(command) = self.editor_command_for_key(stroke) {
+            return SessionKeyBinding::Editor(command);
+        }
+        if self.action("chat", stroke).is_some()
+            || self.registry().is_overridden_key("chat", stroke)
+        {
+            return SessionKeyBinding::Host;
+        }
+        bcode_plugin_sdk::tui::keymap::controls::LiteralText::from_stroke(stroke)
+            .map_or(SessionKeyBinding::Ignored, |text| {
+                SessionKeyBinding::Literal(text.native_stroke())
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bcode_config::TuiConfig;

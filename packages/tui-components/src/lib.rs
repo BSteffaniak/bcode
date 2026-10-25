@@ -17,8 +17,12 @@ pub mod compact;
 pub mod composer;
 #[cfg(feature = "diff-viewer")]
 pub mod diff_viewer;
+#[cfg(feature = "transcript-markdown")]
+pub mod markdown_selection;
 #[cfg(feature = "permission")]
 pub mod permission;
+#[cfg(feature = "session-ui")]
+pub mod session_ui;
 #[cfg(feature = "setup")]
 pub mod setup;
 #[cfg(feature = "source-preview")]
@@ -31,3 +35,9 @@ pub mod terminal_viewer;
 pub mod tool_card;
 #[cfg(feature = "transcript")]
 pub mod transcript;
+#[cfg(feature = "transcript")]
+pub mod transcript_history;
+#[cfg(feature = "transcript-markdown")]
+pub mod transcript_markdown;
+#[cfg(feature = "transcript")]
+pub mod transcript_viewport;

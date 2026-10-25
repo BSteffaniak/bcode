@@ -340,3 +340,39 @@ fn newest_history_cursor(
         sequence: event.sequence.saturating_add(1),
     })
 }
+
+impl bcode_tui_components::transcript_history::TranscriptHistory for OlderHistoryState {
+    fn has_older_history(&self) -> bool {
+        self.cursor().is_some()
+    }
+    fn has_newer_history(&self) -> bool {
+        Self::has_newer_history(self)
+    }
+    fn reveal_request(&self) -> Option<usize> {
+        Self::reveal_request(self)
+    }
+    fn newer_reveal_request(&self) -> Option<usize> {
+        Self::newer_reveal_request(self)
+    }
+    fn cancel_newer_reveal(&mut self) {
+        Self::cancel_newer_reveal(self);
+    }
+    fn cancel_older_reveal(&mut self) {
+        Self::cancel_older_reveal(self);
+    }
+    fn request_load(&mut self, rows: usize) {
+        Self::request_load(self, rows);
+    }
+    fn request_load_newer(&mut self, rows: usize) {
+        Self::request_load_newer(self, rows);
+    }
+    fn clear_reveal_request(&mut self) {
+        Self::clear_reveal_request(self);
+    }
+    fn take_ready_pages(&mut self) -> (bool, bool, bool) {
+        Self::take_ready_pages(self)
+    }
+    fn consume_reveal(&mut self, older: bool, rows: usize) {
+        Self::consume_reveal(self, older, rows);
+    }
+}
