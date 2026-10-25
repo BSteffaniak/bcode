@@ -604,6 +604,40 @@ fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "static-bundled-vox-plugin")]
+    #[test]
+    fn vox_loads_with_command_routing_but_daemon_actions_still_fail_closed() {
+        let bundles = super::static_bundled_plugins();
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundles,
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: std::collections::BTreeSet::from(["bcode.vox".into()]),
+                disabled: std::collections::BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        let mut host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+            .expect("Vox command declarations must permit plugin activation");
+        let commands = host.registered_command_contributions(&bcode_command::CommandSurface::Slash);
+        assert_eq!(commands.len(), bcode_vox_plugin::commands().len());
+        let response = host
+            .invoke_service(
+                "bcode.vox",
+                bcode_command::COMMAND_INTERFACE_ID,
+                bcode_command::OP_INVOKE_COMMAND,
+                serde_json::to_vec(&bcode_command::InvokeCommandRequest {
+                    command_id: "vox.start".into(),
+                    args: std::collections::BTreeMap::new(),
+                    context: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(response.error.unwrap().code, "local_frontend_required");
+        host.deactivate_all().unwrap();
+    }
+
     #[test]
     fn bundled_plugins_activate_alone_and_with_each_peer_disabled() {
         let runtime = tokio::runtime::Builder::new_current_thread()

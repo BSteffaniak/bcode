@@ -3,9 +3,10 @@ name    = "Vox Local Dictation"
 version = "0.1.0"
 
 [[services]]
-description  = "User-only local dictation actions; no model-callable tools"
-interface_id = "bcode.command/v1"
-name         = "Vox User Commands"
+description           = "User-only local dictation actions; no model-callable tools"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Vox User Commands"
 
 [[services]]
 description  = "Versioned actions and redacted status; daemon actions fail closed"
