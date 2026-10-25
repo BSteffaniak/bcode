@@ -10,6 +10,11 @@
 pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
     #[allow(unused_mut)]
     let mut extensions = Vec::new();
+    #[cfg(feature = "static-bundled-vox-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.vox",
+        bcode_vox_plugin::tui_registry,
+    ));
     #[cfg(feature = "static-bundled-code-review-plugin")]
     extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
         "bcode.code_review",
@@ -160,6 +165,8 @@ pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiR
         "bcode.metrics" => Some(bcode_metrics_plugin::tui::tui_registry()),
         #[cfg(feature = "static-bundled-model-plugin")]
         "bcode.model" => Some(bcode_model_plugin::model_tui_registry()),
+        #[cfg(feature = "static-bundled-vox-plugin")]
+        "bcode.vox" => Some(bcode_vox_plugin::tui_registry()),
         #[cfg(feature = "static-bundled-ocr-plugin")]
         "bcode.ocr" => Some(bcode_ocr_plugin::ocr_tui_registry()),
         #[cfg(feature = "static-bundled-read-plugin")]
@@ -268,6 +275,11 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     ));
     #[cfg(feature = "static-bundled-metrics-plugin")]
     plugins.push(metrics_plugin());
+    #[cfg(feature = "static-bundled-vox-plugin")]
+    plugins.push(bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/vox-plugin/bcode-plugin.toml"),
+        bcode_vox_plugin::static_plugin(),
+    ));
     #[cfg(feature = "static-bundled-ocr-plugin")]
     plugins.push(ocr_plugin());
     #[cfg(feature = "static-bundled-fake-provider-plugin")]

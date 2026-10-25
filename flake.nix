@@ -34,6 +34,9 @@
             cmake
             markdownlint-cli
             pkg-config
+            alsa-lib
+            libxkbcommon
+            wayland
             openssl
             fish
           ]);

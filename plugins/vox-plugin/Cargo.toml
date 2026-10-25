@@ -1,0 +1,30 @@
+[package]
+authors.workspace    = true
+categories           = ["development-tools"]
+description          = "Client-local Vox dictation integration for Bcode"
+edition.workspace    = true
+keywords             = ["dictation", "speech", "plugin"]
+license.workspace    = true
+name                 = "bcode_vox_plugin"
+readme.workspace     = true
+repository.workspace = true
+version.workspace    = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_command.workspace    = true
+bcode_plugin_sdk.workspace = true
+bcode_vox.workspace        = true
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace       = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default          = []
+fail-on-warnings = []
+native-dictation = ["bcode_vox/linux-desktop"]
+static-bundled   = ["bcode_plugin_sdk/tui"]

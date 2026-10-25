@@ -4662,6 +4662,15 @@ fn apply_root_slash_command_outcome(
                     chat.app.set_status(refusal.message().to_owned());
                     return;
                 }
+                if let Some(result) = chat.app.plugin_presentation().and_then(|presentation| {
+                    presentation.invoke_frontend_command(&plugin_id, &command_id)
+                }) {
+                    chat.app.set_status(match result {
+                        Ok(()) => "local frontend action accepted".to_owned(),
+                        Err(message) => message,
+                    });
+                    return;
+                }
                 let working_directory = chat.app.working_directory().map_or_else(
                     || settings.launch_working_directory().to_path_buf(),
                     std::path::Path::to_path_buf,

@@ -1565,7 +1565,30 @@ impl BcodeRuntimeModel {
                 self.loop_state.composer_interaction.dismiss();
                 super::invalidation::UiInvalidation::Structural
             }
-            Event::Focus(_) | Event::Tick => super::invalidation::UiInvalidation::Paint,
+            Event::Tick => {
+                if !self.loop_state.modal_foreground() {
+                    let result = self
+                        .chat
+                        .app
+                        .plugin_presentation()
+                        .map(super::plugin_tui::PluginTuiPresentation::drain_frontend_text);
+                    match result {
+                        Some(Ok(texts)) if !texts.is_empty() => {
+                            for text in texts {
+                                self.chat.app.reset_input_history_navigation();
+                                self.chat.app.paste_composer_text(&text);
+                            }
+                            self.chat.app.wake_cursor();
+                            self.draft_autosave.observe(&self.chat, Instant::now());
+                            return super::invalidation::UiInvalidation::Structural;
+                        }
+                        Some(Err(message)) => self.chat.app.set_status(message),
+                        _ => {}
+                    }
+                }
+                super::invalidation::UiInvalidation::Paint
+            }
+            Event::Focus(_) => super::invalidation::UiInvalidation::Paint,
             Event::Paste(text) => {
                 if self.loop_state.modal_foreground() {
                     return super::invalidation::UiInvalidation::None;
@@ -2642,6 +2665,20 @@ impl BcodeRuntimeModel {
                     self.chat.app.set_status(refusal.message().to_owned());
                     return;
                 }
+                if let Some(result) = self
+                    .chat
+                    .app
+                    .plugin_presentation()
+                    .and_then(|presentation| {
+                        presentation.invoke_frontend_command(&plugin_id, &command_id)
+                    })
+                {
+                    self.chat.app.set_status(match result {
+                        Ok(()) => "local frontend action accepted".to_owned(),
+                        Err(message) => message,
+                    });
+                    return;
+                }
                 let working_directory = self
                     .chat
                     .app
@@ -3031,6 +3068,9 @@ impl BcodeRuntimeModel {
     }
 
     pub fn shutdown_owned_work(&mut self) {
+        if let Some(presentation) = self.chat.app.plugin_presentation() {
+            presentation.shutdown_frontend_commands();
+        }
         self.loop_state.abort_all_effects();
         if let Some(event_task) = self.chat.event_task.take() {
             event_task.abort();

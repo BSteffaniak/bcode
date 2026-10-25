@@ -3313,9 +3313,32 @@ impl StaticPluginTuiExtension {
     }
 }
 
+/// A frontend-local, explicitly user-invoked command contribution.
+///
+/// Implementations own their domain workflow. The host only invokes actions and
+/// applies final literal text to its currently focused editor. Never route these
+/// callbacks through a remote daemon or model-tool dispatch.
+pub trait PluginFrontendCommand: Send + Sync {
+    /// Invoke one explicit user action without blocking on recognition.
+    ///
+    /// # Errors
+    /// Returns a safe diagnostic if local action admission fails.
+    fn invoke(&self) -> Result<(), String>;
+    /// Consume at most one finalized text contribution. No implicit retries.
+    ///
+    /// # Errors
+    /// Returns a safe diagnostic if completion cannot be observed.
+    fn drain_text(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    /// Release this frontend's workflow resources on orderly shutdown.
+    fn shutdown(&self) {}
+}
+
 /// Registry of native TUI surfaces contributed by one plugin.
 #[derive(Default)]
 pub struct PluginTuiRegistry {
+    frontend_commands: BTreeMap<String, std::sync::Arc<dyn PluginFrontendCommand>>,
     composer_registry: crate::composer::PluginComposerRegistry,
     keymap_actions: Vec<keymap::KeymapAction>,
     factories: BTreeMap<String, Box<dyn PluginTuiSurfaceFactory>>,
@@ -3325,6 +3348,10 @@ pub struct PluginTuiRegistry {
 impl std::fmt::Debug for PluginTuiRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginTuiRegistry")
+            .field(
+                "frontend_commands",
+                &self.frontend_commands.keys().collect::<Vec<_>>(),
+            )
             .field("composer_registry", &self.composer_registry)
             .field("keymap_actions", &self.keymap_actions)
             .field("surface_kinds", &self.factories.keys().collect::<Vec<_>>())
@@ -3337,6 +3364,41 @@ impl std::fmt::Debug for PluginTuiRegistry {
 }
 
 impl PluginTuiRegistry {
+    /// Register an explicitly user-operated frontend-local command.
+    pub fn register_frontend_command(
+        &mut self,
+        command_id: impl Into<String>,
+        command: std::sync::Arc<dyn PluginFrontendCommand>,
+    ) {
+        self.frontend_commands.insert(command_id.into(), command);
+    }
+    /// Resolve an exact frontend command, never a remote service.
+    #[must_use]
+    pub fn frontend_command(
+        &self,
+        command_id: &str,
+    ) -> Option<std::sync::Arc<dyn PluginFrontendCommand>> {
+        self.frontend_commands.get(command_id).cloned()
+    }
+    /// Consume finalized literal text from registered frontend commands.
+    ///
+    /// # Errors
+    /// Returns an adapter's safe completion error. Already drained text is not retried.
+    pub fn drain_frontend_text(&self) -> Result<Vec<String>, String> {
+        let mut text = Vec::new();
+        for command in self.frontend_commands.values() {
+            if let Some(value) = command.drain_text()? {
+                text.push(value);
+            }
+        }
+        Ok(text)
+    }
+    /// Stop resources owned by this frontend registry.
+    pub fn shutdown_frontend_commands(&self) {
+        for command in self.frontend_commands.values() {
+            command.shutdown();
+        }
+    }
     /// Deliver bounded generic presentation configuration to every retained visual adapter.
     ///
     /// # Errors

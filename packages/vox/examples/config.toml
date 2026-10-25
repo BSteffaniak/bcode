@@ -1,0 +1,17 @@
+# Example: copy to ~/.config/vox/config.toml and set an installed model path.
+backend               = "local"
+compute               = "cpu"
+delivery              = "typing"
+delivery_backend      = "auto"
+max_recording_seconds = 120
+model_path            = "/absolute/path/to/whisper-tiny.en-Q8_0.gguf"
+multiline             = false
+spoken_punctuation    = true
+
+[recognition]
+language   = "en"
+vocabulary = ["Bcode", "BMUX", "Vox"]
+
+[replacements]
+"bee code" = "Bcode"
+"bee mux"  = "BMUX"

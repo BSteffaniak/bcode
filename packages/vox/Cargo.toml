@@ -1,0 +1,79 @@
+[package]
+authors.workspace    = true
+categories           = ["multimedia::audio", "command-line-utilities"]
+description          = "Independent local-first voice dictation library and Vox utility"
+edition.workspace    = true
+keywords             = ["dictation", "speech", "voice"]
+license.workspace    = true
+name                 = "bcode_vox"
+readme.workspace     = true
+repository.workspace = true
+version.workspace    = true
+
+[[bin]]
+name = "vox"
+path = "src/main.rs"
+
+[dependencies]
+arboard = { workspace = true, optional = true }
+audioadapter-buffers.workspace = true
+clap = { workspace = true, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+cpal = { workspace = true, optional = true }
+hex.workspace = true
+hound.workspace = true
+libc.workspace = true
+reqwest = { workspace = true, features = ["blocking", "multipart"] }
+rubato.workspace = true
+rustix = { workspace = true, features = ["event", "std", "fs"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "rt",
+    "time",
+    "net",
+    "sync",
+    "macros",
+    "signal",
+] }
+toml = { workspace = true, features = ["display"] }
+transcribe-cpp = { workspace = true, optional = true }
+unicode-segmentation.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = { workspace = true, optional = true }
+wayland-protocols = { workspace = true, features = [
+    "client",
+    "staging",
+], optional = true }
+wayland-protocols-misc = { workspace = true, features = [
+    "client",
+], optional = true }
+x11rb = { workspace = true, features = ["xtest", "xkb"], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+clipboard = ["dep:arboard"]
+default = []
+fail-on-warnings = []
+linux-desktop = ["native-audio", "local-inference", "wayland", "x11"]
+local-inference = ["dep:transcribe-cpp"]
+metal = ["local-inference", "transcribe-cpp/metal"]
+native-audio = ["dep:cpal"]
+vulkan = ["local-inference", "transcribe-cpp/vulkan"]
+wayland = [
+    "dep:wayland-client",
+    "dep:wayland-protocols-misc",
+    "dep:wayland-protocols",
+]
+x11 = ["dep:x11rb"]

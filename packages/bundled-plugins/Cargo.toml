@@ -49,6 +49,7 @@ bcode_web_search_plugin                 = { workspace = true, optional = true }
 bcode_workflow_plugin                   = { workspace = true, optional = true }
 bcode_worktree_plugin                   = { workspace = true, optional = true }
 
+bcode_vox_plugin = { workspace = true, optional = true }
 [dev-dependencies]
 bcode_command = { workspace = true }
 bcode_config  = { workspace = true }
@@ -178,6 +179,7 @@ static-bundled-plugins = [
     "static-bundled-eval-plugin",
     "static-bundled-usage-plugin",
     "static-bundled-metrics-plugin",
+    "static-bundled-vox-plugin",
     "static-bundled-ocr-plugin",
     "static-bundled-fake-provider-plugin",
     "static-bundled-file-references-plugin",
@@ -244,6 +246,10 @@ static-bundled-vim-edit-plugin = [
     "dep:bcode_vim_edit_plugin",
     "bcode_vim_edit_plugin/static-bundled",
 ]
+static-bundled-vox-plugin = [
+    "dep:bcode_vox_plugin",
+    "bcode_vox_plugin/static-bundled",
+]
 static-bundled-web-search-plugin = [
     "dep:bcode_web_search_plugin",
     "bcode_web_search_plugin/static-bundled",
@@ -259,4 +265,8 @@ static-bundled-worktree-plugin = [
 system-ocr-tesseract = [
     "static-bundled-ocr-plugin",
     "bcode_ocr_plugin/system-tesseract",
+]
+vox-native-dictation = [
+    "static-bundled-vox-plugin",
+    "bcode_vox_plugin/native-dictation",
 ]

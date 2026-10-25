@@ -778,6 +778,63 @@ impl PluginTuiPresentation {
             .ok()?
     }
 
+    /// Invoke a registered frontend-local command only while its plugin is enabled.
+    /// A missing adapter is not permission to fall back to daemon execution.
+    pub fn invoke_frontend_command(
+        &self,
+        plugin_id: &str,
+        command_id: &str,
+    ) -> Option<Result<(), String>> {
+        let loaded = match &self.backend {
+            PresentationPluginBackend::Synchronous(host) => host.has_plugin(plugin_id),
+            PresentationPluginBackend::Runtime(runtime) => {
+                runtime.registry().manifests().contains_key(plugin_id)
+            }
+        };
+        if !loaded {
+            return None;
+        }
+        Some(
+            self.registry(plugin_id)?
+                .frontend_command(command_id)?
+                .invoke(),
+        )
+    }
+
+    /// Consume bounded frontend text from enabled local plugin registries.
+    ///
+    /// # Errors
+    /// Returns registry lock failures or safe adapter completion errors.
+    pub fn drain_frontend_text(&self) -> Result<Vec<String>, String> {
+        let registries = self
+            .registries
+            .lock()
+            .map_err(|_| "frontend registry unavailable".to_owned())?;
+        let mut output = Vec::new();
+        for (id, registry) in registries.iter() {
+            let loaded = match &self.backend {
+                PresentationPluginBackend::Synchronous(host) => host.has_plugin(id),
+                PresentationPluginBackend::Runtime(runtime) => {
+                    runtime.registry().manifests().contains_key(id)
+                }
+            };
+            if loaded {
+                output.extend(registry.drain_frontend_text()?);
+            }
+        }
+        drop(registries);
+        Ok(output)
+    }
+
+    /// Release frontend-local plugin resources before terminal shutdown.
+    pub fn shutdown_frontend_commands(&self) {
+        if let Ok(registries) = self.registries.lock() {
+            for registry in registries.values() {
+                registry.shutdown_frontend_commands();
+            }
+        }
+    }
+
     /// Return one retained native TUI registry.
     #[must_use]
     pub fn registry(&self, plugin_id: &str) -> Option<Arc<PluginTuiRegistry>> {

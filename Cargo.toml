@@ -1,8 +1,10 @@
 [workspace]
 members = [
+    "packages/vox",
     "xtask",
     "examples/hello-plugin",
     "examples/question-dynamic-plugin",
+    "plugins/vox-plugin",
     "plugins/filesystem-plugin",
     "plugins/file-references-plugin",
     "plugins/git-plugin",
@@ -166,6 +168,22 @@ brouter_server               = { version = "0.0.1-alpha.0", default-features = f
 brouter_telemetry            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/telemetry" }
 brouter_telemetry_models     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/telemetry/models" }
 brouter_telemetry_util       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/telemetry-util" }
+
+# Vox native capability dependencies (optional at the package boundary).
+audioadapter-buffers = { version = "5.2.0", default-features = false }
+bcode_vox = { version = "0.0.1-alpha.0", default-features = false, path = "packages/vox" }
+bcode_vox_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/vox-plugin" }
+cpal = { version = "0.18.2", default-features = false }
+hound = { version = "3.5.1", default-features = false }
+rubato = { version = "5.0.1", default-features = false, features = [
+    "fft_resampler",
+] }
+rustix = { version = "1.1.5", default-features = false }
+transcribe-cpp = { version = "=0.4.1", default-features = false }
+wayland-client = { version = "0.31.15", default-features = false }
+wayland-protocols = { version = "0.32.13", default-features = false }
+wayland-protocols-misc = { version = "0.3.12", default-features = false }
+x11rb = { version = "0.14.0", default-features = false }
 
 # Internal bcode packages
 bcode_agent_permissions                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-permissions" }
