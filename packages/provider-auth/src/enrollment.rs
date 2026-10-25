@@ -3,6 +3,12 @@
 //! Preparation is read-only. Credential custody and interactive provider effects
 //! are separate operations; callers publish metadata only after successful enrollment.
 
+mod diagnostics;
+mod intent;
+mod journey;
+pub use diagnostics::{EnrollmentConflict, EnrollmentConflictReason, EnrollmentConflictSource};
+pub use intent::{EnrollmentIntent, plan_intent};
+pub use journey::{AuthenticationJourney, AuthenticationStep};
 mod pooling;
 pub use pooling::{
     EnrollmentPlan, EnrollmentResult, PoolEnrollment, complete, complete_with_config, plan,
@@ -35,6 +41,18 @@ pub struct PreparedEnrollment {
     pub publish_runtime: bool,
 }
 
+impl EnrollmentError {
+    pub(crate) fn in_pool(self, name: &str) -> Self {
+        match self {
+            Self::Conflict(mut diagnostic) => {
+                diagnostic.pool = Some(name.to_owned());
+                Self::Conflict(diagnostic)
+            }
+            error => error,
+        }
+    }
+}
+
 /// Enrollment preparation failure. No secret values are included.
 #[derive(Debug, thiserror::Error)]
 pub enum EnrollmentError {
@@ -44,6 +62,9 @@ pub enum EnrollmentError {
     /// Pool ownership, membership or intent is inconsistent or ambiguous.
     #[error("Authentication pool is ambiguous or incompatible; existing metadata preserved")]
     PoolConflict,
+    /// Structured failure to change pool metadata, without secret values.
+    #[error("{0}")]
+    Conflict(EnrollmentConflict),
     /// New context accounts require a declared destination until context registration is available.
     #[error(
         "Declare this context's authentication profile before enrollment; unscoped account creation is not permitted"

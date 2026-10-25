@@ -331,3 +331,85 @@ fn absent_capability_is_standalone_and_invalid_capability_is_error() {
         .is_err()
     );
 }
+
+#[test]
+fn reauthentication_does_not_validate_or_mutate_conflicting_pool_membership() {
+    let config = BcodeConfig::default();
+    let enrolled = make_plan(
+        &config,
+        &RuntimeAuthSubscriptions::default(),
+        "one",
+        PoolEnrollment::Automatic,
+    )
+    .unwrap();
+    let mut runtime = apply(&enrolled);
+    let name = enrolled.result.pool.as_ref().unwrap();
+    runtime.pools.get_mut(name).unwrap().owner_plugin_id = None;
+    let before = runtime.clone();
+    let destination = EnrollmentDestination {
+        profile: Some("one".to_owned()),
+        ..Default::default()
+    };
+    let renewal = super::super::plan_intent(
+        &config,
+        &runtime,
+        &provider(),
+        ("example.plugin", "browser"),
+        destination.clone(),
+        super::super::EnrollmentIntent::Reauthenticate,
+        Some(&capability()),
+    )
+    .unwrap();
+    assert!(renewal.preserve_memberships);
+    assert!(renewal.pool.is_none());
+    assert_eq!(runtime, before);
+    assert!(complete_with_config(&renewal, &config).is_ok());
+    let error = plan(
+        &config,
+        &runtime,
+        &provider(),
+        "example.plugin",
+        "browser",
+        destination,
+        PoolEnrollment::Explicit(name.clone()),
+        Some(&capability()),
+    )
+    .err()
+    .unwrap();
+    let EnrollmentError::Conflict(diagnostic) = error else {
+        panic!("expected structured conflict");
+    };
+    assert_eq!(diagnostic.pool.as_deref(), Some(name.as_str()));
+    assert_eq!(diagnostic.reason, Reason::Ownership);
+}
+
+#[test]
+fn pool_metadata_mismatch_identifies_category_without_exposing_destinations() {
+    let config = BcodeConfig::default();
+    let enrolled = make_plan(
+        &config,
+        &RuntimeAuthSubscriptions::default(),
+        "one",
+        PoolEnrollment::Automatic,
+    )
+    .unwrap();
+    let mut runtime = apply(&enrolled);
+    let name = enrolled.result.pool.as_ref().unwrap();
+    runtime.pools.get_mut(name).unwrap().profiles[0].vault = "/do-not-print-this-vault".into();
+    let error = make_plan(
+        &config,
+        &runtime,
+        "one",
+        PoolEnrollment::Explicit(name.clone()),
+    )
+    .err()
+    .unwrap();
+    assert!(!error.to_string().contains("do-not-print"));
+    assert!(matches!(
+        error,
+        EnrollmentError::Conflict(EnrollmentConflict {
+            reason: Reason::MemberMetadata,
+            ..
+        })
+    ));
+}

@@ -12539,38 +12539,35 @@ async fn enroll_auth_provider_with_host(
     let provider = registered_auth_provider(host, provider_id)?;
     let mut prompts = auth_login::terminal();
     prompts.interactive &= matches!(prompting, AuthLoginPrompting::Interactive);
-    let method = prompts.method(&provider, requested_method)?;
     let config = bcode_config::load_config()?;
     let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
     let compatibility = auth_pool_compatibility(host, &provider)?;
-    let pooling = if standalone {
-        bcode_provider_auth::enrollment::PoolEnrollment::Standalone
-    } else if let Some(pool) = pool {
-        bcode_provider_auth::enrollment::PoolEnrollment::Explicit(pool.to_owned())
-    } else {
-        bcode_provider_auth::enrollment::PoolEnrollment::Automatic
+    let (mut plan, method) = loop {
+        prompts.back_requested = false;
+        let preflight = auth_login::preflight(
+            &mut prompts,
+            &provider,
+            &config,
+            &runtime,
+            compatibility.as_ref(),
+            &AuthProviderLoginOptions {
+                explicit_profile,
+                explicit_vault: explicit_vault.clone(),
+                recipient_key,
+                no_device_seal,
+                pool,
+                standalone,
+                requested_method,
+                verify,
+                prompting: AuthLoginPrompting::Interactive,
+            },
+        );
+        match preflight {
+            Ok(value) => break value,
+            Err(_) if prompts.back_requested => {}
+            Err(error) => return Err(error),
+        }
     };
-    let planning = auth_login::Planning {
-        config: &config,
-        runtime: &runtime,
-        provider: &provider,
-        method,
-        compatibility: compatibility.as_ref(),
-    };
-    let profile = prompts.profile(
-        &planning,
-        explicit_profile,
-        registered_auth_profile_hint(&config, &runtime, &provider, explicit_profile),
-    )?;
-    let mut plan = prompts.plan(
-        &planning,
-        bcode_provider_auth::enrollment::EnrollmentDestination {
-            profile,
-            vault: explicit_vault,
-            recipient_key: recipient_key.map(str::to_owned),
-        },
-        pooling,
-    )?;
     let resolved = &mut plan.prepared.resolved;
     if no_device_seal {
         resolved
@@ -12850,7 +12847,15 @@ async fn run_auth_interactive_flow(
         verify,
         revoke,
     };
+    let mut status: Option<bcode_tui::auth_inline::AuthStatus> = None;
     loop {
+        if let Some(surface) = status.as_mut()
+            && surface.cancelled()?
+        {
+            drop(status.take());
+            cancel_auth_flow(host, provider, operation, &request)?;
+            return Err(CliError::AuthFlowCancelled);
+        }
         request
             .validate()
             .map_err(|error| CliError::LoginProfile(error.to_string()))?;
@@ -12864,10 +12869,46 @@ async fn run_auth_interactive_flow(
             .map_err(plugin_service_call_error)?;
         // Validate and report diagnostics before returning terminal failures;
         // failed/cancelled flows must not execute further interactive effects.
+        // Validate and report terminal responses only after returning terminal ownership.
+        if matches!(
+            response.status,
+            bcode_provider_auth_models::AuthFlowStatus::Succeeded
+                | bcode_provider_auth_models::AuthFlowStatus::Failed
+                | bcode_provider_auth_models::AuthFlowStatus::Cancelled
+        ) {
+            drop(status.take());
+        }
+        if !response.diagnostics.is_empty() {
+            drop(status.take());
+        }
         let terminal = prepare_auth_flow_response(&mut std::io::stderr().lock(), &response)?;
+        if !terminal && status.is_none() && bcode_tui::auth_inline::supported() {
+            status = Some(bcode_tui::auth_inline::AuthStatus::enter(
+                &bcode_config::load_config()?.tui,
+            )?);
+        }
         let mut input = None;
         for effect in &response.effects {
-            write_auth_effect(&mut std::io::stdout().lock(), effect)?;
+            if let Some(surface) = status.as_mut() {
+                use bcode_provider_auth_models::AuthFlowEffect;
+                let detail = match effect {
+                    AuthFlowEffect::OpenBrowser { url } => {
+                        format!("Opening browser. If it does not open, visit:\n{url}")
+                    }
+                    AuthFlowEffect::DisplayDeviceCode {
+                        verification_url,
+                        user_code,
+                        ..
+                    } => format!("Visit {verification_url}\nDevice code: {user_code}"),
+                    AuthFlowEffect::Message { message } => message.clone(),
+                    AuthFlowEffect::Wait { .. } | AuthFlowEffect::Prompt { .. } => String::new(),
+                };
+                if !detail.is_empty() {
+                    surface.show(&provider.contribution.display_name, &detail)?;
+                }
+            } else {
+                write_auth_effect(&mut std::io::stdout().lock(), effect)?;
+            }
             match effect {
                 bcode_provider_auth_models::AuthFlowEffect::OpenBrowser { url } => {
                     open_browser(url);
@@ -12878,8 +12919,25 @@ async fn run_auth_interactive_flow(
                 } => {
                     open_browser(verification_url);
                 }
-                bcode_provider_auth_models::AuthFlowEffect::Prompt { prompt_id, .. } => {
-                    let value = read_stdin_line()?;
+                bcode_provider_auth_models::AuthFlowEffect::Prompt {
+                    prompt_id,
+                    message,
+                    choices,
+                } => {
+                    // One terminal/input owner: suspend the status guard before another prompt.
+                    drop(status.take());
+                    let value = if choices.is_empty() {
+                        write_auth_effect(&mut std::io::stdout().lock(), effect)?;
+                        read_stdin_line()?
+                    } else {
+                        let mut prompt = auth_login::terminal();
+                        let index = prompt.choose(
+                            message,
+                            choices,
+                            "Provide an exact provider prompt choice.",
+                        )?;
+                        choices[index].clone()
+                    };
                     effect
                         .validate_answer(&value)
                         .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
@@ -12889,12 +12947,30 @@ async fn run_auth_interactive_flow(
                     });
                 }
                 bcode_provider_auth_models::AuthFlowEffect::Wait { millis } => {
-                    tokio::time::sleep(Duration::from_millis(*millis)).await;
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(*millis);
+                    while tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(
+                            Duration::from_millis(50).min(
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            ),
+                        )
+                        .await;
+                        if let Some(surface) = status.as_mut()
+                            && surface.cancelled()?
+                        {
+                            drop(status.take());
+                            let mut cancellation = request.clone();
+                            cancellation.state.clone_from(&response.state);
+                            cancel_auth_flow(host, provider, operation, &cancellation)?;
+                            return Err(CliError::AuthFlowCancelled);
+                        }
+                    }
                 }
                 bcode_provider_auth_models::AuthFlowEffect::Message { .. } => {}
             }
         }
         if terminal {
+            drop(status.take());
             if !response.credentials.is_empty() {
                 bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
                     resolved,
@@ -12912,6 +12988,35 @@ async fn run_auth_interactive_flow(
         request.state = response.state;
         request.input = input;
     }
+}
+
+fn cancel_auth_flow(
+    host: &bcode_plugin::PluginHost,
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    operation: &str,
+    request: &bcode_provider_auth_models::AuthFlowRequest,
+) -> Result<(), CliError> {
+    let mut request = request.clone();
+    request.operation = bcode_provider_auth_models::AuthFlowOperation::Cancel;
+    request.input = None;
+    let response = host
+        .invoke_service_json::<_, bcode_provider_auth_models::AuthFlowResponse>(
+            &provider.plugin_id,
+            bcode_provider_auth_models::AUTH_INTERFACE_ID,
+            operation,
+            &request,
+        )
+        .map_err(plugin_service_call_error)?;
+    response
+        .validate()
+        .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    if response.status != bcode_provider_auth_models::AuthFlowStatus::Cancelled {
+        return Err(CliError::LoginProfile(
+            "Provider did not confirm cancellation. Inspect authentication state before retrying."
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_auth_effect(

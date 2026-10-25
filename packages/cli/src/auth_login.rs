@@ -39,6 +39,8 @@ pub struct Prompter<R, W> {
     pub reader: R,
     pub writer: W,
     pub interactive: bool,
+    pub rich: bool,
+    pub back_requested: bool,
 }
 
 pub fn terminal() -> Prompter<std::io::Stdin, std::io::Stderr> {
@@ -46,11 +48,18 @@ pub fn terminal() -> Prompter<std::io::Stdin, std::io::Stderr> {
         reader: std::io::stdin(),
         writer: std::io::stderr(),
         interactive: interactive(),
+        rich: bcode_tui::auth_inline::supported(),
+        back_requested: false,
     }
 }
 
 impl<R: std::io::Read, W: Write> Prompter<R, W> {
-    fn choose(&mut self, title: &str, labels: &[String], hint: &str) -> Result<usize, CliError> {
+    pub fn choose(
+        &mut self,
+        title: &str,
+        labels: &[String],
+        hint: &str,
+    ) -> Result<usize, CliError> {
         if !self.interactive {
             return Err(CliError::LoginProfile(format!("{title}. {hint}")));
         }
@@ -58,6 +67,23 @@ impl<R: std::io::Read, W: Write> Prompter<R, W> {
             return Err(CliError::LoginProfile(format!(
                 "{title}: no available choices. {hint}"
             )));
+        }
+        if self.rich {
+            let config = bcode_config::load_config()?;
+            return match bcode_tui::auth_inline::choose(title, labels, &config.tui)? {
+                bcode_tui::auth_inline::AuthChoiceOutcome::Selected(index) => Ok(index),
+                bcode_tui::auth_inline::AuthChoiceOutcome::Back => {
+                    self.back_requested = true;
+                    Err(CliError::LoginProfile(
+                        "Return to previous authentication step.".to_owned(),
+                    ))
+                }
+                bcode_tui::auth_inline::AuthChoiceOutcome::Cancelled => {
+                    Err(CliError::LoginProfile(
+                        "Authentication cancelled before provider side effects.".to_owned(),
+                    ))
+                }
+            };
         }
         writeln!(self.writer, "{title}")?;
         for (index, label) in labels.iter().enumerate() {
@@ -161,9 +187,7 @@ impl<R: std::io::Read, W: Write> Prompter<R, W> {
                     Some(name),
                     planning.runtime,
                 )
-                .is_ok_and(|resolved| {
-                    resolved.profile.scheme.as_deref() == Some(planning.method.method_id())
-                })
+                .is_ok()
             })
             .collect::<Vec<_>>();
         let mut labels = profiles
@@ -201,6 +225,31 @@ impl<R: std::io::Read, W: Write> Prompter<R, W> {
         destination: EnrollmentDestination,
         pooling: PoolEnrollment,
     ) -> Result<EnrollmentPlan, CliError> {
+        if pooling == PoolEnrollment::Automatic
+            && bcode_provider_auth::resolve_auth_provider_profile(
+                planning.config,
+                &planning.provider.contribution.provider_id,
+                &planning.provider.plugin_id,
+                destination.profile.as_deref(),
+                planning.runtime,
+            )
+            .is_ok()
+        {
+            writeln!(
+                self.writer,
+                "Reauthenticating existing account; pool memberships will be preserved."
+            )?;
+            return bcode_provider_auth::enrollment::plan_intent(
+                planning.config,
+                planning.runtime,
+                &planning.provider.contribution,
+                (&planning.provider.plugin_id, planning.method.method_id()),
+                destination,
+                bcode_provider_auth::enrollment::EnrollmentIntent::Reauthenticate,
+                planning.compatibility,
+            )
+            .map_err(|error| CliError::LoginProfile(error.to_string()));
+        }
         let eligible = matches!(planning.method, AuthMethodContribution::Interactive { .. })
             && planning.compatibility.is_some_and(|capability| {
                 capability
@@ -253,6 +302,13 @@ impl<R: std::io::Read, W: Write> Prompter<R, W> {
                 "Automatic pool enrollment is unavailable: {error}"
             )?,
         }
+        if plans.len() == 1 {
+            writeln!(
+                self.writer,
+                "Authenticating only; existing pool memberships preserved."
+            )?;
+            return Ok(plans.remove(0));
+        }
         let index = self.choose(
             "Choose authentication pool enrollment",
             &labels,
@@ -291,3 +347,182 @@ impl Planning<'_> {
 
 #[cfg(test)]
 mod tests;
+
+pub fn preflight<'a, R: std::io::Read, W: Write>(
+    prompts: &mut Prompter<R, W>,
+    provider: &'a RegisteredAuthProvider,
+    config: &BcodeConfig,
+    runtime: &RuntimeAuthSubscriptions,
+    compatibility: Option<&AuthPoolCompatibility>,
+    options: &super::AuthProviderLoginOptions<'_>,
+) -> Result<(EnrollmentPlan, &'a AuthMethodContribution), CliError> {
+    use bcode_provider_auth::enrollment::{AuthenticationJourney, AuthenticationStep};
+    let mut journey = AuthenticationJourney::new();
+    let mut prepared = None;
+    let mut inferred = None;
+    let pooling = if options.standalone {
+        PoolEnrollment::Standalone
+    } else if let Some(pool) = options.pool {
+        PoolEnrollment::Explicit(pool.to_owned())
+    } else {
+        PoolEnrollment::Automatic
+    };
+    let mut membership_locked = options.standalone || options.pool.is_some();
+    loop {
+        prompts.back_requested = false;
+        let result = (|| -> Result<(), CliError> {
+            match journey.step() {
+                AuthenticationStep::Account => {
+                    let first_method = initial_method(provider)?;
+                    let (profile, method, locked) = choose_account(
+                        prompts,
+                        &Planning {
+                            config,
+                            runtime,
+                            provider,
+                            method: first_method,
+                            compatibility,
+                        },
+                        options,
+                    )?;
+                    inferred = method;
+                    membership_locked = locked;
+                    prepared = None;
+                    journey.select_account(profile);
+                }
+                AuthenticationStep::Method => {
+                    let method = prompts
+                        .method(provider, options.requested_method.or(inferred.as_deref()))?;
+                    prepared = None;
+                    journey.select_method(method.method_id().to_owned());
+                }
+                AuthenticationStep::Membership => {
+                    let method = selected_auth_method(provider, journey.method())?;
+                    prepared = Some(prompts.plan(
+                        &Planning {
+                            config,
+                            runtime,
+                            provider,
+                            method,
+                            compatibility,
+                        },
+                        EnrollmentDestination {
+                            profile: journey.account().map(str::to_owned),
+                            vault: options.explicit_vault.clone(),
+                            recipient_key: options.recipient_key.map(str::to_owned),
+                        },
+                        pooling.clone(),
+                    )?);
+                    journey.review();
+                }
+                AuthenticationStep::Review => {}
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if prompts.back_requested
+                && journey.back(
+                    options.explicit_profile.is_some(),
+                    options.requested_method.is_some() || inferred.is_some(),
+                    membership_locked,
+                )
+            {
+                continue;
+            }
+            return Err(error);
+        }
+        // Review is entered by membership planning; only a completed review admits effects.
+        if journey.step() == AuthenticationStep::Review && prepared.is_some() {
+            // Run review once after entering it, not in the membership transition.
+            let plan = prepared
+                .take()
+                .ok_or_else(|| CliError::LoginProfile("Authentication plan missing.".to_owned()))?;
+            let method = selected_auth_method(provider, journey.method())?;
+            if prompts.interactive
+                && let Err(error) = review(prompts, provider, &plan, method)
+            {
+                if prompts.back_requested
+                    && journey.back(
+                        options.explicit_profile.is_some(),
+                        options.requested_method.is_some() || inferred.is_some(),
+                        membership_locked,
+                    )
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+            return Ok((plan, method));
+        }
+    }
+}
+
+fn choose_account<R: std::io::Read, W: Write>(
+    prompts: &mut Prompter<R, W>,
+    planning: &Planning<'_>,
+    options: &super::AuthProviderLoginOptions<'_>,
+) -> Result<(Option<String>, Option<String>, bool), CliError> {
+    let Planning {
+        config,
+        runtime,
+        provider,
+        compatibility,
+        ..
+    } = *planning;
+    let first_method = provider.contribution.methods.first().ok_or_else(|| {
+        CliError::LoginProfile("Provider has no registered authentication methods.".to_owned())
+    })?;
+    let profile = prompts.profile(
+        &Planning {
+            config,
+            runtime,
+            provider,
+            method: first_method,
+            compatibility,
+        },
+        options.explicit_profile,
+        super::registered_auth_profile_hint(config, runtime, provider, options.explicit_profile),
+    )?;
+    let existing = bcode_provider_auth::resolve_auth_provider_profile(
+        config,
+        &provider.contribution.provider_id,
+        &provider.plugin_id,
+        profile.as_deref(),
+        runtime,
+    )
+    .ok();
+    let inferred = existing
+        .as_ref()
+        .and_then(|resolved| resolved.profile.scheme.clone());
+    let membership_locked = options.standalone || options.pool.is_some() || existing.is_some();
+    if options.no_device_seal && existing.is_some() && options.pool.is_none() && !options.standalone
+    {
+        return Err(CliError::LoginProfile("Reauthentication preserves the account sealing policy. Use explicit --standalone enrollment to change that policy.".to_owned()));
+    }
+    Ok((profile, inferred, membership_locked))
+}
+
+fn initial_method(provider: &RegisteredAuthProvider) -> Result<&AuthMethodContribution, CliError> {
+    provider.contribution.methods.first().ok_or_else(|| {
+        CliError::LoginProfile("Provider has no registered authentication methods.".to_owned())
+    })
+}
+fn review<R: std::io::Read, W: Write>(
+    prompts: &mut Prompter<R, W>,
+    provider: &RegisteredAuthProvider,
+    plan: &EnrollmentPlan,
+    method: &AuthMethodContribution,
+) -> Result<(), CliError> {
+    let summary = format!(
+        "Continue: {} · {} · {}",
+        provider.contribution.display_name,
+        plan.prepared.resolved.profile_name,
+        method.method_id()
+    );
+    prompts.choose(
+        "Review authentication",
+        &[summary],
+        "Supply explicit choices in noninteractive usage.",
+    )?;
+    Ok(())
+}

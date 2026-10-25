@@ -2,7 +2,24 @@
 
 #[cfg(test)]
 mod tests;
-use super::{EnrollmentDestination, EnrollmentError, PreparedEnrollment, prepare};
+use super::{
+    EnrollmentConflict, EnrollmentConflictReason as Reason, EnrollmentConflictSource as Source,
+    EnrollmentDestination, EnrollmentError, PreparedEnrollment, prepare,
+};
+
+fn conflict(
+    pool: Option<&str>,
+    profile: Option<&str>,
+    source: Source,
+    reason: Reason,
+) -> EnrollmentError {
+    EnrollmentError::Conflict(EnrollmentConflict {
+        pool: pool.map(str::to_owned),
+        profile: profile.map(str::to_owned),
+        source,
+        reason,
+    })
+}
 use bcode_config::{
     BcodeConfig, RuntimeAuthProfile, RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptionProfile,
     RuntimeAuthSubscriptions,
@@ -23,6 +40,7 @@ pub enum PoolEnrollment {
 
 /// Read-only plan; callers must save credentials before invoking completion.
 pub struct EnrollmentPlan {
+    pub(super) preserve_memberships: bool,
     /// Ownership-checked custody destination.
     pub prepared: PreparedEnrollment,
     expected: RuntimeAuthSubscriptions,
@@ -114,7 +132,12 @@ pub fn plan(
     };
     let context = config.active_context.is_some();
     if context && matches!(&pooling, PoolEnrollment::Explicit(_)) {
-        return Err(EnrollmentError::PoolConflict);
+        return Err(conflict(
+            None,
+            Some(&result.profile),
+            Source::Configuration,
+            Reason::ContextBoundary,
+        ));
     }
     let eligible = if let Some(capability) = compatibility {
         crate::managed_pool::validate_compatibility(provider, capability)?;
@@ -147,10 +170,16 @@ pub fn plan(
             .get(&provider.provider_id)
             .is_some_and(|binding| binding.owner_plugin_id != owner_plugin_id)
     {
-        return Err(EnrollmentError::PoolConflict);
+        return Err(conflict(
+            None,
+            Some(&result.profile),
+            Source::Combined,
+            Reason::MemberMetadata,
+        ));
     }
     let original = prepared.resolved.clone();
     Ok(EnrollmentPlan {
+        preserve_memberships: false,
         original,
         prepared,
         expected: runtime.clone(),
@@ -200,14 +229,24 @@ impl PoolPlanner<'_> {
                 } else {
                     let name = format!("{}-{}-default", provider.provider_id, capability.group);
                     if runtime.pools.contains_key(&name) || config.auth.pools.contains_key(&name) {
-                        return Err(EnrollmentError::PoolConflict);
+                        return Err(conflict(
+                            Some(&name),
+                            None,
+                            Source::Combined,
+                            Reason::NameCollision,
+                        ));
                     }
                     Some(name)
                 }
             }
             PoolEnrollment::Explicit(name) => {
                 if name.trim().is_empty() || !eligible {
-                    return Err(EnrollmentError::PoolConflict);
+                    return Err(conflict(
+                        Some(&name),
+                        None,
+                        Source::Combined,
+                        Reason::MethodNotEligible,
+                    ));
                 }
                 Some(name)
             }
@@ -241,7 +280,12 @@ impl PoolPlanner<'_> {
             .flatten()
             .any(|marker| Some(marker) != compatibility.map(|capability| capability.group.as_str()))
         {
-            return Err(EnrollmentError::PoolConflict);
+            return Err(conflict(
+                Some(name),
+                None,
+                Source::Combined,
+                Reason::CompatibilityGroup,
+            ));
         }
         let group = if automatic || declared_marker.is_some() || runtime_marker.is_some() {
             compatibility.map(|capability| capability.group.as_str())
@@ -255,7 +299,12 @@ impl PoolPlanner<'_> {
                         != Some(provider.provider_id.as_str()))
                 || (automatic && declared.automatic_group.as_deref() != group))
         {
-            return Err(EnrollmentError::PoolConflict);
+            return Err(conflict(
+                Some(name),
+                None,
+                Source::Configuration,
+                Reason::Ownership,
+            ));
         }
         let mut pool = if let Some(existing) = runtime.pools.get(name) {
             let declared_opt_in = config.auth.pools.get(name).is_some_and(|pool| {
@@ -272,7 +321,8 @@ impl PoolPlanner<'_> {
                 } else {
                     group
                 },
-            )?;
+            )
+            .map_err(|error| error.in_pool(name))?;
             let mut existing = existing.clone();
             if declared_opt_in {
                 existing.automatic_group = group.map(str::to_owned);
@@ -324,7 +374,12 @@ impl PoolPlanner<'_> {
                 .iter()
                 .any(|method| Some(method.as_str()) == existing.profile.scheme.as_deref())
             {
-                return Err(EnrollmentError::PoolConflict);
+                return Err(conflict(
+                    Some(name),
+                    Some(&member),
+                    Source::Combined,
+                    Reason::MemberMethod,
+                ));
             }
         }
         Ok(())
@@ -357,7 +412,12 @@ impl PoolPlanner<'_> {
                     }) =>
             {
                 if primary.profile.backend != "sshenv" {
-                    return Err(EnrollmentError::PoolConflict);
+                    return Err(conflict(
+                        None,
+                        Some(&primary.profile_name),
+                        Source::Combined,
+                        Reason::MemberMetadata,
+                    ));
                 }
                 let primary_metadata = metadata_for_primary(&primary);
                 if let Some(existing) = pool
@@ -366,7 +426,12 @@ impl PoolPlanner<'_> {
                     .find(|member| member.auth_profile == primary.profile_name)
                 {
                     if existing != &primary_metadata {
-                        return Err(EnrollmentError::PoolConflict);
+                        return Err(conflict(
+                            None,
+                            Some(&primary.profile_name),
+                            Source::Combined,
+                            Reason::MemberMetadata,
+                        ));
                     }
                 } else {
                     pool.profiles.push(primary_metadata);
@@ -395,7 +460,12 @@ impl PoolPlanner<'_> {
             .iter()
             .any(|member| !seen.insert(&member.auth_profile))
         {
-            return Err(EnrollmentError::PoolConflict);
+            return Err(conflict(
+                Some(name),
+                None,
+                Source::Runtime,
+                Reason::MemberIdentity,
+            ));
         }
         let member = RuntimeAuthSubscriptionProfile {
             auth_profile: result.profile.clone(),
@@ -413,7 +483,12 @@ impl PoolPlanner<'_> {
             .find(|existing| existing.auth_profile == result.profile)
         {
             if existing != &member {
-                return Err(EnrollmentError::PoolConflict);
+                return Err(conflict(
+                    Some(name),
+                    Some(&result.profile),
+                    Source::Combined,
+                    Reason::MemberMetadata,
+                ));
             }
         } else {
             result.joined = !config
@@ -483,6 +558,17 @@ fn validate_completion(
 pub fn complete(plan: &EnrollmentPlan) -> Result<EnrollmentResult, bcode_config::ConfigError> {
     let config = bcode_config::load_config()?;
     validate_completion(plan, &config)?;
+    if plan.preserve_memberships {
+        let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
+        let current = crate::resolve_auth_provider_profile(
+            &config, &plan.original.provider_id, &plan.original.owner_plugin_id,
+            Some(&plan.original.profile_name), &runtime,
+        ).map_err(|_| bcode_config::ConfigError::Composition { message: "Account ownership changed during reauthentication; credentials saved but routing metadata was not changed.".to_owned() })?;
+        if current != plan.original || plan.prepared.resolved != plan.original {
+            return Err(bcode_config::ConfigError::Composition { message: "Account destination or policy changed during reauthentication; routing metadata preserved. Inspect account state before retrying.".to_owned() });
+        }
+        return Ok(plan.result.clone());
+    }
     let device_seal = plan
         .prepared
         .resolved

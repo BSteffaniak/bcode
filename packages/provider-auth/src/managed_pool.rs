@@ -1,6 +1,12 @@
 //! Shared automatic/default pool planning. No secrets or ambient filesystem reads.
 
-use crate::{ResolvedAuthProfile, enrollment::EnrollmentError};
+use crate::{
+    ResolvedAuthProfile,
+    enrollment::{
+        EnrollmentConflict, EnrollmentConflictReason as Reason, EnrollmentConflictSource as Source,
+        EnrollmentError,
+    },
+};
 use bcode_config::{BcodeConfig, RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptions};
 use bcode_provider_auth_models::{
     AuthMethodContribution, AuthPoolCompatibility, AuthProviderContribution,
@@ -144,7 +150,12 @@ pub(crate) fn validate_declared(
         || pool.provider_plugin_id.as_deref() != Some(owner)
         || pool.automatic_group.as_deref() != Some(group)
     {
-        return Err(EnrollmentError::PoolConflict);
+        return Err(EnrollmentError::Conflict(EnrollmentConflict {
+            pool: None,
+            profile: None,
+            source: Source::Configuration,
+            reason: Reason::CompatibilityGroup,
+        }));
     }
     Ok(())
 }
@@ -175,12 +186,18 @@ pub(crate) fn managed_pool(
             && (pool.owner_plugin_id.as_deref() == Some(owner)
                 || pool.provider_plugin_id.as_deref() == Some(owner))
         {
-            validate_pool(pool, provider, owner, Some(group))?;
+            validate_pool(pool, provider, owner, Some(group))
+                .map_err(|error| error.in_pool(name))?;
             names.insert(name.clone());
         }
     }
     if names.len() > 1 {
-        return Err(EnrollmentError::PoolConflict);
+        return Err(EnrollmentError::Conflict(EnrollmentConflict {
+            pool: None,
+            profile: None,
+            source: Source::Combined,
+            reason: Reason::MultipleDefaults,
+        }));
     }
     let name = names.into_iter().next();
     if let Some(name) = &name {
@@ -202,7 +219,7 @@ pub(crate) fn managed_pool(
             )?;
         }
         if let Some(pool) = config.auth.pools.get(name) {
-            validate_declared(pool, provider, owner, group)?;
+            validate_declared(pool, provider, owner, group).map_err(|error| error.in_pool(name))?;
         }
     }
     Ok(name)
@@ -214,21 +231,35 @@ pub(crate) fn validate_pool(
     owner: &str,
     group: Option<&str>,
 ) -> Result<(), EnrollmentError> {
+    let error = |reason, profile| {
+        EnrollmentError::Conflict(EnrollmentConflict {
+            pool: None,
+            profile,
+            source: Source::Runtime,
+            reason,
+        })
+    };
     if pool.owner_plugin_id.as_deref() != Some(owner)
         || pool.provider_plugin_id.as_deref() != Some(owner)
         || pool.provider_id.as_deref() != Some(provider)
-        || (group.is_some() && pool.automatic_group.as_deref() != group)
     {
-        return Err(EnrollmentError::PoolConflict);
+        return Err(error(Reason::Ownership, None));
+    }
+    if group.is_some() && pool.automatic_group.as_deref() != group {
+        return Err(error(Reason::CompatibilityGroup, None));
     }
     let mut members = std::collections::BTreeSet::new();
-    if pool.profiles.iter().any(|member| {
-        member.auth_profile.trim().is_empty()
+    for member in &pool.profiles {
+        if member.auth_profile.trim().is_empty()
             || !members.insert(&member.auth_profile)
             || member.provider != provider
             || member.owner_plugin_id.as_deref() != Some(owner)
-    }) {
-        return Err(EnrollmentError::PoolConflict);
+        {
+            return Err(error(
+                Reason::MemberIdentity,
+                Some(member.auth_profile.clone()),
+            ));
+        }
     }
     Ok(())
 }

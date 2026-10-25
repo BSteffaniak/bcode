@@ -69,6 +69,7 @@ bmux_tui_components = { workspace = true, features = [
     "dialog",
     "form",
     "labeled-details",
+    "key-hint-bar",
     "modal-frame",
     "picker-frame",
     "selectable-list",

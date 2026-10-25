@@ -6,6 +6,8 @@ fn prompter(input: &str, interactive: bool) -> Prompter<Cursor<Vec<u8>>, Vec<u8>
         reader: Cursor::new(input.as_bytes().to_vec()),
         writer: Vec::new(),
         interactive,
+        rich: false,
+        back_requested: false,
     }
 }
 
@@ -116,6 +118,8 @@ fn output_failure_does_not_consume_input() {
         reader: Cursor::new(b"1\n"),
         writer: Broken,
         interactive: true,
+        rich: false,
+        back_requested: false,
     };
     assert!(
         prompt

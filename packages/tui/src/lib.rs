@@ -11,6 +11,7 @@ pub(crate) mod activity;
 pub(crate) mod app;
 pub(crate) mod artifact_stream;
 mod auth_browser;
+pub mod auth_inline;
 pub(crate) mod auth_pool_picker;
 pub(crate) mod auth_pool_picker_render;
 pub(crate) mod chat_loop;
