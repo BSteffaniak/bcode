@@ -3,6 +3,13 @@ name    = "Bcode Model Plugin"
 version = "0.0.1"
 
 [[services]]
+class                 = "control"
+description           = "Plugin-owned model selection commands"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Model Commands"
+
+[[services]]
 class        = "service"
 description  = "Typed read-only provider-auth security workflow blocks"
 interface_id = "bcode.workflow-block/v1"

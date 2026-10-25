@@ -10,10 +10,11 @@ interface_id = "bcode.session-milestones/v1"
 name         = "Session Milestones Policy"
 
 [[services]]
-class        = "control"
-description  = "Read or explicitly generate session milestones"
-interface_id = "bcode.command/v1"
-name         = "Session Milestones Commands"
+class                 = "control"
+description           = "Read or explicitly generate session milestones"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Session Milestones Commands"
 
 [[services]]
 class        = "control"

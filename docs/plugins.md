@@ -177,7 +177,30 @@ See [Dynamic plugin authentication](dynamic-plugin-authentication.md).
 
 ## Plugin-owned session fork and clone
 
-The bundled `bcode.session-derivation` plugin exclusively contributes `/fork`, `/clone`, and their
+Executable plugin command contributions require exactly one `bcode.command/v1` service
+with an explicit invocation declaration:
+
+```toml
+[[services]]
+interface_id = "bcode.command/v1"
+invocation_operations = ["invoke"]
+```
+
+The host checks this contract before publishing registered commands. Missing, ambiguous,
+or malformed declarations reject plugin activation rather than exposing commands that cannot
+execute. Discovery-only services without executable contributions need not declare `invoke`.
+Declarations grant routing eligibility only: caller attachment, canonical workspace, agent
+policy, cancellation, and invocation identity checks still apply. Only an admitted top-level
+command receives the existing session-target-checked derivation and milestone application
+bridge; nested plugin providers and composer requests do not inherit it. The bridge accepts
+the bound invocation identity or the admitted command identity used by bundled command
+clients, never an unrelated identity or an explicit alternate route. A runtime
+`plugin_command_route_unavailable` error identifies a command-service declaration problem;
+`plugin_context_denied` remains a privacy-safe context or authorization rejection. Neither
+error should be worked around by broadening filesystem permissions.
+
+The bundled `bcode.session-derivation` plugin exclusively contributes `/copy-session-id`,
+`/fork`, `/clone`, and their
 palette entries. It owns prompt selection, default names, cutoffs, user-facing status, and
 post-success navigation. The host exposes only versioned generic command context, a typed
 `bcode.session-derivation/v1` application service, generic plugin surfaces, and portable command

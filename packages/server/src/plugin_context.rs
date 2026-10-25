@@ -382,7 +382,20 @@ fn admitted_command(
                 bcode_command::CommandAction::Plugin { plugin_id, command_id }
                 if plugin_id == plugin && command_id == command.command_id)
         });
-        if !service_declared || !(legacy_declared || registered_declared) {
+        if !service_declared {
+            tracing::warn!(
+                plugin_id = plugin,
+                interface_id = interface,
+                operation,
+                stage = "command_route_declaration",
+                "command invocation rejected"
+            );
+            return Err(PublicPluginError {
+                code: "plugin_command_route_unavailable",
+                message: "plugin command service must explicitly declare the invoke operation; check the plugin manifest",
+            });
+        }
+        if !(legacy_declared || registered_declared) {
             return Err(rejected());
         }
         Ok(Some(command))
@@ -445,8 +458,23 @@ pub async fn invoke(
         cancellation,
     };
     let work = async {
-        let bound = bind(state, client, &context).await?;
+        let bound = bind(state, client, &context).await.inspect_err(|_| {
+            tracing::debug!(
+                plugin_id = plugin,
+                interface_id = interface,
+                operation,
+                stage = "caller_context",
+                "plugin invocation rejected"
+            );
+        })?;
         if !route_policy_allows(&bound, &plugin, &interface, &operation) {
+            tracing::debug!(
+                plugin_id = plugin,
+                interface_id = interface,
+                operation,
+                stage = "route_policy",
+                "plugin invocation rejected"
+            );
             return Err(rejected());
         }
         let payload = if let Some(command) = command {
@@ -489,6 +517,18 @@ fn bound_identity(id: &str, bound: &str) -> bool {
     id.is_empty() || id == bound
 }
 
+fn command_application_request_allowed(
+    command_id: Option<&str>,
+    bound_id: &str,
+    request: &bcode_tool::ToolInvocationServiceRequest,
+) -> bool {
+    command_id.is_some_and(|command_id| {
+        bound_identity(&request.invocation_id, bound_id) || request.invocation_id == command_id
+    }) && request.route_id.is_none()
+        && (request.interface_id == bcode_plugin_sdk::SESSION_DERIVATION_INTERFACE_ID
+            || request.interface_id == bcode_plugin_sdk::milestones::MILESTONES_HOST_INTERFACE_ID)
+}
+
 fn route<'a>(
     state: &'a ServerState,
     bound: &'a BoundContext,
@@ -508,6 +548,12 @@ fn route<'a>(
         if depth >= 8 {
             return Err(rejected());
         }
+        let command_id = (depth == 0
+            && interface == bcode_command::COMMAND_INTERFACE_ID
+            && operation == bcode_command::OP_INVOKE_COMMAND)
+            .then(|| serde_json::from_slice::<bcode_command::InvokeCommandRequest>(&payload).ok())
+            .flatten()
+            .map(|request| request.command_id);
         let (bridge, mut requests) = super::server_plugin_bridge();
         let invocation = state.plugins.invoke_service_with_bridge_scoped(
             plugin,
@@ -523,6 +569,20 @@ fn route<'a>(
                 result = &mut invocation => return result.map_err(|error| super::plugin_operations::normalize_error(&error)),
                 Some(call) = requests.recv() => {
                     let result = match call.request {
+                        ServiceBridgeRequest::InvokeService(request)
+                            if command_application_request_allowed(command_id.as_deref(), &bound.id, &request) => {
+                            // Only the admitted top-level command receives the existing session
+                            // application bridge. Nested providers and composers cannot inherit it.
+                            match super::resolve_command_plugin_bridge_request(
+                                state,
+                                bound.session,
+                                ServiceBridgeRequest::InvokeService(request),
+                                &call.cancellation,
+                            ).await {
+                                Ok(ServiceBridgeResponse::Service(result)) => result,
+                                _ => denied(),
+                            }
+                        }
                         ServiceBridgeRequest::InvokeService(request)
                             if bound_identity(&request.invocation_id, &bound.id) && request.route_id.is_none() => {
                             if request.interface_id == WORKSPACE_ACCESS_INTERFACE_ID {
@@ -553,20 +613,6 @@ fn denied() -> ToolInvocationServiceResolution {
     }
 }
 
-fn valid_operations(operations: &[String], operation: &str) -> bool {
-    !operations.is_empty()
-        && operations.len() <= 64
-        && operations.iter().all(|entry| {
-            !entry.trim().is_empty() && entry.len() <= 256 && !entry.chars().any(char::is_control)
-        })
-        && operations
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            == operations.len()
-        && operations.iter().any(|entry| entry == operation)
-}
-
 fn declared_route(state: &ServerState, plugin: &str, interface: &str, operation: &str) -> bool {
     state
         .plugins
@@ -579,7 +625,7 @@ fn declared_route(state: &ServerState, plugin: &str, interface: &str, operation:
                 .iter()
                 .filter(|service| service.interface_id == interface)
                 .collect();
-            services.len() == 1 && valid_operations(&services[0].invocation_operations, operation)
+            services.len() == 1 && services[0].permits_invocation(operation)
         })
 }
 
@@ -1180,6 +1226,57 @@ library = "libtest_command_context.dylib"
         );
     }
 
+    #[test]
+    fn missing_command_route_has_actionable_secret_safe_error() {
+        let state = command_state();
+        let error = admitted_command(
+            &state,
+            "not.loaded",
+            bcode_command::COMMAND_INTERFACE_ID,
+            bcode_command::OP_INVOKE_COMMAND,
+            &command_payload("literal"),
+        )
+        .unwrap_err();
+        drop(state);
+        assert_eq!(error.code, "plugin_command_route_unavailable");
+        assert_eq!(
+            error.message,
+            "plugin command service must explicitly declare the invoke operation; check the plugin manifest"
+        );
+    }
+
+    #[test]
+    fn command_application_bridge_does_not_inherit_or_accept_forged_identity() {
+        let allowed = |depth, invocation_id: &str, route_id: Option<String>, interface: &str| {
+            let command_id = (depth == 0).then_some("registered.command");
+            command_application_request_allowed(
+                command_id,
+                "bound-invocation",
+                &bcode_tool::ToolInvocationServiceRequest {
+                    invocation_id: invocation_id.into(),
+                    request_id: "request".into(),
+                    route_id,
+                    interface_id: interface.into(),
+                    operation: "request".into(),
+                    payload: serde_json::json!({}),
+                },
+            )
+        };
+        let interface = bcode_plugin_sdk::SESSION_DERIVATION_INTERFACE_ID;
+        assert!(allowed(0, "bound-invocation", None, interface));
+        assert!(allowed(0, "registered.command", None, interface));
+        assert!(allowed(0, "", None, interface));
+        assert!(!allowed(1, "bound-invocation", None, interface));
+        assert!(!allowed(0, "forged", None, interface));
+        assert!(!allowed(
+            0,
+            "bound-invocation",
+            Some("route".into()),
+            interface
+        ));
+        assert!(!allowed(0, "bound-invocation", None, "unrelated/v1"));
+    }
+
     #[tokio::test]
     async fn typed_command_admission_preserves_declared_route_and_caller_lifetime() {
         let temp = tempfile::tempdir().unwrap();
@@ -1368,6 +1465,199 @@ library = "libtest_command_context.dylib"
         stop.send(()).unwrap();
         server.await.unwrap();
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn bundled_copy_session_id_executes_over_real_ipc() {
+        use bcode_command::application::{
+            CommandApplication as _, CommandInvocationOutcome, CommandInvocationRequest,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bundles = [
+            bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/session-derivation-plugin/bcode-plugin.toml"),
+                bcode_session_derivation_plugin::static_plugin(),
+            ),
+            bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+                bcode_default_agents_plugin::static_plugin(),
+            ),
+        ];
+        let state = std::sync::Arc::new(super::super::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::persistent(root.join("sessions")).unwrap(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection::all_enabled(),
+                &bundles,
+            )
+            .unwrap(),
+        ));
+        let session = state
+            .sessions
+            .create_session(None, root.clone())
+            .await
+            .unwrap();
+        let (endpoint, stop, server) = serve_fixture(std::sync::Arc::clone(&state), temp.path());
+        let client = bcode_client::BcodeClient::new(endpoint).with_runtime_context(Some(
+            bcode_ipc::ClientRuntimeContext {
+                working_directory: Some(root.clone()),
+                ..Default::default()
+            },
+        ));
+        let result = client
+            .invoke_command(CommandInvocationRequest {
+                plugin_id: "bcode.session-derivation".into(),
+                invocation_id: "copy-session-id".into(),
+                agent_id: None,
+                launch_root: Some(root),
+                deadline_ms: 5000,
+                command: bcode_command::InvokeCommandRequest {
+                    command_id: "session-derivation.copy-session-id".into(),
+                    args: BTreeMap::new(),
+                    context: Some(bcode_command::CommandInvocationContext {
+                        session_id: Some(session.id),
+                        working_directory: temp.path().to_path_buf(),
+                    }),
+                },
+            })
+            .await;
+        let CommandInvocationOutcome::Completed(response) = result.outcome else {
+            panic!("copy command failed: {result:?}");
+        };
+        assert!(response.success);
+        assert_eq!(
+            response.effects,
+            vec![
+                bcode_command::CommandEffect::CopyText {
+                    text: session.id.to_string()
+                },
+                bcode_command::CommandEffect::AppendText {
+                    text: format!("Session ID: {}", session.id),
+                    format: bcode_command::CommandTextFormat::PlainText,
+                },
+            ]
+        );
+        assert_bundled_derivation_commands(&client, &state, session.id, temp.path()).await;
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        drop(state);
+    }
+
+    async fn assert_bundled_derivation_commands(
+        client: &bcode_client::BcodeClient,
+        state: &ServerState,
+        session_id: SessionId,
+        root: &Path,
+    ) {
+        use bcode_command::application::{
+            CommandApplication as _, CommandInvocationOutcome, CommandInvocationRequest,
+        };
+        let prompt = state
+            .sessions
+            .append_user_message(session_id, ClientId::new(), "authoritative prompt".into())
+            .await
+            .unwrap();
+        let prompt_sequence = prompt
+            .iter()
+            .find_map(|event| {
+                matches!(
+                    event.kind,
+                    bcode_session_models::SessionEventKind::UserMessage { .. }
+                )
+                .then_some(event.sequence)
+            })
+            .expect("canonical user message");
+        for (suffix, arguments) in [
+            ("fork", None),
+            ("clone", Some("name=clone-fixture".to_owned())),
+            (
+                "fork",
+                Some(format!("sequence={prompt_sequence} name=fork-fixture")),
+            ),
+        ] {
+            let result = client
+                .invoke_command(CommandInvocationRequest {
+                    plugin_id: "bcode.session-derivation".into(),
+                    invocation_id: uuid::Uuid::new_v4().to_string(),
+                    agent_id: None,
+                    launch_root: Some(root.to_path_buf()),
+                    deadline_ms: 30_000,
+                    command: bcode_command::InvokeCommandRequest {
+                        command_id: format!("session-derivation.{suffix}"),
+                        args: arguments
+                            .clone()
+                            .map(|args| BTreeMap::from([("arguments".into(), args)]))
+                            .unwrap_or_default(),
+                        context: Some(bcode_command::CommandInvocationContext {
+                            session_id: Some(session_id),
+                            working_directory: root.to_path_buf(),
+                        }),
+                    },
+                })
+                .await;
+            let CommandInvocationOutcome::Completed(response) = result.outcome else {
+                panic!("{suffix} failed: {result:?}");
+            };
+            assert!(response.success, "{response:?}");
+            if arguments.is_none() {
+                assert!(
+                    !response.effects.is_empty(),
+                    "prompt selection must be presented"
+                );
+                continue;
+            }
+            let destination = response
+                .effects
+                .iter()
+                .find_map(|effect| match effect {
+                    bcode_command::CommandEffect::OpenSession { session_id, .. } => {
+                        Some(*session_id)
+                    }
+                    _ => None,
+                })
+                .expect("derived session navigation");
+            assert_ne!(destination, session_id);
+            assert_derived_prompt(state, destination, suffix == "fork").await;
+        }
+    }
+
+    async fn assert_derived_prompt(state: &ServerState, destination: SessionId, fork: bool) {
+        let snapshot = state
+            .sessions
+            .session_derivation_snapshot(destination)
+            .await
+            .unwrap();
+        let prompts = state
+            .sessions
+            .session_derivation_prompt_candidates(
+                destination,
+                bcode_session_models::SessionDerivationPromptQuery {
+                    generation: snapshot.generation,
+                    before_sequence: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        if fork {
+            assert_eq!(
+                state
+                    .sessions
+                    .session_composer_draft(destination)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("authoritative prompt")
+            );
+            assert!(prompts.candidates.is_empty());
+        } else {
+            assert!(
+                prompts
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.preview == "authoritative prompt")
+            );
+        }
     }
 
     const DISPATCH_MANIFEST: &str = r#"
@@ -2573,6 +2863,12 @@ library = "libtest_wait_second.dylib"
 
     #[test]
     fn declared_nested_operations_fail_closed() {
+        let valid_operations = |operations: &[String], operation: &str| {
+            let mut service: bcode_plugin::PluginService =
+                serde_json::from_value(serde_json::json!({"interface_id": "test/v1"})).unwrap();
+            service.invocation_operations = operations.to_vec();
+            service.permits_invocation(operation)
+        };
         assert!(valid_operations(&["discover".into()], "discover"));
         assert!(!valid_operations(&[], "discover"));
         assert!(!valid_operations(&["discover".into()], "write"));

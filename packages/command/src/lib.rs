@@ -447,6 +447,11 @@ impl CommandRegistry {
         }
     }
 
+    /// Iterate over all registered contributions in stable id order.
+    pub fn contributions(&self) -> impl Iterator<Item = &CommandContribution> {
+        self.contributions.values()
+    }
+
     /// Return commands for a given surface in stable id order.
     #[must_use]
     pub fn commands_for_surface(&self, surface: &CommandSurface) -> Vec<CommandContribution> {

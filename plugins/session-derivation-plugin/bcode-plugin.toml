@@ -5,10 +5,11 @@ version = "0.0.1"
 categories = ["session", "commands"]
 
 [[services]]
-class        = "control"
-description  = "Plugin-owned session fork and clone commands"
-interface_id = "bcode.command/v1"
-name         = "Session Derivation Commands"
+class                 = "control"
+description           = "Plugin-owned session fork and clone commands"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Session Derivation Commands"
 
 [[services]]
 class        = "control"

@@ -859,6 +859,52 @@ pub struct PluginService {
     pub invocation_operations: Vec<String>,
 }
 
+impl PluginService {
+    /// Whether a well-formed explicit declaration permits this exact operation.
+    #[must_use]
+    pub fn permits_invocation(&self, operation: &str) -> bool {
+        let operations = &self.invocation_operations;
+        !operations.is_empty()
+            && operations.len() <= 64
+            && operations.iter().all(|entry| {
+                !entry.trim().is_empty()
+                    && entry.len() <= 256
+                    && !entry.chars().any(char::is_control)
+            })
+            && operations.iter().collect::<BTreeSet<_>>().len() == operations.len()
+            && operations.iter().any(|entry| entry == operation)
+    }
+}
+
+fn validate_command_invocation_declaration(
+    manifest: &PluginManifest,
+    commands: &bcode_command::CommandRegistry,
+) -> Result<(), PluginLoadError> {
+    let executable = !manifest.command_contributions.is_empty()
+        || commands.contributions().any(|command| {
+            matches!(&command.action, bcode_command::CommandAction::Plugin { plugin_id, .. }
+                if plugin_id == &manifest.id)
+        });
+    if !executable {
+        return Ok(());
+    }
+    let mut services = manifest
+        .services
+        .iter()
+        .filter(|service| service.interface_id == bcode_command::COMMAND_INTERFACE_ID);
+    if services
+        .next()
+        .is_some_and(|service| service.permits_invocation(bcode_command::OP_INVOKE_COMMAND))
+        && services.next().is_none()
+    {
+        return Ok(());
+    }
+    Err(PluginLoadError::CommandInvocationDeclaration {
+        plugin_id: manifest.id.clone(),
+        interface_id: bcode_command::COMMAND_INTERFACE_ID,
+    })
+}
+
 /// Plugin config declaration from a plugin manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifestConfig {
@@ -1784,6 +1830,16 @@ pub enum PluginLoadError {
         plugin_id: String,
         actual: u16,
         expected: u16,
+    },
+    /// Executable command contributions lack an explicit invocation route.
+    #[error(
+        "plugin '{plugin_id}' executable commands require exactly one '{interface_id}' service declaring invocation_operations = [\"invoke\"] (additional operations may be declared explicitly)"
+    )]
+    CommandInvocationDeclaration {
+        /// Plugin contributing the executable commands.
+        plugin_id: String,
+        /// Required command service interface.
+        interface_id: &'static str,
     },
     #[error("plugin '{plugin_id}' authentication registration failed: {source}")]
     AuthRegistration {
@@ -5665,6 +5721,7 @@ impl PluginHost {
         let mut commands = self.command_registry.clone();
         let mut auth = self.auth_provider_registry.clone();
         loaded.register_commands(&mut commands)?;
+        validate_command_invocation_declaration(&loaded.manifest, &commands)?;
         loaded.register_auth_providers(&mut auth)?;
         self.command_registry = commands;
         self.auth_provider_registry = auth;
@@ -6737,6 +6794,8 @@ library = "libcommands.dylib"
             .register_commands(&mut registry)
             .expect("plugin registers commands");
 
+        assert_command_declaration_contract(&loaded, &registry);
+
         let commands = registry.commands_for_surface(&bcode_command::CommandSurface::Palette);
 
         assert!(commands.iter().any(|command| {
@@ -6747,6 +6806,44 @@ library = "libcommands.dylib"
                         command_id: "example.run".to_string(),
                     }
         }));
+    }
+
+    fn assert_command_declaration_contract(
+        loaded: &LoadedPlugin,
+        registry: &bcode_command::CommandRegistry,
+    ) {
+        let empty = bcode_command::CommandRegistry::new();
+        let mut discovery = loaded.manifest.clone();
+        discovery.command_contributions.clear();
+        assert!(validate_command_invocation_declaration(&discovery, &empty).is_ok());
+        assert!(matches!(
+            validate_command_invocation_declaration(&loaded.manifest, &empty),
+            Err(PluginLoadError::CommandInvocationDeclaration { .. })
+        ));
+        assert!(matches!(
+            validate_command_invocation_declaration(&discovery, registry),
+            Err(PluginLoadError::CommandInvocationDeclaration { .. })
+        ));
+        let mut host = PluginHost::default();
+        assert!(matches!(
+            host.register_activated_plugin(loaded),
+            Err(PluginLoadError::CommandInvocationDeclaration { .. })
+        ));
+        assert!(host.command_registry.get("example.run").is_none());
+        let service: PluginService = toml::from_str(
+            r#"
+interface_id = "bcode.command/v1"
+invocation_operations = ["invoke"]
+"#,
+        )
+        .unwrap();
+        discovery.services.push(service.clone());
+        assert!(validate_command_invocation_declaration(&discovery, registry).is_ok());
+        discovery.services.push(service);
+        assert!(validate_command_invocation_declaration(&discovery, registry).is_err());
+        discovery.services.pop();
+        discovery.services[0].invocation_operations = vec!["invoke".into(), "invoke".into()];
+        assert!(validate_command_invocation_declaration(&discovery, registry).is_err());
     }
 
     #[test]

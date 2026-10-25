@@ -1653,6 +1653,13 @@ categories = ["review"]
 
 
 [[services]]
+class                 = "control"
+description           = "Plugin-owned code review commands"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Code Review Commands"
+
+[[services]]
 class        = "service"
 description  = "Local Git code review services"
 interface_id = "bcode.code_review/v1"

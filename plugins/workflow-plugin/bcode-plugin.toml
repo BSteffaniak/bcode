@@ -17,10 +17,11 @@ interface_id = "bcode.tool/v1"
 name         = "Workflow Tools"
 
 [[services]]
-class        = "service"
-description  = "Workflow discovery and lifecycle commands"
-interface_id = "bcode.command/v1"
-name         = "Workflow Commands"
+class                 = "service"
+description           = "Workflow discovery and lifecycle commands"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Workflow Commands"
 
 [[services]]
 class        = "service"

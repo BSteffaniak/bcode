@@ -4,10 +4,11 @@ name       = "Bcode Usage Plugin"
 version    = "0.0.1"
 
 [[services]]
-class        = "service"
-description  = "Usage dashboard command contributions"
-interface_id = "bcode.command/v1"
-name         = "Usage Commands"
+class                 = "service"
+description           = "Usage dashboard command contributions"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Usage Commands"
 
 [[tui_surfaces]]
 description = "Estimated model usage costs and comparisons"

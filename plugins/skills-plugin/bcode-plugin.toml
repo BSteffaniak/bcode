@@ -3,6 +3,13 @@ name    = "Bcode Skills Plugin"
 version = "0.0.1"
 
 [[services]]
+class                 = "control"
+description           = "Plugin-owned skill commands"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Skill Commands"
+
+[[services]]
 class        = "service"
 description  = "Plugin-owned optional context and skill/tool relevance ordering"
 interface_id = "bcode.skills-selection/v1"

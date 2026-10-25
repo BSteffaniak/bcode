@@ -15,10 +15,11 @@ interface_id = "bcode.loop.tool-result-triage/v1"
 name         = "Loop Tool Result Triage"
 
 [[services]]
-class        = "service"
-description  = "Prompt loop commands"
-interface_id = "bcode.command/v1"
-name         = "Loop Commands"
+class                 = "service"
+description           = "Prompt loop commands"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Loop Commands"
 
 [[services]]
 class        = "service"

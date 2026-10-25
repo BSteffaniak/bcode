@@ -622,10 +622,11 @@ access   = "read"
 resource = "eval-suite"
 
 [[services]]
-class        = "service"
-description  = "Eval viewer command contributions"
-interface_id = "bcode.command/v1"
-name         = "Eval Commands"
+class                 = "service"
+description           = "Eval viewer command contributions"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Eval Commands"
 
 [[tui_surfaces]]
 description = "Full-screen eval run picker"

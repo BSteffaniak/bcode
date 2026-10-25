@@ -5,10 +5,11 @@ version = "0.0.1"
 categories = ["metrics", "observability"]
 
 [[services]]
-class        = "service"
-description  = "Metrics dashboard command contributions"
-interface_id = "bcode.command/v1"
-name         = "Metrics Commands"
+class                 = "service"
+description           = "Metrics dashboard command contributions"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Metrics Commands"
 
 [[tui_surfaces]]
 description = "Full-screen persisted metrics dashboard"
