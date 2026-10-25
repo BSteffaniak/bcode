@@ -63,7 +63,9 @@ fn embedded_workflow_public_entry_external_consumer() {
             });
             bcode_server::run_embedded_with_workflow_application(
                 bcode_ipc::IpcEndpoint::unix_socket(
-                    std::env::current_dir().unwrap().join("embedded.sock"),
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("private/embedded.sock"),
                 ),
                 bcode_config::BcodeConfig::default(),
                 plugins,

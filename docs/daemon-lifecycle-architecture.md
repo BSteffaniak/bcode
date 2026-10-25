@@ -116,6 +116,17 @@ remain stable through those operations. `Hello` advertises the intended artifact
 peers reject a mismatch. Build fingerprints and compatibility epochs remain independently checked
 rather than serving as artifact identity.
 
+The Unix endpoint lives in a private `0700` Bcode directory under `/tmp`, with a
+`0600` socket. Both directory and socket names retain the endpoint scope digest;
+paths remain within the portable Unix socket limit and do not depend on `TMPDIR`.
+Bcode explicitly selects the transport's strict policy: effective-user ownership,
+protected ancestors, no immediate-parent symlinks, and same-user peers. Parent
+preparation and validation precede stale-socket recovery; insecure existing
+parents are rejected rather than repaired. The transport owns secure parent
+creation, not an earlier generic `create_dir_all` call. Old flat `/tmp` sockets
+are not adopted as a fallback; existing artifact identities remain independent.
+Explicit endpoint overrides must meet the same security requirements.
+
 Runtime scope identity is a digest of the canonicalized state root and config directory. Config
 directory participates because it selects plugins, permissions, and model policy, so two config
 directories must not share a daemon process. Verifying the identity on both sides is required rather

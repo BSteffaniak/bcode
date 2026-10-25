@@ -57,7 +57,10 @@ impl LocalIpcListener {
     pub fn bind(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
         #[cfg(unix)]
         prepare_endpoint_for_bind(endpoint)?;
-        match bmux_ipc::transport::LocalIpcListener::bind(endpoint) {
+        match bmux_ipc::transport::LocalIpcListener::bind_with_policy(
+            endpoint,
+            bmux_ipc::transport::UnixSecurityPolicy::strict(),
+        ) {
             Ok(inner) => Ok(Self { inner }),
             Err(IpcTransportError::Io(error))
                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
@@ -65,7 +68,10 @@ impl LocalIpcListener {
                 #[cfg(unix)]
                 prepare_endpoint_for_bind(endpoint)?;
                 Ok(Self {
-                    inner: bmux_ipc::transport::LocalIpcListener::bind(endpoint)?,
+                    inner: bmux_ipc::transport::LocalIpcListener::bind_with_policy(
+                        endpoint,
+                        bmux_ipc::transport::UnixSecurityPolicy::strict(),
+                    )?,
                 })
             }
             Err(error) => Err(error),
@@ -3898,9 +3904,7 @@ fn prepare_endpoint_for_bind(endpoint: &IpcEndpoint) -> Result<(), IpcTransportE
 
 #[cfg(unix)]
 fn prepare_unix_socket_path_for_bind(path: &Path) -> Result<(), IpcTransportError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    bmux_ipc::transport::UnixSecurityPolicy::strict().prepare_parent(path)?;
     if !path.exists() {
         return Ok(());
     }
@@ -4187,7 +4191,8 @@ fn socket_scope_digest(user: &str, namespace: &str, state_location_id: &str) -> 
 fn socket_path_with_digest(base: &Path, digest: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    let path = base.join(format!("bcode-{digest}.sock"));
+    let private = base.join(format!("bcode-{digest}"));
+    let path = private.join(format!("bcode-{digest}.sock"));
     (path.as_os_str().as_bytes().len() <= MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES).then_some(path)
 }
 
@@ -4612,6 +4617,43 @@ mod tests {
             paths.push(path);
         }
         assert!(paths.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_default_layout_binds_with_strict_transport() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let digest = socket_scope_digest(
+            &format!("{}-{:?}", std::process::id(), std::time::SystemTime::now()),
+            "integration",
+            "isolated",
+        );
+        let path = socket_path_with_digest(Path::new("/tmp"), &digest).unwrap();
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let client = LocalIpcStream::connect(&endpoint).await.unwrap();
+        let accepted = listener.accept().await.unwrap();
+        drop((client, accepted, listener));
+        std::fs::remove_file(&path).unwrap();
+        // Exercise caller-owned stale endpoint recovery within the private parent.
+        let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(stale);
+        let restarted = LocalIpcListener::bind(&endpoint).unwrap();
+        drop(restarted);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 
     #[cfg(unix)]
