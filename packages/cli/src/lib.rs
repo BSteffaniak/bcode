@@ -7403,7 +7403,7 @@ enum AuthCommand {
         require_backend: Option<String>,
     },
     Login {
-        /// Optional provider ID. Omit to retain active-profile enrollment compatibility.
+        /// Optional provider ID. Omit for interactive provider selection.
         provider: Option<String>,
         #[arg(long)]
         profile: Option<String>,
@@ -7418,7 +7418,7 @@ enum AuthCommand {
         #[arg(long)]
         pool: Option<String>,
         /// Keep this login outside automatic pool enrollment.
-        #[arg(long, conflicts_with = "pool", requires = "provider")]
+        #[arg(long, conflicts_with = "pool")]
         standalone: bool,
         /// Explicit provider-local authentication method ID.
         #[arg(long)]
@@ -10087,6 +10087,10 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             method,
             verify,
         } => {
+            let provider = match provider {
+                Some(provider) => Some(provider),
+                None => auth_login::resolve_provider(profile.as_deref())?,
+            };
             if let Some(provider) = provider {
                 auth_provider_login(
                     &provider,
@@ -10099,6 +10103,7 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
                         standalone,
                         requested_method: method.as_deref(),
                         verify,
+                        prompting: AuthLoginPrompting::Interactive,
                     },
                 )
                 .await
@@ -12156,6 +12161,7 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
         .map(|vault| display_from_current_dir(&vault).to_string())
 }
 
+mod auth_login;
 mod credential_setup;
 mod headless;
 mod startup;
@@ -12367,6 +12373,11 @@ fn resolve_or_prepare_auth_profile_from(
     Ok((prepared.resolved, prepared.publish_runtime))
 }
 
+enum AuthLoginPrompting {
+    Interactive,
+    Explicit,
+}
+
 struct AuthProviderLoginOptions<'a> {
     explicit_profile: Option<&'a str>,
     explicit_vault: Option<PathBuf>,
@@ -12376,6 +12387,7 @@ struct AuthProviderLoginOptions<'a> {
     standalone: bool,
     requested_method: Option<&'a str>,
     verify: bool,
+    prompting: AuthLoginPrompting,
 }
 
 struct AuthProviderLoginResult {
@@ -12496,9 +12508,12 @@ async fn enroll_auth_provider_with_host(
         standalone,
         requested_method,
         verify,
+        prompting,
     } = options;
     let provider = registered_auth_provider(host, provider_id)?;
-    let method = selected_auth_method(&provider, requested_method)?;
+    let mut prompts = auth_login::terminal();
+    prompts.interactive &= matches!(prompting, AuthLoginPrompting::Interactive);
+    let method = prompts.method(&provider, requested_method)?;
     let config = bcode_config::load_config()?;
     let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
     let compatibility = auth_pool_compatibility(host, &provider)?;
@@ -12509,21 +12524,27 @@ async fn enroll_auth_provider_with_host(
     } else {
         bcode_provider_auth::enrollment::PoolEnrollment::Automatic
     };
-    let mut plan = bcode_provider_auth::enrollment::plan(
-        &config,
-        &runtime,
-        &provider.contribution,
-        &provider.plugin_id,
-        method.method_id(),
+    let planning = auth_login::Planning {
+        config: &config,
+        runtime: &runtime,
+        provider: &provider,
+        method,
+        compatibility: compatibility.as_ref(),
+    };
+    let profile = prompts.profile(
+        &planning,
+        explicit_profile,
+        registered_auth_profile_hint(&config, &runtime, &provider, explicit_profile),
+    )?;
+    let mut plan = prompts.plan(
+        &planning,
         bcode_provider_auth::enrollment::EnrollmentDestination {
-            profile: registered_auth_profile_hint(&config, &runtime, &provider, explicit_profile),
+            profile,
             vault: explicit_vault,
             recipient_key: recipient_key.map(str::to_owned),
         },
         pooling,
-        compatibility.as_ref(),
-    )
-    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    )?;
     let resolved = &mut plan.prepared.resolved;
     if no_device_seal {
         resolved
@@ -13552,6 +13573,7 @@ async fn run_compatible_login(plan: CompatibleLoginPlan) -> Result<(), CliError>
             standalone: false,
             requested_method: Some(plan.method_id),
             verify: false,
+            prompting: AuthLoginPrompting::Explicit,
         },
         plan.supplied,
         plan.replace_owned,
@@ -22795,7 +22817,7 @@ mod auth_cli_tests {
         assert!(
             Cli::command()
                 .try_get_matches_from(["bcode", "auth", "login", "--standalone",])
-                .is_err()
+                .is_ok()
         );
     }
 

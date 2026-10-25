@@ -146,12 +146,14 @@ Canonical commands are:
 
 ```text
 bcode auth providers
-bcode auth login <provider> [--method <method>] [--profile <profile>]
+bcode auth login [<provider>] [--method <method>] [--profile <profile>]
 bcode auth status <provider> [--profile <profile>]
 bcode auth logout <provider> [--profile <profile>]
 ```
 
-`--pool <pool>` selects an explicit runtime pool without changing the primary provider binding. Without it, a compatible subscription joins or creates a marked automatic default pool; `--standalone` opts out of membership changes. Existing unmarked pools remain manual. The enabled authentication owner's optional typed `pool_compatibility` operation declares the provider-local compatibility group and interactive methods; unsupported operations mean no automatic pooling, while malformed supported declarations fail closed. API-key methods do not qualify.
+In an interactive terminal, omitted provider and ambiguous method choices are selected from enabled plugin registrations. Omitted accounts offer compatible existing profiles or a new profile; named contexts offer only declared accounts. Compatible subscription methods offer validated pool destinations and an authenticate-only choice that preserves existing membership, even when automatic pool enrollment is unavailable. Explicit flags bypass their corresponding choices. Cancellation, EOF, and invalid explicit selections never fall back to another identity. Without a terminal, omitted provider/method choices return actionable errors rather than reading input. Explicit legacy `--profile` enrollment without a registered provider retains API-key compatibility; bare login does not assume API-key authentication.
+
+`--pool <pool>` selects an explicit runtime pool without changing the primary provider binding. Noninteractive enrollment without it joins or creates a marked automatic default pool for a compatible subscription; `--standalone` opts out of membership changes. Existing unmarked pools remain manual. The enabled authentication owner's optional typed `pool_compatibility` operation declares the provider-local compatibility group and interactive methods; unsupported operations mean no automatic pooling, while malformed supported declarations fail closed. API-key methods do not qualify.
 
 Shared enrollment planning validates ownership, context, compatibility, and destination before authentication. Completion occurs after secure storage, checks current configuration against the plan and compares runtime metadata under the registry lock, then publishes profile and membership together. Saved credentials and failed metadata publication are distinct outcomes. `automatic_provider` and `automatic_group` explicitly opt a declarative pool into managed enrollment; names and pool counts never imply that intent. Native managed-routing receipts are in-process, non-serializable provenance—not credential authority supplied by clients. Context-local enrollment remains declared-only; global runtime profiles are not inherited.
 
