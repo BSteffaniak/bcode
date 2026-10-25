@@ -15,7 +15,14 @@ pub enum Command {
     Newline,
     PageUp,
     PageDown,
+    Latest,
     Copy,
+    PermissionApprove,
+    PermissionDeny,
+    SelectUp,
+    SelectDown,
+    SelectConfirm,
+    SelectCancel,
     Ignore,
 }
 
@@ -58,6 +65,21 @@ impl Bindings {
                 Some(Command::Copy)
             }
             _ => None,
+        }
+    }
+    pub fn permission_action(
+        &self,
+        key: KeyStroke,
+    ) -> bcode_tui_components::permission::decision::PermissionAction {
+        use bcode_tui_components::permission::decision::PermissionAction as Action;
+        match self.overrides.get(&key_name(key)) {
+            Some(Command::PermissionApprove) => Action::PermissionApprove,
+            Some(Command::PermissionDeny) => Action::PermissionDeny,
+            Some(Command::SelectUp) => Action::SelectUp,
+            Some(Command::SelectDown) => Action::SelectDown,
+            Some(Command::SelectConfirm) => Action::SelectConfirm,
+            Some(Command::SelectCancel) => Action::SelectCancel,
+            _ => Action::Other,
         }
     }
     pub fn edit(&self, state: &mut TextInputState, key: KeyStroke) {

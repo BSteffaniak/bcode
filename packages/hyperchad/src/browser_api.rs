@@ -4,6 +4,9 @@
 //! revision identify observations, not durable stream offsets. Errors are JSON envelopes
 //! (the `HyperChad` content boundary does not expose HTTP status/header control).
 
+mod controls;
+mod history;
+
 use std::collections::BTreeMap;
 
 use bcode_session_models::SessionId;
@@ -19,7 +22,17 @@ pub fn with_routes(
     state: HyperChadAppState,
 ) -> hyperchad::router::Router {
     let submit_state = state.clone();
+    let history_state = state.clone();
+    let controls_state = state.clone();
     router
+        .with_route("/api/session-view/history", move |request| {
+            let state = history_state.clone();
+            async move { state.browser_history(request).await }
+        })
+        .with_route("/api/session-view/control", move |request| {
+            let state = controls_state.clone();
+            async move { Box::pin(state.browser_control(request)).await }
+        })
         .with_route("/api/session-view/submit-message", move |request| {
             let state = submit_state.clone();
             async move { state.browser_submit(request).await }
@@ -36,11 +49,13 @@ pub fn with_routes(
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CACHED_SESSIONS: usize = 8;
+const BACKEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct BrowserApiState {
     epoch: SessionId,
     revision: u64,
     snapshots: BTreeMap<SessionId, (u64, SessionViewSnapshot)>,
+    windows: BTreeMap<SessionId, bcode_session_models::ProjectionWindowRequest>,
 }
 
 impl Default for BrowserApiState {
@@ -49,11 +64,41 @@ impl Default for BrowserApiState {
             epoch: SessionId::new(),
             revision: 0,
             snapshots: BTreeMap::new(),
+            windows: BTreeMap::new(),
         }
     }
 }
 
 impl BrowserApiState {
+    /// Serialize the complete envelope before mutating the bounded observation cache.
+    fn publish_observation(
+        &mut self,
+        session_id: SessionId,
+        snapshot: SessionViewSnapshot,
+    ) -> Result<Content, &'static str> {
+        let revision = self
+            .snapshots
+            .get(&session_id)
+            .filter(|(_, previous)| previous == &snapshot)
+            .map(|(revision, _)| *revision)
+            .or_else(|| self.revision.checked_add(1))
+            .ok_or("revision_exhausted")?;
+        let envelope = BrowserSessionSnapshot {
+            schema_version: 1,
+            epoch: self.epoch,
+            revision,
+            snapshot,
+        };
+        let mut writer = BoundedJson(Vec::new());
+        serde_json::to_writer(&mut writer, &envelope).map_err(|_| "response_too_large")?;
+        self.observe(session_id, envelope.snapshot)
+            .ok_or("revision_exhausted")?;
+        Ok(Content::Raw {
+            data: writer.0.into(),
+            content_type: "application/json".to_owned(),
+        })
+    }
+
     fn observe(&mut self, session_id: SessionId, snapshot: SessionViewSnapshot) -> Option<u64> {
         if let Some((revision, previous)) = self.snapshots.get(&session_id)
             && previous == &snapshot
@@ -70,6 +115,7 @@ impl BrowserApiState {
                 .map(|(id, _)| *id);
             if let Some(oldest) = oldest {
                 self.snapshots.remove(&oldest);
+                self.windows.remove(&oldest);
             }
         }
         self.snapshots.insert(session_id, (self.revision, snapshot));
@@ -112,6 +158,33 @@ pub struct BrowserActionResponse {
     pub schema_version: u16,
     /// Canonical semantic result, including a durable acceptance receipt.
     pub outcome: bcode_session_view_models::SessionViewActionOutcome,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationGuard {
+    session_id: SessionId,
+    epoch: SessionId,
+    revision: u64,
+}
+
+fn parse_body<T: serde::de::DeserializeOwned>(request: &RouteRequest) -> Result<T, &'static str> {
+    if request.method.as_ref() != "POST" {
+        return Err("method_not_allowed");
+    }
+    if !request.content_type().is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    }) {
+        return Err("invalid_content_type");
+    }
+    let body = request.body.as_deref().map_or(&[][..], AsRef::as_ref);
+    if body.len() > MAX_REQUEST_BYTES {
+        return Err("request_too_large");
+    }
+    serde_json::from_slice(body).map_err(|_| "invalid_request")
 }
 
 fn parse_submission(body: &[u8]) -> Result<BrowserSubmitMessage, &'static str> {
@@ -202,25 +275,25 @@ impl HyperChadAppState {
             return error("invalid_session");
         };
         // Serialize observations so concurrent attaches cannot publish older results after newer ones.
-        let mut observations = self.browser_api.lock().await;
-        let Ok(snapshot) = self.session_snapshot(session_id).await else {
+        let Ok(mut observations) = self.browser_api.try_lock() else {
+            return error("browser_busy");
+        };
+        let window = observations
+            .windows
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_else(crate::hyperchad_projection_window_request);
+        let Ok(Ok(snapshot)) = tokio::time::timeout(
+            BACKEND_TIMEOUT,
+            self.browser_window_snapshot(session_id, window),
+        )
+        .await
+        else {
             return error("session_unavailable");
         };
-        // Reject oversized observations before retaining them in the bounded cache.
-        let mut probe = BoundedJson(Vec::new());
-        if serde_json::to_writer(&mut probe, &snapshot).is_err() {
-            return error("response_too_large");
-        }
-        drop(probe);
-        let Some(revision) = observations.observe(session_id, snapshot.clone()) else {
-            return error("revision_exhausted");
-        };
-        json_content(&BrowserSessionSnapshot {
-            schema_version: 1,
-            epoch: observations.epoch,
-            revision,
-            snapshot,
-        })
+        observations
+            .publish_observation(session_id, snapshot)
+            .unwrap_or_else(error)
     }
 
     pub(super) async fn browser_submit(&self, request: RouteRequest) -> Content {
@@ -252,12 +325,23 @@ impl HyperChadAppState {
             placement: message.placement,
             execution: Box::default(),
         };
-        match bcode_session_view::execute_session_view_action(&self.client, action).await {
-            Ok(outcome) => json_content(&BrowserActionResponse {
+        // Bound concurrent browser backend work without an unbounded waiter queue.
+        // A busy response is pre-admission; clients still retain the exact operation.
+        let Ok(_operation) = self.browser_api.try_lock() else {
+            return error("browser_busy");
+        };
+        match tokio::time::timeout(
+            BACKEND_TIMEOUT,
+            bcode_session_view::execute_session_view_action(&self.client, action),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => json_content(&BrowserActionResponse {
                 schema_version: 1,
                 outcome,
             }),
-            Err(error_value) => error(submission_error(&error_value)),
+            Ok(Err(error_value)) => error(submission_error(&error_value)),
+            Err(_) => error("submission_outcome_unknown"),
         }
     }
 }
@@ -367,6 +451,102 @@ mod tests {
             decode(state.browser_submit(post).await)["error"],
             "request_too_large"
         );
+    }
+
+    #[tokio::test]
+    async fn registered_routes_enforce_auth_method_and_body_before_backend() {
+        let state = HyperChadAppState::new(bcode_client::BcodeClient::default_endpoint(), "secret");
+        let router = crate::router_from_state(state);
+        for (path, method, content_type, body, expected) in [
+            (
+                "/api/session-view/submit-message",
+                "POST",
+                "application/json",
+                b"{}".as_slice(),
+                "unauthorized",
+            ),
+            (
+                "/api/session-view/not-a-session?token=secret",
+                "GET",
+                "",
+                b"".as_slice(),
+                "invalid_session",
+            ),
+            (
+                "/api/session-view/submit-message?token=secret",
+                "GET",
+                "",
+                b"".as_slice(),
+                "method_not_allowed",
+            ),
+            (
+                "/api/session-view/submit-message?token=secret",
+                "POST",
+                "text/plain",
+                b"{}".as_slice(),
+                "invalid_content_type",
+            ),
+            (
+                "/api/session-view/submit-message?token=secret",
+                "POST",
+                "application/json",
+                b"{}".as_slice(),
+                "invalid_request",
+            ),
+        ] {
+            let mut request =
+                RouteRequest::from_path(path, hyperchad::router::RequestInfo::default());
+            request.method = method.parse().unwrap();
+            request
+                .headers
+                .insert("content-type".to_owned(), content_type.to_owned());
+            request.body = Some(std::sync::Arc::new(body.to_vec().into()));
+            let content = router.navigate(request).await.unwrap().unwrap();
+            let Content::Raw { data, .. } = content else {
+                panic!("expected raw JSON")
+            };
+            let value: serde_json::Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!(value["error"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn narrow_routes_reject_unauthorized_methods_and_stale_guards() {
+        let state = HyperChadAppState::new(bcode_client::BcodeClient::default_endpoint(), "secret");
+        let router = crate::router_from_state(state);
+        for endpoint in ["history", "control"] {
+            for (token, method, body, expected) in [
+                ("wrong", "POST", "{}".to_owned(), "unauthorized"),
+                ("secret", "GET", "{}".to_owned(), "method_not_allowed"),
+                ("secret", "POST", "{}".to_owned(), "invalid_request"),
+                (
+                    "secret",
+                    "POST",
+                    if endpoint == "history" {
+                        serde_json::json!({"session_id": SessionId::new(), "epoch": SessionId::new(), "revision": 1, "direction": "older"}).to_string()
+                    } else {
+                        serde_json::json!({"session_id": SessionId::new(), "epoch": SessionId::new(), "revision": 1, "action": {"type": "permission", "permission_id": "p", "approved": true, "remember": false}}).to_string()
+                    },
+                    "stale_observation",
+                ),
+            ] {
+                let mut request = RouteRequest::from_path(
+                    &format!("/api/session-view/{endpoint}?token={token}"),
+                    hyperchad::router::RequestInfo::default(),
+                );
+                request.method = method.parse().unwrap();
+                request
+                    .headers
+                    .insert("content-type".to_owned(), "application/json".to_owned());
+                request.body = Some(std::sync::Arc::new(body.into_bytes().into()));
+                let Content::Raw { data, .. } = router.navigate(request).await.unwrap().unwrap()
+                else {
+                    panic!("expected JSON")
+                };
+                let value: serde_json::Value = serde_json::from_slice(&data).unwrap();
+                assert_eq!(value["error"], expected);
+            }
+        }
     }
 
     #[test]

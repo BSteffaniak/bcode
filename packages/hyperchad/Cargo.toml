@@ -43,9 +43,16 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-bcode_ipc = { workspace = true }
-tempfile  = { workspace = true }
-tokio     = { workspace = true, features = ["macros", "rt"] }
+axum                       = { workspace = true, features = ["http1", "tokio"] }
+bcode_agent_runtime        = { workspace = true }
+bcode_config               = { workspace = true }
+bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_ipc                  = { workspace = true }
+bcode_model_catalog        = { workspace = true }
+bcode_plugin               = { workspace = true }
+bcode_server               = { workspace = true }
+tempfile                   = { workspace = true }
+tokio                      = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 
 [features]
 default = []

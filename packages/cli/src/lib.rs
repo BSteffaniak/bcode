@@ -786,6 +786,24 @@ fn write_artifact_id() -> Result<(), CliError> {
     Ok(())
 }
 
+async fn handle_new_cli_session(
+    cli: Cli,
+    launch_options: bcode_tui::TuiLaunchOptions,
+) -> Result<(), CliError> {
+    if cli.command.is_some() {
+        return Err(CliError::NewSessionWithCommand);
+    }
+    Box::pin(run_new_session_tui(cli.worktree, launch_options)).await
+}
+
+async fn route_cli_startup(cli: &Cli) -> Result<bool, CliError> {
+    if cli.onboard {
+        startup::advanced(cli.no_credential_discovery).await?;
+        return Ok(true);
+    }
+    Ok(cli.command.is_none() && Box::pin(startup::route(cli.no_credential_discovery)).await?)
+}
+
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     let _ = (&cli.profile, cli.request_timeout_secs);
     let _ = (&cli.state_root, &cli.state_profile);
@@ -796,17 +814,9 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     }
     startup::prepare_remembered_source()?;
     if cli.new {
-        if cli.command.is_some() {
-            return Err(CliError::NewSessionWithCommand);
-        }
-        Box::pin(run_new_session_tui(cli.worktree, launch_options)).await?;
-        return Ok(());
+        return handle_new_cli_session(cli, launch_options).await;
     }
-    if cli.onboard {
-        startup::advanced(cli.no_credential_discovery).await?;
-        return Ok(());
-    }
-    if cli.command.is_none() && Box::pin(startup::route(cli.no_credential_discovery)).await? {
+    if route_cli_startup(&cli).await? {
         return Ok(());
     }
     match cli.command.unwrap_or_default() {
@@ -860,7 +870,17 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             port,
             allow_non_loopback,
             tui_assets,
-        } => handle_web_command(bind, port, allow_non_loopback, tui_assets.as_deref()).await?,
+            allowed_browser_origins,
+        } => {
+            handle_web_command(
+                bind,
+                port,
+                allow_non_loopback,
+                tui_assets.as_deref(),
+                &allowed_browser_origins,
+            )
+            .await?
+        }
         Commands::Plugin { command } => handle_plugin_command(command).await?,
         Commands::Theme { command } => handle_theme_command(command)?,
         Commands::Judgement { command } => Box::pin(handle_judgement_command(command)).await?,
@@ -4043,6 +4063,7 @@ async fn handle_web_command(
     requested_port: Option<u16>,
     allow_non_loopback: bool,
     tui_assets: Option<&std::path::Path>,
+    allowed_browser_origins: &[String],
 ) -> Result<(), CliError> {
     // Validate the entire concrete distribution before daemon discovery or binding.
     let tui_assets = tui_assets
@@ -4088,8 +4109,10 @@ async fn handle_web_command(
                 println!("Bcode HyperChad application opened at http://{address}/{route}");
             }
         });
-    let (app, renderer_runtime) = bcode_hyperchad::build_app_with_runtime(builder)
+    let (mut app, renderer_runtime) = bcode_hyperchad::build_app_with_runtime(builder)
         .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
+    bcode_hyperchad::configure_browser_origins(&mut app, allowed_browser_origins)
+        .map_err(|error| CliError::HyperChadRender(error.to_owned()))?;
     bcode_hyperchad::configure_live_updates(&app.renderer, &state);
     let result = tokio::task::spawn_blocking(move || app.handle_serve())
         .await
@@ -4985,6 +5008,9 @@ enum Commands {
         /// Serve the browser-local WASM TUI from a complete built distribution.
         #[arg(long, value_name = "DIR")]
         tui_assets: Option<std::path::PathBuf>,
+        /// Explicit cross-origin browser read grants (repeatable exact HTTP(S) origins).
+        #[arg(long = "allow-browser-origin")]
+        allowed_browser_origins: Vec<String>,
     },
     Plugin {
         #[command(subcommand)]
@@ -26130,6 +26156,7 @@ mod web_command_tests {
             port,
             allow_non_loopback,
             tui_assets,
+            allowed_browser_origins,
         }) = cli.command
         else {
             panic!("expected web command");
@@ -26139,6 +26166,7 @@ mod web_command_tests {
         assert_eq!(port, None);
         assert!(!allow_non_loopback);
         assert_eq!(tui_assets, None);
+        assert!(allowed_browser_origins.is_empty());
     }
 
     #[cfg(feature = "web-renderer")]
@@ -26161,6 +26189,7 @@ mod web_command_tests {
             None,
             false,
             Some(directory.path()),
+            &[],
         )
         .await
         .expect_err("empty assets must fail before startup");

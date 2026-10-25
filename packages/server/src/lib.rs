@@ -529,7 +529,7 @@ pub struct ServerState {
     session_model_selection_origins: Mutex<BTreeMap<SessionId, SessionModelSelectionOrigin>>,
     required_skill_model_overrides:
         Mutex<BTreeMap<(SessionId, SkillId), RequiredSkillModelOverride>>,
-    pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
+    pending_permissions: Mutex<interaction_operations::PendingPermissions>,
     recovered_permissions: Mutex<BTreeMap<String, bcode_session::InvocationRecoveryCheckpoint>>,
     pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
@@ -6757,6 +6757,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::InvokeSkill { .. } => "invoke_skill",
         Request::InvokeSkillWithExecution { .. } => "invoke_skill_with_execution",
         Request::CancelSessionTurn { .. } => "cancel_session_turn",
+        Request::ScopedPermissions { .. } => "scoped_permissions",
+        Request::ResolvePermissionsConditional { .. } => "resolve_permissions_conditional",
         Request::ListPermissions => "list_permissions",
         Request::ResolvePermission { .. } => "resolve_permission",
         Request::ResolvePermissionBatch { .. } => "resolve_permission_batch",
@@ -11054,14 +11056,15 @@ async fn handle_permission_interaction_request(
                 .await;
             send_controller_response(writer, request_id, result).await
         }
+        request @ (PermissionInteractionRequest::ScopedPermissions { .. }
+        | PermissionInteractionRequest::ResolvePermissionsConditional { .. }) => {
+            let payload = scoped_permission_response(state, request).await;
+            send_response(writer, request_id, Response::Ok(payload)).await
+        }
         PermissionInteractionRequest::ListPermissions => {
             let permissions = interaction_operations::list_permissions(state).await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::PermissionList { permissions }),
-            )
-            .await
+            let payload = ResponsePayload::PermissionList { permissions };
+            send_response(writer, request_id, Response::Ok(payload)).await
         }
         PermissionInteractionRequest::ResolvePermission {
             permission_id,
@@ -104147,5 +104150,25 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(state.clients.lock().await.is_empty());
         drop(peer);
         drop(state);
+    }
+}
+
+async fn scoped_permission_response(
+    state: &ServerState,
+    request: PermissionInteractionRequest,
+) -> ResponsePayload {
+    match request {
+        PermissionInteractionRequest::ScopedPermissions { query } => {
+            ResponsePayload::ScopedPermissions {
+                result: interaction_operations::scoped_permissions(state, query).await,
+            }
+        }
+        PermissionInteractionRequest::ResolvePermissionsConditional { decision } => {
+            ResponsePayload::PermissionsConditionalResolved {
+                result: interaction_operations::resolve_permissions_conditional(state, decision)
+                    .await,
+            }
+        }
+        _ => unreachable!("scoped permission dispatcher"),
     }
 }

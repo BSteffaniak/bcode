@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_session_models = { workspace = true }
+partial-json-fixer   = { workspace = true }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true, features = ["std"] }
 

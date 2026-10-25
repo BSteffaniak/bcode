@@ -50,6 +50,7 @@ bcode_tui_components = { workspace = true, features = [
     "source-viewer",
     "terminal-viewer",
     "transcript",
+    "transcript-engine",
     "transcript-markdown",
 ] }
 bcode_usage_models = { workspace = true }

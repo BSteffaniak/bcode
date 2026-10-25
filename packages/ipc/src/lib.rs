@@ -1161,6 +1161,14 @@ pub enum Request {
         session_id: SessionId,
         query: SessionHistoryAroundQuery,
     },
+    /// Bounded source/destination-scoped pending permission lookup.
+    ScopedPermissions {
+        query: bcode_session_models::ScopedPermissionQuery,
+    },
+    /// Atomically validate and claim an exact permission set; no generic invocation.
+    ResolvePermissionsConditional {
+        decision: bcode_session_models::ConditionalPermissionDecision,
+    },
     ListPermissions,
     ResolvePermission {
         permission_id: String,
@@ -2321,6 +2329,14 @@ pub enum ResponsePayload {
         status: PolicyStatusResponse,
     },
     SessionAgentSet,
+    /// Bounded scoped checkpoint observation.
+    ScopedPermissions {
+        result: bcode_session_models::ScopedPermissionLookup,
+    },
+    /// Conditional exact-set decision outcome.
+    PermissionsConditionalResolved {
+        result: bcode_session_models::ConditionalPermissionResult,
+    },
     PermissionList {
         permissions: Vec<PermissionSummary>,
     },
@@ -3338,6 +3354,70 @@ pub fn decode_typed_stable<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Codec
 /// Returns an error when serialization fails.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     encode_positional(value)
+}
+
+/// Encode a request with the Bcode wire codec.
+#[cfg(test)]
+mod scoped_permission_wire_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_permission_requests_and_results_round_trip_through_actual_codec() {
+        use bcode_session_models::*;
+        let session_id = SessionId::new();
+        let identity = PermissionCheckpointIdentity {
+            permission_id: "checkpoint".into(),
+            checkpoint_digest: "ab".repeat(32),
+        };
+        for request in [
+            Request::ScopedPermissions {
+                query: ScopedPermissionQuery {
+                    session_id,
+                    batch_id: Some("batch".into()),
+                    after_permission_id: None,
+                    limit: MAX_SCOPED_PERMISSION_CHECKPOINTS,
+                },
+            },
+            Request::ResolvePermissionsConditional {
+                decision: ConditionalPermissionDecision {
+                    session_id,
+                    batch_id: Some("batch".into()),
+                    expected: vec![identity],
+                    approved: false,
+                    remember: false,
+                },
+            },
+        ] {
+            assert_eq!(
+                decode_request(&encode_request(&request).unwrap()).unwrap(),
+                request
+            );
+        }
+        for result in [
+            ConditionalPermissionResult::Stale,
+            ConditionalPermissionResult::Invalid,
+            ConditionalPermissionResult::Resolved { resolved: 2 },
+            ConditionalPermissionResult::CompletionFailed,
+            ConditionalPermissionResult::BatchApprovalUnavailable,
+        ] {
+            let response = Response::Ok(ResponsePayload::PermissionsConditionalResolved { result });
+            let bytes = encode_typed_stable(&response).unwrap();
+            assert_eq!(decode_typed_stable::<Response>(&bytes).unwrap(), response);
+        }
+        for result in [
+            ScopedPermissionLookup::Invalid,
+            ScopedPermissionLookup::Unavailable,
+            ScopedPermissionLookup::LimitExceeded,
+            ScopedPermissionLookup::Ready {
+                checkpoints: vec![],
+                next_after: None,
+            },
+        ] {
+            let response = Response::Ok(ResponsePayload::ScopedPermissions { result });
+            let bytes = encode_typed_stable(&response).unwrap();
+            assert_eq!(decode_typed_stable::<Response>(&bytes).unwrap(), response);
+        }
+    }
 }
 
 /// Encode a request with the Bcode wire codec.

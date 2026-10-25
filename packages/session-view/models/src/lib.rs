@@ -8,6 +8,8 @@
 //! web, and future renderers should be able to consume them without depending on terminal frames,
 //! browser DOM primitives, daemon clients, or application orchestration.
 
+pub mod presentation;
+
 use bcode_session_models::{
     ClientId, ModelTurnOutcome, RequestContextOccupancy, RuntimeWorkKind, RuntimeWorkStatus,
     SessionId, SessionSummary, SessionTokenUsage, ToolArtifact, ToolInvocationResult, WorkId,

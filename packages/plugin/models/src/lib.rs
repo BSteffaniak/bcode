@@ -11,6 +11,8 @@
 pub mod composer;
 pub mod interaction_controller;
 pub mod keymap;
+pub mod tui_selection;
+pub mod tui_visual;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

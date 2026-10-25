@@ -62,7 +62,8 @@ bundle: real WASM Canvas rendering, grapheme editing, explicit Enter/Ctrl+Enter
 bindings, zero/tiny resize and disposal. Build that distribution before running
 this harness; it is not a full backend or native-parity acceptance suite.
 
-The root Cargo patches pin the pushed BMUX and MoosicBox Git revisions, including
-their shared dependency closure. No sibling worktrees are needed. The build script
+The root Cargo patches track BMUX and MoosicBox `master`, including their shared
+dependency closure; `Cargo.lock` records the resolved commits. No sibling worktrees
+are needed. The build script
 uses the Cargo-resolved BMUX bridge and, when the native shell lacks WASM std, its
 locked Nix toolchain. Assets and tool binaries remain ignored build artifacts.

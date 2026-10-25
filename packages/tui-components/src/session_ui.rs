@@ -189,3 +189,7 @@ pub fn compose<'a>(
                 .height(u64::from(composer_height)),
         )
 }
+
+/// The shared caller-owned transcript child for native and browser BMUX hosts.
+#[cfg(feature = "transcript-engine")]
+pub use crate::transcript::child::TranscriptChild;

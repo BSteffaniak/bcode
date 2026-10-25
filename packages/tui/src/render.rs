@@ -1857,66 +1857,89 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
         })
         .map(|region| region.rect)
         .collect::<Vec<_>>();
-    let mut y = area.y;
+    // The shared retained child owns row painting. Native focus policy remains a
+    // decorator; source geometry and actions keep their existing root authority
+    // until the root switches them atomically to child-owned metadata.
+    let decorate = |visible: super::transcript_layout::VisibleTranscriptLine, row: &Line| {
+        use unicode_segmentation::UnicodeSegmentation as _;
+        let y = area.y.saturating_add(
+            u16::try_from(visible.row_index.saturating_sub(top_row)).unwrap_or(u16::MAX),
+        );
+        let mut styled = row.clone();
+        let mut x = usize::from(area.x);
+        styled.spans = row
+            .spans
+            .iter()
+            .flat_map(|span| {
+                span.content
+                    .graphemes(true)
+                    .map(|grapheme| {
+                        let end = x.saturating_add(text_display_width(grapheme));
+                        let highlight = focused.iter().any(|rect| {
+                            y >= rect.y
+                                && y < rect.bottom()
+                                && x < usize::from(rect.right())
+                                && end > usize::from(rect.x)
+                        });
+                        x = end;
+                        Span::styled(
+                            grapheme.to_owned(),
+                            if highlight {
+                                span.style.add_modifier(Modifier::REVERSED)
+                            } else {
+                                span.style
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        styled
+    };
+    let child = bcode_tui_components::session_ui::TranscriptChild {
+        id: "bcode.transcript",
+        layout: app.transcript_layout(),
+        items: app.transcript(),
+        top: top_row,
+        selection_scope: "bcode.transcript",
+        metadata: false,
+        decorate: Some(&decorate),
+    };
+    let measured = child.layout(
+        bmux_tui::component::Constraints::tight(bmux_tui::geometry::Size::new(
+            area.width,
+            area.height,
+        )),
+        &mut bmux_tui::component::LayoutCx::new(),
+    );
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| child.paint(&measured, cx),
+    );
     for visible in app
         .transcript_layout()
         .visible_lines_from_top(top_row, area.height)
     {
-        if y >= area.bottom() {
-            break;
-        }
-        if let Some(row) = app.transcript_layout().line(visible) {
-            use unicode_segmentation::UnicodeSegmentation as _;
-            let mut styled = row.clone();
-            let mut x = usize::from(area.x);
-            styled.spans = row
-                .spans
-                .iter()
-                .flat_map(|span| {
-                    span.content
-                        .graphemes(true)
-                        .map(|grapheme| {
-                            let end = x.saturating_add(text_display_width(grapheme));
-                            let highlight = focused.iter().any(|rect| {
-                                y >= rect.y
-                                    && y < rect.bottom()
-                                    && x < usize::from(rect.right())
-                                    && end > usize::from(rect.x)
-                            });
-                            x = end;
-                            Span::styled(
-                                grapheme.to_owned(),
-                                if highlight {
-                                    span.style.add_modifier(Modifier::REVERSED)
-                                } else {
-                                    span.style
-                                },
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            if visible.source == super::transcript_layout::VisibleTranscriptSource::Transcript
-                && app.activity_inspection(visible.entry_index).is_some()
-            {
-                frame.push_hit(
-                    HitRegion::new(
-                        format!(
-                            "activity-inspect:{}:{}",
-                            visible.entry_index,
-                            app.transcript()[visible.entry_index].id().get()
-                        ),
-                        Rect::new(area.x, y, area.width, 1),
-                    )
-                    .role(HitRole::Action)
-                    .layer(1),
-                );
-            }
-            frame.write_line(
-                LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
-                &styled,
+        if visible.source == super::transcript_layout::VisibleTranscriptSource::Transcript
+            && app.activity_inspection(visible.entry_index).is_some()
+        {
+            let y = area.y.saturating_add(
+                u16::try_from(visible.row_index.saturating_sub(top_row)).unwrap_or(u16::MAX),
             );
-            y = y.saturating_add(1);
+            frame.push_hit(
+                HitRegion::new(
+                    format!(
+                        "activity-inspect:{}:{}",
+                        visible.entry_index,
+                        app.transcript()[visible.entry_index].id().get()
+                    ),
+                    Rect::new(area.x, y, area.width, 1),
+                )
+                .role(HitRole::Action)
+                .layer(1),
+            );
         }
     }
     render_transcript_markdown_hits(app, area, top_row, frame);

@@ -57,6 +57,22 @@ impl BrowserSession {
         self.surface()?.input(json).map_err(error)
     }
 
+    /// Drain bounded semantic host work after input; never executes platform work.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state or serialization failure.
+    pub fn take_intents(&mut self) -> Result<String, JsValue> {
+        self.surface()?.take_intents().map_err(error)
+    }
+
+    /// Accessible metadata from the last successfully committed BMUX scene.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state or serialization failure.
+    pub fn accessibility(&mut self) -> Result<String, JsValue> {
+        self.surface()?.accessibility().map_err(error)
+    }
+
     /// Resize cells and physical pixel metrics after the previous render settles.
     ///
     /// # Errors
@@ -90,11 +106,6 @@ impl BrowserSession {
         if self.disposed {
             return Err(error("surface disposed"));
         }
-        // A hidden/unmeasured embed has no browser frame. The shared frame
-        // contract rejects empty cell grids; resume painting after a real resize.
-        if self.surface()?.local.presentation().area().is_empty() {
-            return Ok(false);
-        }
         let mut surface = self
             .surface
             .take()
@@ -109,6 +120,9 @@ impl BrowserSession {
             .local
             .present_canvas(&mut canvas, Damage::Full, |cx| inner.paint(cx))
             .await;
+        if matches!(result, Ok(true)) {
+            surface.commit_output();
+        }
         self.surface = Some(surface);
         self.canvas = Some(canvas);
         result
@@ -167,6 +181,58 @@ impl BrowserSession {
     /// Rejects disposed/busy state, malformed responses or unmatched receipts.
     pub fn settle_submission(&mut self, json: &str) -> Result<(), JsValue> {
         self.surface()?.settle_submission(json).map_err(error)
+    }
+
+    /// Prepare one bounded semantic history request from the accepted snapshot.
+    ///
+    /// # Errors
+    /// Rejects absent snapshots or unsupported directions.
+    pub fn prepare_history(&mut self, direction: &str) -> Result<String, JsValue> {
+        self.surface()?
+            .inner
+            .semantic
+            .prepare_history(direction)
+            .map_err(error)
+    }
+
+    /// Validate one explicit pending control against accepted application state.
+    ///
+    /// # Errors
+    /// Rejects stale identities, unsupported actions and oversized payloads.
+    pub fn prepare_control(&mut self, json: &str) -> Result<String, JsValue> {
+        self.surface()?
+            .inner
+            .semantic
+            .prepare_control(json)
+            .map_err(error)
+    }
+
+    /// Verify the outcome matches the exact control sent by this host.
+    ///
+    /// # Errors
+    /// Rejects malformed or unrelated responses; does not automatically retry.
+    pub fn accept_control(&mut self, action: &str, response: &str) -> Result<(), JsValue> {
+        self.surface()?
+            .inner
+            .semantic
+            .accept_control(action, response)
+            .map_err(error)
+    }
+
+    /// Export only bounded caller-owned draft/selection and unresolved action state.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state or oversized recovery.
+    pub fn export_recovery(&mut self) -> Result<String, JsValue> {
+        self.surface()?.export_recovery().map_err(error)
+    }
+
+    /// Restore into a fresh surface without observations or interaction geometry.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state or invalid recovery.
+    pub fn restore_recovery(&mut self, json: &str) -> Result<(), JsValue> {
+        self.surface()?.restore_recovery(json).map_err(error)
     }
 
     /// Cancel browser capture before focus loss or disposal.

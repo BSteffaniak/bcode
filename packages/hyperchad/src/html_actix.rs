@@ -195,6 +195,24 @@ pub fn build_app_with_runtime(
     Ok((app, runtime))
 }
 
+/// Apply explicit trusted cross-origin read grants before starting the server.
+/// Same-origin hosting requires no grants; application authorization is unchanged.
+///
+/// # Errors
+/// Rejects malformed origins rather than granting wildcard CORS access.
+pub fn configure_browser_origins(
+    app: &mut App<DefaultRenderer>,
+    origins: &[String],
+) -> Result<(), &'static str> {
+    let mut policy =
+        hyperchad::renderer_html_actix::HttpPolicy::new(64 * 1024).with_sensitive_path_prefix("/");
+    for origin in origins {
+        policy = policy.with_cors_origin(origin.clone())?;
+    }
+    app.renderer.app.set_http_policy(policy);
+    Ok(())
+}
+
 /// Build the selected HTML/Actix application from the provided builder.
 ///
 /// # Errors

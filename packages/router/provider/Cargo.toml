@@ -26,7 +26,6 @@ sshenv_vault                 = { workspace = true }
 thiserror                    = { workspace = true }
 tokio                        = { workspace = true, features = ["time"] }
 tracing                      = { workspace = true }
-zeroize                      = { workspace = true }
 
 [dev-dependencies]
 axum  = { workspace = true, features = ["http1", "json", "tokio"] }

@@ -631,7 +631,9 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "settle live arrival transition",
-                input: TranscriptFrameInput::SettleScrollTransition,
+                input: TranscriptFrameInput::AdvanceScrollAnimation(
+                    std::time::Duration::from_secs(1),
+                ),
             },
             TranscriptFrameStep {
                 label: "live tail settled",
@@ -3470,13 +3472,17 @@ mod tests {
                 input: TranscriptFrameInput::ScrollDown(4),
             },
             TranscriptFrameStep {
+                label: "settle",
+                input: TranscriptFrameInput::SettleScrollTransition,
+            },
+            TranscriptFrameStep {
                 label: "observe",
                 input: TranscriptFrameInput::Observe,
             },
         ]);
         assert_eq!(
-            frames[1].observation.viewport_top,
-            frames[2].observation.viewport_top
+            frames[2].observation.viewport_top,
+            frames[3].observation.viewport_top
         );
     }
 

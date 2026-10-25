@@ -18,14 +18,81 @@ struct Observation {
     snapshot: SessionViewSnapshot,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Submission {
     #[serde(rename = "submission_id")]
     identity: String,
     #[serde(rename = "session_id")]
     session: String,
     text: String,
-    placement: &'static str,
+    placement: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum BrowserControl {
+    Permission {
+        permission_id: String,
+        approved: bool,
+        remember: bool,
+    },
+    PermissionBatch {
+        batch_id: String,
+        approved: bool,
+    },
+    Interaction {
+        interaction_id: String,
+        input: BrowserInteractionInput,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum BrowserInteractionInput {
+    Activate {
+        control_id: String,
+    },
+    Change {
+        control_id: String,
+        value: serde_json::Value,
+    },
+    Focus {
+        control_id: String,
+    },
+    Blur {
+        control_id: String,
+    },
+    Navigate {
+        direction: BrowserNavigation,
+    },
+    Submit {
+        value: Option<serde_json::Value>,
+    },
+    Cancel,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BrowserNavigation {
+    Next,
+    Previous,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BrowserHistoryDirection {
+    Older,
+    Newer,
+    Tail,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recovery {
+    schema_version: u16,
+    session: String,
+    pending: Option<Submission>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +178,178 @@ impl SnapshotState {
         Ok(true)
     }
 
+    /// Prepare a bounded semantic history replacement from accepted source metadata.
+    /// The host must pass response bytes to `accept`, not merge raw events in JS.
+    ///
+    /// # Errors
+    /// Rejects absent observations, unsupported direction or unavailable boundaries.
+    pub fn prepare_history(&self, direction: &str) -> Result<String, &'static str> {
+        let accepted = self.accepted.as_ref().ok_or("missing observation")?;
+        let direction: BrowserHistoryDirection =
+            serde_json::from_value(serde_json::Value::String(direction.to_owned()))
+                .map_err(|_| "invalid history direction")?;
+        match direction {
+            BrowserHistoryDirection::Older
+                if !accepted.snapshot.transcript.has_older_history
+                    || accepted.snapshot.transcript.source_start_sequence.is_none() =>
+            {
+                return Err("history boundary unavailable");
+            }
+            BrowserHistoryDirection::Newer
+                if !accepted.snapshot.transcript.has_newer_history
+                    || accepted.snapshot.transcript.source_end_sequence.is_none() =>
+            {
+                return Err("history boundary unavailable");
+            }
+            _ => {}
+        }
+        self.browser_request("direction", &direction)
+    }
+
+    /// Prepare only a narrow browser permission or producer-owned interaction input.
+    /// This does not retain a retry receipt or authorize arbitrary session actions.
+    ///
+    /// # Errors
+    /// Rejects malformed/oversized input, unsupported operations and nonpending IDs.
+    pub fn prepare_control(&self, json: &str) -> Result<String, &'static str> {
+        if json.len() > MAX_REQUEST_BYTES {
+            return Err("request too large");
+        }
+        let action: BrowserControl =
+            serde_json::from_str(json).map_err(|_| "invalid browser control")?;
+        let snapshot = self.snapshot().ok_or("missing observation")?;
+        match &action {
+            BrowserControl::Permission {
+                permission_id,
+                remember,
+                ..
+            } => {
+                if !snapshot.permissions.iter().any(|value| {
+                    value.permission_id == *permission_id
+                        && !value.resolved
+                        && (!*remember || value.can_remember)
+                }) {
+                    return Err("stale browser control");
+                }
+            }
+            BrowserControl::PermissionBatch { batch_id, .. } => {
+                if !snapshot.permissions.iter().any(|value| {
+                    !value.resolved
+                        && value
+                            .batch
+                            .as_ref()
+                            .is_some_and(|batch| batch.batch_id == *batch_id)
+                }) {
+                    return Err("stale browser control");
+                }
+            }
+            BrowserControl::Interaction { interaction_id, .. } => {
+                if !snapshot
+                    .interactions
+                    .iter()
+                    .any(|value| value.interaction_id == *interaction_id && !value.resolved)
+                {
+                    return Err("stale browser control");
+                }
+            }
+        }
+        self.browser_request("action", &action)
+    }
+
+    fn browser_request(
+        &self,
+        field: &str,
+        payload: &impl Serialize,
+    ) -> Result<String, &'static str> {
+        let accepted = self.accepted.as_ref().ok_or("missing observation")?;
+        let mut value = serde_json::json!({ "session_id": self.session, "epoch": accepted.epoch, "revision": accepted.revision });
+        value[field] = serde_json::to_value(payload).map_err(|_| "invalid browser request")?;
+        let json = serde_json::to_string(&value).map_err(|_| "invalid browser request")?;
+        if json.len() > MAX_REQUEST_BYTES {
+            return Err("request too large");
+        }
+        Ok(json)
+    }
+
+    /// Validate a narrow control response; it is not an idempotency receipt.
+    /// The host must refresh after every attempt, including transport ambiguity.
+    ///
+    /// # Errors
+    /// Rejects oversized, malformed and unrelated application outcomes.
+    pub fn accept_control(&self, action_json: &str, json: &str) -> Result<(), &'static str> {
+        if action_json.len() > MAX_REQUEST_BYTES || json.len() > MAX_RESPONSE_BYTES {
+            return Err("response too large");
+        }
+        let action: BrowserControl =
+            serde_json::from_str(action_json).map_err(|_| "invalid browser control")?;
+        let response: ActionResponse =
+            serde_json::from_str(json).map_err(|_| "invalid control response")?;
+        if response.schema_version != 1 {
+            return Err("unsupported control schema");
+        }
+        match (action, response.outcome) {
+            (
+                BrowserControl::Permission { .. },
+                SessionViewActionOutcome::PermissionResolved { .. },
+            )
+            | (
+                BrowserControl::PermissionBatch { .. },
+                SessionViewActionOutcome::PermissionBatchResolved { .. },
+            )
+            | (
+                BrowserControl::Interaction { .. },
+                SessionViewActionOutcome::None
+                | SessionViewActionOutcome::InteractionResolved { .. },
+            ) => Ok(()),
+            _ => Err("unmatched control response"),
+        }
+    }
+
+    /// Export only the unresolved operation for caller-owned in-memory recovery.
+    /// Observations, revisions and presentation geometry never cross a remount.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails.
+    pub fn export_recovery(&self) -> Result<String, &'static str> {
+        serde_json::to_string(&Recovery {
+            schema_version: 1,
+            session: self.session.clone(),
+            pending: self.pending.clone(),
+        })
+        .map_err(|_| "invalid recovery state")
+    }
+
+    /// Restore an exact unresolved submission into a fresh adapter only.
+    /// This is not a durable resume token and conveys no backend authority.
+    ///
+    /// # Errors
+    /// Rejects oversized, malformed, foreign or unsupported recovery, invalid
+    /// submissions, and attempts to overwrite already initialized state.
+    pub fn restore_recovery(&mut self, json: &str) -> Result<(), &'static str> {
+        if self.accepted.is_some() || self.pending.is_some() || json.len() > MAX_REQUEST_BYTES * 2 {
+            return Err("invalid recovery state");
+        }
+        let recovery: Recovery =
+            serde_json::from_str(json).map_err(|_| "invalid recovery state")?;
+        if recovery.schema_version != 1 || recovery.session != self.session {
+            return Err("invalid recovery identity or schema");
+        }
+        if let Some(pending) = &recovery.pending
+            && (pending.session != self.session
+                || !uuid(&pending.identity)
+                || pending.text.trim().is_empty()
+                || pending.placement != "steering"
+                || serde_json::to_vec(pending)
+                    .map_err(|_| "invalid recovery submission")?
+                    .len()
+                    > MAX_REQUEST_BYTES)
+        {
+            return Err("invalid recovery submission");
+        }
+        self.pending = recovery.pending;
+        Ok(())
+    }
+
     /// The unmodified accepted semantic snapshot.
     #[must_use]
     pub fn snapshot(&self) -> Option<&SessionViewSnapshot> {
@@ -136,7 +375,7 @@ impl SnapshotState {
             identity,
             session: self.session.clone(),
             text,
-            placement: "steering",
+            placement: "steering".to_owned(),
         };
         let body = serde_json::to_string(&next).map_err(|_| "invalid submission")?;
         if body.len() > MAX_REQUEST_BYTES {
@@ -214,6 +453,53 @@ mod tests {
         assert!(state.accept(&conflicting.to_string()).is_err());
         assert_eq!(state.accept(&observation(u64::MAX)), Ok(true));
         assert!(state.accept(&" ".repeat(MAX_RESPONSE_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn browser_requests_use_exact_u64_observation_and_narrow_authority() {
+        let mut state = SnapshotState::new(SESSION.into()).unwrap();
+        state.accept(&observation(u64::MAX)).unwrap();
+        let request = state.prepare_history("tail").unwrap();
+        assert!(request.contains("18446744073709551615"));
+        assert!(state.prepare_history("older").is_err());
+        assert!(
+            state
+                .prepare_control(r#"{"type":"invoke_skill","skill_id":"shell"}"#)
+                .is_err()
+        );
+        assert!(state.prepare_control(r#"{"type":"permission","permission_id":"missing","approved":true,"remember":false}"#).is_err());
+        let action =
+            r#"{"type":"permission","permission_id":"p","approved":false,"remember":false}"#;
+        assert!(state.accept_control(action, r#"{"schema_version":1,"outcome":{"type":"permission_resolved","resolved":false}}"#).is_ok());
+        assert!(
+            state
+                .accept_control(
+                    action,
+                    r#"{"schema_version":1,"outcome":{"type":"cancelled","cancelled":true}}"#
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_exact_retry_without_old_observation_authority() {
+        let mut old = SnapshotState::new(SESSION.into()).unwrap();
+        old.accept(&observation(5)).unwrap();
+        let exact = old
+            .prepare_submission(EPOCH.into(), "draft 🦀".into())
+            .unwrap();
+        let recovery = old.export_recovery().unwrap();
+        let mut fresh = SnapshotState::new(SESSION.into()).unwrap();
+        fresh.restore_recovery(&recovery).unwrap();
+        assert_eq!(fresh.retry_submission(), Some(exact));
+        assert!(fresh.snapshot().is_none());
+        let mut restarted: serde_json::Value = serde_json::from_str(&observation(1)).unwrap();
+        restarted["epoch"] = SESSION.into();
+        assert_eq!(fresh.accept(&restarted.to_string()), Ok(true));
+        assert!(fresh.restore_recovery(&recovery).is_err());
+        let mut foreign = SnapshotState::new(EPOCH.into()).unwrap();
+        assert!(foreign.restore_recovery(&recovery).is_err());
+        assert!(foreign.retry_submission().is_none());
     }
 
     #[test]

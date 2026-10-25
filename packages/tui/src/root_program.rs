@@ -5895,7 +5895,7 @@ mod tests {
         let (scheduled, _) = model.chat.pending_effects.drain_runtime();
         assert!(scheduled.into_iter().any(|(_, queued)| matches!(queued, TuiEffect::LoadOlderHistory { session_id: queued_session, cursor: queued_cursor, generation: queued_generation, .. } if queued_session == session_id && queued_cursor == cursor && queued_generation == generation)));
         let socket_dir = tempfile::tempdir().expect("IPC directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("page.sock"));
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/page.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let responder = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("client");
@@ -6223,7 +6223,9 @@ mod tests {
             },
         ]);
         assert!(resume[0].observation.semantic_items.len() <= 12);
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("server.sock"));
+        // Keep the private IPC runtime directory separate from the fixture state root.
+        let endpoint =
+            bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("ipc/server.sock"));
         let shutdown = bcode_agent_runtime::CancellationToken::new();
         let client =
             bcode_client::BcodeClient::for_state_location(endpoint.clone(), locations.primary());
@@ -6633,7 +6635,9 @@ mod tests {
                 .then_some(effect)
         }).expect("scheduled older-history effect");
 
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("server.sock"));
+        // Keep the private IPC runtime directory separate from the fixture state root.
+        let endpoint =
+            bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("ipc/server.sock"));
         let shutdown = bcode_agent_runtime::CancellationToken::new();
         let client =
             bcode_client::BcodeClient::for_state_location(endpoint.clone(), locations.primary());

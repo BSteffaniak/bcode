@@ -3519,7 +3519,8 @@ mod projection_paging_tests {
         };
         let expected = confirmation.clone();
         let socket_dir = tempfile::tempdir().unwrap();
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("queue.sock"));
+        let endpoint =
+            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/queue.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let responder = tokio::spawn(respond_to_prepare(
             listener,
@@ -3563,7 +3564,8 @@ mod projection_paging_tests {
 
         let session_id = SessionId::new();
         let socket_dir = tempfile::tempdir().expect("socket directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("history.sock"));
+        let endpoint =
+            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/history.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let responder = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("history client");

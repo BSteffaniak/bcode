@@ -3,45 +3,61 @@ import { mountInteractiveSurface } from './interactive-surface.js';
 import { mountBrowserSession } from './browser-session.js';
 
 const status = document.getElementById('status');
-let host;
-let stopping = false;
-// Launch parameters are explicit. Hash parameters avoid sending credentials to a
-// static asset server. Query parameters remain supported for same-origin launch.
+let host, mounting, lifetime;
+let generation = 0;
+// Caller-owned and memory-only: never persist launch credentials or snapshots.
+const recoveryState = {};
+// Hash launch capabilities are not sent to the static asset server.
 const params = new URLSearchParams(location.hash.slice(1));
 const query = new URLSearchParams(location.search);
 const token = params.get('token') ?? query.get('token');
 const sessionId = params.get('session') ?? query.get('session');
 const backendOrigin = params.get('backend') ?? undefined;
-// Cross-origin static embedding requires host-provided configuration, never a
-// URL-supplied allowlist that could silently authorize token exfiltration.
+// Never accept a URL-supplied allowlist that could authorize token exfiltration.
 const allowedBackendOrigins = globalThis.bcodeTuiConfig?.allowedBackendOrigins ?? [];
-// Remove credentials from visible browser history before initialization/fetch.
 if (token) {
   query.delete('token');
   params.delete('token');
   const search = query.toString(), hash = params.toString();
   history.replaceState(null, '', `${location.pathname}${search ? `?${search}` : ''}${hash ? `#${hash}` : ''}`);
 }
+const initialized = init({ module_or_path: new URL('./bcode_tui_web_bg.wasm', import.meta.url) });
 async function stop() {
-  stopping = true;
+  generation++;
+  lifetime?.abort();
   await host?.dispose();
+  host = undefined;
 }
-window.addEventListener('pagehide', () => { void stop(); }, { once: true });
-try {
-  await init({ module_or_path: new URL('./bcode_tui_web_bg.wasm', import.meta.url) });
-  if (!stopping) {
-    host = await mountBrowserSession({
+async function start() {
+  const current = ++generation;
+  const previous = mounting;
+  lifetime?.abort();
+  const controller = new AbortController();
+  lifetime = controller;
+  try {
+    // A restored bfcache page must not create a second retained compositor while
+    // the old mount/presentation is settling.
+    await previous?.then(next => next.dispose()).catch(() => {});
+    await initialized;
+    if (current !== generation || controller.signal.aborted) return;
+    mounting = mountBrowserSession({
       wasm, mountInteractiveSurface,
       container: document.getElementById('surface'), canvas: document.getElementById('bcode-canvas'),
-      sessionId, token, backendOrigin, allowedBackendOrigins,
-      onError: message => { status.textContent = message; },
+      sessionId, token, backendOrigin, allowedBackendOrigins, recoveryState, signal: controller.signal,
+      capabilities: globalThis.bcodeTuiConfig?.capabilities ?? {},
+      onError: message => { if (current === generation) status.textContent = message; },
     });
-    if (stopping) await host.dispose();
+    const next = await mounting;
+    if (current !== generation || controller.signal.aborted) await next.dispose();
     else {
-      status.textContent = 'BMUX shared Markdown · plugin/tool controls and history paging unavailable';
+      host = next;
+      status.textContent = 'Browser BMUX session connected';
       host.focus();
     }
+  } catch {
+    if (current === generation) status.textContent = 'Browser TUI unavailable. Draft recovery may require remount; verify session, launch token and backend access.';
   }
-} catch {
-  status.textContent = 'Browser TUI unavailable. Supply an explicit session and launch token; verify backend access.';
 }
+window.addEventListener('pagehide', () => { void stop().catch(() => {}); });
+window.addEventListener('pageshow', event => { if (event.persisted) void start(); });
+await start();

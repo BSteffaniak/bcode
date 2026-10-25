@@ -7618,7 +7618,7 @@ async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
     let mut bytes = std::fs::read(&commit.path).expect("live recording prefix");
     bytes.truncate(usize::try_from(commit.committed_bytes).expect("committed length"));
     let socket_dir = tempfile::tempdir().expect("IPC socket directory");
-    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("artifact.sock"));
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/artifact.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
     let response_bytes = bytes.clone();
     let responder = tokio::spawn(async move {

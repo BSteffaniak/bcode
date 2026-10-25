@@ -952,6 +952,12 @@ pub enum PermissionInteractionRequest {
     InteractionControllerInput {
         input: bcode_plugin_models::interaction_controller::InteractionControllerInput,
     },
+    ScopedPermissions {
+        query: bcode_session_models::ScopedPermissionQuery,
+    },
+    ResolvePermissionsConditional {
+        decision: bcode_session_models::ConditionalPermissionDecision,
+    },
     ListPermissions,
     ResolvePermission {
         permission_id: String,
@@ -1987,6 +1993,14 @@ impl RoutedRequest {
                     query,
                 }))
             }
+            Request::ScopedPermissions { query } => {
+                Self::PermissionInteraction(PermissionInteractionRequest::ScopedPermissions {
+                    query,
+                })
+            }
+            Request::ResolvePermissionsConditional { decision } => Self::PermissionInteraction(
+                PermissionInteractionRequest::ResolvePermissionsConditional { decision },
+            ),
             Request::ListPermissions => {
                 Self::PermissionInteraction(PermissionInteractionRequest::ListPermissions)
             }

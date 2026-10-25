@@ -1,5 +1,7 @@
 //! Bcode permission-dialog presentation recipe.
 
+pub mod decision;
+
 use bmux_tui::geometry::{Insets, Size};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 

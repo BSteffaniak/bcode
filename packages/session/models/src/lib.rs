@@ -132,6 +132,9 @@ pub use categorization::{
     SessionCategoryRankRequest, SessionCategoryRankResponse,
 };
 
+mod permission_control;
+pub use permission_control::*;
+
 mod submission;
 pub use submission::*;
 

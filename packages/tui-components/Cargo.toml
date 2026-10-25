@@ -16,14 +16,23 @@ path              = "src/bin/bcode_terminal_grid_probe.rs"
 required-features = ["terminal-viewer"]
 
 [dependencies]
-bcode_markdown_render = { workspace = true, optional = true }
-bcode_syntax_render   = { workspace = true, optional = true }
-bmux_keyboard         = { workspace = true, optional = true }
-bmux_terminal_grid    = { workspace = true, optional = true }
-bmux_text_edit        = { workspace = true, optional = true }
-bmux_tui              = { workspace = true }
-bmux_tui_components   = { workspace = true }
-unicode-width         = { workspace = true, optional = true }
+bcode_markdown_render     = { workspace = true, optional = true }
+bcode_plugin_models       = { workspace = true, optional = true }
+bcode_session_models      = { workspace = true, optional = true }
+bcode_session_view_models = { workspace = true, optional = true }
+bcode_syntax_render       = { workspace = true, optional = true }
+bcode_tool                = { workspace = true, optional = true }
+bmux_keyboard             = { workspace = true, optional = true }
+bmux_terminal_grid        = { workspace = true, optional = true }
+bmux_text_edit            = { workspace = true, optional = true }
+bmux_tui                  = { workspace = true }
+bmux_tui_components       = { workspace = true }
+serde_json                = { workspace = true, optional = true }
+unicode-width             = { workspace = true, optional = true }
+
+[dev-dependencies]
+bcode_session_view  = { workspace = true }
+bcode_syntax_render = { workspace = true }
 
 [features]
 activity = []
@@ -41,6 +50,7 @@ all = [
     "terminal-viewer",
     "tool-card",
     "transcript",
+    "transcript-engine",
     "transcript-markdown",
 ]
 chrome = []
@@ -72,4 +82,12 @@ terminal-viewer = [
 ]
 tool-card = ["compact"]
 transcript = []
+transcript-engine = [
+    "transcript-markdown",
+    "dep:bcode_plugin_models",
+    "dep:bcode_session_models",
+    "dep:bcode_session_view_models",
+    "dep:bcode_tool",
+    "dep:serde_json",
+]
 transcript-markdown = ["transcript", "dep:bcode_markdown_render"]

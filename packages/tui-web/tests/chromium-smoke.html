@@ -1,9 +1,11 @@
 <!doctype html><meta charset="utf-8"><div id="host" style="position:relative;width:720px;height:360px"><canvas id="canvas" style="width:720px;height:360px"></canvas></div><pre id="result">pending</pre>
 <script type="module">
-import init, { BrowserSession } from '../artifacts/consumer-3/bcode_tui_web.js';
-import { mountInteractiveSurface } from '../artifacts/consumer-3/interactive-surface.js';
 const result = document.getElementById('result');
 try {
+  const bundle = new URL(new URLSearchParams(location.search).get('bundle') ?? './bundle/', location.href);
+  if (bundle.origin !== location.origin || !bundle.pathname.endsWith('/')) throw new Error('invalid bundle location');
+  const { default: init, BrowserSession } = await import(new URL('bcode_tui_web.js', bundle));
+  const { mountInteractiveSurface } = await import(new URL('interactive-surface.js', bundle));
   await init();
   const rust = new BrowserSession('00000000-0000-4000-8000-000000000001', 'canvas', 80, 20, 9, 18);
   let queue = Promise.resolve();

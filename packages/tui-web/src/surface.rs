@@ -1,5 +1,13 @@
 //! BMUX rendering/input using retained shared native Markdown components.
-use std::cell::RefCell;
+use bcode_tui_components::permission::{
+    decision::{PermissionDialogOutcome, PermissionDialogResolution, PermissionDialogState},
+    permission_modal,
+};
+use bmux_tui::composition::TextBlock;
+use bmux_tui::composition::{Column, Flex, Row, SizeBox};
+use bmux_tui_components::button::{ButtonComponent, ButtonState};
+use bmux_tui_components::modal_frame::{ModalFrameComponent, ModalTheme};
+use std::cell::{Cell, RefCell};
 
 use crate::transcript::{Transcript, TranscriptComponent};
 use bcode_tui_components::{
@@ -23,6 +31,9 @@ use bmux_web_renderer::{LocalSurface, input::BrowserInput};
 
 use crate::SnapshotState;
 
+const OLDER: &str = "bcode-web/history-older";
+const NEWER: &str = "bcode-web/history-newer";
+const LATEST: &str = "bcode-web/latest";
 const EDITOR: &str = "bcode-web/editor";
 const IDS: SessionUiIds<'static> = SessionUiIds {
     root: "bcode-web/root",
@@ -46,8 +57,15 @@ pub struct SurfaceState {
     height: u16,
     anchor: Option<(String, usize)>,
     focused: bool,
+    focused_hit: Option<String>,
+    navigation_buttons: [Cell<ButtonState>; 3],
     bindings: crate::bindings::Bindings,
     copy_requested: bool,
+    intents: Vec<serde_json::Value>,
+    permission: Option<PermissionDialogState>,
+    permission_inflight: bool,
+    committed_permission: Option<bcode_session_view_models::PermissionView>,
+    permission_buttons: [Cell<ButtonState>; 6],
 }
 
 impl SessionSurface {
@@ -75,8 +93,15 @@ impl SessionSurface {
                 height: 0,
                 anchor: None,
                 focused: true,
+                focused_hit: None,
+                navigation_buttons: std::array::from_fn(|_| Cell::new(ButtonState::new())),
                 bindings: crate::bindings::Bindings::new(),
                 copy_requested: false,
+                intents: Vec::new(),
+                permission: None,
+                permission_inflight: false,
+                committed_permission: None,
+                permission_buttons: std::array::from_fn(|_| Cell::new(ButtonState::new())),
             },
         })
     }
@@ -88,6 +113,31 @@ impl SessionSurface {
     pub fn accept_snapshot(&mut self, json: &str) -> Result<bool, &'static str> {
         let changed = self.inner.semantic.accept(json)?;
         if changed {
+            let pending = self
+                .inner
+                .semantic
+                .snapshot()
+                .and_then(|snapshot| {
+                    snapshot
+                        .permissions
+                        .iter()
+                        .find(|permission| !permission.resolved)
+                })
+                .cloned()
+                .map(|mut permission| {
+                    permission.batch = None;
+                    permission
+                });
+            if self
+                .inner
+                .permission
+                .as_ref()
+                .map(PermissionDialogState::permission)
+                != pending.as_ref()
+            {
+                self.inner.permission_inflight = false;
+                self.inner.permission = pending.map(PermissionDialogState::new);
+            }
             self.prepare();
         }
         Ok(changed)
@@ -100,6 +150,10 @@ impl SessionSurface {
     pub fn resize(&mut self, width: u16, height: u16) -> Result<(), &'static str> {
         let area = checked_area(width, height)?;
         self.cancel_pointer();
+        if area.is_empty() {
+            self.inner.selection.clear();
+            self.inner.focused_hit = None;
+        }
         self.inner.area = area;
         self.local.resize(area);
         self.prepare();
@@ -143,40 +197,22 @@ impl SessionSurface {
             .map_err(|_| "invalid browser input")?;
         let mut submit = false;
         for route in self.local.route_input(input) {
+            if let Some(focus) = &route.focus_changed {
+                self.inner.focused_hit = Some(focus.as_str().to_owned());
+            }
             if route.traversal_consumed {
                 continue;
             }
-            let mut history = WindowHistory;
+            if self.inner.permission.is_some() {
+                self.inner.route_permission(&route);
+                continue;
+            }
+            let mut history = WindowHistory::from_snapshot(self.inner.semantic.snapshot());
+            if self.inner.route_navigation(&route, &mut history) {
+                continue;
+            }
             let action = match route.event {
-                Event::Key(key) => {
-                    use crate::bindings::Command;
-                    match self.inner.bindings.command(key) {
-                        Some(Command::Submit) => {
-                            submit = true;
-                            None
-                        }
-                        Some(Command::Newline) => {
-                            TextInputControl::new(&session_ui::composer_policy())
-                                .handle_paste(&mut self.inner.ui.composer, "\n");
-                            None
-                        }
-                        Some(Command::PageUp) => Some(SessionUiAction::ScrollUp(usize::from(
-                            self.inner.height.max(1),
-                        ))),
-                        Some(Command::PageDown) => Some(SessionUiAction::ScrollDown(usize::from(
-                            self.inner.height.max(1),
-                        ))),
-                        Some(Command::Copy) => {
-                            self.inner.copy_requested = true;
-                            None
-                        }
-                        Some(Command::Ignore) => None,
-                        None => {
-                            self.inner.bindings.edit(&mut self.inner.ui.composer, key);
-                            None
-                        }
-                    }
-                }
+                Event::Key(key) => self.inner.route_key(key, &route, &history, &mut submit),
                 Event::Paste(text) => Some(SessionUiAction::Paste(text)),
                 Event::Mouse(mouse)
                     if matches!(
@@ -214,17 +250,52 @@ impl SessionSurface {
                 submit |=
                     self.inner.ui.update(action, &mut history) == SessionUiEffect::SubmitRequested;
             }
+            if let Some(direction) = history.requested {
+                self.inner
+                    .push_intent(serde_json::json!({"type":"history","direction":direction}));
+            }
         }
         self.inner.capture_anchor();
         Ok(submit)
     }
 
+    /// Drain bounded application intents; no platform authority is exercised here.
+    /// # Errors
+    /// Returns an error if serialization fails.
+    pub fn take_intents(&mut self) -> Result<String, &'static str> {
+        serde_json::to_string(&std::mem::take(&mut self.inner.intents))
+            .map_err(|_| "invalid surface intents")
+    }
+
+    /// Accessibility derives only from successfully committed visible BMUX metadata.
+    /// # Errors
+    /// Returns an error if committed metadata cannot be serialized.
+    pub fn accessibility(&self) -> Result<String, &'static str> {
+        let regions = self.local.presentation().semantics().regions();
+        let labels = regions
+            .iter()
+            .filter_map(|region| match region.id.as_str() {
+                OLDER => Some("Load older history"),
+                NEWER => Some("Load newer history"),
+                id if id.starts_with("bcode-web/permission/") => Some("Permission decision"),
+                LATEST => Some("New messages below; return to latest"),
+                EDITOR => Some("Session composer"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(
+            &serde_json::json!({"label":"Bcode session", "description":labels.join(". ")}),
+        )
+        .map_err(|_| "invalid accessibility metadata")
+    }
+
     /// Prepare projections outside the paint callback.
     pub(crate) fn prepare(&mut self) {
-        self.inner.transcript.prepare(
-            self.inner.semantic.snapshot().map(|s| &s.transcript),
-            self.inner.area.width,
-        );
+        if let Some(snapshot) = self.inner.semantic.snapshot() {
+            self.inner
+                .transcript
+                .prepare_snapshot(snapshot, self.inner.area.width);
+        }
     }
 
     /// Copy canonical accepted Markdown source for the current logical selection.
@@ -259,6 +330,61 @@ impl SessionSurface {
         self.inner.ui.composer.buffer().text()
     }
 
+    /// Export bounded caller-owned editor state and exact unresolved submission.
+    /// Only text/cursor/selection survive; geometry and semantic observations do not.
+    ///
+    /// # Errors
+    /// Rejects oversized drafts or serialization failures.
+    pub fn export_recovery(&self) -> Result<String, &'static str> {
+        if self.draft().len() > 64 * 1024 {
+            return Err("draft exceeds recovery limit");
+        }
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "editor": self.inner.ui.composer.snapshot()["buffer"],
+            "submission": self.inner.semantic.export_recovery()?,
+        }))
+        .map_err(|_| "invalid surface recovery")
+    }
+
+    /// Restore ephemeral recovery into an unused surface, atomically.
+    ///
+    /// # Errors
+    /// Rejects malformed/oversized state or replacing initialized application state.
+    pub fn restore_recovery(&mut self, json: &str) -> Result<(), &'static str> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Recovery {
+            schema_version: u32,
+            editor: serde_json::Value,
+            submission: String,
+        }
+        if json.len() > 256 * 1024 || !self.draft().is_empty() {
+            return Err("invalid surface recovery");
+        }
+        let recovery: Recovery =
+            serde_json::from_str(json).map_err(|_| "invalid surface recovery")?;
+        if recovery.schema_version != 1
+            || recovery
+                .editor
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|text| text.len() > 64 * 1024)
+        {
+            return Err("invalid editor recovery");
+        }
+        let mut editor = TextInputState::new(bmux_text_edit::TextEditBuffer::new());
+        let mut snapshot = editor.snapshot();
+        snapshot["buffer"] = recovery.editor;
+        editor
+            .restore_snapshot(&snapshot)
+            .map_err(|_| "invalid editor recovery")?;
+        self.inner.semantic.restore_recovery(&recovery.submission)?;
+        self.inner.ui.composer = editor;
+        self.cancel_pointer();
+        Ok(())
+    }
+
     /// Validate a durable receipt and clear only its unchanged draft.
     ///
     /// # Errors
@@ -269,9 +395,27 @@ impl SessionSurface {
             self.inner.ui.composer = TextInputState::new(bmux_text_edit::TextEditBuffer::new());
             self.inner
                 .ui
-                .update(SessionUiAction::FollowTail, &mut WindowHistory);
+                .update(SessionUiAction::FollowTail, &mut WindowHistory::default());
         }
         Ok(())
+    }
+
+    pub(crate) fn commit_output(&mut self) {
+        self.inner.committed_permission = if self
+            .local
+            .presentation()
+            .hits()
+            .regions()
+            .iter()
+            .any(|region| region.id.as_str().starts_with("bcode-web/permission/"))
+        {
+            self.inner
+                .permission
+                .as_ref()
+                .map(|dialog| dialog.permission().clone())
+        } else {
+            None
+        };
     }
 
     /// Render to a caller-owned local presentation sink (no network frame decode).
@@ -283,8 +427,13 @@ impl SessionSurface {
         output: impl FnOnce(&bmux_tui::presentation::PreparedPresentation) -> Result<(), E>,
     ) -> Result<bool, bmux_tui::presentation::PresentationError<E>> {
         let inner = &mut self.inner;
-        self.local
-            .present(Damage::Full, |cx| inner.paint(cx), output)
+        let result = self
+            .local
+            .present(Damage::Full, |cx| inner.paint(cx), output);
+        if matches!(result, Ok(true)) {
+            self.commit_output();
+        }
+        result
     }
 }
 
@@ -307,12 +456,84 @@ fn map_point(area: Rect, x: f64, y: f64) -> Option<Point> {
 }
 
 impl SurfaceState {
+    fn permission_intent(&mut self, resolution: PermissionDialogResolution) {
+        let Some(dialog) = &self.permission else {
+            return;
+        };
+        let permission = dialog.permission();
+        let action = if resolution.apply_to_batch {
+            let Some(batch) = &permission.batch else {
+                return;
+            };
+            serde_json::json!({"type":"permission_batch","batch_id":batch.batch_id,"approved":resolution.approved})
+        } else {
+            serde_json::json!({"type":"permission","permission_id":permission.permission_id,"approved":resolution.approved,"remember":resolution.remember})
+        };
+        self.push_intent(serde_json::json!({"type":"control","action_json":action.to_string()}));
+        self.permission_inflight = true;
+    }
+
+    fn push_intent(&mut self, intent: serde_json::Value) {
+        if self.intents.len() < 16 && !self.intents.contains(&intent) {
+            self.intents.push(intent);
+        }
+    }
+
     fn capture_anchor(&mut self) {
         let top = self.ui.viewport.top_row(self.transcript.rows, self.height);
         self.anchor = self.transcript.anchor(top);
     }
 
+    fn paint_permission(&self, cx: &mut PaintCx<'_, '_>) -> bool {
+        if let Some(dialog) = &self.permission {
+            let style = Style::new();
+            let theme = ModalTheme::new(style, style, style, style, style, style);
+            let permission = dialog.permission();
+            let mut content = Column::new().child(
+                SizeBox::new(TextBlock::new(
+                    permission
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Permission requested".to_owned()),
+                ))
+                .height(1),
+            );
+            for index in 0..dialog.action_count() {
+                let mut candidate = dialog.clone();
+                candidate.focus_action(index);
+                let mut state = self.permission_buttons[index].get();
+                state.set_focused(dialog.focused_action_index() == index);
+                state.set_disabled(self.permission_inflight);
+                self.permission_buttons[index].set(state);
+                content = content.child(ButtonComponent::new(
+                    format!("bcode-web/permission/{index}"),
+                    candidate.focused_label(),
+                    &self.permission_buttons[index],
+                ));
+            }
+            content = content.flex(Flex::new(
+                1,
+                TextBlock::new(format!(
+                    "{}\n{}",
+                    permission.tool_name, permission.arguments_json
+                )),
+            ));
+            let modal =
+                ModalFrameComponent::new("bcode-web/permission", permission_modal(theme), content);
+            let layout = modal.layout(
+                Constraints::tight(Size::new(self.area.width, self.area.height)),
+                &mut LayoutCx::new(),
+            );
+            modal.paint(&layout, cx);
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn paint(&mut self, cx: &mut PaintCx<'_, '_>) {
+        if self.area.is_empty() || self.paint_permission(cx) {
+            return;
+        }
         let editor = RefCell::new(std::mem::replace(
             &mut self.ui.composer,
             TextInputState::new(bmux_text_edit::TextEditBuffer::new()),
@@ -321,15 +542,41 @@ impl SurfaceState {
         let composer_height = TextInputControl::new(&policy)
             .visible_rows_for_width(&editor.borrow(), self.area.width.saturating_sub(2))
             .clamp(1, 6)
-            .saturating_add(1)
+            .saturating_add(2)
             .min(self.area.height);
         let style = Style::new();
         let transcript = &self.transcript;
         let focused = self.focused;
+        let [older_state, newer_state, latest_state] = &self.navigation_buttons;
+        self.sync_navigation_focus();
+        let history = WindowHistory::from_snapshot(self.semantic.snapshot());
+        let show_latest = history.newer || !self.ui.viewport.follows_bottom();
         let build = |top| {
+            let mut navigation = Row::new();
+            if history.older {
+                navigation =
+                    navigation.child(ButtonComponent::new(OLDER, "Older history", older_state));
+            }
+            if history.newer {
+                navigation =
+                    navigation.child(ButtonComponent::new(NEWER, "Newer history", newer_state));
+            }
+            if show_latest {
+                navigation = navigation.child(ButtonComponent::new(
+                    LATEST,
+                    "New messages below",
+                    latest_state,
+                ));
+            }
+            let transcript_panel = Column::new()
+                .child(
+                    SizeBox::new(navigation)
+                        .height(u64::from(history.older || history.newer || show_latest)),
+                )
+                .flex(Flex::new(1, TranscriptComponent { transcript, top }));
             session_ui::compose(
                 &IDS,
-                TranscriptComponent { transcript, top },
+                transcript_panel,
                 session_ui::composer(
                     &IDS,
                     &editor,
@@ -370,7 +617,7 @@ impl SurfaceState {
             anchor,
             0,
             0,
-            &mut WindowHistory,
+            &mut WindowHistory::from_snapshot(self.semantic.snapshot()),
         );
         let top = self.ui.viewport.top_row(self.transcript.rows, self.height);
         build(top).paint(&layout, cx);
@@ -385,14 +632,28 @@ impl SurfaceState {
     }
 }
 
-// The endpoint supplies one bounded resident document. No fabricated pagination.
-struct WindowHistory;
+// Resident bounded window metadata feeds the shared native navigation state machine.
+#[derive(Default)]
+struct WindowHistory {
+    older: bool,
+    newer: bool,
+    requested: Option<&'static str>,
+}
+impl WindowHistory {
+    fn from_snapshot(snapshot: Option<&bcode_session_view_models::SessionViewSnapshot>) -> Self {
+        Self {
+            older: snapshot.is_some_and(|s| s.transcript.has_older_history),
+            newer: snapshot.is_some_and(|s| s.transcript.has_newer_history),
+            requested: None,
+        }
+    }
+}
 impl TranscriptHistory for WindowHistory {
     fn has_older_history(&self) -> bool {
-        false
+        self.older
     }
     fn has_newer_history(&self) -> bool {
-        false
+        self.newer
     }
     fn reveal_request(&self) -> Option<usize> {
         None
@@ -402,11 +663,158 @@ impl TranscriptHistory for WindowHistory {
     }
     fn cancel_newer_reveal(&mut self) {}
     fn cancel_older_reveal(&mut self) {}
-    fn request_load(&mut self, _: usize) {}
-    fn request_load_newer(&mut self, _: usize) {}
+    fn request_load(&mut self, _: usize) {
+        self.requested = Some("older");
+    }
+    fn request_load_newer(&mut self, _: usize) {
+        self.requested = Some("newer");
+    }
     fn clear_reveal_request(&mut self) {}
     fn take_ready_pages(&mut self) -> (bool, bool, bool) {
         (false, false, false)
     }
     fn consume_reveal(&mut self, _: bool, _: usize) {}
+}
+
+impl SurfaceState {
+    fn route_permission(&mut self, route: &bmux_tui::interaction::InteractionRoute) {
+        if !self.permission_inflight
+            && self
+                .permission
+                .as_ref()
+                .map(PermissionDialogState::permission)
+                == self.committed_permission.as_ref()
+        {
+            let resolution = if route.is_activation() {
+                route
+                    .target
+                    .as_ref()
+                    .and_then(|id| id.as_str().strip_prefix("bcode-web/permission/"))
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| self.permission.as_mut()?.activate_action(index))
+            } else {
+                None
+            };
+            if let Some(resolution) = resolution {
+                self.permission_intent(resolution);
+            } else if let Event::Key(key) = route.event {
+                if let Some(index) = route
+                    .focus_changed
+                    .as_ref()
+                    .and_then(|id| id.as_str().strip_prefix("bcode-web/permission/"))
+                    .and_then(|index| index.parse::<usize>().ok())
+                    && let Some(permission) = self.permission.as_mut()
+                {
+                    permission.focus_action(index);
+                }
+                let command = self.bindings.permission_action(key);
+                let Some(permission) = self.permission.as_mut() else {
+                    return;
+                };
+                if let PermissionDialogOutcome::Resolve(resolution) =
+                    permission.handle_action(command)
+                {
+                    self.permission_intent(resolution);
+                }
+            }
+        }
+    }
+}
+
+impl SurfaceState {
+    fn sync_navigation_focus(&self) {
+        let [older_state, newer_state, latest_state] = &self.navigation_buttons;
+        for (id, state) in [
+            (OLDER, older_state),
+            (NEWER, newer_state),
+            (LATEST, latest_state),
+        ] {
+            let mut value = state.get();
+            value.set_focused(self.focused && self.focused_hit.as_deref() == Some(id));
+            state.set(value);
+        }
+    }
+}
+
+impl SurfaceState {
+    fn route_navigation(
+        &mut self,
+        route: &bmux_tui::interaction::InteractionRoute,
+        history: &mut WindowHistory,
+    ) -> bool {
+        let activation = route.is_activation();
+        let target = [OLDER, NEWER, LATEST]
+            .into_iter()
+            .find(|id| route.targets(&bmux_tui::hit::HitId::new(*id)));
+        if activation && let Some(target) = target {
+            if target == LATEST {
+                self.ui.update(SessionUiAction::FollowTail, history);
+                if history.newer {
+                    self.push_intent(serde_json::json!({"type":"history","direction":"tail"}));
+                }
+            } else {
+                self.push_intent(serde_json::json!({"type":"history","direction":if target == OLDER { "older" } else { "newer" }}));
+            }
+            return true;
+        }
+
+        false
+    }
+}
+
+impl SurfaceState {
+    fn route_key(
+        &mut self,
+        key: bmux_keyboard::KeyStroke,
+        route: &bmux_tui::interaction::InteractionRoute,
+        history: &WindowHistory,
+        submit: &mut bool,
+    ) -> Option<SessionUiAction> {
+        use crate::bindings::Command;
+        match self.bindings.command(key) {
+            Some(Command::Submit) => {
+                *submit = true;
+                None
+            }
+            Some(Command::Newline) => {
+                TextInputControl::new(&session_ui::composer_policy())
+                    .handle_paste(&mut self.ui.composer, "\n");
+                None
+            }
+            Some(Command::PageUp) => {
+                Some(SessionUiAction::ScrollUp(usize::from(self.height.max(1))))
+            }
+            Some(Command::PageDown) => {
+                Some(SessionUiAction::ScrollDown(usize::from(self.height.max(1))))
+            }
+            Some(Command::Latest) => {
+                if history.newer {
+                    self.push_intent(serde_json::json!({"type":"history","direction":"tail"}));
+                }
+                Some(SessionUiAction::FollowTail)
+            }
+            Some(Command::Copy) => {
+                self.copy_requested = true;
+                None
+            }
+            Some(
+                Command::Ignore
+                | Command::PermissionApprove
+                | Command::PermissionDeny
+                | Command::SelectUp
+                | Command::SelectDown
+                | Command::SelectConfirm
+                | Command::SelectCancel,
+            ) => None,
+            None => {
+                if ![OLDER, NEWER, LATEST]
+                    .into_iter()
+                    .any(|id| route.targets(&bmux_tui::hit::HitId::new(id)))
+                {
+                    self.bindings.edit(&mut self.ui.composer, key);
+                }
+                None
+            }
+        }
+    }
 }

@@ -8598,6 +8598,47 @@ impl BcodeClient {
         }
     }
 
+    /// Read a bounded indexed permission page or one complete batch for a session.
+    /// Results are observations, not reservations; copy returned identities unchanged
+    /// into [`Self::resolve_permissions_conditional`]. Never infer authority from a
+    /// truncated page, or assemble a complete batch from separately timed pages.
+    ///
+    /// # Errors
+    /// Returns transport or server rejection errors; invalid bounds and unavailable
+    /// batches are explicit typed results.
+    pub async fn scoped_permissions(
+        &self,
+        query: bcode_session_models::ScopedPermissionQuery,
+    ) -> Result<bcode_session_models::ScopedPermissionLookup, ClientError> {
+        match self
+            .send_request(Request::ScopedPermissions { query })
+            .await?
+        {
+            ResponsePayload::ScopedPermissions { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve only an unchanged exact checkpoint set addressed to the session.
+    /// A batch requires all original members and never remembers policy. Stale
+    /// validation causes zero pending-state mutation. This is not an exactly-once
+    /// durable receipt: ambiguous transport requires fresh inspection, not retry.
+    ///
+    /// # Errors
+    /// Returns transport or server rejection errors. Stale/invalid sets are typed results.
+    pub async fn resolve_permissions_conditional(
+        &self,
+        decision: bcode_session_models::ConditionalPermissionDecision,
+    ) -> Result<bcode_session_models::ConditionalPermissionResult, ClientError> {
+        match self
+            .send_request(Request::ResolvePermissionsConditional { decision })
+            .await?
+        {
+            ResponsePayload::PermissionsConditionalResolved { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List pending permission checkpoints.
     ///
     /// # Errors

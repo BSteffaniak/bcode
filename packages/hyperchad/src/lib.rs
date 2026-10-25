@@ -12,7 +12,8 @@ mod html_actix;
 #[cfg(feature = "renderer-html-actix")]
 pub use html_actix::{
     DEFAULT_BIND_ADDRESS, TUI_ASSET_FILES, TuiAssets, VIEWPORT, build_app, build_app_with_runtime,
-    build_launch_url, build_tui_launch_url, init, init_with_snapshot, validate_bind_address,
+    build_launch_url, build_tui_launch_url, configure_browser_origins, init, init_with_snapshot,
+    validate_bind_address,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

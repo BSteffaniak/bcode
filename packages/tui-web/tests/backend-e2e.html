@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Real WASM and durable backend acceptance</title>
+<div id="host" style="position:relative;width:900px;height:540px"><canvas id="canvas" style="width:900px;height:540px"></canvas></div>
+<pre id="result">pending</pre>
+<script type="module">
+const output = document.getElementById('result');
+const assert = (value, message) => { if (!value) throw new Error(message); };
+const wait = async (predicate, label) => {
+  const until = performance.now() + 15000;
+  while (!predicate()) {
+    if (performance.now() > until) throw new Error(`timeout: ${label}`);
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+};
+let mounted;
+try {
+  const configuration = await (await fetch('/fixture.json')).json();
+  const wasm = await import('/bundle/bcode_tui_web.js');
+  const { mountInteractiveSurface } = await import('/bundle/interactive-surface.js');
+  const { mountBrowserSession } = await import('/bundle/browser-session.js');
+  await wasm.default();
+  // Observe real Canvas text calls without replacing rendering or manufacturing a UI.
+  // Keep bounded evidence across repaints; canonical backend checks are independent.
+  const drawn = [];
+  const originalFillText = CanvasRenderingContext2D.prototype.fillText;
+  CanvasRenderingContext2D.prototype.fillText = function(text, ...args) {
+    if (this.canvas.id === 'canvas') {
+      drawn.push(String(text));
+      if (drawn.length > 200000) drawn.splice(0, 100000);
+    }
+    return originalFillText.call(this, text, ...args);
+  };
+  const text = 'browser-e2e-real-backend';
+  const recoveryState = {};
+  const operations = [], errors = [], accepted = [];
+  let discard = true, dropped;
+  const realFetch = globalThis.fetch.bind(globalThis);
+  // Fault injection occurs AFTER the real server replies. No response is fabricated.
+  const transport = async (url, options) => {
+    const response = await realFetch(url, options);
+    if (new URL(url).pathname.endsWith('/submit-message')) {
+      operations.push(JSON.parse(options.body));
+      if (discard) {
+        discard = false;
+        dropped = await response.json();
+        assert(dropped.outcome?.type === 'submission_accepted', 'first request did not commit');
+        throw new TypeError('test-owned connection lost after durable acceptance');
+      }
+      accepted.push(await response.clone().json());
+    }
+    return response;
+  };
+  const mount = () => mountBrowserSession({
+    wasm, mountInteractiveSurface,
+    container: document.getElementById('host'), canvas: document.getElementById('canvas'),
+    sessionId: configuration.session, token: configuration.token,
+    backendOrigin: location.origin, fetch: transport, recoveryState,
+    // Manual observations below avoid timing-dependent overlap with mutation admission.
+    pollMs: 60000, requestTimeoutMs: 5000,
+    onError: error => errors.push(error),
+  });
+  const api = async (path, body, token = configuration.token) => {
+    const response = await realFetch(`${path}?token=${encodeURIComponent(token)}`, body === undefined ? {} : {
+      method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(body),
+    });
+    return response.json();
+  };
+  const snapshotPath = `/api/session-view/${configuration.session}`;
+  assert((await api(snapshotPath, undefined, 'wrong-token')).error === 'unauthorized', 'read auth rejection');
+  const unauthorized = {session_id: configuration.session, submission_id: 'unauthorized-e2e', text: 'must never be accepted'};
+  assert((await api('/api/session-view/submit-message', unauthorized, 'wrong-token')).error === 'unauthorized', 'write auth rejection');
+  mounted = await mount();
+  mounted.focus();
+  const editor = document.querySelector('[data-bmux-input]');
+  assert(editor, 'real BMUX input bridge missing');
+  editor.value = text;
+  editor.dispatchEvent(new InputEvent('input', {inputType:'insertText', data:text, bubbles:true}));
+  await wait(() => drawn.join('').includes(text), 'visible editor text');
+  editor.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
+  await wait(() => errors.length > 0 && dropped, 'ambiguous post-commit response');
+  assert(operations.length === 1, 'unexpected implicit resubmission');
+  await mounted.dispose();
+  mounted = undefined;
+  assert(typeof recoveryState.value === 'string', 'pending operation recovery missing');
+  // A new Rust UI and new input bridge reconnect, retaining only production recovery state.
+  mounted = await mount();
+  await mounted.retrySubmission();
+  await wait(() => accepted.length === 1, 'exact retry receipt');
+  assert(JSON.stringify(operations[0]) === JSON.stringify(operations[1]), 'retry changed exact operation');
+  const receipt = accepted[0].outcome?.receipt;
+  assert(JSON.stringify(receipt) === JSON.stringify(dropped.outcome.receipt), 'canonical retry receipt differs');
+  const conflict = await api('/api/session-view/submit-message', {...operations[0], text:'conflicting payload'});
+  assert(conflict.error, 'conflicting retry unexpectedly accepted');
+  const malformed = await api('/api/session-view/submit-message', {...operations[0], submission_id:'authority-e2e', execution:{provider:'not-allowed'}});
+  assert(malformed.error === 'invalid_request', 'browser execution authority accepted');
+  let snapshot;
+  const until = performance.now() + 15000;
+  do {
+    snapshot = await api(snapshotPath);
+    if (JSON.stringify(snapshot.snapshot?.transcript).includes(`fake: ${text}`)) break;
+    if (performance.now() > until) throw new Error('real provider transcript did not arrive');
+    await new Promise(resolve => setTimeout(resolve, 50));
+  } while (true);
+  drawn.length = 0;
+  await mounted.dispose();
+  mounted = await mount();
+  await wait(() => drawn.join('').includes(`fake: ${text}`), 'visible real assistant transcript');
+  const image = document.getElementById('canvas').getContext('2d').getImageData(0, 0, 900, 540).data;
+  const background = Array.from(image.slice(0, 4));
+  assert(image.some((channel, index) => channel !== background[index % 4]), 'Canvas contains no visible ink');
+  await mounted.dispose();
+  mounted = undefined;
+  CanvasRenderingContext2D.prototype.fillText = originalFillText;
+  output.textContent = JSON.stringify({passed:true, text, receipt,
+    evidence:['real WASM Canvas editor input', 'real deterministic provider transcript',
+      'post-commit dropped response', 'remount exact retry identical receipt',
+      'read/write auth rejection', 'conflicting payload and execution-authority rejection'],
+    submission_requests:operations.length, operation:operations[0]});
+} catch (error) {
+  output.textContent = JSON.stringify({passed:false,error:error?.stack ?? String(error)});
+} finally {
+  if (mounted) await mounted.dispose();
+}
+</script>
