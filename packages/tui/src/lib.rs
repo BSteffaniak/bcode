@@ -200,6 +200,15 @@ fn markdown_activation_adapter_linkage() {
 /// Errors returned by the TUI.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
+    /// Runtime execution failed and terminal restoration also failed.
+    #[error("{error}; terminal cleanup failed: {cleanup_error}")]
+    RuntimeCleanup {
+        /// Original runtime error.
+        #[source]
+        error: Box<Self>,
+        /// Failure restoring terminal protocol ownership.
+        cleanup_error: Box<Self>,
+    },
     /// Client error.
     #[error("client error: {0}")]
     Client(#[from] bcode_client::ClientError),

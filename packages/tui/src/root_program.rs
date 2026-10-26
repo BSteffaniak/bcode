@@ -4504,9 +4504,24 @@ async fn finish_runtime_result<P>(
             settlement.map(|()| model)
         }
         Err(
-            bmux_tui_runtime::RuntimeError::Program { error, mut output }
-            | bmux_tui_runtime::RuntimeError::Presenter { error, mut output },
+            bmux_tui_runtime::RuntimeError::Program {
+                error,
+                cleanup_error,
+                mut output,
+            }
+            | bmux_tui_runtime::RuntimeError::Presenter {
+                error,
+                cleanup_error,
+                mut output,
+            },
         ) => {
+            let error = match cleanup_error {
+                Some(cleanup_error) => TuiError::RuntimeCleanup {
+                    error: Box::new(error),
+                    cleanup_error: Box::new(cleanup_error),
+                },
+                None => error,
+            };
             record_runtime_stats(&mut output.program, &output.stats);
             let settlement = Box::pin(output.program.settle_plugin_operations()).await;
             output.program.shutdown_owned_work();
@@ -12706,7 +12721,9 @@ mod tests {
                 position,
             ),
         ));
-        assert_eq!(model.chat.queued_effect_count(), 1);
+        let queued_effects = model.chat.queued_effect_count();
+        drop(model);
+        assert_eq!(queued_effects, 1);
     }
 
     #[tokio::test]
@@ -13634,7 +13651,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_shutdown_waits_for_plugin_results_on_normal_and_fatal_exit() {
-        for exit in ["normal", "program", "presenter"] {
+        for exit in ["normal", "program", "presenter", "cleanup"] {
             let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let (release, receiver) = tokio::sync::oneshot::channel();
             let mut outcome = Some({
@@ -13663,10 +13680,17 @@ mod tests {
                 match exit {
                     "program" => Err(bmux_tui_runtime::RuntimeError::Program {
                         error: std::io::Error::other("terminal input failed").into(),
+                        cleanup_error: None,
+                        output,
+                    }),
+                    "cleanup" => Err(bmux_tui_runtime::RuntimeError::Program {
+                        error: std::io::Error::other("original failure").into(),
+                        cleanup_error: Some(std::io::Error::other("restoration failure").into()),
                         output,
                     }),
                     "presenter" => Err(bmux_tui_runtime::RuntimeError::Presenter {
                         error: std::io::Error::other("terminal writer failed").into(),
+                        cleanup_error: None,
                         output,
                     }),
                     _ => Ok(output),
@@ -13686,21 +13710,31 @@ mod tests {
             );
             assert_eq!(commits.load(std::sync::atomic::Ordering::SeqCst), 0);
             release.send(()).expect("accepted operation still owned");
-            let result = finish.await;
+            let mut retained_result = Some(finish.await);
             assert_eq!(commits.load(std::sync::atomic::Ordering::SeqCst), 1);
-            if exit == "normal" {
-                let mut model = result.expect("normal shutdown observes outcome");
-                assert_eq!(
-                    model.take_plugin_surface_result(),
-                    Some((
-                        "test".to_string(),
-                        Some(serde_json::json!({"settled": true}))
-                    ))
-                );
-                drop(model);
-            } else {
-                assert!(result.is_err());
-                drop(result);
+            let result = retained_result.take().expect("outcome transfers once");
+            drop(retained_result);
+            match result {
+                Ok(mut model) => {
+                    assert_eq!(exit, "normal");
+                    assert_eq!(
+                        model.take_plugin_surface_result(),
+                        Some((
+                            "test".to_string(),
+                            Some(serde_json::json!({"settled": true}))
+                        ))
+                    );
+                    drop(model);
+                }
+                Err(error) => {
+                    assert_ne!(exit, "normal");
+                    if exit == "cleanup" {
+                        let diagnostic = error.to_string();
+                        assert!(diagnostic.contains("original failure"));
+                        assert!(diagnostic.contains("restoration failure"));
+                    }
+                    drop(error);
+                }
             }
         }
     }

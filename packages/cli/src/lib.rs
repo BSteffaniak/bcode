@@ -625,7 +625,7 @@ async fn run_plugin_surface_in_shell(
 ) -> Result<(), CliError> {
     let mut shell = bcode_tui::TerminalShell::enter()?;
     let mut failure_summary = "The interface could not be opened.";
-    let result = async {
+    let result = Box::pin(async {
         let ready = shell
             .wait(
                 "Starting the local server…",
@@ -643,7 +643,7 @@ async fn run_plugin_surface_in_shell(
                 .await?;
         }
         Ok::<(), bcode_tui::TuiError>(())
-    }
+    })
     .await;
     if result.is_err() {
         shell

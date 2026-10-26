@@ -607,12 +607,7 @@ pub fn render_prepared_damage(
     let theme = TuiTheme::for_app(app);
     paint_child_monitor(app, frame, layout, &intersects);
     if intersects(layout.header) {
-        frame.fill(
-            LocalRect::terminal(layout.header),
-            " ",
-            app.presented_theme().canvas,
-        );
-        render_header(app, layout.header, frame, theme);
+        render_header_damage(app, layout.header, frame, theme);
     }
     if intersects(layout.composer) {
         frame.fill(
@@ -704,6 +699,11 @@ pub fn render_prepared_damage(
         frame,
         theme,
     );
+}
+
+fn render_header_damage(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
+    frame.fill(LocalRect::terminal(area), " ", app.presented_theme().canvas);
+    render_header(app, area, frame, theme);
 }
 
 impl FrameLayout {
