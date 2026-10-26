@@ -1166,6 +1166,19 @@ struct AgentDaemonIsolation {
     _config: Option<bcode_config::ConfigOverrideGuard>,
 }
 
+fn isolated_agent_socket_path(root: &Path, variant_dir: &Path) -> Result<PathBuf, EvalError> {
+    // Resolve platform aliases (notably macOS /tmp) before strict IPC parent validation.
+    // Resolution errors must not fall back to an unverified path.
+    Ok(root
+        .canonicalize()?
+        .join(format!(
+            "bcode-eval-{}-{:016x}",
+            std::process::id(),
+            stable_text_hash(&variant_dir.display().to_string())
+        ))
+        .join("daemon.sock"))
+}
+
 fn prepare_agent_daemon_isolation(
     variant: &EvalVariant,
     rep_dir: &Path,
@@ -1193,11 +1206,7 @@ fn prepare_agent_daemon_isolation(
     } else {
         std::env::temp_dir()
     };
-    let socket = socket_root.join(format!(
-        "bcode-eval-{}-{:016x}.sock",
-        std::process::id(),
-        stable_text_hash(&variant_dir.display().to_string())
-    ));
+    let socket = isolated_agent_socket_path(&socket_root, variant_dir)?;
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket.clone());
     let endpoint_value = bcode_ipc::endpoint_env_value(&endpoint)
         .map_err(|error| EvalError::Validation(error.to_string()))?;
@@ -5396,6 +5405,74 @@ required = false
             assert!(minimal_suite(&format!("[metadata]\ncapture_allowance_ms = {value}")).is_err());
         }
         assert!(minimal_suite("[metadata]\ncapture_allowance_ms = 120000").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_agent_socket_resolves_symlinked_root() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        // Keep the real socket below the Unix address-length limit independently of TMPDIR.
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let target = scratch.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let alias = scratch.path().join("alias");
+        symlink(&target, &alias).unwrap();
+        let variant = Path::new("variant");
+        let socket = isolated_agent_socket_path(&alias, variant).unwrap();
+        assert_eq!(
+            socket.parent().unwrap().parent().unwrap(),
+            target.canonicalize().unwrap()
+        );
+        assert_eq!(
+            socket,
+            isolated_agent_socket_path(&target, variant).unwrap()
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket.clone());
+        let _listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let permissions = fs::metadata(socket.parent().unwrap())
+            .unwrap()
+            .permissions();
+        assert_eq!(permissions.mode() & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_agent_socket_preserves_rejection_of_insecure_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = isolated_agent_socket_path(scratch.path(), Path::new("variant")).unwrap();
+        let parent = socket.parent().unwrap();
+        fs::create_dir(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket.clone());
+        assert!(bcode_ipc::LocalIpcListener::bind(&endpoint).is_err());
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn isolated_agent_socket_rejects_unresolvable_root_without_fallback() {
+        let scratch = tempfile::tempdir().unwrap();
+        let missing = scratch.path().join("missing");
+        assert!(matches!(
+            isolated_agent_socket_path(&missing, Path::new("variant")),
+            Err(EvalError::Io(_))
+        ));
+        assert!(!missing.exists());
     }
 
     #[test]

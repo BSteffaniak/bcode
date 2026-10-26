@@ -170,7 +170,8 @@
       "lifecycle_matrix": {
         "source_writer_epochs": [
           2,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": false,
@@ -574,7 +575,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -802,7 +804,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -1032,7 +1035,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": false,
@@ -5501,7 +5505,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -5790,7 +5795,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6084,7 +6090,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6393,7 +6400,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6702,7 +6710,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7011,7 +7020,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7325,7 +7335,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7644,7 +7655,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7963,7 +7975,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -8302,7 +8315,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -8646,7 +8660,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -9057,7 +9072,8 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -9441,10 +9457,56 @@
           12,
           13,
           14,
-          15
+          15,
+          16
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
+        "schema_event_exclusions": []
+      }
+    },
+    {
+      "path": "stores/epoch-16-schema-52-events.jsonl",
+      "source_writer_epochs": [],
+      "covered_writer_schema_pairs": [],
+      "migration_ledger_endpoints": [],
+      "covered_migration_ledger_prefixes": [],
+      "event_schemas": [
+        52
+      ],
+      "migratable_store": false,
+      "historical_payloads": false,
+      "expected_event_count": 2,
+      "expected_classifications": {
+        "converted": 0,
+        "retired_known": 0,
+        "current_passthrough": 2
+      },
+      "covered_schema_event_pairs": [
+        {
+          "event_schema": 52,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 52,
+          "event_kind": "trace_event"
+        }
+      ],
+      "covered_event_kinds": [
+        "session_created",
+        "trace_event"
+      ],
+      "covered_authoritative_records": [],
+      "covered_roots": [],
+      "covered_root_writer_pairs": [],
+      "covered_tables": [],
+      "covered_table_treatments": [],
+      "lifecycle_matrix": {
+        "source_writer_epochs": [
+          16
+        ],
+        "owns_writer_schema": false,
+        "owns_writer_schema_event": false,
         "schema_event_exclusions": []
       }
     }

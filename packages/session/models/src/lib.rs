@@ -10,8 +10,15 @@
 //! model, auth profile, format version, and compatibility key match. The portable summary is the
 //! required fallback for every other surface.
 
+/// Versioned operational compaction evidence.
+pub mod compaction_checkpoint;
+pub use compaction_checkpoint::{
+    COMPACTION_SYNTHESIS_CHECKPOINT_EVENT, CompactionSynthesisCheckpoint,
+    MAX_COMPACTION_CHECKPOINT_KEY_BYTES, MAX_COMPACTION_CHECKPOINT_PAYLOAD_BYTES,
+};
+
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 16;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 17;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///

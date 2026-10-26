@@ -79,6 +79,18 @@ per-session migration identity. Current-materialized identities use exact ordere
 the declared endpoint. The two superseded identities use standalone historical cases, preventing
 tests from pretending they were members of the current schema ledger.
 
+## Epoch-16 operational evidence
+
+`stores/epoch-16-schema-52-events.jsonl` preserves schema-52 canonical session creation and
+turn-independent provider evidence. Epoch 16 and epoch 17 share event schema 52; the 16-to-17
+migration rebuilds the derived evidence projection and advances only the writer contract.
+The fixture is registered for epoch-16 lifecycle input without claiming overlapping writer/schema
+or writer/schema/event ownership. Existing matrix-owner fixtures also include epoch 16, covering
+the historical schema/event cross-product with the same duplicate-rejecting ownership rules.
+Replay tests verify accepted and retired synthesis envelopes, preserve unsupported envelope data,
+and reject unsupported versions rather than downgrading them. Finalization tests ensure interrupted
+or stale evidence rebuilds cannot advance the writer contract and that interruption permits retry.
+
 ## Manifest
 
 `manifest.json` is the machine-enforced inventory for permanent sanitized fixtures. Every listed

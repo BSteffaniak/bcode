@@ -407,6 +407,28 @@ mod tests {
     }
 
     #[test]
+    fn compaction_checkpoint_epoch_has_a_lossless_forward_only_path() {
+        let plan = plan_writer_epoch_migration(16).expect("epoch 16 projection upgrade");
+        assert_eq!(plan.target_writer_epoch, 17);
+        assert_eq!(
+            plan.steps,
+            [MigrationStepDescriptor {
+                id: "session-writer-epoch-16-to-17",
+                source_writer_epoch: 16,
+                target_writer_epoch: 17,
+            }]
+        );
+        // An older artifact's inventory must not reinterpret the new writer contract.
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(17, 16, &MIGRATION_STEPS),
+            Err(MigrationPlanError::FutureWriter {
+                source_writer_epoch: 17,
+                current_writer_epoch: 16,
+            })
+        ));
+    }
+
+    #[test]
     fn current_writer_has_an_empty_plan() {
         let plan = plan_writer_epoch_migration(CURRENT_WRITER_EPOCH).expect("current plan");
         assert!(plan.steps.is_empty());

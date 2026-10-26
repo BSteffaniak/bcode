@@ -13,6 +13,7 @@ mod queue_tests;
 mod actions;
 pub mod child_activity;
 pub mod child_attention;
+pub mod compaction_activity;
 pub mod navigation;
 pub mod presentation;
 

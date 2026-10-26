@@ -108,6 +108,8 @@ jobs:
       - run: cargo check --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: scripts/check-prompt-cache-eval.sh
+      - name: Compaction cancellation and recovery regressions
+        run: bash scripts/check-compaction-eval.sh
 
   failures:
     needs: [packages]

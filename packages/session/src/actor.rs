@@ -960,6 +960,27 @@ impl SessionHandle {
             .await?
     }
 
+    pub async fn commit_compaction_checkpoint(
+        &self,
+        request: crate::CompactionCheckpointCommit,
+        timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.send(|reply| SessionCommand::CommitCompactionCheckpoint {
+            request,
+            timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn compaction_checkpoint(
+        &self,
+        key: String,
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        self.send(|reply| SessionCommand::CompactionCheckpoint { key, reply })
+            .await?
+    }
+
     pub async fn turn_evidence(&self, turn_id: String) -> Result<Vec<SessionEvent>, SessionError> {
         self.send(|reply| SessionCommand::TurnEvidence { turn_id, reply })
             .await?
@@ -1417,6 +1438,15 @@ enum SessionCommand {
     HistoryAround {
         query: SessionHistoryAroundQuery,
         reply: oneshot::Sender<Result<SessionHistoryWindow, SessionError>>,
+    },
+    CommitCompactionCheckpoint {
+        request: crate::CompactionCheckpointCommit,
+        timestamp_ms: u64,
+        reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
+    },
+    CompactionCheckpoint {
+        key: String,
+        reply: oneshot::Sender<Result<Option<SessionEvent>, SessionError>>,
     },
     TurnEvidence {
         turn_id: String,
@@ -2161,6 +2191,33 @@ impl SessionActor {
                     )),
                     Err(error) => Err(error),
                 };
+                let _ = reply.send(result);
+            }
+            SessionCommand::CommitCompactionCheckpoint {
+                request,
+                timestamp_ms,
+                reply,
+            } => {
+                let result =
+                    Box::pin(self.commit_compaction_checkpoint(request, timestamp_ms)).await;
+                let _ = reply.send(result);
+            }
+            SessionCommand::CompactionCheckpoint { key, reply } => {
+                let in_memory = self.state.events.is_some();
+                let result =
+                    match bcode_session_models::CompactionSynthesisCheckpoint::validate_key(&key) {
+                        Err(error) => Err(SessionError::EventSerialization(error)),
+                        Ok(()) => match self.existing_session_db().await {
+                            Ok(Some(db)) => {
+                                db.compaction_checkpoint(&key).await.map_err(Into::into)
+                            }
+                            Ok(None) if in_memory => {
+                                Ok(self.state.compaction_checkpoints.get(&key).cloned())
+                            }
+                            Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                            Err(error) => Err(error),
+                        },
+                    };
                 let _ = reply.send(result);
             }
             SessionCommand::TurnEvidence { turn_id, reply } => {
@@ -3005,6 +3062,49 @@ impl SessionActor {
         Ok(())
     }
 
+    async fn commit_compaction_checkpoint(
+        &mut self,
+        request: crate::CompactionCheckpointCommit,
+        timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.ensure_ownership()?;
+        let store = self
+            .store
+            .clone()
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        let _write_guard =
+            crate::lease::acquire_session_write_lock(&store.root_path(), self.state.summary.id)?;
+        self.ensure_session_db_for_write().await?;
+        self.refresh_state_from_db_for_write().await?;
+        crate::ensure_durable_session_event_kind(&request.marker, None)?;
+        let marker = self
+            .state
+            .build_next_event(request.marker.clone(), timestamp_ms);
+        let retirement_kind = bcode_session_models::CompactionSynthesisCheckpoint {
+            version: 1,
+            operation_key: request.operation_key.clone(),
+            host_payload: None,
+        }
+        .into_event_kind(timestamp_ms)
+        .map_err(SessionError::EventSerialization)?;
+        let mut retirement = self.state.build_next_event(retirement_kind, timestamp_ms);
+        retirement.sequence = marker.sequence.checked_add(1).ok_or_else(|| {
+            SessionError::EventSerialization("compaction sequence exhausted".into())
+        })?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        db.commit_compaction_checkpoint(&request, &marker, &retirement)
+            .await?;
+        self.apply_appended_event(&marker, timestamp_ms).await?;
+        self.apply_appended_event(&retirement, timestamp_ms).await?;
+        self.update_manifest_and_schedule_catalog().await;
+        self.state.load_status = SessionLoadStatusKind::Current;
+        self.refresh_snapshot();
+        Ok(marker)
+    }
+
     async fn append_event(
         &mut self,
         kind: SessionEventKind,
@@ -3112,6 +3212,8 @@ impl SessionActor {
         let total_started_at = Instant::now();
         let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
         crate::ensure_durable_session_event_kind(&kind, metrics.as_ref())?;
+        bcode_session_models::CompactionSynthesisCheckpoint::from_event_kind(&kind)
+            .map_err(SessionError::EventSerialization)?;
         if let Some(metrics) = &metrics {
             metrics.increment_counter("session.actor.append_event.total");
         }

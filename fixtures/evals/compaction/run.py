@@ -12,14 +12,20 @@ import pathlib
 import subprocess
 import tempfile
 import time
+import sys
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--binary", required=True, type=pathlib.Path)
+parser.add_argument("--case", choices=("explicit", "automatic-cancel", "automatic-restart", "automatic-crash"),
+                    default="explicit")
 args = parser.parse_args()
+if args.case != "explicit":
+    raise SystemExit(subprocess.call([sys.executable, str(pathlib.Path(__file__).with_name("run_automatic.py")),
+                                      "--binary", str(args.binary), "--interruption", args.case.removeprefix("automatic-")]))
 binary = args.binary
 if not binary.is_absolute() or not os.access(binary, os.X_OK):
     parser.error("--binary must identify an executable absolute path")
-work = pathlib.Path(tempfile.mkdtemp(prefix="bcode-compaction-regression-"))
+work = pathlib.Path(tempfile.mkdtemp(prefix="bcode-compaction-regression-", dir="/private/tmp"))
 repo = work / "repo"
 repo.mkdir()
 scenario = json.loads((pathlib.Path(__file__).parent / "scenario.json").read_text())
@@ -27,6 +33,8 @@ scenario = json.loads((pathlib.Path(__file__).parent / "scenario.json").read_tex
 (repo / "padding.txt").write_text("deterministic padding, no instructions\n" * 400)
 config = work / "bcode.toml"
 config.write_text('''[plugins]
+default = "none"
+disabled = ["bcode.bedrock", "bcode.openai-compatible"]
 enabled = ["bcode.fake-provider", "bcode.filesystem", "bcode.default-agents"]
 [model]
 profile = "offline"
@@ -76,13 +84,15 @@ def start():
     global server
     log = (work / f"daemon-{len(identity['daemon_pids'])}.log").open("w")
     logs.append(log)
+    socket = pathlib.Path(env["BCODE_SOCKET"])
+    old_inode = socket.stat().st_ino if socket.exists() else None
     server = subprocess.Popen(base + ["server", "run"], cwd=repo, env=env,
                               stdout=log, stderr=subprocess.STDOUT)
     identity["daemon_pids"].append(server.pid)
     for _ in range(300):
         if server.poll() is not None:
             raise RuntimeError(f"isolated daemon exited; inspect {work}")
-        if pathlib.Path(env["BCODE_SOCKET"]).is_socket():
+        if socket.is_socket() and socket.stat().st_ino != old_inode:
             return
         time.sleep(0.1)
     raise TimeoutError("isolated daemon did not become ready")

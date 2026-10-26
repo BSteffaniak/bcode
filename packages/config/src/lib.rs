@@ -4386,6 +4386,10 @@ pub struct CompactionConfig {
     /// Compaction implementation preference. Defaults to provider-native with local fallback.
     #[serde(default)]
     pub backend: CompactionBackend,
+    /// Experimental adaptive packing for local compaction. Disabled by default pending quality evaluation;
+    /// this does not change the recent-context retention policy.
+    #[serde(default)]
+    pub experimental_adaptive_packing: bool,
     /// Percentage of the selected model's context window that triggers proactive compaction.
     #[serde(default = "default_proactive_compaction_threshold_percent")]
     pub proactive_threshold_percent: u8,
@@ -4406,6 +4410,7 @@ impl Default for CompactionConfig {
         Self {
             mode: CompactionMode::Auto,
             backend: CompactionBackend::Auto,
+            experimental_adaptive_packing: false,
             proactive_threshold_percent: default_proactive_compaction_threshold_percent(),
             keep_recent_tokens: default_compaction_keep_recent_tokens(),
             models: BTreeMap::new(),
@@ -4427,6 +4432,9 @@ pub struct ModelCompactionOverrideConfig {
     /// Model-specific compaction implementation preference.
     #[serde(default)]
     pub backend: Option<CompactionBackend>,
+    /// Model-specific experimental adaptive packing opt-in. Omission inherits the global setting.
+    #[serde(default)]
+    pub experimental_adaptive_packing: Option<bool>,
     /// Absolute candidate input-token count that triggers proactive compaction.
     #[serde(default)]
     pub proactive_threshold_tokens: Option<u64>,
@@ -4452,6 +4460,8 @@ pub enum ProactiveCompactionThreshold {
 pub struct EffectiveCompactionConfig {
     pub mode: CompactionMode,
     pub backend: CompactionBackend,
+    /// Whether experimental adaptive packing is enabled for the selected model.
+    pub experimental_adaptive_packing: bool,
     pub proactive_threshold: ProactiveCompactionThreshold,
     pub keep_recent_tokens: u32,
 }
@@ -4475,6 +4485,9 @@ impl CompactionConfig {
             backend: matched
                 .and_then(|policy| policy.backend)
                 .unwrap_or(self.backend),
+            experimental_adaptive_packing: matched
+                .and_then(|policy| policy.experimental_adaptive_packing)
+                .unwrap_or(self.experimental_adaptive_packing),
             proactive_threshold: matched
                 .and_then(|policy| policy.proactive_threshold_tokens)
                 .map_or_else(
@@ -7596,6 +7609,12 @@ fn write_model_compaction_toml(output: &mut String, compaction: &CompactionConfi
     .expect("writing to string should not fail");
     writeln!(
         output,
+        "experimental_adaptive_packing = {}",
+        compaction.experimental_adaptive_packing
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        output,
         "proactive_threshold_percent = {}",
         compaction.proactive_threshold_percent
     )
@@ -7633,6 +7652,10 @@ fn write_model_compaction_toml(output: &mut String, compaction: &CompactionConfi
                 toml_string(compaction_backend_name(backend))
             )
             .expect("writing to string should not fail");
+        }
+        if let Some(enabled) = policy.experimental_adaptive_packing {
+            writeln!(output, "experimental_adaptive_packing = {enabled}")
+                .expect("writing to string should not fail");
         }
         if let Some(tokens) = policy.proactive_threshold_tokens {
             writeln!(output, "proactive_threshold_tokens = {tokens}")
@@ -10961,6 +10984,7 @@ enabled = false
             &[
                 ("mode", "auto"),
                 ("backend", "auto"),
+                ("experimental_adaptive_packing", "false"),
                 ("proactive_threshold_percent", "90"),
                 ("keep_recent_tokens", "20000"),
                 ("context_chars", "0"),
@@ -12954,6 +12978,78 @@ max_tool_rounds = 3
         assert_eq!(config.model.compaction.proactive_threshold_percent, 90);
         assert_eq!(config.model.compaction.keep_recent_tokens, 20_000);
         assert_eq!(config.model.compaction.context_chars, 0);
+    }
+
+    #[test]
+    fn adaptive_packing_defaults_off() {
+        for config in [
+            BcodeConfig::default(),
+            toml::from_str("").expect("empty config should parse"),
+            toml::from_str("[model.compaction]").expect("empty compaction should parse"),
+        ] {
+            let compaction = config.model.compaction;
+            assert!(!compaction.experimental_adaptive_packing);
+            assert!(
+                !compaction
+                    .effective_for(None, None)
+                    .experimental_adaptive_packing
+            );
+        }
+        assert_eq!(
+            super::ModelCompactionOverrideConfig::default().experimental_adaptive_packing,
+            None
+        );
+    }
+
+    #[test]
+    fn adaptive_packing_inherits_and_respects_explicit_overrides() {
+        for global in [false, true] {
+            let config: BcodeConfig = toml::from_str(&format!(
+                r#"
+[model.compaction]
+experimental_adaptive_packing = {global}
+[model.compaction.models.inherited]
+[model.compaction.models.enabled]
+experimental_adaptive_packing = true
+[model.compaction.models.disabled]
+provider_plugin_id = "provider"
+experimental_adaptive_packing = false
+"#
+            ))
+            .expect("adaptive packing config should parse");
+            let compaction = &config.model.compaction;
+            for model in [None, Some("unknown"), Some("inherited")] {
+                assert_eq!(
+                    compaction
+                        .effective_for(Some("provider"), model)
+                        .experimental_adaptive_packing,
+                    global
+                );
+            }
+            assert!(
+                compaction
+                    .effective_for(None, Some("enabled"))
+                    .experimental_adaptive_packing
+            );
+            assert!(
+                !compaction
+                    .effective_for(Some("provider"), Some("disabled"))
+                    .experimental_adaptive_packing
+            );
+            for provider in [None, Some("other-provider")] {
+                assert_eq!(
+                    compaction
+                        .effective_for(provider, Some("disabled"))
+                        .experimental_adaptive_packing,
+                    global
+                );
+            }
+            let rendered = super::config_to_toml(&config);
+            let round_trip: BcodeConfig =
+                toml::from_str(&rendered).expect("rendered config parses");
+            assert_eq!(round_trip.model.compaction, config.model.compaction);
+            assert_eq!(compaction.keep_recent_tokens, 20_000);
+        }
     }
 
     #[test]

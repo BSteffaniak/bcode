@@ -10,7 +10,8 @@ import pathlib
 import sys
 
 
-def verify(paths):
+def load_events(paths):
+    """Merge real canonical exports, rejecting conflicting identities and sequence gaps."""
     events = {}
     for path in paths:
         for line in pathlib.Path(path).read_text().splitlines():
@@ -21,41 +22,79 @@ def verify(paths):
             if key in events and events[key] != event:
                 raise ValueError("conflicting canonical event identity")
             events[key] = event
-    if len({key[0] for key in events}) != 1:
-        raise ValueError("expected exactly one canonical session across restart")
-    markers = []
-    for event in sorted(events.values(), key=lambda event: event["sequence"]):
-        name, kind = next(iter(event["kind"].items()))
-        if name == "context_compacted":
-            markers.append((event, json.loads(kind["summary"])))
-        elif name == "provider_context_compacted":
-            markers.append((event, json.loads(kind["snapshot"]["portable_summary"])))
-    if len(markers) < 2:
-        raise ValueError("need at least two real canonical compaction markers")
-    if len({event["kind"][next(iter(event["kind"]))]["compacted_through_sequence"] for event, _ in markers}) < 2:
-        raise ValueError("compaction coverage did not advance")
-    for _, evidence in markers:
+    if not events or len({key[0] for key in events}) != 1:
+        raise ValueError("expected exactly one nonempty canonical session across restart")
+    ordered = sorted(events.values(), key=lambda event: event["sequence"])
+    if [event["sequence"] for event in ordered] != list(range(ordered[0]["sequence"], ordered[-1]["sequence"] + 1)):
+        raise ValueError("canonical export sequence gap")
+    return ordered
+
+
+def markers(events):
+    """Select only actual canonical local/provider compaction markers."""
+    selected = []
+    for event in events:
+        if "context_compacted" in event["kind"]:
+            selected.append((event, json.loads(event["kind"]["context_compacted"]["summary"])))
+        elif "provider_context_compacted" in event["kind"]:
+            selected.append((event, json.loads(event["kind"]["provider_context_compacted"]["snapshot"]["portable_summary"])))
+    return selected
+
+
+def verify_scope(events, selected):
+    """Verify retention, chronology, user attribution and request-only isolation."""
+    if not selected:
+        raise ValueError("need a real canonical compaction marker")
+    for _, evidence in selected:
         if evidence["format"] != "bcode.compaction.scope.v2":
             raise ValueError("not structured scope evidence")
         if "COMPACTION_REQUEST_ONLY_CANARY_7391" in json.dumps(evidence):
             raise ValueError("request-only canary became portable content")
-    first = json.loads(markers[0][1]["continuation"])
-    latest = markers[-1][1]
+    latest = selected[-1][1]
     state = json.loads(latest["continuation"])
-    if first["facts"].get("early") != "violet-7391" or state["facts"].get("early") != "violet-7391":
-        raise ValueError("early fact did not survive repeated real compaction")
+    if state["facts"].get("early") != "violet-7391":
+        raise ValueError("early fact did not survive real compaction")
     statements = {scope["statement"] for scope in latest["current_scope"]}
     expected = {"No network access", "Read-only analysis; do not edit files"}
     if statements != expected:
         raise ValueError(f"incorrect final independent scope: {statements}")
+    by_sequence = {event["sequence"]: event for event in events}
+    latest_directives = {}
+    through = selected[-1][0]["kind"][next(iter(selected[-1][0]["kind"]))]["compacted_through_sequence"]
+    for event in events:
+        if event["sequence"] > through:
+            continue
+        user = event["kind"].get("user_message", event["kind"].get("submission_activated"))
+        if user is None:
+            continue
+        for line in user["text"].splitlines():
+            if line.startswith("BCODE_FIXTURE_SCOPE "):
+                directive = json.loads(line.removeprefix("BCODE_FIXTURE_SCOPE "))
+                latest_directives[directive["key"]] = (event["sequence"], directive["statement"])
+    expected_sources = set(latest_directives.values())
+    if {(scope["source_sequence"], scope["statement"]) for scope in latest["current_scope"]} != expected_sources:
+        raise ValueError("scope does not reflect chronological latest canonical user directives")
     for scope in latest["current_scope"]:
-        source = next((event for event in events.values() if event["sequence"] == scope["source_sequence"]), None)
+        source = by_sequence.get(scope["source_sequence"])
         user = None if source is None else source["kind"].get("user_message", source["kind"].get("submission_activated"))
         if user is None:
             raise ValueError("scope must cite a real canonical user event or activated submission")
         if scope["statement"] not in user["text"]:
             raise ValueError("scope was not derived from the cited fixture directive")
-    print(f"PASS: {len(markers)} advancing real markers; early fact, corrected role, independent restriction")
+
+
+def verify(paths):
+    events = load_events(paths)
+    selected = markers(events)
+    if len(selected) < 2:
+        raise ValueError("need at least two real canonical compaction markers")
+    if len({event["kind"][next(iter(event["kind"]))]["compacted_through_sequence"] for event, _ in selected}) < 2:
+        raise ValueError("compaction coverage did not advance")
+    verify_scope(events, selected)
+    first = json.loads(selected[0][1]["continuation"])
+    if first["facts"].get("early") != "violet-7391":
+        raise ValueError("early fact did not survive first real compaction")
+    print(f"PASS: {len(selected)} advancing real markers; early fact, corrected role, independent restriction")
     print("LIMIT: caller must verify distinct daemon process/artifact identity and restarted request completion.")
 
 

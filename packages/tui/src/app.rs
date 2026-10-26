@@ -4877,6 +4877,19 @@ impl BmuxApp {
     /// Absorb one live session event.
     #[allow(clippy::too_many_lines)]
     pub fn absorb_session_event(&mut self, event: &SessionEvent) {
+        if matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(trace.payload, SessionTracePayload::ContextCompaction { .. })
+        ) && event.sequence != 0
+            && self
+                .session_view
+                .snapshot()
+                .latest_sequence
+                .is_some_and(|sequence| event.sequence <= sequence)
+        {
+            return;
+        }
         self.restore_uncommitted_navigation();
         if event_affects_transcript_rows(event)
             && self
@@ -5961,8 +5974,8 @@ impl BmuxApp {
             SessionTracePayload::ProviderEvent { event_type, detail } => {
                 self.apply_provider_trace_event(event_type, detail.as_deref());
             }
-            SessionTracePayload::ContextCompaction { message, .. } => {
-                self.apply_compaction_trace(trace.phase, message.as_deref());
+            SessionTracePayload::ContextCompaction { .. } => {
+                self.apply_compaction_trace(trace);
             }
             SessionTracePayload::ModelRequestBuilt {
                 provider,
@@ -6134,39 +6147,24 @@ impl BmuxApp {
         }
     }
 
-    fn apply_compaction_trace(&mut self, phase: SessionTracePhase, message: Option<&str>) {
-        match phase {
-            SessionTracePhase::ContextCompactionStarted => {
-                let detail = message.map_or_else(|| "older context".to_owned(), ToOwned::to_owned);
+    fn apply_compaction_trace(&mut self, trace: &SessionTraceEvent) {
+        use bcode_session_view::compaction_activity::{
+            CompactionActivityUpdate, compaction_activity_update,
+        };
+
+        let update = compaction_activity_update(
+            trace,
+            &self.session_view.snapshot().runtime,
+            matches!(self.activity, ActivityState::Compacting { .. }),
+        );
+        match update {
+            Some(CompactionActivityUpdate::Active { detail }) => {
                 self.set_activity(ActivityState::Compacting { detail });
             }
-            SessionTracePhase::ContextCompactionFinished => {
-                if matches!(self.activity, ActivityState::Compacting { .. }) {
-                    self.set_activity(ActivityState::PreparingModelRequest);
-                }
+            Some(CompactionActivityUpdate::PreparingModelRequest) => {
+                self.set_activity(ActivityState::PreparingModelRequest);
             }
-            SessionTracePhase::ContextCompactionSkipped => {
-                if matches!(self.activity, ActivityState::Compacting { .. }) {
-                    self.set_activity(ActivityState::PreparingModelRequest);
-                }
-            }
-            SessionTracePhase::ContextCompactionDiagnostic
-            | SessionTracePhase::ModelRequestBuilt
-            | SessionTracePhase::ModelProviderRoundStarted
-            | SessionTracePhase::ModelProviderRoundFinished
-            | SessionTracePhase::ModelProviderEvent
-            | SessionTracePhase::ToolInvocationStarted
-            | SessionTracePhase::ToolPolicyEvaluated
-            | SessionTracePhase::ToolPermissionWaitStarted
-            | SessionTracePhase::ToolPermissionWaitFinished
-            | SessionTracePhase::ToolInvocationFinished
-            | SessionTracePhase::ToolInvocationOutput
-            | SessionTracePhase::SkillInvoked
-            | SessionTracePhase::SkillSuggested
-            | SessionTracePhase::SkillActivated
-            | SessionTracePhase::SkillDeactivated
-            | SessionTracePhase::SkillContextLoaded
-            | SessionTracePhase::SkillInvocationFailed => {}
+            None => {}
         }
     }
 }

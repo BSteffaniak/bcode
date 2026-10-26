@@ -14,6 +14,12 @@
 //! Normal model-context reads return that marker plus later semantic events without replaying or
 //! repairing the complete event log.
 
+mod compaction_checkpoint;
+pub use compaction_checkpoint::{
+    CompactionCheckpointCommit, CompactionEventIdentity, MAX_COMPACTION_COMMIT_SOURCE_EVENTS,
+    compaction_event_identity,
+};
+
 /// Initial observation resource exhaustion is not canonical damage.
 #[derive(Debug, thiserror::Error)]
 pub enum InitialObservationPageError {
@@ -1649,6 +1655,7 @@ impl SessionManager {
             latest_compaction_sequence: None,
             context_epoch: 0,
             context_occupancy: None,
+            compaction_checkpoints: BTreeMap::new(),
             turn_evidence: BTreeMap::new(),
             turn_receipts: BTreeMap::new(),
             total_metered_tokens: 0,
@@ -2722,6 +2729,75 @@ impl SessionManager {
         }
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         Ok(db.inspection_page(query).await?)
+    }
+
+    /// Validate frozen source and atomically publish a final marker plus retirement.
+    ///
+    /// # Errors
+    /// Returns an error for stale identities, excessive source bounds, missing checkpoints,
+    /// or unavailable persisted storage. This operation does not support ephemeral sessions.
+    pub async fn commit_compaction_checkpoint(
+        &self,
+        session_id: SessionId,
+        request: CompactionCheckpointCommit,
+    ) -> Result<SessionEvent, SessionError> {
+        self.session_handle(session_id)
+            .await?
+            .commit_compaction_checkpoint(request, self.next_activity_timestamp_ms())
+            .await
+    }
+
+    /// Append bounded operational compaction evidence through the serialized session writer.
+    /// `None` retires a key without erasing its canonical evidence. No model context changes.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bounds, missing sessions or unavailable writable storage.
+    pub async fn append_compaction_checkpoint(
+        &self,
+        session_id: SessionId,
+        key: &str,
+        payload: Option<String>,
+    ) -> Result<SessionEvent, SessionError> {
+        let timestamp_ms = self.next_activity_timestamp_ms();
+        let kind = bcode_session_models::CompactionSynthesisCheckpoint {
+            version: 1,
+            operation_key: key.to_owned(),
+            host_payload: payload,
+        }
+        .into_event_kind(timestamp_ms)
+        .map_err(SessionError::EventSerialization)?;
+        self.session_handle(session_id)
+            .await?
+            .append_event(kind, timestamp_ms)
+            .await
+    }
+
+    /// Read the latest exact-key canonical compaction evidence, including retirement.
+    /// Turn cancellation and unrelated history do not hide a checkpoint.
+    ///
+    /// # Errors
+    /// Returns an error for invalid keys, incompatible evidence, or damaged/missing storage.
+    pub async fn session_compaction_checkpoint(
+        &self,
+        session_id: SessionId,
+        key: &str,
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        bcode_session_models::CompactionSynthesisCheckpoint::validate_key(key)
+            .map_err(SessionError::EventSerialization)?;
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached {
+            return handle.compaction_checkpoint(key.to_owned()).await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.compaction_checkpoint(key).await?)
     }
 
     /// Read exact canonical outcome and correlated output evidence for one turn.

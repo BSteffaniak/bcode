@@ -2242,7 +2242,12 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 15] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 16] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-16-to-17",
+        source_writer_epoch: 16,
+        target_writer_epoch: 17,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-15-to-16",
         source_writer_epoch: 15,
@@ -2399,11 +2404,15 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 15,
         event_schema: 51,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 16,
+        event_schema: 52,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
 pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] =
-    &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
@@ -2994,6 +3003,10 @@ mod tests {
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 15,
                     event_schema: 51
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 16,
+                    event_schema: 52
                 },
             ]
         );

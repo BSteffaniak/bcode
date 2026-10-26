@@ -579,13 +579,15 @@ fn immediate_theme_transition_ignores_curve() {
     drop(app);
 }
 
-#[test]
-fn compaction_trace_lifecycle_preserves_status_and_ignores_diagnostics() {
-    let session_id = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-    app.set_status("existing notice".to_owned());
-
-    let event = |sequence, phase, reason: &str, compacted, message: &str| SessionEvent {
+fn compaction_trace_event(
+    session_id: SessionId,
+    sequence: u64,
+    phase: SessionTracePhase,
+    reason: &str,
+    compacted: bool,
+    message: &str,
+) -> SessionEvent {
+    SessionEvent {
         schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
         sequence,
         timestamp_ms: sequence,
@@ -604,6 +606,17 @@ fn compaction_trace_lifecycle_preserves_status_and_ignores_diagnostics() {
                 },
             }),
         },
+    }
+}
+
+#[test]
+fn compaction_trace_lifecycle_preserves_status_and_projects_active_progress() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_status("existing notice".to_owned());
+
+    let event = |sequence, phase, reason, compacted, message| {
+        compaction_trace_event(session_id, sequence, phase, reason, compacted, message)
     };
 
     app.absorb_session_event(&event(
@@ -616,6 +629,16 @@ fn compaction_trace_lifecycle_preserves_status_and_ignores_diagnostics() {
     assert_eq!(app.activity(), &ActivityState::Idle);
     assert_eq!(app.status(), "existing notice");
 
+    app.absorb_session_event(&SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 0,
+        timestamp_ms: 0,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::ModelTurnStarted {
+            turn_id: "turn-1".to_owned(),
+        },
+    });
     app.absorb_session_event(&event(
         2,
         SessionTracePhase::ContextCompactionStarted,
@@ -631,8 +654,43 @@ fn compaction_trace_lifecycle_preserves_status_and_ignores_diagnostics() {
     );
     assert_eq!(app.status(), "existing notice");
 
+    for (sequence, message) in [
+        (3, "Accepted chunk 1; more context remains"),
+        (4, "Resuming accepted checkpoint"),
+        (5, "Repairing summary"),
+    ] {
+        app.absorb_session_event(&event(
+            sequence,
+            SessionTracePhase::ContextCompactionDiagnostic,
+            "opaque_reason",
+            false,
+            message,
+        ));
+        assert_eq!(
+            app.activity(),
+            &ActivityState::Compacting {
+                detail: message.to_owned()
+            }
+        );
+        assert_eq!(app.status(), "existing notice");
+    }
+
     app.absorb_session_event(&event(
-        3,
+        4,
+        SessionTracePhase::ContextCompactionStarted,
+        "stale_start",
+        false,
+        "out-of-order progress must not overwrite repair",
+    ));
+    assert_eq!(
+        app.activity(),
+        &ActivityState::Compacting {
+            detail: "Repairing summary".to_owned()
+        }
+    );
+
+    app.absorb_session_event(&event(
+        6,
         SessionTracePhase::ContextCompactionFinished,
         "compaction_finished",
         true,
@@ -642,14 +700,14 @@ fn compaction_trace_lifecycle_preserves_status_and_ignores_diagnostics() {
     assert_eq!(app.status(), "existing notice");
 
     app.absorb_session_event(&event(
-        4,
+        7,
         SessionTracePhase::ContextCompactionStarted,
         "compaction_started",
         false,
         "older context",
     ));
     app.absorb_session_event(&event(
-        5,
+        8,
         SessionTracePhase::ContextCompactionSkipped,
         "nothing_to_compact",
         false,
@@ -657,6 +715,157 @@ fn compaction_trace_lifecycle_preserves_status_and_ignores_diagnostics() {
     ));
     assert_eq!(app.activity(), &ActivityState::PreparingModelRequest);
     assert_eq!(app.status(), "existing notice");
+    drop(app);
+}
+
+#[test]
+fn compaction_trace_unattributed_diagnostics_cannot_claim_the_active_turn() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_event(&SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 1,
+        timestamp_ms: 1,
+        session_id,
+        provenance: None,
+        kind: SessionEventKind::ModelTurnStarted {
+            turn_id: "turn-1".to_owned(),
+        },
+    });
+    let mut sequence = 2;
+    for phase in [
+        SessionTracePhase::ContextCompactionStarted,
+        SessionTracePhase::ContextCompactionDiagnostic,
+        SessionTracePhase::ContextCompactionFinished,
+    ] {
+        let mut event = compaction_trace_event(
+            session_id,
+            sequence,
+            phase,
+            "opaque_reason",
+            false,
+            "Accepted chunk",
+        );
+        if let SessionEventKind::TraceEvent { trace } = &mut event.kind {
+            trace.turn_id = None;
+        }
+        app.absorb_session_event(&event);
+        assert_eq!(app.activity(), &ActivityState::PreparingModelRequest);
+        sequence += 1;
+    }
+    // Once the producer retains the originating ID, the same payload is visible.
+    app.absorb_session_event(&compaction_trace_event(
+        session_id,
+        sequence,
+        SessionTracePhase::ContextCompactionStarted,
+        "opaque_reason",
+        false,
+        "Resuming accepted chunks",
+    ));
+    assert_eq!(
+        app.activity(),
+        &ActivityState::Compacting {
+            detail: "Resuming accepted chunks".to_owned(),
+        }
+    );
+    drop(app);
+}
+
+#[test]
+fn compaction_trace_cancellation_and_restart_reject_stale_activity() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    let event = |sequence, phase, reason, compacted, message| {
+        compaction_trace_event(session_id, sequence, phase, reason, compacted, message)
+    };
+    let turn_event = |sequence, kind| SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence,
+        timestamp_ms: sequence,
+        session_id,
+        provenance: None,
+        kind,
+    };
+    app.absorb_session_event(&turn_event(
+        8,
+        SessionEventKind::ModelTurnStarted {
+            turn_id: "turn-1".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        9,
+        SessionTracePhase::ContextCompactionStarted,
+        "started",
+        false,
+        "more context",
+    ));
+    app.absorb_session_event(&turn_event(
+        10,
+        SessionEventKind::ModelTurnCancelRequested {
+            turn_id: "turn-1".to_owned(),
+            requested_at_ms: Some(10),
+            client_id: None,
+        },
+    ));
+    let cancelling = app.activity().clone();
+    app.absorb_session_event(&event(
+        11,
+        SessionTracePhase::ContextCompactionDiagnostic,
+        "accepted",
+        false,
+        "stale accepted chunk",
+    ));
+    assert_eq!(app.activity(), &cancelling);
+    app.absorb_session_event(&turn_event(
+        12,
+        SessionEventKind::ModelTurnFinished {
+            turn_id: "turn-1".to_owned(),
+            outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+            message: None,
+        },
+    ));
+    let terminal = app.activity().clone();
+    app.absorb_session_event(&event(
+        13,
+        SessionTracePhase::ContextCompactionStarted,
+        "started",
+        false,
+        "stale start",
+    ));
+    assert_eq!(app.activity(), &terminal);
+    app.absorb_session_event(&turn_event(
+        14,
+        SessionEventKind::ModelTurnStarted {
+            turn_id: "turn-2".to_owned(),
+        },
+    ));
+    app.absorb_session_event(&event(
+        15,
+        SessionTracePhase::ContextCompactionStarted,
+        "started",
+        false,
+        "stale old turn",
+    ));
+    assert_eq!(app.activity(), &ActivityState::PreparingModelRequest);
+    let status = app.status().to_owned();
+    let mut resumed = event(
+        16,
+        SessionTracePhase::ContextCompactionStarted,
+        "resuming",
+        false,
+        "Resuming accepted chunks",
+    );
+    if let SessionEventKind::TraceEvent { trace } = &mut resumed.kind {
+        trace.turn_id = Some("turn-2".to_owned());
+    }
+    app.absorb_session_event(&resumed);
+    assert_eq!(
+        app.activity(),
+        &ActivityState::Compacting {
+            detail: "Resuming accepted chunks".to_owned()
+        }
+    );
+    assert_eq!(app.status(), status);
     drop(app);
 }
 

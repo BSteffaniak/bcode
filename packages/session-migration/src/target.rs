@@ -81,6 +81,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingTarget {
         calls: Vec<&'static str>,
+        interrupt_projectors: bool,
+        stale_evidence: bool,
     }
 
     #[async_trait]
@@ -121,6 +123,9 @@ mod tests {
             _canonical_tail: Option<u64>,
         ) -> Result<(), Self::Error> {
             self.calls.push("finalize_projectors");
+            if self.interrupt_projectors {
+                return Err(TargetError);
+            }
             Ok(())
         }
 
@@ -129,10 +134,14 @@ mod tests {
             Ok(StrictValidation {
                 canonical_tail: Some(7),
                 projections: vec![ProjectionValidation {
-                    projection: "session_state".to_owned(),
+                    projection: "turn_evidence".to_owned(),
                     actual_schema_version: Some(1),
                     expected_schema_version: 1,
-                    checkpoint: Some(7),
+                    checkpoint: if self.stale_evidence {
+                        Some(6)
+                    } else {
+                        Some(7)
+                    },
                 }],
                 model_context_schema_version: Some(2),
                 expected_model_context_schema_version: 2,
@@ -151,6 +160,40 @@ mod tests {
             self.calls.push("writer");
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_evidence_rebuild_never_advances_writer_and_can_retry() {
+        let mut target = RecordingTarget {
+            interrupt_projectors: true,
+            ..RecordingTarget::default()
+        };
+        assert!(matches!(
+            finalize_validated_target(&mut target, Some(7)).await,
+            Err(MigrationTargetExecutionError::Target(_))
+        ));
+        assert_eq!(target.calls, ["finalize_projectors"]);
+        target.calls.clear();
+        target.interrupt_projectors = false;
+        finalize_validated_target(&mut target, Some(7))
+            .await
+            .expect("retry");
+        assert_eq!(target.calls, ["finalize_projectors", "validate", "writer"]);
+    }
+
+    #[tokio::test]
+    async fn stale_evidence_rebuild_never_advances_writer() {
+        let mut target = RecordingTarget {
+            stale_evidence: true,
+            ..RecordingTarget::default()
+        };
+        assert!(matches!(
+            finalize_validated_target(&mut target, Some(7)).await,
+            Err(MigrationTargetExecutionError::Validation(
+                crate::MigrationTargetValidationError::ProjectionStale { .. }
+            ))
+        ));
+        assert_eq!(target.calls, ["finalize_projectors", "validate"]);
     }
 
     #[tokio::test]

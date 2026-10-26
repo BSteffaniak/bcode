@@ -1,0 +1,2 @@
+{"schema_version":52,"sequence":0,"timestamp_ms":1,"session_id":"00000000-0000-0000-0000-000000000016","provenance":null,"kind":{"session_created":{"name":"epoch 16 projection upgrade","working_directory":"/tmp/bcode-epoch-16"}}}
+{"schema_version":52,"sequence":1,"timestamp_ms":2,"session_id":"00000000-0000-0000-0000-000000000016","provenance":null,"kind":{"trace_event":{"trace":{"timestamp_ms":2,"turn_id":null,"phase":"model_provider_event","payload":{"provider_event":{"event_type":"fixture_operational_evidence","detail":"opaque source evidence"}}}}}}

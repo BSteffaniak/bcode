@@ -1147,6 +1147,172 @@ mod tests {
     }
 
     #[test]
+    fn epoch_16_replay_preserves_canonical_events_without_conversion() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let manifest = crate::load_released_fixture_manifest(&root).expect("fixture inventory");
+        let source_schema = crate::RELEASED_WRITER_SCHEMA_COMBINATIONS
+            .iter()
+            .find(|source| source.writer_epoch == 16)
+            .expect("epoch 16 source contract")
+            .event_schema;
+        let fixtures = manifest.fixtures.iter().filter(|fixture| {
+            fixture.lifecycle_matrix.source_writer_epochs.contains(&16)
+                && fixture.event_schemas == [source_schema]
+        });
+        let mut replayed = 0;
+        for fixture in fixtures {
+            let plan = crate::plan_writer_epoch_migration(16).expect("registered lifecycle plan");
+            assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
+            let payloads =
+                std::fs::read_to_string(root.join(&fixture.path)).expect("fixture payloads");
+            for payload in payloads.lines() {
+                let source: SessionEvent = serde_json::from_str(payload).expect("epoch 16 event");
+                let normalized =
+                    normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                        sequence: source.sequence,
+                        event_kind: bcode_session_models::persisted_session_event_kind_name(
+                            &source.kind,
+                        )
+                        .to_owned(),
+                        schema_version: source.schema_version,
+                        payload: payload.to_owned(),
+                    })
+                    .expect("lossless projection rebuild input");
+                assert_eq!(normalized.event, source);
+                assert!(normalized.metric_counter.is_none());
+                replayed += 1;
+            }
+        }
+        assert!(
+            replayed > 0,
+            "registered epoch 16 lifecycle input must be replayed"
+        );
+        let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
+        // A future schema is not made current even if its event shape is familiar.
+        let mut future: serde_json::Value =
+            serde_json::from_str(fixture.lines().next().unwrap()).unwrap();
+        future["schema_version"] = serde_json::json!(crate::CURRENT_EVENT_SCHEMA + 1);
+        let payload = future.to_string();
+        assert!(matches!(
+            normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                sequence: future["sequence"].as_u64().expect("future event sequence"),
+                event_kind: future["kind"]
+                    .as_object()
+                    .expect("future event kind")
+                    .keys()
+                    .next()
+                    .expect("one event kind")
+                    .clone(),
+                schema_version: u16::try_from(
+                    future["schema_version"].as_u64().expect("future schema")
+                )
+                .expect("schema fits u16"),
+                payload: payload.clone(),
+            }),
+            Err(HistoricalSessionEventError::UnsupportedSchema { .. })
+        ));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+            future
+        );
+    }
+
+    #[test]
+    fn compaction_checkpoint_replay_preserves_operational_evidence() {
+        use bcode_session_models::CompactionSynthesisCheckpoint;
+
+        for host_payload in [Some("accepted synthesis: 🦀".to_owned()), None] {
+            let checkpoint = CompactionSynthesisCheckpoint {
+                version: 1,
+                operation_key: "host-v1/source/policy".to_owned(),
+                host_payload,
+            };
+            let mut event = serde_json::from_str::<SessionEvent>(
+                include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl")
+                    .lines()
+                    .next()
+                    .expect("session fixture"),
+            )
+            .expect("fixture event");
+            event.kind = checkpoint
+                .clone()
+                .into_event_kind(1)
+                .expect("checkpoint event");
+            let payload = serde_json::to_string(&event).expect("canonical payload");
+            let normalized =
+                normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                    sequence: event.sequence,
+                    event_kind: bcode_session_models::persisted_session_event_kind_name(
+                        &event.kind,
+                    )
+                    .to_owned(),
+                    schema_version: event.schema_version,
+                    payload: payload.clone(),
+                })
+                .expect("replay operational evidence");
+            assert_eq!(normalized.event, event);
+            assert_eq!(serde_json::to_string(&normalized.event).unwrap(), payload);
+            assert_eq!(
+                CompactionSynthesisCheckpoint::from_event(&normalized.event).unwrap(),
+                Some(checkpoint)
+            );
+            assert!(normalized.metric_counter.is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_compaction_envelopes_are_preserved_not_reinterpreted() {
+        use bcode_session_models::{CompactionSynthesisCheckpoint, SessionTracePayload};
+
+        let checkpoint = CompactionSynthesisCheckpoint {
+            version: 1,
+            operation_key: "host-v1/source/policy".to_owned(),
+            host_payload: Some("accepted synthesis".to_owned()),
+        };
+        let kind = checkpoint
+            .clone()
+            .into_event_kind(1)
+            .expect("checkpoint event");
+        for envelope in [
+            serde_json::json!({"version": 2, "operation_key": checkpoint.operation_key,
+                "host_payload": "future payload"}),
+            serde_json::json!({"version": 1, "operation_key": checkpoint.operation_key,
+                "host_payload": "payload", "future_field": true}),
+        ] {
+            let mut event = serde_json::from_str::<SessionEvent>(
+                include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl")
+                    .lines()
+                    .next()
+                    .expect("session fixture"),
+            )
+            .expect("fixture event");
+            event.kind = kind.clone();
+            let SessionEventKind::TraceEvent { trace } = &mut event.kind else {
+                panic!("checkpoint must be a trace event");
+            };
+            let SessionTracePayload::ProviderEvent { detail, .. } = &mut trace.payload else {
+                panic!("checkpoint must be provider evidence");
+            };
+            *detail = Some(envelope.to_string());
+            let payload = serde_json::to_string(&event).unwrap();
+            let normalized =
+                normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                    sequence: event.sequence,
+                    event_kind: bcode_session_models::persisted_session_event_kind_name(
+                        &event.kind,
+                    )
+                    .to_owned(),
+                    schema_version: event.schema_version,
+                    payload: payload.clone(),
+                })
+                .expect("normalization must not rewrite opaque provider details");
+            assert_eq!(serde_json::to_string(&normalized.event).unwrap(), payload);
+            // The current projector must reject rather than accept or downgrade this envelope.
+            assert!(CompactionSynthesisCheckpoint::from_event(&normalized.event).is_err());
+        }
+    }
+
+    #[test]
     fn canonical_normalization_always_materializes_the_requested_current_schema() {
         let current_payload = format!(
             r#"{{"schema_version":39,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"session_created":{{"summary":{{"id":"{SESSION_ID}","title":"fixture","cwd":"/tmp","created_at_ms":1,"updated_at_ms":1}}}}}}}}"#

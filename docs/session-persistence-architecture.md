@@ -5,6 +5,31 @@ See [Child sessions](child-sessions.md) for immutable recursive session relation
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 
+## Compaction synthesis recovery
+
+Writer epoch 17 adds indexed operational compaction-synthesis checkpoints without changing event
+schema 52. `CompactionSynthesisCheckpoint` is a versioned envelope in a canonical
+`TraceEvent::ProviderEvent` with no turn ID. Its reserved `turn_evidence` lookup key is separate
+from model-turn evidence. The host owns the opaque accepted-synthesis payload and source/policy
+identity; the checkpoint itself is never model-context content. A retirement record remains the
+latest evidence rather than exposing an older accepted synthesis. Accepted synthesis can be reused
+after cancellation or restart, but recording it does not advance the compaction marker: only the
+full atomic compaction commit publishes the marker and context changes.
+
+The known, lossless `session-writer-epoch-16-to-17` edge uses the existing exclusive migration
+path to rebuild derived projections, including `turn_evidence`, from canonical history. Event
+schema and checkpoint details are not downgraded or rewritten for this edge. Strict projector
+validation must succeed before the writer contract advances to 17, fencing epoch-16 and earlier
+writers that cannot retain the new evidence. Unknown checkpoint envelopes remain preserved in
+canonical history and fail current projector validation; unknown writer epochs are rejected rather
+than migrated backward, including when opened by another artifact.
+
+This edge adds no ownership or recovery mechanism. Migration still requires exclusive maintenance
+coordination, refuses live owners regardless of artifact identity, verifies the retained backup
+before mutation, and uses the existing transactional rebuild/rollback path. Interruption or failed
+validation leaves the prior writer contract and canonical authority intact; a later verified owner
+can retry. Normal bounded reads do not replay history or repair this projection.
+
 ## Provider retry recovery
 
 Recoverable provider timeouts, network failures and provider-internal errors use the existing

@@ -4,6 +4,7 @@
 
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
+mod compaction_control;
 mod compaction_fixture;
 mod judgement;
 pub mod prompt_cache;
@@ -884,7 +885,9 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
         text,
         request_input_tokens,
     } = dispatch;
-    if let Some(script) = event_script {
+    if compaction_control::enabled(request) {
+        compaction_control::dispatch(request, turn, text, request_input_tokens);
+    } else if let Some(script) = event_script {
         run_fake_event_script(turn, script);
     } else if forced_stop == Some(StopReason::Error) {
         turn.push(ProviderTurnEvent::Error {
@@ -1165,6 +1168,11 @@ fn fake_compaction_synthesis(
     request: &ModelTurnRequest,
     prompt: &str,
 ) -> Result<String, ProviderError> {
+    let prompt = if compaction_control::enabled(request) {
+        compaction_control::source_prompt(prompt)
+    } else {
+        prompt
+    };
     if let Some(protocol) = request
         .provider_context
         .settings

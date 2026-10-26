@@ -2671,6 +2671,246 @@ impl SessionDb {
             .transpose()
     }
 
+    /// Atomically verify a bounded frozen source and publish its marker plus retirement.
+    ///
+    /// # Errors
+    /// Returns an error for stale source/checkpoint identities or incompatible storage.
+    pub(crate) async fn commit_compaction_checkpoint(
+        &self,
+        request: &crate::CompactionCheckpointCommit,
+        marker: &SessionEvent,
+        retirement: &SessionEvent,
+    ) -> SessionDbResult<()> {
+        use crate::MAX_COMPACTION_COMMIT_SOURCE_EVENTS;
+        use bcode_session_models::CompactionSynthesisCheckpoint;
+        let invalid = || {
+            SessionDbError::InvalidData(
+                "compaction publication precondition changed or invalid".into(),
+            )
+        };
+        CompactionSynthesisCheckpoint::validate_key(&request.operation_key)
+            .map_err(SessionDbError::InvalidData)?;
+        if request.source.is_empty() || request.source.len() > MAX_COMPACTION_COMMIT_SOURCE_EVENTS {
+            return Err(invalid());
+        }
+        let boundary = match &marker.kind {
+            SessionEventKind::ContextCompacted {
+                compacted_through_sequence,
+                ..
+            }
+            | SessionEventKind::ProviderContextCompacted {
+                compacted_through_sequence,
+                ..
+            } => *compacted_through_sequence,
+            _ => return Err(invalid()),
+        };
+        if request
+            .source
+            .last()
+            .is_none_or(|item| item.sequence != boundary)
+        {
+            return Err(invalid());
+        }
+        let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
+        validate_storage_writer_contract(&*tx).await?;
+        validate_append_preconditions_without_writer(&*tx, marker).await?;
+        self.validate_compaction_prior_marker(&*tx, request).await?;
+        self.validate_compaction_source(&*tx, request, marker, boundary)
+            .await?;
+        self.validate_compaction_retirement(&*tx, request, retirement)
+            .await?;
+        for event in [marker, retirement] {
+            validate_append_preconditions_without_writer(&*tx, event).await?;
+            append_event_projections(&*tx, event, Some(event.timestamp_ms)).await?;
+            validate_append_postconditions(&*tx, event).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn validate_compaction_prior_marker(
+        &self,
+        db: &dyn Database,
+        request: &crate::CompactionCheckpointCommit,
+    ) -> SessionDbResult<()> {
+        use crate::compaction_event_identity;
+        let invalid = || {
+            SessionDbError::InvalidData(
+                "compaction publication precondition changed or invalid".into(),
+            )
+        };
+        let mut latest: Option<SessionEvent> = None;
+        for kind in ["context_compacted", "provider_context_compacted"] {
+            let rows = db
+                .select("events")
+                .columns(&["event_seq", "payload"])
+                .where_eq("event_type", kind)
+                .sort("event_seq", SortDirection::Desc)
+                .limit(1)
+                .execute(db)
+                .await?;
+            if let Some(row) = rows.first() {
+                let event = strict_event_from_row(row, self.session_id)?;
+                if latest
+                    .as_ref()
+                    .is_none_or(|prior| prior.sequence < event.sequence)
+                {
+                    latest = Some(event);
+                }
+            }
+        }
+        let prior = latest
+            .as_ref()
+            .map(compaction_event_identity)
+            .transpose()
+            .map_err(SessionDbError::InvalidData)?;
+        if prior != request.expected_prior_marker {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    async fn validate_compaction_source(
+        &self,
+        db: &dyn Database,
+        request: &crate::CompactionCheckpointCommit,
+        marker: &SessionEvent,
+        boundary: u64,
+    ) -> SessionDbResult<()> {
+        use crate::{MAX_COMPACTION_COMMIT_SOURCE_EVENTS, compaction_event_identity};
+        let invalid = || {
+            SessionDbError::InvalidData(
+                "compaction publication precondition changed or invalid".into(),
+            )
+        };
+        let state = db
+            .select("model_context_projection_state")
+            .columns(&["schema_version", "last_event_seq"])
+            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+            .limit(1)
+            .execute(db)
+            .await?;
+        let state = state.first().ok_or_else(invalid)?;
+        if required_i64(state, "schema_version")?
+            != i64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION)
+            || required_i64(state, "last_event_seq").map(i64_to_u64)?
+                != marker.sequence.saturating_sub(1)
+        {
+            return Err(invalid());
+        }
+        let rows = db
+            .select("model_context_entries")
+            .columns(&["event_seq", "payload"])
+            .where_lte("event_seq", seq_to_value(boundary))
+            .sort("event_seq", SortDirection::Asc)
+            .limit(MAX_COMPACTION_COMMIT_SOURCE_EVENTS + 2)
+            .execute(db)
+            .await?;
+        let mut identities = Vec::new();
+        for row in rows {
+            let sequence = required_i64(&row, "event_seq")?;
+            let canonical = db
+                .select("events")
+                .columns(&["event_seq", "payload"])
+                .where_eq("event_seq", DatabaseValue::Int64(sequence))
+                .limit(1)
+                .execute(db)
+                .await?;
+            let event =
+                strict_event_from_row(canonical.first().ok_or_else(invalid)?, self.session_id)?;
+            if encode_session_event(&event)? != required_string(&row, "payload")? {
+                return Err(invalid());
+            }
+            if matches!(
+                event.kind,
+                SessionEventKind::ContextCompacted { .. }
+                    | SessionEventKind::ProviderContextCompacted { .. }
+            ) {
+                continue;
+            }
+            if matches!(
+                context_history_role(&event.kind),
+                ContextHistoryRole::Excluded
+            ) {
+                return Err(invalid());
+            }
+            identities
+                .push(compaction_event_identity(&event).map_err(SessionDbError::InvalidData)?);
+        }
+        if identities != request.source {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    async fn validate_compaction_retirement(
+        &self,
+        db: &dyn Database,
+        request: &crate::CompactionCheckpointCommit,
+        retirement: &SessionEvent,
+    ) -> SessionDbResult<()> {
+        use bcode_session_models::CompactionSynthesisCheckpoint;
+        let invalid = || {
+            SessionDbError::InvalidData(
+                "compaction publication precondition changed or invalid".into(),
+            )
+        };
+        let indexes = db
+            .select("sqlite_master")
+            .columns(&["name"])
+            .where_eq("type", "index")
+            .where_eq("name", "idx_turn_evidence_sequence")
+            .limit(1)
+            .execute(db)
+            .await?;
+        if indexes.is_empty() {
+            return Err(invalid());
+        }
+        let rows = db
+            .select("turn_evidence")
+            .columns(&["event_seq"])
+            .where_eq("turn_id", request.operation_key.clone())
+            .where_eq("evidence_kind", "compaction")
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute(db)
+            .await?;
+        if rows
+            .first()
+            .map(|row| required_i64(row, "event_seq").map(i64_to_u64))
+            .transpose()?
+            != Some(request.expected_checkpoint_sequence)
+        {
+            return Err(invalid());
+        }
+        let rows = db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .where_eq(
+                "event_seq",
+                seq_to_value(request.expected_checkpoint_sequence),
+            )
+            .limit(1)
+            .execute(db)
+            .await?;
+        let checkpoint_event =
+            strict_event_from_row(rows.first().ok_or_else(invalid)?, self.session_id)?;
+        let checkpoint = CompactionSynthesisCheckpoint::from_event(&checkpoint_event)
+            .map_err(SessionDbError::InvalidData)?
+            .ok_or_else(invalid)?;
+        if checkpoint.operation_key != request.operation_key || checkpoint.host_payload.is_none() {
+            return Err(invalid());
+        }
+        let retired = CompactionSynthesisCheckpoint::from_event(retirement)
+            .map_err(SessionDbError::InvalidData)?
+            .ok_or_else(invalid)?;
+        if retired.operation_key != request.operation_key || retired.host_payload.is_some() {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     /// Append an event and update first-class projections in one transaction.
     ///
     /// # Errors
@@ -3611,6 +3851,75 @@ impl SessionDb {
             last_available_sequence: self.last_event_sequence().await?,
             compatibility_issues: Vec::new(),
         })
+    }
+
+    /// Read the latest exact-key operational compaction evidence, including retirement.
+    ///
+    /// Reads one indexed locator and one canonical event, independent of turn history.
+    /// Missing or stale derived state fails closed without repair.
+    ///
+    /// # Errors
+    /// Returns an error for invalid keys, incompatible envelopes, or damaged storage.
+    pub async fn compaction_checkpoint(&self, key: &str) -> SessionDbResult<Option<SessionEvent>> {
+        use bcode_session_models::CompactionSynthesisCheckpoint;
+        CompactionSynthesisCheckpoint::validate_key(key).map_err(SessionDbError::InvalidData)?;
+        if let Some(tail) = self.last_event_sequence().await? {
+            let snapshot = projection_checkpoint_snapshot(&**self.db).await?;
+            validate_projection_checkpoint_snapshot(&snapshot, tail)?;
+        }
+        let indexes = self
+            .db
+            .select("sqlite_master")
+            .columns(&["name"])
+            .where_eq("type", "index")
+            .where_eq("name", "idx_turn_evidence_sequence")
+            .limit(1)
+            .execute(&**self.db)
+            .await?;
+        if indexes.is_empty() {
+            return Err(SessionDbError::InvalidData(
+                "compaction evidence index missing; explicit maintenance required".into(),
+            ));
+        }
+        let rows = self
+            .db
+            .select("turn_evidence")
+            .columns(&["event_seq"])
+            .where_eq("turn_id", key.to_owned())
+            .where_eq("evidence_kind", "compaction")
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute(&**self.db)
+            .await?;
+        let Some(locator) = rows.first() else {
+            return Ok(None);
+        };
+        let sequence = required_i64(locator, "event_seq")?;
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .where_eq("event_seq", DatabaseValue::Int64(sequence))
+            .limit(1)
+            .execute(&**self.db)
+            .await?;
+        let row = rows.first().ok_or_else(|| {
+            SessionDbError::InvalidData(
+                "compaction evidence references a missing canonical event".into(),
+            )
+        })?;
+        let event = strict_event_from_row(row, self.session_id)?;
+        let checkpoint = CompactionSynthesisCheckpoint::from_event(&event)
+            .map_err(SessionDbError::InvalidData)?;
+        if checkpoint
+            .as_ref()
+            .is_none_or(|record| record.operation_key != key)
+        {
+            return Err(SessionDbError::InvalidData(
+                "compaction evidence disagrees with canonical event".into(),
+            ));
+        }
+        Ok(Some(event))
     }
 
     /// Return exact canonical terminal evidence and the final correlated response for a turn.
@@ -5485,6 +5794,8 @@ async fn validate_append_preconditions_without_writer(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
+    bcode_session_models::CompactionSynthesisCheckpoint::from_event(event)
+        .map_err(SessionDbError::InvalidData)?;
     let canonical_tail = last_sequence(db).await?;
     validate_append_identity(event, canonical_tail)?;
     crate::submission::validate_activation(db, event).await?;
@@ -5796,6 +6107,18 @@ async fn project_appended_event(db: &dyn Database, event: &SessionEvent) -> Sess
 }
 
 async fn project_turn_evidence(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+    if let Some(checkpoint) = bcode_session_models::CompactionSynthesisCheckpoint::from_event(event)
+        .map_err(SessionDbError::InvalidData)?
+    {
+        db.insert("turn_evidence")
+            .value("turn_id", checkpoint.operation_key)
+            .value("evidence_kind", "compaction")
+            .value("segment_order", seq_to_value(event.sequence))
+            .value("event_seq", seq_to_value(event.sequence))
+            .execute(db)
+            .await?;
+        return Ok(());
+    }
     let (turn_id, kind, order) = match &event.kind {
         SessionEventKind::TraceEvent { trace } if matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. } if event_type == bcode_session_models::PROVIDER_RETRY_CHECKPOINT_EVENT) =>
         {
@@ -11326,6 +11649,262 @@ mod tests {
                 .await
                 .expect("checkpoint snapshot after append"),
             before
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_checkpoint_restart_retirement_and_corruption() {
+        use bcode_session_models::CompactionSynthesisCheckpoint as Checkpoint;
+        let temp = tempfile::tempdir().expect("temp");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .expect("open");
+        let checkpoint = |sequence, payload: Option<&str>| {
+            event(
+                id,
+                sequence,
+                Checkpoint {
+                    version: 1,
+                    operation_key: "prior-marker/policy".into(),
+                    host_payload: payload.map(str::to_owned),
+                }
+                .into_event_kind(0)
+                .expect("kind"),
+            )
+        };
+        db.append_event(&checkpoint(0, Some("{\"version\":1,\"consumed\":7}")))
+            .await
+            .expect("checkpoint");
+        for sequence in 1..301 {
+            db.append_event(&event(
+                id,
+                sequence,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: format!("cancelled-{sequence}"),
+                    outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+                    message: None,
+                },
+            ))
+            .await
+            .expect("unrelated");
+        }
+        drop(db);
+        let db = SessionDb::open_existing_turso_in_root(id, temp.path())
+            .await
+            .expect("restart");
+        let record = db
+            .compaction_checkpoint("prior-marker/policy")
+            .await
+            .expect("read")
+            .expect("record");
+        assert_eq!(record.sequence, 0);
+        assert!(
+            db.model_context_events()
+                .await
+                .expect("context")
+                .iter()
+                .all(|event| Checkpoint::from_event(event).expect("valid").is_none())
+        );
+        assert!(
+            db.compaction_checkpoint("different")
+                .await
+                .expect("absent")
+                .is_none()
+        );
+        db.append_event(&checkpoint(301, None))
+            .await
+            .expect("retire");
+        let record = db
+            .compaction_checkpoint("prior-marker/policy")
+            .await
+            .expect("read")
+            .expect("retired");
+        assert_eq!(record.sequence, 301);
+        assert!(
+            Checkpoint::from_event(&record)
+                .expect("decode")
+                .expect("record")
+                .host_payload
+                .is_none()
+        );
+        // Corrupt only the disposable locator; a cancelled turn cannot stand in for evidence.
+        db.database()
+            .update("turn_evidence")
+            .value("event_seq", DatabaseValue::Int64(300))
+            .where_eq("evidence_kind", "compaction")
+            .where_eq("segment_order", DatabaseValue::Int64(301))
+            .execute(db.database())
+            .await
+            .expect("damage locator");
+        assert!(
+            db.compaction_checkpoint("prior-marker/policy")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_checkpoint_unknown_version_fails_closed_without_repair() {
+        use bcode_session_models::{
+            CompactionSynthesisCheckpoint as Checkpoint, SessionTracePayload,
+        };
+        let temp = tempfile::tempdir().expect("temp");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .expect("open");
+        let mut record = event(
+            id,
+            0,
+            Checkpoint {
+                version: 1,
+                operation_key: "key".into(),
+                host_payload: Some("opaque".into()),
+            }
+            .into_event_kind(0)
+            .expect("kind"),
+        );
+        db.append_event(&record).await.expect("checkpoint");
+        let SessionEventKind::TraceEvent { trace } = &mut record.kind else {
+            panic!("trace")
+        };
+        let SessionTracePayload::ProviderEvent { detail, .. } = &mut trace.payload else {
+            panic!("provider event")
+        };
+        *detail =
+            Some("{\"version\":2,\"operation_key\":\"key\",\"host_payload\":\"opaque\"}".into());
+        let payload = encode_session_event(&record).expect("encode future fixture");
+        db.database()
+            .update("events")
+            .value("payload", payload.clone())
+            .where_eq("event_seq", DatabaseValue::Int64(0))
+            .execute(db.database())
+            .await
+            .expect("future fixture");
+        assert!(db.compaction_checkpoint("key").await.is_err());
+        let rows = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", DatabaseValue::Int64(0))
+            .limit(1)
+            .execute(db.database())
+            .await
+            .expect("preserved");
+        assert_eq!(
+            required_string(&rows[0], "payload").expect("payload"),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_checkpoint_commit_is_atomic_and_rejects_stale_source() {
+        use bcode_session_models::CompactionSynthesisCheckpoint as Checkpoint;
+        let temp = tempfile::tempdir().expect("temp");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .expect("open");
+        let source = event(
+            id,
+            0,
+            SessionEventKind::SystemMessage {
+                text: "source".into(),
+            },
+        );
+        db.append_event(&source).await.expect("source");
+        db.append_event(&event(
+            id,
+            1,
+            Checkpoint {
+                version: 1,
+                operation_key: "key".into(),
+                host_payload: Some("v1:carry:consumed=2".into()),
+            }
+            .into_event_kind(0)
+            .expect("kind"),
+        ))
+        .await
+        .expect("carry");
+        let tail = event(
+            id,
+            2,
+            SessionEventKind::SystemMessage {
+                text: "unconsumed tail".into(),
+            },
+        );
+        db.append_event(&tail).await.expect("tail");
+        let marker = event(
+            id,
+            3,
+            SessionEventKind::ContextCompacted {
+                summary: "final".into(),
+                compacted_through_sequence: 0,
+            },
+        );
+        let retirement = event(
+            id,
+            4,
+            Checkpoint {
+                version: 1,
+                operation_key: "key".into(),
+                host_payload: None,
+            }
+            .into_event_kind(0)
+            .expect("kind"),
+        );
+        let mut request = crate::CompactionCheckpointCommit {
+            operation_key: "key".into(),
+            expected_checkpoint_sequence: 1,
+            expected_prior_marker: None,
+            source: vec![crate::compaction_event_identity(&source).expect("identity")],
+            marker: marker.kind.clone(),
+        };
+        request.source[0].sha256 = "bad".into();
+        assert!(
+            db.commit_compaction_checkpoint(&request, &marker, &retirement)
+                .await
+                .is_err()
+        );
+        assert_eq!(db.last_event_sequence().await.expect("tail"), Some(2));
+        request.source[0] = crate::compaction_event_identity(&source).expect("identity");
+        let mut conflicting_retirement = retirement.clone();
+        conflicting_retirement.sequence = marker.sequence;
+        assert!(
+            db.commit_compaction_checkpoint(&request, &marker, &conflicting_retirement)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.last_event_sequence().await.expect("rollback tail"),
+            Some(2)
+        );
+        db.commit_compaction_checkpoint(&request, &marker, &retirement)
+            .await
+            .expect("commit");
+        assert_eq!(db.last_event_sequence().await.expect("tail"), Some(4));
+        assert_compaction_committed(&db, marker, tail).await;
+    }
+
+    async fn assert_compaction_committed(db: &SessionDb, marker: SessionEvent, tail: SessionEvent) {
+        use bcode_session_models::CompactionSynthesisCheckpoint as Checkpoint;
+        let record = db
+            .compaction_checkpoint("key")
+            .await
+            .expect("lookup")
+            .expect("retirement");
+        assert_eq!(record.sequence, 4);
+        assert!(
+            Checkpoint::from_event(&record)
+                .expect("decode")
+                .expect("record")
+                .host_payload
+                .is_none()
+        );
+        assert_eq!(
+            db.model_context_events().await.expect("context"),
+            vec![marker, tail]
         );
     }
 
