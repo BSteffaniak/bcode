@@ -41,15 +41,50 @@ def markers(events):
     return selected
 
 
+def verify_fixture_scope(events, through, evidence):
+    """Check one accepted marker against canonical fixture directives, not model claims."""
+    if evidence.get("format") != "bcode.compaction.scope.v2":
+        raise ValueError("not structured scope evidence")
+    if "COMPACTION_REQUEST_ONLY_CANARY_7391" in json.dumps(evidence):
+        raise ValueError("request-only canary became portable content")
+    current = {}
+    ancestors = {}
+    for event in events:
+        if event["sequence"] > through:
+            continue
+        user = event["kind"].get("user_message", event["kind"].get("submission_activated"))
+        if user is None:
+            continue
+        for line in user["text"].splitlines():
+            if not line.startswith("BCODE_FIXTURE_SCOPE "):
+                continue
+            directive = json.loads(line.removeprefix("BCODE_FIXTURE_SCOPE "))
+            key, statement = directive["key"], directive["statement"]
+            if key in current:
+                previous, previous_statement = current[key]
+                if previous_statement == statement:
+                    continue
+                ancestors.setdefault(key, set()).add(previous)
+            current[key] = (event["sequence"], statement)
+    scopes = evidence["current_scope"]
+    actual = [(scope["source_sequence"], scope["statement"]) for scope in scopes]
+    if len(actual) != len(set(actual)) or set(actual) != set(current.values()):
+        raise ValueError("scope does not reflect chronological latest canonical user directives")
+    for scope in scopes:
+        key = next(key for key, value in current.items()
+                   if value == (scope["source_sequence"], scope["statement"]))
+        supersedes = scope.get("supersedes", [])
+        if len(supersedes) != len(set(supersedes)) or not set(supersedes) <= ancestors.get(key, set()):
+            raise ValueError("supersession lacks same-key canonical user support")
+
+
 def verify_scope(events, selected):
     """Verify retention, chronology, user attribution and request-only isolation."""
     if not selected:
         raise ValueError("need a real canonical compaction marker")
-    for _, evidence in selected:
-        if evidence["format"] != "bcode.compaction.scope.v2":
-            raise ValueError("not structured scope evidence")
-        if "COMPACTION_REQUEST_ONLY_CANARY_7391" in json.dumps(evidence):
-            raise ValueError("request-only canary became portable content")
+    for event, evidence in selected:
+        payload = event["kind"].get("context_compacted", event["kind"].get("provider_context_compacted"))
+        verify_fixture_scope(events, payload["compacted_through_sequence"], evidence)
     latest = selected[-1][1]
     state = json.loads(latest["continuation"])
     if state["facts"].get("early") != "violet-7391":
@@ -58,29 +93,6 @@ def verify_scope(events, selected):
     expected = {"No network access", "Read-only analysis; do not edit files"}
     if statements != expected:
         raise ValueError(f"incorrect final independent scope: {statements}")
-    by_sequence = {event["sequence"]: event for event in events}
-    latest_directives = {}
-    through = selected[-1][0]["kind"][next(iter(selected[-1][0]["kind"]))]["compacted_through_sequence"]
-    for event in events:
-        if event["sequence"] > through:
-            continue
-        user = event["kind"].get("user_message", event["kind"].get("submission_activated"))
-        if user is None:
-            continue
-        for line in user["text"].splitlines():
-            if line.startswith("BCODE_FIXTURE_SCOPE "):
-                directive = json.loads(line.removeprefix("BCODE_FIXTURE_SCOPE "))
-                latest_directives[directive["key"]] = (event["sequence"], directive["statement"])
-    expected_sources = set(latest_directives.values())
-    if {(scope["source_sequence"], scope["statement"]) for scope in latest["current_scope"]} != expected_sources:
-        raise ValueError("scope does not reflect chronological latest canonical user directives")
-    for scope in latest["current_scope"]:
-        source = by_sequence.get(scope["source_sequence"])
-        user = None if source is None else source["kind"].get("user_message", source["kind"].get("submission_activated"))
-        if user is None:
-            raise ValueError("scope must cite a real canonical user event or activated submission")
-        if scope["statement"] not in user["text"]:
-            raise ValueError("scope was not derived from the cited fixture directive")
 
 
 def verify(paths):

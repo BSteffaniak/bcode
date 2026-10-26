@@ -40,6 +40,66 @@ system instructions. Legacy attribution is not invented. Existing scope/superses
 remain in the synthesis path; incomplete, invalid or oversized output is rejected, not clipped.
 Request-only guidance and assembled provider requests are not portable summary sources.
 
+### Host-preserving synthesis updates
+
+Local synthesis uses `packages/server/src/context_compaction_synthesis.rs`. The model is asked for
+`bcode.compaction.scope-update.v1`, containing `current_scope`, `reconciles`, and `continuation`.
+This is a response contract, not a new durable summary format: the host merges accepted updates
+into the existing `bcode.compaction.scope.v2` envelope.
+
+* Omitted unchanged scope is copied verbatim by the host. Exact echoes are allowed; paraphrasing
+  established scope under its completed source is rejected rather than silently normalized.
+* New scope cites eligible canonical user sequences. A newer user source contributing this chunk
+  may declare older sources in `supersedes`. These are per-response changes, not an accumulating
+  authorization history. Updates reject sequence-only supersession when that source contains
+  multiple distinct statements: it cannot safely identify which independent restriction changed.
+  Repair retains the protected scope and records the correction as unresolved rather than
+  inventing broader permission. Legacy full envelopes retain their existing group-replacement
+  compatibility semantics.
+* `reconciles` explicitly names unfinished user sources contributing further fragments in this
+  chunk. Each named source needs replacement scope under the same canonical sequence, including
+  when its final fragment corrects a provisional interpretation. Completed or unrelated sources
+  cannot be reconciled. Unfinished status advances only after acceptance.
+* `continuation` replaces the previous derived continuation. The prompt asks the model to carry
+  forward relevant evidence, blockers and unresolved work; the host does not independently prove
+  that this replacement retains every fact.
+
+Compatibility with full `bcode.compaction.scope.v2` responses remains strict: omission of unchanged
+established scope is an error, not an implicit update. A full response may replace scope only through
+eligible supersession or unfinished-source reconciliation; reconciliation cannot silently retire
+an established provisional source without replacement scope. Free-text legacy summaries remain
+unverified derived input, not newly attributed user authorization.
+
+Supersession currently replaces an entire source-sequence scope group. The prompt requires the
+replacement to preserve independent applicable restrictions, but the validator does not mechanically
+prove that a partial correction retained every other restriction from that same source. Host copying
+protects unchanged groups; it does not establish semantic completeness of new scope, replacements or
+continuation. Keep this limitation distinct from successful structural validation.
+
+### Carry budgets and bounded repair
+
+The prompt reports the remaining JSON-encoded continuation allowance after serializing established
+scope with an empty continuation. Escapes count toward that allowance; it is neither a token budget
+nor a promise that new scope will fit. Acceptance checks the complete merged envelope against the
+6,000-character carry limit, with a separate UTF-8 wire byte guard. Adding scope consumes continuation
+space. Protected scope is not clipped or silently discarded to fit: if scope plus a nonempty valid
+continuation cannot fit, synthesis can fail and leave the marker unchanged. Host preservation reduces
+unnecessary regeneration; it does not remove the capacity ceiling or guarantee compaction progress.
+
+Repair uses typed rejection reasons, including invalid JSON, unsupported format, invalid source or
+supersession, unauthorized scope changes, missing scope, invalid reconciliation, and wire/carry
+budget failures. The repair prompt retains the complete base carry and selected source fragments.
+It attaches the rejected response whole as an untrusted diagnostic JSON string only within the
+attachment allowance; otherwise it explicitly reports the attachment unavailable or oversized.
+Rejected output is not canonical evidence. After a restart without a retained rejected response,
+the repair prompt does not assume that the previous reserved attempt succeeded.
+
+Repair still consumes the existing second durable slot for that chunk, not a new retry allowance.
+Exhaustion reports a rejected synthesis and leaves the old marker unchanged; accepted earlier chunks
+remain durable. Experimental packing budgets the real repair formatter, bounded diagnostic escaping
+and reconciliation eligibility as well as the original request, then checks actual request capacity
+again. Capacity checks can still reject work; reservations are not refunded.
+
 ## Implemented durable local checkpoint path
 
 The current implementation is in `packages/server/src/context_compaction_checkpoint.rs`, with
@@ -78,10 +138,18 @@ Publication accepts at most 4,096 source identities and checks them transactiona
 remain outside the frozen boundary; a changed marker/source conflicts rather than silently rebasing.
 
 `LocalCheckpoint` retains structured evidence, next chunk, user-source and unfinished-source sets,
-and per-chunk request counts. Accepted carry is saved only after the existing fragment validator
-passes and unfinished-source bookkeeping is updated. Later fragments may reconcile the same
-unfinished directive; finalized or unrelated restrictions remain protected. Resume restores these
-sets rather than inferring completion from summary text. No streaming delta becomes accepted carry.
+and per-chunk request counts. Accepted carry is saved only after merged synthesis validation passes
+and unfinished-source bookkeeping is updated. Later fragments may reconcile the same unfinished
+directive; unrelated established scope remains subject to preservation/supersession checks. Resume
+restores these sets rather than inferring completion from summary text. No streaming delta becomes
+accepted carry.
+
+Decode rejects inconsistent retained acceptance state before automatic recovery consults its cursor:
+accepted carry needs nonempty continuation and an exact user-source set equal to retained scope
+sources plus unfinished sources; scope statements must be nonempty and cite retained users. Cursor,
+request-count, format and carry bounds are also checked. Full source/manifest verification remains a
+separate requirement for synthesis resume. A cursor or reserved request alone is not proof that a
+chunk was accepted, and decode integrity does not establish semantic retention or execution authority.
 
 Each provider attempt reserves and saves a slot before dispatch, including repairs and ambiguous
 interrupted attempts. Accepted chunks are skipped on resume; reservations are not refunded.

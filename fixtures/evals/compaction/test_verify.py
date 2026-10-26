@@ -149,7 +149,7 @@ class VerifierTests(unittest.TestCase):
     def test_latest_source_required_not_just_matching_statement(self):
         events = []
         for sequence, key, statement in [(1, "network", "No network access"),
-                                         (2, "role", "Read-only analysis; do not edit files"),
+                                         (2, "role", "Implement changes"),
                                          (3, "role", "Read-only analysis; do not edit files")]:
             text = 'BCODE_FIXTURE_SCOPE ' + json.dumps({"key": key, "statement": statement})
             events.append({"sequence": sequence, "kind": {"user_message": {"text": text}}})

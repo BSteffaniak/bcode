@@ -26,7 +26,7 @@ class Driver:
         self.binary = binary
         self.timeout = timeout
         self.interruption = interruption
-        self.work = Path(tempfile.mkdtemp(prefix="bcode-auto-compaction-", dir="/private/tmp")).resolve()
+        self.work = Path(tempfile.mkdtemp(prefix="bcode-auto-compaction-")).resolve()
         self.repo = self.work / "repo"
         self.repo.mkdir()
         self.control = self.work / "control"
@@ -100,11 +100,26 @@ enabled = false
         log = (self.work / f"daemon-{len(self.identity['daemon_pids'])}.log").open("w")
         self.logs.append(log)
         socket = Path(self.env["BCODE_SOCKET"])
-        old_inode = socket.stat().st_ino if socket.exists() else None
         self.server = subprocess.Popen(self.base + ["server", "run"], cwd=self.repo, env=self.env,
                                        stdout=log, stderr=subprocess.STDOUT)
         self.identity["daemon_pids"].append(self.server.pid)
-        self.until(lambda: socket.is_socket() and socket.stat().st_ino != old_inode, "new isolated daemon socket")
+        def owns_socket():
+            if not socket.is_socket():
+                return False
+            try:
+                import socket as socket_api
+                import struct
+                with socket_api.socket(socket_api.AF_UNIX, socket_api.SOCK_STREAM) as probe:
+                    probe.settimeout(.2)
+                    probe.connect(str(socket))
+                    if hasattr(socket_api, "SO_PEERCRED"):
+                        peer, _, _ = struct.unpack("3i", probe.getsockopt(socket_api.SOL_SOCKET, socket_api.SO_PEERCRED, struct.calcsize("3i")))
+                    else:  # macOS LOCAL_PEERPID on a connected Unix socket.
+                        peer, = struct.unpack("i", probe.getsockopt(0, 2, struct.calcsize("i")))
+                return peer == self.server.pid
+            except OSError:
+                return False
+        self.until(owns_socket, "owned isolated daemon socket")
         server_status = self.run("server", "status", "--verbose").stdout
         self.save(f"server-{len(self.identity['daemon_pids'])}.txt", server_status)
         facts = dict(line.split(": ", 1) for line in server_status.splitlines() if ": " in line)
@@ -142,7 +157,8 @@ enabled = false
         return self.save(name, self.run("session", "export", self.session).stdout)
 
     def send(self, text):
-        result = self.run("send", self.session, text,
+        prompt = self.save("seed-prompt.txt", text)
+        result = self.run("send", self.session, "--file", str(prompt),
                           "--wait", "--timeout-secs", str(self.timeout), check=True)
         with (self.work / "send-results.jsonl").open("a") as output:
             output.write(result.stdout + "\n")

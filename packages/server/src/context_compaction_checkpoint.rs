@@ -133,6 +133,22 @@ impl LocalCheckpoint {
                 .iter()
                 .skip(checkpoint.next_chunk.saturating_add(1))
                 .any(|count| *count != 0)
+            // Automatic recovery consults decoded carry before full source verification.
+            // A cursor alone is not acceptance evidence when its retained state disagrees.
+            || (checkpoint.next_chunk > 0
+                && (checkpoint.evidence.continuation.trim().is_empty()
+                    || checkpoint.user_sequences
+                        != checkpoint
+                            .evidence
+                            .current_scope
+                            .iter()
+                            .map(|scope| scope.source_sequence)
+                            .chain(checkpoint.unfinished.iter().copied())
+                            .collect()))
+            || checkpoint.evidence.current_scope.iter().any(|scope| {
+                scope.statement.trim().is_empty()
+                    || !checkpoint.user_sequences.contains(&scope.source_sequence)
+            })
             || checkpoint.evidence.format != COMPACTION_SUMMARY_FORMAT
             || encode_compaction_evidence(&checkpoint.evidence)?
                 .chars()
@@ -743,6 +759,21 @@ mod tests {
                 .await
                 .unwrap()
         );
+        // A cursor alone cannot certify an interrupted dispatch when accepted carry is corrupt.
+        checkpoint.user_sequences.clear();
+        checkpoint.save(&state, id, "recovery-carry").await.unwrap();
+        assert!(
+            crate::compaction_recovery::can_resume(
+                &state,
+                id,
+                &crate::compaction_recovery::Phase::Local {
+                    key: "recovery-carry".into(),
+                    chunk: 0,
+                },
+            )
+            .await
+            .is_err()
+        );
         drop(state);
     }
 
@@ -813,6 +844,111 @@ mod tests {
         assert_eq!(restored.next_chunk, 0);
         assert_eq!(restored.reserve_slot(0).unwrap(), 1);
         assert!(restored.reserve_slot(0).is_err());
+    }
+
+    #[test]
+    fn accepted_carry_requires_continuation_and_exact_scope_bookkeeping_on_decode() {
+        let (_, plan, transcript, chunks) = fixture("Do not modify files.");
+        let mut checkpoint = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        checkpoint.reserve_slot(0).unwrap();
+        let evidence = CompactionEvidence {
+            format: COMPACTION_SUMMARY_FORMAT.into(),
+            current_scope: vec![CompactionScope {
+                statement: "Do not modify files.".into(),
+                source_sequence: 1,
+                supersedes: Vec::new(),
+            }],
+            continuation: "Inspection remains unfinished.".into(),
+        };
+        checkpoint.accept(&evidence, &BTreeSet::from([1]), &BTreeSet::new());
+        let valid = checkpoint.encode().unwrap();
+        LocalCheckpoint::decode(&valid).unwrap();
+        for (field, value) in [
+            ("user_sequences", serde_json::json!([])),
+            ("user_sequences", serde_json::json!([1, 999])),
+            ("unfinished", serde_json::json!([999])),
+            ("requests", serde_json::json!(vec![0; chunks.len()])),
+        ] {
+            let mut corrupt: serde_json::Value = serde_json::from_str(&valid).unwrap();
+            corrupt[field] = value;
+            assert!(LocalCheckpoint::decode(&corrupt.to_string()).is_err());
+        }
+        for field in ["continuation", "current_scope"] {
+            let mut corrupt: serde_json::Value = serde_json::from_str(&valid).unwrap();
+            if field == "continuation" {
+                corrupt["evidence"][field] = serde_json::json!(" \n\t");
+            } else {
+                corrupt["evidence"][field][0]["statement"] = serde_json::json!(" ");
+            }
+            assert!(LocalCheckpoint::decode(&corrupt.to_string()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_next_chunk_preserves_durable_accepted_and_unfinished_carry() {
+        let (_, plan, transcript, chunks) = fixture(&"unfinished directive ".repeat(2500));
+        assert!(chunks.len() > 2);
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let session = state
+            .sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap();
+        let id = session.id;
+        drop(session);
+        let key = "exhausted-with-carry";
+        let mut checkpoint = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        checkpoint.reserve(&state, id, key, 0).await.unwrap();
+        let evidence = CompactionEvidence {
+            format: COMPACTION_SUMMARY_FORMAT.into(),
+            current_scope: vec![CompactionScope {
+                statement: "Directive remains unfinished.".into(),
+                source_sequence: 1,
+                supersedes: Vec::new(),
+            }],
+            continuation: "Await the remaining chronological fragments.".into(),
+        };
+        let mut unfinished = BTreeSet::new();
+        update_unfinished_sources(&mut unfinished, &chunks[0]);
+        assert_eq!(unfinished, BTreeSet::from([1]));
+        checkpoint.accept(&evidence, &BTreeSet::from([1]), &unfinished);
+        checkpoint.save(&state, id, key).await.unwrap();
+        assert_eq!(checkpoint.reserve(&state, id, key, 1).await.unwrap(), 0);
+        assert_eq!(checkpoint.reserve(&state, id, key, 1).await.unwrap(), 1);
+        let cancel = TurnCancelState::default();
+        cancel.cancel().await;
+        assert!(matches!(
+            compaction_evidence_input(&transcript, Some(&cancel)),
+            Err(CompactionError::Cancelled)
+        ));
+        let mut restored = load(&state, id, key).await.unwrap().unwrap();
+        restored.verify(&plan, &transcript, &chunks).unwrap();
+        let durable_sequence = restored.checkpoint_sequence;
+        let durable_payload = restored.encode().unwrap();
+        assert!(restored.reserve(&state, id, key, 1).await.is_err());
+        assert!(restored.reserve(&state, id, key, 2).await.is_err());
+        assert_eq!(restored.encode().unwrap(), durable_payload);
+        let durable = load(&state, id, key).await.unwrap().unwrap();
+        assert_eq!(durable.checkpoint_sequence, durable_sequence);
+        assert_eq!(durable.encode().unwrap(), durable_payload);
+        assert_eq!(durable.restore().1, BTreeSet::from([1]));
+        assert_eq!(durable.restore().2, unfinished);
+        assert_eq!(
+            encode_compaction_evidence(&durable.restore().0).unwrap(),
+            encode_compaction_evidence(&evidence).unwrap()
+        );
+        assert!(accepted_recovery_chunk(&state, id, key, 0).await.unwrap());
+        assert!(!accepted_recovery_chunk(&state, id, key, 1).await.unwrap());
+        let mut legacy: serde_json::Value = serde_json::from_str(&durable_payload).unwrap();
+        legacy.as_object_mut().unwrap().remove("packing_policy");
+        let mut legacy = LocalCheckpoint::decode(&legacy.to_string()).unwrap();
+        legacy.verify(&plan, &transcript, &chunks).unwrap();
+        assert_eq!(legacy.packing_policy, legacy_packing_policy());
+        assert!(legacy.reserve_slot(1).is_err());
+        assert_eq!(legacy.requests, durable.requests);
+        assert_eq!(legacy.unfinished, durable.unfinished);
+        assert_eq!(legacy.next_chunk, durable.next_chunk);
+        drop(state);
     }
 
     #[test]

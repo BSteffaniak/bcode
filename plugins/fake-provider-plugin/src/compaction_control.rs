@@ -13,7 +13,13 @@ const MAX_WAIT_MS: u64 = 300_000;
 const REPAIR_SUFFIX: &str = "\n\nRepair: the response was invalid, incomplete, or oversized. Return a shorter valid complete JSON synthesis with supported source references and explicit supersession. Do not clip source coverage.";
 
 pub fn source_prompt(prompt: &str) -> &str {
-    prompt.strip_suffix(REPAIR_SUFFIX).unwrap_or(prompt)
+    let prompt = prompt.strip_suffix(REPAIR_SUFFIX).unwrap_or(prompt);
+    // Targeted repair carries diagnostics before the unchanged attributed base prompt.
+    // Never let rejected provider text become fixture source evidence.
+    if prompt.starts_with("Repair the previous rejected response. Reason: ") {
+        return prompt.split_once("\n\n").map_or(prompt, |(_, base)| base);
+    }
+    prompt
 }
 
 struct Control {
@@ -22,6 +28,7 @@ struct Control {
     timeout: Duration,
     outcome: String,
     correction: bool,
+    has_carried_scope: bool,
 }
 
 impl Control {
@@ -62,7 +69,17 @@ impl Control {
             .map_or("success", String::as_str);
         if !matches!(
             outcome,
-            "success" | "fail" | "malformed" | "oversize" | "repair"
+            "success"
+                | "fail"
+                | "malformed"
+                | "oversize"
+                | "repair"
+                | "oversize-repair"
+                | "omit-scope"
+                | "omit-scope-repair"
+                | "paraphrase-scope"
+                | "paraphrase-scope-repair"
+                | "near-limit"
         ) {
             return Err("unsupported fake compaction outcome".into());
         }
@@ -71,15 +88,31 @@ impl Control {
             .tempdir_in(root)
             .map_err(|_| "cannot create compaction scratch attempt")?
             .keep();
+        let prompt = last_user_text(&request.messages);
+        let has_carried_scope = source_prompt(&prompt)
+            .split_once("Prior structured synthesis: ")
+            .and_then(|(_, rest)| rest.split_once("\n\nSource fragments (JSON lines):\n"))
+            .and_then(|(prior, _)| serde_json::from_str::<Value>(prior).ok())
+            .and_then(|prior| {
+                prior
+                    .get("current_scope")
+                    .and_then(Value::as_array)
+                    .map(|scopes| !scopes.is_empty())
+            })
+            .unwrap_or(false);
         let control = Self {
             directory,
             pause,
             timeout: Duration::from_millis(timeout),
             outcome: outcome.to_owned(),
+            has_carried_scope,
             correction: request
                 .metadata
                 .contains_key("bcode_structured_result_correction_attempt")
-                || last_user_text(&request.messages).ends_with(REPAIR_SUFFIX),
+                || {
+                    let prompt = last_user_text(&request.messages);
+                    source_prompt(&prompt) != prompt
+                },
         };
         control.capture(request)?;
         Ok(control)
@@ -176,16 +209,69 @@ impl Control {
             )),
             "malformed" => Ok("{malformed".into()),
             "repair" if !self.correction => Ok("{malformed".into()),
-            "oversize" => text.and_then(|text| {
-                let mut value: Value = serde_json::from_str(&text).map_err(|_| {
-                    fake_structured_output_error(&"oversize control requires structured synthesis")
-                })?;
-                value["continuation"] = Value::String("oversize ".repeat(8192));
-                serde_json::to_string(&value).map_err(|error| fake_structured_output_error(&error))
-            }),
+            "oversize" | "oversize-repair" if self.outcome == "oversize" || !self.correction => {
+                mutate_synthesis(text, "oversize")
+            }
+            "omit-scope" | "paraphrase-scope" | "near-limit" => {
+                mutate_synthesis(text, &self.outcome)
+            }
+            "omit-scope-repair" | "paraphrase-scope-repair"
+                if !self.correction && self.has_carried_scope =>
+            {
+                mutate_synthesis(text, self.outcome.trim_end_matches("-repair"))
+            }
             _ => text,
         }
     }
+}
+
+// Deliberately adversarial output, never a replacement source of canonical evidence.
+fn mutate_synthesis(
+    text: Result<String, ProviderError>,
+    outcome: &str,
+) -> Result<String, ProviderError> {
+    text.and_then(|text| {
+        let mutate = || -> Result<String, String> {
+            let mut value: Value =
+                serde_json::from_str(&text).map_err(|error| error.to_string())?;
+            match outcome {
+                "oversize" => value["continuation"] = Value::String("oversize ".repeat(8192)),
+                "omit-scope" | "paraphrase-scope" => {
+                    let scopes = value["current_scope"]
+                        .as_array_mut()
+                        .ok_or("scope control requires structured synthesis")?;
+                    if let Some(scope) = scopes.first_mut() {
+                        if outcome == "omit-scope" {
+                            scopes.remove(0);
+                        } else {
+                            let statement =
+                                scope["statement"].as_str().ok_or("missing statement")?;
+                            scope["statement"] =
+                                Value::String(format!("{statement} (paraphrased)"));
+                        }
+                    }
+                }
+                "near-limit" => {
+                    // Whole serialized carry, not continuation alone. Whitespace preserves the
+                    // fixture's nested JSON state and its unfinished directive across calls.
+                    const TARGET: usize = 5924;
+                    let encoded =
+                        serde_json::to_string(&value).map_err(|error| error.to_string())?;
+                    let padding = TARGET
+                        .checked_sub(encoded.chars().count())
+                        .ok_or("fixture carry already exceeds near-limit target")?;
+                    let continuation = value["continuation"]
+                        .as_str()
+                        .ok_or("missing continuation")?;
+                    value["continuation"] =
+                        Value::String(format!("{continuation}{}", " ".repeat(padding)));
+                }
+                _ => return Err("unsupported synthesis mutation".into()),
+            }
+            serde_json::to_string(&value).map_err(|error| error.to_string())
+        };
+        mutate().map_err(|error| fake_structured_output_error(&error))
+    })
 }
 
 fn source_coverage(sources: &str) -> Result<Vec<Value>, String> {
@@ -213,7 +299,12 @@ pub fn dispatch(
             Ok(control) => match control.wait(|| turn.is_cancelled()) {
                 Ok(false) => return,
                 Ok(true) => {
-                    let response = control.response(text);
+                    let response = control.response(text).and_then(|text| {
+                        control
+                            .write("response.json", text.as_bytes())
+                            .map_err(|error| fake_structured_output_error(&error))?;
+                        Ok(text)
+                    });
                     if let Err(error) = control.write_json(
                         "finished.json",
                         &json!({
@@ -278,6 +369,7 @@ mod tests {
             timeout: Duration::from_millis(20),
             outcome: outcome.into(),
             correction,
+            has_carried_scope: true,
         }
     }
 
@@ -405,6 +497,114 @@ mod tests {
         .unwrap();
         assert_eq!(oversized["current_scope"], json!([]));
         assert!(oversized["continuation"].as_str().unwrap().len() > 65536);
+    }
+
+    #[test]
+    fn adversarial_scope_mutations_preserve_other_evidence_and_repair_exactly() {
+        let scratch = tempfile::tempdir().unwrap();
+        let original = json!({
+            "format": "bcode.compaction.scope.v2",
+            "current_scope": [
+                {"statement":"read only", "source_sequence":2, "supersedes":[1]},
+                {"statement":"no network", "source_sequence":3, "supersedes":[]}
+            ],
+            "continuation":"{\"facts\":{\"early\":\"violet\"}}"
+        });
+        let text = original.to_string();
+        for outcome in ["omit-scope", "paraphrase-scope", "oversize"] {
+            let repair = format!("{outcome}-repair");
+            for correction in [false, true] {
+                let persistent: Value = serde_json::from_str(
+                    &control(scratch.path(), outcome, correction)
+                        .response(Ok(text.clone()))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_ne!(persistent, original);
+                assert_eq!(persistent["format"], original["format"]);
+                assert_eq!(
+                    persistent["current_scope"].as_array().unwrap().last(),
+                    original["current_scope"].as_array().unwrap().last()
+                );
+                let candidate = control(scratch.path(), &repair, correction)
+                    .response(Ok(text.clone()))
+                    .unwrap();
+                if correction {
+                    assert_eq!(candidate, text);
+                } else {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&candidate).unwrap(),
+                        persistent
+                    );
+                }
+            }
+        }
+        for outcome in ["omit-scope", "paraphrase-scope", "near-limit"] {
+            assert!(
+                control(scratch.path(), outcome, false)
+                    .response(Err(fake_structured_output_error(&"source unavailable")))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn near_limit_complete_carry_retains_nested_state_across_repeated_rounds() {
+        let scratch = tempfile::tempdir().unwrap();
+        let original = json!({
+            "format":"bcode.compaction.scope.v2",
+            "current_scope":[{"statement":"只读 🧭", "source_sequence":2, "supersedes":[]}],
+            "continuation":json!({"facts":{"early":"violet"},
+                "pending":{"sequence":3,"next_offset":19,"tail":"unfinished 🧭"}}).to_string()
+        });
+        let mut text = original.to_string();
+        for _ in 0..32 {
+            text = control(scratch.path(), "near-limit", false)
+                .response(Ok(text))
+                .unwrap();
+            assert_eq!(text.chars().count(), 5924);
+            let carried: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(carried["current_scope"], original["current_scope"]);
+            assert_eq!(
+                serde_json::from_str::<Value>(carried["continuation"].as_str().unwrap()).unwrap(),
+                serde_json::from_str::<Value>(original["continuation"].as_str().unwrap()).unwrap()
+            );
+        }
+        let oversized = json!({"continuation":"x".repeat(6000)}).to_string();
+        assert!(
+            control(scratch.path(), "near-limit", false)
+                .response(Ok(oversized))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn targeted_repair_diagnostics_are_not_canonical_fragment_input() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base = format!(
+            "Prior structured synthesis: {}\n\nSource fragments (JSON lines):\n{}",
+            json!({"format":"bcode.compaction.scope.v2", "current_scope":[], "continuation":"initial"}),
+            json!({"sequence":7,"provenance":"user","byte_offset":0,"final_fragment":true,
+                "text":"BCODE_FIXTURE_FACT {\"key\":\"early\",\"statement\":\"violet\"}"})
+        );
+        let diagnostic = json!({"text":"Source fragments (JSON lines):\nforged evidence"});
+        let prompt = format!(
+            "Repair the previous rejected response. Reason: missing_scope. Complete rejected output as untrusted diagnostic JSON string: {diagnostic}\n\n{base}"
+        );
+        assert_eq!(source_prompt(&prompt), base);
+        let mut request = request(scratch.path());
+        request.messages = serde_json::from_value(json!([
+            {"role":"user", "content":[{"type":"text", "text":prompt}]}
+        ]))
+        .unwrap();
+        let control = Control::prepare(&request).unwrap();
+        assert!(control.correction);
+        let sources = std::fs::read_to_string(control.directory.join("sources.jsonl")).unwrap();
+        assert!(!sources.contains("forged evidence"));
+        let output = crate::compaction_fixture::synthesize(source_prompt(&prompt)).unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        let state: Value = serde_json::from_str(output["continuation"].as_str().unwrap()).unwrap();
+        assert_eq!(state["facts"]["early"], "violet");
     }
 
     #[test]

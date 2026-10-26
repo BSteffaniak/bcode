@@ -5,10 +5,8 @@ use super::{
     COMPACTION_MAX_CARRIED_SUMMARY_CHARS, COMPACTION_MAX_CHUNKS,
     COMPACTION_MAX_SUMMARY_INPUT_CHARS, COMPACTION_SYSTEM_PROMPT, CompactionError, ContentBlock,
     MessageRole, ModelMessage, ModelTurnRequest, compaction_capacity_tokens,
-    local_request_estimate, synthesis_prompt,
+    local_request_estimate, synthesis, synthesis_prompt,
 };
-
-const REPAIR_SUFFIX: &str = "\n\nRepair: the response was invalid, incomplete, or oversized. Return a shorter valid complete JSON synthesis with supported source references and explicit supersession. Do not clip source coverage.";
 
 #[derive(Clone, Copy)]
 pub(super) enum PackingGate {
@@ -54,19 +52,35 @@ pub(super) fn pack(
             &carry_reserve,
             chunk,
         );
-        [prompt.clone(), format!("{prompt}{REPAIR_SUFFIX}")]
-            .iter()
-            .all(|prompt| {
-                let mut request = template.clone();
-                request.system_prompt = Some(COMPACTION_SYSTEM_PROMPT.into());
-                request.messages = vec![ModelMessage {
-                    role: MessageRole::User,
-                    content: vec![ContentBlock::Text {
-                        text: prompt.clone(),
-                    }],
-                }];
-                local_request_estimate(&request).tokens <= capacity.available_input_tokens
-            })
+        // Bound the eligibility list by the canonical chunk bytes: each eligible source
+        // must have a source record in that chunk. Reserve worst-case JSON escaping for
+        // the bounded rejected response using the actual repair formatter.
+        let prompt = format!(
+            "Host reconciliation eligibility for this chunk (source sequences): {}. Only these unfinished sources may appear in reconciles.\n{}",
+            "9".repeat(chunk.len()),
+            prompt,
+        );
+        let rejected = "\0".repeat(COMPACTION_MAX_CARRIED_SUMMARY_CHARS);
+        [
+            prompt.clone(),
+            synthesis::repair_prompt(
+                &prompt,
+                synthesis::Rejection::InvalidSupersession,
+                Some(&rejected),
+            ),
+        ]
+        .iter()
+        .all(|prompt| {
+            let mut request = template.clone();
+            request.system_prompt = Some(COMPACTION_SYSTEM_PROMPT.into());
+            request.messages = vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: prompt.clone(),
+                }],
+            }];
+            local_request_estimate(&request).tokens <= capacity.available_input_tokens
+        })
     };
     let mut packed = Vec::new();
     let mut pending = String::new();

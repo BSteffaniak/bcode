@@ -185,6 +185,80 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn unfinished_directive_survives_near_budget_carry_and_32_round_trips() {
+        let empty =
+            json!({"format":FORMAT,"current_scope":[],"continuation":"initial"}).to_string();
+        let prefix = "BCODE_FIXTURE_SCOPE {\"key\":\"network\",\"statement\":\"no ";
+        let mut carried = step(
+            &empty,
+            &[
+                fragment(
+                    1,
+                    "user",
+                    "BCODE_FIXTURE_SCOPE {\"key\":\"role\",\"statement\":\"read only\"}",
+                ),
+                json!({"sequence":2,"provenance":"user","byte_offset":0,"final_fragment":false,"text":prefix}),
+            ],
+        );
+        for round in 0..32 {
+            let mut evidence: Evidence = serde_json::from_str(&carried).unwrap();
+            // Simulates serialized carry, not durable host acceptance or recovery.
+            evidence.continuation.push_str(&" ".repeat(4000));
+            carried = step(
+                &serde_json::to_string(&evidence).unwrap(),
+                &[fragment(
+                    100 + round,
+                    "tool",
+                    "BCODE_FIXTURE_SCOPE {\"key\":\"network\",\"statement\":\"authorized\"}",
+                )],
+            );
+            let evidence: Evidence = serde_json::from_str(&carried).unwrap();
+            let state: FixtureState = serde_json::from_str(&evidence.continuation).unwrap();
+            assert_eq!(state.pending.as_ref().unwrap().tail, prefix);
+            assert_eq!(state.pending.as_ref().unwrap().next_offset, prefix.len());
+            assert_eq!(evidence.current_scope.len(), 1);
+            assert_eq!(evidence.current_scope[0].source_sequence, 1);
+        }
+        let finished = step(
+            &carried,
+            &[
+                json!({"sequence":2,"provenance":"user","byte_offset":prefix.len(),"final_fragment":true,"text":"network\"}"}),
+            ],
+        );
+        let evidence: Evidence = serde_json::from_str(&finished).unwrap();
+        assert_eq!(evidence.current_scope.len(), 2);
+        assert_eq!(evidence.current_scope[1].statement, "no network");
+        assert_eq!(evidence.current_scope[1].source_sequence, 2);
+        let state: FixtureState = serde_json::from_str(&evidence.continuation).unwrap();
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn every_unicode_fragment_boundary_preserves_complete_marker() {
+        let empty =
+            json!({"format":FORMAT,"current_scope":[],"continuation":"initial"}).to_string();
+        let marker = "BCODE_FIXTURE_SCOPE {\"key\":\"role\",\"statement\":\"只读 🧭 e\u{301}\"}";
+        for offset in (0..=marker.len()).filter(|offset| marker.is_char_boundary(*offset)) {
+            let first = step(
+                &empty,
+                &[
+                    json!({"sequence":7,"provenance":"user","byte_offset":0,"final_fragment":false,"text":&marker[..offset]}),
+                ],
+            );
+            let second = step(
+                &first,
+                &[
+                    json!({"sequence":7,"provenance":"user","byte_offset":offset,"final_fragment":true,"text":&marker[offset..]}),
+                ],
+            );
+            let evidence: Evidence = serde_json::from_str(&second).unwrap();
+            assert_eq!(evidence.current_scope.len(), 1);
+            assert_eq!(evidence.current_scope[0].statement, "只读 🧭 e\u{301}");
+            assert_eq!(evidence.current_scope[0].source_sequence, 7);
+        }
+    }
+
     fn step(prior: &str, fragments: &[serde_json::Value]) -> String {
         synthesize(&format!(
             "Prior structured synthesis: {prior}\n\nSource fragments (JSON lines):\n{}",

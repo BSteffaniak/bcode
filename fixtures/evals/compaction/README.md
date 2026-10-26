@@ -1,3 +1,39 @@
+## Deterministic adversarial synthesis cases
+
+The explicit driver accepts `--outcome repair|oversize-repair|omit-scope-repair|paraphrase-scope-repair|near-limit`
+with an explicitly identified offline binary. The default remains `success`. The check script runs
+these repeated-compaction/restart cases in addition to the automatic interruption cases. No live
+provider or semantic quality prerequisite is involved. Example (coordinator-run validation):
+
+```sh
+python3 fixtures/evals/compaction/run.py --binary /absolute/identified/bcode --outcome omit-scope-repair
+```
+
+The opt-in fake setting `fake_compaction_outcome` also accepts persistent `malformed`, `oversize`,
+`omit-scope`, and `paraphrase-scope`, which corrupt correction attempts too. Repair variants corrupt
+initial output only. Empty scope cannot be omitted/paraphrased; the delivery verifier requires an
+actual effective fault elsewhere, never treating a configured setting as evidence. `near-limit`
+pads complete serialized output to 5924 characters, preserving nested continuation state; an already
+larger output fails instead of clipping. This is a deterministic fixture, not a model of semantic
+summarization or a host input-budget oracle.
+
+Scratch control v1 gains an additive `response.json` file containing exact emitted text, including
+malformed/oversized text. Like request captures, this is sensitive synthetic diagnostic evidence,
+not portable history or proof of acceptance. `verify_injections.py` checks observed fault delivery
+and same-source correction separately from canonical export verification. Every actual marker now
+checks independent scope, original provenance for unchanged restatements, supported same-key
+supersession, duplicate scopes, and request-only exclusion. A later correct marker cannot hide an
+earlier incorrect acceptance. The simulator does not prove native carry compatibility, durable
+checkpoint fencing, automatic recovery, or live-model quality; those retain their own owning tests.
+
+Rust simulator tests additionally cover 32 serialized near-budget carry rounds with an unfinished
+directive, canonical completion after intervening tool claims, and every Unicode fragment boundary.
+Python vector tests run without builds or daemon control:
+
+```sh
+scripts/check-compaction-eval.sh --python-only
+```
+
 ## Automatic interruption and restart cases
 
 The default `--case explicit` preserves the original two-explicit-compaction regression.

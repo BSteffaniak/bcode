@@ -25,6 +25,9 @@ printf 'Compaction regression binary: %s\n' "${binary}"
 shasum -a 256 "${binary}"
 python3 -m unittest discover -s "${root}/fixtures/evals/compaction" -p 'test_*.py'
 python3 "${root}/fixtures/evals/compaction/run.py" --binary "${binary}"
+for outcome in repair oversize-repair omit-scope-repair paraphrase-scope-repair near-limit; do
+    python3 "${root}/fixtures/evals/compaction/run.py" --binary "${binary}" --outcome "${outcome}"
+done
 for interruption in cancel restart crash; do
     python3 "${root}/fixtures/evals/compaction/run_automatic.py" \
         --binary "${binary}" --interruption "${interruption}"
@@ -34,7 +37,7 @@ done
 # full run logs alongside each driver's retained scratch evidence.
 comparison="$(mktemp -d "${TMPDIR:-/tmp}/bcode-compaction-packing.XXXXXX")"
 python3 "${root}/fixtures/evals/compaction/run_automatic.py" \
-    --binary "${binary}" --source-repeat 5500 | tee "${comparison}/off.log"
+    --binary "${binary}" --source-repeat 5500 --timeout-secs 300 | tee "${comparison}/off.log"
 python3 "${root}/fixtures/evals/compaction/run_automatic.py" \
     --binary "${binary}" --source-repeat 5500 --adaptive-packing | tee "${comparison}/on.log"
 off="$(python3 -c 'import sys; print(next(line.strip().removeprefix("Artifacts retained: ") for line in open(sys.argv[1]) if line.startswith("Artifacts retained: ")))' "${comparison}/off.log")"
