@@ -385,7 +385,9 @@ fn image_removal_requires_offline_fence_and_preserves_canonical_state() {
     let root = tempfile::tempdir().unwrap();
     let images = root.path().join("daemon-images");
     fs::create_dir_all(images.join("artifact/digest")).unwrap();
-    fs::write(images.join("artifact/digest/bcode"), b"image").unwrap();
+    let path = images.join("artifact/digest/bcode");
+    fs::write(&path, b"image").unwrap();
+    super::super::open_image_lease(root.path(), &path, true).unwrap();
     let canonical = root.path().join("sessions");
     fs::create_dir(&canonical).unwrap();
     fs::write(canonical.join("history"), b"canonical").unwrap();
@@ -396,7 +398,7 @@ fn image_removal_requires_offline_fence_and_preserves_canonical_state() {
     drop(lifetime);
     let maintenance = ExecutionMaintenance::acquire(root.path()).unwrap();
     maintenance.remove_daemon_images().unwrap();
-    assert!(!images.exists());
+    assert!(!images.join("artifact").exists());
     assert_eq!(fs::read(canonical.join("history")).unwrap(), b"canonical");
     assert!(ExecutionLifetime::begin(root.path(), &record).is_err());
     drop(maintenance);

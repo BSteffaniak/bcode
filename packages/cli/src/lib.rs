@@ -495,6 +495,8 @@ pub async fn run_with_static_bundled(
         )?;
     }
     let _state_location = state_location_from_matches(&matches)?;
+    // Clients need their exact image for reconnect even when no daemon is started.
+    bcode_daemon_lifecycle::pinned_bcode_executable()?;
     initialize_startup_reports(&matches, process_started)?;
     record_early_startup([
         process_started,

@@ -113,7 +113,8 @@ impl ExecutionMaintenance {
 
     /// Remove disposable executable snapshots under this fenced state location.
     /// The caller must separately verify that durable workflow retention permits removal.
-    /// Canonical state and lifetime evidence are never removed.
+    /// Canonical state, live image leases, legacy unleased images and lifetime evidence
+    /// are never removed.
     ///
     /// # Errors
     /// Rejects a symlinked/non-directory image root and reports filesystem failures.
@@ -124,7 +125,13 @@ impl ExecutionMaintenance {
         let images = self.root.join("daemon-images");
         match fs::symlink_metadata(&images) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                fs::remove_dir_all(images)
+                super::remove_unused_daemon_images(
+                    &self.root,
+                    &std::collections::BTreeSet::new(),
+                    &std::collections::BTreeSet::new(),
+                )
+                .map(|_| ())
+                .map_err(|error| io::Error::other(error.to_string()))
             }
             Ok(_) => Err(invalid()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

@@ -6,6 +6,8 @@
 
 pub mod application;
 
+#[cfg(test)]
+mod image_retention_tests;
 mod target;
 pub use target::{DaemonTarget, DaemonTargetError};
 
@@ -1235,6 +1237,9 @@ fn current_cached_daemon_image(
 pub struct PinnedBcodeExecutable {
     path: PathBuf,
     digest: String,
+    // The kernel releases this shared lock on process exit, including crashes.
+    // Legacy images without leases remain conservatively exempt from cleanup.
+    _image_use: Option<fs::File>,
 }
 
 impl PinnedBcodeExecutable {
@@ -1258,6 +1263,7 @@ impl PinnedBcodeExecutable {
 }
 
 static PINNED_EXECUTABLE: OnceLock<PinnedBcodeExecutable> = OnceLock::new();
+static PINNED_EXECUTABLE_INITIALIZATION: Mutex<()> = Mutex::new(());
 
 /// Access the process-pinned Bcode executable, never a PATH-resolved replacement.
 ///
@@ -1268,10 +1274,26 @@ static PINNED_EXECUTABLE: OnceLock<PinnedBcodeExecutable> = OnceLock::new();
 /// Returns an error if materialization or verification fails. A missing or modified
 /// published image fails closed; this accessor never selects another executable.
 pub fn pinned_bcode_executable() -> Result<&'static PinnedBcodeExecutable, DaemonLifecycleError> {
+    let _initialization =
+        PINNED_EXECUTABLE_INITIALIZATION
+            .lock()
+            .map_err(|_| DaemonLifecycleError::Io {
+                path: PathBuf::from("<pinned executable>"),
+                source: std::io::Error::other("pinned executable initialization poisoned"),
+            })?;
     if PINNED_EXECUTABLE.get().is_none() {
-        let path = ensure_current_executable_cached_in_state(&bcode_config::default_state_dir())?;
+        let state_dir = bcode_config::default_state_dir();
+        // Serialize publication and acquisition with deletion, then retain only this image.
+        let _publication = DaemonImageUseGuard::acquire(&state_dir)?;
+        let path = current_cached_daemon_executable_path(&state_dir)?;
+        let image_use = acquire_image_use(&state_dir, &path)?;
+        let path = ensure_current_executable_cached_in_state(&state_dir)?;
         let digest = initialize_artifact_bootstrap()?.digest()?;
-        let _ = PINNED_EXECUTABLE.set(PinnedBcodeExecutable { path, digest });
+        let _ = PINNED_EXECUTABLE.set(PinnedBcodeExecutable {
+            path,
+            digest,
+            _image_use: image_use,
+        });
     }
     let executable = PINNED_EXECUTABLE
         .get()
@@ -1469,6 +1491,95 @@ fn open_daemon_image_cleanup_lock(state_dir: &Path) -> Result<fs::File, DaemonLi
         .map_err(|source| DaemonLifecycleError::Io { path, source })
 }
 
+// Caller holds the global publication guard. Never promote an existing unleased image:
+// older processes using it cannot participate in the new locking protocol.
+fn acquire_image_use(
+    state_dir: &Path,
+    image: &Path,
+) -> Result<Option<fs::File>, DaemonLifecycleError> {
+    let file = match open_image_lease(state_dir, image, false) {
+        Ok(file) => file,
+        Err(DaemonLifecycleError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            if image
+                .try_exists()
+                .map_err(|source| DaemonLifecycleError::Io {
+                    path: image.to_path_buf(),
+                    source,
+                })?
+            {
+                return Ok(None);
+            }
+            open_image_lease(state_dir, image, true)?
+        }
+        Err(error) => return Err(error),
+    };
+    file.lock_shared()
+        .map_err(|source| DaemonLifecycleError::Io {
+            path: image.to_path_buf(),
+            source,
+        })?;
+    Ok(Some(file))
+}
+
+fn open_image_lease(
+    state_dir: &Path,
+    image: &Path,
+    create: bool,
+) -> Result<fs::File, DaemonLifecycleError> {
+    let relative = image
+        .strip_prefix(state_dir.join("daemon-images"))
+        .map_err(|_| DaemonLifecycleError::Io {
+            path: image.to_path_buf(),
+            source: std::io::Error::other("image is outside the selected state cache"),
+        })?;
+    // Never unlink lease files: replacing their inode would split the lock domain.
+    let path = state_dir
+        .join("daemon-image-leases")
+        .join(relative)
+        .with_extension("lock");
+    if create {
+        fs::create_dir_all(path.parent().expect("image lease parent")).map_err(|source| {
+            DaemonLifecycleError::Io {
+                path: path.clone(),
+                source,
+            }
+        })?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|source| DaemonLifecycleError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    if !file
+        .metadata()
+        .map_err(|source| DaemonLifecycleError::Io {
+            path: path.clone(),
+            source,
+        })?
+        .is_file()
+    {
+        return Err(DaemonLifecycleError::Io {
+            path,
+            source: std::io::Error::other("image lease must be a regular file"),
+        });
+    }
+    Ok(file)
+}
+
 struct DaemonImageUseGuard {
     file: fs::File,
 }
@@ -1595,17 +1706,26 @@ pub fn cleanup_stale_daemon_images_retaining_artifacts(
     let Some(_cleanup_lock) = try_acquire_daemon_image_cleanup_lock(state_dir)? else {
         return Ok(0);
     };
+    let (mut retained, ambiguous_record_evidence) = retained_daemon_image_paths(state_dir)?;
+    if ambiguous_record_evidence {
+        return Ok(0);
+    }
+    retained.insert(current_cached_daemon_executable_path(state_dir)?);
+    remove_unused_daemon_images(state_dir, &retained, retained_artifact_ids)
+}
+
+// Caller holds the exclusive image-cleanup lock and supplies domain retention evidence.
+fn remove_unused_daemon_images(
+    state_dir: &Path,
+    retained: &std::collections::BTreeSet<PathBuf>,
+    retained_artifact_ids: &std::collections::BTreeSet<String>,
+) -> Result<usize, DaemonLifecycleError> {
     let root = state_dir.join("daemon-images");
     let namespace_entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(source) => return Err(DaemonLifecycleError::Io { path: root, source }),
     };
-    let (mut retained, ambiguous_record_evidence) = retained_daemon_image_paths(state_dir)?;
-    if ambiguous_record_evidence {
-        return Ok(0);
-    }
-    retained.insert(current_cached_daemon_executable_path(state_dir)?);
     let mut removed = 0;
     for namespace_entry in namespace_entries.flatten() {
         if !namespace_entry
@@ -1638,6 +1758,14 @@ pub fn cleanup_stale_daemon_images_retaining_artifacts(
                 path.clone()
             };
             if retained.contains(&candidate) {
+                continue;
+            }
+            // Missing leases identify pre-lease images; do not guess that they are unused.
+            // Errors and contention preserve the image. Hold the exclusive lock through removal.
+            let Ok(lease) = open_image_lease(state_dir, &candidate, false) else {
+                continue;
+            };
+            if lease.try_lock().is_err() {
                 continue;
             }
             if image_entry
@@ -1845,6 +1973,11 @@ mod tests {
     fn write_test_image(path: &Path) {
         fs::create_dir_all(path.parent().expect("image parent")).expect("image directory");
         fs::write(path, b"stale daemon image").expect("image");
+        let state_dir = path
+            .ancestors()
+            .find(|parent| parent.join("daemon-images").is_dir())
+            .expect("test state root");
+        open_image_lease(state_dir, path, true).expect("managed test image lease");
     }
 
     #[test]
@@ -2563,7 +2696,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = ensure_current_executable_cached_in_state(root.path()).unwrap();
         let digest = executable_sha256(&path).unwrap();
-        let pinned = PinnedBcodeExecutable { path, digest };
+        let image_use = open_image_lease(root.path(), &path, true).expect("image lease");
+        let pinned = PinnedBcodeExecutable {
+            path,
+            digest,
+            _image_use: Some(image_use),
+        };
         assert!(verify_pinned_bcode_executable(&pinned).is_ok());
         fs::write(pinned.path(), b"replacement").unwrap();
         assert!(verify_pinned_bcode_executable(&pinned).is_err());
