@@ -74,6 +74,10 @@ use switchy::{
 };
 use thiserror::Error;
 
+#[path = "db_compaction_inspection.rs"]
+mod compaction_inspection;
+pub(crate) use compaction_inspection::memory_compaction_inspection_page;
+
 const GLOBAL_MIGRATIONS_TABLE: &str = "__bcode_global_migrations";
 const SESSION_MIGRATIONS_TABLE: &str = "__bcode_session_migrations";
 

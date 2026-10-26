@@ -709,6 +709,7 @@ mod tests {
         assert_eq!(frames[3].observation.scroll_mode, "bottom_follow");
         assert_eq!(frames[3].observation, frames[4].observation);
         assert_eq!(app.scroll_offset(), 0);
+        drop(app);
     }
 
     #[test]

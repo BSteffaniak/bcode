@@ -198,6 +198,66 @@ impl LocalCheckpoint {
         Ok(payload)
     }
 
+    /// Emit only after `verify` succeeds or validated acceptance has been durably saved.
+    pub(super) async fn observe(
+        &self,
+        state: &ServerState,
+        session_id: SessionId,
+        resume: bcode_session_models::CompactionInspectionResume,
+        phase: bcode_session_models::CompactionInspectionPhase,
+    ) {
+        use bcode_session_models::{
+            CompactionInspectionBudgets, CompactionInspectionCount, CompactionProgressObservation,
+        };
+        let Ok(total) = u64::try_from(self.manifest.len()) else {
+            return;
+        };
+        let observation = CompactionProgressObservation {
+            version: 1,
+            phase,
+            chunks: Some(CompactionInspectionCount {
+                done: u64::try_from(self.next_chunk).unwrap_or(u64::MAX),
+                total,
+            }),
+            resume,
+            budgets: Some(CompactionInspectionBudgets {
+                provider_requests: Some(CompactionInspectionCount {
+                    done: self.requests.iter().map(|count| u64::from(*count)).sum(),
+                    total: total.saturating_mul(2),
+                }),
+                source_events: None,
+                decoded_bytes: None,
+            }),
+            blocker: None,
+        };
+        let Ok(detail) = observation.encode() else {
+            return;
+        };
+        let turn_id = compaction_trace_owner(state, session_id).await;
+        match state
+            .sessions
+            .append_trace_event(
+                session_id,
+                SessionTraceEvent {
+                    timestamp_ms: current_unix_millis(),
+                    turn_id,
+                    phase: SessionTracePhase::ModelProviderEvent,
+                    payload: SessionTracePayload::ProviderEvent {
+                        event_type: bcode_session_models::COMPACTION_PROGRESS_OBSERVATION_EVENT
+                            .into(),
+                        detail: Some(detail),
+                    },
+                },
+            )
+            .await
+        {
+            Ok(event) => publish_session_event(state, &event).await,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "compaction progress observation unavailable");
+            }
+        }
+    }
+
     pub(super) async fn save(
         &mut self,
         state: &ServerState,
@@ -223,6 +283,13 @@ impl LocalCheckpoint {
     ) -> Result<u8, CompactionError> {
         let attempt = self.reserve_slot(index)?;
         self.save(state, session_id, key).await?;
+        self.observe(
+            state,
+            session_id,
+            bcode_session_models::CompactionInspectionResume::NotReported,
+            bcode_session_models::CompactionInspectionPhase::Synthesizing,
+        )
+        .await;
         Ok(attempt)
     }
 
@@ -611,6 +678,123 @@ mod tests {
         };
         checkpoint.accept(&evidence, &BTreeSet::from([999]), &BTreeSet::new());
         assert!(checkpoint.verify(&plan, &transcript, &chunks).is_err());
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_requires_accepted_carry_not_a_reserved_request() {
+        let (_, plan, transcript, chunks) = fixture("Do not write files.");
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let session = state
+            .sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap();
+        let id = session.id;
+        drop(session);
+        let mut checkpoint = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        checkpoint
+            .reserve(&state, id, "recovery-carry", 0)
+            .await
+            .unwrap();
+        assert!(
+            !accepted_recovery_chunk(&state, id, "recovery-carry", 0)
+                .await
+                .unwrap()
+        );
+        let evidence = CompactionEvidence {
+            format: COMPACTION_SUMMARY_FORMAT.into(),
+            current_scope: vec![CompactionScope {
+                statement: "Do not write files.".into(),
+                source_sequence: 1,
+                supersedes: Vec::new(),
+            }],
+            continuation: "Verified carry".into(),
+        };
+        checkpoint.accept(&evidence, &BTreeSet::from([1]), &BTreeSet::new());
+        checkpoint.save(&state, id, "recovery-carry").await.unwrap();
+        assert!(
+            accepted_recovery_chunk(&state, id, "recovery-carry", 0)
+                .await
+                .unwrap()
+        );
+        checkpoint.verify(&plan, &transcript, &chunks).unwrap();
+        checkpoint
+            .observe(
+                &state,
+                id,
+                bcode_session_models::CompactionInspectionResume::ValidatedCheckpoint,
+                bcode_session_models::CompactionInspectionPhase::Synthesizing,
+            )
+            .await;
+        let page = state
+            .sessions
+            .session_compaction_inspection_page(
+                id,
+                bcode_session_models::SessionCompactionInspectionQuery {
+                    before: None,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_progress_observations(&page, chunks.len());
+        assert!(
+            !accepted_recovery_chunk(&state, id, "recovery-carry", 1)
+                .await
+                .unwrap()
+        );
+        drop(state);
+    }
+
+    fn assert_progress_observations(
+        page: &bcode_session_models::SessionCompactionInspectionPage,
+        chunks: usize,
+    ) {
+        let observations: Vec<_> = page
+            .entries
+            .iter()
+            .filter_map(|entry| entry.progress.as_ref())
+            .collect();
+        assert_eq!(observations.len(), 2);
+        for observation in &observations {
+            observation.validate().expect("valid emitted counts");
+        }
+        let reserved = observations[0];
+        assert_eq!(reserved.chunks.unwrap().done, 0);
+        assert_eq!(
+            reserved
+                .budgets
+                .as_ref()
+                .unwrap()
+                .provider_requests
+                .unwrap()
+                .done,
+            1
+        );
+        let progress = observations
+            .iter()
+            .rev()
+            .copied()
+            .find(|observation| {
+                observation.resume
+                    == bcode_session_models::CompactionInspectionResume::ValidatedCheckpoint
+                    && observation.phase
+                        == bcode_session_models::CompactionInspectionPhase::Synthesizing
+            })
+            .expect("latest typed validated observation");
+        assert_eq!(progress.chunks.unwrap().done, 1);
+        assert_eq!(
+            progress.chunks.unwrap().total,
+            u64::try_from(chunks).unwrap()
+        );
+        assert_eq!(
+            progress.resume,
+            bcode_session_models::CompactionInspectionResume::ValidatedCheckpoint
+        );
+        let budgets = progress.budgets.as_ref().unwrap();
+        assert_eq!(budgets.provider_requests.unwrap().done, 1);
+        assert!(budgets.source_events.is_none());
+        assert!(budgets.decoded_bytes.is_none());
     }
 
     #[tokio::test]

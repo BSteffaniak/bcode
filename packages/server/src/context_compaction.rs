@@ -15,6 +15,81 @@ mod checkpoint;
 #[path = "context_compaction_packing.rs"]
 mod packing;
 
+pub async fn resume_recovery_plan(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    plan: &compaction_recovery::Plan,
+    commands: &mut RuntimeCommandContext<'_>,
+    cancel: &TurnCancelState,
+) -> Result<(), CompactionError> {
+    let history = state
+        .sessions
+        .activated_conversation_snapshot(session_id)
+        .await?
+        .events;
+    if history.iter().any(|event| match event.kind {
+        SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        }
+        | SessionEventKind::ProviderContextCompacted {
+            compacted_through_sequence,
+            ..
+        } => compacted_through_sequence >= plan.boundary,
+        _ => false,
+    }) {
+        return Ok(());
+    }
+    let config = state.session_config(session_id).await;
+    let expected_key = format!(
+        "{}:{:?}",
+        checkpoint::operation_key(
+            &history,
+            selection,
+            config.model.tool_output.context_chars,
+            plan.planning_policy,
+        )?,
+        effective_compaction_config(&config, selection).backend
+    );
+    if expected_key != plan.key {
+        return Err(CompactionError::Provider(
+            "compaction recovery plan configuration changed".into(),
+        ));
+    }
+    Box::pin(compact_session_context_with_policy(
+        state,
+        session_id,
+        selection,
+        plan.first_kept_sequence,
+        Some(commands),
+        cancel,
+        plan.progress_requirement,
+        plan.planning_policy,
+    ))
+    .await
+    .map(|_| ())
+}
+
+pub async fn accepted_recovery_chunk(
+    state: &ServerState,
+    session_id: SessionId,
+    key: &str,
+    chunk: usize,
+) -> Result<bool, bcode_session::SessionError> {
+    if key.len() > 1024 || chunk >= COMPACTION_MAX_CHUNKS {
+        return Ok(false);
+    }
+    checkpoint::load(state, session_id, key)
+        .await
+        .map(|checkpoint| checkpoint.is_some_and(|checkpoint| checkpoint.next_chunk > chunk))
+        .map_err(|_| {
+            bcode_session::SessionError::EventSerialization(
+                "compaction recovery carry is unavailable or invalid".into(),
+            )
+        })
+}
+
 #[derive(Debug, Error)]
 pub enum CompactionError {
     #[error("compaction plan unavailable: {0}")]
@@ -54,7 +129,7 @@ pub struct CompactionCompletion {
 }
 
 /// Selects how much structurally complete history a compaction attempt may retain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CompactionPlanningPolicy {
     /// Preserve complete recent units up to the configured token target.
     Proactive { keep_recent_tokens: usize },
@@ -110,7 +185,7 @@ pub struct CompactionTranscript {
     pub estimated_reclaimable_tokens: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CompactionProgressRequirement {
     pub minimum_reclaimable_tokens: u64,
     pub previous_compacted_through_sequence: Option<u64>,
@@ -385,6 +460,18 @@ async fn compact_session_context_with_policy_inner(
             }
         },
     };
+    compaction_recovery::record_plan(
+        state,
+        session_id,
+        compaction_recovery::Plan {
+            key: checkpoint_key.clone(),
+            boundary: plan.compacted_through_sequence,
+            first_kept_sequence,
+            planning_policy,
+            progress_requirement,
+        },
+    )
+    .await?;
     let transcript = compaction_transcript_from_plan(&plan);
     let (chunks, packing_policy) =
         synthesis_chunks(state, session_id, selection, &transcript, cancel_state).await?;
@@ -396,6 +483,14 @@ async fn compact_session_context_with_policy_inner(
             ));
         }
         checkpoint.verify(&plan, &transcript, &chunks)?;
+        checkpoint
+            .observe(
+                state,
+                session_id,
+                bcode_session_models::CompactionInspectionResume::ValidatedCheckpoint,
+                bcode_session_models::CompactionInspectionPhase::Synthesizing,
+            )
+            .await;
     }
     debug_assert!(
         plan.retained_tail
@@ -559,6 +654,11 @@ async fn compact_session_context_with_policy_inner(
         publish_session_event(state, &event).await;
         state.invalidate_session_continuations(session_id).await;
         drop(marker_commit);
+        if let Some(checkpoint) = &local_checkpoint {
+            checkpoint.observe(state, session_id,
+                bcode_session_models::CompactionInspectionResume::NotReported,
+                bcode_session_models::CompactionInspectionPhase::Committed).await;
+        }
 
         Ok(CompactionCompletion {
             message: format!(
@@ -799,6 +899,7 @@ pub async fn compact_context_with_selected_backend(
             "prior native compaction outcome is unresolved; select local compaction to proceed without replaying it".into(),
         ));
     }
+    compaction_recovery::transition(state, session_id, compaction_recovery::Phase::Native).await?;
     state
         .sessions
         .append_compaction_checkpoint(
@@ -1308,12 +1409,28 @@ async fn collect_compaction_summary_resumable(
                 return Err(CompactionError::Cancelled);
             }
             let repair = if let Some((checkpoint, key)) = &mut checkpoint {
+                compaction_recovery::transition(
+                    state,
+                    session_id,
+                    compaction_recovery::Phase::Local {
+                        key: (*key).to_owned(),
+                        chunk: index,
+                    },
+                )
+                .await?;
                 let reserved = checkpoint.reserve(state, session_id, key, index).await?;
                 if cancel_state.is_cancelled() {
                     return Err(CompactionError::Cancelled);
                 }
                 usize::from(reserved)
             } else {
+                // Without validated durable carry there is no automatic replay-safe boundary.
+                compaction_recovery::transition(
+                    state,
+                    session_id,
+                    compaction_recovery::Phase::Native,
+                )
+                .await?;
                 repair
             };
             let prompt = if repair == 0 {
@@ -1367,6 +1484,16 @@ async fn collect_compaction_summary_resumable(
         if let Some((checkpoint, key)) = &mut checkpoint {
             checkpoint.accept(&evidence, &user_sequences, &unfinished_sources);
             checkpoint.save(state, session_id, key).await?;
+            checkpoint
+                .observe(
+                    state,
+                    session_id,
+                    bcode_session_models::CompactionInspectionResume::NotReported,
+                    bcode_session_models::CompactionInspectionPhase::Synthesizing,
+                )
+                .await;
+            compaction_recovery::transition(state, session_id, compaction_recovery::Phase::Safe)
+                .await?;
         }
         append_context_compaction_trace(
             state,

@@ -2,6 +2,10 @@
 use bcode_session_models::{SessionEvent, SessionEventKind};
 use sha2::{Digest, Sha256};
 
+#[path = "compaction_checkpoint_memory.rs"]
+mod memory;
+pub use memory::validate_memory_commit;
+
 /// Maximum source identities accepted by one bounded publication.
 pub const MAX_COMPACTION_COMMIT_SOURCE_EVENTS: usize = 4096;
 

@@ -69,14 +69,13 @@ async fn oldest_unresolved_acceptance_is_reported_without_skipping_or_mutation()
             .unwrap(),
         Some(first)
     );
-    assert_eq!(
-        state
-            .sessions
-            .submission(session.id, second.receipt.submission_id.clone())
-            .await
-            .unwrap(),
-        Some(second)
-    );
+    let preserved = state
+        .sessions
+        .submission(session.id, second.receipt.submission_id.clone())
+        .await
+        .unwrap();
+    drop(state);
+    assert_eq!(preserved, Some(second));
 }
 
 #[tokio::test]
@@ -154,14 +153,13 @@ async fn workflow_blocker_prohibits_prepare_and_cancel_without_mutation() {
         .await
         .is_err()
     );
-    assert_eq!(
-        state
-            .sessions
-            .submission(session.id, record.receipt.submission_id.clone())
-            .await
-            .unwrap(),
-        Some(record)
-    );
+    let preserved = state
+        .sessions
+        .submission(session.id, record.receipt.submission_id.clone())
+        .await
+        .unwrap();
+    drop(state);
+    assert_eq!(preserved, Some(record));
 }
 
 #[test]
@@ -895,14 +893,13 @@ async fn interrupted_recovery_refuses_workflow_and_unrelated_work_without_mutati
         } else {
             assert!(result.is_err());
         }
-        assert_eq!(
-            state
-                .sessions
-                .current_session_generation(session.id)
-                .await
-                .unwrap(),
-            generation
-        );
+        let observed_generation = state
+            .sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap();
+        drop(state);
+        assert_eq!(observed_generation, generation);
     }
 }
 
@@ -1054,14 +1051,13 @@ async fn interrupted_recovery_work_is_bounded_and_overflow_does_not_mutate() {
             .await
             .is_err()
     );
-    assert_eq!(
-        state
-            .sessions
-            .current_session_generation(session.id)
-            .await
-            .unwrap(),
-        generation
-    );
+    let observed_generation = state
+        .sessions
+        .current_session_generation(session.id)
+        .await
+        .unwrap();
+    drop(state);
+    assert_eq!(observed_generation, generation);
 }
 
 #[tokio::test]

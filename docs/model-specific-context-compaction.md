@@ -55,7 +55,9 @@ The actual `SessionManager` APIs are:
   `None` records retirement without erasing evidence.
 * `commit_compaction_checkpoint(session_id, CompactionCheckpointCommit)`: validates expected
   checkpoint sequence, prior marker and ordered source identities, then atomically publishes the
-  final marker and checkpoint retirement. Final publication requires persisted storage.
+  final marker and checkpoint retirement. Persistent sessions use the storage transaction;
+  in-memory sessions validate and publish both events in one serialized actor command, without an
+  intervening await. In-memory evidence does not survive process loss.
 
 The version-1 `CompactionSynthesisCheckpoint` envelope is a reserved canonical
 `TraceEvent::ProviderEvent`, independent of optional tracing. It has a bounded operation key
@@ -93,8 +95,58 @@ Cancellation is checked through provider processing and final publication under 
 gate. Invalid synthesis, unfinished sources, cancellation or insufficient net reclaim leave the
 old marker unchanged; previously durable carry can be reused by later admitted work. Atomic marker
 plus retirement prevents a half-published boundary. Normal ownership, admission and policy checks
-still govern execution: a checkpoint cannot reopen a cancelled turn, prove an ambiguous call had
-no effects, or authorize automatic daemon recovery.
+still govern execution: accepted carry alone cannot reopen a cancelled turn, prove an ambiguous call
+had no effects, or authorize automatic daemon recovery. Original-activation recovery uses a separate
+protected checkpoint.
+
+## Protected automatic compaction recovery
+
+Automatic proactive and overflow compaction can persist a version-2 provider-retry checkpoint,
+implemented in `packages/server/src/compaction_recovery.rs` and
+`packages/server/src/provider_retry_recovery.rs`. This is distinct from the version-1 local
+synthesis envelope. It binds the original activation, retry counters, round/output positions and
+selected compaction plan to a protected phase. Manual compaction does not acquire this automatic
+turn-recovery authority.
+
+Recovery verifies the original execution descriptor and session/workflow ownership; it does not
+substitute the replacement daemon's configuration. Config-recovery sources remain confined to
+verified allowed roots; private restart fixtures keep their config inside the session root rather
+than relaxing confinement. A recovery dispatch matches the activated FIFO record by session ID,
+activation sequence, submission ID and turn target. It cannot skip the oldest unresolved
+submission, activate input twice, or replay tool work. Terminal turn evidence stays terminal.
+
+A `Safe` phase can resume. A `Local` dispatch can resume only if canonical accepted-chunk evidence
+proves that exact reserved chunk was durably accepted. A reservation alone is insufficient.
+Interrupted native dispatch and local dispatch without accepted evidence terminate with an
+unresolved-outcome error and do not replay the request. Cancellation retains cancellation semantics.
+Once the old activation settles, later admitted work may reuse valid local carry; this is not proof
+that the interrupted provider call had no effects. Retained native snapshots still require normal
+provider/model/authentication/format compatibility checks.
+
+Overflow recovery can additionally retain an optional bounded diagnostic from the normalized
+provider error: code and message are control-character-filtered and capped at 128 and 1,024
+characters respectively. Failure can report the original overflow alongside the recovery failure.
+Older records without that diagnostic remain supported. These operational details are not exposed
+by the secret-safe compaction inspection page.
+
+## Bounded compaction inspection
+
+`bcode session compaction-status <session-id> [--before SEQ] [--limit N] [--json]` reads typed
+historical compaction evidence without restoring or executing a checkpoint. The default limit is
+50, with 1..=200 indexed candidates per page, not matching entries. Follow the returned continuation
+cursor unchanged, including after an empty page with `has_more`. Byte and structural exhaustion,
+unsupported evidence and failed validation are reported as degraded coverage, not guessed progress.
+
+The versioned page exposes closed phase/resume/blocker values and optional validated counters.
+Older lifecycle evidence does not imply recorded counters or resumability. It omits operation keys,
+summary/carry text, source manifests, provider diagnostics and opaque checkpoint payloads; historical
+terminal entries are not live work. This bounded observation is neither execution authority nor
+repair and does not replay history.
+
+Canonical history/range/source-page and export APIs retain exact event evidence. Semantic
+presentation uses payload-free copies of operational compaction-synthesis checkpoints instead of
+publishing private carry; redaction does not rewrite or retire canonical records. Request-only
+context remains excluded from durable checkpoint and marker content.
 
 ## Experimental adaptive packing
 
@@ -115,18 +167,23 @@ snapshot as reusable. Request-only data must not leak through either path.
 
 The offline gate is `scripts/check-compaction-eval.sh`: verifier tests, repeated explicit compaction,
 and automatic cancellation/restart/crash cases using an identified fake-provider binary and isolated
-state. The coordinator reports all cases passing on artifact prefix `af4ee8de`, plus 34 engine tests
-and 101 migration tests; this documentation lane did not rerun those commands. Restart/crash cases
-pass **after explicit targeted cancellation of the interrupted old turn**, followed by new admission.
-They prove checkpoint reuse through those lifecycle paths, not complete automatic daemon resume.
+state. Restart/crash fixtures retain a genuine original execution descriptor with private config
+inside the session root; config confinement must not be relaxed to make a fixture recoverable.
+The recorded restart/crash cases exercise original-activation unresolved-outcome settlement without
+targeted cancellation, then later admission and accepted-carry reuse. They do not demonstrate replay
+of ambiguous work or lossless semantic retention.
 
 Fake-provider fixtures establish structural coverage, attribution, cancellation, durable carry,
 request-only exclusion and actual post-marker request composition. Their canned marker language
 is not evidence of natural-language understanding. No live semantic retention evaluation has run.
 The [retention corpus and scoring protocol](../fixtures/evals/compaction/README.md#natural-language-retention-evaluation)
-predeclare that separate comparison; provider spending requires explicit approval. Adaptive quality,
-automatic daemon recovery without targeted cancellation, and semantic retention across real-model
-repeated compactions remain unproven. Structural validators do not make compaction lossless.
+predeclare that separate comparison. The executable corpus adapter currently uses independent
+accumulated-prefix diagnostic trials: the supported CLI cannot append role-faithful assistant/tool
+batches to an existing session. Enforceable provider-spending budgets and other frozen-protocol
+boundaries remain barriers; operation/wall limits do not substitute for a spending cap. Live mode
+remains blocked, not merely awaiting a flag. Adaptive packing remains default-off; real-model
+quality and semantic retention across repeated compactions remain unproven. Structural validators
+do not make compaction lossless.
 
 ## Reconstructing an already stale summary
 

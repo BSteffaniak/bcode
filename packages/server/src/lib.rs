@@ -14,6 +14,10 @@ mod auxiliary_generation;
 #[cfg(test)]
 mod child_session_ipc_tests;
 mod command_application;
+#[cfg(test)]
+mod compaction_compatibility_tests;
+mod compaction_privacy;
+mod compaction_recovery;
 mod context_accounting;
 pub(crate) mod context_compaction;
 mod context_lineage;
@@ -6628,6 +6632,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SessionCategorization { session_id }
         | Request::TurnJudgementObservation { session_id, .. }
         | Request::SessionInspection { session_id, .. }
+        | Request::SessionCompactionInspection { session_id, .. }
         | Request::PrepareSessionOpen { session_id }
         | Request::WaitSessionOpenProgress { session_id, .. }
         | Request::ReleaseSessionOwnership { session_id }
@@ -6726,6 +6731,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionHistoryAround { .. } => "session_history_around",
         Request::SessionCategorization { .. } => "session_categorization",
         Request::SessionInspection { .. } => "session_inspection",
+        Request::SessionCompactionInspection { .. } => "session_compaction_inspection",
         Request::SessionSearch { .. } => "session_search",
         Request::SessionSearchProviders => "session_search_providers",
         Request::SessionSearchExplain { .. } => "session_search_explain",
@@ -6965,10 +6971,7 @@ async fn dispatch_routed_request(
 ) -> Result<(), ServerError> {
     match request {
         RoutedRequest::SessionLifecycle(request) => {
-            Box::pin(handle_request_inner(
-                *request, request_id, client_id, state, writer,
-            ))
-            .await
+            handle_request_inner(*request, request_id, client_id, state, writer).await
         }
         RoutedRequest::SessionSearchAttach(request) => {
             Box::pin(handle_session_search_attach_request(
@@ -7076,21 +7079,19 @@ fn session_observation_error_response(
     ErrorResponse::new(code, error.to_string())
 }
 
+// Construct only the selected lifecycle future here. Boxing application calls
+// inside one async dispatcher still reserves a poll frame for every arm's result
+// conversion and send temporaries.
 #[allow(clippy::too_many_lines)]
-async fn handle_request_inner(
+fn handle_request_inner<'a>(
     request: SessionLifecycleRequest,
     request_id: u64,
     client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    // Keep the outer reply allocation charged through serialization, writer-lock
-    // waiting, and the actual send. Cancellation drops the send future before
-    // this reservation; this path does not enqueue or clone the boxed response.
-    let mut reply_box_reservation = None;
-    let mut reply_payload_reservation = None;
-    let send_result = match request {
-        SessionLifecycleRequest::OpenSessionObservation { request } => {
+    state: &'a Arc<ServerState>,
+    writer: &'a SharedWriter,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerError>> + Send + 'a>> {
+    match request {
+        SessionLifecycleRequest::OpenSessionObservation { request } => Box::pin(async move {
             let result = async {
                 use bcode_session_models::SessionObservationError as E;
                 if state.shutdown_requested.load(Ordering::SeqCst) {
@@ -7120,8 +7121,12 @@ async fn handle_request_inner(
                 |handle| Response::Ok(ResponsePayload::SessionObservationOpened { handle }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::PullSessionObservation { request } => {
+        }),
+        SessionLifecycleRequest::PullSessionObservation { request } => Box::pin(async move {
+            // Keep both charges alive through serialization, writer-lock waiting,
+            // and send completion. Cancellation drops the send before its charges.
+            let mut reply_box_reservation = None;
+            let mut reply_payload_reservation = None;
             let result = async {
                 let reservation = state.session_observations.reserve_reply_box()?;
                 let (result, payload_reservation) = state
@@ -7138,17 +7143,20 @@ async fn handle_request_inner(
                 |error| Response::Err(session_observation_error_response(error)),
                 |result| Response::Ok(ResponsePayload::SessionObservationPulled { result }),
             );
-            send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::CloseSessionObservation { handle } => {
+            let send_result = send_response(writer, request_id, response).await;
+            drop(reply_payload_reservation);
+            drop(reply_box_reservation);
+            send_result
+        }),
+        SessionLifecycleRequest::CloseSessionObservation { handle } => Box::pin(async move {
             let result = state.session_observations.close(client_id, &handle);
             let response = result.map_or_else(
                 |error| Response::Err(session_observation_error_response(error)),
                 |closed| Response::Ok(ResponsePayload::SessionObservationClosed { closed }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SpawnSession { request } => {
+        }),
+        SessionLifecycleRequest::SpawnSession { request } => Box::pin(async move {
             use bcode_session_models::SessionApplication as _;
             let result =
                 Box::pin(SessionApplicationHandle::new(state, client_id).spawn_session(request))
@@ -7159,7 +7167,7 @@ async fn handle_request_inner(
                 Response::Ok(ResponsePayload::SessionSpawned { result }),
             )
             .await
-        }
+        }),
         SessionLifecycleRequest::Hello {
             client_name,
             runtime_context,
@@ -7167,7 +7175,7 @@ async fn handle_request_inner(
             artifact_id,
             build_fingerprint,
             state_location_id,
-        } => {
+        } => Box::pin(async move {
             Box::pin(handle_hello(
                 request_id,
                 client_id,
@@ -7183,25 +7191,29 @@ async fn handle_request_inner(
                 },
             ))
             .await
-        }
+        }),
         SessionLifecycleRequest::UpdateClientRuntimeContext { runtime_context } => {
-            Box::pin(handle_update_client_runtime_context(
-                request_id,
-                client_id,
-                state,
-                writer,
-                runtime_context,
-            ))
-            .await
+            Box::pin(async move {
+                Box::pin(handle_update_client_runtime_context(
+                    request_id,
+                    client_id,
+                    state,
+                    writer,
+                    runtime_context,
+                ))
+                .await
+            })
         }
-        SessionLifecycleRequest::Ping => Box::pin(handle_ping(request_id, writer)).await,
-        SessionLifecycleRequest::IngestClientMetrics { batch } => {
+        SessionLifecycleRequest::Ping => {
+            Box::pin(async move { Box::pin(handle_ping(request_id, writer)).await })
+        }
+        SessionLifecycleRequest::IngestClientMetrics { batch } => Box::pin(async move {
             Box::pin(handle_ingest_client_metrics(
                 request_id, state, writer, batch,
             ))
             .await
-        }
-        SessionLifecycleRequest::ServerStatus { working_directory } => {
+        }),
+        SessionLifecycleRequest::ServerStatus { working_directory } => Box::pin(async move {
             Box::pin(handle_server_status(
                 request_id,
                 state,
@@ -7209,8 +7221,8 @@ async fn handle_request_inner(
                 working_directory.as_deref(),
             ))
             .await
-        }
-        SessionLifecycleRequest::RuntimeStatus => {
+        }),
+        SessionLifecycleRequest::RuntimeStatus => Box::pin(async move {
             let result =
                 Box::pin(ServicesApplicationHandle::new(state, client_id).runtime_status()).await;
             let response = result.map_or_else(
@@ -7226,8 +7238,8 @@ async fn handle_request_inner(
                 },
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::ModelCatalogSnapshot => {
+        }),
+        SessionLifecycleRequest::ModelCatalogSnapshot => Box::pin(async move {
             let result =
                 Box::pin(ServicesApplicationHandle::new(state, client_id).model_catalog_snapshot())
                     .await;
@@ -7240,8 +7252,8 @@ async fn handle_request_inner(
                 },
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::RefreshModelCatalog => {
+        }),
+        SessionLifecycleRequest::RefreshModelCatalog => Box::pin(async move {
             let result =
                 Box::pin(ServicesApplicationHandle::new(state, client_id).refresh_model_catalog())
                     .await;
@@ -7252,8 +7264,8 @@ async fn handle_request_inner(
                 },
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::ModelCatalogDiagnostics => {
+        }),
+        SessionLifecycleRequest::ModelCatalogDiagnostics => Box::pin(async move {
             let result = Box::pin(
                 ServicesApplicationHandle::new(state, client_id).model_catalog_diagnostics(),
             )
@@ -7265,14 +7277,16 @@ async fn handle_request_inner(
                 },
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::ServerStop { mode } => {
-            handle_server_stop(request_id, client_id, state, writer, mode).await
+            Box::pin(
+                async move { handle_server_stop(request_id, client_id, state, writer, mode).await },
+            )
         }
-        SessionLifecycleRequest::ReleaseSessionOwnership { session_id } => {
+        SessionLifecycleRequest::ReleaseSessionOwnership { session_id } => Box::pin(async move {
             handle_release_session_ownership(request_id, state, writer, session_id).await
-        }
-        SessionLifecycleRequest::SetComposerDraft { scope, text } => {
+        }),
+        SessionLifecycleRequest::SetComposerDraft { scope, text } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).set_composer_draft(scope, text),
             )
@@ -7282,8 +7296,8 @@ async fn handle_request_inner(
                 |()| Response::Ok(ResponsePayload::ComposerDraftSet),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::ComposerDraft { scope } => {
+        }),
+        SessionLifecycleRequest::ComposerDraft { scope } => Box::pin(async move {
             let result =
                 Box::pin(SessionApplicationHandle::new(state, client_id).composer_draft(scope))
                     .await;
@@ -7292,11 +7306,11 @@ async fn handle_request_inner(
                 |draft| Response::Ok(ResponsePayload::ComposerDraft { draft }),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::CreateSession {
             name,
             working_directory,
-        } => {
+        } => Box::pin(async move {
             use bcode_session_models::SessionApplication as _;
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).create_session(
@@ -7312,8 +7326,8 @@ async fn handle_request_inner(
                 |session| Response::Ok(ResponsePayload::SessionCreated { session }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::CreateChildSession { request } => {
+        }),
+        SessionLifecycleRequest::CreateChildSession { request } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).create_child_session(request),
             )
@@ -7323,8 +7337,8 @@ async fn handle_request_inner(
                 |session| Response::Ok(ResponsePayload::SessionCreated { session }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionSummary { session_id } => {
+        }),
+        SessionLifecycleRequest::SessionSummary { session_id } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).session_summary(session_id),
             )
@@ -7334,8 +7348,8 @@ async fn handle_request_inner(
                 |session| Response::Ok(ResponsePayload::SessionSummary { session }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::WorkflowActivityPage { request } => {
+        }),
+        SessionLifecycleRequest::WorkflowActivityPage { request } => Box::pin(async move {
             let response = Box::pin(workflow_representation::workflow_activity::page(
                 state,
                 &state.workflow_activity_scans,
@@ -7358,8 +7372,8 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::WorkflowActivityPage { page }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::WorkflowActivityClose { scan_id } => {
+        }),
+        SessionLifecycleRequest::WorkflowActivityClose { scan_id } => Box::pin(async move {
             let response = match Box::pin(state.workflow_activity_scans.close(&scan_id)).await {
                 Ok(()) => Response::Ok(ResponsePayload::WorkflowActivityClosed),
                 Err(_) => Response::Err(ErrorResponse::new(
@@ -7368,14 +7382,14 @@ async fn handle_request_inner(
                 )),
             };
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionProgressSnapshot { session_id } => {
+        }),
+        SessionLifecycleRequest::SessionProgressSnapshot { session_id } => Box::pin(async move {
             Box::pin(handle_session_progress(
                 request_id, client_id, state, writer, session_id,
             ))
             .await
-        }
-        SessionLifecycleRequest::SessionActivity { session_id, query } => {
+        }),
+        SessionLifecycleRequest::SessionActivity { session_id, query } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).session_activity(session_id, query),
             )
@@ -7385,14 +7399,16 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::SessionActivity { page }),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::ReconcileSessionChildren { parent_id, apply } => {
-            Box::pin(handle_reconcile_session_children(
-                request_id, state, writer, parent_id, apply,
-            ))
-            .await
+            Box::pin(async move {
+                Box::pin(handle_reconcile_session_children(
+                    request_id, state, writer, parent_id, apply,
+                ))
+                .await
+            })
         }
-        SessionLifecycleRequest::SessionChildren { query } => {
+        SessionLifecycleRequest::SessionChildren { query } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).query_child_sessions(query),
             )
@@ -7402,19 +7418,19 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::SessionChildren { page }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::ListSessionsWithScope { scope } => {
+        }),
+        SessionLifecycleRequest::ListSessionsWithScope { scope } => Box::pin(async move {
             Box::pin(handle_scoped_session_list(
                 request_id, client_id, state, writer, scope,
             ))
             .await
-        }
+        }),
         SessionLifecycleRequest::ListSessionsPageWithScope {
             scope,
             query,
             cursor,
             limit,
-        } => {
+        } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .session_catalog_page(scope, query, cursor, limit),
@@ -7425,33 +7441,37 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::SessionCatalogPage { page }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::ListSessions { working_directory } => {
+        }),
+        SessionLifecycleRequest::ListSessions { working_directory } => Box::pin(async move {
             handle_list_sessions(request_id, client_id, state, writer, &working_directory).await
-        }
+        }),
         SessionLifecycleRequest::SessionCompatibilityInventory { request } => {
-            handle_session_compatibility_inventory(request_id, state, writer, request).await
+            Box::pin(async move {
+                handle_session_compatibility_inventory(request_id, state, writer, request).await
+            })
         }
-        SessionLifecycleRequest::SessionBulkMigrationStart { request } => {
+        SessionLifecycleRequest::SessionBulkMigrationStart { request } => Box::pin(async move {
             session_bulk_migration::handle_session_bulk_migration_start(
                 request_id, state, writer, request,
             )
             .await
-        }
+        }),
         SessionLifecycleRequest::SessionBulkMigrationStatus { operation_id } => {
-            session_bulk_migration::handle_session_bulk_migration_status(
-                request_id,
-                state,
-                writer,
-                &operation_id,
-            )
-            .await
+            Box::pin(async move {
+                session_bulk_migration::handle_session_bulk_migration_status(
+                    request_id,
+                    state,
+                    writer,
+                    &operation_id,
+                )
+                .await
+            })
         }
         SessionLifecycleRequest::SessionBulkMigrationWait {
             operation_id,
             after_revision,
             timeout_ms,
-        } => {
+        } => Box::pin(async move {
             session_bulk_migration::handle_session_bulk_migration_wait(
                 request_id,
                 state,
@@ -7461,23 +7481,25 @@ async fn handle_request_inner(
                 timeout_ms,
             )
             .await
-        }
+        }),
         SessionLifecycleRequest::SessionBulkMigrationCancel { operation_id } => {
-            session_bulk_migration::handle_session_bulk_migration_cancel(
-                request_id,
-                state,
-                writer,
-                &operation_id,
-            )
-            .await
+            Box::pin(async move {
+                session_bulk_migration::handle_session_bulk_migration_cancel(
+                    request_id,
+                    state,
+                    writer,
+                    &operation_id,
+                )
+                .await
+            })
         }
-        SessionLifecycleRequest::SubscribeCatalogUpdates => {
+        SessionLifecycleRequest::SubscribeCatalogUpdates => Box::pin(async move {
             handle_subscribe_catalog_updates(request_id, client_id, state, writer).await
-        }
+        }),
         SessionLifecycleRequest::ChangeSessionWorkingDirectory {
             session_id,
             working_directory,
-        } => {
+        } => Box::pin(async move {
             use bcode_session_models::SessionApplication as _;
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
@@ -7498,8 +7520,8 @@ async fn handle_request_inner(
                 ),
             )
             .await
-        }
-        SessionLifecycleRequest::ListWorktrees(request) => {
+        }),
+        SessionLifecycleRequest::ListWorktrees(request) => Box::pin(async move {
             let Some(cwd) = request.cwd else {
                 return send_response(
                     writer,
@@ -7519,11 +7541,11 @@ async fn handle_request_inner(
                 |response| Response::Ok(ResponsePayload::WorktreeList(response)),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::WorktreeCreateStart {
             operation_id,
             request,
-        } => {
+        } => Box::pin(async move {
             let result = Box::pin(
                 ServicesApplicationHandle::new(state, client_id)
                     .start_worktree_creation(operation_id, request),
@@ -7534,8 +7556,8 @@ async fn handle_request_inner(
                 |status| Response::Ok(ResponsePayload::WorktreeCreateOperation { status }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::WorktreeCreateStatus { operation_id } => {
+        }),
+        SessionLifecycleRequest::WorktreeCreateStatus { operation_id } => Box::pin(async move {
             let result = Box::pin(
                 ServicesApplicationHandle::new(state, client_id)
                     .worktree_creation_status(operation_id),
@@ -7546,12 +7568,12 @@ async fn handle_request_inner(
                 |status| Response::Ok(ResponsePayload::WorktreeCreateOperation { status }),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::WorktreeCreateWait {
             operation_id,
             after_revision,
             timeout_ms,
-        } => {
+        } => Box::pin(async move {
             let result = Box::pin(
                 ServicesApplicationHandle::new(state, client_id).wait_worktree_creation(
                     operation_id,
@@ -7565,8 +7587,8 @@ async fn handle_request_inner(
                 |status| Response::Ok(ResponsePayload::WorktreeCreateOperation { status }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::RemoveWorktree(request) => {
+        }),
+        SessionLifecycleRequest::RemoveWorktree(request) => Box::pin(async move {
             let Some(cwd) = request.cwd else {
                 return send_response(
                     writer,
@@ -7591,38 +7613,42 @@ async fn handle_request_inner(
                 |response| Response::Ok(ResponsePayload::WorktreeRemoved(response)),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::RalphStatus(request) => {
-            handle_ralph_status(request_id, state, writer, request).await
+            Box::pin(async move { handle_ralph_status(request_id, state, writer, request).await })
         }
-        SessionLifecycleRequest::RunRalphLoop(request) => {
+        SessionLifecycleRequest::RunRalphLoop(request) => Box::pin(async move {
             handle_run_ralph_loop(request_id, client_id, state, writer, request).await
-        }
-        SessionLifecycleRequest::ApproveRalphRun(request) => {
+        }),
+        SessionLifecycleRequest::ApproveRalphRun(request) => Box::pin(async move {
             handle_approve_ralph_run(request_id, client_id, state, writer, request).await
-        }
-        SessionLifecycleRequest::CancelRalphLoop(request) => {
+        }),
+        SessionLifecycleRequest::CancelRalphLoop(request) => Box::pin(async move {
             Box::pin(handle_cancel_ralph_loop(request_id, state, writer, request)).await
-        }
-        SessionLifecycleRequest::ListRalphRuns(request) => {
+        }),
+        SessionLifecycleRequest::ListRalphRuns(request) => Box::pin(async move {
             Box::pin(handle_list_ralph_runs(request_id, state, writer, *request)).await
-        }
-        SessionLifecycleRequest::ListRalphIterations(request) => {
+        }),
+        SessionLifecycleRequest::ListRalphIterations(request) => Box::pin(async move {
             Box::pin(handle_list_ralph_iterations(
                 request_id, state, writer, *request,
             ))
             .await
-        }
+        }),
         SessionLifecycleRequest::ResumeRalphRun(request) => {
-            handle_resume_ralph_run(request_id, state, writer, request).await
+            Box::pin(
+                async move { handle_resume_ralph_run(request_id, state, writer, request).await },
+            )
         }
         SessionLifecycleRequest::RalphRunStatus(request) => {
-            handle_ralph_run_status(request_id, state, writer, request).await
+            Box::pin(
+                async move { handle_ralph_run_status(request_id, state, writer, request).await },
+            )
         }
-        SessionLifecycleRequest::RecordRalphLifecycle(request) => {
+        SessionLifecycleRequest::RecordRalphLifecycle(request) => Box::pin(async move {
             handle_record_ralph_lifecycle(request_id, state, writer, request).await
-        }
-        SessionLifecycleRequest::RenameSession { session_id, name } => {
+        }),
+        SessionLifecycleRequest::RenameSession { session_id, name } => Box::pin(async move {
             use bcode_session_models::SessionApplication as _;
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).rename_session(session_id, name),
@@ -7637,8 +7663,8 @@ async fn handle_request_inner(
                 ),
             )
             .await
-        }
-        SessionLifecycleRequest::DeleteSession { session_id } => {
+        }),
+        SessionLifecycleRequest::DeleteSession { session_id } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).delete_session(session_id),
             )
@@ -7648,8 +7674,8 @@ async fn handle_request_inner(
                 |session| Response::Ok(ResponsePayload::SessionDeleted { session }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::PrepareContextGeneration(request) => {
+        }),
+        SessionLifecycleRequest::PrepareContextGeneration(request) => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).prepare_context_generation(request),
             )
@@ -7659,8 +7685,8 @@ async fn handle_request_inner(
                 |prepared| Response::Ok(ResponsePayload::PreparedContextGeneration { prepared }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionWorkingDocument(request) => {
+        }),
+        SessionLifecycleRequest::SessionWorkingDocument(request) => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).session_working_document(request),
             )
@@ -7670,8 +7696,8 @@ async fn handle_request_inner(
                 |document| Response::Ok(ResponsePayload::SessionWorkingDocument { document }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::ReadSessionTraceBlob(request) => {
+        }),
+        SessionLifecycleRequest::ReadSessionTraceBlob(request) => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).session_trace_blob_range(request),
             )
@@ -7681,14 +7707,14 @@ async fn handle_request_inner(
                 |range| Response::Ok(ResponsePayload::SessionTraceBlobRange { range }),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::ReadSessionArtifact {
             session_id,
             artifact_id,
             reference_key,
             offset,
             length,
-        } => {
+        } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).session_artifact_range(
                     session_id,
@@ -7704,11 +7730,11 @@ async fn handle_request_inner(
                 |range| Response::Ok(ResponsePayload::SessionArtifactRange { range }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::InvocationInput { session_id, input } => {
+        }),
+        SessionLifecycleRequest::InvocationInput { session_id, input } => Box::pin(async move {
             handle_invocation_input(request_id, client_id, state, writer, session_id, input).await
-        }
-        SessionLifecycleRequest::SessionMilestones { session_id, query } => {
+        }),
+        SessionLifecycleRequest::SessionMilestones { session_id, query } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .session_milestones(session_id, query),
@@ -7719,8 +7745,8 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::SessionMilestones { page }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::GenerateSessionMilestone { session_id } => {
+        }),
+        SessionLifecycleRequest::GenerateSessionMilestone { session_id } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .generate_session_milestone(session_id),
@@ -7731,8 +7757,8 @@ async fn handle_request_inner(
                 |result| Response::Ok(ResponsePayload::SessionMilestoneGenerated { result }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionDerivationSnapshot { session_id } => {
+        }),
+        SessionLifecycleRequest::SessionDerivationSnapshot { session_id } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .session_derivation_snapshot(session_id),
@@ -7743,20 +7769,22 @@ async fn handle_request_inner(
                 |snapshot| Response::Ok(ResponsePayload::SessionDerivationSnapshot { snapshot }),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::SessionDerivationPrompts { session_id, query } => {
-            let result = Box::pin(
-                SessionApplicationHandle::new(state, client_id)
-                    .session_derivation_prompts(session_id, query),
-            )
-            .await;
-            let response = result.map_or_else(
-                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
-                |page| Response::Ok(ResponsePayload::SessionDerivationPrompts { page }),
-            );
-            send_response(writer, request_id, response).await
+            Box::pin(async move {
+                let result = Box::pin(
+                    SessionApplicationHandle::new(state, client_id)
+                        .session_derivation_prompts(session_id, query),
+                )
+                .await;
+                let response = result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |page| Response::Ok(ResponsePayload::SessionDerivationPrompts { page }),
+                );
+                send_response(writer, request_id, response).await
+            })
         }
-        SessionLifecycleRequest::DeriveSession { request } => {
+        SessionLifecycleRequest::DeriveSession { request } => Box::pin(async move {
             let result =
                 Box::pin(SessionApplicationHandle::new(state, client_id).derive_session(*request))
                     .await;
@@ -7765,8 +7793,8 @@ async fn handle_request_inner(
                 |outcome| Response::Ok(ResponsePayload::SessionDerived { outcome }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionDerivationStatus { operation_id } => {
+        }),
+        SessionLifecycleRequest::SessionDerivationStatus { operation_id } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .session_derivation_status(operation_id),
@@ -7777,8 +7805,8 @@ async fn handle_request_inner(
                 |snapshot| Response::Ok(ResponsePayload::SessionDerivationStatus { snapshot }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::CancelSessionDerivation { operation_id } => {
+        }),
+        SessionLifecycleRequest::CancelSessionDerivation { operation_id } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .cancel_session_derivation(operation_id),
@@ -7793,8 +7821,8 @@ async fn handle_request_inner(
                 },
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionHistory { session_id } => {
+        }),
+        SessionLifecycleRequest::SessionHistory { session_id } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).export_session_history(session_id),
             )
@@ -7809,12 +7837,12 @@ async fn handle_request_inner(
                 },
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::RepriceSession {
             session_id,
             range,
             catalog,
-        } => {
+        } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .reprice_session(session_id, range, *catalog),
@@ -7829,8 +7857,8 @@ async fn handle_request_inner(
                 },
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::UsageCatalog { after } => {
+        }),
+        SessionLifecycleRequest::UsageCatalog { after } => Box::pin(async move {
             let result =
                 Box::pin(SessionApplicationHandle::new(state, client_id).usage_catalog_page(after))
                     .await;
@@ -7839,8 +7867,8 @@ async fn handle_request_inner(
                 |session_ids| Response::Ok(ResponsePayload::UsageCatalog { session_ids }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::UsageReport { query } => {
+        }),
+        SessionLifecycleRequest::UsageReport { query } => Box::pin(async move {
             use bcode_usage_models::application::UsageApplication as _;
             let result =
                 Box::pin(ServicesApplicationHandle::new(state, client_id).usage_report(query))
@@ -7855,8 +7883,8 @@ async fn handle_request_inner(
                 |report| Response::Ok(ResponsePayload::UsageReport { report }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionUsage { session_id, query } => {
+        }),
+        SessionLifecycleRequest::SessionUsage { session_id, query } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).session_usage(session_id, query),
             )
@@ -7866,8 +7894,8 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::SessionUsage { page }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::UsageCollect { session_id, query } => {
+        }),
+        SessionLifecycleRequest::UsageCollect { session_id, query } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).collect_usage(session_id, query),
             )
@@ -7877,8 +7905,8 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::UsageCollected { page }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionAdmission { session_id, apply } => {
+        }),
+        SessionLifecycleRequest::SessionAdmission { session_id, apply } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .session_admission(session_id, apply),
@@ -7889,8 +7917,8 @@ async fn handle_request_inner(
                 |report| Response::Ok(ResponsePayload::SessionAdmission { report }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionCompress { request } => {
+        }),
+        SessionLifecycleRequest::SessionCompress { request } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).compress_session_page(request),
             )
@@ -7900,11 +7928,11 @@ async fn handle_request_inner(
                 |result| Response::Ok(ResponsePayload::SessionCompressed { result }),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::SessionStorageUsage {
             session_id,
             entry_budget,
-        } => {
+        } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .session_storage_usage(session_id, entry_budget),
@@ -7915,8 +7943,8 @@ async fn handle_request_inner(
                 |usage| Response::Ok(ResponsePayload::SessionStorageUsage { usage }),
             );
             send_response(writer, request_id, response).await
-        }
-        SessionLifecycleRequest::SessionHistoryPage { session_id, query } => {
+        }),
+        SessionLifecycleRequest::SessionHistoryPage { session_id, query } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .session_history_page(session_id, query),
@@ -7927,11 +7955,11 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::SessionHistoryPage { page }),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::SessionProjectionHistoryPage {
             session_id,
             request,
-        } => {
+        } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id)
                     .session_projection_history_page(session_id, *request),
@@ -7942,20 +7970,22 @@ async fn handle_request_inner(
                 |page| Response::Ok(ResponsePayload::SessionProjectionHistoryPage { page }),
             );
             send_response(writer, request_id, response).await
-        }
+        }),
         SessionLifecycleRequest::SessionHistoryAround { session_id, query } => {
-            let result = Box::pin(
-                SessionApplicationHandle::new(state, client_id)
-                    .session_history_around(session_id, query),
-            )
-            .await;
-            let response = result.map_or_else(
-                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
-                |window| Response::Ok(ResponsePayload::SessionHistoryAround { window }),
-            );
-            send_response(writer, request_id, response).await
+            Box::pin(async move {
+                let result = Box::pin(
+                    SessionApplicationHandle::new(state, client_id)
+                        .session_history_around(session_id, query),
+                )
+                .await;
+                let response = result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |window| Response::Ok(ResponsePayload::SessionHistoryAround { window }),
+                );
+                send_response(writer, request_id, response).await
+            })
         }
-        SessionLifecycleRequest::SessionCategorization { session_id } => {
+        SessionLifecycleRequest::SessionCategorization { session_id } => Box::pin(async move {
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).session_categorization(session_id),
             )
@@ -7967,8 +7997,27 @@ async fn handle_request_inner(
                 },
             );
             send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::SessionCompactionInspection { session_id, query } => {
+            Box::pin(async move {
+                use bcode_session_models::SessionApplication as _;
+                let result = Box::pin(
+                    SessionApplicationHandle::new(state, client_id)
+                        .inspect_compaction(session_id, query),
+                )
+                .await;
+                send_response(
+                    writer,
+                    request_id,
+                    result.map_or_else(
+                        |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                        |page| Response::Ok(ResponsePayload::SessionCompactionInspection { page }),
+                    ),
+                )
+                .await
+            })
         }
-        SessionLifecycleRequest::SessionInspection { session_id, query } => {
+        SessionLifecycleRequest::SessionInspection { session_id, query } => Box::pin(async move {
             use bcode_session_models::SessionApplication as _;
             let result = Box::pin(
                 SessionApplicationHandle::new(state, client_id).inspect_session(session_id, query),
@@ -7983,12 +8032,8 @@ async fn handle_request_inner(
                 ),
             )
             .await
-        }
-    };
-    // The send future has consumed/dropped its response on success or error.
-    drop(reply_payload_reservation);
-    drop(reply_box_reservation);
-    send_result
+        }),
+    }
 }
 
 /// Dispatch session search, open/attach, import, and catalog-refresh requests.
@@ -15808,16 +15853,16 @@ fn submission_execution_descriptor_with_recipe(
     let reference = match bcode_config::recovery::capture(config, launch) {
         Ok(reference) => reference,
         Err(error) => {
-            tracing::debug!(reason = %error, "queued submission requires explicit recovery context after restart");
+            tracing::warn!(reason = %error, "submission recovery configuration provenance unavailable; no substitute configuration captured");
             return None;
         }
     };
     if let Err(reason) =
         bcode_provider_auth::recovery::capture_policy(config, &selection.provider_context)
     {
-        tracing::debug!(
+        tracing::warn!(
             reason,
-            "queued submission has request-only provider policy; explicit recovery required after restart"
+            "submission recovery provider provenance unavailable; request-only policy was not captured"
         );
         return None;
     }
@@ -15843,6 +15888,27 @@ fn submission_execution_descriptor_with_recipe(
     })
 }
 
+fn submission_admission_config(
+    state: &ServerState,
+    runtime_context: Option<&ClientRuntimeContext>,
+) -> Result<bcode_config::BcodeConfig, bcode_session::SessionError> {
+    match runtime_context.and_then(|context| context.effective_config_toml.as_deref()) {
+        Some(contents) => bcode_config::decode_effective_config(contents).map_err(|_| {
+            bcode_session::SessionError::EventSerialization(
+                "submission effective configuration is invalid; daemon defaults were not substituted"
+                    .into(),
+            )
+        }),
+        None if runtime_context.is_some_and(|context| context.config_launch.is_some()) => {
+            Err(bcode_session::SessionError::EventSerialization(
+                "submission configuration provenance has no effective configuration; daemon defaults were not substituted"
+                    .into(),
+            ))
+        }
+        None => Ok(state.startup_config.clone()),
+    }
+}
+
 async fn capture_submission_execution_descriptor(
     state: &ServerState,
     session_id: SessionId,
@@ -15855,7 +15921,7 @@ async fn capture_submission_execution_descriptor(
     let config = config.clone();
     let execution = execution.clone();
     let launch = launch.cloned();
-    let descriptor = tokio::task::spawn_blocking(move || {
+    let descriptor = match tokio::task::spawn_blocking(move || {
         submission_execution_descriptor_with_recipe(
             &selection,
             &config,
@@ -15864,15 +15930,32 @@ async fn capture_submission_execution_descriptor(
         )
     })
     .await
-    .ok()
-    .flatten()?;
+    {
+        Ok(Some(descriptor)) => descriptor,
+        Ok(None) => return None,
+        Err(_) => {
+            tracing::warn!("submission recovery provenance capture did not complete");
+            return None;
+        }
+    };
     // Capture rejects session/provider overrides that the named source cannot reproduce.
-    let context = resolve_submission_context(state, session_id, &descriptor)
-        .await
-        .ok()?;
-    verify_submission_model_target(state, &descriptor, &context)
-        .await
-        .ok()?;
+    let context = match resolve_submission_context(state, session_id, &descriptor).await {
+        Ok(context) => context,
+        Err(issue) => {
+            tracing::warn!(
+                ?issue,
+                "submission recovery provenance cannot be replayed in the selected session"
+            );
+            return None;
+        }
+    };
+    if let Err(issue) = verify_submission_model_target(state, &descriptor, &context).await {
+        tracing::warn!(
+            ?issue,
+            "submission recovery provider/model provenance cannot be verified"
+        );
+        return None;
+    }
     Some(descriptor)
 }
 
@@ -16041,11 +16124,7 @@ async fn enqueue_prompt_submission_inner(
         session_model_selection_with_runtime_context(state, session_id, runtime_context.clone())
             .await;
     apply_turn_model_selection(&mut requested_selection, &admission.execution);
-    let config = runtime_context
-        .as_ref()
-        .and_then(|context| context.effective_config_toml.as_deref())
-        .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
-        .unwrap_or_else(|| state.startup_config.clone());
+    let config = submission_admission_config(state, runtime_context.as_ref())?;
     let execution_descriptor = capture_submission_execution_descriptor(
         state,
         session_id,
@@ -16255,11 +16334,7 @@ async fn admit_turn_inner(
     )
     .await;
     apply_turn_model_selection(&mut selection, &admission.execution);
-    let config = runtime_context
-        .as_ref()
-        .and_then(|context| context.effective_config_toml.as_deref())
-        .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
-        .unwrap_or_else(|| state.startup_config.clone());
+    let config = submission_admission_config(state, runtime_context.as_ref())?;
     let descriptor = capture_submission_execution_descriptor(
         state,
         session_id,
@@ -16607,6 +16682,40 @@ fn command_submission_id(command: &FollowupCommand) -> Option<&bcode_session_mod
     }
 }
 
+fn matches_recovered_submission(
+    command: &FollowupCommand,
+    session_id: SessionId,
+    record: &bcode_session_models::SubmissionRecord,
+) -> bool {
+    let FollowupCommand::ExecuteTurn {
+        user_event,
+        recovering: true,
+        ..
+    } = command
+    else {
+        return false;
+    };
+    let SessionEventKind::SubmissionActivated {
+        submission_id,
+        turn_id,
+        ..
+    } = &user_event.kind
+    else {
+        return false;
+    };
+    matches!(
+        &record.status,
+        bcode_session_models::SubmissionStatus::Activated {
+            turn_id: activated_turn,
+            conversation_sequence,
+        } if user_event.session_id == session_id
+            && user_event.sequence == *conversation_sequence
+            && submission_id == &record.receipt.submission_id
+            && turn_id == activated_turn
+            && turn_id == record.submission.target.turn_id()
+    )
+}
+
 async fn prune_settled_dispatch_hints(
     state: &ServerState,
     session_id: SessionId,
@@ -16622,6 +16731,32 @@ async fn prune_settled_dispatch_hints(
                     bcode_session_models::SubmissionStatus::Pending
                 )
             }) {
+                hints.remove(index);
+                continue;
+            }
+        }
+        if let FollowupCommand::ExecuteTurn { user_event, .. } = &hints[index]
+            && let SessionEventKind::SubmissionActivated {
+                submission_id,
+                turn_id,
+                ..
+            } = &user_event.kind
+        {
+            let record = state
+                .sessions
+                .submission(session_id, submission_id.clone())
+                .await?;
+            let terminal = state
+                .sessions
+                .session_turn_evidence(session_id, &turn_id.0)
+                .await?
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }));
+            if terminal
+                || record.as_ref().is_none_or(|record| {
+                    !matches_recovered_submission(&hints[index], session_id, record)
+                })
+            {
                 hints.remove(index);
                 continue;
             }
@@ -16946,13 +17081,18 @@ async fn next_pending_submission_command(
     // Activated input with no terminal evidence is an unresolved execution obligation.
     // Do not run later FIFO input around it or interpret activation as permission to replay tools.
     let queue = state.sessions.submission_queue_status(session_id).await?;
-    if queue.oldest.as_ref().is_some_and(|record| {
-        matches!(
+    if let Some(record) = queue.oldest.as_ref()
+        && matches!(
             record.status,
             bcode_session_models::SubmissionStatus::Activated { .. }
         )
-    }) {
-        return Ok(None);
+    {
+        // Recovery continues this exact obligation; it does not admit another
+        // turn around the FIFO head or authorize replay of fresh activation hints.
+        return Ok(hints
+            .iter()
+            .position(|command| matches_recovered_submission(command, session_id, record))
+            .map(|index| hints.remove(index)));
     }
     let records = state
         .sessions
@@ -16962,7 +17102,11 @@ async fn next_pending_submission_command(
         *after = None;
         return Ok(hints
             .iter()
-            .position(|command| command_submission_id(command).is_none())
+            .position(|command| {
+                command_submission_id(command).is_none()
+                    && !matches!(command, FollowupCommand::ExecuteTurn { user_event, .. }
+                        if matches!(user_event.kind, SessionEventKind::SubmissionActivated { .. }))
+            })
             .map(|index| hints.remove(index)));
     }
     for record in records {
@@ -21990,6 +22134,25 @@ async fn run_model_turn_inner(
         .await
         {
             Ok(ModelTurnRetry::Continue) => {
+                if let Err(error) = Box::pin(compaction_recovery::resume(
+                    state,
+                    session_id,
+                    &turn_id,
+                    &selection,
+                    command_context,
+                    cancel_state.as_ref(),
+                ))
+                .await
+                {
+                    return ModelTurnCompletion::with_message(
+                        if matches!(error, CompactionError::Cancelled) {
+                            ModelTurnOutcome::Cancelled
+                        } else {
+                            ModelTurnOutcome::Error
+                        },
+                        format!("automatic compaction recovery failed: {error}"),
+                    );
+                }
                 if let Err(error) =
                     provider_retry_recovery::clear(state, session_id, &turn_id).await
                 {
@@ -22140,20 +22303,41 @@ async fn run_model_turn_inner(
             set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
         }
         let compaction_result = if should_evaluate_proactive {
-            Box::pin(maybe_auto_compact_session_context(
+            let protected = Box::pin(compaction_recovery::protect(
                 state,
                 session_id,
-                &selection,
-                cancel_state.as_ref(),
-                command_context,
-                ProactiveCompactionEvaluation {
-                    candidate_input_tokens: context_projection.context_tokens.tokens(),
-                    requested_max_output_tokens: request.parameters.max_output_tokens,
-                    decision: compaction_decision,
-                    previous_compacted_through_sequence: last_proactive_attempt_boundary,
-                },
+                &turn_id,
+                trigger_event.sequence,
+                (
+                    &recovery,
+                    &rounds,
+                    next_assistant_segment_order,
+                    next_output_position,
+                ),
+                maybe_auto_compact_session_context(
+                    state,
+                    session_id,
+                    &selection,
+                    cancel_state.as_ref(),
+                    command_context,
+                    ProactiveCompactionEvaluation {
+                        candidate_input_tokens: context_projection.context_tokens.tokens(),
+                        requested_max_output_tokens: request.parameters.max_output_tokens,
+                        decision: compaction_decision,
+                        previous_compacted_through_sequence: last_proactive_attempt_boundary,
+                    },
+                ),
             ))
-            .await
+            .await;
+            match protected {
+                Ok(result) => result,
+                Err(error) => {
+                    return ModelTurnCompletion::with_message(
+                        ModelTurnOutcome::Error,
+                        format!("automatic compaction recovery checkpoint failed: {error}"),
+                    );
+                }
+            }
         } else {
             Ok(None)
         };
@@ -22470,14 +22654,35 @@ async fn run_model_turn_inner(
                     MAX_TOKENS_CONTINUATION_INSTRUCTION
                 });
                 set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
-                let result = Box::pin(compact_session_after_max_tokens(
+                let protected = Box::pin(compaction_recovery::protect(
                     state,
                     session_id,
-                    &selection,
+                    &turn_id,
                     trigger_event.sequence,
-                    cancel_state.as_ref(),
+                    (
+                        &recovery,
+                        &rounds,
+                        next_assistant_segment_order,
+                        next_output_position,
+                    ),
+                    compact_session_after_max_tokens(
+                        state,
+                        session_id,
+                        &selection,
+                        trigger_event.sequence,
+                        cancel_state.as_ref(),
+                    ),
                 ))
                 .await;
+                let result = match protected {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return ModelTurnCompletion::with_message(
+                            ModelTurnOutcome::Error,
+                            format!("automatic compaction recovery checkpoint failed: {error}"),
+                        );
+                    }
+                };
                 set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
                 match result {
                     Ok(true) => {
@@ -22811,23 +23016,7 @@ async fn maybe_retry_after_provider_error(
         return ModelTurnRetry::None;
     };
 
-    if should_retry_after_malformed_tool_arguments(
-        error,
-        recovery.retried_after_malformed_tool_arguments,
-    ) {
-        recovery.retried_after_malformed_tool_arguments = true;
-        recovery.retry_instruction = Some(MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION);
-        append_provider_event_trace(
-            state,
-            session_id,
-            context.turn_id,
-            "recoverable_error_retry",
-            Some(format!(
-                "model emitted malformed tool arguments ({}: {}); retrying once",
-                error.code, error.message
-            )),
-        )
-        .await;
+    if recover_malformed_arguments(state, session_id, context.turn_id, error, recovery).await {
         return ModelTurnRetry::Continue;
     }
 
@@ -22838,15 +23027,31 @@ async fn maybe_retry_after_provider_error(
     ) {
         recovery.retried_after_context_pressure = true;
         set_runtime_phase(context.phase, SessionRuntimePhase::Compacting).await;
-        let result = Box::pin(compact_session_after_context_overflow(
+        let protected = Box::pin(compaction_recovery::protect_after_provider_error(
             state,
             session_id,
-            context.selection,
-            context.trigger_event_sequence,
+            &context,
+            recovery,
             error,
-            context.cancel_state,
+            compact_session_after_context_overflow(
+                state,
+                session_id,
+                context.selection,
+                context.trigger_event_sequence,
+                error,
+                context.cancel_state,
+            ),
         ))
         .await;
+        let result = match protected {
+            Ok(result) => result,
+            Err(error) => {
+                return ModelTurnRetry::Return(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    format!("automatic compaction recovery checkpoint failed: {error}"),
+                ));
+            }
+        };
         set_runtime_phase(context.phase, SessionRuntimePhase::ProviderActive).await;
         return match result {
             Ok(()) => ModelTurnRetry::Continue,
@@ -22902,6 +23107,35 @@ async fn maybe_retry_after_provider_error(
     }
 
     ModelTurnRetry::None
+}
+
+async fn recover_malformed_arguments(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    error: &bcode_model::ProviderError,
+    recovery: &mut ModelTurnRecoveryState,
+) -> bool {
+    if !should_retry_after_malformed_tool_arguments(
+        error,
+        recovery.retried_after_malformed_tool_arguments,
+    ) {
+        return false;
+    }
+    recovery.retried_after_malformed_tool_arguments = true;
+    recovery.retry_instruction = Some(MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION);
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "recoverable_error_retry",
+        Some(format!(
+            "model emitted malformed tool arguments ({}: {}); retrying once",
+            error.code, error.message
+        )),
+    )
+    .await;
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -44297,6 +44531,7 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::SessionHistoryPage { .. } => "session_history_page",
             ResponsePayload::SessionHistoryAround { .. } => "session_history_around",
             ResponsePayload::SessionInspection { .. } => "session_inspection",
+            ResponsePayload::SessionCompactionInspection { .. } => "session_compaction_inspection",
             ResponsePayload::SessionSearch { .. } => "session_search",
             ResponsePayload::SessionSearchProviders { .. } => "session_search_providers",
             ResponsePayload::SessionSearchPlan { .. } => "session_search_plan",
@@ -72046,6 +72281,323 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap()
             .unwrap();
         assert_eq!(command_submission_id(&selected), Some(&id(&second)));
+        drop(state);
+    }
+
+    fn admission_recovery_context(root: &Path, config_path: PathBuf) -> ClientRuntimeContext {
+        let environment =
+            bcode_config::ConfigEnvironmentSnapshot::new(BTreeMap::new(), root.to_owned());
+        let (config, launch) = bcode_config::recovery::load_config_with_recovery_context(
+            &environment,
+            &bcode_config::ConfigLoadOverrides {
+                exclusive_config_path: Some(config_path),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let resolved = config.resolved_model_selection_with_environment(&environment);
+        ClientRuntimeContext {
+            working_directory: Some(root.to_owned()),
+            selected_provider_plugin_id: resolved.provider_plugin_id,
+            selected_model_id: resolved.model_id,
+            provider_context: bcode_provider_auth::recovery::resolve(
+                &config,
+                Some("offline"),
+                None,
+                None,
+            )
+            .unwrap(),
+            effective_config_toml: Some(Box::new(
+                bcode_config::encode_effective_config(&config).unwrap(),
+            )),
+            config_launch: Some(Box::new(launch)),
+            ..Default::default()
+        }
+    }
+
+    async fn admit_recovery_context(
+        state: &ServerState,
+        session_id: SessionId,
+        context: ClientRuntimeContext,
+    ) -> bcode_session_models::SubmissionRecord {
+        let (admission, _) = Box::pin(admit_turn_inner(
+            state,
+            session_id,
+            ClientId::new(),
+            "retain original configuration".into(),
+            bcode_session_models::TurnAdmissionMetadata::default(),
+            Some(context),
+        ))
+        .await
+        .unwrap();
+        let bcode_session_models::TurnAdmission::Accepted(receipt) = admission else {
+            panic!("accepted turn");
+        };
+        state
+            .sessions
+            .submission(
+                session_id,
+                bcode_session_models::SubmissionId::for_queued_turn(&receipt.turn_id),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admission_captures_only_reproducible_confined_file_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let source = "[model]\nprofile = 'offline'\n[model.profiles.offline]\nprovider_plugin_id = 'bcode.fake-provider'\nmodel_id = 'fake-echo'\n[model.profiles.offline.settings]\nfixture_policy = 'original'\n";
+        let path = root.join("offline.toml");
+        std::fs::write(&path, source).unwrap();
+        let context = admission_recovery_context(&root, path.clone());
+        let sessions = SessionManager::default();
+        let session = sessions.create_session(None, root.clone()).await.unwrap();
+        let state = test_server_state_with_fake_provider(sessions);
+        let original = Box::pin(admit_recovery_context(&state, session.id, context.clone())).await;
+        let descriptor = original
+            .effective_execution_descriptor()
+            .expect("ordinary admission retains provenance");
+        assert_eq!(descriptor.version, 2);
+        let recovered = verified_submission_runtime_context(descriptor, &root).unwrap();
+        assert_eq!(recovered.selected_model_id.as_deref(), Some("fake-echo"));
+        assert_eq!(recovered.provider_context, context.provider_context);
+        let outside = directory.path().join("outside.toml");
+        std::fs::write(&outside, source).unwrap();
+        let rejected = Box::pin(admit_recovery_context(
+            &state,
+            session.id,
+            admission_recovery_context(&root, outside),
+        ))
+        .await;
+        assert!(rejected.effective_execution_descriptor().is_none());
+        let mut transient = context;
+        transient
+            .provider_context
+            .env
+            .insert("PRIVATE_OVERRIDE".into(), "request-only-secret".into());
+        let rejected = Box::pin(admit_recovery_context(&state, session.id, transient)).await;
+        assert!(rejected.effective_execution_descriptor().is_none());
+        assert!(
+            !serde_json::to_string(&rejected)
+                .unwrap()
+                .contains("request-only-secret")
+        );
+        std::fs::write(path, source.replace("original", "changed")).unwrap();
+        assert!(verified_submission_runtime_context(descriptor, &root).is_err());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn malformed_admission_config_never_uses_daemon_defaults() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = test_server_state_with_fake_provider(sessions);
+        let context = ClientRuntimeContext {
+            effective_config_toml: Some(Box::new("secret-bearing-invalid = [".into())),
+            ..Default::default()
+        };
+        assert!(submission_admission_config(&state, Some(&context)).is_err());
+        let missing_effective = ClientRuntimeContext {
+            config_launch: Some(Box::new(bcode_config::ConfigLaunchContext::default())),
+            ..Default::default()
+        };
+        assert!(submission_admission_config(&state, Some(&missing_effective)).is_err());
+        let error = Box::pin(admit_turn_inner(
+            &state,
+            session.id,
+            ClientId::new(),
+            "not accepted".into(),
+            bcode_session_models::TurnAdmissionMetadata::default(),
+            Some(context),
+        ))
+        .await
+        .unwrap_err();
+        assert!(!error.to_string().contains("secret-bearing-invalid"));
+        assert!(
+            state
+                .sessions
+                .submission_queue_status(session.id)
+                .await
+                .unwrap()
+                .oldest
+                .is_none()
+        );
+        drop(state);
+    }
+
+    async fn recovery_queue_hint(
+        state: &ServerState,
+        session_id: SessionId,
+        event: SessionEvent,
+        recovering: bool,
+    ) -> FollowupCommand {
+        let ownership = state
+            .sessions
+            .acquire_session_ownership(
+                session_id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .unwrap();
+        FollowupCommand::ExecuteTurn {
+            client_id: ClientId::new(),
+            runtime_context: None,
+            user_event: Box::new(event),
+            queued_steering: None,
+            cancel_state: None,
+            completion: None,
+            recovering,
+            ownership,
+        }
+    }
+
+    async fn rejected_recovery_queue_hints(
+        state: &ServerState,
+        session_id: SessionId,
+        activation: &SessionEvent,
+        later: &SessionEvent,
+    ) -> Vec<FollowupCommand> {
+        let mut hints = Vec::new();
+        // Fresh activation, wrong sequence/session/turn/submission, and a later
+        // accepted command must never acquire the oldest activated obligation.
+        for case in 0..6 {
+            let mut event = activation.clone();
+            match case {
+                1 => event.sequence += 1,
+                2 => event.session_id = SessionId::new(),
+                3 => {
+                    let SessionEventKind::SubmissionActivated { turn_id, .. } = &mut event.kind
+                    else {
+                        panic!("activation");
+                    };
+                    turn_id.0.push_str("-unrelated");
+                }
+                4 => {
+                    let SessionEventKind::SubmissionActivated { submission_id, .. } =
+                        &mut event.kind
+                    else {
+                        panic!("activation");
+                    };
+                    *submission_id = bcode_session_models::SubmissionId("unrelated".into());
+                }
+                5 => event = later.clone(),
+                _ => {}
+            }
+            hints.push(recovery_queue_hint(state, session_id, event, case != 0).await);
+            assert!(
+                next_pending_submission_command(state, session_id, &mut None, &mut hints)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        hints
+    }
+
+    #[tokio::test]
+    async fn recovered_activation_dispatch_requires_exact_fifo_head_and_no_terminal() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = test_server_state(sessions);
+        let client = ClientId::new();
+        let (_, accepted) = admit_turn(
+            &state,
+            session.id,
+            client,
+            "oldest user input".into(),
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        let accepted = accepted.unwrap();
+        let SessionEventKind::SubmissionAccepted { submission } = &accepted.kind else {
+            panic!("acceptance");
+        };
+        let submission_id = submission.id.clone();
+        let turn_id = submission.target.turn_id().0.clone();
+        let activation = activated_submission_event(&state, session.id, submission_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, later) = admit_turn(
+            &state,
+            session.id,
+            client,
+            "later user input".into(),
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        let later = later.unwrap();
+        let mut hints =
+            rejected_recovery_queue_hints(&state, session.id, &activation, &later).await;
+        hints.push(recovery_queue_hint(&state, session.id, activation.clone(), true).await);
+        let selected = next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+            .await
+            .unwrap()
+            .expect("exact recovered activation can continue");
+        assert!(
+            matches!(&selected, FollowupCommand::ExecuteTurn { user_event, recovering: true, .. }
+            if user_event.as_ref() == &activation)
+        );
+        drop(selected);
+        let oldest = state
+            .sessions
+            .submission_queue_status(session.id)
+            .await
+            .unwrap();
+        assert_eq!(oldest.oldest.unwrap().receipt.submission_id, submission_id);
+        state
+            .sessions
+            .append_model_turn_finished(session.id, turn_id, ModelTurnOutcome::Cancelled, None)
+            .await
+            .unwrap();
+        hints.push(recovery_queue_hint(&state, session.id, activation.clone(), true).await);
+        let selected = next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+            .await
+            .unwrap()
+            .expect("later accepted input retains authority");
+        let SessionEventKind::SubmissionAccepted { submission } = &later.kind else {
+            panic!("acceptance");
+        };
+        assert_eq!(command_submission_id(&selected), Some(&submission.id));
+        drop(selected);
+        assert!(hints.is_empty(), "terminal recovery hint must be pruned");
+        activated_submission_event(&state, session.id, submission.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .sessions
+            .append_model_turn_finished(
+                session.id,
+                submission.target.turn_id().0.clone(),
+                ModelTurnOutcome::Completed,
+                None,
+            )
+            .await
+            .unwrap();
+        hints.push(recovery_queue_hint(&state, session.id, activation, true).await);
+        assert!(
+            next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            hints.is_empty(),
+            "cancelled activation cannot fall through an empty FIFO"
+        );
+        drop(hints);
         drop(state);
     }
 
@@ -103511,6 +104063,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("callback lifecycle cleanup bounded");
+            drop(ordinary);
             assert_eq!(result.is_err(), mode == 1);
             assert!(state.client_runtime_contexts.lock().await.is_empty());
             assert!(state.client_forwarders.lock().await.is_empty());
@@ -103960,6 +104513,47 @@ event_symbol = "bcode_plugin_handle_event_v1"
             request_end,
         });
         (state, owner, handle, writer, peer)
+    }
+
+    #[tokio::test]
+    async fn lifecycle_dispatch_keeps_selected_work_bounded_and_lazy() {
+        use bcode_session_models::SessionObservationPullRequest;
+
+        let (state, owner, handle, writer, peer) = observation_send_fixture().await;
+        let usage = state
+            .session_observations
+            .retention_usage_probe(&handle.handle_id);
+        let initial_usage = usage();
+        let initial_boxes = available_boxes(&state.session_observations);
+        for request in [
+            SessionLifecycleRequest::Ping,
+            SessionLifecycleRequest::CreateSession {
+                name: None,
+                working_directory: std::path::PathBuf::from("/"),
+            },
+            SessionLifecycleRequest::PullSessionObservation {
+                request: SessionObservationPullRequest {
+                    schema_version: 1,
+                    handle_id: handle.handle_id.clone(),
+                    expected_sequence: 0,
+                    wait_ms: 0,
+                },
+            },
+        ] {
+            let operation = handle_request_inner(request, 1, owner, &state, &writer);
+            // Measure the selected coroutine, not the erased pointer to it. This
+            // bounds the state constructed before its first poll as well as at await.
+            assert!(std::mem::size_of_val(operation.as_ref().get_ref()) < 64 * 1024);
+            assert_eq!(usage(), initial_usage);
+            assert_eq!(available_boxes(&state.session_observations), initial_boxes);
+            drop(operation);
+            assert_eq!(usage(), initial_usage);
+            assert_eq!(available_boxes(&state.session_observations), initial_boxes);
+        }
+        assert!(state.session_observations.close(owner, &handle).unwrap());
+        drop(peer);
+        drop(writer);
+        drop(state);
     }
 
     #[tokio::test]

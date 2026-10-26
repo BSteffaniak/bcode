@@ -1215,6 +1215,7 @@ fn queue_resume_settings_require_complete_presentation_and_survive_resize() {
         render(&mut app, &mut PaintCx::new(&mut frame));
         assert_eq!(app.queue_recovery.settings_visible, visible);
     }
+    drop(app);
 }
 
 #[cfg(test)]

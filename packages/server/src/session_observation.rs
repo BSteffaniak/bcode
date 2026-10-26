@@ -452,8 +452,12 @@ fn admit_initial_projection(
                 ledger
                     .try_add(source_charge, INITIAL_RETENTION_LIMITS)
                     .map_err(|_| SessionObservationEnd::LimitReached)?;
-                let projected =
-                    view.apply_event_bounded(event, &mut ledger, INITIAL_RETENTION_LIMITS);
+                let presentation = super::compaction_privacy::presentation_event(event);
+                let projected = view.apply_event_bounded(
+                    presentation.as_ref(),
+                    &mut ledger,
+                    INITIAL_RETENTION_LIMITS,
+                );
                 if projected.is_err() {
                     tracing::warn!(
                         event_kind =
@@ -876,8 +880,10 @@ impl SessionObservation {
             });
             return false;
         }
-        let admitted =
-            self.project(|view, ledger, limits| view.apply_event_bounded(event, ledger, limits));
+        let presentation = super::compaction_privacy::presentation_event(event);
+        let admitted = self.project(|view, ledger, limits| {
+            view.apply_event_bounded(presentation.as_ref(), ledger, limits)
+        });
         if admitted {
             self.source_sequence = Some(event.sequence);
         } else if matches!(self.pending_end, Some(SessionObservationEnd::LimitReached)) {
@@ -1763,6 +1769,8 @@ mod tests {
             assert_eq!(state.next_sequence, 0);
             assert!(state.last.is_none());
             assert_eq!(state.pending.as_ref().unwrap().delivery.sequence, 0);
+            drop(state);
+            drop(entries);
         }
         drop(occupied);
         let reply = registry.pull_charged(owner, pull()).await.unwrap();

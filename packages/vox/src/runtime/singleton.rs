@@ -6,13 +6,10 @@
 //! descriptor lifetime releases ownership after normal exit or process death.
 use crate::contracts::{Error, Result};
 
-#[cfg(target_os = "linux")]
+// Keep descriptor ownership and drop semantics identical on every platform.
 pub(super) struct Reservation {
     _file: std::fs::File,
 }
-
-#[cfg(not(target_os = "linux"))]
-pub(super) struct Reservation;
 
 /// Reserve actual capture ownership without waiting.
 ///

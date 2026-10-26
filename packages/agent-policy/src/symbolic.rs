@@ -51,7 +51,7 @@ pub fn classify(rule: &WordRule, command: &impl CommandWords) -> Match {
 }
 
 fn closure(rule: &WordRule, states: &mut States) {
-    let mut queue = VecDeque::from_iter(states.iter().copied());
+    let mut queue: VecDeque<_> = states.iter().copied().collect();
     while let Some((state, ended)) = queue.pop_front() {
         for (atom, target) in &rule.edges[state] {
             if atom.is_none() && states.insert((*target, ended)) {

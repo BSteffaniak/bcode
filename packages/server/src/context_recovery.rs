@@ -357,13 +357,13 @@ mod tests {
         let state = crate::tests::test_server_state_with_fake_provider(sessions);
         let cancel = TurnCancelState::default();
         cancel.close();
-        let result = rebuild_session_summary(
+        let result = Box::pin(rebuild_session_summary(
             &state,
             request(session.id, old.sequence),
             &SessionModelSelection::default(),
             None,
             &cancel,
-        )
+        ))
         .await;
         assert!(matches!(result, Err(CompactionError::Cancelled)));
         assert_eq!(
@@ -374,22 +374,21 @@ mod tests {
                 .unwrap(),
             old.sequence
         );
-        let result = rebuild_session_summary(
+        let result = Box::pin(rebuild_session_summary(
             &state,
             request(session.id, source.sequence),
             &SessionModelSelection::default(),
             None,
             &TurnCancelState::default(),
-        )
+        ))
         .await;
         assert!(result.is_err());
-        assert_eq!(
-            state
-                .sessions
-                .current_context_epoch(session.id)
-                .await
-                .unwrap(),
-            old.sequence
-        );
+        let epoch = state
+            .sessions
+            .current_context_epoch(session.id)
+            .await
+            .unwrap();
+        drop(state);
+        assert_eq!(epoch, old.sequence);
     }
 }

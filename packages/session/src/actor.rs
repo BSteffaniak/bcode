@@ -986,6 +986,24 @@ impl SessionHandle {
             .await?
     }
 
+    /// Inspect secret-safe compaction evidence. At most three bounded index ranges of
+    /// `limit + 1` metadata rows and `limit` payloads are read, with 2 MiB aggregate physical
+    /// and decoded payload admission plus structural limits.
+    ///
+    /// Ephemeral sessions binary-seek the inclusive cursor and examine at most `limit`
+    /// borrowed events, including unrelated events, with the same aggregate structural
+    /// allowance. No repair or replay is performed.
+    ///
+    /// # Errors
+    /// Returns storage/allowance errors; malformed or oversized evidence is a degraded page.
+    pub async fn compaction_inspection_page(
+        &self,
+        query: bcode_session_models::SessionCompactionInspectionQuery,
+    ) -> Result<bcode_session_models::SessionCompactionInspectionPage, SessionError> {
+        self.send(|reply| SessionCommand::CompactionInspectionPage { query, reply })
+            .await?
+    }
+
     pub async fn inspection_page(
         &self,
         query: SessionInspectionQuery,
@@ -1452,6 +1470,12 @@ enum SessionCommand {
         turn_id: String,
         reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
     },
+    CompactionInspectionPage {
+        query: bcode_session_models::SessionCompactionInspectionQuery,
+        reply: oneshot::Sender<
+            Result<bcode_session_models::SessionCompactionInspectionPage, SessionError>,
+        >,
+    },
     InspectionPage {
         query: SessionInspectionQuery,
         reply: oneshot::Sender<Result<SessionInspectionPage, SessionError>>,
@@ -1763,8 +1787,13 @@ impl SessionActor {
         }
     }
 
+    // Decode before constructing async state: each command owns a separate boxed future,
+    // rather than retaining every read operation in one oversized dispatch poll frame.
     #[allow(clippy::too_many_lines)]
-    async fn handle_read_command(&mut self, command: SessionCommand) -> bool {
+    fn handle_read_command(
+        &mut self,
+        command: SessionCommand,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         match command {
             SessionCommand::RenormalizeUsage { .. }
             | SessionCommand::RepriceUsage { .. }
@@ -1785,7 +1814,7 @@ impl SessionActor {
                 descriptor,
                 timestamp_ms,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let _ = reply.send(
                     self.admit_queued_turn(
                         client_id,
@@ -1796,36 +1825,41 @@ impl SessionActor {
                     )
                     .await,
                 );
-            }
-            SessionCommand::SubmissionQueueStatus { reply } => {
+                false
+            }),
+            SessionCommand::SubmissionQueueStatus { reply } => Box::pin(async move {
                 let result = self.submission_queue_status().await;
                 let _ = reply.send(result);
-            }
-            SessionCommand::SubmissionRecoveryRetry { kind, reply } => {
+                false
+            }),
+            SessionCommand::SubmissionRecoveryRetry { kind, reply } => Box::pin(async move {
                 let result = self.check_recovery_retry(&kind).await;
                 let _ = reply.send(result);
-            }
+                false
+            }),
             SessionCommand::SubmissionMutation {
                 mutation,
                 timestamp_ms,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let _ = reply.send(self.mutate_submission(mutation, timestamp_ms).await);
-            }
-            SessionCommand::SubmissionLookup { id, reply } => {
+                false
+            }),
+            SessionCommand::SubmissionLookup { id, reply } => Box::pin(async move {
                 let result = match self.existing_session_db().await {
                     Ok(Some(db)) => db.submission(&id).await.map_err(Into::into),
                     Ok(None) => Ok(self.memory_submissions.get(&id).cloned()),
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
-            }
+                false
+            }),
             SessionCommand::PendingSubmissionsForTurn {
                 turn_id,
                 after,
                 limit,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let result = match self.existing_session_db().await {
                     Ok(Some(db)) => db
                         .pending_submissions_for_turn(&turn_id, after, limit)
@@ -1848,12 +1882,13 @@ impl SessionActor {
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
-            }
+                false
+            }),
             SessionCommand::PendingSubmissions {
                 after,
                 limit,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let result = match self.existing_session_db().await {
                     Ok(Some(db)) => db
                         .pending_submissions(after, limit)
@@ -1872,12 +1907,13 @@ impl SessionActor {
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
-            }
+                false
+            }),
             SessionCommand::TurnReceipt {
                 producer,
                 idempotency_key,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let result = async {
                     if let Some(db) = self.existing_session_db().await? {
                         return Ok::<_, SessionError>(
@@ -1892,29 +1928,34 @@ impl SessionActor {
                 }
                 .await;
                 let _ = reply.send(result);
-            }
-            SessionCommand::SubscribeEventsBounded { limits, reply } => {
+                false
+            }),
+            SessionCommand::SubscribeEventsBounded { limits, reply } => Box::pin(async move {
                 let _ = reply.send(Ok(self.state.subscribe_bounded(limits)));
-            }
-            SessionCommand::SubscribeEvents(reply) => {
+                false
+            }),
+            SessionCommand::SubscribeEvents(reply) => Box::pin(async move {
                 let _ = reply.send(Ok(self.subscribe_events()));
-            }
-            SessionCommand::Detach { client_id, reply } => {
+                false
+            }),
+            SessionCommand::Detach { client_id, reply } => Box::pin(async move {
                 let _ = reply.send(Ok(self.detach(client_id).await));
-            }
+                false
+            }),
             SessionCommand::ObservedChildPage {
                 after,
                 limit,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let result = match self.existing_session_db().await {
                     Ok(Some(db)) => db.direct_child_page(after, limit).await.map_err(Into::into),
                     Ok(None) => Err(SessionError::NotFound(self.state.summary.id)),
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
-            }
-            SessionCommand::ObservedChildReceipt { child, reply } => {
+                false
+            }),
+            SessionCommand::ObservedChildReceipt { child, reply } => Box::pin(async move {
                 let result = match self.existing_session_db().await {
                     Ok(Some(db)) => db
                         .child_publication_receipt(child)
@@ -1924,64 +1965,82 @@ impl SessionActor {
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
-            }
-            SessionCommand::ObservedSummary(reply) => {
+                false
+            }),
+            SessionCommand::ObservedSummary(reply) => Box::pin(async move {
                 let _ = reply.send(self.observed_summary().await);
-            }
-            SessionCommand::Summary(reply) => {
+                false
+            }),
+            SessionCommand::Summary(reply) => Box::pin(async move {
                 let _ = reply.send(self.state.summary());
-            }
-            SessionCommand::WorkingDirectory(reply) => {
+                false
+            }),
+            SessionCommand::WorkingDirectory(reply) => Box::pin(async move {
                 let _ = reply.send(self.state.working_directory.clone());
-            }
-            SessionCommand::ComposerDraft(reply) => {
+                false
+            }),
+            SessionCommand::ComposerDraft(reply) => Box::pin(async move {
                 let _ = reply.send(self.composer_draft().await);
-            }
-            SessionCommand::ValidateWriteReadiness(reply) => {
+                false
+            }),
+            SessionCommand::ValidateWriteReadiness(reply) => Box::pin(async move {
                 let _ = reply.send(self.validate_write_readiness().await);
-            }
-            SessionCommand::ReloadStateAndValidateWriteReadiness(reply) => {
+                false
+            }),
+            SessionCommand::ReloadStateAndValidateWriteReadiness(reply) => Box::pin(async move {
                 let _ = reply.send(self.reload_state_and_validate_write_readiness().await);
-            }
-            SessionCommand::Health { root, reply } => {
+                false
+            }),
+            SessionCommand::Health { root, reply } => Box::pin(async move {
                 let _ = reply.send(self.health(&root).await);
-            }
-            SessionCommand::History(reply) => {
+                false
+            }),
+            SessionCommand::History(reply) => Box::pin(async move {
                 let _ = reply.send(self.history().await);
-            }
+                false
+            }),
             SessionCommand::MilestoneContext {
                 max_bytes,
                 max_turns,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let _ = reply.send(self.milestone_context(max_bytes, max_turns).await);
-            }
+                false
+            }),
             SessionCommand::MilestoneEvaluationStatus {
                 evaluation_id,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let _ = reply.send(self.milestone_evaluation_status(&evaluation_id).await);
-            }
-            SessionCommand::MilestoneEvaluationCheckpoint { reply } => {
+                false
+            }),
+            SessionCommand::MilestoneEvaluationCheckpoint { reply } => Box::pin(async move {
                 let _ = reply.send(self.milestone_evaluation_checkpoint().await);
-            }
-            SessionCommand::RequestMilestoneEvaluation { request, reply } => {
+                false
+            }),
+            SessionCommand::RequestMilestoneEvaluation { request, reply } => Box::pin(async move {
                 let _ = reply.send(self.request_milestone_evaluation(request).await);
-            }
-            SessionCommand::PublishMilestone { request, reply } => {
+                false
+            }),
+            SessionCommand::PublishMilestone { request, reply } => Box::pin(async move {
                 let _ = reply.send(self.publish_milestone(request).await);
-            }
+                false
+            }),
             SessionCommand::CompleteMilestoneEvaluation { completion, reply } => {
-                let _ = reply.send(self.complete_milestone_evaluation(completion).await);
+                Box::pin(async move {
+                    let _ = reply.send(self.complete_milestone_evaluation(completion).await);
+                    false
+                })
             }
-            SessionCommand::Milestones { query, reply } => {
+            SessionCommand::Milestones { query, reply } => Box::pin(async move {
                 let _ = reply.send(self.milestones(query).await);
-            }
+                false
+            }),
             SessionCommand::InitialProjectionHistory {
                 request,
                 mut budget,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let result = async {
                     let session_id = self.state.summary.id;
                     let limit = request
@@ -2149,12 +2208,13 @@ impl SessionActor {
                 }
                 .await;
                 let _ = reply.send(result);
-            }
+                false
+            }),
             SessionCommand::HistoryPageWithDecodeBudget {
                 query,
                 mut budget,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let result = async {
                     let db = self.existing_session_db().await?;
                     if let Some(db) = db {
@@ -2176,14 +2236,17 @@ impl SessionActor {
                 }
                 .await;
                 let _ = reply.send(result);
-            }
-            SessionCommand::HistoryPage { query, reply } => {
+                false
+            }),
+            SessionCommand::HistoryPage { query, reply } => Box::pin(async move {
                 let _ = reply.send(self.history_page(query).await);
-            }
-            SessionCommand::HistoryAround { query, reply } => {
+                false
+            }),
+            SessionCommand::HistoryAround { query, reply } => Box::pin(async move {
                 let _ = reply.send(self.history_around(query).await);
-            }
-            SessionCommand::UsagePage { query, reply } => {
+                false
+            }),
+            SessionCommand::UsagePage { query, reply } => Box::pin(async move {
                 let result = match self.existing_session_db().await {
                     Ok(Some(db)) => db.usage_page(&query).await.map_err(SessionError::from),
                     Ok(None) => Err(SessionError::EventSerialization(
@@ -2192,17 +2255,19 @@ impl SessionActor {
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
-            }
+                false
+            }),
             SessionCommand::CommitCompactionCheckpoint {
                 request,
                 timestamp_ms,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let result =
                     Box::pin(self.commit_compaction_checkpoint(request, timestamp_ms)).await;
                 let _ = reply.send(result);
-            }
-            SessionCommand::CompactionCheckpoint { key, reply } => {
+                false
+            }),
+            SessionCommand::CompactionCheckpoint { key, reply } => Box::pin(async move {
                 let in_memory = self.state.events.is_some();
                 let result =
                     match bcode_session_models::CompactionSynthesisCheckpoint::validate_key(&key) {
@@ -2219,8 +2284,9 @@ impl SessionActor {
                         },
                     };
                 let _ = reply.send(result);
-            }
-            SessionCommand::TurnEvidence { turn_id, reply } => {
+                false
+            }),
+            SessionCommand::TurnEvidence { turn_id, reply } => Box::pin(async move {
                 let in_memory = self.state.events.is_some();
                 let result = match self.existing_session_db().await {
                     Ok(Some(db)) => db.turn_evidence(&turn_id).await.map_err(Into::into),
@@ -2234,46 +2300,80 @@ impl SessionActor {
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
-            }
-            SessionCommand::InspectionPage { query, reply } => {
+                false
+            }),
+            SessionCommand::CompactionInspectionPage { query, reply } => Box::pin(async move {
+                let in_memory = self.store.is_none();
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .compaction_inspection_page(query)
+                        .await
+                        .map_err(SessionError::from),
+                    Ok(None) if in_memory => self
+                        .state
+                        .events
+                        .as_ref()
+                        .ok_or(SessionError::DbUnavailable(self.state.summary.id))
+                        .and_then(|events| {
+                            crate::db::memory_compaction_inspection_page(
+                                self.state.summary.id,
+                                events,
+                                query,
+                            )
+                            .map_err(SessionError::from)
+                        }),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::InspectionPage { query, reply } => Box::pin(async move {
                 let _ = reply.send(self.inspection_page(query).await);
-            }
-            SessionCommand::ProjectionWindowFromIndex { request, reply } => {
+                false
+            }),
+            SessionCommand::ProjectionWindowFromIndex { request, reply } => Box::pin(async move {
                 let _ = reply.send(self.projection_window(request).await);
-            }
+                false
+            }),
             SessionCommand::EventsRange {
                 start_sequence,
                 end_sequence,
                 max_events,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let _ = reply.send(
                     self.events_range(start_sequence, end_sequence, max_events)
                         .await,
                 );
-            }
-            SessionCommand::InputHistory(reply) => {
+                false
+            }),
+            SessionCommand::InputHistory(reply) => Box::pin(async move {
                 let _ = reply.send(self.input_history().await);
-            }
+                false
+            }),
             SessionCommand::InputHistoryPage {
                 before_sequence,
                 limit,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let _ = reply.send(self.input_history_page(before_sequence, limit).await);
-            }
-            SessionCommand::CurrentContextEpoch(reply) => {
+                false
+            }),
+            SessionCommand::CurrentContextEpoch(reply) => Box::pin(async move {
                 let result = if let Ok(Some(db)) = self.existing_session_db().await {
                     db.current_context_epoch().await.map_err(SessionError::from)
                 } else {
                     Ok(self.state.context_epoch)
                 };
                 let _ = reply.send(result);
-            }
-            SessionCommand::CurrentRequestContextOccupancy(reply) => {
+                false
+            }),
+            SessionCommand::CurrentRequestContextOccupancy(reply) => Box::pin(async move {
                 let _ = reply.send(self.current_context_occupancy().await);
-            }
-            SessionCommand::ActivatedConversationSnapshot(reply) => {
+                false
+            }),
+            SessionCommand::ActivatedConversationSnapshot(reply) => Box::pin(async move {
                 let result = match self.existing_session_db().await {
                     Ok(Some(db)) => db
                         .activated_conversation_snapshot()
@@ -2288,29 +2388,34 @@ impl SessionActor {
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
-            }
-            SessionCommand::ModelContextEvents(reply) => {
+                false
+            }),
+            SessionCommand::ModelContextEvents(reply) => Box::pin(async move {
                 let _ = reply.send(self.model_context_events().await);
-            }
-            SessionCommand::InterruptedRecoveryWork(reply) => {
+                false
+            }),
+            SessionCommand::InterruptedRecoveryWork(reply) => Box::pin(async move {
                 let result = self.interrupted_recovery_work().await;
                 let _ = reply.send(result);
-            }
-            SessionCommand::ActiveToolRuns(reply) => {
+                false
+            }),
+            SessionCommand::ActiveToolRuns(reply) => Box::pin(async move {
                 let _ = reply.send(self.active_tool_runs().await);
-            }
+                false
+            }),
             SessionCommand::RuntimeWorkByIds {
                 ids,
                 max_bytes,
                 reply,
-            } => {
+            } => Box::pin(async move {
                 let _ = reply.send(self.runtime_work_by_ids(&ids, max_bytes).await);
-            }
+                false
+            }),
             SessionCommand::ActiveRuntimeWork {
                 reply,
                 queued,
                 fail_fast,
-            } => {
+            } => Box::pin(async move {
                 queued.finish();
                 let result = if fail_fast {
                     crate::db_connection::without_open_retries(self.active_runtime_work()).await
@@ -2318,8 +2423,9 @@ impl SessionActor {
                     self.active_runtime_work().await
                 };
                 let _ = reply.send(result);
-            }
-            SessionCommand::CurrentRuntimeSelection(reply) => {
+                false
+            }),
+            SessionCommand::CurrentRuntimeSelection(reply) => Box::pin(async move {
                 let _ = reply.send(crate::SessionRuntimeSelection {
                     agent_id: self.state.current_agent.clone(),
                     provider_plugin_id: self.state.current_provider.clone(),
@@ -2328,62 +2434,74 @@ impl SessionActor {
                     reasoning_effort: self.state.reasoning_effort.clone(),
                     reasoning_summary: self.state.reasoning_summary.clone(),
                 });
-            }
-            SessionCommand::CurrentModelSelection(reply) => {
+                false
+            }),
+            SessionCommand::CurrentModelSelection(reply) => Box::pin(async move {
                 let _ = reply.send((
                     self.state.current_provider.clone(),
                     self.state.current_model.clone(),
                 ));
-            }
-            SessionCommand::CurrentReasoningSelection(reply) => {
+                false
+            }),
+            SessionCommand::CurrentReasoningSelection(reply) => Box::pin(async move {
                 let _ = reply.send((
                     self.state.reasoning_effort.clone(),
                     self.state.reasoning_summary.clone(),
                 ));
-            }
-            SessionCommand::RememberedReasoningForModel { scope, reply } => {
+                false
+            }),
+            SessionCommand::RememberedReasoningForModel { scope, reply } => Box::pin(async move {
                 let _ = reply.send(self.state.reasoning_by_model.get(&scope).cloned());
-            }
-            SessionCommand::CurrentAgentSelection(reply) => {
+                false
+            }),
+            SessionCommand::CurrentAgentSelection(reply) => Box::pin(async move {
                 let _ = reply.send(self.state.current_agent.clone());
-            }
-            SessionCommand::SetCurrentAgent { agent_id, reply } => {
+                false
+            }),
+            SessionCommand::SetCurrentAgent { agent_id, reply } => Box::pin(async move {
                 self.set_current_agent(agent_id);
                 let _ = reply.send(Ok(()));
-            }
-            SessionCommand::PublishLive { event, reply } => {
+                false
+            }),
+            SessionCommand::PublishLive { event, reply } => Box::pin(async move {
                 let _ = reply.send(self.publish_live_event(event));
-            }
-            SessionCommand::ReleaseIdleResources(reply) => {
+                false
+            }),
+            SessionCommand::ReleaseIdleResources(reply) => Box::pin(async move {
                 let _ = reply.send(self.release_idle_resources().await);
-            }
-            SessionCommand::ReleaseDatabaseResources(reply) => {
+                false
+            }),
+            SessionCommand::ReleaseDatabaseResources(reply) => Box::pin(async move {
                 let released = self.release_database_resources().await == DatabaseRelease::Released;
                 let _ = reply.send(released);
-            }
-            SessionCommand::AcquireOwnership { kind, reply } => {
+                false
+            }),
+            SessionCommand::AcquireOwnership { kind, reply } => Box::pin(async move {
                 let _ = reply.send(self.acquire_ownership(kind));
-            }
-            SessionCommand::OwnershipSnapshot(reply) => {
+                false
+            }),
+            SessionCommand::OwnershipSnapshot(reply) => Box::pin(async move {
                 let _ = reply.send(self.ownership_snapshot());
-            }
-            SessionCommand::ReleaseOwnershipIfQuiescent(reply) => {
+                false
+            }),
+            SessionCommand::ReleaseOwnershipIfQuiescent(reply) => Box::pin(async move {
                 let _ = reply.send(self.release_ownership_if_quiescent().await);
-            }
-            SessionCommand::AdoptLease { lease, reply } => {
+                false
+            }),
+            SessionCommand::AdoptLease { lease, reply } => Box::pin(async move {
                 self.lease = Some(lease);
                 self.refresh_snapshot();
                 if self.state.clients.is_empty() && !self.has_ownership_guards() {
                     let _ = self.release_idle_resources().await;
                 }
                 let _ = reply.send(());
-            }
-            SessionCommand::Shutdown(reply) => {
+                false
+            }),
+            SessionCommand::Shutdown(reply) => Box::pin(async move {
                 let _ = reply.send(());
-                return true;
-            }
+                true
+            }),
         }
-        false
     }
 
     fn replace_persisted_state(&mut self, mut state: SessionState) {
@@ -3068,6 +3186,9 @@ impl SessionActor {
         timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionError> {
         self.ensure_ownership()?;
+        if self.store.is_none() {
+            return self.commit_memory_compaction_checkpoint(&request, timestamp_ms);
+        }
         let store = self
             .store
             .clone()
@@ -3100,6 +3221,49 @@ impl SessionActor {
         self.apply_appended_event(&marker, timestamp_ms).await?;
         self.apply_appended_event(&retirement, timestamp_ms).await?;
         self.update_manifest_and_schedule_catalog().await;
+        self.state.load_status = SessionLoadStatusKind::Current;
+        self.refresh_snapshot();
+        Ok(marker)
+    }
+
+    fn commit_memory_compaction_checkpoint(
+        &mut self,
+        request: &crate::CompactionCheckpointCommit,
+        timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        let events = self
+            .state
+            .events
+            .as_ref()
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        crate::compaction_checkpoint::validate_memory_commit(events, request)?;
+        crate::ensure_durable_session_event_kind(&request.marker, None)?;
+        // Reserve both sequence increments and perform all fallible construction before
+        // publication. This actor command has no await point between the two applications.
+        self.state.next_sequence.checked_add(2).ok_or_else(|| {
+            SessionError::EventSerialization("compaction sequence exhausted".into())
+        })?;
+        let marker = self
+            .state
+            .build_next_event(request.marker.clone(), timestamp_ms);
+        let retirement_kind = bcode_session_models::CompactionSynthesisCheckpoint {
+            version: 1,
+            operation_key: request.operation_key.clone(),
+            host_payload: None,
+        }
+        .into_event_kind(timestamp_ms)
+        .map_err(SessionError::EventSerialization)?;
+        let mut retirement = self.state.build_next_event(retirement_kind, timestamp_ms);
+        retirement.sequence = marker.sequence + 1;
+        crate::persisted::encode_session_event(&marker)
+            .map_err(|_| SessionError::EventSerialization("invalid compaction marker".into()))?;
+        crate::persisted::encode_session_event(&retirement).map_err(|_| {
+            SessionError::EventSerialization("invalid compaction retirement".into())
+        })?;
+        self.state
+            .apply_persisted_event(marker.clone(), timestamp_ms);
+        self.retire_live_text_checkpoint_for_durable_event(&marker.kind);
+        self.state.apply_persisted_event(retirement, timestamp_ms);
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         Ok(marker)

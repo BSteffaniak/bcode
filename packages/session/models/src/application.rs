@@ -683,6 +683,24 @@ pub trait SessionApplication: Sync {
         query: SessionInspectionQuery,
     ) -> impl Future<Output = Result<SessionInspectionPage, SessionApplicationFailure>> + Send;
 
+    /// Inspect secret-safe compaction evidence without replay or checkpoint restoration.
+    ///
+    /// # Errors
+    /// Returns `unsupported_operation` by default. Implementations reject invalid bounds,
+    /// unavailable storage or incompatible namespaces using normalized failures.
+    fn inspect_compaction(
+        &self,
+        _session_id: SessionId,
+        _query: crate::SessionCompactionInspectionQuery,
+    ) -> impl Future<
+        Output = Result<crate::SessionCompactionInspectionPage, SessionApplicationFailure>,
+    > + Send {
+        std::future::ready(Err(SessionApplicationFailure {
+            code: "unsupported_operation".into(),
+            message: "Compaction inspection is unavailable in this application".into(),
+        }))
+    }
+
     /// Rename a canonical session, publishing its event and updating its derived catalog entry.
     ///
     /// # Errors

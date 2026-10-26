@@ -5,6 +5,14 @@ set -euo pipefail
 # cancellation and isolated daemon restart/crash using the static fake provider.
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 binary="${BCODE_COMPACTION_EVAL_BINARY:-}"
+if [[ "${1:-}" == "--python-only" ]]; then
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "${root}/fixtures/evals/compaction" -p 'test_*.py'
+    exit
+fi
+if [[ $# -ne 0 ]]; then
+    echo 'usage: check-compaction-eval.sh [--python-only]' >&2
+    exit 2
+fi
 if [[ -z "${binary}" ]]; then
     cargo build --locked -p bcode --bin bcode --features app,static-bundled-plugins,static-bundled-fake-provider-plugin
     binary="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug/bcode"

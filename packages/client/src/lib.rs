@@ -1421,6 +1421,19 @@ impl bcode_session_models::SessionApplication for BcodeClient {
             .await
             .map_err(session_application_failure)
     }
+    async fn inspect_compaction(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionCompactionInspectionQuery,
+    ) -> Result<
+        bcode_session_models::SessionCompactionInspectionPage,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        self.session_compaction_inspection(session_id, query)
+            .await
+            .map_err(session_application_failure)
+    }
+
     async fn inspect_session(
         &self,
         session_id: SessionId,
@@ -4901,10 +4914,27 @@ impl BcodeClient {
         }
     }
 
+    /// Read bounded, secret-safe compaction observations without opening a session.
+    ///
+    /// # Errors
+    /// Returns an error if the request fails or the daemon returns an incompatible response.
+    pub async fn session_compaction_inspection(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionCompactionInspectionQuery,
+    ) -> Result<bcode_session_models::SessionCompactionInspectionPage, ClientError> {
+        let response = self
+            .send_request(Request::SessionCompactionInspection { session_id, query })
+            .await?;
+        match response {
+            ResponsePayload::SessionCompactionInspection { page } if page.version == 1 => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return one bounded structured session investigation page.
     ///
     /// # Errors
-    ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn session_inspection(
         &self,

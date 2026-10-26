@@ -278,7 +278,7 @@ pub fn serve(config: Config) -> Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = config;
+        drop(config);
         Err(unsupported())
     }
 }
@@ -363,7 +363,7 @@ fn exchange(command: Command) -> Result<Status> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = command;
+        drop(command);
         Err(unsupported())
     }
 }

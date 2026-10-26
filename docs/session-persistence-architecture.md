@@ -14,7 +14,10 @@ from model-turn evidence. The host owns the opaque accepted-synthesis payload an
 identity; the checkpoint itself is never model-context content. A retirement record remains the
 latest evidence rather than exposing an older accepted synthesis. Accepted synthesis can be reused
 after cancellation or restart, but recording it does not advance the compaction marker: only the
-full atomic compaction commit publishes the marker and context changes.
+full atomic compaction commit publishes the marker and context changes. Persistent sessions commit
+marker plus retirement transactionally; in-memory sessions validate and publish both events in one
+serialized actor command without an intervening await. The latter is process-local, not durable
+restart evidence.
 
 The known, lossless `session-writer-epoch-16-to-17` edge uses the existing exclusive migration
 path to rebuild derived projections, including `turn_evidence`, from canonical history. Event
@@ -29,6 +32,51 @@ coordination, refuses live owners regardless of artifact identity, verifies the 
 before mutation, and uses the existing transactional rebuild/rollback path. Interruption or failed
 validation leaves the prior writer contract and canonical authority intact; a later verified owner
 can retry. Normal bounded reads do not replay history or repair this projection.
+
+### Original-activation recovery and uncertain outcomes
+
+Automatic compaction also uses a version-2 provider-retry checkpoint, separate from the version-1
+synthesis envelope. It retains the original activation and execution counters, selected compaction
+plan and protected phase. Recovery verifies canonical activation evidence, the exact original
+execution descriptor and session/workflow ownership. Config-recovery sources remain confined to
+verified allowed roots; private restart fixtures retain their config inside the session root rather
+than relaxing confinement. Recovery does not select replacement-daemon defaults. FIFO dispatch
+requires the same session, activation sequence, submission ID and turn target as the oldest
+activated record. It neither reactivates input nor skips unresolved work.
+
+A safe point is resumable; a dispatched local chunk requires exact canonical accepted-chunk proof.
+A reservation alone does not prove acceptance. Interrupted native dispatch or local dispatch
+without that proof settles the original activation as an unresolved-outcome error without request
+replay. Cancellation and existing terminal outcomes retain their semantics. Later admitted work
+can reuse validated local carry after settlement; that is not evidence that an ambiguous provider
+operation had no effects. Manual compaction has no automatic original-turn recovery authority.
+
+Optional overflow diagnostics retain bounded, control-character-filtered normalized provider
+code/message (128/1,024 characters). Recovery failures can preserve the original overflow alongside
+the later failure; older checkpoints may omit it. Typed public inspection excludes these details.
+This extends compaction recovery, not general replay of arbitrary interrupted provider/tool work.
+See [Model-specific context compaction](model-specific-context-compaction.md) for host checkpoint
+identity, packing, attempt allowances and evaluation limits.
+
+### Bounded inspection and presentation privacy
+
+`bcode session compaction-status <session-id> [--before SEQ] [--limit N] [--json]` exposes a
+version-1 typed historical page through the application boundary. It scans bounded indexed
+candidates and verifies canonical evidence, with byte/structural allowances and explicit degraded
+coverage. Limits are 1..=200 candidates (default 50), not matching entries. Continue with the
+returned cursor unchanged even when an incomplete page has no entries. Reads do not repair,
+reindex, replay history or restore execution state.
+
+Only closed phase/resume/blocker vocabulary and optional validated counters are presented. Missing
+legacy progress is not fabricated; checkpoint presence alone does not establish resumability.
+Operation keys, summaries, source manifests, provider diagnostics and opaque carry remain absent.
+Historical terminal evidence cannot reopen work.
+
+Canonical event storage, history/range/source-page APIs and export retain exact evidence. Semantic
+observation/presentation uses payload-free copies of compaction-synthesis checkpoint events rather
+than publishing their private carry. This is presentation redaction, not mutation, retirement or a
+replacement authority for canonical history. Request-only context must not enter durable carry or
+markers implicitly.
 
 ## Provider retry recovery
 
@@ -49,8 +97,9 @@ reads at most one retry checkpoint alongside existing terminal/output evidence; 
 history cannot hide it. The epoch-15-to-16 migration rebuilds derived evidence through the normal
 exclusive migration path; older writers are fenced from silently discarding retry evidence.
 
-A checkpoint authorizes recovery only during a provider-only backoff interval, after failed-attempt
-cleanup. It is retired before another provider attempt or tool execution can begin. Restart
+A version-1 checkpoint authorizes recovery only during a provider-only backoff interval, after
+failed-attempt cleanup. It is retired before another provider attempt or tool execution can begin.
+Version-2 protected automatic compaction recovery is described above. Restart
 recovery retains nonterminal work and verifies the original submission execution descriptor and
 session/workflow ownership before dispatching the same activation. It restores remaining backoff,
 limits and source positions without activating input again or replaying tools. A mismatched or

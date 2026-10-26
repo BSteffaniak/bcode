@@ -10,6 +10,17 @@
 //! model, auth profile, format version, and compatibility key match. The portable summary is the
 //! required fallback for every other surface.
 
+/// Bounded, secret-safe compaction diagnostics and host observation contracts.
+pub mod compaction_inspection;
+pub use compaction_inspection::{
+    COMPACTION_PROGRESS_OBSERVATION_EVENT, CompactionInspectionBlocker,
+    CompactionInspectionBudgets, CompactionInspectionCount, CompactionInspectionPhase,
+    CompactionInspectionResume, CompactionProgressObservation,
+    MAX_COMPACTION_INSPECTION_CANDIDATES, MAX_COMPACTION_PROGRESS_OBSERVATION_BYTES,
+    SessionCompactionInspectionEntry, SessionCompactionInspectionPage,
+    SessionCompactionInspectionQuery,
+};
+
 /// Versioned operational compaction evidence.
 pub mod compaction_checkpoint;
 pub use compaction_checkpoint::{

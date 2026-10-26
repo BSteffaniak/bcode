@@ -27,7 +27,7 @@ use crate::{
     contracts::{Cancellation, RecognitionOptions, Recognizer, Recording, Transcript},
 };
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_WAV_BYTES: usize = 64 * 1024 * 1024;

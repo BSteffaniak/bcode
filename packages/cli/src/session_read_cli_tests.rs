@@ -105,6 +105,26 @@ fn history_payload(
                 },
             }
         }
+        bcode_ipc::Request::SessionCompactionInspection {
+            session_id: actual,
+            query,
+        } => {
+            assert!(!inspection);
+            assert_eq!(*actual, session_id);
+            assert_eq!(query.before, Some(SessionHistoryCursor { sequence: 20 }));
+            assert_eq!(query.limit, 5);
+            bcode_ipc::ResponsePayload::SessionCompactionInspection {
+                page: bcode_session_models::SessionCompactionInspectionPage {
+                    version: 1,
+                    session_id,
+                    entries: Vec::new(),
+                    scanned_events: 5,
+                    degraded: false,
+                    next_cursor: Some(SessionHistoryCursor { sequence: 10 }),
+                    has_more: true,
+                },
+            }
+        }
         bcode_ipc::Request::SessionInspection {
             session_id: actual,
             query,
@@ -149,7 +169,7 @@ async fn ownerless_history_read_child() {
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let server = tokio::spawn(async move {
         for fail in [false, true] {
-            for inspection in [false, true] {
+            for inspection in [false, true, false] {
                 let mut stream = hello(&listener).await;
                 let envelope = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
                 let request = bcode_ipc::decode_request(&envelope.payload).unwrap();
@@ -178,7 +198,8 @@ async fn ownerless_history_read_child() {
                 true,
             )
             .await;
-            for result in [around, inspect] {
+            let compaction = session_compaction_status(session_id, Some(20), 5, true).await;
+            for result in [around, inspect, compaction] {
                 if fail {
                     let error = result.unwrap_err().to_string();
                     assert!(

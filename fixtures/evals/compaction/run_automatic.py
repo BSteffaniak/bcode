@@ -18,7 +18,9 @@ from verify_automatic import accepted_checkpoint, admitted_turn, attempts, verif
 
 
 class Driver:
-    def __init__(self, binary, interruption, timeout, adaptive_packing=False, source_repeat=1800):
+    def __init__(self, binary, interruption, timeout, adaptive_packing=False, source_repeat=1800,
+                 legacy_restart_cancel=False):
+        self.legacy_restart_cancel = legacy_restart_cancel
         self.adaptive_packing = adaptive_packing
         self.source_repeat = source_repeat
         self.binary = binary
@@ -29,14 +31,15 @@ class Driver:
         self.repo.mkdir()
         self.control = self.work / "control"
         self.control.mkdir()
-        self.config = self.work / "offline.toml"
+        self.config = self.repo / "offline.toml"
         self.server = None
         self.logs = []
         with binary.open("rb") as executable:
             binary_sha256 = hashlib.file_digest(executable, "sha256").hexdigest()
         self.identity = {"binary": str(binary), "sha256": binary_sha256,
                          "daemon_pids": [], "interruption": interruption, "result": "not_completed",
-                         "adaptive_packing": adaptive_packing, "source_repeat": source_repeat}
+                         "adaptive_packing": adaptive_packing, "source_repeat": source_repeat,
+                         "legacy_restart_cancel": legacy_restart_cancel}
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("BCODE_")}
         self.env["BCODE_CONFIG"] = str(self.config)
         self.env["BCODE_SOCKET"] = str(self.work / "daemon.sock")
@@ -159,6 +162,52 @@ enabled = false
                        and event["kind"]["model_turn_finished"]["outcome"] == outcome for event in events)
         self.until(settled, f"canonical {outcome} for exact turn {turn_id}")
 
+    def reconnect_and_settle(self, turn_id):
+        """Normal bounded attachment triggers recovery; history reads stay non-mutating."""
+        stdout = (self.work / "reconnect-watch.jsonl").open("w")
+        stderr = (self.work / "reconnect-watch.stderr").open("w")
+        watcher = subprocess.Popen(self.base + ["session", "watch", self.session,
+                                   "--limit", "32", "--json"], cwd=self.repo, env=self.env,
+                                   stdout=stdout, stderr=stderr)
+        try:
+            # Wait for a real initial snapshot so a slow/failed attach cannot be
+            # confused with reconnect recovery. Only the watcher owns attachment;
+            # subsequent exports remain passive observations.
+            def attached():
+                if watcher.poll() is not None:
+                    raise ValueError("normal reconnect watcher exited before initial snapshot")
+                path = self.work / "reconnect-watch.jsonl"
+                with path.open() as stream:
+                    line = stream.readline(4 * 1024 * 1024)
+                if not line.endswith("\n"):
+                    return False
+                value = json.loads(line)
+                if value.get("type") != "snapshot" or value.get("session_id") != self.session:
+                    raise ValueError("normal reconnect did not yield exact-session snapshot")
+                return True
+            self.until(attached, "normal watcher initial snapshot")
+            self.save("reconnect.json", json.dumps({"format": "bcode.compaction.reconnect.v1",
+                       "operation": "session watch", "initial_event_limit": 32,
+                       "pid": watcher.pid, "turn_id": turn_id,
+                       "outcome": "attached_pending_settlement"}, indent=2))
+            self.terminal(turn_id, "error")
+            if watcher.poll() is not None:
+                raise ValueError("normal reconnect watcher exited before settlement observation")
+            self.save("reconnect.json", json.dumps({"format": "bcode.compaction.reconnect.v1",
+                       "operation": "session watch", "initial_event_limit": 32,
+                       "pid": watcher.pid, "turn_id": turn_id,
+                       "outcome": "exact_original_terminal_observed"}, indent=2))
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+                try:
+                    watcher.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    watcher.kill()
+                    watcher.wait(timeout=10)
+            stdout.close()
+            stderr.close()
+
     def execute(self):
         self.start()
         self.session = self.run("session", "create", "automatic-compaction-regression").stdout.strip()
@@ -201,11 +250,20 @@ enabled = false
         else:
             self.stop(crash=self.interruption == "crash")
             self.start()
-            # Restart does not authorize replaying the interrupted turn. Explicitly settle
-            # that exact turn through the supported cancellation boundary, retaining carry.
-            self.save("post-restart-cancel.json", self.run("cancel", self.session,
-                      "--turn-id", turn_id, "--json").stdout)
-            self.terminal(turn_id, "cancelled")
+            if self.legacy_restart_cancel:
+                self.save("post-restart-cancel.json", self.run("cancel", self.session,
+                          "--turn-id", turn_id, "--json").stdout)
+                self.terminal(turn_id, "cancelled")
+            else:
+                # Readiness is not settlement: require the original activation's terminal
+                # outcome without a cancellation request or replacement admission.
+                self.reconnect_and_settle(turn_id)
+                settled = load_events([self.export("restart-settlement-history.jsonl")])
+                from verify_automatic import original_activation_settlement
+                evidence = original_activation_settlement(settled, admission, "error")
+                if evidence["message"] != "interrupted compaction provider outcome is unresolved; no request replayed":
+                    raise ValueError("restart error did not explicitly preserve unresolved provider outcome")
+                self.save("original-activation-settlement.json", json.dumps(evidence, indent=2))
         self.export("interrupted.jsonl")
         # Ordinary new turn admission exercises the real same-session automatic path.
         followup = self.run("send", self.session,
@@ -237,9 +295,10 @@ enabled = false
             raise ValueError("no final atomic compaction marker followed by canonical terminal continuation")
         self.save("context-report.json", self.run("session", "context-observation-report", self.session,
                                                    "--output-directory", str(self.work / "captures")).stdout)
+        self.save("artifact-identity.json", json.dumps(self.identity, indent=2))
         report = verify_automatic(self.work)
         self.save("verification.json", json.dumps(report, indent=2))
-        self.identity["result"] = "passed"
+        self.identity["result"] = "legacy_workaround_only" if self.legacy_restart_cancel else "passed"
 
     def close(self):
         self.stop()
@@ -253,6 +312,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--interruption", choices=("cancel", "restart", "crash"), default="cancel")
+    parser.add_argument("--legacy-restart-cancel", action="store_true",
+                        help="Historical workaround only; does NOT prove automatic recovery")
     parser.add_argument("--timeout-secs", type=int, default=60)
     parser.add_argument("--adaptive-packing", action="store_true", help="Opt into real experimental adaptive packing")
     parser.add_argument("--source-repeat", type=int, default=1800, help="Bounded canonical source size for paired packing trials")
@@ -263,7 +324,10 @@ def main():
         parser.error("timeout must be 1..300 seconds")
     if not 1800 <= args.source_repeat <= 6000:
         parser.error("source repeat must be 1800..6000")
-    driver = Driver(args.binary, args.interruption, args.timeout_secs, args.adaptive_packing, args.source_repeat)
+    if args.legacy_restart_cancel and args.interruption == "cancel":
+        parser.error("legacy restart cancellation applies only to restart/crash")
+    driver = Driver(args.binary, args.interruption, args.timeout_secs, args.adaptive_packing,
+                    args.source_repeat, args.legacy_restart_cancel)
     try:
         driver.execute()
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:

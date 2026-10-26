@@ -171,6 +171,42 @@ def admitted_turn(value):
     return receipt["turn_id"]
 
 
+def original_activation_settlement(events, admission, outcome):
+    """Bind terminal evidence to the exact original admission and canonical activation."""
+    turn = admitted_turn(admission)
+    variant = admission["admission"]
+    receipt = next(variant[key] for key in ("accepted", "existing", "deferred") if key in variant)
+    accepted = [event for event in events if event["sequence"] == receipt.get("accepted_event_sequence")]
+    if len(accepted) != 1:
+        raise ValueError("original accepted event is unavailable")
+    accepted_kind = accepted[0]["kind"]
+    if "submission_accepted" in accepted_kind:
+        submission = accepted_kind["submission_accepted"]["submission"]
+        if submission.get("target", {}).get("own_turn", {}).get("turn_id") != turn:
+            raise ValueError("accepted submission targets another activation")
+    elif "submission_activated" in accepted_kind:
+        if accepted_kind["submission_activated"].get("turn_id") != turn:
+            raise ValueError("accepted activation belongs to another turn")
+    elif "user_message" not in accepted_kind:
+        raise ValueError("receipt does not identify a canonical accepted input")
+    activations = [event for event in events
+                   if event["kind"].get("model_turn_started", {}).get("turn_id") == turn]
+    terminals = [event for event in events
+                 if event["kind"].get("model_turn_finished", {}).get("turn_id") == turn]
+    if len(activations) != 1 or len(terminals) != 1:
+        raise ValueError("need unique original canonical activation and exact-turn terminal")
+    activation, finished = activations[0], terminals[0]
+    if (activation["sequence"] < accepted[0]["sequence"]
+            or finished["kind"]["model_turn_finished"]["outcome"] != outcome
+            or finished["sequence"] <= activation["sequence"]):
+        raise ValueError("terminal does not settle the exact originally admitted activation")
+    return {"format": "bcode.compaction.activation-settlement.v1", "turn_id": turn,
+            "accepted_event_sequence": receipt["accepted_event_sequence"],
+            "activation_sequence": activation["sequence"],
+            "terminal_sequence": finished["sequence"], "outcome": outcome,
+            "message": finished["kind"]["model_turn_finished"].get("message")}
+
+
 def verify_automatic(work):
     work = Path(work)
     events = load_events([work / "seed.jsonl", work / "before-interruption.jsonl",
@@ -181,6 +217,27 @@ def verify_automatic(work):
         raise ValueError("original history authority replaced before synthesis completion")
     checkpoint_event, _, checkpoint = accepted_checkpoint(load_events([work / "before-interruption.jsonl"]))
     interruption = json.loads((work / "interruption.json").read_text())
+    identity = json.loads((work / "artifact-identity.json").read_text()) if (work / "artifact-identity.json").exists() else {}
+    if interruption["mode"] in ("restart", "crash") and not identity.get("legacy_restart_cancel", False):
+        receipt = json.loads((work / "trigger-admission.json").read_text())
+        original_turn = admitted_turn(receipt)
+        original_receipt = next(value for key, value in receipt["admission"].items()
+                                if key in ("accepted", "existing", "deferred"))
+        accepted = next(event for event in events
+                        if event["sequence"] == original_receipt["accepted_event_sequence"])
+        descriptor = accepted["kind"].get("submission_accepted", {}).get("submission", {}).get("execution_descriptor")
+        if not isinstance(descriptor, dict):
+            raise ValueError(f"original turn {original_turn} lacks persisted real execution descriptor")
+        expected = original_activation_settlement(events, receipt, "error")
+        saved = json.loads((work / "original-activation-settlement.json").read_text())
+        reconnect = json.loads((work / "reconnect.json").read_text())
+        if (reconnect.get("format") != "bcode.compaction.reconnect.v1"
+                or reconnect.get("operation") != "session watch"
+                or reconnect.get("turn_id") != expected["turn_id"]
+                or reconnect.get("outcome") != "exact_original_terminal_observed"):
+            raise ValueError("restart requires normal watcher attachment before exact settlement")
+        if saved != expected or (work / "post-restart-cancel.json").exists():
+            raise ValueError("restart recovery lacks exact original settlement without cancellation")
     if checkpoint_event["sequence"] >= selected[-1][0]["sequence"]:
         raise ValueError("acceptance checkpoint must precede final atomic marker")
     resumed = json.loads((work / "resumed-attempt.json").read_text())["attempt"]
@@ -222,7 +279,8 @@ def verify_automatic(work):
                event["kind"].get("model_turn_finished", {}).get("turn_id") == target_turn and
                event["kind"]["model_turn_finished"]["outcome"] == "completed" for event in events):
         raise ValueError("no canonical completed continuation after final marker")
-    print(f"PASS: automatic multi-chunk {interruption['mode']}; accepted prefix reused, lossless user fragments, real continuation request")
+    label = "LEGACY WORKAROUND ONLY" if identity.get("legacy_restart_cancel") else "PASS"
+    print(f"{label}: automatic multi-chunk {interruption['mode']}; accepted prefix reused, lossless user fragments, real continuation request")
     return {"synthesis_requests": len(ordered), "planned_chunks": len(checkpoint["manifest"])}
 
 

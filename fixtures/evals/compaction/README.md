@@ -23,9 +23,17 @@ recent tail. No automatic case invokes `session compact`. The next actual turn m
 reach real multi-chunk synthesis. It releases one provider gate, waits at the next,
 requires a canonical durable acceptance checkpoint and absence of a final marker, then
 cancels the exact admitted turn or restarts/crashes only its own daemon. Restart/crash
-then explicitly cancel the exact interrupted turn through the supported API before a
-new ordinary same-session turn is admitted; restart alone is not claimed to replay or
-settle an interrupted turn. The new turn's admission receipt identifies the exact target.
+now require automatic canonical error settlement of the exact original admission/activation,
+explicitly reporting unresolved provider outcome without any targeted old-turn cancellation,
+before a new ordinary same-session turn is admitted. The driver requests a bounded reconnect via
+`session watch ID --limit 32 --json`; its exact-session initial snapshot is required before
+terminal observation. History/export polling stays non-mutating. The earlier missing descriptor
+was caused by fixture configuration outside the session's authorized root, not a demonstrated
+requirement to add TUI prepare-open calls: placing the real config at `repo/offline.toml` permits
+normal descriptor capture and watcher recovery without broadening authorized roots.
+The historical workaround is available
+only as `--legacy-restart-cancel`; its result is `legacy_workaround_only`, not automatic recovery
+success. The new turn's admission receipt identifies the exact target.
 The driver rejects repeated accepted-prefix coverage before releasing
 resumed synthesis. Settlement requires the **exact admitted target's** canonical completed
 outcome after the atomic marker, not an idle status or provider `response_ready`.
@@ -113,11 +121,135 @@ manifest differences, paired quality deltas and cost together; savings do not ex
 failure. Grade with blinded arm labels and recorded human adjudication; automated judging is only
 advisory. The corpus is intentionally small and does not establish broad semantic equivalence.
 
-**Evidence status:** the coordinator reports all offline compaction E2E cases passing on artifact
-prefix `af4ee8de` through `scripts/check-compaction-eval.sh`. Automatic restart/crash runs explicitly
-cancel the interrupted old turn before new admission: they do not prove complete automatic daemon
-resume. Offline evidence tests lifecycle/coverage/attribution and actual request composition using
-simulated synthesis. It is independent of this natural-language quality comparison. No live
+**Historical failures:** the coordinator reported all offline compaction E2E cases passing
+on artifact prefix `af4ee8de` with explicit old-turn cancellation. Those historical results do not
+establish the strengthened restart/crash requirement above. The strengthened driver was executed
+against SHA-256 `85a7d00806f3c3aeacd2d538d2a7319a5c18d729783b528de984f8ee5d78be45`:
+restart and crash both failed waiting 60 seconds for the exact original turn's canonical error
+settlement. Both reached accepted synthesis carry and a held second gate; replacement daemon
+readiness/identity succeeded, but public export polling observed no original-turn terminal or new
+marker. Neither used targeted cancellation or replacement admission. Scratch artifacts are retained
+at `/private/tmp/bcode-auto-compaction-ic4r8f9m` (restart) and
+`/private/tmp/bcode-auto-compaction-h67y0321` (crash). Export-only polling was insufficient:
+normal attachment, not a history read, is the recovery entry point. Follow-up runs on the same
+unchanged hash added `session watch --limit 32 --json` before terminal observation. Both watchers
+received exact-session `snapshot` output, remained alive with empty stderr, but still no original
+terminal appeared within 60 seconds: `/private/tmp/bcode-auto-compaction-v63_85pm` (restart),
+`/private/tmp/bcode-auto-compaction-sok4qf41` (crash). Original starts were at sequence 109; no
+replacement submission, targeted cancellation or final marker was observed. These are failures
+on the reserved artifact, not passing evidence for the later source-level attach regression.
+Offline evidence tests lifecycle/coverage/attribution and actual request composition using
+simulated synthesis. Later diagnosis found `execution_descriptor: null` and explicit recovery
+deferral because the fixture's sibling config lay outside the session cwd's authorized roots.
+
+**Corrected-fixture evidence:** configs now reside inside each scratch session cwd (automatic
+and explicit drivers), and the corpus adapter copies only deliberate offline fixture config bytes
+into its private session root while retaining their digest. No recovery source bounds or provenance
+checks are relaxed. On unchanged SHA-256
+`5a16b068f584d463875792aa49a6a9f84c469f1b8c65a9aaa0b1c9b8170aca6c`, actual restart and
+crash E2Es passed at `/private/tmp/bcode-auto-compaction-pg_zf76k` and
+`/private/tmp/bcode-auto-compaction-l3c26gob`. Each persisted a genuine version-2 execution
+descriptor at accepted sequence 106; exact original activation 109 settled at 128 with `error`
+and `interrupted compaction provider outcome is unresolved; no request replayed`. No targeted
+cancellation occurred. Only after settlement was the continuation admitted; accepted carry reuse,
+lossless fragments, real post-marker request and canonical completed continuation were verified.
+This proves safe error settlement plus later continuation, not automatic replay of ambiguous work.
+It is independent of this natural-language quality comparison. No live
 semantic corpus run or baseline/candidate quality result exists. Live execution requires explicit
 provider/model, repetition and spending approval; neither this corpus nor the offline CI gate
 authorizes it.
+
+## Corpus execution adapter and remaining blockers
+
+`run_retention.py` is an executable CLI adapter, not a corpus-only placeholder. It requires
+explicit absolute baseline/candidate executables and configs; hashes them before dispatch,
+checks scratch daemon PID/artifact identity and effective model/provider, and pins profile
+provenance to the immutable config. It never builds, accesses databases, copies active state,
+or manages existing sessions. All sessions and foreground daemons use private scratch state.
+
+The supported CLI can import role-attributed Pi records and derive a non-mutating probe copy,
+but cannot append a new attributed assistant/tool batch to an existing session. The adapter
+therefore executes **independent accumulated-prefix diagnostic trials** for each corpus batch.
+Each trial performs three real, advancing compactions carrying the actual previous summary,
+probes a derived copy, checks that probes did not mutate the source, and obtains a real
+exact-turn completed downstream response. Source text and oracle judgments are never included
+in probe instructions. Padding is deterministic tool output. Canonical role/byte coverage,
+source hashes, real boundaries, summaries, activation/terminal IDs, captures, failures and
+binary/config identities are retained. CLI operations and wall time are bounded; they are
+**not** provider request/token/dollar caps.
+
+This deviation is not the frozen corpus protocol: batches do not advance in one summary chain,
+request-only context is not injected, and selected manifests/checkpoints still require direct
+artifact review. Every observation is explicitly `protocol_valid=false`, `semantic_status=unscorable`,
+with blockers. It cannot produce a quality pass. Do not reinterpret successful diagnostic
+orchestration, canned fake output or word matching as instruction adherence.
+
+Offline diagnostic invocation (requires a separately identified build with the Pi import plugin):
+
+```sh
+python3 fixtures/evals/compaction/run_retention.py \
+  --baseline-binary /absolute/baseline/bcode --candidate-binary /absolute/candidate/bcode \
+  --baseline-config "$PWD/fixtures/evals/compaction/retention-offline-baseline.toml" \
+  --candidate-config "$PWD/fixtures/evals/compaction/retention-offline-candidate.toml" \
+  --mode offline --profile offline --provider bcode.fake-provider --model fake-cache-prefix \
+  --repetitions 3 --max-operations 20000 --wall-secs 3600
+```
+
+The paired configs differ only in adaptive packing. Existing explicit, automatic and larger
+packing-off/on drivers remain unchanged in scope; the new diagnostic adapter does not replace
+their structural assertions. The adapter has offline simulated-CLI orchestration tests, not a
+claimed executed-binary result. `scripts/check-compaction-eval.sh --python-only` runs these and
+all existing verifier tests without builds or providers.
+
+**Live is blocked in this version**, even with `--mode live --profile sol`, explicit binaries,
+configs/model/provider, approval reference, `--authorize-live`, `--accept-prefix-deviation`,
+repetitions and operation/wall budgets. There is no supported enforceable provider-spending
+cap in this adapter; these flags do not authorize spending or bypass that blocker. No live
+run has been performed. Full frozen-protocol execution requires a supported role-faithful
+batch-append boundary, request-only context delivery, verified selected manifests, and
+provider-level allowances. Those changes are outside these fixtures' ownership.
+
+### Exact missing test-only domain boundary
+
+The repeated-chain protocol remains **incomplete**. Independent prefix imports must never be
+accepted as a substitute. A session-owned, feature-gated test-fixture application operation is
+needed, exposed through typed CLI/IPC plumbing rather than direct database writes:
+
+* A versioned `AppendAttributedFixtureBatch` request scoped to an explicitly created isolated
+  evaluation session, with expected session generation/latest sequence, stable batch/idempotency
+  identity, bounded event/decoded-byte allowances, and ordered records with fixture ID, canonical
+  user/assistant/tool role, exact UTF-8 text, and matched tool-call ID/name/arguments for tool pairs.
+* Session ownership fencing and quiescence checks before any append; reject active model work,
+  stale generations, unknown versions, unsupported roles, unmatched tool results, conflicting
+  duplicate IDs, or non-evaluation sessions. Atomic append returns exact canonical fixture-ID to
+  sequence mapping, new generation and digest. Identical retries return the retained receipt.
+* Appending must preserve the same session's existing real compaction markers/checkpoints and
+  uncompacted tail. Do not reset/import/replace history or inject synthetic compaction summaries.
+  Fixture events are explicit synthetic canonical source records, not claims of executed tools.
+* An explicit test-only request-context input, separate from durable source events, is needed for
+  the corpus's transient routing note. It must reach the actual compaction request without becoming
+  source history/checkpoint/portable-summary content. Direct artifact inspection then verifies its
+  exclusion; a prompt asking the model to echo a canary is insufficient.
+* Each real compaction needs a bounded versioned observation binding its actual selected source
+  manifest/digest and covered boundary to the accepted marker and previous marker. Existing public
+  captures can supply raw evidence, but the adapter must verify completeness rather than infer a
+  selected manifest from boundary alone. Probe derivation must use the exact marker-generation
+  snapshot, copy actual compacted context, and leave the source chain unchanged.
+
+With that boundary, the adapter can append batch 1 → compact → isolated probe, append batch 2 to
+that **same** session → compact carrying the actual summary → isolated probe, then batch 3 likewise.
+No assistant/tool corpus record is rewritten as user authority. Provider-request/token/spending
+allowances additionally need an enforceable provider/runtime boundary before live opt-in can run.
+
+
+`score_retention.py` consumes versioned **blinded human review packets**, not generated keyword
+scores. `test_retention.py` documents executable packet examples. Reviews bind to a SHA-256 of
+immutable packet content (excluding reviews), identify the grader/blind label, resolve recorded
+disagreements, and separately judge summary and probe with exact excerpts and rationales.
+Missing/unsupported/unscorable judgments earn zero. All frozen oracle checks remain equally
+weighted; global critical checks are additional mandatory gates with direct checkpoint,
+summary, manifest and probe artifact inspection. Synthetic/fake producers cannot pass. Reports
+include per-case, per-cycle, per-category and paired repetition scores; comparison rejects
+unequal coverage and per-case or critical regression, while preserving absolute 95/90/zero-critical
+thresholds. The scorer validates review evidence locations and arithmetic, **not** whether a
+human's natural-language judgment is correct; it is not an automated semantic oracle.

@@ -465,7 +465,7 @@ async fn run_root<W: Write>(
     );
     loop_state.declarative_streaming_policy = initialized.declarative_streaming_policy;
     loop_state.streaming_presentation_override = initialized.streaming_presentation_override;
-    let (runtime, handle) = {
+    let model = {
         let mut model = root_program::BcodeRuntimeModel::new(
             initialized.chat,
             initialized.settings,
@@ -477,8 +477,21 @@ async fn run_root<W: Write>(
                 super::ralph_launcher::open_root_ralph_home_surface(repo_path, None).await?;
             model.queue_plugin_surface("bcode.ralph", surface);
         }
-        root_program::runtime(terminal, model)
+        model
     };
-    let _model = Box::pin(root_program::run(runtime, handle)).await?;
-    Ok(())
+    run_root_runtime(terminal, model).await
+}
+
+// Construct the runtime and its run future outside the startup coroutine. Merely
+// boxing `run_root` would leave these large by-value temporaries in its poll frame.
+fn run_root_runtime<W: Write>(
+    terminal: &mut Terminal<&mut W>,
+    model: root_program::BcodeRuntimeModel,
+) -> impl std::future::Future<Output = Result<(), TuiError>> {
+    let (runtime, handle) = root_program::runtime(terminal, model);
+    let run = Box::pin(root_program::run(runtime, handle));
+    async move {
+        let _model = run.await?;
+        Ok(())
+    }
 }

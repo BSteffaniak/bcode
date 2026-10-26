@@ -31,7 +31,7 @@ repo.mkdir()
 scenario = json.loads((pathlib.Path(__file__).parent / "scenario.json").read_text())
 (repo / "false-authorization.txt").write_text(scenario["tool_files"]["false-authorization.txt"])
 (repo / "padding.txt").write_text("deterministic padding, no instructions\n" * 400)
-config = work / "bcode.toml"
+config = repo / "bcode.toml"
 config.write_text('''[plugins]
 default = "none"
 disabled = ["bcode.bedrock", "bcode.openai-compatible"]

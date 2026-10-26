@@ -30,6 +30,26 @@ fn record() -> SubmissionRecord {
     }
 }
 
+fn private_queue_ipc_fixture() -> (
+    tempfile::TempDir,
+    bcode_ipc::IpcEndpoint,
+    bcode_ipc::LocalIpcListener,
+) {
+    // Keep the Unix socket path short and resolve aliases such as macOS /tmp.
+    let socket = tempfile::tempdir_in("/tmp").unwrap();
+    // Let strict IPC create its own private parent instead of trusting tempfile's mode.
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(
+        socket
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("ipc")
+            .join("queue.sock"),
+    );
+    let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+    (socket, endpoint, listener)
+}
+
 #[tokio::test]
 async fn queue_hydration_and_targeted_actions_use_only_bounded_application_operations() {
     let session_id = SessionId::new();
@@ -51,9 +71,7 @@ async fn queue_hydration_and_targeted_actions_use_only_bounded_application_opera
     };
     let expected_confirmation = confirmation.clone();
     let expected_record = pending.clone();
-    let socket = tempfile::tempdir().unwrap();
-    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket.path().join("queue.sock"));
-    let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+    let (_socket, endpoint, listener) = private_queue_ipc_fixture();
     let responder = tokio::spawn(respond_to_recovery_scenario(
         listener,
         session_id,

@@ -1427,6 +1427,10 @@ pub enum Request {
     SessionCategorization {
         session_id: SessionId,
     },
+    SessionCompactionInspection {
+        session_id: SessionId,
+        query: bcode_session_models::SessionCompactionInspectionQuery,
+    },
     SessionInspection {
         session_id: SessionId,
         query: SessionInspectionQuery,
@@ -2876,6 +2880,9 @@ pub enum ResponsePayload {
     },
     SessionCategorization {
         categorization: Option<bcode_session_models::SessionCategorization>,
+    },
+    SessionCompactionInspection {
+        page: bcode_session_models::SessionCompactionInspectionPage,
     },
     SessionInspection {
         page: SessionInspectionPage,

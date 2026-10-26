@@ -36,6 +36,11 @@ impl Mock {
                     Err(error) => panic!("mock accept failed: {error}"),
                 }
             };
+            // BSD/macOS can inherit the listener's nonblocking flag. Request
+            // reads and response writes must instead honor the timeouts below.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking mock connection");
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("read timeout");

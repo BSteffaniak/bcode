@@ -269,6 +269,10 @@ pub enum SessionLifecycleRequest {
     SessionCategorization {
         session_id: SessionId,
     },
+    SessionCompactionInspection {
+        session_id: SessionId,
+        query: bcode_session_models::SessionCompactionInspectionQuery,
+    },
     SessionInspection {
         session_id: SessionId,
         query: SessionInspectionQuery,
@@ -2375,6 +2379,11 @@ impl RoutedRequest {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionCategorization {
                     session_id,
                 }))
+            }
+            Request::SessionCompactionInspection { session_id, query } => {
+                Self::SessionLifecycle(Box::new(
+                    SessionLifecycleRequest::SessionCompactionInspection { session_id, query },
+                ))
             }
             Request::SessionInspection { session_id, query } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionInspection {

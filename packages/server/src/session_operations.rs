@@ -1036,6 +1036,47 @@ pub async fn inspect(
     Ok(page)
 }
 
+/// Read bounded, secret-safe compaction evidence without transport framing.
+///
+/// # Errors
+/// Rejects incompatible active namespaces or unavailable canonical storage.
+pub async fn inspect_compaction(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+    query: bcode_session_models::SessionCompactionInspectionQuery,
+) -> Result<bcode_session_models::SessionCompactionInspectionPage, ReadHistoryError> {
+    if let Some(namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let mut admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await?;
+    let page = state
+        .sessions
+        .session_compaction_inspection_page(session_id, query)
+        .await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let page =
+        super::storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, page)
+            .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let page = page?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    record_history_access(state, session_id).await;
+    Ok(page)
+}
+
 /// Read bounded source accounting without changing the reporting index.
 /// # Errors
 /// Rejects ambiguous locations, unavailable projections, and changed generations.

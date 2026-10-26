@@ -768,59 +768,59 @@ mod tests {
         state
             .shutdown_requested
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let app = ServicesApplicationHandle::new(&state, ClientId::new());
-        assert_eq!(
-            app.list_agents().await.unwrap_err().code,
-            "services_application_stopped"
-        );
-        assert_eq!(
-            app.list_skills().await.unwrap_err().code,
-            "services_application_stopped"
-        );
-        assert_eq!(
-            app.list_models(None).await.unwrap_err().code,
-            "services_application_stopped"
-        );
-        assert_eq!(
-            app.default_model_status().await.unwrap_err().code,
-            "services_application_stopped"
-        );
-        assert_eq!(
-            app.model_catalog_diagnostics().await.unwrap_err().code,
-            "services_application_stopped"
-        );
-        assert_eq!(
-            app.list_plugin_services().await.unwrap_err().code,
-            "services_application_stopped"
-        );
-        assert_eq!(
-            app.publish_plugin_event("event".into(), vec![])
-                .await
-                .unwrap_err()
-                .code,
-            "services_application_stopped"
-        );
-        assert_eq!(
-            app.cancel_plugin_service_invocation("one".into())
-                .await
-                .unwrap_err()
-                .code,
-            "services_application_stopped"
-        );
-        assert_eq!(
-            app.list_worktrees(PathBuf::from("unavailable"))
-                .await
-                .unwrap_err()
-                .code,
-            "services_application_stopped"
-        );
-        assert_eq!(
+        let final_error = {
+            let app = ServicesApplicationHandle::new(&state, ClientId::new());
+            assert_eq!(
+                app.list_agents().await.unwrap_err().code,
+                "services_application_stopped"
+            );
+            assert_eq!(
+                app.list_skills().await.unwrap_err().code,
+                "services_application_stopped"
+            );
+            assert_eq!(
+                app.list_models(None).await.unwrap_err().code,
+                "services_application_stopped"
+            );
+            assert_eq!(
+                app.default_model_status().await.unwrap_err().code,
+                "services_application_stopped"
+            );
+            assert_eq!(
+                app.model_catalog_diagnostics().await.unwrap_err().code,
+                "services_application_stopped"
+            );
+            assert_eq!(
+                app.list_plugin_services().await.unwrap_err().code,
+                "services_application_stopped"
+            );
+            assert_eq!(
+                app.publish_plugin_event("event".into(), vec![])
+                    .await
+                    .unwrap_err()
+                    .code,
+                "services_application_stopped"
+            );
+            assert_eq!(
+                app.cancel_plugin_service_invocation("one".into())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "services_application_stopped"
+            );
+            assert_eq!(
+                app.list_worktrees(PathBuf::from("unavailable"))
+                    .await
+                    .unwrap_err()
+                    .code,
+                "services_application_stopped"
+            );
             app.worktree_creation_status("one".into())
                 .await
                 .unwrap_err()
-                .code,
-            "services_application_stopped"
-        );
+                .code
+        };
+        assert_eq!(final_error, "services_application_stopped");
         drop(state);
     }
 
@@ -833,13 +833,14 @@ mod tests {
         let state = state();
         {
             let app = ServicesApplicationHandle::new(&state, ClientId::new());
-            {
+            let abandoned_admission = {
                 let abandoned = app
                     .prepare_runtime_shutdown(RuntimeShutdownMode::Force)
                     .await
                     .unwrap();
-                assert_eq!(abandoned.admission().mode, RuntimeShutdownMode::Force);
-            }
+                abandoned.admission()
+            };
+            assert_eq!(abandoned_admission.mode, RuntimeShutdownMode::Force);
             assert!(
                 !state
                     .shutdown_requested
@@ -1013,22 +1014,23 @@ mod tests {
     #[tokio::test]
     async fn invocation_cancellation_and_transient_status_do_not_invent_work() {
         let state = state();
-        {
+        let missing_operation_error = {
             let app = ServicesApplicationHandle::new(&state, ClientId::new());
             assert!(
                 !app.cancel_plugin_service_invocation("missing".into())
                     .await
                     .unwrap()
             );
-            assert_eq!(
-                app.worktree_creation_status("missing".into())
-                    .await
-                    .unwrap_err()
-                    .code,
-                "worktree_create_operation_not_found"
-            );
-            assert!(state.worktree_creations.lock().await.is_empty());
-        }
+            app.worktree_creation_status("missing".into())
+                .await
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(
+            missing_operation_error,
+            "worktree_create_operation_not_found"
+        );
+        assert!(state.worktree_creations.lock().await.is_empty());
         drop(state);
     }
 }

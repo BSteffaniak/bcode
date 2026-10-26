@@ -4952,7 +4952,7 @@ fn campaign_metric_table(
         .iter()
         .map(|generation| {
             let value = metric
-                .and_then(|name| data.generation_run(generation).map(|run| (name, run)))
+                .zip(data.generation_run(generation))
                 .and_then(|(name, run)| run_avg_measurement(&run.result, name));
             string_row(vec![
                 generation.id.clone(),

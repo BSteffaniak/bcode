@@ -1,0 +1,36 @@
+[plugins]
+default = "none"
+enabled = ["bcode.fake-provider", "bcode.default-agents", "bcode.pi-session-import"]
+disabled = ["bcode.bedrock", "bcode.openai-compatible"]
+
+[model]
+profile = "offline"
+provider_plugin_id = "bcode.fake-provider"
+model_id = "fake-cache-prefix"
+
+[model.profiles.offline]
+provider_plugin_id = "bcode.fake-provider"
+model_id = "fake-cache-prefix"
+
+[model.profiles.offline.settings]
+fake_compaction_fixture = "scope-v1"
+
+[model.prompt_cache]
+mode = "off"
+
+[model.compaction]
+mode = "off"
+backend = "local"
+keep_recent_tokens = 0
+experimental_adaptive_packing = false
+
+[session_import.pi]
+path_mode = "custom_only"
+paths = ["pi"]
+
+[observability]
+persist_model_requests = true
+persist_tool_io = true
+
+[skills]
+enabled = false

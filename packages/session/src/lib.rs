@@ -2704,6 +2704,32 @@ impl SessionManager {
         Ok(db.usage_page(&query).await?)
     }
 
+    /// Inspect secret-safe compaction evidence through a bounded non-mutating query.
+    ///
+    /// # Errors
+    /// Returns an error for missing or unavailable storage, invalid bounds or database failure.
+    /// Unknown canonical evidence is surfaced as a degraded page without raw decoder detail.
+    pub async fn session_compaction_inspection_page(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionCompactionInspectionQuery,
+    ) -> Result<bcode_session_models::SessionCompactionInspectionPage, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.compaction_inspection_page(query).await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.compaction_inspection_page(query).await?)
+    }
+
     /// Return one bounded structured session investigation page.
     ///
     /// # Errors
@@ -2735,7 +2761,8 @@ impl SessionManager {
     ///
     /// # Errors
     /// Returns an error for stale identities, excessive source bounds, missing checkpoints,
-    /// or unavailable persisted storage. This operation does not support ephemeral sessions.
+    /// or unavailable canonical storage. Ephemeral sessions publish the pair atomically
+    /// through the serialized actor without creating persistent storage.
     pub async fn commit_compaction_checkpoint(
         &self,
         session_id: SessionId,

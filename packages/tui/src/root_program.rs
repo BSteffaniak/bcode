@@ -8748,6 +8748,7 @@ mod tests {
             fixture.model.compose_focused_input_event(&escape),
             bmux_tui::event::EventOutcome::Ignored,
         );
+        drop(fixture);
     }
 
     #[tokio::test]
@@ -8814,6 +8815,7 @@ mod tests {
                 usize::from(outcome == EventOutcome::Ignored)
             );
             assert!(fixture.model.chat.app.take_pending_submission().is_empty());
+            drop(fixture);
         }
     }
 

@@ -894,6 +894,23 @@ impl SessionApplication for SessionApplicationHandle<'_> {
             .map_err(|error| failure(error.code(), error.message()))
     }
 
+    async fn inspect_compaction(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionCompactionInspectionQuery,
+    ) -> Result<bcode_session_models::SessionCompactionInspectionPage, SessionApplicationFailure>
+    {
+        self.selected_location(session_id).await?;
+        session_operations::inspect_compaction(self.state, self.client_id, session_id, query)
+            .await
+            .map_err(|error| match error {
+                session_operations::ReadHistoryError::Session(error) => session_failure(&error),
+                error @ session_operations::ReadHistoryError::IncompatibleActiveNamespace(_) => {
+                    failure(error.code(), error.message())
+                }
+            })
+    }
+
     async fn inspect_session(
         &self,
         session_id: SessionId,

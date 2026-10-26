@@ -193,7 +193,7 @@ async fn wait_for_settled_ownership(
 #[tokio::test]
 async fn terminal_scheduler_removal_preserves_evidence_until_explicit_ownership_release() {
     let root = tempfile::tempdir().unwrap();
-    let (state, id, ownership) = owned_terminal_fixture(root.path()).await;
+    let (state, id, ownership) = Box::pin(owned_terminal_fixture(root.path())).await;
     let query = || SessionActivityQuery {
         scope: SessionActivityScope::Own,
         after: None,
@@ -230,6 +230,7 @@ async fn terminal_scheduler_removal_preserves_evidence_until_explicit_ownership_
         let observations = state.activity_observations.lock().await;
         assert!(observations.evidence(id).counts_complete);
         assert_eq!(observations.evidence(id).observed_event_sequence, Some(3));
+        drop(observations);
     }
     let outcome = crate::explicit_session_ownership_release_outcome(&state, id)
         .await
@@ -255,7 +256,7 @@ async fn terminal_evidence_does_not_release_registered_unsettled_work() {
     use crate::runtime_work::{CancellationHandle, RuntimeWorkSpec};
     use bcode_session_models::{RuntimeWorkKind, WorkId};
     let root = tempfile::tempdir().unwrap();
-    let (state, id, ownership) = owned_terminal_fixture(root.path()).await;
+    let (state, id, ownership) = Box::pin(owned_terminal_fixture(root.path())).await;
     let page = activity(
         &state,
         id,

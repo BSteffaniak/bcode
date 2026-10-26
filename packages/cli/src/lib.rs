@@ -1579,7 +1579,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         ))
         .await;
     }
-    Box::pin(dispatch_workflow_command(command)).await
+    Box::pin(dispatch_workflow_command(*command)).await
 }
 
 async fn print_workflow_definition(
@@ -1607,40 +1607,48 @@ async fn print_workflow_definition(
     Ok(())
 }
 
+// Decode synchronously so each workflow operation has an independent async frame.
 #[allow(clippy::too_many_lines)]
-async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
+fn dispatch_workflow_command(
+    command: WorkflowCommand,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CliError>> + Send>> {
     let client = BcodeClient::default_endpoint();
-    match *command {
-        WorkflowCommand::PublishRunEdit { file } => {
+    match command {
+        WorkflowCommand::PublishRunEdit { file } => Box::pin(async move {
             let request: bcode_workflow::WorkflowRunGraphEditBatch =
                 serde_json::from_value(read_bounded_json(&file)?)?;
             let revision = Box::pin(client.publish_workflow_run_graph_edit(request)).await?;
             print_json(&serde_json::json!({"published": true, "revision": revision}))?;
-        }
-        WorkflowCommand::StageRunEdit { file } => {
+            Ok(())
+        }),
+        WorkflowCommand::StageRunEdit { file } => Box::pin(async move {
             let request: bcode_workflow::WorkflowRunGraphEditBatch =
                 serde_json::from_value(read_bounded_json(&file)?)?;
             let created = Box::pin(client.stage_workflow_run_graph_edit(request)).await?;
             print_json(
                 &serde_json::json!({"staged": true, "created": created, "published": false}),
             )?;
-        }
-        WorkflowCommand::Template { command } => {
+            Ok(())
+        }),
+        WorkflowCommand::Template { command } => Box::pin(async move {
             Box::pin(handle_workflow_template_command(&client, *command)).await?;
-        }
-        WorkflowCommand::Author { command } => {
+            Ok(())
+        }),
+        WorkflowCommand::Author { command } => Box::pin(async move {
             Box::pin(handle_workflow_author_command(&client, command)).await?;
-        }
-        WorkflowCommand::Package { command } => {
+            Ok(())
+        }),
+        WorkflowCommand::Package { command } => Box::pin(async move {
             Box::pin(handle_workflow_package_command(&client, command)).await?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::PublicEvents {
             run_id,
             after_sequence,
             through_sequence,
             limit,
             json: _,
-        } => {
+        } => Box::pin(async move {
             let query = bcode_workflow::WorkflowCommittedHistoryQuery {
                 version: 1,
                 run_id,
@@ -1659,12 +1667,13 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::LifecycleHistoryRun {
             run_id,
             cursor_json,
             limit,
-        } => {
+        } => Box::pin(async move {
             let query = lifecycle_history_query(run_id, cursor_json.as_deref(), limit)?;
             print_json(
                 &Box::pin(
@@ -1674,7 +1683,8 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::InventoryRun {
             run,
             run_id,
@@ -1682,7 +1692,7 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             cursor_json,
             limit,
             json: _,
-        } => {
+        } => Box::pin(async move {
             let run_id = run.or(run_id).ok_or_else(|| {
                 CliError::InvalidArguments("inventory run identity required".into())
             })?;
@@ -1711,12 +1721,13 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 ))
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::SemanticHistoryRun {
             run_id,
             cursor_json,
             limit,
-        } => {
+        } => Box::pin(async move {
             let query = semantic_history_query(run_id, cursor_json.as_deref(), limit)?;
             print_json(
                 &Box::pin(
@@ -1726,13 +1737,14 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::Observations {
             run_id,
             after_sequence,
             through_sequence,
             limit,
-        } => {
+        } => Box::pin(async move {
             print_json(
                 &Box::pin(
                     bcode_workflow::WorkflowRunApplication::workflow_observations(
@@ -1745,12 +1757,13 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::Events {
             run_id,
             after_sequence,
             limit,
-        } => {
+        } => Box::pin(async move {
             print_json(
                 &Box::pin(
                     bcode_workflow::WorkflowRunApplication::workflow_event_history(
@@ -1762,13 +1775,14 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::Attempts {
             run_id,
             after_prepared_at_ms,
             after_dispatch_identity,
             limit,
-        } => {
+        } => Box::pin(async move {
             let cursor = match (after_prepared_at_ms, after_dispatch_identity) {
                 (Some(prepared_at_ms), Some(dispatch_identity)) => {
                     Some(bcode_workflow::AttemptCursor {
@@ -1789,15 +1803,17 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
-        WorkflowCommand::Definitions { limit } => {
+            Ok(())
+        }),
+        WorkflowCommand::Definitions { limit } => Box::pin(async move {
             print_json(&Box::pin(client.list_workflow_definitions(limit)).await?)?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::DescribeDefinition {
             definition_id,
             version,
             typed,
-        } => {
+        } => Box::pin(async move {
             Box::pin(print_workflow_definition(
                 &client,
                 definition_id,
@@ -1805,15 +1821,17 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 typed,
             ))
             .await?;
-        }
-        WorkflowCommand::Doctor { run_id, limit } => {
+            Ok(())
+        }),
+        WorkflowCommand::Doctor { run_id, limit } => Box::pin(async move {
             print_json(
                 &Box::pin(bcode_workflow::WorkflowRunApplication::doctor_workflow_run(
                     &client, run_id, limit,
                 ))
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::CancelDiscovery { .. }
         | WorkflowCommand::LaunchCatalog { .. }
         | WorkflowCommand::Watch
@@ -1826,61 +1844,68 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
         | WorkflowCommand::LaunchDetail { .. } => {
             unreachable!("handled before dispatch")
         }
-        WorkflowCommand::CatalogView { query } => {
+        WorkflowCommand::CatalogView { query } => Box::pin(async move {
             let request =
                 serde_json::from_value(read_workflow_input_value(&query)?).map_err(|_| {
                     CliError::InvalidArguments("invalid workflow catalog query".to_owned())
                 })?;
             print_json(&Box::pin(client.workflow_catalog_view(request)).await?)?;
-        }
-        WorkflowCommand::RunView { run_id, limit } => {
+            Ok(())
+        }),
+        WorkflowCommand::RunView { run_id, limit } => Box::pin(async move {
             print_json(&Box::pin(client.workflow_run_view(run_id, limit)).await?)?;
-        }
-        WorkflowCommand::RunStatus { run_id } => {
+            Ok(())
+        }),
+        WorkflowCommand::RunStatus { run_id } => Box::pin(async move {
             print_json(
                 &Box::pin(bcode_workflow::WorkflowRunApplication::workflow_run_status(
                     &client, run_id,
                 ))
                 .await?,
             )?;
-        }
-        WorkflowCommand::Runs { limit } => {
+            Ok(())
+        }),
+        WorkflowCommand::Runs { limit } => Box::pin(async move {
             print_json(
                 &Box::pin(bcode_workflow::WorkflowRunApplication::list_workflow_runs(
                     &client, limit,
                 ))
                 .await?,
             )?;
-        }
-        WorkflowCommand::CancelRun { run_id } => {
+            Ok(())
+        }),
+        WorkflowCommand::CancelRun { run_id } => Box::pin(async move {
             print_json(
                 &Box::pin(bcode_workflow::WorkflowRunApplication::cancel_workflow_run(
                     &client, run_id,
                 ))
                 .await?,
             )?;
-        }
-        WorkflowCommand::PauseRun { run_id } => {
+            Ok(())
+        }),
+        WorkflowCommand::PauseRun { run_id } => Box::pin(async move {
             print_json(
                 &Box::pin(bcode_workflow::WorkflowRunApplication::pause_workflow_run(
                     &client, run_id,
                 ))
                 .await?,
             )?;
-        }
-        WorkflowCommand::ResumeRun { run_id } => {
+            Ok(())
+        }),
+        WorkflowCommand::ResumeRun { run_id } => Box::pin(async move {
             print_json(
                 &Box::pin(bcode_workflow::WorkflowRunApplication::resume_workflow_run(
                     &client, run_id,
                 ))
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::IncreaseAllowance {
             run_id,
             expected_cap,
             target_cap,
-        } => {
+        } => Box::pin(async move {
             print_json(
                 &client
                     .control_workflow_run(
@@ -1892,13 +1917,14 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                     )
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::RetryNode {
             run_id,
             node_id,
             activation_id,
             failed_attempt,
-        } => {
+        } => Box::pin(async move {
             print_json(
                 &Box::pin(client.retry_workflow_node(
                     run_id,
@@ -1908,17 +1934,19 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 ))
                 .await?,
             )?;
-        }
-        WorkflowCommand::Waits { run_id, limit } => {
+            Ok(())
+        }),
+        WorkflowCommand::Waits { run_id, limit } => Box::pin(async move {
             print_json(&Box::pin(client.list_workflow_waits(run_id, limit)).await?)?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::InspectRunGraph {
             run_id,
             expected_revision,
             after_node_id,
             after_edge_id,
             limit,
-        } => {
+        } => Box::pin(async move {
             if expected_revision == 0 || limit == 0 {
                 return Err(CliError::InvalidArguments(
                     "graph page limit and expected revision must be positive".to_string(),
@@ -1939,8 +1967,9 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
-        WorkflowCommand::InspectRun { run_id, limit } => {
+            Ok(())
+        }),
+        WorkflowCommand::InspectRun { run_id, limit } => Box::pin(async move {
             print_json(
                 &Box::pin(
                     bcode_workflow::WorkflowRunApplication::inspect_workflow_run(
@@ -1950,24 +1979,26 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 .await
                 .map_err(|source| CliError::WorkflowInspection { source })?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::DiagnosticArtifacts {
             run_id,
             dispatch_identity,
-        } => {
+        } => Box::pin(async move {
             print_json(
                 &client
                     .workflow_diagnostic_artifacts(run_id, dispatch_identity)
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::ReadDiagnosticArtifact {
             run_id,
             dispatch_identity,
             artifact_id,
             offset,
             length,
-        } => {
+        } => Box::pin(async move {
             print_json(
                 &client
                     .workflow_diagnostic_artifact(
@@ -1982,8 +2013,9 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                     )
                     .await?,
             )?;
-        }
-        WorkflowCommand::RunOutput { run_id, limit } => {
+            Ok(())
+        }),
+        WorkflowCommand::RunOutput { run_id, limit } => Box::pin(async move {
             print_json(
                 &Box::pin(
                     bcode_workflow::WorkflowRunApplication::workflow_run_outputs(
@@ -1992,27 +2024,29 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::ProvideInput {
             run_id,
             node_id,
             activation_id,
             value,
-        } => {
+        } => Box::pin(async move {
             let value = read_workflow_input_value(&value)?;
             print_json(
                 &client
                     .provide_workflow_input(run_id, node_id, activation_id, value)
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::ResolveApproval {
             run_id,
             node_id,
             activation_id,
             approve,
             deny,
-        } => {
+        } => Box::pin(async move {
             if approve == deny {
                 return Err(CliError::InvalidArguments(
                     "exactly one of --approve or --deny is required".to_string(),
@@ -2023,12 +2057,13 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                     .resolve_workflow_approval(run_id, node_id, activation_id, approve)
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::ResolveMutationApproval {
             approval_id,
             approve,
             deny,
-        } => {
+        } => Box::pin(async move {
             if approve == deny {
                 return Err(CliError::InvalidArguments(
                     "exactly one of --approve or --deny is required".to_string(),
@@ -2049,8 +2084,9 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             if result.continuation == Some(bcode_workflow::WorkflowApprovalContinuation::Failed) {
                 return Err(CliError::WorkflowApprovalContinuationFailed);
             }
-        }
-        WorkflowCommand::MutationApprovals { run_id, limit } => {
+            Ok(())
+        }),
+        WorkflowCommand::MutationApprovals { run_id, limit } => Box::pin(async move {
             let approvals = if let Some(run_id) = run_id {
                 client
                     .list_workflow_mutation_approvals(run_id, limit)
@@ -2059,8 +2095,9 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 client.list_all_workflow_mutation_approvals(limit).await?
             };
             print_json(&approvals)?;
-        }
-        WorkflowCommand::CancelComputation { operation_id } => {
+            Ok(())
+        }),
+        WorkflowCommand::CancelComputation { operation_id } => Box::pin(async move {
             print_json(
                 &bcode_workflow::WorkflowAuthoringApplication::cancel_workflow_computation(
                     &client,
@@ -2068,7 +2105,8 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::ActivityRun {
             run_id,
             root_run_id,
@@ -2078,7 +2116,7 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             revision,
             limit,
             json,
-        } => {
+        } => Box::pin(async move {
             let root_run_id = root_run_id.unwrap_or_else(|| run_id.clone());
             let page = client
                 .workflow_activity_page(bcode_ipc::WorkflowActivityPageRequest {
@@ -2126,15 +2164,17 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                     println!("issue: {issue}");
                 }
             }
-        }
-        WorkflowCommand::ActivityClose { scan_id } => {
+            Ok(())
+        }),
+        WorkflowCommand::ActivityClose { scan_id } => Box::pin(async move {
             client.workflow_activity_close(scan_id).await?;
             print_json(&serde_json::json!({"closed": true}))?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::RecoverOffline { .. } => {
             unreachable!("offline maintenance handled before client creation")
         }
-        WorkflowCommand::ReconcileOrphans { apply, limit, json } => {
+        WorkflowCommand::ReconcileOrphans { apply, limit, json } => Box::pin(async move {
             let report = bcode_workflow::WorkflowRunApplication::reconcile_orphaned_workflow_runs(
                 &client, apply, limit,
             )
@@ -2144,16 +2184,18 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             } else {
                 print_orphaned_workflow_report(&report);
             }
-        }
-        WorkflowCommand::MigrateStore => {
+            Ok(())
+        }),
+        WorkflowCommand::MigrateStore => Box::pin(async move {
             print_json(
                 &bcode_workflow_store::WorkflowStore::migrate_to_current_in_state_dir(
                     &bcode_config::default_state_dir(),
                     current_unix_time_ms()?,
                 )?,
             )?;
-        }
-        WorkflowCommand::ResetStore { confirm } => {
+            Ok(())
+        }),
+        WorkflowCommand::ResetStore { confirm } => Box::pin(async move {
             if confirm != "DELETE-INCOMPATIBLE-WORKFLOW-STATE" {
                 return Err(CliError::InvalidArguments(
                     "workflow store reset requires --confirm DELETE-INCOMPATIBLE-WORKFLOW-STATE"
@@ -2165,7 +2207,8 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 &confirm,
                 current_unix_time_ms()?,
             )?)?;
-        }
+            Ok(())
+        }),
         WorkflowCommand::Start {
             selection,
             parent_session_id,
@@ -2174,7 +2217,7 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             parent_session_generation,
             configuration,
             input,
-        } => {
+        } => Box::pin(async move {
             let input = input.as_deref().map(read_bounded_json).transpose()?;
             let selection = match selection {
                 WorkflowStartSelection::Revision {
@@ -2244,9 +2287,9 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
-        }
+            Ok(())
+        }),
     }
-    Ok(())
 }
 
 async fn handle_workflow_draft_edit(
@@ -6632,6 +6675,18 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect bounded secret-safe compaction evidence without restoring checkpoints.
+    CompactionStatus {
+        session_id: SessionId,
+        /// Inclusive sequence cursor; follow the returned next cursor unchanged.
+        #[arg(long)]
+        before: Option<u64>,
+        /// Maximum indexed candidates, not matching entries (1..=200).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect one high-value semantic event category with bounded canonical work.
     Inspect {
         session_id: SessionId,
@@ -8823,31 +8878,34 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
     Box::pin(dispatch_non_ranking_session_command(command)).await
 }
 
+// Keep session operation futures separate; do not construct an async match over all commands.
 #[allow(clippy::too_many_lines)]
-async fn dispatch_non_ranking_session_command(
+fn dispatch_non_ranking_session_command(
     command: Box<SessionCommand>,
-) -> Result<(), CliError> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CliError>> + Send>> {
     match *command {
         SessionCommand::RankCategories { .. } => unreachable!("ranking is dispatched above"),
-        SessionCommand::Categorization { session_id, json } => {
+        SessionCommand::Categorization { session_id, json } => Box::pin(async move {
             Box::pin(print_session_categorization(session_id, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::Compress {
             session_id,
             older_than,
             tier,
             dry_run,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(run_session_compression(
                 session_id, older_than, &tier, dry_run, json,
             ))
             .await?;
-        }
+            Ok(())
+        }),
         SessionCommand::CompactLegacyAdmission {
             entry_budget,
             apply,
-        } => {
+        } => Box::pin(async move {
             if !apply {
                 return Err(CliError::InvalidArguments(
                     "explicit --apply is required".to_owned(),
@@ -8877,8 +8935,9 @@ async fn dispatch_non_ranking_session_command(
                     &serde_json::json!({ "retired": retired, "maintenance_blocker_retained": true }),
                 )?;
             }
-        }
-        SessionCommand::StorageAdmission { session_id, apply } => {
+            Ok(())
+        }),
+        SessionCommand::StorageAdmission { session_id, apply } => Box::pin(async move {
             ensure_server_running().await?;
             let report = BcodeClient::default_endpoint()
                 .session_admission(session_id, apply)
@@ -8887,17 +8946,19 @@ async fn dispatch_non_ranking_session_command(
             if report.busy || report.invalid {
                 return Err(CliError::SessionCompressionIncomplete);
             }
-        }
+            Ok(())
+        }),
         SessionCommand::StorageUsage {
             session_id,
             entry_budget,
-        } => {
+        } => Box::pin(async move {
             ensure_server_running().await?;
             let usage = BcodeClient::default_endpoint()
                 .session_storage_usage(session_id, entry_budget)
                 .await?;
             print_json(&usage)?;
-        }
+            Ok(())
+        }),
         SessionCommand::Milestones { .. }
         | SessionCommand::AppendPresentationNote { .. }
         | SessionCommand::Summary { .. }
@@ -8914,7 +8975,7 @@ async fn dispatch_non_ranking_session_command(
             launch_working_directory,
             set_file,
             clear,
-        } => {
+        } => Box::pin(async move {
             let scope = match (session_id, launch_working_directory) {
                 (Some(session_id), None) => {
                     bcode_session_models::ComposerDraftScope::Session { session_id }
@@ -8947,19 +9008,22 @@ async fn dispatch_non_ranking_session_command(
             } else {
                 print_json(&Box::pin(client.composer_draft(scope)).await?)?;
             }
-        }
-        SessionCommand::TraceRange(args) => {
+            Ok(())
+        }),
+        SessionCommand::TraceRange(args) => Box::pin(async move {
             Box::pin(read_trace_range(args)).await?;
-        }
-        SessionCommand::ArtifactRange(args) => {
+            Ok(())
+        }),
+        SessionCommand::ArtifactRange(args) => Box::pin(async move {
             Box::pin(read_artifact_range_to(
                 &BcodeClient::default_endpoint(),
                 args,
                 &mut std::io::stdout(),
             ))
             .await?;
-        }
-        SessionCommand::Agents { json } => {
+            Ok(())
+        }),
+        SessionCommand::Agents { json } => Box::pin(async move {
             ensure_server_running().await?;
             let agents = Box::pin(BcodeClient::default_endpoint().list_agents()).await?;
             if json {
@@ -8975,8 +9039,9 @@ async fn dispatch_non_ranking_session_command(
                 }
                 output.flush()?;
             }
-        }
-        SessionCommand::Skills { json } => {
+            Ok(())
+        }),
+        SessionCommand::Skills { json } => Box::pin(async move {
             ensure_server_running().await?;
             let result = BcodeClient::default_endpoint().list_skills().await?;
             if json {
@@ -8988,121 +9053,161 @@ async fn dispatch_non_ranking_session_command(
                     &result,
                 )?;
             }
-        }
-        SessionCommand::DescribeSkill { skill_id, json } => {
+            Ok(())
+        }),
+        SessionCommand::DescribeSkill { skill_id, json } => Box::pin(async move {
             Box::pin(describe_skill(skill_id, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::Create {
             name,
             cwd,
             parent,
             child_id,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(create_session(name, cwd, parent, child_id, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::ReconcileChildren {
             parent_id,
             apply,
             yes,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(reconcile_children(parent_id, apply, yes, json)).await?;
-        }
-        SessionCommand::Progress { session_id, json } => {
+            Ok(())
+        }),
+        SessionCommand::Progress { session_id, json } => Box::pin(async move {
             Box::pin(show_session_progress(session_id, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::Activity {
             session_id,
             children,
             after,
             limit,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(show_session_activity(
                 session_id, children, after, limit, json,
             ))
             .await?;
-        }
+            Ok(())
+        }),
         SessionCommand::Children {
             parent_id,
             after,
             limit,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(show_session_children(parent_id, after, limit, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::List {
             cwd,
             all_directories,
             with_status,
             json,
-        } => Box::pin(list_sessions(cwd, all_directories, with_status, json)).await?,
-        SessionCommand::Refresh { cwd, sources, json } => {
+        } => Box::pin(async move {
+            Box::pin(list_sessions(cwd, all_directories, with_status, json)).await?;
+            Ok(())
+        }),
+        SessionCommand::Refresh { cwd, sources, json } => Box::pin(async move {
             Box::pin(refresh_session_catalog(cwd, sources, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::Rename {
             session_id,
             name,
             json,
-        } => Box::pin(rename_session(session_id, name, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(rename_session(session_id, name, json)).await?;
+            Ok(())
+        }),
         SessionCommand::Delete {
             session_id,
             yes,
             json,
-        } => Box::pin(delete_session(session_id, yes, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(delete_session(session_id, yes, json)).await?;
+            Ok(())
+        }),
         SessionCommand::SetWorkingDirectory {
             session_id,
             path,
             json,
-        } => Box::pin(set_session_working_directory(session_id, path, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(set_session_working_directory(session_id, path, json)).await?;
+            Ok(())
+        }),
         SessionCommand::SetAgent {
             session_id,
             agent_id,
             json,
-        } => Box::pin(set_session_agent(session_id, agent_id, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(set_session_agent(session_id, agent_id, json)).await?;
+            Ok(())
+        }),
         SessionCommand::SetModel {
             session_id,
             model_id,
             provider,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(set_session_model_selection(
                 session_id, provider, model_id, json,
             ))
             .await?;
-        }
+            Ok(())
+        }),
         SessionCommand::SetReasoning {
             session_id,
             effort,
             summary,
             json,
-        } => Box::pin(set_session_reasoning(session_id, effort, summary, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(set_session_reasoning(session_id, effort, summary, json)).await?;
+            Ok(())
+        }),
         SessionCommand::SetAuthPool {
             pool,
             profile,
             clear,
             json,
-        } => Box::pin(set_auth_pool_preference(pool, profile, clear, json)).await?,
-        SessionCommand::ActiveSkills { session_id, json } => {
+        } => Box::pin(async move {
+            Box::pin(set_auth_pool_preference(pool, profile, clear, json)).await?;
+            Ok(())
+        }),
+        SessionCommand::ActiveSkills { session_id, json } => Box::pin(async move {
             Box::pin(list_active_skills(session_id, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::InvokeSkill {
             session_id,
             skill_id,
             arguments,
             json,
-        } => Box::pin(invoke_session_skill(session_id, skill_id, arguments, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(invoke_session_skill(session_id, skill_id, arguments, json)).await?;
+            Ok(())
+        }),
         SessionCommand::ActivateSkill {
             session_id,
             skill_id,
             json,
-        } => Box::pin(set_session_skill(session_id, skill_id, true, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(set_session_skill(session_id, skill_id, true, json)).await?;
+            Ok(())
+        }),
         SessionCommand::DeactivateSkill {
             session_id,
             skill_id,
             json,
-        } => Box::pin(set_session_skill(session_id, skill_id, false, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(set_session_skill(session_id, skill_id, false, json)).await?;
+            Ok(())
+        }),
         SessionCommand::Compact {
             session_id,
             json,
@@ -9113,7 +9218,7 @@ async fn dispatch_non_ranking_session_command(
             rebuild_max_decoded_bytes,
             rebuild_max_provider_requests,
             rebuild_timeout_ms,
-        } => {
+        } => Box::pin(async move {
             if rebuild_summary {
                 Box::pin(rebuild_session_summary(
                     bcode_session_models::SessionSummaryRebuildRequest {
@@ -9133,13 +9238,14 @@ async fn dispatch_non_ranking_session_command(
             } else {
                 Box::pin(compact_session(session_id, json)).await?;
             }
-        }
+            Ok(())
+        }),
         SessionCommand::Watch {
             session_id,
             limit,
             json,
             interaction_controller_version,
-        } => {
+        } => Box::pin(async move {
             Box::pin(watch_session(
                 session_id,
                 limit,
@@ -9147,20 +9253,22 @@ async fn dispatch_non_ranking_session_command(
                 interaction_controller_version,
             ))
             .await?;
-        }
-        SessionCommand::QueueStatus { session_id } => {
+            Ok(())
+        }),
+        SessionCommand::QueueStatus { session_id } => Box::pin(async move {
             print_json(
                 &session_read_client(session_id)
                     .await?
                     .queue_status(session_id)
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         SessionCommand::PrepareResume {
             session_id,
             submission_id,
             expected_accepted_sequence,
-        } => {
+        } => Box::pin(async move {
             print_json(
                 &session_read_client(session_id)
                     .await?
@@ -9171,12 +9279,13 @@ async fn dispatch_non_ranking_session_command(
                     )
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         SessionCommand::ResumePending {
             session_id,
             confirmation,
             operation_id,
-        } => {
+        } => Box::pin(async move {
             let mut contents = Vec::new();
             std::io::Read::take(std::fs::File::open(&confirmation)?, 65_537)
                 .read_to_end(&mut contents)?;
@@ -9193,13 +9302,14 @@ async fn dispatch_non_ranking_session_command(
                     .resume_submission(session_id, confirmation, operation_id)
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         SessionCommand::CancelPending {
             session_id,
             submission_id,
             expected_accepted_sequence,
             operation_id,
-        } => {
+        } => Box::pin(async move {
             print_json(
                 &session_read_client(session_id)
                     .await?
@@ -9211,19 +9321,23 @@ async fn dispatch_non_ranking_session_command(
                     )
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         SessionCommand::Pending {
             session_id,
             after,
             limit,
             json,
-        } => Box::pin(session_pending(session_id, after, limit, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(session_pending(session_id, after, limit, json)).await?;
+            Ok(())
+        }),
         SessionCommand::ContextObservationReport {
             session_id,
             output_directory,
             max_events,
             max_pages,
-        } => {
+        } => Box::pin(async move {
             Box::pin(session_context_observation_report(
                 session_id,
                 &output_directory,
@@ -9231,21 +9345,37 @@ async fn dispatch_non_ranking_session_command(
                 max_pages,
             ))
             .await?;
-        }
+            Ok(())
+        }),
         SessionCommand::History {
             session_id,
             after,
             before,
             limit,
             json,
-        } => Box::pin(session_history(session_id, after, before, limit, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(session_history(session_id, after, before, limit, json)).await?;
+            Ok(())
+        }),
         SessionCommand::Around {
             session_id,
             sequence,
             before,
             after,
             json,
-        } => Box::pin(session_around(session_id, sequence, before, after, json)).await?,
+        } => Box::pin(async move {
+            Box::pin(session_around(session_id, sequence, before, after, json)).await?;
+            Ok(())
+        }),
+        SessionCommand::CompactionStatus {
+            session_id,
+            before,
+            limit,
+            json,
+        } => Box::pin(async move {
+            Box::pin(session_compaction_status(session_id, before, limit, json)).await?;
+            Ok(())
+        }),
         SessionCommand::Inspect {
             session_id,
             category,
@@ -9253,19 +9383,21 @@ async fn dispatch_non_ranking_session_command(
             before,
             limit,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(session_inspect(
                 session_id, category, after, before, limit, json,
             ))
             .await?;
-        }
+            Ok(())
+        }),
         command @ (SessionCommand::MigrateInventory { .. }
         | SessionCommand::MigrateStart { .. }
         | SessionCommand::MigrateStatus { .. }
         | SessionCommand::MigrateWait { .. }
-        | SessionCommand::MigrateCancel { .. }) => {
+        | SessionCommand::MigrateCancel { .. }) => Box::pin(async move {
             Box::pin(handle_session_migration_subcommand(command)).await?;
-        }
+            Ok(())
+        }),
         command @ (SessionCommand::Search { .. }
         | SessionCommand::SearchStatus { .. }
         | SessionCommand::SearchPurge { .. }
@@ -9275,47 +9407,56 @@ async fn dispatch_non_ranking_session_command(
         | SessionCommand::SearchBackfillWait { .. }
         | SessionCommand::SearchBackfillCancel { .. }
         | SessionCommand::SearchBackfill { .. }
-        | SessionCommand::SearchExplain { .. }) => {
+        | SessionCommand::SearchExplain { .. }) => Box::pin(async move {
             Box::pin(handle_session_search_subcommand(command)).await?;
-        }
-        SessionCommand::Export { session_id, format } => {
+            Ok(())
+        }),
+        SessionCommand::Export { session_id, format } => Box::pin(async move {
             Box::pin(session_export(session_id, format)).await?;
-        }
-        SessionCommand::Timeline { session_id } => Box::pin(session_timeline(session_id)).await?,
-        SessionCommand::Diagnose { session_id, json } => {
+            Ok(())
+        }),
+        SessionCommand::Timeline { session_id } => Box::pin(async move {
+            Box::pin(session_timeline(session_id)).await?;
+            Ok(())
+        }),
+        SessionCommand::Diagnose { session_id, json } => Box::pin(async move {
             Box::pin(session_diagnose(session_id, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::Doctor {
             session_id,
             catalog,
             scan,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(run_session_repair_command(SessionRepairCliOptions {
                 target: repair_cli_target(session_id, catalog, scan),
                 mode: SessionRepairCliMode::DryRun,
                 output: repair_cli_output(json),
             }))
             .await?;
-        }
-        SessionCommand::RetiredCatalogs { apply, json } => {
+            Ok(())
+        }),
+        SessionCommand::RetiredCatalogs { apply, json } => Box::pin(async move {
             Box::pin(retired_catalogs(apply, json)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::Repair {
             session_id,
             catalog,
             scan,
             dry_run,
             json,
-        } => {
+        } => Box::pin(async move {
             Box::pin(run_session_repair_command(SessionRepairCliOptions {
                 target: repair_cli_target(session_id, catalog, scan),
                 mode: repair_cli_mode(dry_run),
                 output: repair_cli_output(json),
             }))
             .await?;
-        }
-        SessionCommand::Usage { session_id, query } => {
+            Ok(())
+        }),
+        SessionCommand::Usage { session_id, query } => Box::pin(async move {
             let query: bcode_session_models::SessionUsageQuery = serde_json::from_str(&query)
                 .map_err(|_| CliError::InvalidArguments("invalid SessionUsageQuery JSON".into()))?;
             query.validate().map_err(CliError::InvalidArguments)?;
@@ -9324,49 +9465,56 @@ async fn dispatch_non_ranking_session_command(
                     .session_usage(session_id, query)
                     .await?,
             )?;
-        }
+            Ok(())
+        }),
         SessionCommand::Reprice {
             session_id,
             from_ms,
             to_ms,
             catalog,
-        } => {
+        } => Box::pin(async move {
             Box::pin(reprice_session_command(
                 session_id, from_ms, to_ms, &catalog,
             ))
             .await?;
-        }
-        SessionCommand::Reindex { session_id } => {
+            Ok(())
+        }),
+        SessionCommand::Reindex { session_id } => Box::pin(async move {
             Box::pin(reindex_session_model_context(session_id)).await?;
-        }
+            Ok(())
+        }),
         SessionCommand::Relocate {
             to,
             to_profile,
             session,
             dry_run,
             json,
-        } => {
+        } => Box::pin(async move {
             relocate_sessions_command(to, to_profile, &session, dry_run, json)?;
-        }
-        SessionCommand::ReleaseOwner { session_id } => {
+            Ok(())
+        }),
+        SessionCommand::ReleaseOwner { session_id } => Box::pin(async move {
             Box::pin(release_session_owner(session_id)).await?;
-        }
-        SessionCommand::StopOwner { session_id } => {
+            Ok(())
+        }),
+        SessionCommand::StopOwner { session_id } => Box::pin(async move {
             Box::pin(stop_session_owner(session_id, false)).await?;
-        }
-        SessionCommand::KillOwner { session_id, yes } => {
+            Ok(())
+        }),
+        SessionCommand::KillOwner { session_id, yes } => Box::pin(async move {
             if !yes {
                 return Err(CliError::InvalidArguments(
                     "force-killing a session owner requires --yes".to_owned(),
                 ));
             }
             Box::pin(stop_session_owner(session_id, true)).await?;
-        }
-        SessionCommand::Import { command } => {
+            Ok(())
+        }),
+        SessionCommand::Import { command } => Box::pin(async move {
             Box::pin(handle_session_import_command(command)).await?;
-        }
+            Ok(())
+        }),
     }
-    Ok(())
 }
 
 async fn reprice_session_command(
@@ -17950,6 +18098,40 @@ async fn session_around(
     }
     for event in window.events {
         print_session_event(&event);
+    }
+    Ok(())
+}
+
+async fn session_compaction_status(
+    session_id: SessionId,
+    before: Option<u64>,
+    limit: usize,
+    json: bool,
+) -> Result<(), CliError> {
+    let page = session_read_client(session_id)
+        .await?
+        .session_compaction_inspection(
+            session_id,
+            bcode_session_models::SessionCompactionInspectionQuery {
+                before: before.map(|sequence| SessionHistoryCursor { sequence }),
+                limit,
+            },
+        )
+        .await?;
+    if json {
+        print_json(&page)?;
+        return Ok(());
+    }
+    // The domain returns normalized evidence; the CLI never interprets host checkpoints/text.
+    for entry in &page.entries {
+        print_json(entry)?;
+    }
+    eprintln!(
+        "scanned={} incomplete={} degraded={}",
+        page.scanned_events, page.has_more, page.degraded
+    );
+    if let Some(cursor) = page.next_cursor {
+        eprintln!("next cursor: {}", cursor.sequence);
     }
     Ok(())
 }
