@@ -34,12 +34,17 @@
             cmake
             markdownlint-cli
             pkg-config
-            alsa-lib
-            libxkbcommon
-            wayland
             openssl
             fish
-          ]);
+          ])
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux (
+            with pkgs;
+            [
+              alsa-lib
+              libxkbcommon
+              wayland
+            ]
+          );
 
           shellHook = ''
             echo "bcode development environment loaded"
