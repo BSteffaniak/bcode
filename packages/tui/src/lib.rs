@@ -21,6 +21,7 @@ pub mod code_review_launcher;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;
 pub(crate) mod composer_flow;
+pub(crate) mod composer_submit;
 pub(crate) mod cursor_blink;
 pub(crate) mod daemon_issue;
 pub(crate) mod effects;

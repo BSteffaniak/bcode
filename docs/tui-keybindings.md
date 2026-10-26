@@ -53,6 +53,21 @@ Bcode's terminal keybindings are scoped and configurable in `bcode.toml`. Each t
 
 Key names use `modifier+key`, with `ctrl`, `alt`, and `shift` modifiers. Examples include `ctrl+d`, `alt+left`, `pageUp`, `escape`, and `enter`.
 
+## Composer submission button
+
+The native chat composer includes a unified Send control at its bottom-right.
+Clicking the Send portion submits through the existing steering submission flow;
+only the arrow opens a menu with **Send now** and **Queue as follow-up**.
+Choosing a menu item submits immediately and does not change the main button's mode.
+The two pointer targets have independent hover/pressed feedback.
+
+These controls add no keyboard bindings and do not change existing bindings. Keyboard
+input dismisses the menu and continues through the normal keymap; clicking outside
+dismisses it without activating content underneath. Empty drafts disable submission.
+Resize and focus loss cancel pending pointer gestures. When the composer is too small
+to display the complete control, it is hidden rather than leaving a partial send target.
+Terminal mouse reporting is required for this fallback.
+
 ## Chat and transcript
 
 Common defaults:

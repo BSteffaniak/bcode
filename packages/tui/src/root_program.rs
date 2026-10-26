@@ -1557,11 +1557,13 @@ impl BcodeRuntimeModel {
         }
         let damage = match event {
             Event::Resize(_) => {
+                self.chat.app.composer_submit.dismiss();
                 self.loop_state.composer_interaction.painted_list = None;
                 self.loop_state.composer_interaction.painted_layout = None;
                 super::invalidation::UiInvalidation::Full
             }
             Event::Focus(bmux_tui::event::FocusEvent::Lost) => {
+                self.chat.app.composer_submit.dismiss();
                 self.loop_state.composer_interaction.dismiss();
                 super::invalidation::UiInvalidation::Structural
             }
@@ -1590,6 +1592,7 @@ impl BcodeRuntimeModel {
             }
             Event::Focus(_) => super::invalidation::UiInvalidation::Paint,
             Event::Paste(text) => {
+                self.chat.app.composer_submit.dismiss();
                 if self.loop_state.modal_foreground() {
                     return super::invalidation::UiInvalidation::None;
                 }
@@ -1601,6 +1604,8 @@ impl BcodeRuntimeModel {
                 super::invalidation::UiInvalidation::Structural
             }
             Event::Key(stroke) => {
+                let submit_menu_open = self.chat.app.composer_submit.is_open();
+                self.chat.app.composer_submit.dismiss();
                 if !self.loop_state.modal_foreground()
                     && self.settings.keymap().action("chat", stroke) == Some("tui.monitor.toggle")
                 {
@@ -1871,13 +1876,34 @@ impl BcodeRuntimeModel {
                 }
                 self.loop_state.refresh_slash_palette(&mut self.chat);
                 self.draft_autosave.observe(&self.chat, Instant::now());
-                if outcome.redraw {
+                if outcome.redraw || submit_menu_open {
                     super::invalidation::UiInvalidation::Structural
                 } else {
                     super::invalidation::UiInvalidation::None
                 }
             }
             Event::Mouse(mouse) => {
+                if !self.loop_state.modal_foreground()
+                    && !self.loop_state.has_command_palette()
+                    && !self.loop_state.has_slash_palette()
+                {
+                    let enabled = !self.chat.app.composer().text().trim().is_empty()
+                        && self.chat.opening_session_id().is_none();
+                    let outcome =
+                        self.chat
+                            .app
+                            .composer_submit
+                            .mouse(&self.committed_hits, mouse, enabled);
+                    if let Some(placement) = outcome.placement {
+                        self.chat.app.stage_submission();
+                        self.stage_root_submission(placement);
+                        self.loop_state.refresh_slash_palette(&mut self.chat);
+                        self.draft_autosave.observe(&self.chat, Instant::now());
+                    }
+                    if outcome.handled {
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                }
                 if !self.loop_state.modal_foreground()
                     && self.chat.app.child_panel_open()
                     && matches!(
@@ -12636,6 +12662,49 @@ mod tests {
         assert!(model.presentation_damage.is_full());
         assert!(!model.fast_temporal_presentation);
         drop(model);
+    }
+
+    #[tokio::test]
+    async fn composer_send_button_uses_existing_submission_flow_and_rejects_duplicate_release() {
+        let mut model = root_test_model();
+        model
+            .chat
+            .app
+            .replace_composer_with("hello from the Send button");
+        let area = bmux_tui::geometry::Rect::new(0, 0, 60, 15);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        super::super::render::render(
+            &mut model.chat.app,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+        );
+        model.committed_hits = frame.hits().clone();
+        let send = model
+            .committed_hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "composer.send")
+            .expect("Send button")
+            .area;
+        let position = bmux_tui::geometry::Point::new(send.x, send.y);
+        for kind in [
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+        ] {
+            model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(kind, position),
+            ));
+        }
+        assert_eq!(model.chat.queued_effect_count(), 1);
+        assert!(model.chat.app.composer().is_empty());
+        // A second release cannot submit an empty draft or duplicate the request.
+        model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
+            bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                position,
+            ),
+        ));
+        assert_eq!(model.chat.queued_effect_count(), 1);
     }
 
     #[tokio::test]

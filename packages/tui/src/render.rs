@@ -696,6 +696,14 @@ pub fn render_prepared_damage(
             |cx| component.paint(&measured, cx),
         );
     }
+    let enabled = !app.composer().text().trim().is_empty();
+    super::composer_submit::paint_menu(
+        &mut app.composer_submit,
+        layout.area,
+        enabled,
+        frame,
+        theme,
+    );
 }
 
 impl FrameLayout {
@@ -1618,8 +1626,8 @@ fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
         .visible_rows_for_width(app.composer_state(), content_width);
     let content_rows = rows.clamp(1, MAX_COMPOSER_ROWS);
     content_rows
-        .saturating_add(2)
-        .min(area.height.saturating_sub(2).max(3))
+        .saturating_add(3)
+        .min(area.height.saturating_sub(2).max(4))
         .min(area.height)
 }
 
@@ -1633,22 +1641,31 @@ const fn composer_area(area: Rect, composer_height: u16) -> Rect {
 }
 
 fn composer_content_area(area: Rect, theme: TuiTheme) -> Rect {
-    let component = bcode_tui_components::composer::composer_panel(
-        bcode_tui_components::composer::ComposerStyle {
-            border: theme.focused,
-            surface: theme.raised,
+    let state = RefCell::new(bmux_tui_components::text_input::TextInputState::default());
+    let policy = composer_policy();
+    let submit = super::composer_submit::ComposerSubmit::default();
+    let component = super::composer_submit::panel(
+        &state,
+        &policy,
+        &submit,
+        super::composer_submit::ComposerPresentation {
+            theme,
+            focused: false,
+            enabled: false,
+            size: area.size(),
         },
-        TextBlock::new(""),
     );
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    let child = &layout.children[0];
+    let child = layout
+        .find_logical_rect(&bmux_tui::component::LayoutId::new("composer.editor"))
+        .expect("composer owns its editor");
     Rect::new(
         area.x
             .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
         area.y
             .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
-        u16::try_from(child.node.size.width).unwrap_or(u16::MAX),
-        u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+        u16::try_from(child.width).unwrap_or(u16::MAX),
+        u16::try_from(child.height).unwrap_or(u16::MAX),
     )
 }
 
@@ -5823,27 +5840,19 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
     }
     let state = RefCell::new(app.composer_state().clone());
     let policy = composer_policy();
-    let panel = bcode_tui_components::session_ui::composer(
-        &bcode_tui_components::session_ui::SessionUiIds {
-            root: "chat",
-            composer: "bcode.composer",
-            editor: "composer.editor",
-            composer_size: "composer.size",
-        },
+    let panel = super::composer_submit::panel(
         &state,
         &policy,
-        bcode_tui_components::session_ui::SessionComposerStyle {
-            panel: bcode_tui_components::composer::ComposerStyle {
-                border: theme.focused,
-                surface: theme.raised,
-            },
-            text: theme.text,
-            selection: theme.selection,
-            muted: theme.muted,
+        &app.composer_submit,
+        super::composer_submit::ComposerPresentation {
+            theme,
+            focused: app.cursor_visible(),
+            enabled: !app.composer().text().trim().is_empty(),
+            size: area.size(),
         },
-        app.cursor_visible(),
     );
     let layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    app.composer_submit.record_layout(&layout, area);
     frame.with_child(
         i32::from(area.x),
         i64::from(area.y),

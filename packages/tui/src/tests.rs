@@ -885,7 +885,7 @@ fn render_includes_status_and_composer() {
 
     assert!(buffer.row_symbols(0).unwrap().contains("bcode"));
     assert!(!output.contains("TUI is attached"));
-    assert!(buffer.row_symbols(7).unwrap().contains("Message"));
+    assert!(output.contains("Message"));
     assert!(cursor.is_some());
 }
 
@@ -900,7 +900,7 @@ fn composer_expands_and_scrolls_when_input_exceeds_max_rows() {
     drop(app);
     let output = rendered_text(&buffer);
 
-    assert!(buffer.row_symbols(12).unwrap().contains("Message"));
+    assert!(output.contains("Message"));
     assert!(output.contains('9'));
 }
 

@@ -430,6 +430,7 @@ pub struct BmuxApp {
     reasoning_default_summary: Option<String>,
     token_usage: TokenUsageMeter,
     session_ui: bcode_tui_components::session_ui::SessionUi,
+    pub(crate) composer_submit: super::composer_submit::ComposerSubmit,
     input_history: InputHistory,
     transcript: TranscriptDocument,
     transcript_projection_revision: u64,
@@ -668,6 +669,7 @@ impl BmuxApp {
             reasoning_default_summary: None,
             token_usage: TokenUsageMeter::default(),
             session_ui: bcode_tui_components::session_ui::SessionUi::new(),
+            composer_submit: super::composer_submit::ComposerSubmit::default(),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
             transcript_projection_revision: 0,
@@ -4000,6 +4002,7 @@ impl BmuxApp {
 
     /// Store the current composer text as a pending submission and clear input.
     pub fn stage_submission(&mut self) {
+        self.composer_submit.dismiss();
         self.restore_uncommitted_navigation();
         // Freeze the displayed top before clearing the composer changes body height.
         // This is an automatic hold, not a manual detach; acceptance owns its reveal.
@@ -5310,6 +5313,7 @@ impl BmuxApp {
     }
 
     fn replace_composer_with_policy(&mut self, text: &str, reset_history: bool) {
+        self.composer_submit.dismiss();
         if reset_history {
             self.input_history.reset_navigation();
         }
