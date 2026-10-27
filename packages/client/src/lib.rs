@@ -638,6 +638,104 @@ impl bcode_provider_auth_models::application::AuthPoolApplication for BcodeClien
     }
 }
 
+impl bcode_provider_auth_models::application::AccountRoutingApplication for BcodeClient {
+    async fn account_routing(
+        &self,
+        session_id: String,
+    ) -> Result<
+        bcode_provider_auth_models::AccountRouting,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let session_id = session_id.parse().map_err(|_| {
+            bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: "invalid_session".into(),
+                message: "invalid session ID".into(),
+            }
+        })?;
+        Self::account_routing(self, session_id)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn set_account_routing(
+        &self,
+        session_id: String,
+        request: bcode_provider_auth_models::SetAccountRoutingRequest,
+    ) -> Result<
+        bcode_provider_auth_models::AccountRouting,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let session_id = session_id.parse().map_err(|_| {
+            bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: "invalid_session".into(),
+                message: "invalid session ID".into(),
+            }
+        })?;
+        Self::set_account_routing(self, session_id, request)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn set_account_pause(
+        &self,
+        session_id: String,
+        request: bcode_provider_auth_models::SetAccountPauseRequest,
+    ) -> Result<
+        bcode_provider_auth_models::AccountRouting,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let session_id = session_id.parse().map_err(|_| {
+            bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: "invalid_session".into(),
+                message: "invalid session ID".into(),
+            }
+        })?;
+        Self::set_account_pause(self, session_id, request)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+    async fn rename_account(
+        &self,
+        session_id: String,
+        request: bcode_provider_auth_models::RenameAccountRequest,
+    ) -> Result<
+        bcode_provider_auth_models::AccountRouting,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let session_id = session_id.parse().map_err(|_| {
+            bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: "invalid_session".into(),
+                message: "invalid session ID".into(),
+            }
+        })?;
+        Self::rename_account(self, session_id, request)
+            .await
+            .map_err(|error| {
+                let error = session_application_failure(error);
+                bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            })
+    }
+}
+
 impl bcode_daemon_lifecycle::application::RuntimeApplication for BcodeClient {
     async fn runtime_status(
         &self,
@@ -5586,6 +5684,82 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionModelSet => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Apply/read account routing bound to this session's effective configuration.
+    /// # Errors
+    /// Fails on transport, invalid scope/account, or unavailable durable state.
+    pub async fn account_routing(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bcode_provider_auth_models::AccountRouting, ClientError> {
+        match self
+            .send_request(Request::AccountRouting { session_id })
+            .await?
+        {
+            ResponsePayload::AccountRouting { routing } => Ok(routing),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Apply/read account routing bound to this session's effective configuration.
+    /// # Errors
+    /// Fails on transport, invalid scope/account, or unavailable durable state.
+    pub async fn set_account_routing(
+        &self,
+        session_id: SessionId,
+        request: bcode_provider_auth_models::SetAccountRoutingRequest,
+    ) -> Result<bcode_provider_auth_models::AccountRouting, ClientError> {
+        match self
+            .send_request(Request::SetAccountRouting {
+                session_id,
+                request,
+            })
+            .await?
+        {
+            ResponsePayload::AccountRouting { routing } => Ok(routing),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Apply/read account routing bound to this session's effective configuration.
+    /// # Errors
+    /// Fails on transport, invalid scope/account, or unavailable durable state.
+    pub async fn set_account_pause(
+        &self,
+        session_id: SessionId,
+        request: bcode_provider_auth_models::SetAccountPauseRequest,
+    ) -> Result<bcode_provider_auth_models::AccountRouting, ClientError> {
+        match self
+            .send_request(Request::SetAccountPause {
+                session_id,
+                request,
+            })
+            .await?
+        {
+            ResponsePayload::AccountRouting { routing } => Ok(routing),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Apply/read account routing bound to this session's effective configuration.
+    /// # Errors
+    /// Fails on transport, invalid scope/account, or unavailable durable state.
+    pub async fn rename_account(
+        &self,
+        session_id: SessionId,
+        request: bcode_provider_auth_models::RenameAccountRequest,
+    ) -> Result<bcode_provider_auth_models::AccountRouting, ClientError> {
+        match self
+            .send_request(Request::RenameAccount {
+                session_id,
+                request,
+            })
+            .await?
+        {
+            ResponsePayload::AccountRouting { routing } => Ok(routing),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

@@ -1414,6 +1414,25 @@ pub enum Request {
     /// List portable auth-pool status.
     AuthPoolList,
     /// Persist or clear an interactive preferred auth-pool profile.
+    /// Read account-first next-turn routing in the session configuration.
+    AccountRouting {
+        session_id: SessionId,
+    },
+    /// Set next-turn routing and/or new-session defaults.
+    SetAccountRouting {
+        session_id: SessionId,
+        request: bcode_provider_auth_models::SetAccountRoutingRequest,
+    },
+    /// Pause/resume across pools in the session configuration.
+    SetAccountPause {
+        session_id: SessionId,
+        request: bcode_provider_auth_models::SetAccountPauseRequest,
+    },
+    /// Rename display metadata only.
+    RenameAccount {
+        session_id: SessionId,
+        request: bcode_provider_auth_models::RenameAccountRequest,
+    },
     SetAuthPoolPreference {
         pool: String,
         #[serde(default)]
@@ -2875,6 +2894,10 @@ pub enum ResponsePayload {
     },
     /// Interactive auth-pool preference was updated.
     AuthPoolPreferenceSet,
+    /// Secret-free account routing snapshot.
+    AccountRouting {
+        routing: bcode_provider_auth_models::AccountRouting,
+    },
     /// Current snapshot after preparing or waiting for session open.
     SessionOpenPrepared {
         snapshot: SessionOpenOperationSnapshot,

@@ -5541,6 +5541,8 @@ mod auth_pool_reconciliation;
 pub use auth_enrollment::publish_auth_enrollment;
 pub use auth_pool_reconciliation::publish_auth_pool_reconciliation;
 
+pub mod account_settings;
+
 /// Non-secret runtime subscription registry for provider logins that should not mutate declarative config.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAuthSubscriptions {

@@ -49,7 +49,7 @@ pub enum SlashCommandOutcome {
     OpenChildMonitor,
     /// Open model picker.
     PickModel,
-    /// Open auth-pool subscription picker.
+    /// Open account-first subscriptions.
     PickAuthPool,
     /// Preview a bundled theme without persistence.
     PreviewTheme { theme_id: String },

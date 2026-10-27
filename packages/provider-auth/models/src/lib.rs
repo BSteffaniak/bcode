@@ -7,6 +7,8 @@
 //! These types describe provider registration and normalized interactive authentication flows.
 //! They intentionally contain no vault access, plugin loading, networking, prompting, or UI logic.
 
+pub mod account_routing;
+pub use account_routing::*;
 pub mod application;
 pub mod refresh;
 pub mod startup;

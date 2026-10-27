@@ -1301,29 +1301,19 @@ impl BcodeRuntimeModel {
             {
                 super::chat_loop::AuthPoolPickerRootOutcome::Continue => {}
                 super::chat_loop::AuthPoolPickerRootOutcome::Cancel => {
-                    self.chat
-                        .app
-                        .set_status("auth pool picker closed".to_owned());
+                    self.chat.app.set_status("accounts closed".to_owned());
                 }
-                super::chat_loop::AuthPoolPickerRootOutcome::Promote { pool, profile } => {
-                    self.chat
-                        .start_effect(super::effects::TuiEffect::SetAuthPoolPreference {
-                            pool,
-                            profile: Some(profile),
-                        });
-                    self.chat
-                        .app
-                        .set_status("updating preferred subscription…".to_owned());
-                }
-                super::chat_loop::AuthPoolPickerRootOutcome::Clear { pool } => {
-                    self.chat
-                        .start_effect(super::effects::TuiEffect::SetAuthPoolPreference {
-                            pool,
-                            profile: None,
-                        });
-                    self.chat
-                        .app
-                        .set_status("clearing subscription preference…".to_owned());
+                super::chat_loop::AuthPoolPickerRootOutcome::Apply(action) => {
+                    if let Some(session_id) = self.chat.attached_session_id() {
+                        self.chat
+                            .start_effect(super::effects::TuiEffect::SetAuthPoolPreference {
+                                session_id,
+                                action,
+                            });
+                        self.chat
+                            .app
+                            .set_status("Updating account settings…".to_owned());
+                    }
                 }
             }
             return super::invalidation::UiInvalidation::Structural;

@@ -7452,6 +7452,11 @@ struct VerifyCacheArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Manage account selection, next-turn routing, saved defaults, labels, and pause state.
+    Account {
+        #[command(subcommand)]
+        command: account_routing::AccountCommand,
+    },
     /// Initialize, reconnect, or inspect retained broker credential custody.
     BrokerSetup {
         #[arg(value_enum)]
@@ -10364,6 +10369,7 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
         AuthCommand::Discover | AuthCommand::Import { .. } => {
             credential_setup::handle_command(command)
         }
+        AuthCommand::Account { command } => account_routing::handle(command).await,
         AuthCommand::Providers => auth_providers(),
         AuthCommand::Status { provider, profile } => provider
             .map_or_else(auth_status, |provider| {
@@ -12524,6 +12530,7 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
         .map(|vault| display_from_current_dir(&vault).to_string())
 }
 
+mod account_routing;
 mod auth_login;
 mod credential_setup;
 mod headless;

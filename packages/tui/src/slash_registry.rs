@@ -178,8 +178,11 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         id: BuiltinCommandId::AuthPool,
         names: &["auth-pool", "subscriptions"],
         completions: &[
-            completion!("/auth-pool", "Choose preferred provider subscription"),
-            completion!("/subscriptions", "Choose preferred provider subscription"),
+            completion!("/auth-pool", "Choose account routing; keep model unchanged"),
+            completion!(
+                "/subscriptions",
+                "Choose account routing; keep model unchanged"
+            ),
         ],
     },
     BuiltinCommandSpec {

@@ -566,8 +566,26 @@ fn register_monitor_actions(
         (
             "auth_pool_picker",
             "tui.auth.clear",
-            "Clear promotion",
+            "Follow configuration",
             vec!["c"],
+        ),
+        (
+            "auth_pool_picker",
+            "tui.auth.pause",
+            "Pause or resume account",
+            vec!["p"],
+        ),
+        (
+            "auth_pool_picker",
+            "tui.auth.rename",
+            "Rename account",
+            vec!["r"],
+        ),
+        (
+            "auth_pool_picker",
+            "tui.auth.details",
+            "Account details",
+            vec!["d"],
         ),
         (
             "chat",

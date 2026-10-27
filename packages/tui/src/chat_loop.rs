@@ -266,8 +266,7 @@ struct RootModelPicker {
 pub enum AuthPoolPickerRootOutcome {
     Continue,
     Cancel,
-    Promote { pool: String, profile: String },
-    Clear { pool: String },
+    Apply(super::auth_pool_picker::AccountAction),
 }
 
 #[derive(Debug)]
@@ -1578,40 +1577,15 @@ impl ChatLoopState {
         let Some(picker) = self.auth_pool_picker.as_mut() else {
             return AuthPoolPickerRootOutcome::Continue;
         };
-        let action = match event {
-            Event::Key(stroke) => match keymap.action("auth_pool_picker", *stroke) {
-                Some("tui.control.cancel") => AuthPoolPickerRootOutcome::Cancel,
-                Some("tui.control.submit") => picker
-                    .selected()
-                    .map_or(AuthPoolPickerRootOutcome::Continue, |(pool, profile)| {
-                        AuthPoolPickerRootOutcome::Promote { pool, profile }
-                    }),
-                Some("tui.auth.clear") => picker
-                    .selected_pool()
-                    .map_or(AuthPoolPickerRootOutcome::Continue, |pool| {
-                        AuthPoolPickerRootOutcome::Clear { pool }
-                    }),
-                Some("tui.control.up") => {
-                    picker.select_previous();
-                    AuthPoolPickerRootOutcome::Continue
-                }
-                Some("tui.control.down") => {
-                    picker.select_next();
-                    AuthPoolPickerRootOutcome::Continue
-                }
-                _ => AuthPoolPickerRootOutcome::Continue,
-            },
-            Event::Mouse(mouse) => {
-                if let Some(row) = super::picker_mouse::picker_row_from_mouse(*mouse) {
-                    picker.select_visible(row);
-                }
-                AuthPoolPickerRootOutcome::Continue
-            }
-            Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) | Event::Paste(_) => {
-                AuthPoolPickerRootOutcome::Continue
+        let action = match picker.handle_event(event, keymap) {
+            super::auth_pool_picker::PickerOutcome::Continue => AuthPoolPickerRootOutcome::Continue,
+            super::auth_pool_picker::PickerOutcome::Cancel => AuthPoolPickerRootOutcome::Cancel,
+            super::auth_pool_picker::PickerOutcome::Apply(action) => {
+                picker.submitting = true;
+                AuthPoolPickerRootOutcome::Apply(action)
             }
         };
-        if !matches!(action, AuthPoolPickerRootOutcome::Continue) {
+        if matches!(action, AuthPoolPickerRootOutcome::Cancel) {
             self.auth_pool_picker = None;
         }
         action
@@ -3737,29 +3711,32 @@ pub fn apply_effect_result(
             }
             Err(error) => report_nonfatal_client_error(chat, "Model providers unavailable", &error),
         },
-        TuiEffectResult::AuthPoolPickerLoaded { result } => match result {
-            Ok(pools) if pools.iter().any(|pool| !pool.profiles.is_empty()) => {
+        TuiEffectResult::AuthPoolPickerLoaded { session_id, result } => match result {
+            _ if chat.attached_session_id() != Some(session_id) => {}
+            Ok(snapshot) => {
                 loop_state.auth_pool_picker =
-                    Some(super::auth_pool_picker::AuthPoolPickerApp::new(pools));
+                    Some(super::auth_pool_picker::AuthPoolPickerApp::new(snapshot));
                 chat.app
-                    .set_status("select the preferred subscription".to_owned());
+                    .set_status("Choose an account; model stays unchanged".to_owned());
             }
-            Ok(_) => chat.app.set_status("no auth pools configured".to_owned()),
-            Err(error) => report_nonfatal_client_error(chat, "Auth pools unavailable", &error),
+            Err(error) => report_nonfatal_client_error(chat, "Accounts unavailable", &error),
         },
-        TuiEffectResult::AuthPoolPreferenceSet {
-            pool,
-            profile,
-            result,
-        } => match result {
-            Ok(()) => {
-                chat.app.set_status(profile.map_or_else(
-                    || format!("cleared interactive preference for {pool}"),
-                    |profile| format!("preferred subscription for {pool}: {profile}"),
+        TuiEffectResult::AuthPoolPreferenceSet { session_id, result } => match result {
+            _ if chat.attached_session_id() != Some(session_id) => {}
+            Ok(snapshot) => {
+                let picker = super::auth_pool_picker::AuthPoolPickerApp::new(snapshot);
+                chat.app.set_status(format!(
+                    "This session: {} · New sessions: {} · model unchanged",
+                    picker.route_label(&picker.snapshot.session_route),
+                    picker.route_label(&picker.snapshot.new_session_route)
                 ));
+                loop_state.auth_pool_picker = Some(picker);
             }
             Err(error) => {
-                report_nonfatal_client_error(chat, "Auth pool preference update failed", &error);
+                if let Some(picker) = loop_state.auth_pool_picker.as_mut() {
+                    picker.submitting = false;
+                }
+                report_nonfatal_client_error(chat, "Account update failed", &error);
             }
         },
         TuiEffectResult::SelectedModelChecked {
@@ -4615,9 +4592,14 @@ fn apply_root_slash_command_outcome(
             chat.start_effect(TuiEffect::AttachWorktree { session_id, path });
         }
         SlashCommandOutcome::PickAuthPool => {
-            chat.start_effect(TuiEffect::LoadAuthPoolPicker);
-            chat.app
-                .set_status("loading auth subscriptions…".to_owned());
+            if let Some(session_id) = chat.attached_session_id() {
+                chat.start_effect(TuiEffect::LoadAuthPoolPicker { session_id });
+            } else {
+                chat.app
+                    .set_status("Open a session before choosing accounts".to_owned());
+                return;
+            }
+            chat.app.set_status("loading accounts…".to_owned());
         }
         SlashCommandOutcome::SetLocalModel {
             provider_plugin_id,

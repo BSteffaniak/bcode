@@ -449,11 +449,11 @@ pub enum TuiEffect {
     /// Load model providers before opening the root model picker.
     LoadModelProviders,
     /// Load portable auth-pool status before opening the subscription picker.
-    LoadAuthPoolPicker,
+    LoadAuthPoolPicker { session_id: SessionId },
     /// Persist or clear an auth-pool preference.
     SetAuthPoolPreference {
-        pool: String,
-        profile: Option<String>,
+        session_id: SessionId,
+        action: super::auth_pool_picker::AccountAction,
     },
     /// Explicitly consented, bounded check for exactly one selected model.
     CheckSelectedModel {
@@ -891,17 +891,17 @@ pub enum TuiEffectResult {
     },
     /// Portable auth-pool status loaded.
     AuthPoolPickerLoaded {
+        /// Session whose configured context was read.
+        session_id: SessionId,
         /// Loaded secret-free pool summaries.
-        result: Result<Vec<bcode_provider_auth_models::AuthPoolSummary>, ClientError>,
+        result: Result<bcode_provider_auth_models::AccountRouting, ClientError>,
     },
     /// Interactive auth-pool preference mutation completed.
     AuthPoolPreferenceSet {
-        /// Updated pool.
-        pool: String,
-        /// New preferred profile, or `None` when clearing the override.
-        profile: Option<String>,
-        /// Daemon response.
-        result: Result<(), ClientError>,
+        /// Session whose configured context was updated.
+        session_id: SessionId,
+        /// Authoritative post-mutation routing snapshot.
+        result: Result<bcode_provider_auth_models::AccountRouting, ClientError>,
     },
     /// Completed selected check and post-persistence model-list refresh.
     SelectedModelChecked {
@@ -1153,7 +1153,9 @@ impl TuiEffectResult {
             Self::RalphStarted { result } => DaemonObservation::from_tui_result(result),
             Self::PluginSurfaceOpened { result, .. } => DaemonObservation::from_tui_result(result),
             Self::ModelProvidersLoaded { result } => DaemonObservation::from_client_result(result),
-            Self::AuthPoolPickerLoaded { result } => DaemonObservation::from_client_result(result),
+            Self::AuthPoolPickerLoaded { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
             Self::AuthPoolPreferenceSet { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
@@ -1464,7 +1466,7 @@ impl TuiEffect {
             | Self::RalphStart { .. }
             | Self::OpenPluginSurface { .. }
             | Self::LoadModelProviders
-            | Self::LoadAuthPoolPicker
+            | Self::LoadAuthPoolPicker { .. }
             | Self::SetAuthPoolPreference { .. }
             | Self::CheckSelectedModel { .. }
             | Self::LoadModelPicker { .. }
@@ -1538,7 +1540,7 @@ impl TuiEffect {
             | Self::RalphStart { .. }
             | Self::OpenPluginSurface { .. }
             | Self::LoadModelProviders
-            | Self::LoadAuthPoolPicker
+            | Self::LoadAuthPoolPicker { .. }
             | Self::SetAuthPoolPreference { .. }
             | Self::CheckSelectedModel { .. }
             | Self::LoadModelPicker { .. }
@@ -1780,7 +1782,7 @@ impl TuiEffect {
             Self::RalphStart { .. } => EffectKey::RalphStart,
             Self::OpenPluginSurface { .. } => EffectKey::PluginSurface,
             Self::LoadModelProviders => EffectKey::ModelProviders,
-            Self::LoadAuthPoolPicker => EffectKey::AuthPoolPicker,
+            Self::LoadAuthPoolPicker { .. } => EffectKey::AuthPoolPicker,
             Self::SetAuthPoolPreference { .. } => EffectKey::AuthPoolPreference,
             Self::CheckSelectedModel { .. } => EffectKey::ModelCheck,
             Self::LoadModelPicker { .. } => EffectKey::ModelPicker,
@@ -2298,15 +2300,23 @@ impl TuiEffect {
                         .collect()
                 }),
             },
-            Self::LoadAuthPoolPicker => TuiEffectResult::AuthPoolPickerLoaded {
-                result: client.auth_pool_list().await,
+            Self::LoadAuthPoolPicker { session_id } => TuiEffectResult::AuthPoolPickerLoaded {
+                session_id,
+                result: client.account_routing(session_id).await,
             },
-            Self::SetAuthPoolPreference { pool, profile } => {
-                TuiEffectResult::AuthPoolPreferenceSet {
-                    pool: pool.clone(),
-                    profile: profile.clone(),
-                    result: client.set_auth_pool_preference(pool, profile).await,
-                }
+            Self::SetAuthPoolPreference { session_id, action } => {
+                let result = match action {
+                    super::auth_pool_picker::AccountAction::Route(request) => {
+                        client.set_account_routing(session_id, request).await
+                    }
+                    super::auth_pool_picker::AccountAction::Pause(request) => {
+                        client.set_account_pause(session_id, request).await
+                    }
+                    super::auth_pool_picker::AccountAction::Rename(request) => {
+                        client.rename_account(session_id, request).await
+                    }
+                };
+                TuiEffectResult::AuthPoolPreferenceSet { session_id, result }
             }
             Self::CheckSelectedModel {
                 session_id,

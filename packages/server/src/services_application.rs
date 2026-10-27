@@ -752,6 +752,150 @@ impl bcode_daemon_lifecycle::application::RuntimeApplication for ServicesApplica
     }
 }
 
+impl bcode_provider_auth_models::application::AccountRoutingApplication
+    for ServicesApplicationHandle<'_>
+{
+    async fn account_routing(
+        &self,
+        session_id: String,
+    ) -> Result<
+        bcode_provider_auth_models::AccountRouting,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let fail =
+            |message: String| bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: "account_routing_unavailable".into(),
+                message,
+            };
+        let session_id = session_id
+            .parse()
+            .map_err(|_| fail("invalid session ID".into()))?;
+        self.selected_session(session_id)
+            .await
+            .map_err(|(_, message)| fail(message))?;
+        if !self
+            .state
+            .session_configs
+            .lock()
+            .await
+            .contains_key(&session_id)
+        {
+            let runtime = self.state.client_runtime_context(self.client_id).await;
+            self.state
+                .set_session_config_from_runtime_context(session_id, runtime.as_ref())
+                .await;
+        }
+        crate::account_routing::read(self.state, session_id)
+            .await
+            .map_err(fail)
+    }
+    async fn set_account_routing(
+        &self,
+        session_id: String,
+        request: bcode_provider_auth_models::SetAccountRoutingRequest,
+    ) -> Result<
+        bcode_provider_auth_models::AccountRouting,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let fail =
+            |message: String| bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: "account_routing_unavailable".into(),
+                message,
+            };
+        let session_id = session_id
+            .parse()
+            .map_err(|_| fail("invalid session ID".into()))?;
+        self.selected_session(session_id)
+            .await
+            .map_err(|(_, message)| fail(message))?;
+        if !self
+            .state
+            .session_configs
+            .lock()
+            .await
+            .contains_key(&session_id)
+        {
+            let runtime = self.state.client_runtime_context(self.client_id).await;
+            self.state
+                .set_session_config_from_runtime_context(session_id, runtime.as_ref())
+                .await;
+        }
+        crate::account_routing::set_route(self.state, session_id, request)
+            .await
+            .map_err(fail)
+    }
+    async fn set_account_pause(
+        &self,
+        session_id: String,
+        request: bcode_provider_auth_models::SetAccountPauseRequest,
+    ) -> Result<
+        bcode_provider_auth_models::AccountRouting,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let fail =
+            |message: String| bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: "account_routing_unavailable".into(),
+                message,
+            };
+        let session_id = session_id
+            .parse()
+            .map_err(|_| fail("invalid session ID".into()))?;
+        self.selected_session(session_id)
+            .await
+            .map_err(|(_, message)| fail(message))?;
+        if !self
+            .state
+            .session_configs
+            .lock()
+            .await
+            .contains_key(&session_id)
+        {
+            let runtime = self.state.client_runtime_context(self.client_id).await;
+            self.state
+                .set_session_config_from_runtime_context(session_id, runtime.as_ref())
+                .await;
+        }
+        crate::account_routing::pause(self.state, session_id, request)
+            .await
+            .map_err(fail)
+    }
+    async fn rename_account(
+        &self,
+        session_id: String,
+        request: bcode_provider_auth_models::RenameAccountRequest,
+    ) -> Result<
+        bcode_provider_auth_models::AccountRouting,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        let fail =
+            |message: String| bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+                code: "account_routing_unavailable".into(),
+                message,
+            };
+        let session_id = session_id
+            .parse()
+            .map_err(|_| fail("invalid session ID".into()))?;
+        self.selected_session(session_id)
+            .await
+            .map_err(|(_, message)| fail(message))?;
+        if !self
+            .state
+            .session_configs
+            .lock()
+            .await
+            .contains_key(&session_id)
+        {
+            let runtime = self.state.client_runtime_context(self.client_id).await;
+            self.state
+                .set_session_config_from_runtime_context(session_id, runtime.as_ref())
+                .await;
+        }
+        crate::account_routing::rename(self.state, session_id, request)
+            .await
+            .map_err(fail)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

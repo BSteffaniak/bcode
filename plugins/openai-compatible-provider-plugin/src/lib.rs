@@ -4062,6 +4062,33 @@ fn order_candidate_selections_by<'a>(
     cooldown_candidates: &[&'a ProviderAuthCandidate],
     mut needs_priming: impl FnMut(&ProviderAuthCandidate) -> bool,
 ) -> Vec<CandidateSelection<'a>> {
+    if request.provider_context.account_routing_frozen
+        && request
+            .provider_context
+            .auth_pool_selection_reason
+            .as_deref()
+            == Some("explicit_account_route")
+    {
+        let mut candidates = available_candidates
+            .iter()
+            .chain(cooldown_candidates)
+            .copied()
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| {
+            request
+                .provider_context
+                .auth_candidates
+                .iter()
+                .position(|entry| entry.profile == candidate.profile)
+        });
+        return candidates
+            .into_iter()
+            .map(|candidate| CandidateSelection {
+                candidate,
+                reason: CandidateSelectionReason::Strategy,
+            })
+            .collect();
+    }
     let priming_candidate = available_candidates
         .iter()
         .copied()
@@ -13965,6 +13992,30 @@ mod tests {
             profile: Some(profile.to_string()),
             ..ProviderAuthCandidate::default()
         }
+    }
+
+    #[test]
+    fn explicit_account_routing_preserves_order_without_priming() {
+        let mut request = test_request(Vec::new());
+        let candidates = [auth_candidate("work"), auth_candidate("personal")];
+        request.provider_context.auth_candidates = candidates.to_vec();
+        request.provider_context.account_routing_frozen = true;
+        request.provider_context.auth_pool_selection_reason = Some("explicit_account_route".into());
+        let selections =
+            order_candidate_selections_by(&request, &[&candidates[1]], &[&candidates[0]], |_| {
+                panic!("explicit account routing must not consult priming")
+            });
+        assert_eq!(
+            selections
+                .iter()
+                .map(|selection| selection.candidate.profile.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("work"), Some("personal")]
+        );
+        request.provider_context.auth_candidates.truncate(1);
+        let selections = order_candidate_selections_by(&request, &[&candidates[0]], &[], |_| false);
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].candidate.profile.as_deref(), Some("work"));
     }
 
     #[test]

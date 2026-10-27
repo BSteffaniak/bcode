@@ -8,6 +8,7 @@
 //! material for provider plugins, plus compatibility env values for providers
 //! that still consume environment-shaped credentials.
 
+pub mod account_routing;
 pub mod auth_pool_routing;
 pub mod auth_pool_state;
 #[cfg(unix)]
@@ -58,7 +59,20 @@ pub fn apply_auth_pool_preference(
 pub fn auth_pool_summaries(
     config: &bcode_config::BcodeConfig,
 ) -> Vec<bcode_provider_auth_models::AuthPoolSummary> {
-    let registry = bcode_config::load_runtime_auth_subscriptions();
+    let registry = if config.active_context.is_some() {
+        bcode_config::RuntimeAuthSubscriptions::default()
+    } else {
+        bcode_config::load_runtime_auth_subscriptions()
+    };
+    auth_pool_summaries_with_subscriptions(config, &registry)
+}
+
+/// Return secret-free pool details from an already-authorized configuration and registry snapshot.
+#[must_use]
+pub fn auth_pool_summaries_with_subscriptions(
+    config: &bcode_config::BcodeConfig,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+) -> Vec<bcode_provider_auth_models::AuthPoolSummary> {
     let state = auth_pool_state::load_state();
     let selected = config.resolved_model_selection();
     let names = config
@@ -73,7 +87,7 @@ pub fn auth_pool_summaries(
         .map(|pool| {
             let order = bcode_config::effective_auth_pool_order(
                 config,
-                &registry,
+                registry,
                 &pool,
                 (selected.auth_pool.as_deref() == Some(pool.as_str()))
                     .then_some(selected.auth_profile.as_deref())
@@ -597,6 +611,7 @@ fn resolve_request_context_from_registry(
             request.selection.auth_pool.as_deref(),
         ),
         auth_pool_selection_reason: None,
+        account_routing_frozen: false,
         settings: request.selection.settings,
         auth: None,
         auth_candidates: Vec::new(),

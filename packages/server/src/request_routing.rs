@@ -943,6 +943,25 @@ pub enum CoreRuntimeRequest {
         invocation_id: String,
     },
     AuthPoolList,
+    /// Read account-first next-turn routing in the session configuration.
+    AccountRouting {
+        session_id: SessionId,
+    },
+    /// Set next-turn routing and/or new-session defaults.
+    SetAccountRouting {
+        session_id: SessionId,
+        request: bcode_provider_auth_models::SetAccountRoutingRequest,
+    },
+    /// Pause/resume across pools in the session configuration.
+    SetAccountPause {
+        session_id: SessionId,
+        request: bcode_provider_auth_models::SetAccountPauseRequest,
+    },
+    /// Rename display metadata only.
+    RenameAccount {
+        session_id: SessionId,
+        request: bcode_provider_auth_models::RenameAccountRequest,
+    },
     SetAuthPoolPreference {
         pool: String,
         profile: Option<String>,
@@ -2374,6 +2393,30 @@ impl RoutedRequest {
                     invocation_id,
                 }))
             }
+            Request::AccountRouting { session_id } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::AccountRouting { session_id }))
+            }
+            Request::SetAccountRouting {
+                session_id,
+                request,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetAccountRouting {
+                session_id,
+                request,
+            })),
+            Request::SetAccountPause {
+                session_id,
+                request,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetAccountPause {
+                session_id,
+                request,
+            })),
+            Request::RenameAccount {
+                session_id,
+                request,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::RenameAccount {
+                session_id,
+                request,
+            })),
             Request::AuthPoolList => Self::CoreRuntime(Box::new(CoreRuntimeRequest::AuthPoolList)),
             Request::SetAuthPoolPreference { pool, profile } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetAuthPoolPreference {

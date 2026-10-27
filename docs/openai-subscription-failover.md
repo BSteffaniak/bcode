@@ -146,6 +146,10 @@ an `openai` pool from the authentication scheme. Pool and profile names are user
 
 ## Preferred profile and effective order
 
+For account-first session switching, saved defaults, pause/resume, and labels,
+see [Account selection and pause controls](account-selection.md). Pool preference
+is an advanced ordering control, not an exclusive account selection.
+
 Auth pools support any number of profiles. The first profile in effective order is the preferred
 profile for failover and for `priming.include_primary` semantics. Declare a default without changing
 the underlying profile list:

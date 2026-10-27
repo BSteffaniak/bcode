@@ -1000,9 +1000,18 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         request: CreateSessionRequest,
     ) -> Result<SessionSummary, SessionApplicationFailure> {
         self.require_running()?;
-        session_operations::create(self.state, request.name, request.working_directory)
+        let session =
+            session_operations::create(self.state, request.name, request.working_directory)
+                .await
+                .map_err(|error| failure(error.code(), error.message()))?;
+        let runtime = self.state.client_runtime_context(self.client_id).await;
+        self.state
+            .set_session_config_from_runtime_context(session.id, runtime.as_ref())
+            .await;
+        crate::account_routing::initialize(self.state, session.id)
             .await
-            .map_err(|error| failure(error.code(), error.message()))
+            .map_err(|message| failure("account_routing_unavailable", &message))?;
+        Ok(session)
     }
 
     async fn inspect_compaction(

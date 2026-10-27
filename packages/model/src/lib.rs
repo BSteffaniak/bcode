@@ -2724,6 +2724,9 @@ pub struct ProviderRequestContext {
     /// Reason the host selected the active auth-pool candidate.
     #[serde(default)]
     pub auth_pool_selection_reason: Option<String>,
+    /// Host has frozen account eligibility/order for the running turn. No ambient preference reads.
+    #[serde(default)]
+    pub account_routing_frozen: bool,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
     /// Semantic auth material resolved from the selected auth profile.

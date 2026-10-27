@@ -13,6 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub fn prepare_auth_pool_usage(
     context: &mut bcode_model::ProviderRequestContext,
 ) -> Vec<bcode_model::AuthUsageRequest> {
+    if context.account_routing_frozen {
+        return Vec::new();
+    }
     if let Some(pool) = context.auth_pool.as_deref()
         && let Some(preferred) = bcode_config::load_runtime_auth_subscriptions()
             .pools
@@ -98,6 +101,9 @@ pub fn record_auth_pool_usage(
 
 /// Apply current pool routing to a request, retaining all candidates for provider-owned fallback.
 pub fn apply_auth_pool_selection(context: &mut bcode_model::ProviderRequestContext) {
+    if context.account_routing_frozen {
+        return;
+    }
     let state = auth_pool_state::load_state();
     apply_auth_pool_selection_with_state(context, &state, unix_now());
 }

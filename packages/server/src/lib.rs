@@ -9,6 +9,7 @@
 //! Every provider usage or managed-compaction event must be applied to the exact request boundary
 //! captured before that request was sent rather than inferred from later session history.
 
+pub(crate) mod account_routing;
 pub(crate) mod artifact_operations;
 mod auxiliary_generation;
 #[cfg(test)]
@@ -463,6 +464,7 @@ pub struct ServerState {
     startup_config: bcode_config::BcodeConfig,
     history_auth_gate: Arc<tokio::sync::Semaphore>,
     session_configs: Mutex<BTreeMap<SessionId, bcode_config::BcodeConfig>>,
+    session_config_launches: Mutex<BTreeMap<SessionId, bcode_config::ConfigLaunchContext>>,
     session_external_configs: Mutex<BTreeSet<SessionId>>,
     session_skills: Mutex<BTreeMap<SessionId, Option<SkillRegistry>>>,
     session_repository_roots: Mutex<BTreeMap<SessionId, (PathBuf, Option<PathBuf>)>>,
@@ -2603,6 +2605,7 @@ impl ServerState {
             history_auth_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             contextual_plugin_invocations: StdMutex::default(),
             session_configs: Mutex::default(),
+            session_config_launches: Mutex::default(),
             session_external_configs: Mutex::default(),
             session_skills: Mutex::default(),
             session_repository_roots: Mutex::default(),
@@ -3002,6 +3005,12 @@ impl ServerState {
             external.remove(&session_id);
         }
         drop(external);
+        if let Some(launch) = context.and_then(|context| context.config_launch.as_deref()) {
+            self.session_config_launches
+                .lock()
+                .await
+                .insert(session_id, launch.clone());
+        }
         self.session_configs.lock().await.insert(session_id, config);
         self.session_skills.lock().await.insert(session_id, skills);
     }
@@ -6935,6 +6944,10 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RestartSessionCompaction { .. } => "restart_session_compaction",
         Request::SetSessionModel { .. } => "set_session_model",
         Request::SetSessionReasoning { .. } => "set_session_reasoning",
+        Request::AccountRouting { .. } => "account_routing",
+        Request::SetAccountRouting { .. } => "set_account_routing",
+        Request::SetAccountPause { .. } => "set_account_pause",
+        Request::RenameAccount { .. } => "rename_account",
         Request::AuthPoolList => "auth_pool_list",
         Request::SetAuthPoolPreference { .. } => "set_auth_pool_preference",
         Request::AppendPresentationNote { .. } => "append_presentation_note",
@@ -10701,6 +10714,43 @@ async fn handle_core_runtime_request(
                 |error| Response::Err(ErrorResponse::new(error.code, error.message)),
                 |result| Response::Ok(ResponsePayload::ApplicationCommandCancelled { result }),
             );
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::AccountRouting { session_id } => {
+            let response = match bcode_provider_auth_models::application::AccountRoutingApplication::account_routing(&ServicesApplicationHandle::new(state, client_id), session_id.to_string()).await {
+                Ok(routing) => Response::Ok(ResponsePayload::AccountRouting { routing }),
+                Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::SetAccountRouting {
+            session_id,
+            request,
+        } => {
+            let response = match bcode_provider_auth_models::application::AccountRoutingApplication::set_account_routing(&ServicesApplicationHandle::new(state, client_id), session_id.to_string(), request).await {
+                Ok(routing) => Response::Ok(ResponsePayload::AccountRouting { routing }),
+                Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::SetAccountPause {
+            session_id,
+            request,
+        } => {
+            let response = match bcode_provider_auth_models::application::AccountRoutingApplication::set_account_pause(&ServicesApplicationHandle::new(state, client_id), session_id.to_string(), request).await {
+                Ok(routing) => Response::Ok(ResponsePayload::AccountRouting { routing }),
+                Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::RenameAccount {
+            session_id,
+            request,
+        } => {
+            let response = match bcode_provider_auth_models::application::AccountRoutingApplication::rename_account(&ServicesApplicationHandle::new(state, client_id), session_id.to_string(), request).await {
+                Ok(routing) => Response::Ok(ResponsePayload::AccountRouting { routing }),
+                Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
+            };
             send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::AuthPoolList => {
@@ -22197,6 +22247,12 @@ async fn prepare_model_turn_setup(
             turn.selection = Some(selection.clone());
         }
     }
+    if let Err(error) = account_routing::freeze(state, session_id, &mut selection).await {
+        return ModelTurnCompletion::with_message(ModelTurnOutcome::ProviderUnavailable, error);
+    }
+    if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
+        turn.selection = Some(selection.clone());
+    }
     let compaction_policy_timer = state.metrics.timer();
     let mut compaction_policy =
         automatic_compaction_policy(state, &selection, &turn_config.model.compaction).await;
@@ -26075,6 +26131,7 @@ async fn handle_provider_turn_event(
     // races delivery, without reopening the terminal session turn.
     if let ProviderTurnEvent::ModelAvailability { observation } = &event {
         model_evidence::persist(state, observation);
+        account_routing::record_usage(state, session_id, observation).await;
         return;
     }
     if state
@@ -30035,6 +30092,9 @@ async fn select_host_auth_pool_candidate(
     use bcode_provider_auth::auth_pool_routing::{
         apply_auth_pool_selection, prepare_auth_pool_usage, record_auth_pool_usage,
     };
+    if context.account_routing_frozen {
+        return;
+    }
     for request in prepare_auth_pool_usage(context) {
         if let Ok(response) =
             invoke_model_provider_json_blocking::<_, bcode_model::AuthUsageResponse>(
