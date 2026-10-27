@@ -225,6 +225,7 @@ struct TurnState {
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
     usage_recorder: Arc<Mutex<Option<bcode_model_provider_runtime::UsageRecorder<'static>>>>,
     positioned_output: Arc<AtomicBool>,
+    semantic_output_started: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
     structured_text: Arc<Mutex<Option<Result<String, String>>>>,
@@ -276,6 +277,18 @@ struct OpenAiAuthTokenResponse {
 
 impl TurnState {
     fn push(&self, event: ProviderTurnEvent) {
+        if matches!(
+            &event,
+            ProviderTurnEvent::TextDelta { .. }
+                | ProviderTurnEvent::ReasoningDelta { .. }
+                | ProviderTurnEvent::ReasoningActivity { .. }
+                | ProviderTurnEvent::ToolCallStarted { .. }
+                | ProviderTurnEvent::ToolCallDelta { .. }
+                | ProviderTurnEvent::ToolCallFinished { .. }
+                | ProviderTurnEvent::Output { .. }
+        ) {
+            self.semantic_output_started.store(true, Ordering::Release);
+        }
         self.timing.lock().expect("timing lock").observe(&event);
         if let ProviderTurnEvent::TextDelta { text } = &event {
             let mut buffered = self.structured_text.lock().expect("structured text lock");
@@ -3529,7 +3542,11 @@ async fn stream_chat_completion_with_failover(
             }
             Err(error) if is_subscription_quota_error(&error) => {
                 record_selected_auth_profile_quota_error(request, turn, &error);
-                try_auth_candidates_after_selected_failure(request, turn).await
+                try_auth_candidates_after_selected_failure(request, turn, error).await
+            }
+            Err(error) if can_failover_auth_error(&error, turn) => {
+                warn_auth_profile_failure(turn, request.provider_context.auth_profile.as_deref());
+                try_auth_candidates_after_selected_failure(request, turn, error).await
             }
             outcome => outcome,
         };
@@ -3570,6 +3587,7 @@ async fn stream_chat_completion_with_failover(
 async fn try_auth_candidates_after_selected_failure(
     request: &ModelTurnRequest,
     turn: &TurnState,
+    selected_error: ProviderError,
 ) -> Result<StreamOutcome, ProviderError> {
     let selected_profile = request.provider_context.auth_profile.as_deref();
     let mut fallback_request = request.clone();
@@ -3581,11 +3599,7 @@ async fn try_auth_candidates_after_selected_failure(
         .cloned()
         .collect();
     if fallback_request.provider_context.auth_candidates.is_empty() {
-        return Err(provider_error(
-            "openai_auth_pool_exhausted",
-            ProviderErrorCategory::RateLimit,
-            "all configured OpenAI subscriptions are quota-limited",
-        ));
+        return Err(selected_error);
     }
     match try_auth_candidates_once(&fallback_request, turn).await? {
         CandidateAttemptOutcome::Finished(outcome) => Ok(outcome),
@@ -3730,7 +3744,7 @@ async fn try_auth_candidates_once(
             CandidateTryOutcome::Finished(outcome) => {
                 return Ok(CandidateAttemptOutcome::Finished(outcome));
             }
-            CandidateTryOutcome::QuotaLimited {
+            CandidateTryOutcome::Unavailable {
                 error,
                 retry_at_unix,
             } => {
@@ -3766,7 +3780,7 @@ struct CandidateAttemptState {
 #[derive(Debug)]
 enum CandidateTryOutcome {
     Finished(StreamOutcome),
-    QuotaLimited {
+    Unavailable {
         error: ProviderError,
         retry_at_unix: Option<u64>,
     },
@@ -3795,9 +3809,16 @@ async fn try_auth_candidate(
         }
         Err(error) if is_subscription_quota_error(&error) => {
             let retry_at_unix = record_auth_candidate_quota_error(request, turn, candidate, &error);
-            Ok(CandidateTryOutcome::QuotaLimited {
+            Ok(CandidateTryOutcome::Unavailable {
                 error,
                 retry_at_unix,
+            })
+        }
+        Err(error) if can_failover_auth_error(&error, turn) => {
+            warn_auth_profile_failure(turn, candidate.profile.as_deref());
+            Ok(CandidateTryOutcome::Unavailable {
+                error,
+                retry_at_unix: None,
             })
         }
         Err(error) => Err(error),
@@ -4134,6 +4155,21 @@ fn quota_error_retry_at_unix(error: &ProviderError) -> Option<u64> {
         .as_ref()
         .and_then(|hint| hint.retry_at_unix)
         .or_else(|| Some(unix_timestamp().saturating_add(quota_error_cooldown(error).as_secs())))
+}
+
+fn can_failover_auth_error(error: &ProviderError, turn: &TurnState) -> bool {
+    error.category == ProviderErrorCategory::Auth
+        && !turn.semantic_output_started.load(Ordering::Acquire)
+        && !turn.is_cancelled()
+}
+
+fn warn_auth_profile_failure(turn: &TurnState, profile: Option<&str>) {
+    turn.push(ProviderTurnEvent::Warning {
+        message: format!(
+            "OpenAI auth profile '{}' failed authentication; trying remaining configured profiles. Reconnect this profile to restore it.",
+            profile.unwrap_or("unknown")
+        ),
+    });
 }
 
 fn is_subscription_quota_error(error: &ProviderError) -> bool {
@@ -9918,6 +9954,117 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_failover_requires_auth_failure_before_output_and_cancellation() {
+        let turn = TurnState::default();
+        let error = provider_error("token_revoked", ProviderErrorCategory::Auth, "revoked");
+        assert!(can_failover_auth_error(&error, &turn));
+        for category in [
+            ProviderErrorCategory::InvalidRequest,
+            ProviderErrorCategory::ProviderInternal,
+            ProviderErrorCategory::RateLimit,
+        ] {
+            assert!(!can_failover_auth_error(
+                &provider_error("other", category, "other"),
+                &turn
+            ));
+        }
+        turn.push(ProviderTurnEvent::TextDelta {
+            text: "partial".into(),
+        });
+        turn.drain();
+        assert!(!can_failover_auth_error(&error, &turn));
+        let tool_turn = TurnState::default();
+        tool_turn.push(ProviderTurnEvent::ToolCallStarted {
+            call_id: "call".into(),
+            name: "tool".into(),
+        });
+        tool_turn.drain();
+        assert!(!can_failover_auth_error(&error, &tool_turn));
+        let cancelled = TurnState::default();
+        cancelled.cancel();
+        assert!(!can_failover_auth_error(&error, &cancelled));
+    }
+
+    #[tokio::test]
+    async fn auth_failover_tries_remaining_profiles_and_preserves_exhausted_error() {
+        for (selected, fallback_succeeds) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let worker = thread::spawn(move || {
+                let mut attempts = 0;
+                while !worker_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            read_http_request_body(&mut stream);
+                            attempts += 1;
+                            if fallback_succeeds && attempts == 2 {
+                                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                                continue;
+                            }
+                            let body = r#"{"error":{"code":"token_revoked","message":"revoked"}}"#;
+                            write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                }
+                attempts
+            });
+            let mut request = test_request(Vec::new());
+            request
+                .provider_context
+                .settings
+                .insert("base_url".into(), format!("http://{address}/v1"));
+            request
+                .provider_context
+                .settings
+                .insert("dialect".into(), "chat_completions".into());
+            request
+                .provider_context
+                .env
+                .insert("BCODE_OPENAI_API_KEY".into(), "test-key".into());
+            request.provider_context.auth_candidates = (0..2)
+                .map(|index| ProviderAuthCandidate {
+                    profile: Some(format!("revoked-{selected}-{index}")),
+                    env: request.provider_context.env.clone(),
+                    ..ProviderAuthCandidate::default()
+                })
+                .collect();
+            if selected {
+                request.provider_context.auth_profile =
+                    request.provider_context.auth_candidates[0].profile.clone();
+            }
+            let turn = TurnState::default();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                stream_chat_completion_with_failover(&request, &turn),
+            )
+            .await;
+            stop.store(true, Ordering::Release);
+            let attempts = worker.join().unwrap();
+            if fallback_succeeds {
+                assert!(matches!(outcome.unwrap().unwrap(), StreamOutcome::Finished));
+            } else {
+                let error = outcome.unwrap().unwrap_err();
+                assert_eq!(error.category, ProviderErrorCategory::Auth);
+                assert_eq!(error.code, "token_revoked");
+            }
+            assert_eq!(attempts, 2);
+        }
+    }
 
     #[test]
     fn subscription_enrollment_requires_new_refresh_authority() {
