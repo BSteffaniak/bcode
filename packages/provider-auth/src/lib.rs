@@ -24,6 +24,7 @@ pub mod pool_reconciliation;
 /// Verified restart credential materialization.
 pub mod recovery;
 pub mod security;
+pub mod session_routing;
 pub mod startup;
 pub mod store;
 

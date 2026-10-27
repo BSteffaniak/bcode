@@ -232,6 +232,23 @@ reprime_after = "7d"
 
 Bcode scopes provider-native conversation reuse state by auth profile. The host selects the subscription before planning reuse, so native provider response IDs and encrypted reasoning state are reused only with the same auth profile. If OpenAI quota handling falls back to a different subscription after the request was built, the plugin suppresses provider-native reuse state for that fallback request.
 
+## Session-local authentication failover
+
+An authentication rejection remembers the failed credential revision only within the current
+session and pool. Subsequent requests exclude that revision before priming, model selection and
+provider-native reuse/cache planning, avoiding a rejected primary request on every round. No
+configured order or interactive preference is changed. A new session uses the configured order;
+changed credentials become eligible again in the existing session. If every member is rejected,
+Bcode returns a reconnect-required error instead of retrying the known failures indefinitely.
+
+Health observations are disposable, bounded and machine-local, keyed with session-scoped digests;
+credential values are not stored in routing state. They can survive a daemon restart but do not
+promote a fallback account globally. Eviction can cause an old failed credential to be probed again.
+Quota cooldowns and round-robin policy remain separate. Ordinary healthy profiles still follow the
+configured strategy; session failure health does not permanently pin any account. The first fallback
+still clears cross-account continuation state; subsequent host-planned requests use the healthy
+profile directly, so its native continuation state can be retained safely.
+
 ## Failover behavior
 
 Bcode tries profiles in pool order. On quota-like OpenAI errors, it marks the profile on cooldown and retries the next available profile. If all profiles are unavailable, Bcode reports a friendly error suggesting another login or waiting for reset.

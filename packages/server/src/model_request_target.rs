@@ -8,6 +8,8 @@ use super::*;
 
 /// Unresolved inputs needed to select one provider model request target.
 pub struct ModelRequestTargetInput<'a> {
+    /// Session-local routing scope, absent for non-session probes.
+    pub session_id: Option<SessionId>,
     pub provider_plugin_id: Option<&'a str>,
     pub selected_model_id: Option<&'a str>,
     pub provider_context: &'a bcode_model::ProviderRequestContext,
@@ -54,6 +56,11 @@ pub enum ModelRequestTargetError {
     /// Managed membership or credential ownership could not be verified.
     #[error("managed default authentication unavailable")]
     ManagedAuthentication,
+    /// Every pool credential was rejected in this session.
+    #[error(
+        "all auth-pool profiles failed authentication in this session; reconnect a profile or start a new session to retry"
+    )]
+    SessionAuthentication,
 }
 
 /// Resolve one request's effective model and normalized request-critical metadata.
@@ -72,6 +79,13 @@ pub async fn resolve_model_request_target(
         input.native_default,
     )
     .await?;
+    if let Some(session) = input.session_id {
+        bcode_provider_auth::session_routing::prepare_session_auth_pool(
+            &session.to_string(),
+            &mut provider_context,
+        )
+        .map_err(|_| ModelRequestTargetError::SessionAuthentication)?;
+    }
     let models = resolved_provider_models(
         state,
         input.provider_plugin_id.map(ToOwned::to_owned),

@@ -1715,9 +1715,13 @@ impl OpenAiCompatibleProviderPlugin {
         context: &NativeServiceContext,
         positioned_output: bool,
     ) -> ServiceResponse {
-        let mut request = match context.request.payload_json::<ModelTurnRequest>() {
+        let request = match context.request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
+        };
+        let mut request = match prepare_session_request(&request) {
+            Ok(request) => request,
+            Err(error) => return startup_error_response(context, error),
         };
         let mut settings = settings_for_context(&request.provider_context);
         if !context.bridge.is_available()
@@ -3528,6 +3532,8 @@ async fn stream_chat_completion_with_failover(
     if turn.is_cancelled() {
         return Ok(StreamOutcome::Cancelled);
     }
+    let session_request = prepare_session_request(request)?;
+    let request = &session_request;
     if request.provider_context.auth_candidates.is_empty() {
         return stream_chat_completion_inner(request, turn).await;
     }
@@ -3545,6 +3551,10 @@ async fn stream_chat_completion_with_failover(
                 try_auth_candidates_after_selected_failure(request, turn, error).await
             }
             Err(error) if can_failover_auth_error(&error, turn) => {
+                bcode_provider_auth::session_routing::record_auth_failure(
+                    &request.session_id.to_string(),
+                    &request.provider_context,
+                );
                 try_auth_candidates_after_selected_failure(request, turn, error).await
             }
             outcome => outcome,
@@ -3859,6 +3869,10 @@ async fn try_auth_candidate(
             })
         }
         Err(error) if can_failover_auth_error(&error, turn) => {
+            bcode_provider_auth::session_routing::record_auth_failure(
+                &request.session_id.to_string(),
+                &candidate_request.provider_context,
+            );
             warn_auth_profile_failure(turn, candidate.profile.as_deref());
             Ok(CandidateTryOutcome::Unavailable {
                 error,
@@ -3867,6 +3881,35 @@ async fn try_auth_candidate(
         }
         Err(error) => Err(error),
     }
+}
+
+fn prepare_session_request(request: &ModelTurnRequest) -> Result<ModelTurnRequest, ProviderError> {
+    let mut prepared = request.clone();
+    bcode_provider_auth::session_routing::prepare_session_auth_pool(
+        &request.session_id.to_string(),
+        &mut prepared.provider_context,
+    )
+    .map_err(|message| {
+        provider_error(
+            "session_auth_pool_exhausted",
+            ProviderErrorCategory::Auth,
+            message,
+        )
+    })?;
+    if prepared.provider_context.auth_profile != request.provider_context.auth_profile {
+        clear_cross_profile_reuse(&mut prepared);
+    }
+    Ok(prepared)
+}
+
+fn clear_cross_profile_reuse(request: &mut ModelTurnRequest) {
+    request.conversation_reuse.previous_provider_response_id = None;
+    request.conversation_reuse.new_messages_start_index = None;
+    request.conversation_reuse.provider_state = None;
+    request.metadata.insert(
+        "suppress_provider_reuse_state".into(),
+        "auth_profile_changed".into(),
+    );
 }
 
 fn auth_candidate_request(
@@ -3881,17 +3924,7 @@ fn auth_candidate_request(
     candidate_request.provider_context.auth = Some(candidate.auth.clone());
     candidate_request.provider_context.env = candidate.env.clone();
     if candidate.profile != request.provider_context.auth_profile {
-        candidate_request
-            .conversation_reuse
-            .previous_provider_response_id = None;
-        candidate_request
-            .conversation_reuse
-            .new_messages_start_index = None;
-        candidate_request.conversation_reuse.provider_state = None;
-        candidate_request.metadata.insert(
-            "suppress_provider_reuse_state".to_string(),
-            "auth_profile_changed".to_string(),
-        );
+        clear_cross_profile_reuse(&mut candidate_request);
     }
     candidate_request
 }
@@ -10216,7 +10249,7 @@ mod tests {
                                 .unwrap();
                             read_http_request_body(&mut stream);
                             attempts += 1;
-                            if fallback_succeeds && attempts == 2 {
+                            if fallback_succeeds && attempts >= 2 {
                                 let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
                                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                                 continue;
@@ -10233,6 +10266,9 @@ mod tests {
                 attempts
             });
             let mut request = test_request(Vec::new());
+            request.session_id = bcode_session_models::SessionId::new();
+            request.provider_context.auth_pool =
+                Some(format!("session-retry-{selected}-{fallback_succeeds}"));
             request
                 .provider_context
                 .settings
@@ -10262,16 +10298,32 @@ mod tests {
                 stream_chat_completion_with_failover(&request, &turn),
             )
             .await;
+            let repeated = if fallback_succeeds {
+                Some(
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        stream_chat_completion_with_failover(&request, &TurnState::default()),
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
             stop.store(true, Ordering::Release);
             let attempts = worker.join().unwrap();
             if fallback_succeeds {
                 assert!(matches!(outcome.unwrap().unwrap(), StreamOutcome::Finished));
+                assert!(matches!(
+                    repeated.unwrap().unwrap().unwrap(),
+                    StreamOutcome::Finished
+                ));
+                assert_eq!(attempts, 3);
             } else {
                 let error = outcome.unwrap().unwrap_err();
                 assert_eq!(error.category, ProviderErrorCategory::Auth);
                 assert_eq!(error.code, "token_revoked");
+                assert_eq!(attempts, 2);
             }
-            assert_eq!(attempts, 2);
         }
     }
 

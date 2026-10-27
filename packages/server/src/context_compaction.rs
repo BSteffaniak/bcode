@@ -2051,6 +2051,7 @@ async fn prepare_synthesis(
     let generation_target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
+            session_id: Some(session_id),
             provider_plugin_id: selection.provider_plugin_id.as_deref(),
             selected_model_id: selection.model_id.as_deref(),
             provider_context: &selection.provider_context,
@@ -2292,6 +2293,7 @@ async fn repair_synthesis_chunk(
             let target = Box::pin(resolve_model_request_target(
                 state,
                 ModelRequestTargetInput {
+                    session_id: Some(session_id),
                     provider_plugin_id: selection.provider_plugin_id.as_deref(),
                     selected_model_id: selection.model_id.as_deref(),
                     provider_context: &selection.provider_context,
@@ -2485,6 +2487,7 @@ async fn synthesis_chunks(
     let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
+            session_id: Some(session_id),
             provider_plugin_id: selection.provider_plugin_id.as_deref(),
             selected_model_id: selection.model_id.as_deref(),
             provider_context: &selection.provider_context,
@@ -2854,6 +2857,7 @@ async fn prepare_synthesis_request(
     let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
+            session_id: Some(session_id),
             provider_plugin_id: selection.provider_plugin_id.as_deref(),
             selected_model_id: selection.model_id.as_deref(),
             provider_context: &selection.provider_context,

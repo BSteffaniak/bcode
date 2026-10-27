@@ -15658,6 +15658,11 @@ impl BlockingModelProviderInvoker for CliPluginTurnInvoker<'_> {
             apply_auth_pool_selection, prepare_auth_pool_usage, record_auth_pool_usage,
         };
         let mut request = request.clone();
+        bcode_provider_auth::session_routing::prepare_session_auth_pool(
+            &request.session_id.to_string(),
+            &mut request.provider_context,
+        )
+        .map_err(str::to_owned)?;
         for usage_request in prepare_auth_pool_usage(&mut request.provider_context) {
             if let Ok(response) = self.invoke_json::<_, bcode_model::AuthUsageResponse>(
                 provider_plugin_id,

@@ -4233,6 +4233,7 @@ async fn invariant_selector_runtime(
     let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
+            session_id: Some(session_id),
             provider_plugin_id: model.provider_plugin_id.as_deref(),
             selected_model_id: Some(&model.model_id),
             provider_context: &model.provider_context,
@@ -16852,6 +16853,7 @@ async fn verify_submission_model_target(
     let target = model_request_target::resolve_model_request_target(
         state,
         model_request_target::ModelRequestTargetInput {
+            session_id: None,
             provider_plugin_id: context.selected_provider_plugin_id.as_deref(),
             selected_model_id: context.selected_model_id.as_deref(),
             provider_context: &context.provider_context,
@@ -22228,6 +22230,7 @@ async fn prepare_model_turn_setup(
     let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
+            session_id: Some(session_id),
             provider_plugin_id: provider_plugin_id.as_deref(),
             selected_model_id: selection.model_id.as_deref(),
             provider_context: &selection.provider_context,
@@ -29488,6 +29491,7 @@ async fn assemble_model_turn_request(
     let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
+            session_id: Some(session_id),
             provider_plugin_id,
             selected_model_id,
             provider_context: &selection.provider_context,
@@ -59609,6 +59613,7 @@ library = "test"
         let target = resolve_model_request_target(
             &state,
             ModelRequestTargetInput {
+                session_id: None,
                 provider_plugin_id: Some("bcode.fake-provider"),
                 selected_model_id: Some("fake-echo"),
                 provider_context: &provider_context,

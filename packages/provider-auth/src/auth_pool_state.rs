@@ -18,6 +18,9 @@ pub struct AuthPoolState {
     /// Per-pool routing state.
     #[serde(default)]
     pub pools: BTreeMap<String, AuthPoolRoutingState>,
+    /// Disposable session-local authentication failures; never preferences or credentials.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_auth_failures: BTreeMap<String, crate::session_routing::SessionAuthFailure>,
 }
 
 /// Per-pool routing cursor state.
@@ -381,7 +384,7 @@ fn observation_lock() -> std::io::Result<fs::File> {
     Ok(file)
 }
 
-fn mutate_state<T>(f: impl FnOnce(&mut AuthPoolState) -> T) -> T {
+pub(crate) fn mutate_state<T>(f: impl FnOnce(&mut AuthPoolState) -> T) -> T {
     let _guard = STATE_LOCK.lock().ok();
     let ownership = observation_lock();
     let mut state = load_state();
@@ -727,6 +730,7 @@ mod tests {
                 },
             )]),
             pools: BTreeMap::new(),
+            session_auth_failures: BTreeMap::new(),
         };
         let required_windows = BTreeMap::from([("codex".to_string(), vec!["primary".to_string()])]);
 
@@ -762,6 +766,7 @@ mod tests {
                 },
             )]),
             pools: BTreeMap::new(),
+            session_auth_failures: BTreeMap::new(),
         };
         let required_windows = BTreeMap::from([("codex".to_string(), vec!["primary".to_string()])]);
 

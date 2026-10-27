@@ -152,6 +152,7 @@ async fn resolve_target(
     let target = resolve_model_request_target(
         state,
         ModelRequestTargetInput {
+            session_id: Some(input.session_id),
             provider_plugin_id: Some(&provider),
             selected_model_id: config
                 .resolved_model_profile(&input.model_profile)

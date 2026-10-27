@@ -579,6 +579,7 @@ mod tests {
                     last_selected_profile: Some("openai".to_string()),
                 },
             )]),
+            ..AuthPoolState::default()
         };
 
         let selection =
@@ -612,6 +613,7 @@ mod tests {
                     last_selected_profile: Some("openai".to_string()),
                 },
             )]),
+            ..AuthPoolState::default()
         };
 
         let selection =

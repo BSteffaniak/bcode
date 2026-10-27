@@ -540,6 +540,7 @@ impl ModelHostOperations {
             Box::pin(resolve_model_request_target(
                 state,
                 ModelRequestTargetInput {
+                    session_id: None,
                     provider_plugin_id: Some(requested_provider),
                     selected_model_id: Some(requested_model),
                     provider_context: &context,
