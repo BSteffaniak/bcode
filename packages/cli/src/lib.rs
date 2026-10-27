@@ -4024,8 +4024,9 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
             plugin_id,
             command_id,
             request,
+            deadline_ms,
         } => {
-            execute_plugin_command(&plugin_id, &command_id, &request).await?;
+            execute_plugin_command(&plugin_id, &command_id, &request, deadline_ms).await?;
         }
         PluginCommand::List { root, json } => list_plugins(&root, json)?,
         PluginCommand::Services { root, daemon, json } => {
@@ -8013,6 +8014,9 @@ enum PluginCommand {
         /// Typed `InvokeCommandRequest` JSON, or - for stdin (maximum 1 MiB).
         #[arg(long)]
         request: PathBuf,
+        /// Total command deadline; long-running operations require explicit opt-in.
+        #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..=900_000))]
+        deadline_ms: u64,
     },
     /// Discover selected local plugin manifests without loading native libraries.
     List {
@@ -14605,6 +14609,7 @@ async fn execute_plugin_command(
     plugin_id: &str,
     command_id: &str,
     path: &Path,
+    deadline_ms: u64,
 ) -> Result<(), CliError> {
     use bcode_command::application::{CommandApplication as _, CommandInvocationRequest};
     let request: bcode_command::InvokeCommandRequest = serde_json::from_value(
@@ -14635,7 +14640,7 @@ async fn execute_plugin_command(
                     .is_none()
                     .then(|| context.working_directory.clone())
             }),
-            deadline_ms: 30_000,
+            deadline_ms,
             command: request,
         })
         .await;

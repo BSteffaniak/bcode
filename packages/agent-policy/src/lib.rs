@@ -157,6 +157,42 @@ pub fn evaluate_tool_call(
     request: &EvaluateToolCallRequest,
     cwd: &Path,
 ) -> PolicyEvaluation {
+    if matches!(request.operation, ToolPolicyOperation::Process { .. }) {
+        return evaluate_process(config, request, cwd);
+    }
+    if let ToolPolicyOperation::Compound { operations } = &request.operation {
+        if operations.is_empty()
+            || operations.len() > 32
+            || operations
+                .iter()
+                .any(|operation| matches!(operation, ToolPolicyOperation::Compound { .. }))
+        {
+            return evaluation(
+                AgentDecision::Deny,
+                "invalid compound operation".into(),
+                None,
+                None,
+            );
+        }
+        let mut outcome = evaluation(AgentDecision::Allow, String::new(), None, None);
+        for operation in operations {
+            let mut child = request.clone();
+            child.operation = operation.clone();
+            let result = evaluate_tool_call(config, &child, cwd);
+            if result.response.decision == AgentDecision::Deny {
+                return result;
+            }
+            if result.response.decision == AgentDecision::Ask {
+                outcome = result;
+            }
+        }
+        // A remembered choice for one child must never authorize the entire compound.
+        outcome.matched_rule = None;
+        outcome.matches.clear();
+        outcome.command_part = None;
+        outcome.response.shell = None;
+        return outcome;
+    }
     if tool_enabled(config, request) == Some(false) {
         return evaluation(
             AgentDecision::Deny,
@@ -207,11 +243,94 @@ pub fn evaluate_tool_call(
     evaluate_after_path(config, request)
 }
 
+fn evaluate_process(
+    config: &AgentConfig,
+    request: &EvaluateToolCallRequest,
+    cwd: &Path,
+) -> PolicyEvaluation {
+    let ToolPolicyOperation::Process {
+        executable,
+        arguments,
+        working_directory,
+        read_paths,
+        write_paths,
+        network_urls,
+    } = &request.operation
+    else {
+        return evaluation(AgentDecision::Deny, "invalid process".into(), None, None);
+    };
+    let name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || arguments.len() > 256
+        || arguments
+            .iter()
+            .any(|argument| argument.len() > 16_384 || argument.contains('\0'))
+        || read_paths.len() + write_paths.len() + network_urls.len() > 24
+    {
+        return evaluation(
+            AgentDecision::Deny,
+            "invalid process operation".into(),
+            None,
+            None,
+        );
+    }
+    let mut process = request.clone();
+    process.tool_name = format!("process.{name}");
+    process.aliases.clear();
+    // Parent tool enablement never confers executable authority.
+    if tool_enabled(config, &process) != Some(true) {
+        return evaluation(
+            AgentDecision::Deny,
+            format!(
+                "enable {} explicitly for literal subprocess execution",
+                process.tool_name
+            ),
+            None,
+            None,
+        );
+    }
+    let mut operations = vec![ToolPolicyOperation::Mutating];
+    let mut reads = read_paths.clone();
+    if let Some(directory) = working_directory {
+        reads.push(directory.clone());
+    }
+    operations.push(ToolPolicyOperation::Read { paths: reads });
+    if !write_paths.is_empty() {
+        operations.push(ToolPolicyOperation::Write {
+            paths: write_paths.clone(),
+            category: "write".into(),
+        });
+    }
+    operations.extend(network_urls.iter().map(|url| ToolPolicyOperation::Web {
+        url: Some(url.clone()),
+    }));
+    process.operation = ToolPolicyOperation::Compound { operations };
+    evaluate_tool_call(config, &process, cwd)
+}
+
 fn evaluate_after_path(
     config: &AgentConfig,
     request: &EvaluateToolCallRequest,
 ) -> PolicyEvaluation {
     match &request.operation {
+        ToolPolicyOperation::Process { .. } => evaluation(
+            AgentDecision::Deny,
+            "process requires resource admission".into(),
+            None,
+            None,
+        ),
+        ToolPolicyOperation::Compound { .. } => evaluation(
+            AgentDecision::Deny,
+            "invalid nested compound operation".into(),
+            None,
+            None,
+        ),
         ToolPolicyOperation::Command { .. } => evaluate_shell(config, request),
         ToolPolicyOperation::Web { .. } => evaluate_web_url(config, request),
         ToolPolicyOperation::Write { category, .. } => {
@@ -1970,6 +2089,112 @@ mod tests {
             assert_eq!(winner.regex_flags, flags, "{pattern}");
             assert_eq!(winner.broad, broad, "{pattern}");
         }
+    }
+
+    #[test]
+    fn literal_process_requires_separate_executable_and_all_resource_permissions() {
+        let mut input = request("build", "unused");
+        input.tool_name = "recap.create".into();
+        input.aliases.clear();
+        input.operation = ToolPolicyOperation::Process {
+            executable: "ffmpeg".into(),
+            arguments: vec!["-i".into(), "/tmp/input".into()],
+            working_directory: None,
+            read_paths: vec!["/tmp/input".into()],
+            write_paths: vec!["/tmp/output".into()],
+            network_urls: Vec::new(),
+        };
+        let mut config = AgentConfig {
+            tools: BTreeMap::from([("recap.create".into(), true)]),
+            ..Default::default()
+        };
+        config.permission.external_directory = Action::Allow;
+        assert_eq!(
+            evaluate_tool_call(&config, &input, Path::new("/tmp"))
+                .response
+                .decision,
+            AgentDecision::Deny
+        );
+        config.tools.insert("process.ffmpeg".into(), true);
+        config
+            .permission
+            .tools
+            .insert("process.ffmpeg".into(), Action::Allow);
+        config
+            .permission
+            .write
+            .insert("/tmp/output".into(), Action::Deny);
+        assert_eq!(
+            evaluate_tool_call(&config, &input, Path::new("/tmp"))
+                .response
+                .decision,
+            AgentDecision::Deny
+        );
+        config
+            .permission
+            .write
+            .insert("/tmp/output".into(), Action::Allow);
+        assert_eq!(
+            evaluate_tool_call(&config, &input, Path::new("/tmp"))
+                .response
+                .decision,
+            AgentDecision::Allow
+        );
+        config
+            .permission
+            .read
+            .insert("/tmp/input".into(), Action::Deny);
+        assert_eq!(
+            evaluate_tool_call(&config, &input, Path::new("/tmp"))
+                .response
+                .decision,
+            AgentDecision::Deny
+        );
+    }
+
+    #[test]
+    fn compound_resources_require_every_child_and_reject_nesting() {
+        let mut input = request("build", "true");
+        input.tool_name = "recap.refine".into();
+        input.aliases.clear();
+        let config = AgentConfig {
+            tools: BTreeMap::from([("recap.refine".into(), true)]),
+            permission: PermissionConfig {
+                external_directory: Action::Allow,
+                read: BTreeMap::from([("/tmp/source".into(), Action::Allow)]),
+                write: BTreeMap::from([("/tmp/output".into(), Action::Deny)]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        input.operation = ToolPolicyOperation::Compound {
+            operations: vec![
+                ToolPolicyOperation::Read {
+                    paths: vec!["/tmp/source".into()],
+                },
+                ToolPolicyOperation::Write {
+                    paths: vec!["/tmp/output".into()],
+                    category: "write".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            evaluate_tool_call(&config, &input, Path::new("/tmp"))
+                .response
+                .decision,
+            AgentDecision::Deny
+        );
+        input.operation = ToolPolicyOperation::Compound {
+            operations: vec![ToolPolicyOperation::Compound {
+                operations: vec![ToolPolicyOperation::ReadOnly],
+            }],
+        };
+        assert_eq!(
+            evaluate_tool_call(&config, &input, Path::new("/tmp"))
+                .response
+                .decision,
+            AgentDecision::Deny
+        );
     }
 
     fn request(agent_id: &str, command: &str) -> EvaluateToolCallRequest {

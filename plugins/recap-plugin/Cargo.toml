@@ -1,0 +1,32 @@
+[package]
+authors.workspace    = true
+categories           = ["development-tools"]
+description          = "Direct-library visual recap tools and commands for Bcode"
+edition.workspace    = true
+keywords             = ["bcode", "plugin", "recap", "video"]
+license.workspace    = true
+name                 = "bcode_recap_plugin"
+readme.workspace     = true
+repository.workspace = true
+version.workspace    = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64.workspace           = true
+bcode_command.workspace    = true
+bcode_model.workspace      = true
+bcode_plugin_sdk.workspace = true
+bcode_recap.workspace      = true
+bcode_tool.workspace       = true
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace       = true
+tempfile.workspace         = true
+thiserror.workspace        = true
+tokio                      = { workspace = true, features = ["rt-multi-thread", "time"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

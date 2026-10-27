@@ -225,6 +225,18 @@ pub enum ToolPolicyOperation {
         paths: Vec<String>,
         category: String,
     },
+    /// Literal, non-shell process execution. The executable has its own `process.<name>`
+    /// tool selector; argv never becomes shell text or grants resource access.
+    Process {
+        executable: String,
+        arguments: Vec<String>,
+        working_directory: Option<String>,
+        read_paths: Vec<String>,
+        write_paths: Vec<String>,
+        network_urls: Vec<String>,
+    },
+    /// All resource operations must be authorized. Nested compounds are rejected by policy.
+    Compound { operations: Vec<Self> },
     /// Read-only operation requiring no domain-specific evaluation.
     ReadOnly,
     /// Mutating operation requiring explicit tool enablement/permission.
@@ -327,6 +339,8 @@ impl ToolPolicyAuthorizationMetadata {
             ToolPolicyOperation::Web { .. } => "web",
             ToolPolicyOperation::Read { .. } => "read",
             ToolPolicyOperation::Write { .. } => "write",
+            ToolPolicyOperation::Process { .. } => "process",
+            ToolPolicyOperation::Compound { .. } => "compound",
             ToolPolicyOperation::ReadOnly => "read_only",
             ToolPolicyOperation::Mutating => "mutating",
         }

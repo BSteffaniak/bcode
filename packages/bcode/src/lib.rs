@@ -5343,6 +5343,98 @@ impl Bcode {
             .build())
     }
 
+    /// Configure embedded execution from one explicit file and request-only selection overrides.
+    /// No process environment or global configuration overrides are mutated.
+    ///
+    /// # Errors
+    /// Returns an error for invalid configuration, missing selection, plugin loading or discovery.
+    #[cfg(all(feature = "config", feature = "embedded-plugins"))]
+    pub async fn configured_embedded_from_file(
+        path: PathBuf,
+        profile: Option<&str>,
+        context: Option<&str>,
+        model: Option<&str>,
+        provider: Option<&str>,
+        static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    ) -> Result<Self> {
+        use std::fmt::Write as _;
+        let quote = |value: &str| {
+            serde_json::to_string(value)
+                .map_err(|_| BcodeError::ProviderConfiguration("invalid selection".into()))
+        };
+        let mut overlay = String::new();
+        if let Some(context) = context {
+            writeln!(overlay, "active_context = {}", quote(context)?).map_err(|_| {
+                BcodeError::ProviderConfiguration("invalid selection overlay".into())
+            })?;
+        }
+        if profile.is_some() || model.is_some() || provider.is_some() {
+            overlay.push_str("[model]\n");
+            if let Some(profile) = profile {
+                writeln!(overlay, "profile = {}", quote(profile)?).map_err(|_| {
+                    BcodeError::ProviderConfiguration("invalid selection overlay".into())
+                })?;
+            }
+            if let Some(model) = model {
+                writeln!(overlay, "model_id = {}", quote(model)?).map_err(|_| {
+                    BcodeError::ProviderConfiguration("invalid selection overlay".into())
+                })?;
+            }
+            if let Some(provider) = provider {
+                writeln!(overlay, "provider_plugin_id = {}", quote(provider)?).map_err(|_| {
+                    BcodeError::ProviderConfiguration("invalid selection overlay".into())
+                })?;
+            }
+        }
+        let overrides = bcode_config::ConfigLoadOverrides {
+            exclusive_config_path: Some(path),
+            cli_config_toml: Some(overlay),
+            ..Default::default()
+        };
+        let config =
+            bcode_config::load_config_from_paths_with_overrides(&[], &overrides).map_err(|_| {
+                BcodeError::ProviderConfiguration("invalid explicit model configuration".into())
+            })?;
+        let defaults = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
+        let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &selection,
+            static_plugins,
+        )?;
+        let environment =
+            bcode_config::ConfigEnvironmentSnapshot::new(BTreeMap::new(), PathBuf::from("."));
+        let resolved = config.resolved_model_selection_with_environment(&environment);
+        if model.is_some_and(|requested| resolved.model_id.as_deref() != Some(requested))
+            || provider
+                .is_some_and(|requested| resolved.provider_plugin_id.as_deref() != Some(requested))
+        {
+            return Err(BcodeError::ProviderConfiguration(
+                "explicit model/provider conflicts with the centrally resolved profile".into(),
+            ));
+        }
+        let auth = bcode_provider_auth::try_resolve_provider_request_context(
+            bcode_provider_auth::ProviderRequestContextResolution {
+                config: &config,
+                selection: resolved.clone(),
+            },
+        )?;
+        let mut builder = Self::builder().plugin_runtime(plugins);
+        builder.provider_registry = ProviderRegistry::from_resolved_model_selection(&resolved);
+        builder.provider_context = auth;
+        let sdk = builder.build();
+        let selector = sdk
+            .default_model_selector()
+            .cloned()
+            .ok_or_else(|| BcodeError::ProviderConfiguration("no configured model".into()))?;
+        let owner = selector
+            .provider_plugin_id()
+            .ok_or_else(|| BcodeError::ProviderConfiguration("no configured provider".into()))?
+            .to_owned();
+        let auth = sdk.provider_context().clone();
+        sdk.discover_provider(owner, auth, Some(selector.model_id().to_owned()))
+            .await
+    }
+
     /// Build an embedded SDK handle from layered configuration and caller-provided static plugins,
     /// then discover the configured provider's granular capabilities and selected-model metadata.
     ///
@@ -8323,6 +8415,44 @@ impl Agent {
             )?;
         self.generate_object_with_provider(&mut provider, prompt)
             .await
+    }
+
+    /// Run multimodal structured generation using the configured embedded provider.
+    ///
+    /// This preserves the configured provider's authentication and model selection. No tools
+    /// are discovered by this method; the caller supplies bounded normalized messages.
+    ///
+    /// # Errors
+    /// Returns an error on missing provider, cancellation, provider failure, invalid JSON or
+    /// schema mismatch. Timeout is inherited from this agent's configuration.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn generate_object_from_messages<T>(
+        &self,
+        messages: Vec<ModelMessage>,
+        options: StructuredOutputOptions,
+        cancellation: CancellationToken,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let mut provider: Box<dyn ModelProviderInvoker> =
+            self.provider_factory.as_ref().map_or_else(
+                || {
+                    self.provider
+                        .clone()
+                        .map(|provider| Box::new(provider) as Box<dyn ModelProviderInvoker>)
+                        .ok_or(BcodeError::MissingProvider)
+                },
+                |factory| Ok(factory()),
+            )?;
+        Box::pin(self.generate_object_with_provider_and_request_options(
+            &mut provider,
+            String::new(),
+            options,
+            messages,
+            cancellation,
+        ))
+        .await
     }
 
     /// Generate and deserialize a structured object using explicit options and cancellation.

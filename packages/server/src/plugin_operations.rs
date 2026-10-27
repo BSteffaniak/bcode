@@ -439,9 +439,9 @@ fn validate_activity_response(
     presentation.validate(producer).map_err(|_| invalid())
 }
 
-struct ModelOwnerGuard {
-    host: std::sync::Arc<super::model_host_operations::ModelHostOperations>,
-    owner: Option<(String, String)>,
+pub struct ModelOwnerGuard {
+    pub host: std::sync::Arc<super::model_host_operations::ModelHostOperations>,
+    pub owner: Option<(String, String)>,
 }
 
 impl Drop for ModelOwnerGuard {

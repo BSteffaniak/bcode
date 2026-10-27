@@ -987,6 +987,7 @@ pub struct TurnCancelState {
     marker_commit: Mutex<()>,
     judgement_observation: StdMutex<Option<judgement::TurnObservationHandle>>,
     settled_tool_observations: std::sync::atomic::AtomicUsize,
+    process_admission_agents: StdMutex<BTreeMap<String, String>>,
 }
 
 impl TurnCancelState {
@@ -6375,6 +6376,10 @@ async fn read_client_envelopes(
             && let Some(context) = contextual_invocation_reservation(request)
             && !plugin_context::reserve(&state, client_id, &context)
         {
+            tracing::warn!(
+                stage = "contextual_read_admission",
+                "plugin invocation context rejected"
+            );
             if send_response(
                 &writer,
                 envelope.request_id,
@@ -33804,6 +33809,11 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             .await;
             return ToolAuthorizationDecision::Allow;
         }
+        if let Ok(mut agents) = self.cancel_state.process_admission_agents.lock() {
+            agents.insert(request.call.id.clone(), self.agent_id.to_owned());
+        } else {
+            return ToolAuthorizationDecision::Deny("process admission scope unavailable".into());
+        }
         let agent_decision = evaluate_agent_tool_policy_with_metadata(
             self.state,
             self.session_id,
@@ -35980,6 +35990,24 @@ async fn resolve_server_plugin_bridge_request(
             })
         }
         ServiceBridgeRequest::InvokeService(request)
+            if request.interface_id == bcode_tool::PROCESS_ADMISSION_INTERFACE_ID =>
+        {
+            let resolution =
+                admit_plugin_process(state, session_id, call, plugin_id, request, cancel_state)
+                    .await?;
+            ServiceBridgeResponse::Service(resolution)
+        }
+        ServiceBridgeRequest::InvokeService(request)
+            if request.interface_id == bcode_model::host_operation::INTERFACE_ID =>
+        {
+            let result = if request.invocation_id == call.id && !cancel_state.is_cancelled() {
+                state.model_host.clone().dispatch(plugin_id, request).await
+            } else {
+                ToolInvocationServiceResolution::Cancelled
+            };
+            ServiceBridgeResponse::Service(result)
+        }
+        ServiceBridgeRequest::InvokeService(request)
             if request.interface_id == bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID =>
         {
             let resolution = resolve_workflow_application_request(
@@ -36015,6 +36043,131 @@ async fn resolve_server_plugin_bridge_request(
             )
         }
     })
+}
+
+fn process_policy_name(
+    operation: &bcode_agent_profile::ToolPolicyOperation,
+) -> Result<String, String> {
+    let bcode_agent_profile::ToolPolicyOperation::Process { executable, .. } = operation else {
+        return Err("invalid process operation".into());
+    };
+    Ok(format!(
+        "process.{}",
+        Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("invalid")
+    ))
+}
+
+struct ProcessAgentGuard<'a> {
+    cancel: &'a TurnCancelState,
+    id: &'a str,
+}
+impl Drop for ProcessAgentGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut agents) = self.cancel.process_admission_agents.lock() {
+            agents.remove(self.id);
+        }
+    }
+}
+
+async fn admit_plugin_process(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    plugin_id: &str,
+    request: ToolInvocationServiceRequest,
+    cancel_state: &TurnCancelState,
+) -> Result<ToolInvocationServiceResolution, String> {
+    Ok(
+        if request.invocation_id != call.id
+            || request.route_id.is_some()
+            || request.operation != bcode_tool::OP_AUTHORIZE_PROCESS
+            || cancel_state.is_cancelled()
+        {
+            ToolInvocationServiceResolution::Cancelled
+        } else if let Ok(operation @ bcode_agent_profile::ToolPolicyOperation::Process { .. }) =
+            serde_json::from_value::<bcode_agent_profile::ToolPolicyOperation>(
+                request.payload.clone(),
+            )
+        {
+            let agent = cancel_state
+                .process_admission_agents
+                .lock()
+                .ok()
+                .and_then(|agents| agents.get(&call.id).cloned());
+            let Some(agent) = agent else {
+                return Ok(ToolInvocationServiceResolution::Failed {
+                    code: "process_scope_unavailable".into(),
+                    message: "process admission requires the original authorized tool agent".into(),
+                });
+            };
+            let metadata = ToolPolicyAuthorizationMetadata {
+                requires_permission: true,
+                aliases: Vec::new(),
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
+                permission_category: None,
+                operation,
+            };
+            let decision = evaluate_agent_tool_policy_with_metadata(
+                state, session_id, &agent, call, &metadata, None,
+            )
+            .await;
+            let skill = evaluate_active_skill_tool_policy_with_metadata(
+                state, session_id, &call.name, &metadata,
+            )
+            .await;
+            if matches!(skill, SkillToolPolicyOutcome::Deny { .. }) {
+                return Ok(ToolInvocationServiceResolution::Failed {
+                    code: "process_denied".into(),
+                    message: "active skill policy denied process execution".into(),
+                });
+            }
+            let must_ask = matches!(skill, SkillToolPolicyOutcome::Ask { .. });
+            let process_name = process_policy_name(&metadata.operation)?;
+            let mut prompt = call.clone();
+            prompt.name.clone_from(&process_name);
+            prompt.arguments = request.payload;
+            let allowed = match decision.decision {
+                AgentDecision::Allow if !must_ask => true,
+                AgentDecision::Deny => false,
+                AgentDecision::Ask | AgentDecision::Allow => {
+                    request_tool_permission(
+                        state,
+                        session_id,
+                        &prompt,
+                        &process_name,
+                        plugin_id,
+                        cancel_state,
+                        PermissionPolicyContext {
+                            source: Some("process".into()),
+                            reason: decision.reason,
+                            skill_decision_key: None,
+                            batch: None,
+                        },
+                    )
+                    .await
+                }
+            };
+            if allowed && !cancel_state.is_cancelled() {
+                ToolInvocationServiceResolution::Responded {
+                    payload: serde_json::json!({}),
+                }
+            } else {
+                ToolInvocationServiceResolution::Failed {
+                    code: "process_denied".into(),
+                    message: "literal subprocess admission denied".into(),
+                }
+            }
+        } else {
+            ToolInvocationServiceResolution::Failed {
+                code: "invalid_process".into(),
+                message: "invalid literal subprocess operation".into(),
+            }
+        },
+    )
 }
 
 async fn resolve_server_exchange(
@@ -36111,6 +36264,14 @@ async fn invoke_plugin_tool_transport(
         },
     )
     .await;
+    let _process_agent_guard = ProcessAgentGuard {
+        cancel: cancel_state,
+        id: &call.id,
+    };
+    let _model_owner_guard = plugin_operations::ModelOwnerGuard {
+        host: Arc::clone(&state.model_host),
+        owner: Some((plugin_id.to_owned(), call.id.clone())),
+    };
     let (input_sender, input_receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
     let input_receiver = Mutex::new(input_receiver);
     let invocation_ownership = state

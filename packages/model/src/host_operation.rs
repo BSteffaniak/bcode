@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 /// Supported model-host interface.
 pub const INTERFACE_ID: &str = "bcode.model-host/v1";
+/// Check fixed-profile admission without reserving work or invoking a provider.
+pub const OP_ADMISSION: &str = "admission";
 /// Start operation.
 pub const OP_START: &str = "start_turn";
 /// Poll operation.
@@ -14,6 +16,175 @@ pub const OP_POLL: &str = "poll_turn_events";
 pub const OP_CANCEL: &str = "cancel_turn";
 /// Cleanup operation.
 pub const OP_FINISH: &str = "finish_turn";
+
+/// Explicit tool-free multimodal structured generation operation. Legacy `start_turn`
+/// retains its text-only validation and compatibility behavior.
+pub const OP_START_STRUCTURED: &str = "start_structured_turn";
+
+/// Bounded normalized visual inference under the same fixed host admission as text turns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredStartRequest {
+    pub scope_id: String,
+    pub expires_at: u64,
+    pub request_id: String,
+    /// Only system/user/assistant text and user raster images are admitted.
+    #[serde(deserialize_with = "deserialize_structured_messages")]
+    pub messages: Vec<crate::ModelMessage>,
+    pub output: crate::StructuredOutputRequest,
+    pub max_output_tokens: Option<u32>,
+}
+
+fn deserialize_structured_messages<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::ModelMessage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let messages = value
+        .as_array()
+        .ok_or_else(|| D::Error::custom("invalid_messages"))?;
+    for message in messages {
+        fields(message, &["role", "content"]).map_err(D::Error::custom)?;
+        let blocks = message
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| D::Error::custom("invalid_content"))?;
+        for block in blocks {
+            match block.get("type").and_then(serde_json::Value::as_str) {
+                Some("text") => fields(block, &["type", "text"]).map_err(D::Error::custom)?,
+                Some("image") => {
+                    fields(block, &["type", "image"]).map_err(D::Error::custom)?;
+                    let image = block
+                        .get("image")
+                        .ok_or_else(|| D::Error::custom("invalid_image"))?;
+                    fields(image, &["mime_type", "data_base64", "metadata"])
+                        .map_err(D::Error::custom)?;
+                    if let Some(metadata) = image.get("metadata") {
+                        fields(metadata, &["width", "height", "byte_len", "source_path"])
+                            .map_err(D::Error::custom)?;
+                        if metadata
+                            .get("source_path")
+                            .is_some_and(|value| !value.is_null())
+                        {
+                            return Err(D::Error::custom("image_path_not_admitted"));
+                        }
+                    }
+                }
+                _ => return Err(D::Error::custom("unsupported_public_content")),
+            }
+        }
+    }
+    serde_json::from_value(value).map_err(D::Error::custom)
+}
+
+impl StructuredStartRequest {
+    /// Validate portable content without admitting provider extensions or tool execution.
+    ///
+    /// # Errors
+    /// Rejects unsupported content, image metadata paths, oversized payloads or unsafe schemas.
+    pub fn validate_public(&self) -> Result<(), &'static str> {
+        if self.messages.is_empty()
+            || self.messages.len() > 128
+            || serde_json::to_vec(self)
+                .map_err(|_| "invalid_request")?
+                .len()
+                > 900_000
+            || !valid_name(&self.output.name)
+            || !self.output.schema.is_object()
+        {
+            return Err("request_bounds_exceeded");
+        }
+        validate_schema_tree(&self.output.schema)?;
+        for message in &self.messages {
+            if message.role == crate::MessageRole::Tool
+                || message.content.is_empty()
+                || message.content.len() > 256
+            {
+                return Err("invalid_message");
+            }
+            for block in &message.content {
+                match block {
+                    crate::ContentBlock::Text { .. } => {}
+                    crate::ContentBlock::Image { image }
+                        if message.role == crate::MessageRole::User
+                            && matches!(
+                                image.mime_type.as_str(),
+                                "image/png" | "image/jpeg" | "image/webp"
+                            )
+                            && !image.data_base64.is_empty()
+                            && image.metadata.source_path.is_none() => {}
+                    _ => return Err("unsupported_public_content"),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    use super::*;
+    fn request() -> StructuredStartRequest {
+        StructuredStartRequest {
+            scope_id: "scope".into(),
+            expires_at: 200,
+            request_id: "request".into(),
+            messages: vec![crate::ModelMessage {
+                role: crate::MessageRole::User,
+                content: vec![crate::ContentBlock::Image {
+                    image: crate::ImageContent {
+                        mime_type: "image/png".into(),
+                        data_base64: "aW1hZ2U=".into(),
+                        metadata: crate::ImageMetadata::default(),
+                    },
+                }],
+            }],
+            output: crate::StructuredOutputRequest {
+                name: "recap".into(),
+                schema: serde_json::json!({"type":"object"}),
+                strict: true,
+            },
+            max_output_tokens: Some(1024),
+        }
+    }
+    #[test]
+    fn structured_images_round_trip_but_legacy_and_private_content_fail() {
+        let input = request();
+        assert!(input.validate_public().is_ok());
+        let encoded = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            serde_json::from_value::<StructuredStartRequest>(encoded.clone()).unwrap(),
+            input
+        );
+        let mut private = encoded.clone();
+        private["messages"][0]["content"][0]["image"]["provider_token"] = "secret".into();
+        assert!(serde_json::from_value::<StructuredStartRequest>(private).is_err());
+        let mut legacy = encoded;
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("output");
+        object.insert("tools".into(), serde_json::json!([]));
+        assert!(serde_json::from_value::<StartRequest>(legacy).is_err());
+    }
+    #[test]
+    fn structured_requests_reject_external_schema_svg_and_oversized_images() {
+        let mut input = request();
+        input.output.schema = serde_json::json!({"$ref":"https://example.com/schema"});
+        assert!(input.validate_public().is_err());
+        input = request();
+        if let crate::ContentBlock::Image { image } = &mut input.messages[0].content[0] {
+            image.mime_type = "image/svg+xml".into();
+        }
+        assert!(input.validate_public().is_err());
+        input = request();
+        if let crate::ContentBlock::Image { image } = &mut input.messages[0].content[0] {
+            image.data_base64 = "a".repeat(900_001);
+        }
+        assert!(input.validate_public().is_err());
+    }
+}
 
 /// Public text-only message role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

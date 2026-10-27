@@ -14526,7 +14526,7 @@ mod command_control {
             controls: client.command_invocations.clone(),
             id: request.invocation_id.clone(),
         };
-        let timeout = Duration::from_millis(request.deadline_ms.min(30_000))
+        let timeout = Duration::from_millis(request.deadline_ms.min(900_000))
             .saturating_add(Duration::from_secs(2));
         let work = async {
             let mut connection = client.connect("bcode-command-context").await?;

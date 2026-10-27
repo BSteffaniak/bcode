@@ -1,0 +1,50 @@
+[package]
+authors.workspace    = true
+categories           = ["multimedia::video", "command-line-utilities"]
+description          = "Standalone visual video recap executable"
+edition.workspace    = true
+keywords             = ["video", "recap", "summary"]
+license.workspace    = true
+name                 = "bcode_recap_cli"
+readme.workspace     = true
+repository.workspace = true
+version.workspace    = true
+
+[[bin]]
+name = "recap"
+path = "../src/main.rs"
+
+[dependencies]
+base64.workspace = true
+bcode = { workspace = true, features = [
+    "config",
+    "embedded-plugins",
+    "openai-compatible-provider",
+] }
+bcode_model.workspace = true
+bcode_openai_compatible_provider_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
+bcode_plugin.workspace = true
+bcode_recap.workspace = true
+clap = { workspace = true, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+] }
+
+[features]
+default          = []
+fail-on-warnings = []

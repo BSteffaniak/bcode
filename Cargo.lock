@@ -1756,6 +1756,7 @@ dependencies = [
  "bcode_prompt_profile_plugin",
  "bcode_question_plugin",
  "bcode_read_plugin",
+ "bcode_recap_plugin",
  "bcode_session_derivation_plugin",
  "bcode_session_milestones_plugin",
  "bcode_shell_plugin",
@@ -2791,6 +2792,57 @@ dependencies = [
  "insta",
  "libc",
  "tempfile",
+]
+
+[[package]]
+name = "bcode_recap"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url 2.5.8",
+]
+
+[[package]]
+name = "bcode_recap_cli"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "base64 0.22.1",
+ "bcode",
+ "bcode_model",
+ "bcode_openai_compatible_provider_plugin",
+ "bcode_plugin",
+ "bcode_recap",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_recap_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "base64 0.22.1",
+ "bcode_command",
+ "bcode_model",
+ "bcode_plugin_sdk",
+ "bcode_recap",
+ "bcode_tool",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

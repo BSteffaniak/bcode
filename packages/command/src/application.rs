@@ -29,7 +29,8 @@ pub struct CommandInvocationRequest {
     pub agent_id: Option<String>,
     /// Optional workspace hint; canonical session context takes precedence.
     pub launch_root: Option<PathBuf>,
-    /// Total execution deadline in milliseconds, between 1 and 30,000.
+    /// Total execution deadline in milliseconds, between 1 and 900,000.
+    /// Clients default to 30,000 and must explicitly opt in to longer operations.
     pub deadline_ms: u64,
     /// Existing command-owned input, including optional canonical session context.
     pub command: InvokeCommandRequest,

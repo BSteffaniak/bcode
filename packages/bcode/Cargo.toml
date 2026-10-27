@@ -109,6 +109,10 @@ hex              = { workspace = true }
 sha2             = { workspace = true }
 
 [features]
+static-bundled-recap-plugin = [
+    "embedded-plugins",
+    "bcode_bundled_plugins/static-bundled-recap-plugin",
+]
 static-bundled-vox-plugin = [
     "embedded-plugins",
     "bcode_bundled_plugins/static-bundled-vox-plugin",
@@ -256,6 +260,7 @@ static-bundled-plugins = [
     "static-bundled-session-milestones-plugin",
     "static-bundled-jev-provider-plugin",
     "bcode_bundled_plugins/static-bundled-plugins",
+    "static-bundled-recap-plugin",
     "static-bundled-vox-plugin",
     "bcode_cli/static-bundled-plugins",
 ]

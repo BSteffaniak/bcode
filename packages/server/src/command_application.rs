@@ -84,6 +84,7 @@ impl<'a> CommandApplicationHandle<'a> {
                 "canonical command context is unavailable",
             )
         })?;
+        let canonical_launch_root = session_id.is_none().then(|| directory.clone());
         request.command.context = Some(bcode_command::CommandInvocationContext {
             session_id,
             working_directory: directory,
@@ -107,7 +108,7 @@ impl<'a> CommandApplicationHandle<'a> {
                     invocation_id: request.invocation_id,
                     workspace: bcode_plugin_sdk::WorkspaceContext {
                         session_id: session_id.map(|id| id.to_string()),
-                        launch_root: request.launch_root,
+                        launch_root: canonical_launch_root,
                     },
                     deadline_ms: request.deadline_ms,
                 },

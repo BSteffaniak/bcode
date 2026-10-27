@@ -1,4 +1,8 @@
-#![cfg(all(feature = "config", feature = "embedded-plugins"))]
+#![cfg(all(
+    feature = "config",
+    feature = "embedded-plugins",
+    feature = "bundled-plugins"
+))]
 
 use std::collections::BTreeMap;
 

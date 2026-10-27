@@ -275,6 +275,11 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     ));
     #[cfg(feature = "static-bundled-metrics-plugin")]
     plugins.push(metrics_plugin());
+    #[cfg(feature = "static-bundled-recap-plugin")]
+    plugins.push(bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/recap-plugin/bcode-plugin.toml"),
+        bcode_recap_plugin::static_plugin(),
+    ));
     #[cfg(feature = "static-bundled-vox-plugin")]
     plugins.push(bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/vox-plugin/bcode-plugin.toml"),
@@ -604,6 +609,39 @@ fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "static-bundled-recap-plugin")]
+    #[test]
+    fn recap_selection_loads_commands_and_disabled_selection_removes_them() {
+        let bundles = super::static_bundled_plugins();
+        let selection = bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::Explicit,
+            enabled: std::collections::BTreeSet::from(["bcode.recap".into()]),
+            disabled: std::collections::BTreeSet::new(),
+        };
+        let selected = bcode_plugin::filter_selected_static_plugins(&bundles, &selection).unwrap();
+        let mut host = bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap();
+        let commands = host.registered_command_contributions(&bcode_command::CommandSurface::Slash);
+        assert_eq!(commands.len(), 4);
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.id.starts_with("recap."))
+        );
+        host.deactivate_all().unwrap();
+        let disabled = bcode_plugin::PluginSelection {
+            enabled: std::collections::BTreeSet::new(),
+            disabled: std::collections::BTreeSet::from(["bcode.recap".into()]),
+            ..selection
+        };
+        let selected = bcode_plugin::filter_selected_static_plugins(&bundles, &disabled).unwrap();
+        let mut host = bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap();
+        assert!(
+            host.registered_command_contributions(&bcode_command::CommandSurface::Slash)
+                .is_empty()
+        );
+        host.deactivate_all().unwrap();
+    }
+
     #[cfg(feature = "static-bundled-vox-plugin")]
     #[test]
     fn vox_loads_with_command_routing_but_daemon_actions_still_fail_closed() {

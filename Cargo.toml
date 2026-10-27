@@ -1,9 +1,12 @@
 [workspace]
 members = [
+    "packages/recap",
+    "packages/recap/cli",
     "packages/vox",
     "xtask",
     "examples/hello-plugin",
     "examples/question-dynamic-plugin",
+    "plugins/recap-plugin",
     "plugins/vox-plugin",
     "plugins/filesystem-plugin",
     "plugins/file-references-plugin",
@@ -171,6 +174,9 @@ brouter_telemetry_util       = { version = "0.0.1-alpha.0", default-features = f
 
 # Vox native capability dependencies (optional at the package boundary).
 audioadapter-buffers = { version = "5.2.0", default-features = false }
+bcode = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bcode" }
+bcode_recap = { version = "0.0.1-alpha.0", default-features = false, path = "packages/recap" }
+bcode_recap_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/recap-plugin" }
 bcode_vox = { version = "0.0.1-alpha.0", default-features = false, path = "packages/vox" }
 bcode_vox_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/vox-plugin" }
 cpal = { version = "0.18.2", default-features = false }

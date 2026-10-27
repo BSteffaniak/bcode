@@ -49,7 +49,8 @@ bcode_web_search_plugin                 = { workspace = true, optional = true }
 bcode_workflow_plugin                   = { workspace = true, optional = true }
 bcode_worktree_plugin                   = { workspace = true, optional = true }
 
-bcode_vox_plugin = { workspace = true, optional = true }
+bcode_recap_plugin = { workspace = true, optional = true }
+bcode_vox_plugin   = { workspace = true, optional = true }
 [dev-dependencies]
 bcode_command = { workspace = true }
 bcode_config  = { workspace = true }
@@ -179,6 +180,7 @@ static-bundled-plugins = [
     "static-bundled-eval-plugin",
     "static-bundled-usage-plugin",
     "static-bundled-metrics-plugin",
+    "static-bundled-recap-plugin",
     "static-bundled-vox-plugin",
     "static-bundled-ocr-plugin",
     "static-bundled-fake-provider-plugin",
@@ -217,6 +219,10 @@ static-bundled-question-plugin = [
 static-bundled-read-plugin = [
     "dep:bcode_read_plugin",
     "bcode_read_plugin/static-bundled",
+]
+static-bundled-recap-plugin = [
+    "dep:bcode_recap_plugin",
+    "bcode_recap_plugin/static-bundled",
 ]
 static-bundled-session-derivation-plugin = [
     "dep:bcode_session_derivation_plugin",

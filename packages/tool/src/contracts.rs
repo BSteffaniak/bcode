@@ -122,6 +122,12 @@ pub struct PreparedToolInvocation {
     pub preparation: ToolPreparationResponse,
 }
 
+/// Caller-bound per-spawn authorization for normalized literal process facts.
+/// This service grants admission only; it never executes a process or accepts shell text.
+pub const PROCESS_ADMISSION_INTERFACE_ID: &str = "bcode.process-admission/v1";
+/// Authorize one fully constructed process operation before spawn.
+pub const OP_AUTHORIZE_PROCESS: &str = "authorize";
+
 /// Opaque nested service request issued by an active invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationServiceRequest {

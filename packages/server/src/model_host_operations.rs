@@ -68,6 +68,7 @@ struct Turn {
     scope: String,
     expires_at: u64,
     request: wire::StartRequest,
+    structured_output: Option<bcode_model::StructuredOutputRequest>,
     cancel: AtomicBool,
     inner: Mutex<TurnState>,
 }
@@ -153,12 +154,20 @@ impl ModelHostOperations {
     /// Read opt-in admission from existing plugin configuration; malformed/missing disables it.
     #[must_use]
     pub fn from_config(config: &bcode_config::BcodeConfig) -> Self {
-        let admission = config
+        let mut configured = config
             .plugins
             .config
-            .get("bcode.auth-broker")
-            .and_then(|table| table.get("model_host"))
-            .and_then(|value| value.clone().try_into::<Admission>().ok())
+            .iter()
+            .filter_map(|(owner, table)| table.get("model_host").map(|value| (owner, value)));
+        let candidate = configured.next().and_then(|(owner, value)| {
+            let admission = value.clone().try_into::<Admission>().ok()?;
+            // The historical broker bucket remains supported; new declarations belong to
+            // their admitted owner. Multiple fixed-model hosts require a future typed registry.
+            (owner == &admission.allowed_plugin_id || owner == "bcode.auth-broker")
+                .then_some(admission)
+        });
+        let admission = candidate
+            .filter(|_| configured.next().is_none())
             .unwrap_or(Admission {
                 allowed_plugin_id: String::new(),
                 model_profile: String::new(),
@@ -196,6 +205,9 @@ impl ModelHostOperations {
         if request.interface_id != wire::INTERFACE_ID {
             return ToolInvocationServiceResolution::Unsupported;
         }
+        if request.route_id.is_some() {
+            return failed("invalid_model_host_route");
+        }
         if caller != self.admission.allowed_plugin_id
             || !self.admission.supported_account_use
             || self.admission.model_profile.is_empty()
@@ -205,7 +217,15 @@ impl ModelHostOperations {
         {
             return failed("model_host_not_admitted");
         }
+        if matches!(
+            request.operation.as_str(),
+            wire::OP_ADMISSION | wire::OP_START | wire::OP_START_STRUCTURED
+        ) && !self.admits(caller)
+        {
+            return failed("model_host_not_admitted");
+        }
         match request.operation.as_str() {
+            wire::OP_ADMISSION => responded(&bcode_model::AckResponse::default()),
             wire::OP_START => {
                 let Ok(input) = serde_json::from_value::<wire::StartRequest>(request.payload)
                 else {
@@ -214,7 +234,29 @@ impl ModelHostOperations {
                 let Some(state) = self.server.get().and_then(Weak::upgrade) else {
                     return failed("model_host_unavailable");
                 };
-                self.start(state, caller, &request.invocation_id, input)
+                self.start(state, caller, &request.invocation_id, input, None)
+                    .await
+            }
+            wire::OP_START_STRUCTURED => {
+                let input = match decode_structured_start(request.payload) {
+                    Ok(input) => input,
+                    Err(code) => return failed(code),
+                };
+                let Some(state) = self.server.get().and_then(Weak::upgrade) else {
+                    return failed("model_host_unavailable");
+                };
+                let output = input.output;
+                let text = wire::StartRequest {
+                    scope_id: input.scope_id,
+                    expires_at: input.expires_at,
+                    request_id: input.request_id,
+                    messages: input.messages,
+                    tools: Vec::new(),
+                    tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+                    tool_schema_mode: None,
+                    max_output_tokens: input.max_output_tokens,
+                };
+                self.start(state, caller, &request.invocation_id, text, Some(output))
                     .await
             }
             wire::OP_POLL => {
@@ -254,9 +296,20 @@ impl ModelHostOperations {
         caller: &str,
         invocation: &str,
         input: wire::StartRequest,
+        structured_output: Option<bcode_model::StructuredOutputRequest>,
     ) -> ToolInvocationServiceResolution {
-        if self.stopping.load(Ordering::Acquire) || !valid_start(&input, &self.admission, now()) {
-            return failed("invalid_request");
+        let valid = valid_start_envelope(&input, &self.admission, now())
+            && (structured_output.is_some() || valid_start(&input, &self.admission, now()));
+        if self.stopping.load(Ordering::Acquire) || !valid {
+            tracing::warn!(
+                stage = "start_envelope",
+                scope_id_valid = bounded_scope_id(&input.scope_id),
+                request_id_valid = bounded_scope_id(&input.request_id),
+                expires_in_seconds = input.expires_at.saturating_sub(now()),
+                max_scope_seconds = self.admission.max_scope_seconds,
+                "model host request rejected"
+            );
+            return failed("start_envelope_rejected");
         }
         let mut turns = self.turns.lock().await;
         // Serialize shutdown admission with reservation. An invocation that waited for
@@ -267,6 +320,9 @@ impl ModelHostOperations {
         for (id, turn) in turns.iter() {
             if let Some(result) = reserve_match(turn, caller, invocation, &input) {
                 return match result {
+                    Ok(()) if turn.structured_output != structured_output => {
+                        failed("request_conflict")
+                    }
                     Ok(()) => responded(&wire::StartResponse {
                         turn_id: id.clone(),
                     }),
@@ -284,6 +340,7 @@ impl ModelHostOperations {
             scope: input.scope_id.clone(),
             expires_at: input.expires_at,
             request: input,
+            structured_output,
             cancel: AtomicBool::new(false),
             inner: Mutex::new(TurnState::default()),
         });
@@ -572,13 +629,19 @@ impl ModelHostOperations {
             provider_context.auth = Some(material.auth);
             provider_context.env = material.env;
         }
-        let request = build_turn_request(
+        let mut request = build_turn_request(
             id,
             &turn.request,
             target.model_id,
             provider_context,
             max_output_tokens,
         );
+        request
+            .structured_output
+            .clone_from(&turn.structured_output);
+        if let Some(output) = &request.structured_output {
+            jsonschema::validator_for(&output.schema).map_err(|_| "invalid_output_schema")?;
+        }
         let route = target.provider_plugin_id.ok_or("provider_unavailable")?;
         validate_tool_capabilities(state, &request, &route).await?;
         for tool in &request.tools {
@@ -916,18 +979,64 @@ fn reserve_match(
 }
 
 fn valid_start(input: &wire::StartRequest, admission: &Admission, time: u64) -> bool {
-    let bounded_id = |id: &str| {
-        !id.is_empty()
-            && id.len() <= 128
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-    };
-    bounded_id(&input.scope_id)
-        && bounded_id(&input.request_id)
+    valid_start_envelope(input, admission, time) && input.validate_public().is_ok()
+}
+
+fn decode_structured_start(
+    payload: serde_json::Value,
+) -> Result<wire::StructuredStartRequest, &'static str> {
+    let input =
+        serde_json::from_value::<wire::StructuredStartRequest>(payload).map_err(|error| {
+            let category = match error.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data_contract",
+                serde_json::error::Category::Eof => "eof",
+            };
+            let detail = error.to_string();
+            let reason = [
+                "unknown_public_content_field",
+                "image_path_not_admitted",
+                "unsupported_public_content",
+                "invalid_messages",
+                "invalid_content",
+                "invalid_image",
+            ]
+            .into_iter()
+            .find(|reason| detail.contains(reason))
+            .unwrap_or("unsupported_wire_shape");
+            tracing::warn!(
+                stage = "structured_deserialize",
+                category,
+                reason,
+                "model host request rejected"
+            );
+            "structured_decode_rejected"
+        })?;
+    input.validate_public().map_err(|reason| {
+        tracing::warn!(
+            stage = "structured_validate",
+            reason,
+            "model host request rejected"
+        );
+        "structured_validation_rejected"
+    })?;
+    Ok(input)
+}
+
+fn bounded_scope_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
+fn valid_start_envelope(input: &wire::StartRequest, admission: &Admission, time: u64) -> bool {
+    bounded_scope_id(&input.scope_id)
+        && bounded_scope_id(&input.request_id)
         && input.expires_at > time
         && input.expires_at <= time.saturating_add(admission.max_scope_seconds)
-        && input.validate_public().is_ok()
         && input
             .max_output_tokens
             .is_none_or(|tokens| (1..=16384).contains(&tokens))
@@ -939,7 +1048,15 @@ async fn validate_tool_capabilities(
     route: &str,
 ) -> Result<(), &'static str> {
     use bcode_model::{RequestedModelFeature as Feature, ToolChoice, ToolChoiceMode};
-    if request.tools.is_empty() {
+    if request.tools.is_empty()
+        && request.structured_output.is_none()
+        && !request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, bcode_model::ContentBlock::Image { .. }))
+        })
+    {
         return Ok(());
     }
     let negotiation = tokio::time::timeout(
@@ -960,7 +1077,27 @@ async fn validate_tool_capabilities(
         ToolChoice::Required => ToolChoiceMode::Required,
         ToolChoice::Tool { .. } => ToolChoiceMode::Named,
     };
-    let mut features = vec![Feature::ToolChoice(choice)];
+    let mut features = Vec::new();
+    if !request.tools.is_empty() {
+        features.push(Feature::ToolChoice(choice));
+    }
+    if let Some(output) = &request.structured_output {
+        features.push(Feature::StructuredOutput(if output.strict {
+            bcode_model::StructuredOutputMode::StrictJsonSchema
+        } else {
+            bcode_model::StructuredOutputMode::JsonSchema
+        }));
+    }
+    if request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, bcode_model::ContentBlock::Image { .. }))
+    }) {
+        features.push(Feature::MediaInput(
+            bcode_model::MediaInputFeature::UserImage,
+        ));
+    }
     if request.tool_call_policy.parallel == Some(true) {
         features.push(Feature::ToolChoice(ToolChoiceMode::Parallel));
     }
@@ -1142,6 +1279,44 @@ mod tests {
             panic!("settled normalized host poll must succeed");
         };
         serde_json::from_value(payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn structured_start_preserves_owner_admission_and_conflicting_schema_identity() {
+        let (host, _state) = fake_host(BTreeMap::new());
+        let text = retained_test_turn().request.clone();
+        let mut input = wire::StructuredStartRequest {
+            scope_id: text.scope_id,
+            expires_at: text.expires_at,
+            request_id: text.request_id,
+            messages: text.messages,
+            output: bcode_model::StructuredOutputRequest {
+                name: "result".into(),
+                schema: serde_json::json!({"type":"object"}),
+                strict: true,
+            },
+            max_output_tokens: Some(1024),
+        };
+        input.messages[0].content = vec![bcode_model::ContentBlock::Text {
+            text: "e".repeat(220_000),
+        }];
+        assert!(input.validate_public().is_ok());
+        assert!(
+            matches!(call_host(&host, "foreign", "serve", wire::OP_START_STRUCTURED, &input).await,
+            ToolInvocationServiceResolution::Failed { code, .. } if code == "model_host_not_admitted")
+        );
+        let first = call_host(&host, "plugin", "serve", wire::OP_START_STRUCTURED, &input).await;
+        assert!(matches!(
+            first,
+            ToolInvocationServiceResolution::Responded { .. }
+        ));
+        let mut changed = input;
+        changed.output.schema = serde_json::json!({"type":"array"});
+        assert!(
+            matches!(call_host(&host, "plugin", "serve", wire::OP_START_STRUCTURED, changed).await,
+            ToolInvocationServiceResolution::Failed { code, .. } if code == "request_conflict")
+        );
+        host.shutdown().await;
     }
 
     #[tokio::test]
@@ -1527,6 +1702,7 @@ mod tests {
             scope: request.scope_id.clone(),
             expires_at: request.expires_at,
             request,
+            structured_output: None,
             cancel: AtomicBool::new(false),
             inner: Mutex::new(TurnState::default()),
         })

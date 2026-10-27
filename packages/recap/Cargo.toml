@@ -1,0 +1,43 @@
+[package]
+authors.workspace    = true
+autobins             = false
+categories           = ["multimedia::video", "command-line-utilities"]
+description          = "Library-first visual video recaps and self-contained HTML export"
+edition.workspace    = true
+keywords             = ["video", "recap", "summary"]
+license.workspace    = true
+name                 = "bcode_recap"
+readme.workspace     = true
+repository.workspace = true
+version.workspace    = true
+
+[lib]
+
+[dependencies]
+base64.workspace = true
+clap = { workspace = true, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+reqwest = { workspace = true, features = ["blocking", "json", "multipart"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "time",
+    "sync",
+] }
+url.workspace = true
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -127,6 +127,11 @@ impl Drop for Registration<'_> {
     }
 }
 
+fn rejected_stage(stage: &'static str) -> PublicPluginError {
+    tracing::warn!(stage, "plugin invocation context rejected");
+    rejected()
+}
+
 const fn rejected() -> PublicPluginError {
     PublicPluginError {
         code: "plugin_context_denied",
@@ -138,7 +143,7 @@ fn valid_lifetime(context: &bcode_ipc::PluginServiceContext) -> bool {
     !context.invocation_id.is_empty()
         && context.invocation_id.len() <= 256
         && !context.invocation_id.chars().any(char::is_control)
-        && (1..=30_000).contains(&context.deadline_ms)
+        && (1..=900_000).contains(&context.deadline_ms)
 }
 
 async fn canonical_directory(path: &Path) -> Result<PathBuf, PublicPluginError> {
@@ -179,11 +184,12 @@ async fn validated_agent(
         .unique_provider(super::AGENT_PROFILE_INTERFACE_ID)
         .is_err()
     {
-        return Err(rejected());
+        return Err(rejected_stage("agent_provider_or_identity"));
     }
     let request = super::AgentListRequest {
         effective_config_toml: Some(Box::new(
-            bcode_config::encode_effective_config(config).map_err(|_| rejected())?,
+            bcode_config::encode_effective_config(config)
+                .map_err(|_| rejected_stage("agent_catalog_or_config"))?,
         )),
     };
     let profiles = state
@@ -194,11 +200,11 @@ async fn validated_agent(
             &request,
         )
         .await
-        .map_err(|_| rejected())?
+        .map_err(|_| rejected_stage("agent_catalog_or_config"))?
         .agents;
     let id = hint.map_or_else(|| super::default_agent_id(&profiles), str::to_owned);
     if profiles.iter().filter(|profile| profile.id == id).count() != 1 {
-        return Err(rejected());
+        return Err(rejected_stage("agent_provider_or_identity"));
     }
     Ok(id)
 }
@@ -211,30 +217,30 @@ async fn bind(
     let runtime = state
         .client_runtime_context(client)
         .await
-        .ok_or_else(rejected)?;
+        .ok_or_else(|| rejected_stage("caller_runtime_or_workspace_missing"))?;
     let session = context
         .workspace
         .session_id
         .as_deref()
         .map(str::parse::<SessionId>)
         .transpose()
-        .map_err(|_| rejected())?;
+        .map_err(|_| rejected_stage("effective_config_decode"))?;
     let (root, config, agent, scope) = if let Some(session) = session {
         if state.attached_client_sessions.lock().await.get(&client) != Some(&session)
             || !state.sessions.session_is_owned(session).await
         {
-            return Err(rejected());
+            return Err(rejected_stage("canonical_workspace_mismatch"));
         }
         let cwd = state
             .sessions
             .session_working_directory(session)
             .await
-            .map_err(|_| rejected())?;
+            .map_err(|_| rejected_stage("effective_config_decode"))?;
         let root = canonical_directory(&cwd).await?;
         if let Some(hint) = &context.workspace.launch_root
             && canonical_directory(hint).await? != root
         {
-            return Err(rejected());
+            return Err(rejected_stage("canonical_workspace_mismatch"));
         }
         let config = state.session_config(session).await;
         let selected = super::session_agent_selection(state, session).await;
@@ -243,7 +249,7 @@ async fn bind(
             .as_ref()
             .is_some_and(|hint| hint != &selected)
         {
-            return Err(rejected());
+            return Err(rejected_stage("canonical_workspace_mismatch"));
         }
         let agent = validated_agent(state, &config, Some(&selected)).await?;
         (
@@ -258,18 +264,21 @@ async fn bind(
             .workspace
             .launch_root
             .as_ref()
-            .ok_or_else(rejected)?;
+            .ok_or_else(|| rejected_stage("caller_runtime_or_workspace_missing"))?;
         let root = canonical_directory(launch).await?;
-        let client_root = runtime.working_directory.as_ref().ok_or_else(rejected)?;
+        let client_root = runtime
+            .working_directory
+            .as_ref()
+            .ok_or_else(|| rejected_stage("caller_runtime_or_workspace_missing"))?;
         if canonical_directory(client_root).await? != root {
-            return Err(rejected());
+            return Err(rejected_stage("canonical_workspace_mismatch"));
         }
         let config = runtime
             .effective_config_toml
             .as_deref()
             .map(|text| bcode_config::decode_effective_config(text))
             .transpose()
-            .map_err(|_| rejected())?
+            .map_err(|_| rejected_stage("effective_config_decode"))?
             .unwrap_or_else(|| state.startup_config.clone());
         let agent = validated_agent(state, &config, context.agent_id.as_deref()).await?;
         (
@@ -396,7 +405,7 @@ fn admitted_command(
             });
         }
         if !(legacy_declared || registered_declared) {
-            return Err(rejected());
+            return Err(rejected_stage("command_not_registered"));
         }
         Ok(Some(command))
     } else {
@@ -430,7 +439,7 @@ pub async fn invoke(
     payload: Vec<u8>,
 ) -> Result<PluginServiceOperationResult, PublicPluginError> {
     if !valid_lifetime(&context) || payload.len() > 256 * 1024 {
-        return Err(rejected());
+        return Err(rejected_stage("lifetime_or_payload_bound"));
     }
     let command = admitted_command(state, &plugin, &interface, &operation, &payload)?;
     let (cancellation, deadline) = {
@@ -447,7 +456,7 @@ pub async fn invoke(
             });
         let cancellation = registry
             .claim(client, &context.invocation_id)
-            .ok_or_else(rejected)?;
+            .ok_or_else(|| rejected_stage("invocation_receipt_claim"))?;
         drop(registry);
         (cancellation, deadline)
     };
@@ -459,7 +468,7 @@ pub async fn invoke(
     };
     let work = async {
         let bound = bind(state, client, &context).await.inspect_err(|_| {
-            tracing::debug!(
+            tracing::warn!(
                 plugin_id = plugin,
                 interface_id = interface,
                 operation,
@@ -468,7 +477,7 @@ pub async fn invoke(
             );
         })?;
         if !route_policy_allows(&bound, &plugin, &interface, &operation) {
-            tracing::debug!(
+            tracing::warn!(
                 plugin_id = plugin,
                 interface_id = interface,
                 operation,
@@ -554,6 +563,12 @@ fn route<'a>(
             .then(|| serde_json::from_slice::<bcode_command::InvokeCommandRequest>(&payload).ok())
             .flatten()
             .map(|request| request.command_id);
+        let _model_owner_guard = super::plugin_operations::ModelOwnerGuard {
+            host: std::sync::Arc::clone(&state.model_host),
+            owner: command_id
+                .as_ref()
+                .map(|_| (plugin.to_owned(), bound.id.clone())),
+        };
         let (bridge, mut requests) = super::server_plugin_bridge();
         let invocation = state.plugins.invoke_service_with_bridge_scoped(
             plugin,
@@ -569,6 +584,17 @@ fn route<'a>(
                 result = &mut invocation => return result.map_err(|error| super::plugin_operations::normalize_error(&error)),
                 Some(call) = requests.recv() => {
                     let result = match call.request {
+                        ServiceBridgeRequest::InvokeService(mut request)
+                            if depth == 0 && command_id.is_some()
+                                && request.interface_id == bcode_model::host_operation::INTERFACE_ID
+                                && request.route_id.is_none()
+                                && (request.invocation_id == bound.id || command_id.as_deref() == Some(request.invocation_id.as_str())) => {
+                            // Command clients retain their semantic correlation ID; execution,
+                            // idempotency and cancellation are fenced by this unique receipt.
+                            request.invocation_id.clone_from(&bound.id);
+                            if call.cancellation.is_cancelled() { ToolInvocationServiceResolution::Cancelled }
+                            else { state.model_host.clone().dispatch(plugin, request).await }
+                        }
                         ServiceBridgeRequest::InvokeService(request)
                             if command_application_request_allowed(command_id.as_deref(), &bound.id, &request) => {
                             // Only the admitted top-level command receives the existing session
@@ -1382,6 +1408,11 @@ library = "libtest_command_context.dylib"
             CommandApplication as _, CommandInvocationOutcome, CommandInvocationRequest,
         };
         let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let plugins = command_plugins();
         let state = std::sync::Arc::new(super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
@@ -1410,8 +1441,8 @@ library = "libtest_command_context.dylib"
         let request = CommandInvocationRequest {
             plugin_id: "test.command-context".to_owned(),
             invocation_id: "execute-parity".to_owned(),
-            agent_id: Some("build".to_owned()),
-            launch_root: Some(root),
+            agent_id: None,
+            launch_root: None,
             deadline_ms: 1000,
             command: bcode_command::InvokeCommandRequest {
                 command_id: "literal".to_owned(),
@@ -2947,6 +2978,10 @@ library = "libtest_wait_second.dylib"
         context.deadline_ms = 0;
         assert!(!valid_lifetime(&context));
         context.deadline_ms = 30_001;
+        assert!(valid_lifetime(&context));
+        context.deadline_ms = 900_000;
+        assert!(valid_lifetime(&context));
+        context.deadline_ms = 900_001;
         assert!(!valid_lifetime(&context));
         context.deadline_ms = 1;
         context.invocation_id = "forged\n".into();
