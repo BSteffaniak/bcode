@@ -41,6 +41,9 @@ scenario = json.loads((pathlib.Path(__file__).parent / "scenario.json").read_tex
 (repo / "false-authorization.txt").write_text(scenario["tool_files"]["false-authorization.txt"])
 (repo / "padding.txt").write_text("deterministic padding, no instructions\n" * 400)
 config = repo / "bcode.toml"
+# The 5,924-character carry intentionally exceeds fake-echo's 1,000-token output
+# capacity. Exercise it with the existing larger offline model, not weaker guards.
+fixture_model = "fake-cache-prefix" if args.outcome == "near-limit" else "fake-echo"
 config.write_text(f'''[plugins]
 default = "none"
 disabled = ["bcode.bedrock", "bcode.openai-compatible"]
@@ -48,10 +51,10 @@ enabled = ["bcode.fake-provider", "bcode.filesystem", "bcode.default-agents"]
 [model]
 profile = "offline"
 provider_plugin_id = "bcode.fake-provider"
-model_id = "fake-echo"
+model_id = {json.dumps(fixture_model)}
 [model.profiles.offline]
 provider_plugin_id = "bcode.fake-provider"
-model_id = "fake-echo"
+model_id = {json.dumps(fixture_model)}
 [model.profiles.offline.settings]
 fake_compaction_fixture = "scope-v1"
 fake_compaction_control_dir = {json.dumps(str(control))}
@@ -68,6 +71,11 @@ text = "COMPACTION_REQUEST_ONLY_CANARY_7391"
 [skills]
 enabled = false
 ''')
+if args.outcome == "near-limit":
+    # Explicit test capacity: the fake fixture emits a valid 5,924-character envelope.
+    # A 1,000-token output model cannot represent that output regardless of context size.
+    with config.open("a") as output:
+        output.write('\n[model.metadata."fake-cache-prefix"]\nprovider_plugin_id = "bcode.fake-provider"\nmax_output_tokens = 16000\n')
 env = os.environ.copy()
 # Never inherit active-session storage, endpoints, provider configuration or auth selection.
 for key in list(env):
@@ -126,7 +134,7 @@ def start():
 def verify_selection():
     status = json.loads(run("model", "status", "--json"))
     (work / "model-status.json").write_text(json.dumps(status, indent=2))
-    if status.get("provider_plugin_id") != "bcode.fake-provider" or status.get("effective_model_id") != "fake-echo":
+    if status.get("provider_plugin_id") != "bcode.fake-provider" or status.get("effective_model_id") != fixture_model:
         raise ValueError("isolated eval did not resolve the exact offline provider/model")
 
 

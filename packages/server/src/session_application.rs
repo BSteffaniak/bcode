@@ -185,6 +185,21 @@ fn compaction_failure(error: session_operations::CompactError) -> SessionApplica
                 "request_still_too_large",
                 "request remains too large after context compaction",
             ),
+            CompactionError::RecoveryRequired(reason) => {
+                use crate::context_compaction::CompactionRecoveryReason;
+                let detail = match reason {
+                    CompactionRecoveryReason::InvalidCheckpoint => {
+                        "retained compaction checkpoint is invalid or incompatible; preserve it and prepare explicit bounded recovery"
+                    }
+                    CompactionRecoveryReason::PolicyChanged => {
+                        "retained compaction policy is incompatible with this operation; preserve it and prepare explicit bounded recovery"
+                    }
+                    CompactionRecoveryReason::ConsolidationUnresolved => {
+                        "retained consolidation outcome is unresolved; preserve it and prepare explicit bounded recovery"
+                    }
+                };
+                failure("compaction_recovery_required", detail)
+            }
             CompactionError::Provider(message) => compaction_provider_failure(&message),
             CompactionError::PlanUnavailable(_) | CompactionError::InsufficientProgress { .. } => {
                 failure(
@@ -193,6 +208,46 @@ fn compaction_failure(error: session_operations::CompactError) -> SessionApplica
                 )
             }
         },
+    }
+}
+
+impl bcode_session_models::SessionCompactionRecoveryDiscoveryApplication
+    for SessionApplicationHandle<'_>
+{
+    async fn prepare_session_compaction_recovery(
+        &self,
+        request: bcode_session_models::SessionCompactionRecoveryDiscoveryRequest,
+    ) -> Result<bcode_session_models::SessionCompactionRecoveryPreparation, SessionApplicationFailure>
+    {
+        self.selected_location(request.session_id).await?;
+        if request.version != 1 || request.operation_id.is_nil() || !request.budget.is_valid() {
+            return Err(failure(
+                "invalid_compaction_restart",
+                "invalid recovery preparation request",
+            ));
+        }
+        if self
+            .state
+            .active_session_namespace_mismatch(request.session_id, self.client_id)
+            .await
+            .is_some()
+        {
+            return Err(failure(
+                "incompatible_session_namespace",
+                "session belongs to another active execution namespace",
+            ));
+        }
+        let selection = super::session_model_selection_with_runtime_context(
+            self.state,
+            request.session_id,
+            self.state.client_runtime_context(self.client_id).await,
+        )
+        .await;
+        super::context_compaction::prepare_compaction_recovery(self.state, &selection, &request)
+            .await
+            .map_err(|error| {
+                compaction_failure(session_operations::CompactError::Compaction(error))
+            })
     }
 }
 
@@ -1971,6 +2026,41 @@ mod tests {
             assert!(std::ptr::eq(app.state, std::ptr::from_ref(&state)));
         }
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn recovery_preparation_without_checkpoint_does_not_mutate_history() {
+        use bcode_session_models::SessionCompactionRecoveryDiscoveryApplication as _;
+        let state = state();
+        let session = state
+            .sessions
+            .create_session(
+                Some("recovery preparation".into()),
+                std::env::current_dir().unwrap(),
+            )
+            .await
+            .unwrap();
+        let before = state.sessions.session_history(session.id).await.unwrap();
+        let result = SessionApplicationHandle::new(&state, ClientId::new())
+            .prepare_session_compaction_recovery(
+                bcode_session_models::SessionCompactionRecoveryDiscoveryRequest {
+                    version: 1,
+                    session_id: session.id,
+                    operation_id: uuid::Uuid::new_v4(),
+                    budget: bcode_session_models::SessionCompactionRestartBudget {
+                        max_provider_requests: 16,
+                        timeout_ms: 30_000,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.restart.is_none());
+        assert!(result.blocker.is_some());
+        assert_eq!(
+            before,
+            state.sessions.session_history(session.id).await.unwrap()
+        );
     }
 
     #[test]

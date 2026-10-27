@@ -90,9 +90,13 @@ async fn memory_compaction_commit_validates_and_atomically_retires_native_and_lo
     }
 }
 
-#[tokio::test]
-async fn memory_restart_is_atomic_fenced_and_idempotent() {
-    use crate::CompactionCheckpointRestart;
+async fn memory_restart_fixture() -> (
+    SessionManager,
+    bcode_session_models::SessionId,
+    bcode_session_models::SessionEvent,
+    bcode_session_models::SessionEvent,
+    crate::CompactionCheckpointRestart,
+) {
     let manager = SessionManager::default();
     let session = manager
         .create_session(None, std::env::current_dir().unwrap())
@@ -121,18 +125,25 @@ async fn memory_restart_is_atomic_fenced_and_idempotent() {
         )
         .await
         .unwrap();
-    let request = CompactionCheckpointRestart {
+    let request = crate::CompactionCheckpointRestart {
         operation_key: "old".into(),
         expected_checkpoint_sequence: checkpoint.sequence,
         expected_prior_marker: None,
         source: vec![compaction_event_identity(&source).unwrap()],
         rejection: compaction_event_identity(&rejection).unwrap(),
+        expected_tail: None,
         replacement_key: "fresh".into(),
         replacement_payload: "fresh allowance".into(),
         pointer_key: "discovery".into(),
         pointer_payload: "fresh".into(),
     };
-    let original = manager.session_history(session.id).await.unwrap();
+    (manager, session.id, source, rejection, request)
+}
+
+#[tokio::test]
+async fn memory_restart_is_atomic_fenced_and_idempotent() {
+    let (manager, session_id, source, rejection, request) = memory_restart_fixture().await;
+    let original = manager.session_history(session_id).await.unwrap();
     for field in 0..4 {
         let mut stale = request.clone();
         match field {
@@ -148,17 +159,46 @@ async fn memory_restart_is_atomic_fenced_and_idempotent() {
         }
         assert!(
             manager
-                .restart_compaction_checkpoint(session.id, stale)
+                .restart_compaction_checkpoint(session_id, stale)
                 .await
                 .is_err()
         );
-        assert_eq!(manager.session_history(session.id).await.unwrap(), original);
+        assert_eq!(manager.session_history(session_id).await.unwrap(), original);
     }
-    let replacement = manager
-        .restart_compaction_checkpoint(session.id, request.clone())
+    let terminal = manager
+        .append_event(
+            session_id,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "owning-turn".into(),
+                outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+                message: None,
+            },
+        )
         .await
         .unwrap();
-    let history = manager.session_history(session.id).await.unwrap();
+    // Legacy requests remain exactly rejection-fenced; they cannot silently adopt the new tail.
+    assert!(
+        manager
+            .restart_compaction_checkpoint(session_id, request.clone())
+            .await
+            .is_err()
+    );
+    let mut request = request;
+    request.expected_tail = Some(compaction_event_identity(&terminal).unwrap());
+    let mut wrong_digest = request.clone();
+    wrong_digest.expected_tail.as_mut().unwrap().sha256 = "0".repeat(64);
+    assert!(
+        manager
+            .restart_compaction_checkpoint(session_id, wrong_digest)
+            .await
+            .is_err()
+    );
+    let original = manager.session_history(session_id).await.unwrap();
+    let replacement = manager
+        .restart_compaction_checkpoint(session_id, request.clone())
+        .await
+        .unwrap();
+    let history = manager.session_history(session_id).await.unwrap();
     assert_eq!(&history[..original.len()], &original);
     assert_eq!(history.len(), original.len() + 4);
     assert_eq!(history.last().unwrap().sequence, replacement.sequence + 1);
@@ -171,21 +211,21 @@ async fn memory_restart_is_atomic_fenced_and_idempotent() {
     );
     assert_eq!(
         manager
-            .restart_compaction_checkpoint(session.id, request.clone())
+            .restart_compaction_checkpoint(session_id, request.clone())
             .await
             .unwrap(),
         replacement
     );
-    assert_eq!(manager.session_history(session.id).await.unwrap(), history);
+    assert_eq!(manager.session_history(session_id).await.unwrap(), history);
     let mut conflict = request;
     conflict.replacement_payload = "more allowance".into();
     assert!(
         manager
-            .restart_compaction_checkpoint(session.id, conflict)
+            .restart_compaction_checkpoint(session_id, conflict)
             .await
             .is_err()
     );
-    assert_eq!(manager.session_history(session.id).await.unwrap(), history);
+    assert_eq!(manager.session_history(session_id).await.unwrap(), history);
 }
 
 fn marker(native: bool, boundary: u64) -> SessionEventKind {

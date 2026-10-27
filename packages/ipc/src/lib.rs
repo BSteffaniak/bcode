@@ -1633,6 +1633,11 @@ pub enum Request {
     RestartSessionCompaction {
         request: bcode_session_models::SessionCompactionRestartRequest,
     },
+    /// Read-only bounded candidate discovery; does not authorize replacement work.
+    /// Appended to preserve existing binary request discriminants.
+    PrepareSessionCompactionRecovery {
+        request: bcode_session_models::SessionCompactionRecoveryDiscoveryRequest,
+    },
 }
 
 /// Server stop request policy.
@@ -3018,6 +3023,10 @@ pub enum ResponsePayload {
     RuntimeWorkPage {
         page: bcode_session_models::RuntimeWorkPage,
     },
+    /// Bounded preparation. Appended to preserve previous binary response discriminants.
+    SessionCompactionRecoveryPrepared {
+        preparation: bcode_session_models::SessionCompactionRecoveryPreparation,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -4241,6 +4250,7 @@ mod tests {
                     expected_terminal_sequence: 46,
                     expected_terminal_sha256: "cd".repeat(32),
                     expected_prior_marker: marker,
+                    expected_tail_marker: None,
                     budget: SessionCompactionRestartBudget {
                         max_provider_requests: 16,
                         timeout_ms: 30_000,

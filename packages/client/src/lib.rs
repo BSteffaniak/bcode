@@ -3123,6 +3123,29 @@ fn configured_request_timeout() -> Duration {
     })
 }
 
+impl bcode_session_models::SessionCompactionRecoveryDiscoveryApplication for BcodeClient {
+    async fn prepare_session_compaction_recovery(
+        &self,
+        request: bcode_session_models::SessionCompactionRecoveryDiscoveryRequest,
+    ) -> Result<
+        bcode_session_models::SessionCompactionRecoveryPreparation,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        let mut connection = self
+            .connect("bcode-compaction-recovery-prepare")
+            .await
+            .map_err(session_application_failure)?;
+        match connection
+            .send_request(Request::PrepareSessionCompactionRecovery { request })
+            .await
+            .map_err(session_application_failure)?
+        {
+            ResponsePayload::SessionCompactionRecoveryPrepared { preparation } => Ok(preparation),
+            _ => Err(session_application_failure(ClientError::UnexpectedResponse)),
+        }
+    }
+}
+
 impl bcode_session_models::SessionCompactionRestartApplication for BcodeClient {
     type CompactionOperation = ClientSessionCompactionOperation;
 

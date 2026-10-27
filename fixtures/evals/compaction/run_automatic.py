@@ -90,13 +90,37 @@ enabled = false
 ''')
 
     def run(self, *args, check=True):
-        result = subprocess.run(self.base + list(args), cwd=self.repo, env=self.env,
-                                capture_output=True, text=True, timeout=self.timeout + 30)
+        # The CLI may autostart a daemon. Once this driver owns one, a dead
+        # foreground process is failure, never permission to spawn a replacement.
+        if self.server is not None and self.server.poll() is not None:
+            raise RuntimeError(f"owned isolated daemon exited before CLI {args[0]}")
+        client = subprocess.Popen(self.base + list(args), cwd=self.repo, env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + self.timeout + 30
+        try:
+            while True:
+                try:
+                    stdout, stderr = client.communicate(timeout=.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.server is not None and self.server.poll() is not None:
+                        raise RuntimeError(f"owned isolated daemon exited during CLI {args[0]}")
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"CLI {args[0]} exceeded bounded driver deadline")
+        except BaseException:
+            client.kill()
+            stdout, stderr = client.communicate()
+            self.save("failed-cli.json", json.dumps({"args": list(args), "stdout": stdout,
+                                                    "stderr": stderr, "returncode": client.returncode}))
+            raise
+        result = subprocess.CompletedProcess(client.args, client.returncode, stdout, stderr)
         if check and result.returncode:
             raise RuntimeError(f"CLI {args[0]} failed ({result.returncode}): {result.stderr}\n{result.stdout}")
         return result
 
     def start(self):
+        if self.server is not None:
+            raise RuntimeError("cannot start another daemon while an owned child remains unreaped")
         log = (self.work / f"daemon-{len(self.identity['daemon_pids'])}.log").open("w")
         self.logs.append(log)
         socket = Path(self.env["BCODE_SOCKET"])
@@ -132,9 +156,22 @@ enabled = false
             raise ValueError("isolated daemon did not resolve the exact offline provider/model")
 
     def stop(self, crash=False):
-        if self.server is not None and self.server.poll() is None:
-            self.server.kill() if crash else self.server.terminate()
-            self.server.wait(timeout=30)
+        server = self.server
+        if server is not None and server.poll() is None:
+            server.kill() if crash else server.terminate()
+            try:
+                server.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                # Cleanup must not mask the original gate/transport failure. Only
+                # the exact Popen-owned isolated child is eligible for escalation.
+                self.identity.setdefault("cleanup", []).append({"pid": server.pid,
+                    "action": "kill_after_stop_timeout"})
+                server.kill()
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.identity["cleanup"][-1]["reap"] = "timed_out"
+                    return  # retain the handle; never start another owned daemon
         self.server = None
 
     def save(self, name, text):
@@ -145,11 +182,11 @@ enabled = false
     def until(self, predicate, description):
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
+            if self.server is not None and self.server.poll() is not None:
+                raise RuntimeError(f"isolated daemon exited while awaiting {description}")
             value = predicate()
             if value:
                 return value
-            if self.server is not None and self.server.poll() is not None:
-                raise RuntimeError(f"isolated daemon exited while awaiting {description}")
             time.sleep(.05)
         raise RuntimeError(f"missing {description}; core/control may not implement resumable automatic compaction; inspect {self.work}")
 
@@ -164,6 +201,23 @@ enabled = false
             output.write(result.stdout + "\n")
         # This seed turn waits for its own authoritative terminal receipt.
         return result.stdout
+
+    def prove_isolation(self, blocked_turn):
+        """A held provider request must not monopolize another session's actor/turn."""
+        unrelated = self.run("session", "create", "compaction-isolation-canary").stdout.strip()
+        admission = json.loads(self.run("send", unrelated, "UNRELATED_SESSION_CANARY_7391", "--json").stdout)
+        target = admitted_turn(admission)
+        def completed():
+            events = load_events([self.save("unrelated.jsonl", self.run("session", "export", unrelated).stdout)])
+            return any(event["kind"].get("model_turn_finished", {}).get("turn_id") == target
+                       and event["kind"]["model_turn_finished"]["outcome"] == "completed" for event in events)
+        self.until(completed, "unrelated exact-turn completion while synthesis is held")
+        blocked = load_events([self.export("isolation-blocked.jsonl")])
+        if any(event["kind"].get("model_turn_finished", {}).get("turn_id") == blocked_turn for event in blocked):
+            raise ValueError("blocked compaction settled before isolation was demonstrated")
+        self.save("isolation.json", json.dumps({"session_id": unrelated, "turn_id": target,
+                    "blocked_session_id": self.session, "blocked_turn_id": blocked_turn,
+                    "result": "completed_while_compaction_held"}, indent=2))
 
     def gate(self, seen):
         def pending():
@@ -258,6 +312,7 @@ enabled = false
         accepted_checkpoint(load_events([before]))
         if markers(load_events([before])):
             raise ValueError("final atomic marker was published before all synthesis gates completed")
+        self.prove_isolation(turn_id)
         self.save("interruption.json", json.dumps({"first": first.name, "held": second.name,
                                                    "turn_id": turn_id, "mode": self.interruption}))
         if self.interruption == "cancel":

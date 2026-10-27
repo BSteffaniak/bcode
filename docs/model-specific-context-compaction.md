@@ -78,13 +78,13 @@ continuation. Keep this limitation distinct from successful structural validatio
 
 ### Carry budgets and bounded repair
 
-The prompt reports the remaining JSON-encoded continuation allowance after serializing established
-scope with an empty continuation. Escapes count toward that allowance; it is neither a token budget
-nor a promise that new scope will fit. Acceptance checks the complete merged envelope against the
-6,000-character carry limit, with a separate UTF-8 wire byte guard. Adding scope consumes continuation
-space. Protected scope is not clipped or silently discarded to fit: if scope plus a nonempty valid
-continuation cannot fit, synthesis can fail and leave the marker unchanged. Host preservation reduces
-unnecessary regeneration; it does not remove the capacity ceiling or guarantee compaction progress.
+The legacy compatibility path reports remaining JSON-encoded continuation space after serializing
+established scope with an empty continuation, and applies its 6,000-character merged-envelope guard.
+That legacy character accounting is not the current capacity-aware token policy described below.
+Escapes count toward serialized guards; protected scope is never clipped to fit. If scope plus a
+valid continuation cannot fit the applicable guards and complete-request capacity, synthesis fails
+without advancing the marker. Host preservation reduces unnecessary regeneration but does not
+guarantee compaction progress.
 
 Repair uses typed rejection reasons, including invalid JSON, unsupported format, invalid source or
 supersession, unauthorized scope changes, missing scope, invalid reconciliation, and wire/carry
@@ -192,6 +192,14 @@ still govern execution: accepted carry alone cannot reopen a cancelled turn, pro
 had no effects, or authorize automatic daemon recovery. Original-activation recovery uses a separate
 protected checkpoint.
 
+Cancellation cleanup drains bounded provider events and records the latest cumulative usage only
+when that same invocation supplies an explicit `TurnFinished`. A local cancellation token, a
+preterminal usage snapshot, or a provider's scratch artifact cannot certify request settlement.
+Without authoritative final evidence the reservation remains consumed and recovery reports an
+unsettled-request blocker. Setup, synthesis, and publication execute as separate awaited stages
+on the owning task; task-local recovery authority and publication fencing are not transferred to
+detached work.
+
 ## Protected automatic compaction recovery
 
 Automatic proactive and overflow compaction can persist a version-2 provider-retry checkpoint,
@@ -256,11 +264,31 @@ the previous marker, retaining existing provider/model/authentication/format com
 portable fallback behavior. Local carry cannot certify an interrupted native request or opaque
 snapshot as reusable. Request-only data must not leak through either path.
 
+Adaptive packing version 2 reserves feasible token-based carry headroom, not the independent
+maximum allocation guards as hypothetical escaped model input. Both the complete initial request
+and targeted repair must fit. A rejected response is optional untrusted diagnostic material; repair
+omits the entire attachment when it cannot fit, without clipping canonical source or accepted carry.
+Actual synthesis requests retain their capacity checks, and incompatible retained packing identities
+require explicit replacement rather than silently reinterpreting accepted work.
+
 ## Evidence and remaining gaps
 
 The offline gate is `scripts/check-compaction-eval.sh`: verifier tests, repeated explicit compaction,
-and automatic cancellation/restart/crash cases using an identified fake-provider binary and isolated
-state. Restart/crash fixtures retain a genuine original execution descriptor with private config
+automatic cancellation/restart/crash cases, explicit failed-operation recovery, policy mismatch,
+stale/duplicate candidate checks, and forced consolidation drivers using an identified fake-provider
+binary and isolated state. Held synthesis/consolidation gates also require an unrelated session's
+exact admitted turn to complete before release. The drivers retain evidence and fail rather than
+skip missing preparation, consolidation or canonical settlement.
+
+The progressive growth fixture alone does **not** establish reclaim: a carry above 6,000 characters
+can be valid without any consolidation. `run_consolidation.py --finish-consolidation` separately
+requires an observed production consolidation request, meaningful carry shortening, positive frozen
+net-reclaim requirement, atomic marker and the original turn's completed outcome. Its interruption
+mode instead exercises cancellation and explicit recovery; it does not claim successful compression
+under the old pressure. These are executable gate requirements, not a claim that an unrun binary
+has passed them.
+
+Restart/crash fixtures retain a genuine original execution descriptor with private config
 inside the session root; config confinement must not be relaxed to make a fixture recoverable.
 The recorded restart/crash cases exercise original-activation unresolved-outcome settlement without
 targeted cancellation, then later admission and accepted-carry reuse. They do not demonstrate replay
@@ -277,6 +305,25 @@ boundaries remain barriers; operation/wall limits do not substitute for a spendi
 remains blocked, not merely awaiting a flag. Adaptive packing remains default-off; real-model
 quality and semantic retention across repeated compactions remain unproven. Structural validators
 do not make compaction lossless.
+
+## Explicit recovery of a failed unpublished operation
+
+This is distinct from rebuilding a committed summary. `session compact ID --prepare-restart`
+with `--restart-operation-id UUID`, `--restart-max-provider-requests N`, and
+`--restart-timeout-ms MS` returns a bounded, read-only preparation. A successful preparation
+contains a `restart` request with exact checkpoint, terminal and prior-marker identities; a
+blocker is not permission to retry or increase allowances. Preparation does not dispatch a model
+request or confer ownership.
+
+Save the returned `restart` object, review it, then explicitly submit
+`session compact ID --restart-request /absolute/request.json --json`. Admission rechecks fenced
+ownership and canonical identities. The distinct replacement operation receives only its explicit
+new allowances and reconstructs the frozen source prefix. Old accepted carry, consumed reservations
+and terminal evidence remain canonical; they are not rewritten as current-policy checkpoints.
+A stale selection cannot authorize dispatch. Duplicate admission is not permission to repeat
+provider work. Ambiguous provider outcomes, incomplete terminal usage evidence and unsupported
+formats remain blocked, including interrupted consolidation without settled request evidence.
+Known policy incompatibility is not permission to reinterpret or silently discard retained state.
 
 ## Reconstructing an already stale summary
 

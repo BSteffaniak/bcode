@@ -37,7 +37,7 @@ pub struct CompactionCheckpointCommit {
 /// Exact compare-and-supersede request for an unpublished current-format operation.
 ///
 /// The host validates opaque payload and rejection semantics. Storage validates canonical
-/// identities and fences the tail at the later of the checkpoint and rejection events.
+/// identities and fences the exact host-selected tail independently of the rejection event.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionCheckpointRestart {
@@ -51,6 +51,9 @@ pub struct CompactionCheckpointRestart {
     pub source: Vec<CompactionEventIdentity>,
     /// Exact canonical complete-rejection event validated by the host.
     pub rejection: CompactionEventIdentity,
+    /// Exact selected canonical tail. Omission preserves the original rejection-as-tail contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_tail: Option<CompactionEventIdentity>,
     /// Distinct fresh operation namespace; stable across retries.
     pub replacement_key: String,
     /// Opaque host-versioned replacement checkpoint.
@@ -111,11 +114,19 @@ impl CompactionCheckpointRestart {
         {
             return Err(Self::invalid());
         }
+        if self.tail_identity().sequence < self.rejection.sequence
+            || self.tail_identity().sequence < self.expected_checkpoint_sequence
+            || (self.tail_identity().sequence == self.rejection.sequence
+                && self.tail_identity() != &self.rejection)
+        {
+            return Err(Self::invalid());
+        }
         let identities = self
             .source
             .iter()
             .chain(std::iter::once(&self.rejection))
-            .chain(self.expected_prior_marker.iter());
+            .chain(self.expected_prior_marker.iter())
+            .chain(self.expected_tail.iter());
         for identity in identities {
             if identity.sha256.len() != 64
                 || !identity
@@ -154,9 +165,12 @@ impl CompactionCheckpointRestart {
         Ok(hex::encode(Sha256::digest(bytes)))
     }
 
+    pub(crate) fn tail_identity(&self) -> &CompactionEventIdentity {
+        self.expected_tail.as_ref().unwrap_or(&self.rejection)
+    }
+
     pub(crate) fn fence(&self) -> u64 {
-        self.expected_checkpoint_sequence
-            .max(self.rejection.sequence)
+        self.tail_identity().sequence
     }
 
     pub(crate) fn comparison(&self) -> CompactionCheckpointCommit {

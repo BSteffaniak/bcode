@@ -6578,6 +6578,12 @@ enum SessionCommand {
     /// Explicitly compact one session's model context.
     Compact {
         session_id: SessionId,
+        /// Prepare a bounded exact restart candidate without admitting provider work.
+        #[arg(long, requires_all = ["restart_operation_id", "restart_max_provider_requests", "restart_timeout_ms"], conflicts_with_all = ["restart_operation", "rebuild_summary", "restart_request"])]
+        prepare_restart: bool,
+        /// Execute the exact restart request emitted by preparation, after review.
+        #[arg(long, conflicts_with_all = ["restart_operation", "rebuild_summary", "prepare_restart"])]
+        restart_request: Option<PathBuf>,
         /// Reconstruct the selected summary from bounded canonical history.
         #[arg(
             long,
@@ -6589,7 +6595,7 @@ enum SessionCommand {
         #[arg(long, requires_all = ["restart_operation_id", "expected_operation_key", "expected_checkpoint_sequence", "expected_terminal_sequence", "expected_terminal_sha256", "restart_marker", "restart_max_provider_requests", "restart_timeout_ms"])]
         restart_operation: bool,
         /// Distinct new operation UUID; retain it unchanged if admission outcome is unknown.
-        #[arg(long, requires = "restart_operation")]
+        #[arg(long)]
         restart_operation_id: Option<uuid::Uuid>,
         /// Exact old checkpoint namespace, including its original policy identity.
         #[arg(long, requires = "restart_operation")]
@@ -6618,10 +6624,10 @@ enum SessionCommand {
         )]
         expected_no_prior_marker: bool,
         /// Explicit new provider-call allowance, including repair/consolidation attempts.
-        #[arg(long, requires = "restart_operation")]
+        #[arg(long)]
         restart_max_provider_requests: Option<u32>,
         /// Explicit new elapsed-time allowance in milliseconds.
-        #[arg(long, requires = "restart_operation")]
+        #[arg(long)]
         restart_timeout_ms: Option<u32>,
         /// Exact latest marker selected for replacement.
         #[arg(long, requires = "rebuild_summary")]
@@ -9254,6 +9260,8 @@ fn dispatch_non_ranking_session_command(
         }),
         SessionCommand::Compact {
             session_id,
+            prepare_restart,
+            restart_request,
             json,
             rebuild_summary,
             restart_operation,
@@ -9274,6 +9282,50 @@ fn dispatch_non_ranking_session_command(
             rebuild_max_provider_requests,
             rebuild_timeout_ms,
         } => Box::pin(async move {
+            if prepare_restart {
+                use bcode_session_models::SessionCompactionRecoveryDiscoveryApplication as _;
+                let client = BcodeClient::new(default_endpoint());
+                let required = || {
+                    CliError::InvalidArguments(
+                        "recovery preparation requires operation identity and bounded allowances"
+                            .into(),
+                    )
+                };
+                let preparation = client
+                    .prepare_session_compaction_recovery(
+                        bcode_session_models::SessionCompactionRecoveryDiscoveryRequest {
+                            version: 1,
+                            session_id,
+                            operation_id: restart_operation_id.ok_or_else(required)?,
+                            budget: bcode_session_models::SessionCompactionRestartBudget {
+                                max_provider_requests: restart_max_provider_requests
+                                    .ok_or_else(required)?,
+                                timeout_ms: restart_timeout_ms.ok_or_else(required)?,
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|failure| bcode_client::ClientError::Server {
+                        code: failure.code,
+                        message: failure.message,
+                    })?;
+                return print_json(&preparation);
+            }
+            if let Some(path) = restart_request {
+                let request: bcode_session_models::SessionCompactionRestartRequest =
+                    serde_json::from_value(read_json_with_limit(
+                        &path,
+                        1024 * 1024,
+                        "compaction restart request",
+                    )?)?;
+                if request.session_id != session_id {
+                    return Err(CliError::InvalidArguments(
+                        "restart request belongs to another session".into(),
+                    ));
+                }
+                restart_session_compaction(request, json).await?;
+                return Ok(());
+            }
             if restart_operation {
                 let required = || {
                     CliError::InvalidArguments(
@@ -9306,6 +9358,7 @@ fn dispatch_non_ranking_session_command(
                             .ok_or_else(required)?,
                         expected_terminal_sha256: expected_terminal_sha256.ok_or_else(required)?,
                         expected_prior_marker,
+                        expected_tail_marker: None,
                         budget: bcode_session_models::SessionCompactionRestartBudget {
                             max_provider_requests: restart_max_provider_requests
                                 .ok_or_else(required)?,
@@ -29251,6 +29304,60 @@ mod session_configuration_cli_tests {
         assert!(matches!(
             error,
             CliError::InvalidArguments(message) if message == "session deletion requires --yes"
+        ));
+    }
+
+    #[test]
+    fn compaction_recovery_preparation_and_execution_are_distinct_cli_modes() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        let operation = uuid::Uuid::new_v4().to_string();
+        let prepare = [
+            "bcode",
+            "session",
+            "compact",
+            &session,
+            "--prepare-restart",
+            "--restart-operation-id",
+            &operation,
+            "--restart-max-provider-requests",
+            "16",
+            "--restart-timeout-ms",
+            "30000",
+            "--json",
+        ];
+        assert!(matches!(
+            Cli::try_parse_from(prepare).unwrap().command,
+            Some(Commands::Session {
+                command: SessionCommand::Compact {
+                    prepare_restart: true,
+                    restart_operation: false,
+                    restart_request: None,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["bcode", "session", "compact", &session, "--prepare-restart"])
+                .is_err()
+        );
+        assert!(matches!(
+            Cli::try_parse_from([
+                "bcode",
+                "session",
+                "compact",
+                &session,
+                "--restart-request",
+                "candidate.json"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Session {
+                command: SessionCommand::Compact {
+                    prepare_restart: false,
+                    restart_request: Some(_),
+                    ..
+                }
+            })
         ));
     }
 

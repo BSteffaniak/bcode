@@ -2786,6 +2786,10 @@ impl SessionDb {
             .await?;
         self.validate_compaction_retirement(&*tx, &comparison, &events[1])
             .await?;
+        let tail = self.restart_event_at(&*tx, request.fence()).await?;
+        if compaction_event_identity(&tail).map_err(|_| invalid())? != *request.tail_identity() {
+            return Err(invalid());
+        }
         let rejection = self
             .restart_event_at(&*tx, request.rejection.sequence)
             .await?;
@@ -11975,14 +11979,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn compaction_restart_is_atomic_and_retry_survives_reopen() {
-        use bcode_session_models::CompactionSynthesisCheckpoint as Checkpoint;
-        let temp = tempfile::tempdir().unwrap();
-        let id = SessionId::new();
-        let db = SessionDb::open_turso_in_root(id, temp.path())
-            .await
-            .unwrap();
+    async fn compaction_restart_fixture(
+        db: &SessionDb,
+        id: SessionId,
+    ) -> (SessionEvent, crate::CompactionCheckpointRestart) {
         let source = event(
             id,
             0,
@@ -11994,7 +11994,7 @@ mod tests {
         let checkpoint = event(
             id,
             1,
-            Checkpoint {
+            bcode_session_models::CompactionSynthesisCheckpoint {
                 version: 1,
                 operation_key: "old".into(),
                 host_payload: Some("consumed=2".into()),
@@ -12017,11 +12017,24 @@ mod tests {
             expected_prior_marker: None,
             source: vec![crate::compaction_event_identity(&source).unwrap()],
             rejection: crate::compaction_event_identity(&rejection).unwrap(),
+            expected_tail: None,
             replacement_key: "replacement".into(),
             replacement_payload: "fresh explicit allowance".into(),
             pointer_key: "discovery".into(),
             pointer_payload: "replacement".into(),
         };
+        (checkpoint, request)
+    }
+
+    #[tokio::test]
+    async fn compaction_restart_is_atomic_and_retry_survives_reopen() {
+        use bcode_session_models::CompactionSynthesisCheckpoint as Checkpoint;
+        let temp = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .unwrap();
+        let (checkpoint, request) = compaction_restart_fixture(&db, id).await;
         let template = event(
             id,
             3,
@@ -12031,6 +12044,46 @@ mod tests {
         );
         let events = request.events(&template).unwrap();
         assert_compaction_restart_fences(&db, &request, &template, &checkpoint).await;
+        let terminal = event(
+            id,
+            3,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "owning-turn".into(),
+                outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+                message: None,
+            },
+        );
+        db.append_event(&terminal).await.unwrap();
+        assert!(
+            db.restart_compaction_checkpoint(&request, &events)
+                .await
+                .is_err()
+        );
+        let mut request = request;
+        request.expected_tail = Some(crate::compaction_event_identity(&terminal).unwrap());
+        let template = event(
+            id,
+            4,
+            SessionEventKind::SystemMessage {
+                text: String::new(),
+            },
+        );
+        let events = request.events(&template).unwrap();
+        for field in 0..2 {
+            let mut stale = request.clone();
+            if field == 0 {
+                stale.expected_tail.as_mut().unwrap().sha256 = "0".repeat(64);
+            } else {
+                stale.source[0].sha256 = "0".repeat(64);
+            }
+            let stale_events = stale.events(&template).unwrap();
+            assert!(
+                db.restart_compaction_checkpoint(&stale, &stale_events)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(db.last_event_sequence().await.unwrap(), Some(3));
+        }
         let replacement = db
             .restart_compaction_checkpoint(&request, &events)
             .await
@@ -12055,7 +12108,7 @@ mod tests {
         let db = SessionDb::open_existing_turso_in_root(id, temp.path())
             .await
             .unwrap();
-        assert_compaction_restart_retry(&db, &request, &replacement).await;
+        Box::pin(assert_compaction_restart_retry(&db, &request, &replacement)).await;
     }
 
     async fn assert_compaction_restart_retry(

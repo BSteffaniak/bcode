@@ -6677,6 +6677,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SubscribeRuntimeWork { session_id }
         | Request::AttachSessionProjectionWindow { session_id, .. } => Some(*session_id),
         Request::RebuildSessionSummary { request } => Some(request.session_id),
+        Request::PrepareSessionCompactionRecovery { request } => Some(request.session_id),
         Request::RestartSessionCompaction { request } => Some(request.session_id),
         Request::ContinueWorkflow(request) => Some(request.successor.parent_session_id),
         Request::RequestWorkflowReplacement(request) => Some(request.successor.parent_session_id),
@@ -6740,6 +6741,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionHistoryAround { .. } => "session_history_around",
         Request::SessionCategorization { .. } => "session_categorization",
         Request::SessionInspection { .. } => "session_inspection",
+        Request::PrepareSessionCompactionRecovery { .. } => "prepare_session_compaction_recovery",
         Request::SessionCompactionInspection { .. } => "session_compaction_inspection",
         Request::SessionSearch { .. } => "session_search",
         Request::SessionSearchProviders => "session_search_providers",
@@ -8022,6 +8024,27 @@ fn handle_request_inner<'a>(
                     result.map_or_else(
                         |error| Response::Err(ErrorResponse::new(error.code, error.message)),
                         |page| Response::Ok(ResponsePayload::SessionCompactionInspection { page }),
+                    ),
+                )
+                .await
+            })
+        }
+        SessionLifecycleRequest::PrepareSessionCompactionRecovery { request } => {
+            Box::pin(async move {
+                use bcode_session_models::SessionCompactionRecoveryDiscoveryApplication as _;
+                let result = SessionApplicationHandle::new(state, client_id)
+                    .prepare_session_compaction_recovery(request)
+                    .await;
+                send_response(
+                    writer,
+                    request_id,
+                    result.map_or_else(
+                        |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                        |preparation| {
+                            Response::Ok(ResponsePayload::SessionCompactionRecoveryPrepared {
+                                preparation,
+                            })
+                        },
                     ),
                 )
                 .await
@@ -16500,8 +16523,20 @@ async fn enqueue_targeted_cancel_turn_command(
     requested_by: Option<ClientId>,
     expected_turn_id: Option<String>,
 ) -> Result<bool, ServerError> {
-    state.sessions.session_summary(session_id).await?;
-    let handle = session_runtime_handle(state, session_id).await;
+    // A registered runtime already establishes the live routing target. Querying the session
+    // actor first can queue cancellation behind the durable work it needs to interrupt.
+    let live_handle = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    let handle = if let Some(handle) = live_handle {
+        handle
+    } else {
+        state.sessions.session_summary(session_id).await?;
+        session_runtime_handle(state, session_id).await
+    };
     let clear_queue = clear_queue && expected_turn_id.is_none();
     let expected_turn_id = match expected_turn_id {
         Some(turn_id) => Some(turn_id),
@@ -21683,15 +21718,85 @@ async fn run_model_turn_lifecycle(
     recovering: bool,
 ) -> ModelTurnCompletion {
     let session_id = permit.enter_turn();
+    let PreparedTurnLifecycle {
+        turn_config,
+        turn_id,
+        turn_span,
+        model_work_id,
+        cancel_state,
+    } = prepare_turn_lifecycle(
+        state,
+        session_id,
+        trigger_event,
+        client_id,
+        runtime_context.as_ref(),
+        command_context,
+        phase,
+        supplied_cancel_state,
+        recovering,
+    )
+    .await;
+    let completion = Box::pin(run_model_turn_inner(
+        state,
+        session_id,
+        trigger_event,
+        runtime_context,
+        Arc::clone(&cancel_state),
+        command_context,
+        phase,
+        recovering,
+    ))
+    .await;
+    settle_turn_lifecycle(
+        state,
+        session_id,
+        trigger_event,
+        command_context,
+        phase,
+        recovering,
+        PreparedTurnLifecycle {
+            turn_config,
+            turn_id,
+            turn_span,
+            model_work_id,
+            cancel_state,
+        },
+        completion,
+    )
+    .await
+}
+
+// Prepared lifecycle state retains the same cancellation owner and metric span across
+// execution; setup and terminal-only temporaries are not resident in its active poll.
+struct PreparedTurnLifecycle {
+    turn_config: bcode_config::BcodeConfig,
+    turn_id: String,
+    turn_span: bcode_metrics::MetricsSpan,
+    model_work_id: WorkId,
+    cancel_state: Arc<TurnCancelState>,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn prepare_turn_lifecycle(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+    client_id: ClientId,
+    runtime_context: Option<&ClientRuntimeContext>,
+    command_context: &mut RuntimeCommandContext<'_>,
+    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    supplied_cancel_state: Option<Arc<TurnCancelState>>,
+    recovering: bool,
+) -> PreparedTurnLifecycle {
     state
-        .set_session_config_from_runtime_context(session_id, runtime_context.as_ref())
+        .set_session_config_from_runtime_context(session_id, runtime_context)
         .await;
     let turn_config = state.session_config(session_id).await;
     let turn_id = execution_turn_id(trigger_event);
     if let Ok(mut candidates) = state.optional_context.lock() {
         candidates.remove(&session_id);
     }
-    let mut turn_span = state
+    let turn_span = state
         .metrics
         .span("model.turn")
         .labels(model_turn_metric_labels(session_id, &turn_id));
@@ -21772,17 +21877,33 @@ async fn run_model_turn_lifecycle(
     }
     set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
     service_runtime_priority_commands(state, session_id, command_context).await;
-    let completion = Box::pin(run_model_turn_inner(
-        state,
-        session_id,
-        trigger_event,
-        runtime_context,
-        Arc::clone(&cancel_state),
-        command_context,
-        phase,
-        recovering,
-    ))
-    .await;
+    PreparedTurnLifecycle {
+        turn_config,
+        turn_id,
+        turn_span,
+        model_work_id,
+        cancel_state,
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn settle_turn_lifecycle(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+    command_context: &mut RuntimeCommandContext<'_>,
+    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    recovering: bool,
+    prepared: PreparedTurnLifecycle,
+    completion: ModelTurnCompletion,
+) -> ModelTurnCompletion {
+    let PreparedTurnLifecycle {
+        turn_config,
+        turn_id,
+        mut turn_span,
+        model_work_id,
+        cancel_state,
+    } = prepared;
     state
         .generation_contexts
         .lock()
@@ -21989,21 +22110,32 @@ async fn submission_bound_model_selection(
     Ok(selection)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    clippy::large_stack_frames,
-    clippy::too_many_arguments
-)]
-async fn run_model_turn_inner(
+// Setup must finish before the provider/compaction loop is polled. Keeping its
+// temporary-heavy selection and discovery branches out of that poll frame also
+// bounds the stack retained while nested provider work services cancellation.
+struct PreparedModelTurnSetup {
+    execution: TurnExecutionOptions,
+    turn_config: bcode_config::BcodeConfig,
+    turn_id: String,
+    selection: SessionModelSelection,
+    provider_plugin_id: Option<String>,
+    compaction_policy: context_compaction::AutomaticCompactionPolicy,
+    compaction_decision: context_compaction::CompactionDecision,
+    provider_retry_rules: Vec<bcode_model::ProviderRetryRule>,
+    remote_catalog_retry_rules: Vec<bcode_model::ProviderRetryRule>,
+    static_context: StaticModelTurnContext,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn prepare_model_turn_setup(
     state: &ServerState,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
     runtime_context: Option<ClientRuntimeContext>,
-    cancel_state: Arc<TurnCancelState>,
+    cancel_state: &TurnCancelState,
     command_context: &mut RuntimeCommandContext<'_>,
-    phase: &Arc<Mutex<SessionRuntimePhase>>,
     recovering: bool,
-) -> ModelTurnCompletion {
+) -> Result<PreparedModelTurnSetup, ModelTurnCompletion> {
     let execution = turn_execution_options(trigger_event);
     let turn_config = state.session_config(session_id).await;
     let turn_id = execution_turn_id(trigger_event);
@@ -22017,10 +22149,10 @@ async fn run_model_turn_inner(
     ))
     .await
     else {
-        return ModelTurnCompletion::with_message(
+        return Err(ModelTurnCompletion::with_message(
             ModelTurnOutcome::ProviderUnavailable,
             "accepted execution context is unavailable or changed",
-        );
+        ));
     };
     if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
         turn.selection = Some(selection.clone());
@@ -22032,10 +22164,10 @@ async fn run_model_turn_inner(
     );
 
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()) {
-        return ModelTurnCompletion::with_message(
+        return Err(ModelTurnCompletion::with_message(
             ModelTurnOutcome::ProviderUnavailable,
             "model provider unavailable",
-        );
+        ));
     }
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
@@ -22052,10 +22184,10 @@ async fn run_model_turn_inner(
         {
             Ok(context) => context,
             Err(error) => {
-                return ModelTurnCompletion::with_message(
+                return Err(ModelTurnCompletion::with_message(
                     ModelTurnOutcome::Error,
                     format!("failed to resolve model request target: {error}"),
-                );
+                ));
             }
         };
         selection.native_default = false;
@@ -22111,20 +22243,20 @@ async fn run_model_turn_inner(
     let target = match target {
         Ok(target) => target,
         Err(error) => {
-            return ModelTurnCompletion::with_message(
+            return Err(ModelTurnCompletion::with_message(
                 ModelTurnOutcome::Error,
                 format!("failed to resolve model request target: {error}"),
-            );
+            ));
         }
     };
     let prepared_catalog = wait_for_provider_call(
         state,
         session_id,
         command_context,
-        &cancel_state,
+        cancel_state,
         Box::pin(tool_host_retry::prepare_with_retry(
             &turn_config.tools.execution,
-            &cancel_state,
+            cancel_state,
             None,
             || async {
                 if execution.tools == bcode_session_models::TurnToolPolicy::Disabled
@@ -22159,16 +22291,16 @@ async fn run_model_turn_inner(
         ProviderCallWait::Completed(Ok(snapshot)) => snapshot,
         ProviderCallWait::Cancelled
         | ProviderCallWait::Completed(Err(tool_host_retry::ToolBatchOutcome::Cancelled)) => {
-            return ModelTurnCompletion::with_message(
+            return Err(ModelTurnCompletion::with_message(
                 ModelTurnOutcome::Cancelled,
                 "model turn cancelled during tool discovery",
-            );
+            ));
         }
         ProviderCallWait::Completed(Err(_)) => {
-            return ModelTurnCompletion::with_message(
+            return Err(ModelTurnCompletion::with_message(
                 ModelTurnOutcome::Error,
                 "tool catalog preparation failed",
-            );
+            ));
         }
     };
     let static_context_timer = state.metrics.timer();
@@ -22179,7 +22311,7 @@ async fn run_model_turn_inner(
             SessionEventKind::SubmissionActivated { .. }
         );
     let categorization_observation = consumer_observation(
-        &cancel_state,
+        cancel_state,
         &turn_config,
         bcode_model::judgement::Feature::SessionCategorization,
         categorization_applicable,
@@ -22207,7 +22339,7 @@ async fn run_model_turn_inner(
                 bcode_session_models::OP_CATEGORIZE,
                 payload,
                 &turn_config,
-                &cancel_state,
+                cancel_state,
                 categorization_observation.operation.as_ref(),
             )
             .await
@@ -22254,7 +22386,7 @@ async fn run_model_turn_inner(
         &selection,
         !recovering,
         Some(prepared_catalog),
-        &cancel_state,
+        cancel_state,
     ))
     .await;
     state.metrics.record_histogram_with_labels(
@@ -22267,8 +22399,65 @@ async fn run_model_turn_inner(
         Err(error) => {
             let message = format!("model turn preparation error: {error}");
             append_system_event(state, session_id, message.clone()).await;
-            return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+            return Err(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                message,
+            ));
         }
+    };
+    Ok(PreparedModelTurnSetup {
+        execution,
+        turn_config,
+        turn_id,
+        selection,
+        provider_plugin_id,
+        compaction_policy,
+        compaction_decision,
+        provider_retry_rules,
+        remote_catalog_retry_rules,
+        static_context,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::large_stack_frames,
+    clippy::too_many_arguments
+)]
+async fn run_model_turn_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+    runtime_context: Option<ClientRuntimeContext>,
+    cancel_state: Arc<TurnCancelState>,
+    command_context: &mut RuntimeCommandContext<'_>,
+    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    recovering: bool,
+) -> ModelTurnCompletion {
+    let PreparedModelTurnSetup {
+        execution,
+        turn_config,
+        turn_id,
+        selection,
+        provider_plugin_id,
+        compaction_policy,
+        compaction_decision,
+        provider_retry_rules,
+        remote_catalog_retry_rules,
+        static_context,
+    } = match prepare_model_turn_setup(
+        state,
+        session_id,
+        trigger_event,
+        runtime_context,
+        &cancel_state,
+        command_context,
+        recovering,
+    )
+    .await
+    {
+        Ok(setup) => setup,
+        Err(completion) => return completion,
     };
     let mut rounds = ModelTurnRoundState::new(turn_config.model.effective_max_tool_rounds());
     let mut next_assistant_segment_order = 0_u32;
@@ -25393,6 +25582,26 @@ async fn drain_interrupted_request_usage(
     }
 }
 
+// A usage snapshot alone can be preterminal. Only an explicit provider end event
+// on this exact invocation permits publication as terminal cancellation billing.
+#[derive(Default)]
+struct FinalBillingUsage {
+    latest: Option<TokenUsage>,
+}
+
+impl FinalBillingUsage {
+    fn observe(&mut self, event: ProviderTurnEvent) -> Option<TokenUsage> {
+        match event {
+            ProviderTurnEvent::Usage { usage } => {
+                self.latest = Some(usage);
+                None
+            }
+            ProviderTurnEvent::TurnFinished { .. } => self.latest.take(),
+            _ => None,
+        }
+    }
+}
+
 async fn receive_final_billing_usage(
     invocation: &mut bcode_plugin::StreamingServiceInvocation,
     provider: &str,
@@ -25400,20 +25609,25 @@ async fn receive_final_billing_usage(
 ) -> Option<TokenUsage> {
     invocation.cancel.cancel();
     tokio::time::timeout(Duration::from_millis(250), async {
+        let mut final_usage = FinalBillingUsage::default();
         for _ in 0..128 {
             let payload = match invocation.next_event().await {
                 Ok(StreamingServiceInvocationEvent::Event(payload)) => payload,
                 Ok(StreamingServiceInvocationEvent::Response(_)) | Err(_) => break,
             };
             match serde_json::from_slice(&payload) {
-                Ok(ProviderTurnEvent::Usage { usage }) => return Some(usage),
                 Ok(ProviderTurnEvent::OriginalUsage { original: report }) => {
                     bcode_model_provider_runtime::receive_original_usage(
                         provider, original, *report,
                     )
                     .ok()?;
                 }
-                _ => {}
+                Ok(event) => {
+                    if let Some(usage) = final_usage.observe(event) {
+                        return Some(usage);
+                    }
+                }
+                Err(_) => {}
             }
         }
         None
@@ -44837,6 +45051,9 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::SessionHistoryPage { .. } => "session_history_page",
             ResponsePayload::SessionHistoryAround { .. } => "session_history_around",
             ResponsePayload::SessionInspection { .. } => "session_inspection",
+            ResponsePayload::SessionCompactionRecoveryPrepared { .. } => {
+                "session_compaction_recovery_prepared"
+            }
             ResponsePayload::SessionCompactionInspection { .. } => "session_compaction_inspection",
             ResponsePayload::SessionSearch { .. } => "session_search",
             ResponsePayload::SessionSearchProviders { .. } => "session_search_providers",
@@ -52557,6 +52774,227 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn live_cancellation_routes_without_session_actor_roundtrip() {
+        // Deliberately no stored session: a live route must not need storage to deliver
+        // cancellation. Cold targets still require the normal session validation.
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let session_id = SessionId::new();
+        let (followup_commands, _followups) = mpsc::channel(1);
+        let (steering_commands, _steering) = mpsc::channel(1);
+        let (cancel_commands, mut cancels) = mpsc::channel(1);
+        let cancellation = Arc::new(TurnCancelState::default());
+        state.session_runtimes.lock().await.insert(
+            session_id,
+            SessionRuntimeHandle {
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups: Arc::new(AtomicUsize::new(0)),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
+                phase: Arc::new(Mutex::new(SessionRuntimePhase::Compacting)),
+                current_turn: Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
+                    interaction_route: None,
+                    kind: RuntimeOperationKind::ModelTurn,
+                    client_id: ClientId::new(),
+                    turn_id: "live-compaction".into(),
+                    cancel_state: Arc::clone(&cancellation),
+                    model: None,
+                    agent_profile: None,
+                    execution: Some(TurnExecutionOptions::default()),
+                    selection: None,
+                }))),
+            },
+        );
+        let request = enqueue_targeted_cancel_turn_command(
+            &state,
+            session_id,
+            true,
+            None,
+            Some("live-compaction".into()),
+        );
+        let actor = async {
+            let command = cancels.recv().await.expect("live cancellation delivered");
+            assert_eq!(command.expected_turn_id.as_deref(), Some("live-compaction"));
+            assert!(!command.clear_queue);
+            cancellation.close();
+            acknowledge_cancel_command(command, true);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(request, actor)
+        })
+        .await
+        .expect("live delivery must not wait for storage");
+        assert!(result.unwrap());
+        assert!(cancellation.is_cancelled());
+        assert!(
+            enqueue_targeted_cancel_turn_command(&state, SessionId::new(), false, None, None)
+                .await
+                .is_err(),
+            "unknown cold sessions must still fail validation"
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn model_turn_setup_failure_still_settles_original_turn() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .expect("session");
+        let client = ClientId::new();
+        let trigger = sessions
+            .append_user_message(session.id, client, "no provider configured".into())
+            .await
+            .expect("prompt")
+            .into_iter()
+            .find(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+            .expect("user event");
+        let state = test_server_state(sessions.clone());
+        let (_followup, mut followups) = mpsc::channel(1);
+        let (_steering, mut steering) = mpsc::channel(1);
+        let (_cancel, mut cancels) = mpsc::channel(1);
+        let queued = AtomicUsize::new(0);
+        let current = Arc::new(Mutex::new(None));
+        let mut commands = RuntimeCommandContext::new(
+            &mut followups,
+            &mut steering,
+            &mut cancels,
+            &queued,
+            Arc::clone(&current),
+        );
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let mut permit = SessionTurnPermit::new(session.id);
+        let completion = run_model_turn(
+            &state,
+            &mut permit,
+            &trigger,
+            client,
+            None,
+            &mut commands,
+            &phase,
+            None,
+            false,
+        )
+        .await;
+        drop(state);
+        assert_eq!(completion.outcome, ModelTurnOutcome::ProviderUnavailable);
+        assert_eq!(
+            completion.message.as_deref(),
+            Some("model provider unavailable")
+        );
+        assert!(current.lock().await.is_none());
+        let turn_id = execution_turn_id(&trigger);
+        let history = sessions.session_history(session.id).await.expect("history");
+        let outcomes = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: id,
+                    outcome,
+                    ..
+                } if id == &turn_id => Some(*outcome),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes, vec![ModelTurnOutcome::ProviderUnavailable]);
+    }
+
+    #[tokio::test]
+    async fn compaction_runtime_future_sizes() {
+        fn measure<T>(label: &str, value: &T) {
+            let bytes = std::mem::size_of_val(value);
+            eprintln!("{label}: {bytes} bytes");
+            assert!(bytes < 64 * 1024, "{label} future grew to {bytes} bytes");
+        }
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let session_id = SessionId::new();
+        let trigger = session_event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "future size probe".into(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        );
+        let (_followup, mut followups) = mpsc::channel(1);
+        let (_steering, mut steering) = mpsc::channel(1);
+        let (_cancel, mut cancels) = mpsc::channel(1);
+        let queued = AtomicUsize::new(0);
+        let current = Arc::new(Mutex::new(None));
+        let mut commands = RuntimeCommandContext::new(
+            &mut followups,
+            &mut steering,
+            &mut cancels,
+            &queued,
+            Arc::clone(&current),
+        );
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let turn = run_model_turn_inner(
+            &state,
+            session_id,
+            &trigger,
+            None,
+            Arc::new(TurnCancelState::default()),
+            &mut commands,
+            &phase,
+            true,
+        );
+        measure("run_model_turn_inner", &turn);
+        drop(turn);
+        let runtime = run_session_runtime_inner(
+            Arc::clone(&state),
+            session_id,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicUsize::new(0)),
+            phase,
+            current,
+        );
+        measure("run_session_runtime_inner", &runtime);
+        drop(runtime);
+        let recovery = recover_abandoned_session_runtime_work_best_effort_inner(&state, session_id);
+        measure(
+            "recover_abandoned_session_runtime_work_best_effort_inner",
+            &recovery,
+        );
+        drop(recovery);
+        let append = state.sessions.append_model_turn_cancel_requested(
+            session_id,
+            "probe".into(),
+            Some(1),
+            None,
+        );
+        measure("session append_model_turn_cancel_requested", &append);
+        drop(append);
+        let append =
+            append_model_turn_cancel_requested_event(&state, session_id, "probe".into(), None);
+        measure("append_model_turn_cancel_requested_event", &append);
+        drop(append);
+        let finish = finish_session_turn_cancellation(
+            &state,
+            session_id,
+            RuntimeCurrentTurn {
+                interaction_route: None,
+                kind: RuntimeOperationKind::ModelTurn,
+                client_id: ClientId::new(),
+                turn_id: "probe".into(),
+                cancel_state: Arc::new(TurnCancelState::default()),
+                model: None,
+                agent_profile: None,
+                execution: Some(TurnExecutionOptions::default()),
+                selection: None,
+            },
+            None,
+        );
+        measure("finish_session_turn_cancellation", &finish);
+        drop(finish);
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn cancel_acknowledgement_precedes_commit_bookkeeping() {
         let cancel_state = TurnCancelState::default();
         let commit = cancel_state.marker_commit.lock().await;
@@ -59489,10 +59927,14 @@ library = "test"
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn manual_compaction_queues_behind_unrelated_active_turn() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
         let summary = sessions
-            .create_session(Some("manual queue".to_owned()), test_working_directory())
+            .create_session(
+                Some("manual queue".to_owned()),
+                compaction_cwd.path().to_path_buf(),
+            )
             .await
             .expect("session should be created");
         let session_id = summary.id;
@@ -59555,6 +59997,7 @@ library = "test"
                 ..SessionModelSelection::default()
             },
         );
+        isolate_compaction_request_fixture(&mut state);
         let state = Arc::new(state);
         let client_id = ClientId::new();
         let (turn_tx, turn_rx) = oneshot::channel();
@@ -59653,11 +60096,12 @@ library = "test"
 
     #[tokio::test]
     async fn manual_compaction_registers_exclusive_runtime_work_and_clears_it() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(
                 Some("manual compaction".to_owned()),
-                test_working_directory(),
+                compaction_cwd.path().to_path_buf(),
             )
             .await
             .expect("session should be created");
@@ -59678,13 +60122,23 @@ library = "test"
                 .append_event(
                     session_id,
                     SessionEventKind::AssistantMessage {
-                        text: format!("response to {text}"),
+                        text: if text == "active turn" {
+                            format!("response to {text}")
+                        } else {
+                            // Give compaction genuine reclaimable historical content;
+                            // do not enlarge the fake provider's real input capacity.
+                            format!(
+                                "response to {text}: {}",
+                                "resolved historical detail; ".repeat(160)
+                            )
+                        },
                     },
                 )
                 .await
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
@@ -62838,6 +63292,74 @@ library = "test"
         assert_eq!(COST_AVAILABILITY_ESTIMATED, "estimated");
         assert_eq!(COST_AVAILABILITY_UNAVAILABLE, "unavailable");
         assert_eq!(COST_AVAILABILITY_NOT_OBSERVED, "not_observed");
+    }
+
+    #[test]
+    fn cancellation_billing_requires_provider_terminal_and_uses_latest_snapshot() {
+        let mut billing = FinalBillingUsage::default();
+        let pending = TokenUsage {
+            input_tokens: Some(17),
+            output_tokens: Some(1),
+            total_tokens: Some(18),
+            ..TokenUsage::default()
+        };
+        assert!(
+            billing
+                .observe(ProviderTurnEvent::Usage { usage: pending })
+                .is_none()
+        );
+        assert!(billing.observe(ProviderTurnEvent::Cancelled).is_none());
+        let final_usage = TokenUsage {
+            input_tokens: Some(17),
+            output_tokens: Some(4),
+            total_tokens: Some(21),
+            ..TokenUsage::default()
+        };
+        assert!(
+            billing
+                .observe(ProviderTurnEvent::Usage {
+                    usage: final_usage.clone()
+                })
+                .is_none()
+        );
+        assert_eq!(
+            billing.observe(ProviderTurnEvent::TurnFinished {
+                stop_reason: bcode_model::StopReason::Cancelled,
+            }),
+            Some(final_usage)
+        );
+    }
+
+    #[test]
+    fn cancellation_billing_does_not_invent_missing_or_foreign_usage() {
+        let mut missing = FinalBillingUsage::default();
+        assert!(
+            missing
+                .observe(ProviderTurnEvent::TurnFinished {
+                    stop_reason: bcode_model::StopReason::Cancelled,
+                })
+                .is_none()
+        );
+        let mut unfinished = FinalBillingUsage::default();
+        assert!(
+            unfinished
+                .observe(ProviderTurnEvent::Usage {
+                    usage: TokenUsage {
+                        total_tokens: Some(9),
+                        ..TokenUsage::default()
+                    },
+                })
+                .is_none()
+        );
+        assert!(unfinished.observe(ProviderTurnEvent::Cancelled).is_none());
+        // A different invocation's terminal cannot certify this request's usage.
+        assert!(
+            FinalBillingUsage::default()
+                .observe(ProviderTurnEvent::TurnFinished {
+                    stop_reason: bcode_model::StopReason::EndTurn,
+                })
+                .is_none()
+        );
     }
 
     #[test]
@@ -97887,10 +98409,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[allow(clippy::too_many_lines)] // Complete managed settlement and compatibility fixture.
     async fn managed_compaction_runtime_case(fail_synthesis: bool) {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
         let summary = sessions
-            .create_session(Some("managed runtime".to_owned()), test_working_directory())
+            .create_session(
+                Some("managed runtime".to_owned()),
+                compaction_cwd.path().to_path_buf(),
+            )
             .await
             .expect("session should be created");
         let session_id = summary.id;
@@ -97915,6 +98441,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append trigger event");
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
         state.startup_config.system_prompt.text = Some("request-only managed canary".into());
         let mut provider_context = bcode_model::ProviderRequestContext {
@@ -99078,14 +99605,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn large_tool_result_followup_triggers_one_useful_proactive_compaction() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let session_id = sessions
-            .create_session(Some("large followup".to_owned()), test_working_directory())
+            .create_session(
+                Some("large followup".to_owned()),
+                compaction_cwd.path().to_path_buf(),
+            )
             .await
             .expect("session")
             .id;
         append_large_followup_fixture(&sessions, session_id).await;
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.tool_output.context_chars = 20_000;
@@ -99272,11 +99804,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn proactive_compaction_cancellation_persists_no_marker() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(
                 Some("cancel proactive".to_owned()),
-                test_working_directory(),
+                compaction_cwd.path().to_path_buf(),
             )
             .await
             .expect("session");
@@ -99302,6 +99835,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append active turn");
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         let selection = SessionModelSelection {
@@ -99368,9 +99902,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn overflow_compaction_cancellation_persists_no_marker() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
-            .create_session(Some("cancel overflow".to_owned()), test_working_directory())
+            .create_session(
+                Some("cancel overflow".to_owned()),
+                compaction_cwd.path().to_path_buf(),
+            )
             .await
             .expect("session");
         let session_id = summary.id;
@@ -99394,7 +99932,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("append trigger");
-        let state = test_server_state_with_fake_provider(sessions);
+        let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_owned()),
             model_id: Some("fake-echo".to_owned()),
@@ -99457,11 +99996,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn unavailable_provider_native_compaction_uses_local_marker() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(
                 Some("native unavailable".to_owned()),
-                test_working_directory(),
+                compaction_cwd.path().to_path_buf(),
             )
             .await
             .expect("session should be created");
@@ -99482,13 +100022,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .append_event(
                     session_id,
                     SessionEventKind::AssistantMessage {
-                        text: format!("response to {text}"),
+                        text: if text == "active turn" {
+                            format!("response to {text}")
+                        } else {
+                            // Give compaction genuine reclaimable historical content;
+                            // do not enlarge the fake provider's real input capacity.
+                            format!(
+                                "response to {text}: {}",
+                                "resolved historical detail; ".repeat(160)
+                            )
+                        },
                     },
                 )
                 .await
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Auto;
         let selection = SessionModelSelection {
@@ -99529,9 +100079,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn provider_native_failure_falls_back_to_local_compaction_without_provider_marker() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
-            .create_session(Some("native fallback".to_owned()), test_working_directory())
+            .create_session(
+                Some("native fallback".to_owned()),
+                compaction_cwd.path().to_path_buf(),
+            )
             .await
             .expect("session should be created");
         let session_id = summary.id;
@@ -99551,13 +100105,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .append_event(
                     session_id,
                     SessionEventKind::AssistantMessage {
-                        text: format!("response to {text}"),
+                        text: if text == "active turn" {
+                            format!("response to {text}")
+                        } else {
+                            // Give compaction genuine reclaimable historical content;
+                            // do not enlarge the fake provider's real input capacity.
+                            format!(
+                                "response to {text}: {}",
+                                "resolved historical detail; ".repeat(160)
+                            )
+                        },
                     },
                 )
                 .await
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Auto;
         let selection = SessionModelSelection {
@@ -99606,11 +100170,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn provider_native_compaction_persists_compatible_snapshot_and_portable_fallback() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(
                 Some("native compaction".to_owned()),
-                test_working_directory(),
+                compaction_cwd.path().to_path_buf(),
             )
             .await
             .expect("session should be created");
@@ -99631,13 +100196,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .append_event(
                     session_id,
                     SessionEventKind::AssistantMessage {
-                        text: format!("response to {text}"),
+                        text: if text == "active turn" {
+                            format!("response to {text}")
+                        } else {
+                            // Give compaction genuine reclaimable historical content;
+                            // do not enlarge the fake provider's real input capacity.
+                            format!(
+                                "response to {text}: {}",
+                                "resolved historical detail; ".repeat(160)
+                            )
+                        },
                     },
                 )
                 .await
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend =
             bcode_config::CompactionBackend::ProviderNative;
@@ -99762,7 +100337,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .append_event(
                 session_id,
                 SessionEventKind::AssistantMessage {
-                    text: format!("round {round} assistant {turn}"),
+                    text: format!(
+                        "round {round} assistant {turn}: {}",
+                        "resolved historical detail; ".repeat(160)
+                    ),
                 },
             )
             .await
@@ -99771,16 +100349,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn multiple_provider_native_compactions_advance_persisted_boundary() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let session_id = sessions
             .create_session(
                 Some("multiple compactions".to_owned()),
-                test_working_directory(),
+                compaction_cwd.path().to_path_buf(),
             )
             .await
             .expect("session should be created")
             .id;
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend =
             bcode_config::CompactionBackend::ProviderNative;
@@ -99858,11 +100438,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn ineffective_compaction_is_rejected_before_provider_work_without_marker() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(
                 Some("ineffective compaction".to_owned()),
-                test_working_directory(),
+                compaction_cwd.path().to_path_buf(),
             )
             .await
             .expect("session should be created");
@@ -99889,13 +100470,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("append assistant turn");
         }
-        let mut state = test_server_state(sessions);
+        let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         let cancel_state = TurnCancelState::default();
         let Err(error) = Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
-            &SessionModelSelection::default(),
+            &SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".into()),
+                model_id: Some("fake-echo".into()),
+                ..SessionModelSelection::default()
+            },
             None,
             None,
             &cancel_state,
@@ -99928,13 +100514,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn automatic_nothing_to_compact_is_trace_only() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
-            .create_session(Some("automatic no-op".to_owned()), test_working_directory())
+            .create_session(
+                Some("automatic no-op".to_owned()),
+                compaction_cwd.path().to_path_buf(),
+            )
             .await
             .expect("session should be created");
         let session_id = summary.id;
-        let state = test_server_state(sessions);
+        let mut state = test_server_state(sessions);
+        isolate_compaction_request_fixture(&mut state);
 
         let result = Box::pin(compact_session_context_with_limit(
             &state,
@@ -100819,24 +101410,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
     }
 
-    fn isolate_compaction_budget_fixture(state: &mut ServerState) {
-        // Keep budget fixtures independent of checkout guidance and in-progress diff size.
+    // Structural compaction tests exercise their own canonical instructions/history, not
+    // the checkout's AGENTS.md, diff, or the developer's installed skill catalog.
+    // Keep the fake model's real capacity and all production admission checks intact.
+    fn isolate_compaction_request_fixture(state: &mut ServerState) {
         state.startup_config.invariants.enabled = false;
-        state
-            .startup_config
-            .system_prompt
-            .sections
-            .repository_context = false;
-        state
-            .startup_config
-            .system_prompt
-            .sections
-            .repository_invariants = false;
-        state
-            .startup_config
-            .system_prompt
-            .sections
-            .dynamic_repository_context = false;
+        state.startup_config.skills.enabled = false;
+        let sections = &mut state.startup_config.system_prompt.sections;
+        sections.repository_context = false;
+        sections.repository_invariants = false;
+        sections.dynamic_repository_context = false;
+    }
+
+    fn isolate_compaction_budget_fixture(state: &mut ServerState) {
+        isolate_compaction_request_fixture(state);
         state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.startup_config.model.compaction.keep_recent_tokens = 1;
     }
@@ -101048,16 +101635,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn cancelled_compaction_before_provider_work_persists_no_marker() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(
                 Some("cancel compaction".to_owned()),
-                test_working_directory(),
+                compaction_cwd.path().to_path_buf(),
             )
             .await
             .expect("session should be created");
         let session_id = summary.id;
-        let state = test_server_state(sessions);
+        let mut state = test_server_state(sessions);
+        isolate_compaction_request_fixture(&mut state);
         let cancel_state = TurnCancelState::default();
         cancel_state.cancel().await;
 

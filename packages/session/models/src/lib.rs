@@ -31,9 +31,41 @@ pub use compaction_checkpoint::{
 /// Explicit bounded authorization to supersede a failed unpublished compaction operation.
 pub mod compaction_restart;
 pub use compaction_restart::{
+    SessionCompactionRecoveryBlocker, SessionCompactionRecoveryPreparation,
+    SessionCompactionRecoveryPreparationApplication, SessionCompactionRecoveryPrepareRequest,
     SessionCompactionRestartApplication, SessionCompactionRestartBudget,
     SessionCompactionRestartMarker, SessionCompactionRestartRequest,
 };
+
+/// Read-only discovery of a bounded candidate for explicit compaction recovery.
+/// Preparing a candidate never admits provider work or resets existing allowances.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCompactionRecoveryDiscoveryRequest {
+    /// Discovery contract version; only one is supported.
+    pub version: u32,
+    /// Canonical session in the selected state location.
+    pub session_id: SessionId,
+    /// Caller-retained identity of the proposed replacement operation.
+    pub operation_id: uuid::Uuid,
+    /// Explicit allowances to bind into the candidate, not permission to spend them.
+    pub budget: SessionCompactionRestartBudget,
+}
+
+/// Read-only preparation is separate from authorizing replacement provider work.
+pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
+    /// Inspect bounded canonical evidence and prepare an exact restart candidate.
+    ///
+    /// # Errors
+    /// Returns an error for invalid input, unavailable ownership/location, or failed reads.
+    /// Unsupported or incomplete evidence is returned as a preparation blocker.
+    fn prepare_session_compaction_recovery(
+        &self,
+        request: SessionCompactionRecoveryDiscoveryRequest,
+    ) -> impl std::future::Future<
+        Output = Result<SessionCompactionRecoveryPreparation, SessionApplicationFailure>,
+    > + Send;
+}
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 17;

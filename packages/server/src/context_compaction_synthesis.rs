@@ -387,14 +387,37 @@ pub(super) fn repair_prompt(base: &str, reason: Rejection, rejected: Option<&str
     )
 }
 
-/// Rejected output is diagnostic data, never canonical source. Attach it whole only when its
-/// UTF-8 bytes fit the independent response wire guard; carry/section limits do not apply.
-/// Source fragments and prior carry are always retained whole in the base prompt.
-///
-/// Capacity planning must estimate the complete returned repair request, including this attachment
-/// and JSON escaping, before dispatch. A worst-case reservation can use a rejected string of
-/// `policy.wire_bytes` NUL bytes (six encoded characters per byte), passed through this exact
-/// formatter. Never reserve just `base` or assume the raw response byte bound caps escaped input.
+/// Fit a repair against the frozen complete-request policy. Rejected output is optional,
+/// untrusted diagnostic material: omit it whole when it does not fit, never clip source/carry.
+pub(super) fn capacity_checked_repair_prompt(
+    base: &str,
+    reason: Rejection,
+    rejected: Option<&str>,
+    limits: SynthesisPolicy,
+    template: &super::ModelTurnRequest,
+    policy: &super::budget::ResolvedSummaryPolicy,
+) -> Result<String, super::CompactionError> {
+    let fits = |prompt: &str| {
+        let mut request = template.clone();
+        request.messages = vec![super::ModelMessage {
+            role: super::MessageRole::User,
+            content: vec![super::ContentBlock::Text {
+                text: prompt.to_owned(),
+            }],
+        }];
+        policy.validate_request(&request)
+    };
+    if let Some(rejected) = rejected.filter(|text| text.len() <= limits.wire_bytes) {
+        let attached = repair_prompt_with_policy(base, reason, Some(rejected), limits);
+        if fits(&attached).is_ok() {
+            return Ok(attached);
+        }
+    }
+    let minimal = repair_prompt_with_policy(base, reason, None, limits);
+    fits(&minimal)?;
+    Ok(minimal)
+}
+
 pub(super) fn repair_prompt_with_policy(
     base: &str,
     reason: Rejection,

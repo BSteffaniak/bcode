@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const PREFIX_SCOPE: &str = "BCODE_FIXTURE_SCOPE ";
+// Explicit synthetic restatements remain a single JSON string. They can exceed
+// the legacy scope/fact marker guard without permitting unbounded fixture state.
+const PROGRESSIVE_MARKER_BYTES: usize = 16_384;
 const PREFIX_FACT: &str = "BCODE_FIXTURE_FACT ";
 const FORMAT: &str = "bcode.compaction.scope.v2";
 
@@ -292,9 +295,14 @@ fn synthesize_inner(prompt: &str, progressive: bool) -> Result<String, String> {
         } else {
             // Arbitrary fixture padding must not grow the bounded continuation. A marker itself
             // has a small explicit fixture limit; fail instead of partially interpreting it.
-            if pending.tail.len() > 1024 {
+            let marker_limit = if progressive {
+                PROGRESSIVE_MARKER_BYTES
+            } else {
+                1024
+            };
+            if pending.tail.len() > marker_limit {
                 if pending.tail.starts_with("BCODE_FIXTURE_") {
-                    return Err("fixture marker exceeds 1024 bytes".into());
+                    return Err("fixture marker exceeds bounded byte limit".into());
                 }
                 pending.tail.clear();
                 pending.discarding_line = true;
@@ -401,7 +409,10 @@ fn apply_marker(
             if let Some(payload) = line.strip_prefix(prefix) {
                 let marker: Marker =
                     serde_json::from_str(payload).map_err(|error| error.to_string())?;
-                if marker.key.is_empty() || marker.statement.is_empty() || payload.len() > 1024 {
+                if marker.key.is_empty()
+                    || marker.statement.is_empty()
+                    || payload.len() > PROGRESSIVE_MARKER_BYTES
+                {
                     return Err("invalid progressive fixture marker".into());
                 }
                 let records = state.sections.entry(section.into()).or_default();
@@ -626,6 +637,54 @@ mod tests {
         )
         .unwrap();
         assert!(update["sections"].get("findings_evidence").is_none());
+    }
+
+    #[test]
+    fn repeated_progressive_json_marker_preserves_unicode_across_fragments_and_duplicates() {
+        let empty = json!({"format":FORMAT,"current_scope":[],"continuation":""}).to_string();
+        let proposition = "監査 🧭 e\u{301}: no edits; no network; retain q1,q3";
+        let statement = [proposition; 32].join(" Fixture restatement: ");
+        let text = format!(
+            "BCODE_FIXTURE_BLOCKER {}",
+            json!({"key":"q1,q3/restriction","statement":statement})
+        );
+        assert!(text.len() > 1024);
+        let split = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index > 1100)
+            .unwrap();
+        let first_fragment = json!({"sequence":4,"provenance":"user","byte_offset":0,
+            "final_fragment":false,"text":&text[..split]});
+        let first = synthesize_progressive(&format!(
+            "bcode.compaction.section-update.v1 NEW facts to append\nPrior structured synthesis: {empty}\n\nSource fragments (JSON lines):\n{first_fragment}"
+        )).unwrap();
+        let prior = accept_sections(&empty, &first);
+        let last_fragment = json!({"sequence":4,"provenance":"user","byte_offset":split,
+            "final_fragment":true,"text":&text[split..]});
+        let update = synthesize_progressive(&format!(
+            "bcode.compaction.section-update.v1 NEW facts to append\nPrior structured synthesis: {prior}\n\nSource fragments (JSON lines):\n{last_fragment}"
+        )).unwrap();
+        let accepted: serde_json::Value =
+            serde_json::from_str(&accept_sections(&prior, &update)).unwrap();
+        let sections: serde_json::Value =
+            serde_json::from_str(accepted["continuation"].as_str().unwrap()).unwrap();
+        let records: BTreeMap<String, String> =
+            serde_json::from_str(sections["active_work_blockers"].as_str().unwrap()).unwrap();
+        assert_eq!(records["q1,q3/restriction"], statement);
+        let mut state = FixtureState {
+            progressive: true,
+            ..FixtureState::default()
+        };
+        let mut scopes = Vec::new();
+        apply_marker(&text, 4, &mut state, &mut scopes).unwrap();
+        apply_marker(&text, 4, &mut state, &mut scopes).unwrap();
+        assert_eq!(state.sections["active_work_blockers"].len(), 1);
+        let oversized = format!(
+            "BCODE_FIXTURE_BLOCKER {}",
+            json!({"key":"q1","statement":"x".repeat(PROGRESSIVE_MARKER_BYTES)})
+        );
+        assert!(apply_marker(&oversized, 4, &mut state, &mut scopes).is_err());
     }
 
     #[test]

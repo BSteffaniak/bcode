@@ -24,23 +24,53 @@ fi
 printf 'Compaction regression binary: %s\n' "${binary}"
 shasum -a 256 "${binary}"
 python3 -m unittest discover -s "${root}/fixtures/evals/compaction" -p 'test_*.py'
-python3 "${root}/fixtures/evals/compaction/run.py" --binary "${binary}"
-python3 "${root}/fixtures/evals/compaction/run_progressive.py" --binary "${binary}"
+# Each driver owns an isolated state root, socket and fake-provider daemon. Run a bounded
+# number together; retain every log and wait for all jobs in a batch before reporting failure.
+logs="$(mktemp -d "${TMPDIR:-/tmp}/bcode-compaction-gate.XXXXXX")"
+printf 'Compaction gate logs: %s\n' "${logs}"
+pids=()
+names=()
+wait_batch() {
+    local failed=0 index
+    for index in "${!pids[@]}"; do
+        if ! wait "${pids[index]}"; then
+            printf 'FAILED: %s\n' "${names[index]}" >&2
+            failed=1
+        fi
+        cat "${logs}/${names[index]}.log"
+    done
+    pids=()
+    names=()
+    return "${failed}"
+}
+run_case() {
+    local name="$1"
+    shift
+    python3 "${root}/fixtures/evals/compaction/$1" --binary "${binary}" "${@:2}" >"${logs}/${name}.log" 2>&1 &
+    pids+=("$!")
+    names+=("${name}")
+    if [[ "${#pids[@]}" -ge 4 ]]; then
+        wait_batch
+    fi
+}
+run_case explicit run.py
+run_case progressive run_progressive.py
+run_case recovery run_recovery.py
+run_case policy-mismatch run_recovery.py --policy-mismatch
+run_case consolidation-interrupted run_consolidation.py
+run_case consolidation-reclaim run_consolidation.py --finish-consolidation
 for outcome in repair oversize-repair omit-scope-repair paraphrase-scope-repair near-limit; do
-    python3 "${root}/fixtures/evals/compaction/run.py" --binary "${binary}" --outcome "${outcome}"
+    run_case "${outcome}" run.py --outcome "${outcome}"
 done
 for interruption in cancel restart crash; do
-    python3 "${root}/fixtures/evals/compaction/run_automatic.py" \
-        --binary "${binary}" --interruption "${interruption}"
+    run_case "automatic-${interruption}" run_automatic.py --interruption "${interruption}"
 done
+wait_batch
 
-# Compare identical larger inputs through both production packing paths. Preserve
-# full run logs alongside each driver's retained scratch evidence.
-comparison="$(mktemp -d "${TMPDIR:-/tmp}/bcode-compaction-packing.XXXXXX")"
-python3 "${root}/fixtures/evals/compaction/run_automatic.py" \
-    --binary "${binary}" --source-repeat 5500 --timeout-secs 300 | tee "${comparison}/off.log"
-python3 "${root}/fixtures/evals/compaction/run_automatic.py" \
-    --binary "${binary}" --source-repeat 5500 --adaptive-packing | tee "${comparison}/on.log"
-off="$(python3 -c 'import sys; print(next(line.strip().removeprefix("Artifacts retained: ") for line in open(sys.argv[1]) if line.startswith("Artifacts retained: ")))' "${comparison}/off.log")"
-on="$(python3 -c 'import sys; print(next(line.strip().removeprefix("Artifacts retained: ") for line in open(sys.argv[1]) if line.startswith("Artifacts retained: ")))' "${comparison}/on.log")"
+# Compare identical larger inputs through both production packing paths.
+run_case packing-off run_automatic.py --source-repeat 5500 --timeout-secs 300
+run_case packing-on run_automatic.py --source-repeat 5500 --adaptive-packing
+wait_batch
+off="$(python3 -c 'import sys; print(next(line.strip().removeprefix("Artifacts retained: ") for line in open(sys.argv[1]) if line.startswith("Artifacts retained: ")))' "${logs}/packing-off.log")"
+on="$(python3 -c 'import sys; print(next(line.strip().removeprefix("Artifacts retained: ") for line in open(sys.argv[1]) if line.startswith("Artifacts retained: ")))' "${logs}/packing-on.log")"
 python3 "${root}/fixtures/evals/compaction/verify_automatic.py" --compare-packing "${off}" "${on}"

@@ -356,9 +356,32 @@ struct FakeProviderState {
     max_tokens_by_turn: BTreeSet<String>,
 }
 
+#[derive(Debug)]
+struct FakeTurnEvents {
+    queue: VecDeque<ProviderTurnEvent>,
+    usage: TokenUsage,
+    terminal: bool,
+}
+
+impl Default for FakeTurnEvents {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            // The local fake has no billable work before its first reported usage.
+            usage: TokenUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                total_tokens: Some(0),
+                ..TokenUsage::default()
+            },
+            terminal: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct FakeTurn {
-    events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
+    events: Arc<Mutex<FakeTurnEvents>>,
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
     positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -366,6 +389,18 @@ struct FakeTurn {
 
 impl FakeTurn {
     fn push(&self, event: ProviderTurnEvent) {
+        let Ok(mut events) = self.events.lock() else {
+            return;
+        };
+        if events.terminal || self.is_cancelled() {
+            return;
+        }
+        if let ProviderTurnEvent::Usage { usage } = &event {
+            events.usage = usage.clone();
+        }
+        if matches!(&event, ProviderTurnEvent::TurnFinished { .. }) {
+            events.terminal = true;
+        }
         let event = if self.positioned_output.load(Ordering::Acquire) {
             match self.output_positions.lock() {
                 Ok(mut positions) => positions.position(event),
@@ -374,9 +409,7 @@ impl FakeTurn {
         } else {
             event
         };
-        if let Ok(mut events) = self.events.lock() {
-            events.push_back(event);
-        }
+        events.queue.push_back(event);
     }
 
     fn enable_positioned_output(&self) {
@@ -384,22 +417,26 @@ impl FakeTurn {
     }
 
     fn drain(&self) -> Vec<ProviderTurnEvent> {
-        self.events
-            .lock()
-            .map_or_else(|_| Vec::new(), |mut events| events.drain(..).collect())
+        self.events.lock().map_or_else(
+            |_| Vec::new(),
+            |mut events| events.queue.drain(..).collect(),
+        )
     }
 
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
         if let Ok(mut events) = self.events.lock() {
-            if events
-                .iter()
-                .any(|event| matches!(event, ProviderTurnEvent::TurnFinished { .. }))
-            {
+            self.cancelled.store(true, Ordering::SeqCst);
+            if events.terminal {
                 return;
             }
-            events.push_back(ProviderTurnEvent::Cancelled);
-            events.push_back(ProviderTurnEvent::TurnFinished {
+            // The same lock fences every worker push. Once cancelled, no later fake
+            // output or billing can be produced; report this request's final cumulative
+            // usage, including known zero when work never reached a usage report.
+            events.terminal = true;
+            let usage = events.usage.clone();
+            events.queue.push_back(ProviderTurnEvent::Usage { usage });
+            events.queue.push_back(ProviderTurnEvent::Cancelled);
+            events.queue.push_back(ProviderTurnEvent::TurnFinished {
                 stop_reason: StopReason::Cancelled,
             });
         }
@@ -3167,6 +3204,124 @@ mod tests {
             structured_input_payload(&format!("Instructions.\n\n{payload}")),
             payload
         );
+    }
+
+    #[test]
+    fn fake_cancellation_reports_exact_cumulative_usage_and_fences_late_work() {
+        let first = FakeTurn::default();
+        let second = FakeTurn::default();
+        let usage = TokenUsage {
+            input_tokens: Some(41),
+            output_tokens: Some(7),
+            total_tokens: Some(48),
+            cached_input_tokens: Some(3),
+            ..TokenUsage::default()
+        };
+        first.push(ProviderTurnEvent::Usage {
+            usage: usage.clone(),
+        });
+        first.drain(); // Finalization must retain usage even after an earlier poll consumed it.
+        first.cancel();
+        first.push(ProviderTurnEvent::Usage {
+            usage: TokenUsage::default(),
+        });
+        first.push(ProviderTurnEvent::TextDelta {
+            text: "late work".into(),
+        });
+        let events = first.drain();
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[0], ProviderTurnEvent::Usage { usage: actual } if actual == &usage)
+        );
+        assert!(matches!(events[1], ProviderTurnEvent::Cancelled));
+        assert!(matches!(
+            events[2],
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Cancelled
+            }
+        ));
+        first.cancel();
+        assert!(
+            first.drain().is_empty(),
+            "terminal delivery must not be replayed"
+        );
+        second.cancel();
+        let events = second.drain();
+        assert!(matches!(&events[0], ProviderTurnEvent::Usage { usage } if
+            usage.input_tokens == Some(0) && usage.output_tokens == Some(0) && usage.total_tokens == Some(0)));
+    }
+
+    #[test]
+    fn fake_push_cancellation_delivers_usage_before_terminal_response() {
+        extern "C" fn collect_event(
+            payload: *const u8,
+            length: usize,
+            user_data: *mut std::ffi::c_void,
+        ) {
+            // SAFETY: The synchronous stream owns this vector until all callbacks return.
+            let events = unsafe { &mut *user_data.cast::<Vec<ProviderTurnEvent>>() };
+            let bytes = unsafe { std::slice::from_raw_parts(payload, length) };
+            events.push(serde_json::from_slice(bytes).expect("typed provider event"));
+        }
+        let mut context: NativeServiceContext = serde_json::from_value(serde_json::json!({
+            "plugin_id": "bcode.fake-provider",
+            "request": {
+                "interface_id": MODEL_PROVIDER_INTERFACE_ID_V3,
+                "operation": OP_RUN_TURN,
+                "payload": []
+            }
+        }))
+        .expect("context");
+        let mut events = Vec::<ProviderTurnEvent>::new();
+        context.events = bcode_plugin_sdk::ServiceEventEmitter::new(
+            Some(collect_event),
+            std::ptr::from_mut(&mut events).cast(),
+        );
+        context.cancellation.cancel();
+        let response = stream_fake_turn_events(&FakeTurn::default(), &context);
+        assert!(response.error.is_none());
+        assert!(
+            matches!(&events[0], ProviderTurnEvent::Usage { usage } if usage.total_tokens == Some(0))
+        );
+        assert!(matches!(events[1], ProviderTurnEvent::Cancelled));
+        assert!(matches!(
+            events[2],
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Cancelled
+            }
+        ));
+        let response: RunTurnResponse =
+            serde_json::from_slice(&response.payload).expect("response");
+        assert_eq!(response.stop_reason, Some(StopReason::Cancelled));
+    }
+
+    #[test]
+    fn fake_cancellation_does_not_replace_completed_turn_billing() {
+        let turn = FakeTurn::default();
+        let usage = TokenUsage {
+            total_tokens: Some(19),
+            ..TokenUsage::default()
+        };
+        turn.push(ProviderTurnEvent::Usage {
+            usage: usage.clone(),
+        });
+        turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        });
+        turn.cancel();
+        let events = turn.drain();
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], ProviderTurnEvent::Usage { usage: actual } if actual == &usage)
+        );
+        assert!(matches!(
+            events[1],
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn
+            }
+        ));
+        turn.cancel();
+        assert!(turn.drain().is_empty());
     }
 
     fn drain_script_until(

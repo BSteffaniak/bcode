@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{FakeTurn, fake_structured_output_error, finish_fake_text_response, last_user_text};
 
+#[path = "compaction_progressive.rs"]
+mod progressive;
+
 const MAX_WAIT_MS: u64 = 300_000;
 const REPAIR_SUFFIX: &str = "\n\nRepair: the response was invalid, incomplete, or oversized. Return a shorter valid complete JSON synthesis with supported source references and explicit supersession. Do not clip source coverage.";
 
@@ -325,12 +328,24 @@ pub fn dispatch(
     input_tokens: u64,
 ) {
     let control = Control::prepare(request);
+    let request_progressive = request
+        .provider_context
+        .settings
+        .get("fake_compaction_fixture")
+        .is_some_and(|value| value == "progressive-v1");
+    let consolidation_prompt = last_user_text(&request.messages);
     std::thread::spawn(move || {
         let response = match control {
             Ok(control) => match control.wait(|| turn.is_cancelled()) {
                 Ok(false) => return,
                 Ok(true) => {
                     let response = control.response(text).and_then(|text| {
+                        let text = if request_progressive {
+                            progressive::consolidate_with_budget(&text, &consolidation_prompt)
+                                .map_err(|error| fake_structured_output_error(&error))?
+                        } else {
+                            text
+                        };
                         control
                             .write("response.json", text.as_bytes())
                             .map_err(|error| fake_structured_output_error(&error))?;

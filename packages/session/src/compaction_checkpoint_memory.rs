@@ -142,7 +142,14 @@ pub fn validate_memory_restart(
         || SessionError::EventSerialization(super::CompactionCheckpointRestart::invalid());
     request.validate().map_err(|_| invalid())?;
     validate_memory_commit(history, &request.comparison()).map_err(|_| invalid())?;
-    if history.last().map(|event| event.sequence) != Some(request.fence()) {
+    if history
+        .last()
+        .map(super::compaction_event_identity)
+        .transpose()
+        .map_err(|_| invalid())?
+        .as_ref()
+        != Some(request.tail_identity())
+    {
         return Err(invalid());
     }
     let rejection = history

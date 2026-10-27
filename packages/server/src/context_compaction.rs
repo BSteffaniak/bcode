@@ -112,7 +112,7 @@ pub async fn restart_session_context(
         let old = checkpoint::load_archived_checkpoint(state, request).await?;
         let start = request.expected_terminal_sequence.saturating_sub(511);
         let events = state.sessions.session_events_range(session_id, start, request.expected_terminal_sequence, 512).await?;
-        let started = events.iter().rev().find(|event| {
+        let started = events.iter().find(|event| {
             event.sequence < request.expected_checkpoint_sequence && matches!(&event.kind,
                 SessionEventKind::TraceEvent { trace } if trace.phase == SessionTracePhase::ContextCompactionStarted)
         }).ok_or_else(|| CompactionError::Provider("restart requires bounded canonical completed-failure evidence".into()))?;
@@ -155,6 +155,111 @@ async fn compact_session_context_with_policy_key(
         .await
 }
 
+/// Secret-safe host-side reason retained separately from provider failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CompactionRecoveryReason {
+    /// Checkpoint integrity or compatibility could not be established.
+    #[error("invalid or incompatible compaction checkpoint; boundary unchanged")]
+    InvalidCheckpoint,
+    /// The frozen synthesis contract differs from the selected operation policy.
+    #[error(
+        "compaction synthesis policy changed or is incompatible; explicit supersession required; boundary unchanged"
+    )]
+    PolicyChanged,
+    /// A consolidation dispatch has no accepted outcome.
+    #[error("compaction consolidation outcome is unresolved; boundary unchanged")]
+    ConsolidationUnresolved,
+}
+
+/// Discover the retained operation and its terminal evidence without restoring execution.
+pub async fn prepare_compaction_recovery(
+    state: &ServerState,
+    selection: &SessionModelSelection,
+    request: &bcode_session_models::SessionCompactionRecoveryDiscoveryRequest,
+) -> Result<bcode_session_models::SessionCompactionRecoveryPreparation, CompactionError> {
+    use bcode_session_models::{
+        SessionCompactionRecoveryBlocker as Blocker, SessionCompactionRecoveryPreparation,
+        SessionCompactionRecoveryPrepareRequest, SessionHistoryDirection, SessionHistoryQuery,
+    };
+    let blocked = |blocker| SessionCompactionRecoveryPreparation {
+        version: 1,
+        session_id: request.session_id,
+        checkpoint: None,
+        terminal: None,
+        blocker: Some(blocker),
+        restart: None,
+    };
+    let history = state
+        .sessions
+        .activated_conversation_snapshot(request.session_id)
+        .await?
+        .events;
+    let config = state.session_config(request.session_id).await;
+    let planning = CompactionPlanningPolicy::Proactive {
+        keep_recent_tokens: effective_compaction_config(&config, selection).keep_recent_tokens
+            as usize,
+    };
+    let key = format!(
+        "{}:{:?}",
+        checkpoint::operation_key(
+            &history,
+            selection,
+            config.model.tool_output.context_chars,
+            planning,
+        )?,
+        effective_compaction_config(&config, selection).backend
+    );
+    let (key, checkpoint) = match checkpoint::load_resolved(state, request.session_id, &key).await {
+        Ok(value) => value,
+        Err(CompactionError::RecoveryRequired(_)) => {
+            return Ok(blocked(Blocker::UnsupportedCheckpoint));
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(checkpoint) = checkpoint else {
+        return Ok(blocked(Blocker::EvidenceUnavailable));
+    };
+    let page = state
+        .sessions
+        .session_history_page(
+            request.session_id,
+            SessionHistoryQuery {
+                cursor: None,
+                limit: 512,
+                direction: SessionHistoryDirection::Backward,
+            },
+        )
+        .await?;
+    if !page.compatibility_issues.is_empty() {
+        return Ok(blocked(Blocker::EvidenceUnavailable));
+    }
+    let terminal = page.events.iter().rev().find(|event| {
+        event.sequence > checkpoint.checkpoint_sequence
+            && matches!(&event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if trace.phase == SessionTracePhase::ContextCompactionFinished
+                    && matches!(&trace.payload, SessionTracePayload::ContextCompaction {
+                        compacted: false, message: Some(message), ..
+                    } if message.starts_with("context compaction failed:")))
+    });
+    let Some(terminal) = terminal else {
+        return Ok(blocked(Blocker::EvidenceUnavailable));
+    };
+    checkpoint::prepare_recovery(
+        state,
+        &SessionCompactionRecoveryPrepareRequest {
+            version: 1,
+            session_id: request.session_id,
+            operation_id: request.operation_id,
+            expected_operation_key: key,
+            expected_checkpoint_sequence: checkpoint.checkpoint_sequence,
+            expected_terminal_sequence: terminal.sequence,
+            budget: request.budget,
+        },
+    )
+    .await
+}
+
 #[derive(Debug, Error)]
 pub enum CompactionError {
     #[error("compaction plan unavailable: {0}")]
@@ -184,6 +289,8 @@ pub enum CompactionError {
         estimated_tokens: u64,
         threshold_tokens: u64,
     },
+    #[error("{0}")]
+    RecoveryRequired(CompactionRecoveryReason),
     #[error("provider error: {0}")]
     Provider(String),
 }
@@ -429,8 +536,18 @@ async fn compact_session_context_with_policy(
     COMPACTION_TRACE_OWNER
         .scope(
             (session_id, owner),
-            context_compaction_request_budget::scope(Box::pin(
-                compact_session_context_with_policy_inner(
+            context_compaction_request_budget::scope(Box::pin(async {
+                append_context_compaction_trace(
+                    state,
+                    session_id,
+                    CompactionTraceKind::Started,
+                    "compaction_started",
+                    0,
+                    false,
+                    Some("planning older context".into()),
+                )
+                .await;
+                let result = Box::pin(compact_session_context_with_policy_inner(
                     state,
                     session_id,
                     selection,
@@ -439,8 +556,24 @@ async fn compact_session_context_with_policy(
                     cancel_state,
                     progress_requirement,
                     planning_policy,
-                ),
-            )),
+                ))
+                .await;
+                let (compacted, message) = match &result {
+                    Ok(completion) => (true, completion.message.clone()),
+                    Err(error) => (false, format!("context compaction failed: {error}")),
+                };
+                append_context_compaction_trace(
+                    state,
+                    session_id,
+                    CompactionTraceKind::Finished,
+                    "compaction_finished",
+                    0,
+                    compacted,
+                    Some(message),
+                )
+                .await;
+                result
+            })),
         )
         .await
 }
@@ -487,7 +620,7 @@ async fn compact_session_context_with_policy_inner(
         effective_compaction_config(&config, selection).backend
     );
     let checkpoint_key = RESTART_KEY.try_with(Clone::clone).unwrap_or(checkpoint_key);
-    let (checkpoint_key, mut local_checkpoint) =
+    let (checkpoint_key, local_checkpoint) =
         checkpoint::load_resolved(state, session_id, &checkpoint_key).await?;
     if local_checkpoint.as_ref().is_some_and(|checkpoint| {
         first_kept_sequence.is_some_and(|cutoff| checkpoint.boundary >= cutoff)
@@ -545,6 +678,29 @@ async fn compact_session_context_with_policy_inner(
     )
     .await?;
     let transcript = compaction_transcript_from_plan(&plan);
+    if let Some(requirement) = progress_requirement
+        && !compaction_plan_meets_progress_requirement(&transcript, requirement)
+    {
+        let message = format!(
+            "plan would reclaim approximately {} tokens, below the required {} tokens or without advancing the prior boundary",
+            transcript.estimated_reclaimable_tokens, requirement.minimum_reclaimable_tokens
+        );
+        append_context_compaction_trace(
+            state,
+            session_id,
+            CompactionTraceKind::Skipped,
+            "insufficient_progress",
+            0,
+            false,
+            Some(message.clone()),
+        )
+        .await;
+        return Err(CompactionError::InsufficientProgress {
+            message,
+            compacted_through_sequence: transcript.compacted_through_sequence,
+        });
+    }
+
     // Appending a new admitted tail must not reset accepted work or its original allowances.
     // Retain the original complete policy; final actual-request validation still checks the tail.
     let summary_budget = if let Some(checkpoint) = &local_checkpoint {
@@ -566,6 +722,17 @@ async fn compact_session_context_with_policy_inner(
         .await?
     };
     let synthesis_policy = synthesis_limits(&summary_budget);
+    if let Some(checkpoint) = &local_checkpoint {
+        checkpoint.verify_policy(synthesis_policy)?;
+        checkpoint.verify_capacity_policy(&summary_budget)?;
+        let expected_legacy =
+            !effective_compaction_config(&config, selection).experimental_adaptive_packing;
+        if checkpoint.packing_policy.starts_with("legacy-chars-v1") != expected_legacy {
+            return Err(CompactionError::RecoveryRequired(
+                CompactionRecoveryReason::PolicyChanged,
+            ));
+        }
+    }
     let (chunks, packing_policy) = synthesis_chunks(
         state,
         session_id,
@@ -580,9 +747,8 @@ async fn compact_session_context_with_policy_inner(
         checkpoint.verify_policy(synthesis_policy)?;
         checkpoint.verify_capacity_policy(&summary_budget)?;
         if checkpoint.packing_policy != packing_policy {
-            return Err(CompactionError::Provider(
-                "compaction packing policy changed; retained checkpoint requires original policy"
-                    .into(),
+            return Err(CompactionError::RecoveryRequired(
+                CompactionRecoveryReason::PolicyChanged,
             ));
         }
         checkpoint.verify(&plan, &transcript, &chunks)?;
@@ -612,257 +778,268 @@ async fn compact_session_context_with_policy_inner(
         plan.prior_boundary
             .is_none_or(|boundary| plan.compacted_through_sequence > boundary)
     );
-    if let Some(requirement) = progress_requirement
-        && !compaction_plan_meets_progress_requirement(&transcript, requirement)
-    {
-        let message = format!(
-            "plan would reclaim approximately {} tokens, below the required {} tokens or without advancing the prior boundary",
-            transcript.estimated_reclaimable_tokens, requirement.minimum_reclaimable_tokens
-        );
-        append_context_compaction_trace(
-            state,
-            session_id,
-            CompactionTraceKind::Skipped,
-            "insufficient_progress",
-            0,
-            false,
-            Some(message.clone()),
-        )
-        .await;
-        return Err(CompactionError::InsufficientProgress {
-            message,
-            compacted_through_sequence: transcript.compacted_through_sequence,
-        });
-    }
-
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()) {
         return Err(CompactionError::ProviderUnavailable);
     }
 
-    append_context_compaction_trace(
+    Box::pin(execute_compaction_plan(
         state,
         session_id,
-        CompactionTraceKind::Started,
-        "compaction_started",
-        0,
-        false,
-        Some("older context".to_string()),
-    )
-    .await;
+        selection,
+        command_context,
+        cancel_state,
+        history,
+        transcript_history,
+        plan,
+        transcript,
+        summary_budget,
+        chunks,
+        packing_policy,
+        checkpoint_key,
+        local_checkpoint,
+    ))
+    .await
+}
 
-    let result = Box::pin(async {
-        // A saved local operation must not repeat a provider-native operation on resume.
-        let native_snapshot = if local_checkpoint.is_some() {
-            None
-        } else {
-            compact_context_with_selected_backend(
-                state,
-                session_id,
-                selection,
-                &native_compaction_history(&transcript_history, &plan.compactable_prefix),
-                cancel_state,
-            )
-            .await?
-        };
-        if native_snapshot.is_none() && local_checkpoint.is_none() {
-            let mut checkpoint = checkpoint::LocalCheckpoint::create_with_policy(
-                &plan,
-                &transcript,
-                &chunks,
-                synthesis_policy,
-            )?;
-            checkpoint.bind_capacity_policy(&summary_budget)?;
-            checkpoint.packing_policy.clone_from(&packing_policy);
-            checkpoint.save(state, session_id, &checkpoint_key).await?;
-            local_checkpoint = Some(checkpoint);
+/// Execution and atomic publication follow planning on the same task and command ownership.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_compaction_plan(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+    history: Vec<bcode_session_models::SessionEvent>,
+    transcript_history: Vec<bcode_session_models::SessionEvent>,
+    plan: CompactionPlan,
+    transcript: CompactionTranscript,
+    summary_budget: budget::ResolvedSummaryPolicy,
+    chunks: Vec<String>,
+    packing_policy: String,
+    checkpoint_key: String,
+    mut local_checkpoint: Option<checkpoint::LocalCheckpoint>,
+) -> Result<CompactionCompletion, CompactionError> {
+    let synthesis_policy = synthesis_limits(&summary_budget);
+    // A saved local operation must not repeat a provider-native operation on resume.
+    let native_snapshot = if local_checkpoint.is_some() {
+        None
+    } else {
+        compact_context_with_selected_backend(
+            state,
+            session_id,
+            selection,
+            &native_compaction_history(&transcript_history, &plan.compactable_prefix),
+            cancel_state,
+        )
+        .await?
+    };
+    if native_snapshot.is_none() && local_checkpoint.is_none() {
+        let mut checkpoint = checkpoint::LocalCheckpoint::create_with_policy(
+            &plan,
+            &transcript,
+            &chunks,
+            synthesis_policy,
+        )?;
+        checkpoint.bind_capacity_policy(&summary_budget)?;
+        checkpoint.packing_policy.clone_from(&packing_policy);
+        checkpoint.save(state, session_id, &checkpoint_key).await?;
+        local_checkpoint = Some(checkpoint);
+    }
+    let portable_summary = if native_snapshot.is_some() {
+        match Box::pin(collect_compaction_summary_resumable(
+            state,
+            session_id,
+            selection,
+            &transcript,
+            command_context,
+            cancel_state,
+            Some(&summary_budget),
+            None,
+        ))
+        .await
+        {
+            Ok(summary) if !summary.trim().is_empty() => summary.trim().to_string(),
+            Ok(_) => local_compaction_summary(&transcript, "provider returned an empty summary"),
+            Err(CompactionError::Cancelled) => return Err(CompactionError::Cancelled),
+            Err(error) => local_compaction_summary(&transcript, &compaction_error_detail(error)),
         }
-        let portable_summary = if native_snapshot.is_some() {
-            match Box::pin(collect_compaction_summary_resumable(
-                state,
-                session_id,
-                selection,
-                &transcript,
-                command_context,
-                cancel_state,
-                Some(&summary_budget),
-                None,
-            ))
-            .await
-            {
-                Ok(summary) if !summary.trim().is_empty() => summary.trim().to_string(),
-                Ok(_) => {
-                    local_compaction_summary(&transcript, "provider returned an empty summary")
-                }
-                Err(CompactionError::Cancelled) => return Err(CompactionError::Cancelled),
-                Err(error) => {
-                    local_compaction_summary(&transcript, &compaction_error_detail(error))
-                }
-            }
-        } else {
-            let summary = Box::pin(collect_compaction_summary_resumable(
-                state,
-                session_id,
-                selection,
-                &transcript,
-                command_context,
-                cancel_state,
-                Some(&summary_budget),
-                local_checkpoint
-                    .as_mut()
-                    .map(|checkpoint| (checkpoint, checkpoint_key.as_str())),
-            ))
-            .await?;
-            let summary = summary.trim().to_string();
-            if summary.is_empty() {
-                return Err(CompactionError::Provider(
-                    "provider returned an empty compaction summary".to_string(),
-                ));
-            }
-            summary
-        };
-        if portable_summary.trim().is_empty() {
+    } else {
+        let summary = Box::pin(collect_compaction_summary_resumable(
+            state,
+            session_id,
+            selection,
+            &transcript,
+            command_context,
+            cancel_state,
+            Some(&summary_budget),
+            local_checkpoint
+                .as_mut()
+                .map(|checkpoint| (checkpoint, checkpoint_key.as_str())),
+        ))
+        .await?;
+        let summary = summary.trim().to_string();
+        if summary.is_empty() {
             return Err(CompactionError::Provider(
-                "no complete bounded portable summary; boundary unchanged".into(),
+                "provider returned an empty compaction summary".to_string(),
             ));
         }
-        let mut retained = context_compaction_request_budget::replaced_history(
-            &history,
-            plan.compacted_through_sequence,
-            &portable_summary,
-        )?;
-        let portable_request = context_compaction_request_budget::project(
-            state,
-            session_id,
-            selection,
-            &retained,
-            cancel_state,
-        )
-        .await?;
-        summary_budget.validate_candidate(&portable_summary, "", &portable_request)?;
-        if let Some(snapshot) = &native_snapshot {
-            let mut snapshot = snapshot.clone();
-            snapshot.portable_summary.clone_from(&portable_summary);
-            retained[0].kind = SessionEventKind::ProviderContextCompacted {
-                snapshot,
-                compacted_through_sequence: plan.compacted_through_sequence,
-            };
-        }
-        let retained_request = context_compaction_request_budget::project(
-            state,
-            session_id,
-            selection,
-            &retained,
-            cancel_state,
-        )
-        .await?;
-        summary_budget.validate_retained_request(&portable_summary, "", &retained_request)?;
-        let marker_commit = cancel_state.marker_commit.lock().await;
-        if let Some(checkpoint) = &local_checkpoint {
-            checkpoint.verify_publication_deadline()?;
-        }
-        if cancel_state.is_cancelled() {
-            return Err(CompactionError::Cancelled);
-        }
-        let (commit_key, expected_checkpoint_sequence) = if let Some(checkpoint) = &local_checkpoint
-        {
-            (checkpoint_key.clone(), checkpoint.checkpoint_sequence)
-        } else {
-            let key = format!("{checkpoint_key}:native-commit");
-            let event = state
-                .sessions
-                .append_compaction_checkpoint(
-                    session_id,
-                    &key,
-                    Some("bcode.native-compaction.commit-ready.v1".into()),
-                )
-                .await?;
-            (key, event.sequence)
-        };
-        let prior_marker = history.iter().rev().find(|event| {
-            matches!(
-                event.kind,
-                SessionEventKind::ContextCompacted { .. }
-                    | SessionEventKind::ProviderContextCompacted { .. }
-            )
-        });
-        let source = plan
-            .compactable_prefix
-            .iter()
-            .map(bcode_session::compaction_event_identity)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| CompactionError::Provider("cannot identify compaction source".into()))?;
-        let expected_prior_marker = prior_marker
-            .map(bcode_session::compaction_event_identity)
-            .transpose()
-            .map_err(|_| {
-                CompactionError::Provider("cannot identify prior compaction marker".into())
-            })?;
-        let marker = if let Some(mut snapshot) = native_snapshot {
-            snapshot.portable_summary = portable_summary;
-            SessionEventKind::ProviderContextCompacted {
-                snapshot,
-                compacted_through_sequence: transcript.compacted_through_sequence,
-            }
-        } else {
-            SessionEventKind::ContextCompacted {
-                summary: portable_summary,
-                compacted_through_sequence: transcript.compacted_through_sequence,
-            }
-        };
-        let event = state
-            .sessions
-            .commit_compaction_checkpoint(
-                session_id,
-                bcode_session::CompactionCheckpointCommit {
-                    operation_key: commit_key,
-                    expected_checkpoint_sequence,
-                    expected_prior_marker,
-                    source,
-                    marker,
-                },
-            )
-            .await?;
-        publish_session_event(state, &event).await;
-        state.invalidate_session_continuations(session_id).await;
-        drop(marker_commit);
-        if let Some(checkpoint) = &local_checkpoint {
-            checkpoint
-                .observe(
-                    state,
-                    session_id,
-                    bcode_session_models::CompactionInspectionResume::NotReported,
-                    bcode_session_models::CompactionInspectionPhase::Committed,
-                )
-                .await;
-        }
-
-        Ok(CompactionCompletion {
-            message: format!(
-                "compacted {} events through #{} (retained approximately {} tokens)",
-                transcript.event_count,
-                transcript.compacted_through_sequence,
-                plan.estimated_tail_tokens,
-            ),
-            compacted_through_sequence: transcript.compacted_through_sequence,
-        })
-    })
-    .await;
-
-    let (compacted, message) = match &result {
-        Ok(completion) => (true, Some(completion.message.clone())),
-        Err(error) => (false, Some(format!("context compaction failed: {error}"))),
+        summary
     };
-    append_context_compaction_trace(
+    Box::pin(publish_compaction_plan(
         state,
         session_id,
-        CompactionTraceKind::Finished,
-        "compaction_finished",
-        0,
-        compacted,
-        message,
+        selection,
+        cancel_state,
+        &history,
+        &plan,
+        &transcript,
+        &summary_budget,
+        &checkpoint_key,
+        local_checkpoint.as_ref(),
+        native_snapshot,
+        portable_summary,
+    ))
+    .await
+}
+
+/// Candidate validation and marker publication share the original cancellation commit gate.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn publish_compaction_plan(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    cancel_state: &TurnCancelState,
+    history: &[bcode_session_models::SessionEvent],
+    plan: &CompactionPlan,
+    transcript: &CompactionTranscript,
+    summary_budget: &budget::ResolvedSummaryPolicy,
+    checkpoint_key: &str,
+    local_checkpoint: Option<&checkpoint::LocalCheckpoint>,
+    native_snapshot: Option<bcode_session_models::ProviderContextSnapshot>,
+    portable_summary: String,
+) -> Result<CompactionCompletion, CompactionError> {
+    if portable_summary.trim().is_empty() {
+        return Err(CompactionError::Provider(
+            "no complete bounded portable summary; boundary unchanged".into(),
+        ));
+    }
+    let mut retained = context_compaction_request_budget::replaced_history(
+        history,
+        plan.compacted_through_sequence,
+        &portable_summary,
+    )?;
+    let portable_request = context_compaction_request_budget::project(
+        state,
+        session_id,
+        selection,
+        &retained,
+        cancel_state,
     )
-    .await;
-    result
+    .await?;
+    summary_budget.validate_candidate(&portable_summary, "", &portable_request)?;
+    if let Some(snapshot) = &native_snapshot {
+        let mut snapshot = snapshot.clone();
+        snapshot.portable_summary.clone_from(&portable_summary);
+        retained[0].kind = SessionEventKind::ProviderContextCompacted {
+            snapshot,
+            compacted_through_sequence: plan.compacted_through_sequence,
+        };
+    }
+    let retained_request = context_compaction_request_budget::project(
+        state,
+        session_id,
+        selection,
+        &retained,
+        cancel_state,
+    )
+    .await?;
+    summary_budget.validate_retained_request(&portable_summary, "", &retained_request)?;
+    let marker_commit = cancel_state.marker_commit.lock().await;
+    if let Some(checkpoint) = local_checkpoint {
+        checkpoint.verify_publication_deadline()?;
+    }
+    if cancel_state.is_cancelled() {
+        return Err(CompactionError::Cancelled);
+    }
+    let (commit_key, expected_checkpoint_sequence) = if let Some(checkpoint) = local_checkpoint {
+        (checkpoint_key.to_owned(), checkpoint.checkpoint_sequence)
+    } else {
+        let key = format!("{checkpoint_key}:native-commit");
+        let event = state
+            .sessions
+            .append_compaction_checkpoint(
+                session_id,
+                &key,
+                Some("bcode.native-compaction.commit-ready.v1".into()),
+            )
+            .await?;
+        (key, event.sequence)
+    };
+    let prior_marker = history.iter().rev().find(|event| {
+        matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        )
+    });
+    let source = plan
+        .compactable_prefix
+        .iter()
+        .map(bcode_session::compaction_event_identity)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CompactionError::Provider("cannot identify compaction source".into()))?;
+    let expected_prior_marker = prior_marker
+        .map(bcode_session::compaction_event_identity)
+        .transpose()
+        .map_err(|_| CompactionError::Provider("cannot identify prior compaction marker".into()))?;
+    let marker = if let Some(mut snapshot) = native_snapshot {
+        snapshot.portable_summary = portable_summary;
+        SessionEventKind::ProviderContextCompacted {
+            snapshot,
+            compacted_through_sequence: transcript.compacted_through_sequence,
+        }
+    } else {
+        SessionEventKind::ContextCompacted {
+            summary: portable_summary,
+            compacted_through_sequence: transcript.compacted_through_sequence,
+        }
+    };
+    let event = state
+        .sessions
+        .commit_compaction_checkpoint(
+            session_id,
+            bcode_session::CompactionCheckpointCommit {
+                operation_key: commit_key,
+                expected_checkpoint_sequence,
+                expected_prior_marker,
+                source,
+                marker,
+            },
+        )
+        .await?;
+    publish_session_event(state, &event).await;
+    state.invalidate_session_continuations(session_id).await;
+    drop(marker_commit);
+    if let Some(checkpoint) = local_checkpoint {
+        checkpoint
+            .observe(
+                state,
+                session_id,
+                bcode_session_models::CompactionInspectionResume::NotReported,
+                bcode_session_models::CompactionInspectionPhase::Committed,
+            )
+            .await;
+    }
+
+    Ok(CompactionCompletion {
+        message: format!(
+            "compacted {} events through #{} (retained approximately {} tokens)",
+            transcript.event_count,
+            transcript.compacted_through_sequence,
+            plan.estimated_tail_tokens,
+        ),
+        compacted_through_sequence: transcript.compacted_through_sequence,
+    })
 }
 
 pub async fn provider_context_management_capabilities(
@@ -1723,31 +1900,107 @@ async fn consolidate_carry(
     Ok(candidate)
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Durable carry is separate from per-chunk request and repair temporaries.
+struct SynthesisProgress {
+    evidence: CompactionEvidence,
+    user_sequences: BTreeSet<u64>,
+    unfinished_sources: BTreeSet<u64>,
+}
+
+struct SynthesisSetup {
+    summary_budget: budget::ResolvedSummaryPolicy,
+    chunks: Vec<String>,
+    generation_target: super::model_request_target::ResolvedModelRequestTarget,
+    resume_offset: usize,
+    progress: SynthesisProgress,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn collect_compaction_summary_resumable(
     state: &ServerState,
     session_id: SessionId,
     selection: &SessionModelSelection,
     transcript: &CompactionTranscript,
-    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    mut command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
     frozen_budget: Option<&budget::ResolvedSummaryPolicy>,
     mut checkpoint: Option<(&mut checkpoint::LocalCheckpoint, &str)>,
 ) -> Result<String, CompactionError> {
+    // Phase futures stay on this same task: request policy and recovery task-locals are intact.
+    let setup = Box::pin(prepare_synthesis(
+        state,
+        session_id,
+        selection,
+        transcript,
+        cancel_state,
+        frozen_budget,
+        checkpoint
+            .as_ref()
+            .map(|(checkpoint, key)| (&**checkpoint, *key)),
+    ))
+    .await?;
+    let SynthesisSetup {
+        summary_budget,
+        chunks,
+        generation_target,
+        resume_offset,
+        mut progress,
+    } = setup;
+    for (index, chunk) in chunks.iter().enumerate().skip(resume_offset) {
+        progress = Box::pin(synthesize_chunk(
+            state,
+            session_id,
+            selection,
+            transcript,
+            command_context.as_deref_mut(),
+            cancel_state,
+            &summary_budget,
+            &mut checkpoint,
+            &generation_target,
+            index,
+            chunk,
+            chunks.len(),
+            resume_offset,
+            progress,
+        ))
+        .await?;
+    }
+    Box::pin(finish_synthesis(
+        state,
+        session_id,
+        selection,
+        transcript,
+        command_context,
+        cancel_state,
+        &summary_budget,
+        &mut checkpoint,
+        progress,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn prepare_synthesis(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    transcript: &CompactionTranscript,
+    cancel_state: &TurnCancelState,
+    frozen_budget: Option<&budget::ResolvedSummaryPolicy>,
+    checkpoint: Option<(&checkpoint::LocalCheckpoint, &str)>,
+) -> Result<SynthesisSetup, CompactionError> {
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
-    let owned_budget;
-    let history;
     let summary_budget = if let Some(policy) = frozen_budget {
-        policy
+        policy.clone()
     } else {
-        history = state
+        let history = state
             .sessions
             .activated_conversation_snapshot(session_id)
             .await?
             .events;
-        owned_budget = resolve_summary_budget(
+        resolve_summary_budget(
             state,
             session_id,
             selection,
@@ -1756,9 +2009,9 @@ async fn collect_compaction_summary_resumable(
             0,
             cancel_state,
         )
-        .await?;
-        &owned_budget
+        .await?
     };
+    let summary_budget = &summary_budget;
     let synthesis_policy = synthesis_limits(summary_budget);
     let (chunks, packing_policy) = synthesis_chunks(
         state,
@@ -1770,13 +2023,12 @@ async fn collect_compaction_summary_resumable(
     )
     .await?;
     let packing_policy = budget_packing_identity(&packing_policy, summary_budget)?;
-    if let Some((checkpoint, _)) = &checkpoint {
+    if let Some((checkpoint, _)) = checkpoint {
         checkpoint.verify_policy(synthesis_policy)?;
         checkpoint.verify_resolved_policy(summary_budget)?;
         if checkpoint.packing_policy != packing_policy {
-            return Err(CompactionError::Provider(
-                "compaction packing policy changed; retained checkpoint requires original policy"
-                    .into(),
+            return Err(CompactionError::RecoveryRequired(
+                CompactionRecoveryReason::PolicyChanged,
             ));
         }
         // Frozen manifests are checked in orchestration; direct resume still verifies every chunk.
@@ -1791,25 +2043,11 @@ async fn collect_compaction_summary_resumable(
     )?;
     let mut user_sequences = prior_scope_sequences(transcript.previous_summary.as_deref());
     let mut unfinished_sources = BTreeSet::new();
-    let resume_offset = checkpoint
-        .as_ref()
-        .map_or(0, |(checkpoint, _)| checkpoint.next_chunk);
-    if let Some((checkpoint, _)) = &checkpoint {
+    let resume_offset = checkpoint.map_or(0, |(checkpoint, _)| checkpoint.next_chunk);
+    if let Some((checkpoint, _)) = checkpoint {
         (evidence, user_sequences, unfinished_sources) = checkpoint.restore();
     }
-    append_context_compaction_trace(
-        state,
-        session_id,
-        CompactionTraceKind::Diagnostic,
-        "summary_request",
-        0,
-        false,
-        Some(format!(
-            "processing {} complete chronological chunks; at most two requests per chunk; done={resume_offset} total={} resume_offset={resume_offset}",
-            chunks.len(), chunks.len()
-        )),
-    )
-    .await;
+    report_synthesis_plan(state, session_id, chunks.len(), resume_offset).await;
     let generation_target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
@@ -1821,18 +2059,98 @@ async fn collect_compaction_summary_resumable(
     ))
     .await
     .map_err(|error| CompactionError::Provider(error.to_string()))?;
-    let mut command_context = command_context;
-    for (index, chunk) in chunks.iter().enumerate().skip(resume_offset) {
-        if cancel_state.is_cancelled() {
-            return Err(CompactionError::Cancelled);
+    Ok(SynthesisSetup {
+        summary_budget: summary_budget.clone(),
+        chunks,
+        generation_target,
+        resume_offset,
+        progress: SynthesisProgress {
+            evidence,
+            user_sequences,
+            unfinished_sources,
+        },
+    })
+}
+
+async fn report_synthesis_plan(
+    state: &ServerState,
+    session_id: SessionId,
+    total: usize,
+    resume_offset: usize,
+) {
+    append_context_compaction_trace(
+        state, session_id, CompactionTraceKind::Diagnostic, "summary_request", 0, false,
+        Some(format!("processing {total} complete chronological chunks; at most two requests per chunk; done={resume_offset} total={total} resume_offset={resume_offset}")),
+    ).await;
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn synthesize_chunk(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    transcript: &CompactionTranscript,
+    mut command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+    summary_budget: &budget::ResolvedSummaryPolicy,
+    checkpoint: &mut Option<(&mut checkpoint::LocalCheckpoint, &str)>,
+    generation_target: &super::model_request_target::ResolvedModelRequestTarget,
+    index: usize,
+    chunk: &str,
+    total_chunks: usize,
+    resume_offset: usize,
+    progress: SynthesisProgress,
+) -> Result<SynthesisProgress, CompactionError> {
+    let synthesis_policy = synthesis_limits(summary_budget);
+    let SynthesisProgress {
+        mut evidence,
+        mut user_sequences,
+        mut unfinished_sources,
+    } = progress;
+    if cancel_state.is_cancelled() {
+        return Err(CompactionError::Cancelled);
+    }
+    let new_user_sequences = chunk_user_sequences(chunk);
+    user_sequences.extend(new_user_sequences.iter().copied());
+    let reconcilable = unfinished_sources
+        .intersection(&new_user_sequences)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut prompt = synthesis::section_update_prompt(
+        &evidence,
+        chunk,
+        &new_user_sequences,
+        &reconcilable,
+        synthesis_policy,
+    )
+    .map_err(|reason| CompactionError::Provider(reason.guidance().into()))?;
+    let projected = build_compaction_request(
+        session_id,
+        generation_target.model_id.clone(),
+        generation_target.provider_context.clone(),
+        &prompt,
+        String::new(),
+    );
+    if summary_budget.validate_request(&projected).is_err() {
+        if index == 0 {
+            return Err(CompactionError::Provider(
+                "first complete synthesis request cannot fit selected model; no source clipped"
+                    .into(),
+            ));
         }
-        let new_user_sequences = chunk_user_sequences(chunk);
-        user_sequences.extend(new_user_sequences.iter().copied());
-        let reconcilable = unfinished_sources
-            .intersection(&new_user_sequences)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let mut prompt = synthesis::section_update_prompt(
+        evidence = Box::pin(consolidate_carry(
+            state,
+            session_id,
+            selection,
+            transcript,
+            &evidence,
+            summary_budget,
+            command_context.as_deref_mut(),
+            cancel_state,
+            checkpoint,
+        ))
+        .await?;
+        prompt = synthesis::section_update_prompt(
             &evidence,
             chunk,
             &new_user_sequences,
@@ -1847,187 +2165,233 @@ async fn collect_compaction_summary_resumable(
             &prompt,
             String::new(),
         );
-        if summary_budget.validate_request(&projected).is_err() {
-            if index == 0 {
-                return Err(CompactionError::Provider(
-                    "first complete synthesis request cannot fit selected model; no source clipped"
-                        .into(),
-                ));
-            }
-            evidence = consolidate_carry(
+        summary_budget.validate_request(&projected)?;
+    }
+    for scope in &mut evidence.current_scope {
+        scope.supersedes.clear();
+    }
+    prompt = synthesis::section_update_prompt(
+        &evidence,
+        chunk,
+        &new_user_sequences,
+        &reconcilable,
+        synthesis_policy,
+    )
+    .map_err(|reason| CompactionError::Provider(reason.guidance().into()))?;
+    evidence = Box::pin(repair_synthesis_chunk(
+        state,
+        session_id,
+        selection,
+        transcript,
+        command_context,
+        cancel_state,
+        summary_budget,
+        checkpoint,
+        index,
+        total_chunks,
+        &prompt,
+        &evidence,
+        &user_sequences,
+        &new_user_sequences,
+        &reconcilable,
+    ))
+    .await?;
+    update_unfinished_sources(&mut unfinished_sources, chunk);
+    user_sequences = evidence
+        .current_scope
+        .iter()
+        .map(|scope| scope.source_sequence)
+        .chain(unfinished_sources.iter().copied())
+        .collect();
+    if let Some((checkpoint, key)) = checkpoint.as_mut() {
+        checkpoint.accept(&evidence, &user_sequences, &unfinished_sources);
+        checkpoint.save(state, session_id, key).await?;
+        checkpoint
+            .observe(
                 state,
                 session_id,
-                selection,
-                transcript,
-                &evidence,
-                summary_budget,
-                command_context.as_deref_mut(),
-                cancel_state,
-                &mut checkpoint,
+                bcode_session_models::CompactionInspectionResume::NotReported,
+                bcode_session_models::CompactionInspectionPhase::Synthesizing,
+            )
+            .await;
+        compaction_recovery::transition(state, session_id, compaction_recovery::Phase::Safe)
+            .await?;
+    }
+    append_context_compaction_trace(
+        state,
+        session_id,
+        CompactionTraceKind::Diagnostic,
+        "summary_chunk_accepted",
+        0,
+        false,
+        Some(format!(
+            "done={} total={} resume_offset={resume_offset}",
+            index + 1,
+            total_chunks
+        )),
+    )
+    .await;
+    Ok(SynthesisProgress {
+        evidence,
+        user_sequences,
+        unfinished_sources,
+    })
+}
+
+/// Reservations, rejected output and the bounded repair loop live only for this chunk.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn repair_synthesis_chunk(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    transcript: &CompactionTranscript,
+    mut command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+    summary_budget: &budget::ResolvedSummaryPolicy,
+    checkpoint: &mut Option<(&mut checkpoint::LocalCheckpoint, &str)>,
+    index: usize,
+    total_chunks: usize,
+    prompt: &str,
+    evidence: &CompactionEvidence,
+    user_sequences: &BTreeSet<u64>,
+    new_user_sequences: &BTreeSet<u64>,
+    reconcilable: &BTreeSet<u64>,
+) -> Result<CompactionEvidence, CompactionError> {
+    let synthesis_policy = synthesis_limits(summary_budget);
+    let mut accepted = None;
+    let mut rejection = None;
+    let mut rejected_output = None;
+    for repair in 0..2 {
+        if cancel_state.is_cancelled() {
+            return Err(CompactionError::Cancelled);
+        }
+        let repair = if let Some((checkpoint, key)) = checkpoint.as_mut() {
+            compaction_recovery::transition(
+                state,
+                session_id,
+                compaction_recovery::Phase::Local {
+                    key: (*key).to_owned(),
+                    chunk: index,
+                },
             )
             .await?;
-            prompt = synthesis::section_update_prompt(
-                &evidence,
-                chunk,
-                &new_user_sequences,
-                &reconcilable,
-                synthesis_policy,
-            )
-            .map_err(|reason| CompactionError::Provider(reason.guidance().into()))?;
-            let projected = build_compaction_request(
-                session_id,
-                generation_target.model_id.clone(),
-                generation_target.provider_context.clone(),
-                &prompt,
-                String::new(),
-            );
-            summary_budget.validate_request(&projected)?;
-        }
-        for scope in &mut evidence.current_scope {
-            scope.supersedes.clear();
-        }
-        prompt = synthesis::section_update_prompt(
-            &evidence,
-            chunk,
-            &new_user_sequences,
-            &reconcilable,
-            synthesis_policy,
-        )
-        .map_err(|reason| CompactionError::Provider(reason.guidance().into()))?;
-        let mut accepted = None;
-        let mut rejection = None;
-        let mut rejected_output = None;
-        for repair in 0..2 {
+            let reserved = checkpoint.reserve(state, session_id, key, index).await?;
             if cancel_state.is_cancelled() {
                 return Err(CompactionError::Cancelled);
             }
-            let repair = if let Some((checkpoint, key)) = &mut checkpoint {
-                compaction_recovery::transition(
-                    state,
-                    session_id,
-                    compaction_recovery::Phase::Local {
-                        key: (*key).to_owned(),
-                        chunk: index,
-                    },
-                )
+            usize::from(reserved)
+        } else {
+            // Without validated durable carry there is no automatic replay-safe boundary.
+            compaction_recovery::transition(state, session_id, compaction_recovery::Phase::Native)
                 .await?;
-                let reserved = checkpoint.reserve(state, session_id, key, index).await?;
-                if cancel_state.is_cancelled() {
-                    return Err(CompactionError::Cancelled);
-                }
-                usize::from(reserved)
-            } else {
-                // Without validated durable carry there is no automatic replay-safe boundary.
-                compaction_recovery::transition(
-                    state,
-                    session_id,
-                    compaction_recovery::Phase::Native,
-                )
-                .await?;
-                repair
-            };
-            let attempt_prompt = if repair == 0 {
-                prompt.clone()
-            } else {
-                synthesis::repair_prompt_with_policy(
-                    &prompt,
-                    rejection.unwrap_or(synthesis::Rejection::PreviousAttemptUnavailable),
-                    rejected_output.as_deref(),
-                    synthesis_policy,
-                )
-            };
-            let response = collect_compaction_summary_once_with_policy(
+            repair
+        };
+        let attempt_prompt = if repair == 0 {
+            prompt.to_owned()
+        } else {
+            let target = Box::pin(resolve_model_request_target(
                 state,
+                ModelRequestTargetInput {
+                    provider_plugin_id: selection.provider_plugin_id.as_deref(),
+                    selected_model_id: selection.model_id.as_deref(),
+                    provider_context: &selection.provider_context,
+                    native_default: selection.native_default,
+                },
+            ))
+            .await
+            .map_err(|error| CompactionError::Provider(error.to_string()))?;
+            let template = build_compaction_request(
                 session_id,
-                selection,
-                transcript,
-                &attempt_prompt,
-                command_context.as_deref_mut(),
-                cancel_state,
+                target.model_id,
+                target.provider_context,
+                prompt,
+                String::new(),
+            );
+            synthesis::capacity_checked_repair_prompt(
+                prompt,
+                rejection.unwrap_or(synthesis::Rejection::PreviousAttemptUnavailable),
+                rejected_output.as_deref(),
+                synthesis_policy,
+                &template,
                 summary_budget,
-            )
-            .await;
-            let summary = match response {
-                Ok(summary) => summary,
-                Err(CompactionError::Provider(message))
-                    if message == "compaction output exceeds bounded synthesis budget"
-                        || message == "incomplete compaction output" =>
-                {
-                    rejection = Some(if message == "incomplete compaction output" {
-                        synthesis::Rejection::IncompleteOutput
-                    } else {
-                        synthesis::Rejection::WireBudget
-                    });
-                    rejected_output = None;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if summary_budget.validate_response(&summary).is_err() {
-                rejection = Some(synthesis::Rejection::WireBudget);
+            )?
+        };
+        // Bound the nested synthesis future; cancellation shares this worker stack.
+        let response = Box::pin(collect_compaction_summary_once_with_policy(
+            state,
+            session_id,
+            selection,
+            transcript,
+            &attempt_prompt,
+            command_context.as_deref_mut(),
+            cancel_state,
+            summary_budget,
+        ))
+        .await;
+        let summary = match response {
+            Ok(summary) => summary,
+            Err(CompactionError::Provider(message))
+                if message == "compaction output exceeds bounded synthesis budget"
+                    || message == "incomplete compaction output" =>
+            {
+                rejection = Some(if message == "incomplete compaction output" {
+                    synthesis::Rejection::IncompleteOutput
+                } else {
+                    synthesis::Rejection::WireBudget
+                });
                 rejected_output = None;
                 continue;
             }
-            match synthesis::merge_response_with_policy(
-                &summary,
-                &evidence,
-                &user_sequences,
-                &new_user_sequences,
-                &reconcilable,
-                synthesis_policy,
-            ) {
-                Ok(candidate) => {
-                    accepted = Some(candidate);
-                    break;
-                }
-                Err(reason) => {
-                    rejection = Some(reason);
-                    rejected_output = Some(summary);
-                }
+            Err(error) => return Err(error),
+        };
+        if summary_budget.validate_response(&summary).is_err() {
+            rejection = Some(synthesis::Rejection::WireBudget);
+            rejected_output = None;
+            continue;
+        }
+        match synthesis::merge_response_with_policy(
+            &summary,
+            evidence,
+            user_sequences,
+            new_user_sequences,
+            reconcilable,
+            synthesis_policy,
+        ) {
+            Ok(candidate) => {
+                accepted = Some(candidate);
+                break;
+            }
+            Err(reason) => {
+                rejection = Some(reason);
+                rejected_output = Some(summary);
             }
         }
-        evidence = accepted.ok_or_else(|| CompactionError::Provider(format!(
-            "compaction synthesis rejected after bounded repair; chunk={}/{} reason={}; boundary unchanged",
-            index + 1,
-            chunks.len(),
-            rejection.map_or("no accepted response", synthesis::Rejection::guidance),
-        )))?;
-        update_unfinished_sources(&mut unfinished_sources, chunk);
-        user_sequences = evidence
-            .current_scope
-            .iter()
-            .map(|scope| scope.source_sequence)
-            .chain(unfinished_sources.iter().copied())
-            .collect();
-        if let Some((checkpoint, key)) = &mut checkpoint {
-            checkpoint.accept(&evidence, &user_sequences, &unfinished_sources);
-            checkpoint.save(state, session_id, key).await?;
-            checkpoint
-                .observe(
-                    state,
-                    session_id,
-                    bcode_session_models::CompactionInspectionResume::NotReported,
-                    bcode_session_models::CompactionInspectionPhase::Synthesizing,
-                )
-                .await;
-            compaction_recovery::transition(state, session_id, compaction_recovery::Phase::Safe)
-                .await?;
-        }
-        append_context_compaction_trace(
-            state,
-            session_id,
-            CompactionTraceKind::Diagnostic,
-            "summary_chunk_accepted",
-            0,
-            false,
-            Some(format!(
-                "done={} total={} resume_offset={resume_offset}",
-                index + 1,
-                chunks.len()
-            )),
-        )
-        .await;
     }
+    accepted.ok_or_else(|| CompactionError::Provider(format!(
+        "compaction synthesis rejected after bounded repair; chunk={}/{} reason={}; boundary unchanged",
+        index + 1,
+        total_chunks,
+        rejection.map_or("no accepted response", synthesis::Rejection::guidance),
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_synthesis(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    transcript: &CompactionTranscript,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+    summary_budget: &budget::ResolvedSummaryPolicy,
+    checkpoint: &mut Option<(&mut checkpoint::LocalCheckpoint, &str)>,
+    progress: SynthesisProgress,
+) -> Result<String, CompactionError> {
+    let SynthesisProgress {
+        mut evidence,
+        unfinished_sources,
+        ..
+    } = progress;
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
@@ -2059,7 +2423,7 @@ async fn collect_compaction_summary_resumable(
         .validate_candidate(&summary, "", &request)
         .is_err()
     {
-        evidence = consolidate_carry(
+        evidence = Box::pin(consolidate_carry(
             state,
             session_id,
             selection,
@@ -2068,8 +2432,8 @@ async fn collect_compaction_summary_resumable(
             summary_budget,
             command_context,
             cancel_state,
-            &mut checkpoint,
-        )
+            checkpoint,
+        ))
         .await?;
         summary = encode_compaction_evidence(&evidence)?;
         let retained = context_compaction_request_budget::replaced_history(
@@ -2144,7 +2508,7 @@ async fn synthesis_chunks(
         )
     })?;
     let semantics = serde_json::to_vec(&(
-        "adaptive-complete-request-v1",
+        packing::ALGORITHM_ID,
         window,
         status.max_output_tokens,
         super::context_accounting::LOCAL_CONTEXT_ESTIMATOR_VERSION,
@@ -2157,7 +2521,8 @@ async fn synthesis_chunks(
     ))
     .map_err(|_| CompactionError::Provider("cannot identify experimental packing policy".into()))?;
     let packing_identity = format!(
-        "adaptive-complete-request-v1:{}",
+        "{}:{}",
+        packing::ALGORITHM_ID,
         hex::encode(sha2::Sha256::digest(semantics))
     );
     let packed = if let Some(policy) = policy {
@@ -2433,16 +2798,52 @@ fn compaction_request_attempt(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn collect_compaction_summary_once_with_policy(
+fn collect_compaction_summary_once_with_policy<'a>(
+    state: &'a ServerState,
+    session_id: SessionId,
+    selection: &'a SessionModelSelection,
+    transcript: &'a CompactionTranscript,
+    prompt_text: &'a str,
+    command_context: Option<&'a mut RuntimeCommandContext<'_>>,
+    cancel_state: &'a TurnCancelState,
+    policy: &'a budget::ResolvedSummaryPolicy,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CompactionError>> + Send + 'a>>
+{
+    Box::pin(async move {
+        let (request, mut attempt) = Box::pin(prepare_synthesis_request(
+            state,
+            session_id,
+            selection,
+            transcript,
+            prompt_text,
+            cancel_state,
+            policy,
+        ))
+        .await?;
+        Box::pin(dispatch_synthesis_request(
+            state,
+            session_id,
+            selection,
+            request,
+            &mut attempt,
+            command_context,
+            cancel_state,
+        ))
+        .await
+    })
+}
+
+/// Resolve and validate a single reserved request before entering provider transport.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_synthesis_request(
     state: &ServerState,
     session_id: SessionId,
     selection: &SessionModelSelection,
     transcript: &CompactionTranscript,
     prompt_text: &str,
-    command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
     policy: &budget::ResolvedSummaryPolicy,
-) -> Result<String, CompactionError> {
+) -> Result<(ModelTurnRequest, ModelRequestAttempt), CompactionError> {
     context_recovery::reserve_provider_request()?;
     let turn_id = format!(
         // Logical compaction boundaries may be retried: each dispatch needs its own identity.
@@ -2490,22 +2891,33 @@ async fn collect_compaction_summary_once_with_policy(
         return Err(CompactionError::Cancelled);
     }
 
-    let mut attempt = compaction_request_attempt(selection, transcript, &request, &turn_id, target);
+    let attempt = compaction_request_attempt(selection, transcript, &request, &turn_id, target);
     record_pending_request_usage(state, session_id, &attempt)
         .await
         .map_err(CompactionError::Provider)?;
 
-    // Prefer push delivery when the provider serves the streaming interface. Compaction keeps its own
-    // narrower progress rules and tool-call-is-error policy; only the transport changes.
+    Ok((request, attempt))
+}
+
+async fn dispatch_synthesis_request(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    request: ModelTurnRequest,
+    attempt: &mut ModelRequestAttempt,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+) -> Result<String, CompactionError> {
+    // Preserve push preference and compaction-specific transport validation.
     if let Some((push_plugin_id, push_interface_id)) =
         model_provider_push_route(state, selection.provider_plugin_id.as_deref())
     {
         let payload = serde_json::to_vec(&request)
             .map_err(|error| CompactionError::Provider(error.to_string()))?;
-        return stream_compaction_summary(
+        return Box::pin(stream_compaction_summary(
             state,
             session_id,
-            &mut attempt,
+            attempt,
             state
                 .plugins
                 .invoke_service_with_events(
@@ -2518,19 +2930,19 @@ async fn collect_compaction_summary_once_with_policy(
                 .map_err(|error| CompactionError::Provider(error.to_string()))?,
             command_context,
             cancel_state,
-        )
+        ))
         .await;
     }
 
-    collect_polled_compaction_summary(
+    Box::pin(collect_polled_compaction_summary(
         state,
         session_id,
         selection,
         request,
-        &mut attempt,
+        attempt,
         command_context,
         cancel_state,
-    )
+    ))
     .await
 }
 

@@ -115,6 +115,40 @@ class ProgressiveTests(unittest.TestCase):
         self.assertFalse(result["met_preference"])
         self.assertGreater(result["after_chars"], 6000)
 
+    def test_shortening_uses_same_codec_for_unicode_and_whitespace(self):
+        prior = {name: '{}' for name in SECTIONS}
+        prior.update(format=FORMAT, background="CJK 漢字 and emoji 🧭 e\u0301")
+        before = {"current_scope": [], "continuation": json.dumps(prior, ensure_ascii=False, separators=(",", ":"))}
+        response = {"format": "bcode.compaction.section-consolidation.v1", "sections": {}}
+        result = verify_shortening(before, response, 6000)
+        self.assertFalse(result["shortened"])
+        self.assertEqual(result["before_chars"], result["after_chars"])
+
+    def test_exact_restatement_reduction_preserves_references_and_qualifiers(self):
+        selected = [record for batch in phases() for record in batch][:6]
+        repeated = [(kind, section, key, " Fixture restatement: ".join([statement] * 8))
+                    for kind, section, key, statement in selected]
+        prior = {name: json.dumps({key: statement for _, section, key, statement in repeated if section == name},
+                                  ensure_ascii=False, separators=(",", ":")) for name in SECTIONS}
+        prior.update(format=FORMAT, background="unchanged 🧭 e\u0301")
+        summary = {"current_scope": [{"statement": "Read-only; no network", "source_sequence": 3}],
+                   "continuation": json.dumps(prior, ensure_ascii=False, separators=(",", ":"))}
+        verify_sections(summary, selected)
+        response = {"format": "bcode.compaction.section-consolidation.v1",
+                    "sections": {name: json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+                                 for name, values in expected(selected).items()}}
+        result = verify_shortening(summary, response, 6000)
+        self.assertTrue(result["shortened"])
+        self.assertLess(result["after_chars"], 2000)
+        self.assertGreater(result["before_chars"], 6000)
+        bad = copy.deepcopy(response)
+        facts = json.loads(bad["sections"]["active_work_blockers"])
+        key = next(iter(facts))
+        facts[key] += "; network now permitted"
+        bad["sections"]["active_work_blockers"] = json.dumps(facts)
+        with self.assertRaises(ValueError):
+            verify_shortening(summary, bad, 6000)
+
     def test_consolidation_cannot_claim_source_coverage_or_scope(self):
         summary = evidence([record for batch in phases() for record in batch])
         valid = {"format": "bcode.compaction.section-consolidation.v1", "sections": {}}

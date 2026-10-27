@@ -111,7 +111,11 @@ impl ResolvedSummaryPolicy {
         };
         let maximum_retained_tokens = maximum_after_tokens
             .checked_sub(input.retained_without_summary.tokens)
-            .ok_or_else(|| invalid("retained tail and overhead leave no summary budget"))?;
+            .ok_or_else(|| invalid(&format!(
+                "retained tail and overhead leave no summary budget (before={}, retained={}, capacity={}, required_reclaim={})",
+                input.before.tokens, input.retained_without_summary.tokens,
+                retained_capacity.available_input_tokens, input.minimum_reclaim_tokens,
+            )))?;
         if maximum_retained_tokens == 0 {
             return Err(invalid("no summary capacity remains"));
         }
@@ -175,7 +179,6 @@ impl ResolvedSummaryPolicy {
         self.preferred_summary_tokens
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(super) const fn maximum_retained_tokens(&self) -> u64 {
         self.maximum_retained_tokens

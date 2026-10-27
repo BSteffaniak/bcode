@@ -145,6 +145,7 @@ class AdapterTests(unittest.TestCase):
             driver.env = {}
             driver.base = ['/explicit/test/bcode']
             driver.session = 'scratch-session'
+            driver.server = None
             driver.timeout = 1
             for fail in (False, True):
                 with self.subTest(fail=fail):

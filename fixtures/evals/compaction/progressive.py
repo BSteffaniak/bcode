@@ -10,6 +10,12 @@ FORMAT = "bcode.compaction.continuation-sections.v1"
 SECTIONS = ("decisions", "active_work_blockers", "findings_evidence")
 
 
+def semantic_statement(statement):
+    """Fixture-only identical restatements; never infer synonyms or discard qualifiers."""
+    parts = statement.split(" Fixture restatement: ")
+    return parts[0] if parts[0] and all(part == parts[0] for part in parts) else statement
+
+
 def records():
     corpus = json.loads(Path(__file__).with_name("retention_cases.json").read_text())
     result = []
@@ -40,7 +46,7 @@ def line(record):
 def expected(selected):
     sections = {name: {} for name in SECTIONS}
     for _, section, key, statement in selected:
-        sections[section][key] = statement
+        sections[section][key] = semantic_statement(statement)
     return sections
 
 
@@ -54,7 +60,7 @@ def verify_sections(evidence, selected):
             for key, statement in json.loads(part).items():
                 if key in actual:
                     raise ValueError("duplicate accepted evidence")
-                actual[key] = statement
+                actual[key] = semantic_statement(statement)
         if actual != values:
             raise ValueError(f"lost, invented, or changed {name}")
 
@@ -107,14 +113,17 @@ def verify_shortening(before, response, preferred_chars):
                 for key, statement in json.loads(part).items():
                     if key in result[name]:
                         raise ValueError("duplicate consolidation evidence")
-                    result[name][key] = statement
+                    result[name][key] = semantic_statement(statement)
         return result
     if meanings(prior) != meanings(merged) or prior["background"] != merged["background"]:
         raise ValueError("consolidation lost or changed accepted evidence")
     if after.get("current_scope") != before.get("current_scope"):
         raise ValueError("consolidation changed protected scope")
-    before_size = len(before["continuation"])
-    after_size = len(after["continuation"])
+    # Compare identical JSON codecs on both sides. The provider uses compact
+    # UTF-8 JSON; Python's default ASCII escaping can otherwise report growth
+    # merely from reserializing CJK/emoji or map whitespace.
+    before_size = len(json.dumps(prior, ensure_ascii=False, separators=(",", ":")))
+    after_size = len(json.dumps(merged, ensure_ascii=False, separators=(",", ":")))
     return {"shortened": after_size < before_size, "met_preference": after_size <= preferred_chars,
             "before_chars": before_size, "after_chars": after_size,
             "hard_capacity_acceptance": "host-owned; not established by fixture"}

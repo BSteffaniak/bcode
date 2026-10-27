@@ -273,6 +273,9 @@ pub enum SessionLifecycleRequest {
         session_id: SessionId,
         query: bcode_session_models::SessionCompactionInspectionQuery,
     },
+    PrepareSessionCompactionRecovery {
+        request: bcode_session_models::SessionCompactionRecoveryDiscoveryRequest,
+    },
     SessionInspection {
         session_id: SessionId,
         query: SessionInspectionQuery,
@@ -2388,6 +2391,9 @@ impl RoutedRequest {
                     session_id,
                 }))
             }
+            Request::PrepareSessionCompactionRecovery { request } => Self::SessionLifecycle(
+                Box::new(SessionLifecycleRequest::PrepareSessionCompactionRecovery { request }),
+            ),
             Request::SessionCompactionInspection { session_id, query } => {
                 Self::SessionLifecycle(Box::new(
                     SessionLifecycleRequest::SessionCompactionInspection { session_id, query },
