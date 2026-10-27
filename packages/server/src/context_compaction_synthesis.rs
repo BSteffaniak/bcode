@@ -6,7 +6,7 @@ use super::COMPACTION_MAX_CARRIED_SUMMARY_CHARS;
 use super::{BTreeSet, COMPACTION_SUMMARY_FORMAT, CompactionEvidence, CompactionScope};
 
 #[path = "context_compaction_sections.rs"]
-mod sections;
+pub(super) mod sections;
 pub(super) use sections::{
     SECTION_UPDATE_FORMAT, consolidate_response, consolidation_prompt, section_update_prompt,
 };
@@ -37,6 +37,16 @@ pub(super) const UPDATE_FORMAT: &str = "bcode.compaction.scope-update.v1";
 pub(super) enum Rejection {
     WireBudget,
     InvalidJson,
+    Schema {
+        field: &'static str,
+        rule: &'static str,
+    },
+    InvalidShape,
+    UnknownField,
+    JsonSyntax {
+        line: usize,
+        column: usize,
+    },
     UnsupportedFormat,
     EmptyContinuation,
     CarryBudget,
@@ -51,10 +61,27 @@ pub(super) enum Rejection {
 }
 
 impl Rejection {
-    pub(super) const fn guidance(self) -> &'static str {
-        match self {
+    pub(super) fn guidance(self) -> String {
+        if let Self::Schema { field, rule } = self {
+            return format!(
+                "invalid_response_shape: field={field} rule={rule}; follow the response schema exactly"
+            );
+        }
+        if let Self::JsonSyntax { line, column } = self {
+            return format!(
+                "invalid_json_syntax: line={line} column={column}; return a complete JSON object without fences"
+            );
+        }
+        String::from(match self {
             Self::WireBudget => {
                 "wire_budget: response exceeded the bounded wire allowance; return a compact scope update, not copied carry"
+            }
+            Self::JsonSyntax { .. } | Self::Schema { .. } => unreachable!(),
+            Self::UnknownField => {
+                "invalid_response_shape: unknown field; omit keys outside the response schema"
+            }
+            Self::InvalidShape => {
+                "invalid_response_shape: JSON parsed but fields, types or required keys do not satisfy the response schema; follow the complete response schema exactly"
             }
             Self::InvalidJson => {
                 "invalid_json: return only the specified JSON object, without fences or extra fields"
@@ -92,7 +119,7 @@ impl Rejection {
             Self::PreviousAttemptUnavailable => {
                 "previous_attempt_unavailable: an earlier reserved attempt has no accepted result available; re-synthesize from the complete carry and fragments below, without assuming it succeeded"
             }
-        }
+        })
     }
 }
 
@@ -128,7 +155,7 @@ fn decode(summary: &str, policy: SynthesisPolicy) -> Result<serde_json::Value, R
     if summary.len() > policy.wire_bytes {
         return Err(Rejection::WireBudget);
     }
-    serde_json::from_str(summary).map_err(|_| Rejection::InvalidJson)
+    serde_json::from_str(summary).map_err(|error| super::response::decode_error(&error))
 }
 
 /// Strict full-envelope validation: missing or paraphrased carried scope is never repaired here.
@@ -158,8 +185,8 @@ pub(super) fn validate_full_with_policy(
     reconcilable: &BTreeSet<u64>,
     policy: SynthesisPolicy,
 ) -> Result<CompactionEvidence, Rejection> {
-    let evidence =
-        serde_json::from_value(decode(summary, policy)?).map_err(|_| Rejection::InvalidJson)?;
+    let evidence = serde_json::from_value(decode(summary, policy)?)
+        .map_err(|error| super::response::decode_error(&error))?;
     validate_evidence(
         evidence,
         prior,
@@ -302,7 +329,8 @@ pub(super) fn merge_response_with_policy(
             policy,
         );
     }
-    let update: ScopeUpdate = serde_json::from_value(value).map_err(|_| Rejection::InvalidJson)?;
+    let update: ScopeUpdate =
+        serde_json::from_value(value).map_err(|error| super::response::decode_error(&error))?;
     if update.format != UPDATE_FORMAT {
         return Err(Rejection::UnsupportedFormat);
     }
@@ -938,7 +966,7 @@ mod tests {
         let base = "Complete source fragments and prior carry";
         let rejected = "{malformed response}";
         let prompt = repair_prompt(base, Rejection::InvalidJson, Some(rejected));
-        assert!(prompt.contains(Rejection::InvalidJson.guidance()));
+        assert!(prompt.contains(&Rejection::InvalidJson.guidance()));
         assert!(prompt.contains(&serde_json::to_string(rejected).unwrap()));
         assert!(prompt.ends_with(base));
         let large = "not canonical evidence".repeat(1000);

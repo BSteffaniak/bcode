@@ -19,6 +19,8 @@ mod budget;
 mod checkpoint;
 #[path = "context_compaction_packing.rs"]
 mod packing;
+#[path = "context_compaction_response.rs"]
+mod response;
 #[path = "context_compaction_synthesis.rs"]
 mod synthesis;
 
@@ -423,7 +425,7 @@ const COMPACTION_MAX_CHUNKS: usize = 32;
 const COMPACTION_FRAGMENT_BYTES: usize = 2_000;
 const COMPACTION_SUMMARY_FORMAT: &str = "bcode.compaction.scope.v2";
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CompactionScope {
     statement: String,
@@ -644,6 +646,26 @@ async fn compact_session_context_with_policy(
                     ))
                     .await;
                 }
+                if matches!(&result, Err(CompactionError::Provider(message))
+                    if (message.starts_with("compaction synthesis rejected after bounded repair;")
+                    && ["reason=invalid_json", "reason=invalid_response_shape", "reason=incomplete_output", "reason=wire_budget"].iter().any(|reason| message.contains(reason)))
+                    || message.starts_with("derived consolidation rejected:"))
+                {
+                    // One in-activation correction only. Durable checkpoint admission proves
+                    // settlement and prevents another grant after restart or repeated submission.
+                    append_context_compaction_trace(state, session_id, CompactionTraceKind::Started,
+                        "compaction_started", 0, false, Some("continuing settled response-contract rejection".into())).await;
+                    let corrected = Box::pin(compact_session_context_with_policy_inner(
+                        state, session_id, selection, first_kept_sequence, command_context,
+                        cancel_state, progress_requirement, planning_policy,
+                    )).await;
+                    append_context_compaction_trace(state, session_id, CompactionTraceKind::Finished,
+                        "compaction_finished", 0, corrected.is_ok(), Some(match &corrected {
+                            Ok(completion) => completion.message.clone(),
+                            Err(error) => format!("context compaction failed: {error}"),
+                        })).await;
+                    return corrected;
+                }
                 result
             })),
         )
@@ -815,7 +837,8 @@ async fn compact_session_context_with_policy_inner(
     )
     .await?;
     let packing_policy = budget_packing_identity(&packing_policy, &summary_budget)?;
-    if let Some(checkpoint) = &local_checkpoint {
+    let mut local_checkpoint = local_checkpoint;
+    if let Some(checkpoint) = &mut local_checkpoint {
         checkpoint.verify_policy(synthesis_policy)?;
         checkpoint.verify_capacity_policy(&summary_budget)?;
         if checkpoint.packing_policy != packing_policy {
@@ -824,6 +847,9 @@ async fn compact_session_context_with_policy_inner(
             ));
         }
         checkpoint.verify(&plan, &transcript, &chunks)?;
+        checkpoint
+            .admit_contract_continuation(state, session_id, &checkpoint_key)
+            .await?;
         checkpoint
             .observe(
                 state,
@@ -1685,7 +1711,9 @@ pub async fn maybe_auto_compact_session_context(
         Some(command_context),
         cancel_state,
         Some(CompactionProgressRequirement {
-            minimum_reclaimable_tokens: projected_context_tokens.saturating_sub(threshold_tokens),
+            minimum_reclaimable_tokens: projected_context_tokens
+                .saturating_sub(threshold_tokens)
+                .saturating_add(1),
             previous_compacted_through_sequence: evaluation.previous_compacted_through_sequence,
         }),
     ))
@@ -1918,7 +1946,7 @@ async fn consolidate_carry(
     let prompt = format!(
         "{}\nPreferred derived continuation target: {} tokens. Preserve unresolved work and evidence; this preference is not an acceptance ceiling.",
         synthesis::consolidation_prompt(evidence, limits)
-            .map_err(|reason| CompactionError::Provider(reason.guidance().into()))?,
+            .map_err(|reason| CompactionError::Provider(reason.guidance()))?,
         policy.preferred_summary_tokens()
     );
     if let Some((checkpoint, key)) = checkpoint {
@@ -1942,11 +1970,17 @@ async fn consolidate_carry(
         selection,
         transcript,
         &prompt,
+        response::ResponseContract::Consolidation,
         command_context,
         cancel,
         policy,
     )
     .await?;
+    if let Some((checkpoint, key)) = checkpoint {
+        checkpoint
+            .settle_contract_response(state, session_id, key)
+            .await?;
+    }
     let validated = policy.validate_response(&response).and_then(|()| {
         synthesis::consolidate_response(&response, evidence, limits).map_err(|reason| {
             CompactionError::Provider(format!(
@@ -2196,7 +2230,7 @@ async fn synthesize_chunk(
         &reconcilable,
         synthesis_policy,
     )
-    .map_err(|reason| CompactionError::Provider(reason.guidance().into()))?;
+    .map_err(|reason| CompactionError::Provider(reason.guidance()))?;
     let projected = build_compaction_request(
         session_id,
         generation_target.model_id.clone(),
@@ -2230,7 +2264,7 @@ async fn synthesize_chunk(
             &reconcilable,
             synthesis_policy,
         )
-        .map_err(|reason| CompactionError::Provider(reason.guidance().into()))?;
+        .map_err(|reason| CompactionError::Provider(reason.guidance()))?;
         let projected = build_compaction_request(
             session_id,
             generation_target.model_id.clone(),
@@ -2250,7 +2284,7 @@ async fn synthesize_chunk(
         &reconcilable,
         synthesis_policy,
     )
-    .map_err(|reason| CompactionError::Provider(reason.guidance().into()))?;
+    .map_err(|reason| CompactionError::Provider(reason.guidance()))?;
     evidence = Box::pin(repair_synthesis_chunk(
         state,
         session_id,
@@ -2397,13 +2431,21 @@ async fn repair_synthesis_chunk(
             selection,
             transcript,
             &attempt_prompt,
+            response::ResponseContract::Update,
             command_context.as_deref_mut(),
             cancel_state,
             summary_budget,
         ))
         .await;
         let summary = match response {
-            Ok(summary) => summary,
+            Ok(summary) => {
+                if let Some((checkpoint, key)) = checkpoint.as_mut() {
+                    checkpoint
+                        .settle_contract_response(state, session_id, key)
+                        .await?;
+                }
+                summary
+            }
             Err(CompactionError::Provider(message))
                 if message == "compaction output exceeds bounded synthesis budget"
                     || message == "incomplete compaction output" =>
@@ -2445,7 +2487,7 @@ async fn repair_synthesis_chunk(
         "compaction synthesis rejected after bounded repair; chunk={}/{} reason={}; boundary unchanged",
         index + 1,
         total_chunks,
-        rejection.map_or("no accepted response", synthesis::Rejection::guidance),
+        rejection.map_or_else(|| "no accepted response".to_owned(), synthesis::Rejection::guidance),
     )))
 }
 
@@ -2654,7 +2696,7 @@ fn validate_fragment_compaction_evidence(
         new_user_sequences,
         reconcilable,
     )
-    .map_err(|reason| CompactionError::Provider(reason.guidance().into()))
+    .map_err(|reason| CompactionError::Provider(reason.guidance()))
 }
 
 fn prior_scope_sequences(previous: Option<&str>) -> BTreeSet<u64> {
@@ -2879,6 +2921,7 @@ fn collect_compaction_summary_once_with_policy<'a>(
     selection: &'a SessionModelSelection,
     transcript: &'a CompactionTranscript,
     prompt_text: &'a str,
+    contract: response::ResponseContract,
     command_context: Option<&'a mut RuntimeCommandContext<'_>>,
     cancel_state: &'a TurnCancelState,
     policy: &'a budget::ResolvedSummaryPolicy,
@@ -2891,11 +2934,12 @@ fn collect_compaction_summary_once_with_policy<'a>(
             selection,
             transcript,
             prompt_text,
+            contract,
             cancel_state,
             policy,
         ))
         .await?;
-        Box::pin(dispatch_synthesis_request(
+        let response = Box::pin(dispatch_synthesis_request(
             state,
             session_id,
             selection,
@@ -2904,7 +2948,19 @@ fn collect_compaction_summary_once_with_policy<'a>(
             command_context,
             cancel_state,
         ))
-        .await
+        .await;
+        let validation = response.as_ref().ok().map(|text| contract.validate(text));
+        if let Some(Err(reason)) = validation {
+            append_context_compaction_trace(state, session_id, CompactionTraceKind::Diagnostic,
+                "synthesis_response_contract_diagnostic", 0, false,
+                Some(format!("request_id={} contract={} response_bytes={} response_sha256={} {}; body not retained in public diagnostics",
+                    attempt.identity.request_id,
+                    contract.request().name,
+                    response.as_ref().map_or(0, String::len),
+                    hex::encode(sha2::Sha256::digest(response.as_ref().expect("validated response").as_bytes())),
+                    reason.guidance()))).await;
+        }
+        response
     })
 }
 
@@ -2916,6 +2972,7 @@ async fn prepare_synthesis_request(
     selection: &SessionModelSelection,
     transcript: &CompactionTranscript,
     prompt_text: &str,
+    contract: response::ResponseContract,
     cancel_state: &TurnCancelState,
     policy: &budget::ResolvedSummaryPolicy,
 ) -> Result<(ModelTurnRequest, ModelRequestAttempt), CompactionError> {
@@ -2938,13 +2995,46 @@ async fn prepare_synthesis_request(
     ))
     .await
     .map_err(|error| CompactionError::Provider(error.to_string()))?;
-    let request = build_compaction_request(
+    let mut request = build_compaction_request(
         session_id,
         target.model_id.clone(),
         target.provider_context.clone(),
         prompt_text,
         turn_id.clone(),
     );
+    request.structured_output = Some(contract.request());
+    let negotiation = super::resolve_model_feature_negotiation(
+        state,
+        selection.provider_plugin_id.as_deref(),
+        &request.model_id,
+        &request.provider_context,
+    )
+    .await;
+    let support = negotiation.as_ref().map(|facts| {
+        facts.provider.feature_support.negotiate(
+            &facts.model.feature_support,
+            bcode_model::RequestedModelFeature::StructuredOutput(
+                bcode_model::StructuredOutputMode::StrictJsonSchema,
+            ),
+        )
+    });
+    if !matches!(
+        support,
+        Some(bcode_model::NegotiatedFeatureSupport::Guaranteed { .. })
+    ) {
+        // Unsupported/unknown providers keep the bounded host-validated compatibility path.
+        request.structured_output = None;
+    }
+    super::append_negotiated_feature_fidelity_events(
+        state,
+        session_id,
+        &request,
+        &bcode_model::ResolvedModelFeatureCapabilities {
+            structured_output: support,
+            strict_tool_schema: None,
+        },
+    )
+    .await;
     policy.validate_request(&request)?;
     let config = state.session_config(session_id).await;
     {
@@ -3134,7 +3224,12 @@ pub fn build_compaction_request(
         turn_id,
         model_id,
         provider_context,
-        system_prompt: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+        // Keep the historical namespace prompt stable so upgrades discover already-spent work.
+        // Correct the outgoing instruction without rewriting that durable discovery identity.
+        system_prompt: Some(COMPACTION_SYSTEM_PROMPT.replace(
+            "Local synthesis contract: bcode.compaction.scope-update.v1; the host preserves unchanged scope and validates explicit replacements, while bcode.compaction.scope.v2 full envelopes remain strict.",
+            "Follow the active section-update or section-consolidation response schema specified by this request exactly. The host preserves unchanged scope and sections; omitted or null section patches mean unchanged. Legacy scope-update/full envelopes are compatibility inputs, not the requested response format.",
+        )),
         messages: vec![ModelMessage {
             role: MessageRole::User,
             content: vec![ContentBlock::Text {
@@ -3144,7 +3239,7 @@ pub fn build_compaction_request(
         tools: Vec::new(),
         tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
         tool_schema_mode: None,
-        structured_output: None,
+        structured_output: Some(response::ResponseContract::Update.request()),
         context_management: bcode_model::ContextManagementRequest::default(),
         parameters: ModelParameters::default(),
         prompt_cache: bcode_model::PromptCacheHints::default(),

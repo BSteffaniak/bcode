@@ -22248,7 +22248,10 @@ async fn prepare_model_turn_setup(
         }
     }
     if let Err(error) = account_routing::freeze(state, session_id, &mut selection).await {
-        return ModelTurnCompletion::with_message(ModelTurnOutcome::ProviderUnavailable, error);
+        return Err(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::ProviderUnavailable,
+            error,
+        ));
     }
     if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
         turn.selection = Some(selection.clone());
@@ -22579,6 +22582,7 @@ async fn run_model_turn_inner(
     }
     let mut last_proactive_compaction_boundary = None;
     let mut last_proactive_attempt_boundary = None;
+    let mut capacity_compaction_passes = 0_u8;
     append_context_compaction_trace(
         state,
         session_id,
@@ -22749,8 +22753,10 @@ async fn run_model_turn_inner(
         if should_evaluate_proactive {
             set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
         }
+        let mut compacted_this_pass = false;
         match compaction_result {
             Ok(Some(compacted_through_sequence)) => {
+                compacted_this_pass = true;
                 if last_proactive_compaction_boundary
                     .is_some_and(|boundary| compacted_through_sequence <= boundary)
                 {
@@ -22856,6 +22862,23 @@ async fn run_model_turn_inner(
             )
             .await
         {
+            if compacted_this_pass && capacity_compaction_passes < 3 {
+                capacity_compaction_passes += 1;
+                append_context_compaction_trace(
+                    state,
+                    session_id,
+                    CompactionTraceKind::Diagnostic,
+                    "additional_capacity_compaction",
+                    0,
+                    false,
+                    Some(format!(
+                        "rebuilt request still exceeds capacity; automatic bounded pass {}",
+                        capacity_compaction_passes + 1
+                    )),
+                )
+                .await;
+                continue;
+            }
             let error = CompactionError::RequestStillTooLarge {
                 estimated_tokens,
                 threshold_tokens: capacity.available_input_tokens,

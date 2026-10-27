@@ -390,11 +390,11 @@ fn consolidation_is_scope_immutable_and_separate_from_new_source_acceptance() {
     invalid["current_scope"] = serde_json::json!([]);
     assert_eq!(
         consolidate_response(&invalid.to_string(), &prior, policy()).unwrap_err(),
-        Rejection::InvalidJson
+        Rejection::UnknownField
     );
     assert_eq!(
         merge_update(&serde_json::from_str(&response).unwrap(), &prior).unwrap_err(),
-        Rejection::InvalidJson
+        Rejection::InvalidShape
     );
 }
 

@@ -13,7 +13,7 @@ pub(in super::super) const SECTION_UPDATE_INSTRUCTIONS: &str = "Return only JSON
 /// Consolidation never extracts scope or processes newly selected source fragments.
 pub(in super::super) const CONSOLIDATION_INSTRUCTIONS: &str = "Return only JSON with format bcode.compaction.section-consolidation.v1 and sections containing optional decisions, active_work_blockers, findings_evidence, background string replacements. Consolidate only the complete accepted derived continuation provided below; omitted sections remain unchanged. Preserve relevant decisions, evidence, chronology, user provenance, blockers and unfinished work. Do not add scope, claim completion, infer new authorization, or claim any new source coverage. Scope is immutable and host-preserved. Do not clip: if the complete relevant facts cannot fit the supplied limits, no successful consolidation is possible.";
 const SECTIONS_FORMAT: &str = "bcode.compaction.continuation-sections.v1";
-const CONSOLIDATION_FORMAT: &str = "bcode.compaction.section-consolidation.v1";
+pub(in super::super) const CONSOLIDATION_FORMAT: &str = "bcode.compaction.section-consolidation.v1";
 
 /// Build a complete attributed chunk prompt. `selected_sources` must be the host's canonical
 /// chronological source serialization, not a truncated response or reconstructed old summary.
@@ -59,16 +59,16 @@ struct Sections {
     background: String,
 }
 
-#[derive(Default, serde::Deserialize)]
+#[derive(Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Patch {
+pub(in super::super) struct Patch {
     decisions: Option<String>,
     active_work_blockers: Option<String>,
     findings_evidence: Option<String>,
     background: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Target {
     source_sequence: u64,
@@ -77,9 +77,9 @@ struct Target {
     replacement_statement: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Update {
+pub(in super::super) struct Update {
     format: String,
     current_scope: Vec<CompactionScope>,
     reconciles: Vec<u64>,
@@ -87,9 +87,9 @@ struct Update {
     sections: Patch,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Consolidation {
+pub(in super::super) struct Consolidation {
     format: String,
     sections: Patch,
 }
@@ -192,7 +192,10 @@ pub(super) fn merge(
     reconcilable: &BTreeSet<u64>,
     policy: SynthesisPolicy,
 ) -> Result<CompactionEvidence, Rejection> {
-    let update: Update = serde_json::from_value(value).map_err(|_| Rejection::InvalidJson)?;
+    super::super::response::ResponseContract::Update
+        .validate(&serde_json::to_string(&value).map_err(|_| Rejection::InvalidJson)?)?;
+    let update: Update = serde_json::from_value(value)
+        .map_err(|error| super::super::response::decode_error(&error))?;
     if update.format != SECTION_UPDATE_FORMAT {
         return Err(Rejection::UnsupportedFormat);
     }
@@ -274,8 +277,16 @@ pub(in super::super) fn consolidate_response(
     policy: SynthesisPolicy,
 ) -> Result<CompactionEvidence, Rejection> {
     let value = super::decode(response, policy)?;
-    let update: Consolidation =
-        serde_json::from_value(value).map_err(|_| Rejection::InvalidJson)?;
+    if value
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|format| format != CONSOLIDATION_FORMAT)
+    {
+        return Err(Rejection::UnsupportedFormat);
+    }
+    super::super::response::ResponseContract::Consolidation.validate(response)?;
+    let update: Consolidation = serde_json::from_value(value)
+        .map_err(|error| super::super::response::decode_error(&error))?;
     if update.format != CONSOLIDATION_FORMAT || prior.format != COMPACTION_SUMMARY_FORMAT {
         return Err(Rejection::UnsupportedFormat);
     }

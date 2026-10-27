@@ -306,6 +306,30 @@ remains blocked, not merely awaiting a flag. Adaptive packing remains default-of
 quality and semantic retention across repeated compactions remain unproven. Structural validators
 do not make compaction lossless.
 
+## Automatic response-contract continuation
+
+Local synthesis and derived consolidation request separate typed JSON schemas through provider/model
+feature negotiation. Native strict output is used only when guaranteed; the bounded compatibility path
+still validates output on the host. Optional/null section patches preserve unchanged content. Schema
+compliance never establishes source authority, coverage, supersession, or retained-request capacity.
+Public response diagnostics contain request identity, contract, response size/digest and bounded safe
+validation guidance, not response bodies or arbitrary deserializer error text.
+
+An ordinary compaction can automatically continue a settled response-contract rejection without a
+repair command. Admission verifies the exact canonical failed attempt and unique terminal usage for
+every reserved request, after validating the frozen source manifest and budget. It preserves accepted
+chunks and old reservation counters. A durable, one-shot contract-versioned continuation permits at
+most two corrective attempts at the failed chunk and at most 64 additional requests / 300 seconds for
+the remaining operation. Its counters/deadline survive daemon replacement and repeated submissions;
+no further grant is minted after exhaustion. Missing settlement, corruption, incompatible source or
+unknown state fails closed. This is bounded new synthesis, not corruption repair or ambiguous replay.
+
+When the rebuilt main request still exceeds actual input capacity after successful compaction, the
+same turn can attempt at most three additional capacity passes, each requiring boundary progress.
+All passes use canonical request accounting and retain the protected current context. A repeated
+boundary or exhausted pass allowance terminates with an actionable capacity failure rather than
+clipping evidence or dispatching an oversized request.
+
 ## Automatic recovery of known policy incompatibilities
 
 An admitted manual or automatic compaction internally replaces a structurally valid original
