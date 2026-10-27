@@ -3,6 +3,10 @@
 use super::*;
 use sha2::Sha256;
 
+#[path = "context_compaction_recovery_read.rs"]
+mod recovery_read;
+pub(super) use recovery_read::{RECOVERY_MAX_EVENTS, recovery_events};
+
 const CHECKPOINT_FORMAT: &str = "bcode.local-compaction.v1";
 const MAX_PAYLOAD: usize = bcode_session_models::MAX_COMPACTION_CHECKPOINT_PAYLOAD_BYTES;
 const CAPACITY_POLICY_FORMAT: &str = "bcode.compaction.capacity-policy.v1";
@@ -282,7 +286,9 @@ impl LocalCheckpoint {
         let value = self
             .resolved_policy
             .as_ref()
-            .ok_or_else(invalid_checkpoint)?;
+            .ok_or(CompactionError::RecoveryRequired(
+                CompactionRecoveryReason::PolicyChanged,
+            ))?;
         if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
             return Err(invalid_checkpoint());
         }
@@ -844,18 +850,16 @@ pub(super) async fn prepare_recovery(
     let Some(tail_sequence) = page.events.last().map(|event| event.sequence) else {
         return Ok(result);
     };
-    let events = state
-        .sessions
-        .session_events_range(
-            request.session_id,
-            request
-                .expected_terminal_sequence
-                .saturating_sub(511)
-                .max(1),
-            tail_sequence,
-            512,
-        )
-        .await?;
+    let events = recovery_events(
+        state,
+        request.session_id,
+        request
+            .expected_checkpoint_sequence
+            .saturating_sub(511)
+            .max(1),
+        tail_sequence,
+    )
+    .await?;
     if events.last().map(|event| event.sequence) != Some(tail_sequence) {
         return Ok(result);
     }
@@ -953,9 +957,9 @@ pub(super) struct RestartFailureProof {
     operation_key: String,
 }
 
-/// Explicit maintenance evidence read, bounded to 512 exact canonical sequence positions.
+/// Explicit maintenance evidence read, paginated with aggregate event/byte bounds.
 /// `start_sequence` selects the operation's Started trace; `finished_sequence` selects its
-/// complete bounded-repair rejection. This neither scans history nor classifies unknown formats.
+/// complete rejection. This never upgrades or rewrites the retained checkpoint.
 pub(super) async fn read_restart_failure_proof(
     state: &ServerState,
     request: &bcode_session_models::SessionCompactionRestartRequest,
@@ -967,7 +971,7 @@ pub(super) async fn read_restart_failure_proof(
         .checked_sub(start_sequence)
         .and_then(|value| value.checked_add(1))
         .ok_or_else(invalid_checkpoint)?;
-    if length > 512
+    if length > RECOVERY_MAX_EVENTS as u64
         || start_sequence >= request.expected_checkpoint_sequence
         || finished_sequence != request.expected_terminal_sequence
         || finished_sequence <= request.expected_checkpoint_sequence
@@ -978,13 +982,10 @@ pub(super) async fn read_restart_failure_proof(
         .expected_tail_marker
         .as_ref()
         .map_or(finished_sequence, |tail| tail.sequence);
-    if tail_sequence.saturating_sub(start_sequence) >= 512 {
+    if tail_sequence.saturating_sub(start_sequence) >= RECOVERY_MAX_EVENTS as u64 {
         return Err(invalid_checkpoint());
     }
-    let events = state
-        .sessions
-        .session_events_range(request.session_id, start_sequence, tail_sequence, 512)
-        .await?;
+    let events = recovery_events(state, request.session_id, start_sequence, tail_sequence).await?;
     select_restart_failure_proof(request, &events)
 }
 
@@ -1108,7 +1109,7 @@ fn validate_restart_failure_proof(
     events: &[bcode_session_models::SessionEvent],
 ) -> Result<RestartFailureProof, CompactionError> {
     if events.len() < 3
-        || events.len() > 512
+        || events.len() > RECOVERY_MAX_EVENTS
         || events
             .iter()
             .any(|event| event.session_id != request.session_id)
@@ -1209,6 +1210,21 @@ fn restart_attempt_evidence(
     request: &bcode_session_models::SessionCompactionRestartRequest,
     events: &[bcode_session_models::SessionEvent],
 ) -> Result<(LocalCheckpoint, RestartRequestUsages), CompactionError> {
+    let boundary = events
+        .iter()
+        .find_map(|event| {
+            if event.sequence != request.expected_checkpoint_sequence {
+                return None;
+            }
+            bcode_session_models::CompactionSynthesisCheckpoint::from_event(event)
+                .ok()
+                .flatten()
+                .and_then(|envelope| envelope.host_payload)
+                .and_then(|payload| LocalCheckpoint::decode(&payload).ok())
+                .map(|checkpoint| checkpoint.boundary)
+        })
+        .ok_or_else(invalid_checkpoint)?;
+    let prefix = format!("{}-compact-{boundary}-", request.session_id);
     let mut checkpoint = None;
     let mut usages = BTreeSet::new();
     for event in events {
@@ -1239,6 +1255,7 @@ fn restart_attempt_evidence(
         }
         if let SessionEventKind::ModelUsage { turn_id, usage } = &event.kind
             && usage.terminal
+            && turn_id.starts_with(&prefix)
         {
             let request_id = usage.request_id.as_deref().ok_or_else(invalid_checkpoint)?;
             if !usages.insert((turn_id.clone(), request_id.to_owned())) {
@@ -2051,6 +2068,38 @@ mod tests {
                 .unwrap()
                 .sha256;
         assert!(select_restart_failure_proof(&retry_request, &retried).is_ok());
+        // A spent checkpoint remains recoverable after thousands of ordinary events.
+        // Unrelated terminal model requests are not compaction attempt settlement.
+        let mut aged = events.clone();
+        aged.extend((7..=5_006).map(|sequence| user(session_id, sequence, "later history")));
+        aged[100].kind = SessionEventKind::ModelUsage {
+            turn_id: "ordinary-turn".into(),
+            usage: bcode_session_models::SessionTokenUsage {
+                request_id: Some("ordinary-provider-request".into()),
+                terminal: true,
+                ..bcode_session_models::SessionTokenUsage::default()
+            },
+        };
+        let mut aged_start = events[0].clone();
+        aged_start.sequence = 5_007;
+        aged.push(aged_start);
+        let mut aged_failure = events[5].clone();
+        aged_failure.sequence = 5_008;
+        aged_failure.kind = trace(SessionTracePhase::ContextCompactionFinished, false,
+            Some("context compaction failed: invalid or incompatible compaction checkpoint; boundary unchanged".into()));
+        aged.push(aged_failure);
+        let mut aged_request = request.clone();
+        aged_request.expected_terminal_sequence = 5_008;
+        aged_request.expected_terminal_sha256 =
+            bcode_session::compaction_event_identity(aged.last().unwrap())
+                .unwrap()
+                .sha256;
+        assert!(select_restart_failure_proof(&aged_request, &aged).is_ok());
+        let mut missing_aged_usage = aged.clone();
+        if let SessionEventKind::ModelUsage { usage, .. } = &mut missing_aged_usage[4].kind {
+            usage.terminal = false;
+        }
+        assert!(select_restart_failure_proof(&aged_request, &missing_aged_usage).is_err());
         let mut missing_usage = retried.clone();
         if let SessionEventKind::ModelUsage { usage, .. } = &mut missing_usage[4].kind {
             usage.terminal = false;
@@ -2333,6 +2382,21 @@ mod tests {
         assert!(restored.verify_restart_allowance().is_err());
     }
 
+    async fn append_recovery_history_gap(state: &ServerState, session_id: SessionId) {
+        for _ in 0..5_100 {
+            state
+                .sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::SystemMessage {
+                        text: "later ordinary conversation".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn read_only_preparation_returns_exact_identity_without_changing_checkpoint() {
         use bcode_session_models::compaction_restart::{
@@ -2374,6 +2438,21 @@ mod tests {
             .await
             .unwrap();
         let before = checkpoint.encode().unwrap();
+        // The accepted checkpoint can predate thousands of later conversation events.
+        // Recovery preparation must page from the checkpoint, not only the latest failure.
+        state.sessions.append_trace_event(session_id, trace(
+            SessionTracePhase::ContextCompactionFinished,
+            Some("context compaction failed: invalid or incompatible compaction checkpoint; boundary unchanged".into()),
+        )).await.unwrap();
+        append_recovery_history_gap(&state, session_id).await;
+        state
+            .sessions
+            .append_trace_event(
+                session_id,
+                trace(SessionTracePhase::ContextCompactionStarted, None),
+            )
+            .await
+            .unwrap();
         let terminal = state.sessions.append_trace_event(session_id, trace(
             SessionTracePhase::ContextCompactionFinished,
             Some("context compaction failed: invalid or incompatible compaction checkpoint; boundary unchanged".into()),

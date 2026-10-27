@@ -110,8 +110,8 @@ pub async fn restart_session_context(
         let session_id = request.session_id;
         let config = state.session_config(session_id).await;
         let old = checkpoint::load_archived_checkpoint(state, request).await?;
-        let start = request.expected_terminal_sequence.saturating_sub(511);
-        let events = state.sessions.session_events_range(session_id, start, request.expected_terminal_sequence, 512).await?;
+        let start = request.expected_checkpoint_sequence.saturating_sub(511).max(1);
+        let events = checkpoint::recovery_events(state, session_id, start, request.expected_terminal_sequence).await?;
         let started = events.iter().find(|event| {
             event.sequence < request.expected_checkpoint_sequence && matches!(&event.kind,
                 SessionEventKind::TraceEvent { trace } if trace.phase == SessionTracePhase::ContextCompactionStarted)

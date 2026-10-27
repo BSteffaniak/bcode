@@ -324,6 +324,12 @@ A stale selection cannot authorize dispatch. Duplicate admission is not permissi
 provider work. Ambiguous provider outcomes, incomplete terminal usage evidence and unsupported
 formats remain blocked, including interrupted consolidation without settled request evidence.
 Known policy incompatibility is not permission to reinterpret or silently discard retained state.
+Explicit preparation and admission page canonical evidence from the selected checkpoint (including
+up to 511 earlier operation events), rather than requiring that checkpoint to be in the latest
+512 events. Reads are limited to 128 events per page, 16,384 events and 32 MiB in aggregate;
+missing pages, unsupported events and exhausted bounds fail closed. Ordinary model-turn usage
+is not counted as settlement of compaction requests. The current tail remains independently
+identity-fenced; intervening conversation never becomes permission to replay an uncertain call.
 
 ## Reconstructing an already stale summary
 
