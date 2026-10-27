@@ -3545,7 +3545,6 @@ async fn stream_chat_completion_with_failover(
                 try_auth_candidates_after_selected_failure(request, turn, error).await
             }
             Err(error) if can_failover_auth_error(&error, turn) => {
-                warn_auth_profile_failure(turn, request.provider_context.auth_profile.as_deref());
                 try_auth_candidates_after_selected_failure(request, turn, error).await
             }
             outcome => outcome,
@@ -3599,8 +3598,39 @@ async fn try_auth_candidates_after_selected_failure(
         .cloned()
         .collect();
     if fallback_request.provider_context.auth_candidates.is_empty() {
+        turn.push(ProviderTurnEvent::Warning {
+            message: format!(
+                "Auth pool '{}' has no alternative profiles after '{}' failed ({}).",
+                request
+                    .provider_context
+                    .auth_pool
+                    .as_deref()
+                    .unwrap_or("unnamed"),
+                selected_profile.unwrap_or("unknown"),
+                selected_error.code
+            ),
+        });
         return Err(selected_error);
     }
+    turn.push(ProviderTurnEvent::Warning {
+        message: format!(
+            "Auth pool '{}': '{}' failed ({}); trying configured alternatives: {}.",
+            request
+                .provider_context
+                .auth_pool
+                .as_deref()
+                .unwrap_or("unnamed"),
+            selected_profile.unwrap_or("unknown"),
+            selected_error.code,
+            fallback_request
+                .provider_context
+                .auth_candidates
+                .iter()
+                .filter_map(|candidate| candidate.profile.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    });
     match try_auth_candidates_once(&fallback_request, turn).await? {
         CandidateAttemptOutcome::Finished(outcome) => Ok(outcome),
         CandidateAttemptOutcome::Exhausted { error, .. } => Err(error),
@@ -3791,7 +3821,21 @@ async fn try_auth_candidate(
     turn: &TurnState,
     selection: CandidateSelection<'_>,
 ) -> Result<CandidateTryOutcome, ProviderError> {
+    if turn.is_cancelled() {
+        return Ok(CandidateTryOutcome::Finished(StreamOutcome::Cancelled));
+    }
     let candidate = selection.candidate;
+    turn.push(ProviderTurnEvent::Warning {
+        message: format!(
+            "Auth pool '{}': attempting profile '{}'.",
+            request
+                .provider_context
+                .auth_pool
+                .as_deref()
+                .unwrap_or("unnamed"),
+            candidate.profile.as_deref().unwrap_or("unknown")
+        ),
+    });
     let mut candidate_request = auth_candidate_request(request, candidate);
     if selection.reason == CandidateSelectionReason::Priming {
         candidate_request
@@ -4166,7 +4210,7 @@ fn can_failover_auth_error(error: &ProviderError, turn: &TurnState) -> bool {
 fn warn_auth_profile_failure(turn: &TurnState, profile: Option<&str>) {
     turn.push(ProviderTurnEvent::Warning {
         message: format!(
-            "OpenAI auth profile '{}' failed authentication; trying remaining configured profiles. Reconnect this profile to restore it.",
+            "OpenAI auth profile '{}' failed authentication. Reconnect this profile to restore it.",
             profile.unwrap_or("unknown")
         ),
     });
@@ -9987,6 +10031,149 @@ mod tests {
         assert!(!can_failover_auth_error(&error, &cancelled));
     }
 
+    fn credential_sensitive_subscription_server(
+        listener: TcpListener,
+    ) -> thread::JoinHandle<Vec<(String, serde_json::Value)>> {
+        thread::spawn(move || {
+            let mut observed = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while observed.len() < 2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "missing fallback request"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    assert!(!line.is_empty());
+                    headers.push_str(&line);
+                }
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let headers = headers.to_ascii_lowercase();
+                let healthy = headers.contains("authorization: bearer healthy-access")
+                    && headers.contains("chatgpt-account-id: healthy-account");
+                observed.push((
+                    headers,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                ));
+                if healthy {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    let body = r#"{"error":{"code":"token_revoked","message":"revoked"}}"#;
+                    write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+            observed
+        })
+    }
+
+    #[tokio::test]
+    async fn subscription_failover_switches_wire_credentials_and_drops_reuse() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = credential_sensitive_subscription_server(listener);
+        let mut request = test_request(Vec::new());
+        request.provider_context.auth_profile = Some("revoked".into());
+        request.conversation_reuse.previous_provider_response_id = Some("old-response".into());
+        let candidates: Vec<_> = [
+            ("revoked", "revoked-access", "revoked-account"),
+            ("healthy", "healthy-access", "healthy-account"),
+        ]
+        .into_iter()
+        .map(|(profile, access, account)| ProviderAuthCandidate {
+            profile: Some(profile.into()),
+            auth: bcode_model::ProviderAuthContext {
+                profile: Some(profile.into()),
+                scheme: Some("chatgpt".into()),
+                credentials: [("access_token", access), ("account_id", account)]
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name.into(),
+                            bcode_model::ProviderAuthCredential {
+                                value: value.into(),
+                                source: None,
+                            },
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .collect();
+        let client = Client::new();
+        let turn = TurnState::default();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let attempt = auth_candidate_request(&request, candidate);
+            let settings = settings_for_context(&attempt.provider_context);
+            let AuthSettings::ChatGpt { access_token, .. } = &settings.auth else {
+                panic!("subscription auth");
+            };
+            let result = send_responses_request_to(
+                &client,
+                &settings,
+                access_token,
+                &attempt,
+                "model",
+                Some(&turn),
+                &format!("http://{address}/responses"),
+            )
+            .await;
+            if index == 0 {
+                let error = result.unwrap_err();
+                assert!(can_failover_auth_error(&error, &turn));
+            } else {
+                assert!(result.is_ok());
+                assert!(
+                    attempt
+                        .conversation_reuse
+                        .previous_provider_response_id
+                        .is_none()
+                );
+            }
+        }
+        let observed = worker.join().unwrap();
+        assert!(
+            observed[0]
+                .0
+                .contains("authorization: bearer revoked-access")
+        );
+        assert!(
+            observed[1]
+                .0
+                .contains("authorization: bearer healthy-access")
+        );
+        assert!(observed[1].1.get("previous_response_id").is_none());
+    }
+
     #[tokio::test]
     async fn auth_failover_tries_remaining_profiles_and_preserves_exhausted_error() {
         for (selected, fallback_succeeds) in
@@ -10002,6 +10189,7 @@ mod tests {
                 while !worker_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
                             stream
                                 .set_read_timeout(Some(Duration::from_secs(5)))
                                 .unwrap();

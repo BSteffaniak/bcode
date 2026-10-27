@@ -20,6 +20,7 @@ pub mod managed_pool;
 #[cfg(target_os = "macos")]
 pub mod native_device;
 pub mod operations;
+pub mod pool_reconciliation;
 /// Verified restart credential materialization.
 pub mod recovery;
 pub mod security;
@@ -372,6 +373,17 @@ fn validate_auth_selection_metadata(
     } else {
         registry
     };
+    if let Some(pool) = request.selection.auth_pool.as_deref() {
+        let order = bcode_config::effective_auth_pool_order(
+            request.config,
+            registry,
+            pool,
+            request.selection.auth_profile.as_deref(),
+        );
+        if let Some(message) = order.degraded_reason {
+            return Err(bcode_config::ConfigError::Composition { message });
+        }
+    }
     validate_runtime_account_selection(request, registry)?;
     validate_runtime_pool_selection(request, registry)
 }

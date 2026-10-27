@@ -105,6 +105,17 @@ pub fn mint_managed_default_with_runtime(
     if owner_plugin_id.is_empty() || selection.provider_plugin_id != owner_plugin_id {
         return Err(EnrollmentError::PoolConflict);
     }
+    if bcode_config::effective_auth_pool_order(
+        config,
+        runtime,
+        selection.auth_pool.unwrap_or(""),
+        selection.auth_profile,
+    )
+    .degraded_reason
+    .is_some()
+    {
+        return Err(EnrollmentError::PoolConflict);
+    }
     if let Some(name) = selection.auth_pool {
         if let Some(pool) = config.auth.pools.get(name) {
             if pool.automatic_group.is_none() {
@@ -315,9 +326,12 @@ pub fn refresh_managed_default(
     let Some(pool) = selected else {
         return Ok(None);
     };
-    let profiles =
-        bcode_config::effective_auth_pool_order(config, runtime, &pool, receipt.primary.as_deref())
-            .profiles;
+    let order =
+        bcode_config::effective_auth_pool_order(config, runtime, &pool, receipt.primary.as_deref());
+    if order.degraded_reason.is_some() {
+        return Err(EnrollmentError::PoolConflict);
+    }
+    let profiles = order.profiles;
     for name in &profiles {
         resolve_member(config, runtime, receipt, name)?;
     }

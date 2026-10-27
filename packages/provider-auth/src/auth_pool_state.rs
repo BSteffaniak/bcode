@@ -365,11 +365,30 @@ fn with_state<T>(f: impl FnOnce(&AuthPoolState) -> T) -> T {
     f(&state)
 }
 
+fn observation_lock() -> std::io::Result<fs::File> {
+    let path = state_path();
+    fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("missing parent"))?,
+    )?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    file.try_lock().map_err(std::io::Error::other)?;
+    Ok(file)
+}
+
 fn mutate_state<T>(f: impl FnOnce(&mut AuthPoolState) -> T) -> T {
     let _guard = STATE_LOCK.lock().ok();
+    let ownership = observation_lock();
     let mut state = load_state();
     let result = f(&mut state);
-    save_state(&state);
+    if ownership.is_ok() {
+        save_state(&state);
+    }
     result
 }
 
@@ -391,6 +410,100 @@ fn legacy_state_path() -> PathBuf {
         .join("openai-compatible-auth-pool-state.json")
 }
 
+pub(crate) struct ObservationOwnership {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    _file: fs::File,
+}
+
+/// Copy observations without removing the source, making retries after interruption safe.
+///
+/// # Errors
+/// Rejects unsupported/corrupt state, conflicting destination observations or failed atomic writes.
+pub(crate) fn preserve_pool_observations(
+    source: &str,
+    destination: &str,
+) -> Result<ObservationOwnership, bcode_config::ConfigError> {
+    use std::io::{Read as _, Write as _};
+    let invalid = || bcode_config::ConfigError::Composition {
+        message: "Auth-pool observations are incompatible or unavailable; existing state preserved"
+            .into(),
+    };
+    let _guard = STATE_LOCK.lock().map_err(|_| invalid())?;
+    let _ownership = observation_lock().map_err(|_| invalid())?;
+    let ownership = ObservationOwnership {
+        _guard,
+        _file: _ownership,
+    };
+    let path = state_path();
+    let input = if path.exists() {
+        path.clone()
+    } else {
+        legacy_state_path()
+    };
+    let mut bytes = Vec::new();
+    match fs::File::open(&input) {
+        Ok(file) => {
+            file.take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| invalid())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ownership),
+        Err(_) => return Err(invalid()),
+    }
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(invalid());
+    }
+    let original: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let mut state: AuthPoolState =
+        serde_json::from_value(original.clone()).map_err(|_| invalid())?;
+    if serde_json::to_value(&state).map_err(|_| invalid())? != original {
+        return Err(invalid());
+    }
+    copy_pool_observations(&mut state, source, destination).map_err(|()| invalid())?;
+    let parent = path.parent().ok_or_else(invalid)?;
+    fs::create_dir_all(parent).map_err(|_| invalid())?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| invalid())?;
+    serde_json::to_writer_pretty(&mut temporary, &state).map_err(|_| invalid())?;
+    temporary.flush().map_err(|_| invalid())?;
+    temporary.as_file().sync_all().map_err(|_| invalid())?;
+    temporary.persist(&path).map_err(|_| invalid())?;
+    Ok(ownership)
+}
+
+fn copy_pool_observations(
+    state: &mut AuthPoolState,
+    source: &str,
+    destination: &str,
+) -> Result<(), ()> {
+    let mut next = state.clone();
+    let prefix = format!("{source}/");
+    for (key, value) in &state.entries {
+        if let Some(profile) = key.strip_prefix(&prefix) {
+            let target = format!("{destination}/{profile}");
+            if next
+                .entries
+                .get(&target)
+                .is_some_and(|existing| existing != value)
+            {
+                return Err(());
+            }
+            next.entries.insert(target, value.clone());
+        }
+    }
+    if let Some(routing) = state.pools.get(source) {
+        if next
+            .pools
+            .get(destination)
+            .is_some_and(|existing| existing != routing)
+        {
+            return Err(());
+        }
+        next.pools.insert(destination.to_owned(), routing.clone());
+    }
+    *state = next;
+    Ok(())
+}
+
 fn save_state(state: &AuthPoolState) {
     let path = state_path();
     let Some(parent) = path.parent() else {
@@ -399,8 +512,11 @@ fn save_state(state: &AuthPoolState) {
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    if let Ok(contents) = serde_json::to_string_pretty(state) {
-        let _ = fs::write(path, contents);
+    if let Ok(mut temporary) = tempfile::NamedTempFile::new_in(parent)
+        && serde_json::to_writer_pretty(&mut temporary, state).is_ok()
+        && temporary.as_file().sync_all().is_ok()
+    {
+        let _ = temporary.persist(path);
     }
 }
 
@@ -518,6 +634,37 @@ pub(crate) fn reset_cooldowns_in_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_observation_copy_is_retryable_and_rejects_conflicts_without_changes() {
+        let mut state = AuthPoolState::default();
+        state.entries.insert(
+            "old/one".into(),
+            AuthPoolProfileState {
+                cooldown_until_unix: 100,
+                ..Default::default()
+            },
+        );
+        state.pools.insert(
+            "old".into(),
+            AuthPoolRoutingState {
+                last_selected_profile: Some("one".into()),
+            },
+        );
+        copy_pool_observations(&mut state, "old", "chosen").unwrap();
+        assert_eq!(state.entries["old/one"], state.entries["chosen/one"]);
+        let after = state.clone();
+        copy_pool_observations(&mut state, "old", "chosen").unwrap();
+        assert_eq!(state, after);
+        state
+            .entries
+            .get_mut("chosen/one")
+            .unwrap()
+            .cooldown_until_unix = 200;
+        let before = state.clone();
+        assert!(copy_pool_observations(&mut state, "old", "chosen").is_err());
+        assert_eq!(state, before);
+    }
 
     #[test]
     fn provider_targets_exclude_missing_secondary_and_unrelated_cached_meters() {

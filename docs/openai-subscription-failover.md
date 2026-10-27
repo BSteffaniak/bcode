@@ -170,6 +170,33 @@ declarative configuration. Promotion moves only the selected profile to the fron
 relative order of every other profile. In the TUI, `/auth-pool` and `/subscriptions` open the same
 generic profile picker. Pool status reports the effective order and preference source.
 
+## Explicit reconciliation of split automatic pools
+
+Pool names are identities, not aliases. Selecting `openai` does not inherit accounts from
+`openai-subscription-default`. Conflicting automatic pools for the same provider/plugin/group
+surface degraded status and block strict selection and managed-default routing.
+
+```sh
+bcode auth pool reconcile --source openai-subscription-default --destination openai
+bcode auth pool reconcile --source openai-subscription-default --destination openai --apply
+```
+
+The default is a read-only preview. The destination must be a declared automatic pool with the
+same verified owner and compatibility group. The source must be runtime-only and no loaded model
+selection may reference it. Conflicting credential destinations, seal policy, preferences, or
+observations reject the operation. Credentials and provider bindings are unchanged. References
+from other configuration files or clients must be updated explicitly.
+
+Apply with pool activity quiescent, especially while older daemon artifacts are running: old
+artifacts do not participate in observation locking. Reconciliation locks and revision-checks the
+registry, retains a registry backup, atomically copies observations while retaining their source,
+then atomically publishes destination membership and removes the redundant runtime pool. New
+observation writers share a filesystem lock. Failed publication leaves source observations intact
+for retry. Unknown registry/observation fields are not discarded. Restart affected clients to resolve
+new membership; do not reset credentials or copy tokens between machines. Membership remains
+machine-local even when declarative Nix policy is shared. Priming policy is independent of whether
+pool routing is enabled.
+
 ## Routing strategies
 
 Auth pools default to failover routing, which tries profiles in configured order and only moves to the next profile when the active subscription reports quota or rate-limit exhaustion.

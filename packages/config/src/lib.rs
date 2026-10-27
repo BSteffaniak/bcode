@@ -5537,7 +5537,9 @@ fn update_writable_config(
 }
 
 mod auth_enrollment;
+mod auth_pool_reconciliation;
 pub use auth_enrollment::publish_auth_enrollment;
+pub use auth_pool_reconciliation::publish_auth_pool_reconciliation;
 
 /// Non-secret runtime subscription registry for provider logins that should not mutate declarative config.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -6103,6 +6105,57 @@ pub struct EffectiveAuthPoolOrder {
     pub degraded_reason: Option<String>,
 }
 
+fn automatic_pool_conflict(
+    config: &BcodeConfig,
+    registry: &RuntimeAuthSubscriptions,
+    pool: &str,
+) -> Option<String> {
+    let declared = config.auth.pools.get(pool);
+    let runtime = registry.pools.get(pool);
+    let automatic = declared
+        .and_then(|entry| entry.automatic_group.as_deref())
+        .zip(declared.and_then(|entry| entry.automatic_provider.as_deref()))
+        .zip(declared.and_then(|entry| entry.provider_plugin_id.as_deref()))
+        .map(|((group, provider), owner)| (group, provider, owner))
+        .or_else(|| {
+            runtime.and_then(|entry| {
+                Some((
+                    entry.automatic_group.as_deref()?,
+                    entry.provider_id.as_deref()?,
+                    entry.owner_plugin_id.as_deref()?,
+                ))
+            })
+        });
+    let competing = automatic.map(|(group, provider, owner)| {
+        config
+            .auth
+            .pools
+            .iter()
+            .filter(|(_, entry)| {
+                entry.automatic_group.as_deref() == Some(group)
+                    && entry.automatic_provider.as_deref() == Some(provider)
+                    && entry.provider_plugin_id.as_deref() == Some(owner)
+            })
+            .map(|(name, _)| name.clone())
+            .chain(
+                registry
+                    .pools
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry.automatic_group.as_deref() == Some(group)
+                            && entry.provider_id.as_deref() == Some(provider)
+                            && entry.owner_plugin_id.as_deref() == Some(owner)
+                    })
+                    .map(|(name, _)| name.clone()),
+            )
+            .collect::<BTreeSet<_>>()
+    });
+    competing.filter(|names| names.len() > 1).map(|names| format!(
+        "Conflicting automatic auth pools: {}. Reconcile pool membership explicitly with `bcode auth pool reconcile`.",
+        names.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
+
 /// Resolve an auth pool's effective profile order from config and user state.
 #[must_use]
 pub fn effective_auth_pool_order(
@@ -6145,7 +6198,7 @@ pub fn effective_auth_pool_order(
         (selected_profile, "selected_profile"),
         (profiles.first().map(String::as_str), "pool_order"),
     ];
-    let mut degraded_reason = None;
+    let mut degraded_reason = automatic_pool_conflict(config, registry, pool);
     let mut effective = None;
     for (preference, source) in preferences {
         let Some(preference) = preference else {

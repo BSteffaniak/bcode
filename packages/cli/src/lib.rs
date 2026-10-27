@@ -7592,6 +7592,15 @@ enum AuthPoolCommand {
         #[arg(long, requires = "default_pool")]
         provider: Option<String>,
     },
+    /// Preview or explicitly reconcile compatible automatic runtime pool membership.
+    Reconcile {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        destination: String,
+        #[arg(long)]
+        apply: bool,
+    },
     List,
     /// Read normalized, secret-free auth-pool status from the daemon as JSON.
     /// Unlike local list/status, this reports the running host's effective pools.
@@ -10442,6 +10451,32 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
     }
 }
 
+fn reconcile_auth_pool(source: &str, destination: &str, apply: bool) -> Result<(), CliError> {
+    let config = bcode_config::load_config()?;
+    let registry = bcode_config::try_load_runtime_auth_subscriptions()?;
+    let plan = bcode_provider_auth::pool_reconciliation::plan_pool_reconciliation(
+        &config,
+        &registry,
+        source,
+        destination,
+    )?;
+    println!(
+        "Reconcile '{source}' -> '{destination}'; preserve credential destinations for: {}",
+        plan.profiles().join(", ")
+    );
+    if apply {
+        plan.apply()?;
+        println!(
+            "Membership reconciled. Source observations retained for recovery; restart clients to load membership."
+        );
+    } else {
+        println!(
+            "Dry run; no state changed. Review, then use --apply with pool activity quiescent."
+        );
+    }
+    Ok(())
+}
+
 async fn handle_auth_pool_command(command: AuthPoolCommand) -> Result<(), CliError> {
     match command {
         AuthPoolCommand::MigrateConfig {
@@ -10488,6 +10523,11 @@ async fn handle_auth_pool_command(command: AuthPoolCommand) -> Result<(), CliErr
             }
             Ok(())
         }
+        AuthPoolCommand::Reconcile {
+            source,
+            destination,
+            apply,
+        } => reconcile_auth_pool(&source, &destination, apply),
         AuthPoolCommand::List => auth_pool_list(),
         AuthPoolCommand::DaemonStatus => {
             let pools = Box::pin(BcodeClient::default_endpoint().auth_pool_list()).await?;

@@ -268,7 +268,7 @@ fn providers_sharing_plugin_and_group_are_disambiguated() {
 }
 
 #[test]
-fn explicit_automatic_receipt_pins_pool_despite_other_defaults() {
+fn explicit_automatic_receipt_rejects_conflicting_defaults_but_manual_selection_stays_explicit() {
     let mut config = BcodeConfig::default();
     config
         .auth
@@ -295,6 +295,17 @@ fn explicit_automatic_receipt_pins_pool_despite_other_defaults() {
         auth_pool: Some("first"),
         native_defaults: true,
     };
+    assert!(
+        mint_managed_default(
+            &config,
+            &selection,
+            &provider(),
+            "example.plugin",
+            &capability()
+        )
+        .is_err()
+    );
+    config.auth.pools.remove("second");
     let receipt = mint_managed_default(
         &config,
         &selection,
