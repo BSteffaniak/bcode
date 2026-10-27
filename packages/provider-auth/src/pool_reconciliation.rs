@@ -50,6 +50,43 @@ impl PoolReconciliation {
     }
 }
 
+fn validate_member_destinations(
+    config: &BcodeConfig,
+    registry: &RuntimeAuthSubscriptions,
+    replacement: &RuntimeAuthSubscriptionPool,
+    provider: &str,
+    owner: &str,
+) -> Result<(), ConfigError> {
+    let reject = || {
+        invalid("Pool members have conflicting credential destinations; existing state preserved")
+    };
+    for member in &replacement.profiles {
+        let resolved = crate::resolve_auth_provider_profile(
+            config,
+            provider,
+            owner,
+            Some(&member.auth_profile),
+            registry,
+        )
+        .map_err(|_| reject())?;
+        if resolved.profile.settings.get("profile") != Some(&member.storage_profile)
+            || resolved
+                .profile
+                .settings
+                .get("vault")
+                .map(std::path::Path::new)
+                != Some(member.vault.as_path())
+            || resolved.profile.scheme.as_deref() != Some(member.scheme.as_str())
+            || resolved.profile.backend != "sshenv"
+            || resolved.profile.settings.get("device_seal") != member.device_seal.as_ref()
+            || (!member.map.is_empty() && resolved.profile.map != member.map)
+        {
+            return Err(reject());
+        }
+    }
+    Ok(())
+}
+
 /// Plan moving a runtime automatic pool into a declared automatic pool of the same owner/group.
 /// Rejects ambiguity rather than changing credentials or guessing preference conflicts.
 ///
@@ -119,30 +156,7 @@ pub fn plan_pool_reconciliation(
             _ => {}
         }
     }
-    for member in &replacement.profiles {
-        let resolved = crate::resolve_auth_provider_profile(
-            config,
-            provider,
-            owner,
-            Some(&member.auth_profile),
-            registry,
-        )
-        .map_err(|_| reject())?;
-        if resolved.profile.settings.get("profile") != Some(&member.storage_profile)
-            || resolved
-                .profile
-                .settings
-                .get("vault")
-                .map(std::path::Path::new)
-                != Some(member.vault.as_path())
-            || resolved.profile.scheme.as_deref() != Some(member.scheme.as_str())
-            || resolved.profile.backend != "sshenv"
-            || resolved.profile.settings.get("device_seal") != member.device_seal.as_ref()
-            || (!member.map.is_empty() && resolved.profile.map != member.map)
-        {
-            return Err(reject());
-        }
-    }
+    validate_member_destinations(config, registry, &replacement, provider, owner)?;
     if replacement
         .preferred_profile
         .as_ref()

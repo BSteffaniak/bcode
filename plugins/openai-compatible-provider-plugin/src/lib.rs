@@ -10031,6 +10031,27 @@ mod tests {
         assert!(!can_failover_auth_error(&error, &cancelled));
     }
 
+    #[tokio::test]
+    async fn auth_failure_with_no_alternative_reports_pool_without_promising_retry() {
+        let mut request = test_request(Vec::new());
+        request.provider_context.auth_pool = Some("single".into());
+        request.provider_context.auth_profile = Some("revoked".into());
+        request.provider_context.auth_candidates = vec![ProviderAuthCandidate {
+            profile: Some("revoked".into()),
+            ..Default::default()
+        }];
+        let turn = TurnState::default();
+        let error = provider_error("token_revoked", ProviderErrorCategory::Auth, "revoked");
+        let returned = try_auth_candidates_after_selected_failure(&request, &turn, error)
+            .await
+            .unwrap_err();
+        assert_eq!(returned.code, "token_revoked");
+        let events = turn.drain();
+        assert!(
+            matches!(&events[..], [ProviderTurnEvent::Warning { message }] if message.contains("single") && message.contains("no alternative profiles") && !message.contains("trying"))
+        );
+    }
+
     fn credential_sensitive_subscription_server(
         listener: TcpListener,
     ) -> thread::JoinHandle<Vec<(String, serde_json::Value)>> {

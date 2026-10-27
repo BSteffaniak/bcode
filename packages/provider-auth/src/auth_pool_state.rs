@@ -428,11 +428,11 @@ pub(crate) fn preserve_pool_observations(
         message: "Auth-pool observations are incompatible or unavailable; existing state preserved"
             .into(),
     };
-    let _guard = STATE_LOCK.lock().map_err(|_| invalid())?;
-    let _ownership = observation_lock().map_err(|_| invalid())?;
+    let guard = STATE_LOCK.lock().map_err(|_| invalid())?;
+    let file = observation_lock().map_err(|_| invalid())?;
     let ownership = ObservationOwnership {
-        _guard,
-        _file: _ownership,
+        _guard: guard,
+        _file: file,
     };
     let path = state_path();
     let input = if path.exists() {
