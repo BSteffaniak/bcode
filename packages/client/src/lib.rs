@@ -3123,6 +3123,62 @@ fn configured_request_timeout() -> Duration {
     })
 }
 
+impl bcode_session_models::SessionCompactionRestartApplication for BcodeClient {
+    type CompactionOperation = ClientSessionCompactionOperation;
+
+    async fn begin_session_compaction_restart(
+        &self,
+        request: bcode_session_models::SessionCompactionRestartRequest,
+    ) -> Result<Self::CompactionOperation, bcode_session_models::SessionApplicationFailure> {
+        request
+            .validate()
+            .map_err(|message| session_application_failure(ClientError::Protocol(message)))?;
+        let mut connection = self
+            .connect("bcode-compaction-restart")
+            .await
+            .map_err(session_application_failure)?;
+        let request_id = connection.next_request_id;
+        connection.next_request_id += 1;
+        let envelope = request_envelope(request_id, &Request::RestartSessionCompaction { request })
+            .map_err(ClientError::from)
+            .map_err(session_application_failure)?;
+        send_envelope(&mut connection.stream, &envelope)
+            .await
+            .map_err(ClientError::from)
+            .map_err(session_application_failure)?;
+        let deadline = tokio::time::Instant::now() + connection.request_timeout;
+        loop {
+            let envelope = tokio::time::timeout_at(deadline, recv_envelope(&mut connection.stream))
+                .await
+                .map_err(|_| {
+                    session_application_failure(ClientError::RequestTimeout {
+                        timeout: connection.request_timeout,
+                    })
+                })?
+                .map_err(ClientError::from)
+                .map_err(session_application_failure)?;
+            if envelope.kind != EnvelopeKind::Response || envelope.request_id != request_id {
+                continue;
+            }
+            match decode_response(&envelope.payload)
+                .map_err(ClientError::from)
+                .map_err(session_application_failure)?
+            {
+                Response::Ok(ResponsePayload::SessionCompactionAccepted) => {
+                    return Ok(ClientSessionCompactionOperation {
+                        connection,
+                        request_id,
+                    });
+                }
+                Response::Err(error) => return Err(session_application_failure(error.into())),
+                Response::Ok(_) => {
+                    return Err(session_application_failure(ClientError::UnexpectedResponse));
+                }
+            }
+        }
+    }
+}
+
 impl BcodeClient {
     /// Construct an independent consumer for an explicitly verified running daemon.
     ///

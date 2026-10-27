@@ -20,6 +20,7 @@ mod compaction_privacy;
 mod compaction_recovery;
 mod context_accounting;
 pub(crate) mod context_compaction;
+mod context_compaction_request_budget;
 mod context_lineage;
 mod context_recovery;
 mod image_input;
@@ -860,6 +861,13 @@ enum FollowupCommand {
         client_id: ClientId,
         selection: SessionModelSelection,
         request: bcode_session_models::SessionSummaryRebuildRequest,
+        response: oneshot::Sender<Result<String, CompactionError>>,
+        ownership: bcode_session::SessionOwnershipGuard,
+    },
+    RestartSessionCompaction {
+        client_id: ClientId,
+        selection: SessionModelSelection,
+        request: bcode_session_models::SessionCompactionRestartRequest,
         response: oneshot::Sender<Result<String, CompactionError>>,
         ownership: bcode_session::SessionOwnershipGuard,
     },
@@ -6669,6 +6677,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SubscribeRuntimeWork { session_id }
         | Request::AttachSessionProjectionWindow { session_id, .. } => Some(*session_id),
         Request::RebuildSessionSummary { request } => Some(request.session_id),
+        Request::RestartSessionCompaction { request } => Some(request.session_id),
         Request::ContinueWorkflow(request) => Some(request.successor.parent_session_id),
         Request::RequestWorkflowReplacement(request) => Some(request.successor.parent_session_id),
         Request::StartWorkflowRun(request) => Some(request.parent_session_id),
@@ -6920,6 +6929,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ComposerDraft { .. } => "composer_draft",
         Request::CompactSession { .. } => "compact_session",
         Request::RebuildSessionSummary { .. } => "rebuild_session_summary",
+        Request::RestartSessionCompaction { .. } => "restart_session_compaction",
         Request::SetSessionModel { .. } => "set_session_model",
         Request::SetSessionReasoning { .. } => "set_session_reasoning",
         Request::AuthPoolList => "auth_pool_list",
@@ -10299,6 +10309,9 @@ async fn handle_core_runtime_request(
         }
         CoreRuntimeRequest::RebuildSessionSummary { request } => {
             handle_rebuild_session_summary(request_id, client_id, state, writer, request).await
+        }
+        CoreRuntimeRequest::RestartSessionCompaction { request } => {
+            handle_restart_session_compaction(request_id, client_id, state, writer, request).await
         }
         CoreRuntimeRequest::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
@@ -16602,6 +16615,36 @@ async fn enqueue_compact_session_command(
     Ok(completion)
 }
 
+async fn enqueue_restart_session_compaction_command(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    client_id: ClientId,
+    selection: SessionModelSelection,
+    request: bcode_session_models::SessionCompactionRestartRequest,
+) -> Result<oneshot::Receiver<Result<String, CompactionError>>, ServerError> {
+    let (response, completion) = oneshot::channel();
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?;
+    enqueue_followup_command(
+        state,
+        session_id,
+        FollowupCommand::RestartSessionCompaction {
+            client_id,
+            selection,
+            request,
+            response,
+            ownership,
+        },
+    )
+    .await?;
+    Ok(completion)
+}
+
 fn usize_to_u32_saturating(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -17527,6 +17570,30 @@ async fn run_session_runtime_inner(
                 let _sent = response.send(result);
                 drop(ownership);
             }
+            FollowupCommand::RestartSessionCompaction {
+                client_id,
+                selection,
+                request,
+                response,
+                ownership,
+            } => {
+                let result = Box::pin(process_restart_session_compaction_command(
+                    &state,
+                    permit.session_id(),
+                    Arc::clone(&phase),
+                    &mut followup_commands,
+                    &mut steering_commands,
+                    &mut cancel_commands,
+                    queued_followups.as_ref(),
+                    Arc::clone(&current_turn),
+                    client_id,
+                    selection,
+                    request,
+                ))
+                .await;
+                let _sent = response.send(result);
+                drop(ownership);
+            }
             FollowupCommand::CompactSession {
                 client_id,
                 selection,
@@ -18235,6 +18302,53 @@ async fn process_skill_invocation_command(
             .ok();
     }
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_restart_session_compaction_command(
+    state: &ServerState,
+    session_id: SessionId,
+    phase: Arc<Mutex<SessionRuntimePhase>>,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    steering_commands: &mut mpsc::Receiver<SteeringCommand>,
+    cancel_commands: &mut mpsc::Receiver<CancelCommand>,
+    queued_followups: &AtomicUsize,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+    client_id: ClientId,
+    selection: SessionModelSelection,
+    request: bcode_session_models::SessionCompactionRestartRequest,
+) -> Result<String, CompactionError> {
+    let cancel_state = Arc::new(TurnCancelState::default());
+    *current_turn.lock().await = Some(RuntimeCurrentTurn {
+        interaction_route: None,
+        kind: RuntimeOperationKind::ManualCompaction,
+        agent_profile: None,
+        execution: None,
+        selection: None,
+        client_id,
+        turn_id: format!("{session_id}-manual-compact-{}", uuid::Uuid::new_v4()),
+        cancel_state: Arc::clone(&cancel_state),
+        model: None,
+    });
+    set_runtime_phase(&phase, SessionRuntimePhase::Compacting).await;
+    let mut command_context = RuntimeCommandContext::new(
+        followup_commands,
+        steering_commands,
+        cancel_commands,
+        queued_followups,
+        Arc::clone(&current_turn),
+    );
+    let result = Box::pin(context_compaction::restart_session_context(
+        state,
+        &request,
+        &selection,
+        Some(&mut command_context),
+        cancel_state.as_ref(),
+    ))
+    .await;
+    *current_turn.lock().await = None;
+    set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
+    result.map(|completion| completion.message)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20567,6 +20681,49 @@ async fn send_compaction_noop_response(
     .await
 }
 
+async fn handle_restart_session_compaction(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_session_models::SessionCompactionRestartRequest,
+) -> Result<(), ServerError> {
+    use bcode_session_models::{
+        SessionCompactionOperation as _, SessionCompactionRestartApplication as _,
+    };
+    let admitted = SessionApplicationHandle::new(state, client_id)
+        .begin_session_compaction_restart(request)
+        .await;
+    let result = match admitted {
+        Ok(operation) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionCompactionAccepted),
+            )
+            .await?;
+            operation.complete().await
+        }
+        Err(error) => Err(error),
+    };
+    let response = match result {
+        Ok(bcode_session_models::SessionCompactionResult::Compacted(message)) => {
+            Response::Ok(ResponsePayload::SessionCompacted {
+                compacted: true,
+                message,
+            })
+        }
+        Ok(bcode_session_models::SessionCompactionResult::Noop(message)) => {
+            Response::Ok(ResponsePayload::SessionCompacted {
+                compacted: false,
+                message,
+            })
+        }
+        Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
+    };
+    send_response(writer, request_id, response).await
+}
+
 async fn handle_rebuild_session_summary(
     request_id: u64,
     client_id: ClientId,
@@ -21499,7 +21656,7 @@ async fn run_model_turn(
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
     recovering: bool,
 ) -> ModelTurnCompletion {
-    Box::pin(run_model_turn_lifecycle(
+    context_compaction_request_budget::scope(Box::pin(run_model_turn_lifecycle(
         state,
         permit,
         trigger_event,
@@ -21509,7 +21666,7 @@ async fn run_model_turn(
         phase,
         supplied_cancel_state,
         recovering,
-    ))
+    )))
     .await
 }
 
@@ -22314,7 +22471,7 @@ async fn run_model_turn_inner(
                     next_assistant_segment_order,
                     next_output_position,
                 ),
-                maybe_auto_compact_session_context(
+                Box::pin(maybe_auto_compact_session_context(
                     state,
                     session_id,
                     &selection,
@@ -22326,7 +22483,7 @@ async fn run_model_turn_inner(
                         decision: compaction_decision,
                         previous_compacted_through_sequence: last_proactive_attempt_boundary,
                     },
-                ),
+                )),
             ))
             .await;
             match protected {
@@ -22358,7 +22515,7 @@ async fn run_model_turn_inner(
                 }
                 last_proactive_attempt_boundary = Some(compacted_through_sequence);
                 last_proactive_compaction_boundary = Some(compacted_through_sequence);
-                let prepared = match build_model_turn_request(
+                let prepared = match Box::pin(build_model_turn_request(
                     state,
                     session_id,
                     trigger_event,
@@ -22371,7 +22528,7 @@ async fn run_model_turn_inner(
                     &compaction_policy,
                     &static_context,
                     &turn_config,
-                )
+                ))
                 .await
                 {
                     Ok(prepared) => prepared,
@@ -24281,20 +24438,37 @@ async fn run_model_turn_round(
                     source.compacted_through_sequence == compaction.compacted_through_sequence
                 });
         let summary = if let Some(source) = source {
-            context_compaction::collect_compaction_summary(
+            Box::pin(context_compaction::collect_compaction_summary(
                 state,
                 session_id,
                 &selection,
                 &source.into_compaction_transcript(),
                 Some(&mut *command_context),
                 &cancel_state,
-            )
+            ))
             .await
         } else {
             Err(CompactionError::Provider(
                 "complete canonical managed-compaction source unavailable; boundary unchanged"
                     .into(),
             ))
+        };
+        let summary = match summary {
+            Ok(summary) => {
+                let mut snapshot = compaction.snapshot.clone();
+                snapshot.portable_summary.clone_from(&summary);
+                context_compaction::validate_provider_summary_publication(
+                    state,
+                    session_id,
+                    &selection,
+                    compaction.compacted_through_sequence,
+                    &snapshot,
+                    &cancel_state,
+                )
+                .await
+                .map(|()| summary)
+            }
+            Err(error) => Err(error),
         };
         match summary {
             Ok(summary) => compaction.snapshot.portable_summary = summary,
@@ -28241,6 +28415,49 @@ async fn prepare_static_model_turn_context(
     prepared_catalog: Option<Arc<tool_catalog::Snapshot>>,
     cancel_state: &TurnCancelState,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
+    Box::pin(prepare_static_model_turn_context_inner(
+        state,
+        session_id,
+        turn_id,
+        trigger_event_sequence,
+        execution,
+        config,
+        model_target,
+        runtime_context,
+        selection,
+        retain_environment_snapshot,
+        prepared_catalog,
+        cancel_state,
+        false,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn prepare_static_model_turn_context_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    trigger_event_sequence: u64,
+    execution: &bcode_session_models::TurnExecutionOptions,
+    config: &bcode_config::BcodeConfig,
+    model_target: &model_request_target::ResolvedModelRequestTarget,
+    runtime_context: Option<&ClientRuntimeContext>,
+    selection: &SessionModelSelection,
+    retain_environment_snapshot: bool,
+    prepared_catalog: Option<Arc<tool_catalog::Snapshot>>,
+    cancel_state: &TurnCancelState,
+    projection_only: bool,
+) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
+    let projection_cancel = TurnCancelState {
+        token: cancel_state.token.clone(),
+        ..TurnCancelState::default()
+    };
+    let cancel_state = if projection_only {
+        &projection_cancel
+    } else {
+        cancel_state
+    };
     let setup_labels = model_turn_metric_labels(session_id, turn_id);
     #[cfg(test)]
     let probe_timer = |stage| {
@@ -28370,8 +28587,9 @@ async fn prepare_static_model_turn_context(
         .filter_map(|candidate| candidate.get("id")?.as_str().map(str::to_owned))
         .collect();
     let mut skill_ranking_applied = false;
-    if let Some(purpose) =
-        skill_catalog_ranking_purpose(skill_catalog_eligible, pressure, &config.judgement)
+    if !projection_only
+        && let Some(purpose) =
+            skill_catalog_ranking_purpose(skill_catalog_eligible, pressure, &config.judgement)
         && let Some(order) = optional_selection_order(
             state,
             newest_task,
@@ -28433,11 +28651,19 @@ async fn prepare_static_model_turn_context(
         setup_labels.clone(),
     );
     let invariant_mode = config.invariants.enabled.then_some(config.invariants.mode);
-    let full_fallback = state
-        .invariant_full_fallback
-        .lock()
-        .await
-        .remove(&session_id);
+    let full_fallback = if projection_only {
+        state
+            .invariant_full_fallback
+            .lock()
+            .await
+            .contains(&session_id)
+    } else {
+        state
+            .invariant_full_fallback
+            .lock()
+            .await
+            .remove(&session_id)
+    };
     #[cfg(test)]
     let stage_timer =
         probe_timer(workflow_representation::fanout_stages::FanoutAdmissionStage::DynamicContext);
@@ -28567,20 +28793,22 @@ async fn prepare_static_model_turn_context(
                 text: skill_context.context,
             }],
         });
-        let _ = state
-            .sessions
-            .append_event(
-                session_id,
-                SessionEventKind::SkillContextLoaded {
-                    skill_id: skill_context.skill_id,
-                    bytes_loaded: skill_context.bytes_loaded,
-                    truncated: skill_context.truncated,
-                    loaded_at_ms: current_time_ms(),
-                    preview: Some(preview),
-                    source: Some(skill_context.source),
-                },
-            )
-            .await;
+        if !projection_only {
+            let _ = state
+                .sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::SkillContextLoaded {
+                        skill_id: skill_context.skill_id,
+                        bytes_loaded: skill_context.bytes_loaded,
+                        truncated: skill_context.truncated,
+                        loaded_at_ms: current_time_ms(),
+                        preview: Some(preview),
+                        source: Some(skill_context.source),
+                    },
+                )
+                .await;
+        }
     }
     let enabled_tools = intersect_tool_allowlists(
         agent_context
@@ -28614,7 +28842,9 @@ async fn prepare_static_model_turn_context(
             "Tool discovery degraded: {} provider(s) unavailable; their tools are excluded for this turn.",
             tool_catalog.failures.len()
         );
-        append_system_event(state, session_id, message.clone()).await;
+        if !projection_only {
+            append_system_event(state, session_id, message.clone()).await;
+        }
         system_messages.push(ModelMessage {
             role: MessageRole::System,
             content: vec![ContentBlock::Text { text: message }],
@@ -28641,26 +28871,30 @@ async fn prepare_static_model_turn_context(
         .filter_map(|candidate| candidate.get("id")?.as_str().map(str::to_owned))
         .collect();
     let mut final_tool_order = original_tool_ids.clone();
-    let tool_ranking_applied = optional_selection_order(
-        state,
-        newest_task,
-        "recommendations",
-        shortlist.clone(),
-        config,
-        cancel_state,
-        &observation,
-    )
-    .await
-    .is_some_and(|order| {
-        let original = base_tools.clone();
-        for (slot, id) in order.iter().enumerate() {
-            if let Some(tool) = original.iter().find(|tool| &tool.name == id) {
-                base_tools[slot] = tool.clone();
+    let tool_ranking_applied = if projection_only {
+        false
+    } else {
+        optional_selection_order(
+            state,
+            newest_task,
+            "recommendations",
+            shortlist.clone(),
+            config,
+            cancel_state,
+            &observation,
+        )
+        .await
+        .is_some_and(|order| {
+            let original = base_tools.clone();
+            for (slot, id) in order.iter().enumerate() {
+                if let Some(tool) = original.iter().find(|tool| &tool.name == id) {
+                    base_tools[slot] = tool.clone();
+                }
             }
-        }
-        final_tool_order.clone_from(&order);
-        order != original_tool_ids
-    });
+            final_tool_order.clone_from(&order);
+            order != original_tool_ids
+        })
+    };
     if let Some(selection) = selection_observation(&shortlist, &final_tool_order, &final_tool_order)
     {
         observation.finish_recommendation(
@@ -28732,7 +28966,6 @@ async fn build_model_turn_request(
 ) -> Result<PreparedModelRequest, bcode_session::SessionError> {
     let metric_labels =
         model_request_metric_labels(session_id, provider_plugin_id, selected_model_id, round);
-    let build_timer = state.metrics.timer();
     let history_timer = state.metrics.timer();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let mut admission =
@@ -28783,13 +29016,55 @@ async fn build_model_turn_request(
         history.len() as u64,
         metric_labels.clone(),
     );
+    Box::pin(assemble_model_turn_request(
+        state,
+        session_id,
+        trigger_event,
+        execution,
+        round,
+        provider_plugin_id,
+        selected_model_id,
+        retry_instruction,
+        selection,
+        compaction_policy,
+        static_context,
+        config,
+        &history,
+        context_through_sequence,
+        false,
+    ))
+    .await
+}
+
+/// Share actual assembly with non-dispatch compaction projections.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn assemble_model_turn_request(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+    execution: &bcode_session_models::TurnExecutionOptions,
+    round: u32,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: Option<&str>,
+    retry_instruction: Option<&str>,
+    selection: &SessionModelSelection,
+    compaction_policy: &AutomaticCompactionPolicy,
+    static_context: &StaticModelTurnContext,
+    config: &bcode_config::BcodeConfig,
+    history: &[bcode_session_models::SessionEvent],
+    context_through_sequence: u64,
+    projection_only: bool,
+) -> Result<PreparedModelRequest, bcode_session::SessionError> {
+    let metric_labels =
+        model_request_metric_labels(session_id, provider_plugin_id, selected_model_id, round);
+    let build_timer = state.metrics.timer();
     let context_format = compaction_policy
         .capabilities
         .as_ref()
         .and_then(|capabilities| capabilities.context_format.as_ref());
     let convert_timer = state.metrics.timer();
     let mut messages = session_events_to_model_messages_with_turn_context(
-        &history,
+        history,
         config.model.tool_output.context_chars,
         provider_plugin_id,
         Some(&model_id_for_provider_request(selected_model_id)),
@@ -28799,6 +29074,15 @@ async fn build_model_turn_request(
         config.model.tool_output.fallback_argument_chars.get(),
         Some((trigger_event.sequence, &static_context.system_messages)),
     );
+    if projection_only
+        && !history
+            .iter()
+            .any(|event| event.sequence == trigger_event.sequence)
+    {
+        // A manual operation may compact the last admitted trigger. Its replacement request
+        // still needs the complete current turn-static overhead, never an empty-history discount.
+        messages.extend(static_context.system_messages.clone());
+    }
     if let Some(source) = context_generation::events(state, session_id, execution).await? {
         let mut preceding = session_events_to_model_messages_for_target_with_limits(
             &source,
@@ -28837,49 +29121,56 @@ async fn build_model_turn_request(
             .sum::<usize>() as u64,
         metric_labels.clone(),
     );
-    // Diagnostic advice is request-only and follows canonical tool/result chronology.
-    let runtime = state
-        .session_runtimes
-        .lock()
-        .await
-        .get(&session_id)
-        .cloned();
-    if let Some(runtime) = runtime {
-        let cancellation = {
-            let current = runtime.current_turn.lock().await;
-            current
-                .as_ref()
-                .filter(|current| current.turn_id == execution_turn_id(trigger_event))
-                .map(|current| {
-                    current.cancel_state.append_advisory_messages(&mut messages);
-                    Arc::clone(&current.cancel_state)
-                })
-        };
-        if let Some(cancellation) = cancellation {
-            let evidence = match workflow_contributor_evidence::entry_context(
-                state,
-                session_id,
-                &cancellation,
-            )
+    let request_only_start = messages.len();
+    let mut incorporated_lineage = context_lineage::Incorporated::default();
+    if projection_only {
+        messages.extend(context_compaction_request_budget::request_only());
+    } else {
+        // Diagnostic advice is request-only and follows canonical tool/result chronology.
+        let runtime = state
+            .session_runtimes
+            .lock()
             .await
-            {
-                Ok(Some(evidence)) => Some(serde_json::to_string(&evidence).map_err(|error| {
-                    bcode_session::SessionError::EventSerialization(error.to_string())
-                })?),
-                Ok(None) => None,
-                Err(error) => {
-                    // Optional context never authorizes access or changes activation state.
-                    // A revised graph may no longer prove this source's contributor scope.
-                    let failure =
-                        workflow_contributor_evidence::EvidenceFailure::from_error(&error)
-                            .resolution();
-                    Some(serde_json::to_string(&failure).map_err(|error| {
-                        bcode_session::SessionError::EventSerialization(error.to_string())
-                    })?)
-                }
+            .get(&session_id)
+            .cloned();
+        if let Some(runtime) = runtime {
+            let cancellation = {
+                let current = runtime.current_turn.lock().await;
+                current
+                    .as_ref()
+                    .filter(|current| current.turn_id == execution_turn_id(trigger_event))
+                    .map(|current| {
+                        current.cancel_state.append_advisory_messages(&mut messages);
+                        Arc::clone(&current.cancel_state)
+                    })
             };
-            if let Some(evidence) = evidence {
-                messages.push(ModelMessage {
+            if let Some(cancellation) = cancellation {
+                let evidence = match workflow_contributor_evidence::entry_context(
+                    state,
+                    session_id,
+                    &cancellation,
+                )
+                .await
+                {
+                    Ok(Some(evidence)) => {
+                        Some(serde_json::to_string(&evidence).map_err(|error| {
+                            bcode_session::SessionError::EventSerialization(error.to_string())
+                        })?)
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        // Optional context never authorizes access or changes activation state.
+                        // A revised graph may no longer prove this source's contributor scope.
+                        let failure =
+                            workflow_contributor_evidence::EvidenceFailure::from_error(&error)
+                                .resolution();
+                        Some(serde_json::to_string(&failure).map_err(|error| {
+                            bcode_session::SessionError::EventSerialization(error.to_string())
+                        })?)
+                    }
+                };
+                if let Some(evidence) = evidence {
+                    messages.push(ModelMessage {
                     role: MessageRole::System,
                     content: vec![ContentBlock::Text {
                         text: format!(
@@ -28887,70 +29178,72 @@ async fn build_model_turn_request(
                         ),
                     }],
                 });
+                }
             }
         }
-    }
-    // The active explicit user objective is gathered from the already bounded current context,
-    // never by replaying history. Only text is eligible; tool output is not an objective.
-    let objective = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == MessageRole::User)
-        .and_then(|message| {
-            message.content.iter().find_map(|block| match block {
-                ContentBlock::Text { text } if !text.trim().is_empty() && text.len() <= 4096 => {
-                    Some(text.clone())
-                }
-                _ => None,
-            })
-        });
-    if let Ok(mut windows) = state.progress_windows.lock() {
-        if windows.len() >= 256 && !windows.contains_key(&session_id) {
-            windows.clear();
-        }
-        let window = windows.entry(session_id).or_default();
-        window.set_objective(objective.unwrap_or_default());
-        if config
-            .judgement
-            .enabled(bcode_model::judgement::Feature::ProgressMonitoring)
-            && let Some(advice) = &window.advice
-        {
-            messages.push(ModelMessage {
+        // The active explicit user objective is gathered from the already bounded current context,
+        // never by replaying history. Only text is eligible; tool output is not an objective.
+        let objective = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+            .and_then(|message| {
+                message.content.iter().find_map(|block| match block {
+                    ContentBlock::Text { text }
+                        if !text.trim().is_empty() && text.len() <= 4096 =>
+                    {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+            });
+        if let Ok(mut windows) = state.progress_windows.lock() {
+            if windows.len() >= 256 && !windows.contains_key(&session_id) {
+                windows.clear();
+            }
+            let window = windows.entry(session_id).or_default();
+            window.set_objective(objective.unwrap_or_default());
+            if config
+                .judgement
+                .enabled(bcode_model::judgement::Feature::ProgressMonitoring)
+                && let Some(advice) = &window.advice
+            {
+                messages.push(ModelMessage {
                 role: MessageRole::System,
                 content: vec![ContentBlock::Text {
                     text: format!("Advisory observation only; not completion, permission or retry authority: {}", advice.message),
                 }],
             });
+            }
         }
-    }
-    let mut incorporated_lineage = context_lineage::Incorporated::default();
-    // Optional evidence is request-local; canonical messages remain in their original order.
-    if let Some((token, observation)) = &static_context.optional_context_owner {
-        let cancel = TurnCancelState {
-            token: token.clone(),
-            judgement_observation: StdMutex::new(observation.clone()),
-            ..TurnCancelState::default()
-        };
-        incorporated_lineage = append_turn_optional_context(
-            state,
-            session_id,
-            execution,
-            &mut messages,
-            config,
-            &cancel,
-        )
-        .await;
-        let history_lineage = judgement_history::append(
-            state,
-            session_id,
-            trigger_event.sequence,
-            execution,
-            &mut messages,
-            config,
-            &cancel,
-        )
-        .await;
-        incorporated_lineage.merge(history_lineage);
+        // Optional evidence is request-local; canonical messages remain in their original order.
+        if let Some((token, observation)) = &static_context.optional_context_owner {
+            let cancel = TurnCancelState {
+                token: token.clone(),
+                judgement_observation: StdMutex::new(observation.clone()),
+                ..TurnCancelState::default()
+            };
+            incorporated_lineage = append_turn_optional_context(
+                state,
+                session_id,
+                execution,
+                &mut messages,
+                config,
+                &cancel,
+            )
+            .await;
+            let history_lineage = judgement_history::append(
+                state,
+                session_id,
+                trigger_event.sequence,
+                execution,
+                &mut messages,
+                config,
+                &cancel,
+            )
+            .await;
+            incorporated_lineage.merge(history_lineage);
+        }
     }
     // Recovery observations must follow historical snapshots to supersede them.
     if let Some(context) = &static_context.recovery_context {
@@ -28966,6 +29259,15 @@ async fn build_model_turn_request(
                 text: instruction.to_string(),
             }],
         });
+    }
+    if !projection_only {
+        context_compaction_request_budget::remember(
+            trigger_event,
+            execution,
+            round,
+            static_context,
+            &messages[request_only_start..],
+        );
     }
     let system_prompt = static_context.system_prompt.clone();
     let tools = static_context.tools.clone();
@@ -29252,13 +29554,8 @@ async fn build_model_turn_request(
         build_timer.elapsed_ms(),
         metric_labels,
     );
-    let context_projection = Box::pin(projected_request_context(
-        state,
-        session_id,
-        provider_plugin_id,
-        &request,
-    ))
-    .await;
+    // Request-local hydration is read-only and shared with projections, so the estimator sees
+    // the same complete image representation that is sent to the provider.
     Box::pin(image_input::hydrate_tool_result_images(
         state,
         session_id,
@@ -29266,15 +29563,24 @@ async fn build_model_turn_request(
         &mut request,
     ))
     .await;
-    request.context_lineage =
-        context_lineage::final_lineage(&request.messages, &incorporated_lineage);
-    Box::pin(append_negotiated_feature_fidelity_events(
+    let context_projection = Box::pin(projected_request_context(
         state,
         session_id,
+        provider_plugin_id,
         &request,
-        &resolved_features,
     ))
     .await;
+    if !projection_only {
+        request.context_lineage =
+            context_lineage::final_lineage(&request.messages, &incorporated_lineage);
+        Box::pin(append_negotiated_feature_fidelity_events(
+            state,
+            session_id,
+            &request,
+            &resolved_features,
+        ))
+        .await;
+    }
     Ok(PreparedModelRequest {
         request,
         context_projection,

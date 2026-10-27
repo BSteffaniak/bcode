@@ -33,6 +33,10 @@ struct Control {
 
 impl Control {
     fn prepare(request: &ModelTurnRequest) -> Result<Self, String> {
+        Self::prepare_with_prefix(request, "attempt-")
+    }
+
+    fn prepare_with_prefix(request: &ModelTurnRequest, prefix: &str) -> Result<Self, String> {
         let settings = &request.provider_context.settings;
         let root = Path::new(&settings["fake_compaction_control_dir"]);
         if !root.is_absolute() || !root.is_dir() {
@@ -84,7 +88,7 @@ impl Control {
             return Err("unsupported fake compaction outcome".into());
         }
         let directory = tempfile::Builder::new()
-            .prefix("attempt-")
+            .prefix(prefix)
             .tempdir_in(root)
             .map_err(|_| "cannot create compaction scratch attempt")?
             .keep();
@@ -286,6 +290,33 @@ fn source_coverage(sources: &str) -> Result<Vec<Value>, String> {
     }).collect()
 }
 
+/// Capture actual non-compaction model input for offline post-marker verification.
+/// Provider settings/custody are excluded, exactly as for compaction request captures.
+///
+/// # Errors
+/// Returns an error for an invalid scratch directory or failed atomic evidence write.
+pub fn capture_context(request: &ModelTurnRequest) -> Result<(), String> {
+    if !request
+        .provider_context
+        .settings
+        .contains_key("fake_compaction_control_dir")
+        || request
+            .metadata
+            .get("bcode_request_kind")
+            .is_some_and(|kind| kind == "compaction")
+    {
+        return Ok(());
+    }
+    let control = Control::prepare_with_prefix(request, "context-")?;
+    control.write_json(
+        "context.json",
+        &json!({
+            "format": "bcode.fake.compaction-context.v1",
+            "request_file": "request.json",
+        }),
+    )
+}
+
 /// Dispatch only explicitly enabled compaction requests, without blocking turn admission.
 pub fn dispatch(
     request: &ModelTurnRequest,
@@ -345,6 +376,36 @@ pub fn enabled(request: &ModelTurnRequest) -> bool {
 mod tests {
     use super::*;
     use crate::ProviderTurnEvent;
+
+    #[test]
+    fn ordinary_context_capture_does_not_enter_compaction_attempt_inventory() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut request = request(scratch.path());
+        request.metadata.remove("bcode_request_kind");
+        capture_context(&request).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(scratch.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("context-")
+        );
+        assert!(entries[0].join("context.json").is_file());
+        let captured: Value =
+            serde_json::from_slice(&std::fs::read(entries[0].join("request.json")).unwrap())
+                .unwrap();
+        assert!(captured.get("provider_context").is_none());
+        assert_eq!(
+            captured["messages"],
+            serde_json::to_value(&request.messages).unwrap()
+        );
+    }
 
     fn request(directory: &Path) -> ModelTurnRequest {
         let directory = directory.canonicalize().unwrap();

@@ -16,8 +16,8 @@
 
 mod compaction_checkpoint;
 pub use compaction_checkpoint::{
-    CompactionCheckpointCommit, CompactionEventIdentity, MAX_COMPACTION_COMMIT_SOURCE_EVENTS,
-    compaction_event_identity,
+    CompactionCheckpointCommit, CompactionCheckpointRestart, CompactionEventIdentity,
+    MAX_COMPACTION_COMMIT_SOURCE_EVENTS, compaction_event_identity,
 };
 
 /// Initial observation resource exhaustion is not canonical damage.
@@ -2771,6 +2771,26 @@ impl SessionManager {
         self.session_handle(session_id)
             .await?
             .commit_compaction_checkpoint(request, self.next_activity_timestamp_ms())
+            .await
+    }
+
+    /// Atomically supersede an unpublished current-format checkpoint without erasing evidence.
+    ///
+    /// Exact retries return the original replacement event. A conflicting retry, changed
+    /// source/marker/checkpoint/rejection generation, or unsupported evidence fails closed.
+    /// The host must validate opaque payloads and complete-rejection semantics beforehand.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or stale fences, incompatible storage, lost ownership,
+    /// unavailable storage, or transaction failure. No partial retirement is published.
+    pub async fn restart_compaction_checkpoint(
+        &self,
+        session_id: SessionId,
+        request: CompactionCheckpointRestart,
+    ) -> Result<SessionEvent, SessionError> {
+        self.session_handle(session_id)
+            .await?
+            .restart_compaction_checkpoint(request, self.next_activity_timestamp_ms())
             .await
     }
 

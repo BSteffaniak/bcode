@@ -5,6 +5,50 @@ use sha2::Sha256;
 
 const CHECKPOINT_FORMAT: &str = "bcode.local-compaction.v1";
 const MAX_PAYLOAD: usize = bcode_session_models::MAX_COMPACTION_CHECKPOINT_PAYLOAD_BYTES;
+const CAPACITY_POLICY_FORMAT: &str = "bcode.compaction.capacity-policy.v1";
+
+/// Exact validation bounds, not a replacement for semantic request estimation.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointPolicy {
+    format: String,
+    max_carry_chars: usize,
+    max_wire_bytes: usize,
+    max_section_chars: usize,
+}
+
+impl CheckpointPolicy {
+    fn from_policy(policy: synthesis::SynthesisPolicy) -> Result<Self, CompactionError> {
+        let value = Self {
+            format: CAPACITY_POLICY_FORMAT.into(),
+            max_carry_chars: policy.carry_chars,
+            max_wire_bytes: policy.wire_bytes,
+            max_section_chars: policy.section_chars,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), CompactionError> {
+        if self.format != CAPACITY_POLICY_FORMAT
+            || self.max_carry_chars == 0
+            || self.max_wire_bytes == 0
+            || self.max_section_chars == 0
+            || self.max_section_chars > self.max_carry_chars
+        {
+            return Err(invalid_checkpoint());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+enum SynthesisPhase {
+    #[default]
+    Accumulating,
+    ConsolidatingV1,
+}
 
 fn legacy_packing_policy() -> String {
     "legacy-chars-v1".into()
@@ -76,10 +120,27 @@ pub(super) fn operation_key(
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RestartAllowance {
+    max_requests: u32,
+    deadline_ms: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct LocalCheckpoint {
     format: String,
     #[serde(default = "legacy_packing_policy")]
     pub(super) packing_policy: String,
+    #[serde(default)]
+    synthesis_policy: Option<CheckpointPolicy>,
+    #[serde(default)]
+    resolved_policy: Option<serde_json::Value>,
+    #[serde(default)]
+    restart_allowance: Option<RestartAllowance>,
+    #[serde(default)]
+    synthesis_phase: SynthesisPhase,
+    #[serde(default)]
+    consolidation_requests: Vec<u8>,
     pub(super) boundary: u64,
     source_digest: String,
     manifest: Vec<String>,
@@ -93,6 +154,7 @@ pub(super) struct LocalCheckpoint {
 }
 
 impl LocalCheckpoint {
+    #[cfg(test)]
     pub(super) fn create(
         plan: &CompactionPlan,
         transcript: &CompactionTranscript,
@@ -103,6 +165,11 @@ impl LocalCheckpoint {
             checkpoint_sequence: 0,
             format: CHECKPOINT_FORMAT.into(),
             packing_policy: legacy_packing_policy(),
+            synthesis_policy: None,
+            resolved_policy: None,
+            restart_allowance: None,
+            synthesis_phase: SynthesisPhase::Accumulating,
+            consolidation_requests: Vec::new(),
             boundary: plan.compacted_through_sequence,
             source_digest: source_digest(&plan.compactable_prefix)?,
             manifest: chunks.iter().map(digest).collect::<Result<_, _>>()?,
@@ -116,11 +183,186 @@ impl LocalCheckpoint {
         Ok(checkpoint)
     }
 
+    /// Start current capacity-aware work. Existing payloads are never upgraded in place.
+    pub(super) fn create_with_policy(
+        plan: &CompactionPlan,
+        transcript: &CompactionTranscript,
+        chunks: &[String],
+        policy: synthesis::SynthesisPolicy,
+    ) -> Result<Self, CompactionError> {
+        let checkpoint = Self {
+            checkpoint_sequence: 0,
+            format: CHECKPOINT_FORMAT.into(),
+            packing_policy: legacy_packing_policy(),
+            synthesis_policy: Some(CheckpointPolicy::from_policy(policy)?),
+            resolved_policy: None,
+            restart_allowance: None,
+            synthesis_phase: SynthesisPhase::Accumulating,
+            consolidation_requests: vec![0; chunks.len()],
+            boundary: plan.compacted_through_sequence,
+            source_digest: source_digest(&plan.compactable_prefix)?,
+            manifest: chunks.iter().map(digest).collect::<Result<_, _>>()?,
+            next_chunk: 0,
+            requests: vec![0; chunks.len()],
+            evidence: initial_evidence_with_policy(transcript, policy.carry_chars)?,
+            unfinished: BTreeSet::new(),
+            user_sequences: prior_scope_sequences(transcript.previous_summary.as_deref()),
+        };
+        Self::decode(&checkpoint.encode()?)?;
+        Ok(checkpoint)
+    }
+
+    /// Call before restoration or dispatch; absence is explicit incompatibility, not a reset.
+    pub(super) fn verify_policy(
+        &self,
+        policy: synthesis::SynthesisPolicy,
+    ) -> Result<(), CompactionError> {
+        if self.synthesis_policy.as_ref() != Some(&CheckpointPolicy::from_policy(policy)?) {
+            return Err(CompactionError::Provider(
+                "compaction synthesis policy changed or is incompatible; explicit supersession required; boundary unchanged".into(),
+            ));
+        }
+        if self.synthesis_phase != SynthesisPhase::Accumulating {
+            return Err(CompactionError::Provider(
+                "compaction consolidation outcome is unresolved; boundary unchanged".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Freeze the complete version-1 resolved budget on fresh, undispatched work only.
+    /// Generic serialization avoids coupling checkpoint storage to the planner module's location.
+    pub(super) fn bind_resolved_policy<T: serde::Serialize>(
+        &mut self,
+        policy: &T,
+    ) -> Result<(), CompactionError> {
+        let value = serde_json::to_value(policy).map_err(|_| invalid_checkpoint())?;
+        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || self.synthesis_policy.is_none()
+            || self.resolved_policy.is_some()
+            || self.next_chunk != 0
+            || self.requests.iter().any(|count| *count != 0)
+        {
+            return Err(invalid_checkpoint());
+        }
+        self.resolved_policy = Some(value);
+        self.encode()?;
+        Ok(())
+    }
+
+    /// Bind the complete serialized token-capacity contract, not only synthesis byte guards.
+    pub(super) fn bind_capacity_policy<T: serde::Serialize>(
+        &mut self,
+        policy: &T,
+    ) -> Result<(), CompactionError> {
+        self.bind_resolved_policy(policy)
+    }
+
+    /// Verify the complete frozen contract without changing consumed allowances or source pins.
+    pub(super) fn verify_capacity_policy<T: serde::Serialize>(
+        &self,
+        policy: &T,
+    ) -> Result<(), CompactionError> {
+        self.verify_resolved_policy(policy)
+    }
+
+    /// Stable digest of the complete frozen serialized capacity contract.
+    #[cfg(test)]
+    pub(super) fn capacity_policy_digest(&self) -> Result<String, CompactionError> {
+        digest(
+            self.resolved_policy
+                .as_ref()
+                .ok_or_else(invalid_checkpoint)?,
+        )
+    }
+
+    /// Decode the frozen budget into the planner's current typed contract.
+    /// Absence is incompatible state, never permission to resolve and replace a spent budget.
+    pub(super) fn resolved_policy<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<T, CompactionError> {
+        let value = self
+            .resolved_policy
+            .as_ref()
+            .ok_or_else(invalid_checkpoint)?;
+        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return Err(invalid_checkpoint());
+        }
+        serde_json::from_value(value.clone()).map_err(|_| invalid_checkpoint())
+    }
+
+    /// Compare the entire freshly resolved typed budget before any restoration or reservation.
+    pub(super) fn verify_resolved_policy<T: serde::Serialize>(
+        &self,
+        policy: &T,
+    ) -> Result<(), CompactionError> {
+        let value = serde_json::to_value(policy).map_err(|_| invalid_checkpoint())?;
+        if self.resolved_policy.as_ref() != Some(&value) {
+            return Err(invalid_checkpoint());
+        }
+        Ok(())
+    }
+
     pub(super) fn decode(payload: &str) -> Result<Self, CompactionError> {
         if payload.len() > MAX_PAYLOAD {
             return Err(invalid_checkpoint());
         }
         let checkpoint: Self = serde_json::from_str(payload).map_err(|_| invalid_checkpoint())?;
+        if checkpoint
+            .restart_allowance
+            .as_ref()
+            .is_some_and(|allowance| {
+                allowance.max_requests == 0
+                    || allowance.max_requests > 2_048
+                    || allowance.deadline_ms == 0
+                    || checkpoint.resolved_policy.is_none()
+                    || checkpoint
+                        .requests
+                        .iter()
+                        .chain(&checkpoint.consolidation_requests)
+                        .map(|count| u32::from(*count))
+                        .sum::<u32>()
+                        > allowance.max_requests
+            })
+        {
+            return Err(invalid_checkpoint());
+        }
+        if checkpoint.resolved_policy.as_ref().is_some_and(|value| {
+            checkpoint.synthesis_policy.is_none()
+                || value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        }) {
+            return Err(invalid_checkpoint());
+        }
+        let max_carry_chars = if let Some(policy) = &checkpoint.synthesis_policy {
+            policy.validate()?;
+            if checkpoint.consolidation_requests.len() != checkpoint.manifest.len()
+                || checkpoint
+                    .consolidation_requests
+                    .iter()
+                    .any(|count| *count > 2)
+                || checkpoint
+                    .consolidation_requests
+                    .iter()
+                    .skip(checkpoint.next_chunk)
+                    .any(|count| *count != 0)
+                || (checkpoint.synthesis_phase == SynthesisPhase::ConsolidatingV1
+                    && (checkpoint.next_chunk == 0
+                        || checkpoint
+                            .consolidation_requests
+                            .get(checkpoint.next_chunk - 1)
+                            .is_none_or(|count| *count == 0)))
+            {
+                return Err(invalid_checkpoint());
+            }
+            policy.max_carry_chars
+        } else {
+            if checkpoint.synthesis_phase != SynthesisPhase::Accumulating
+                || !checkpoint.consolidation_requests.is_empty()
+            {
+                return Err(invalid_checkpoint());
+            }
+            COMPACTION_MAX_CARRIED_SUMMARY_CHARS
+        };
         if checkpoint.format != CHECKPOINT_FORMAT
             || checkpoint.manifest.is_empty()
             || checkpoint.manifest.len() > COMPACTION_MAX_CHUNKS
@@ -153,11 +395,16 @@ impl LocalCheckpoint {
             || encode_compaction_evidence(&checkpoint.evidence)?
                 .chars()
                 .count()
-                > COMPACTION_MAX_CARRIED_SUMMARY_CHARS
+                > max_carry_chars
         {
             return Err(invalid_checkpoint());
         }
         Ok(checkpoint)
+    }
+
+    /// A cursor alone cannot establish acceptance while a second synthesis call is unresolved.
+    pub(super) fn accepted_chunk(&self, chunk: usize) -> bool {
+        self.synthesis_phase == SynthesisPhase::Accumulating && self.next_chunk > chunk
     }
 
     pub(super) fn verify_chunks(&self, chunks: &[String]) -> Result<(), CompactionError> {
@@ -199,7 +446,13 @@ impl LocalCheckpoint {
             || (self.next_chunk > 0 && self.user_sequences != expected_users)
             || (self.next_chunk == 0
                 && (self.user_sequences != known
-                    || digest(&self.evidence)? != digest(&initial_evidence(transcript))?))
+                    || digest(&self.evidence)?
+                        != digest(&match &self.synthesis_policy {
+                            Some(policy) => {
+                                initial_evidence_with_policy(transcript, policy.max_carry_chars)?
+                            }
+                            None => initial_evidence(transcript),
+                        })?))
         {
             return Err(invalid_checkpoint());
         }
@@ -238,8 +491,17 @@ impl LocalCheckpoint {
             resume,
             budgets: Some(CompactionInspectionBudgets {
                 provider_requests: Some(CompactionInspectionCount {
-                    done: self.requests.iter().map(|count| u64::from(*count)).sum(),
-                    total: total.saturating_mul(2),
+                    done: self
+                        .requests
+                        .iter()
+                        .chain(&self.consolidation_requests)
+                        .map(|count| u64::from(*count))
+                        .sum(),
+                    total: total.saturating_mul(if self.synthesis_policy.is_some() {
+                        4
+                    } else {
+                        2
+                    }),
                 }),
                 source_events: None,
                 decoded_bytes: None,
@@ -309,8 +571,42 @@ impl LocalCheckpoint {
         Ok(attempt)
     }
 
+    /// Recheck immediately before final publication; reaching the call cap after a completed
+    /// response is allowed, but an elapsed explicit restart deadline is not.
+    pub(super) fn verify_publication_deadline(&self) -> Result<(), CompactionError> {
+        if self
+            .restart_allowance
+            .as_ref()
+            .is_some_and(|allowance| current_unix_millis() >= allowance.deadline_ms)
+        {
+            return Err(CompactionError::Provider(
+                "explicit compaction restart deadline exhausted; boundary unchanged".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_restart_allowance(&self) -> Result<(), CompactionError> {
+        if let Some(allowance) = &self.restart_allowance {
+            let consumed: u32 = self
+                .requests
+                .iter()
+                .chain(&self.consolidation_requests)
+                .map(|count| u32::from(*count))
+                .sum();
+            if consumed >= allowance.max_requests || current_unix_millis() >= allowance.deadline_ms
+            {
+                return Err(CompactionError::Provider(
+                    "explicit compaction restart allowance exhausted; boundary unchanged".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn reserve_slot(&mut self, index: usize) -> Result<u8, CompactionError> {
-        if index != self.next_chunk {
+        self.verify_restart_allowance()?;
+        if index != self.next_chunk || self.synthesis_phase != SynthesisPhase::Accumulating {
             return Err(invalid_checkpoint());
         }
         let count = self
@@ -325,6 +621,80 @@ impl LocalCheckpoint {
         let attempt = *count;
         *count += 1;
         Ok(attempt)
+    }
+
+    fn reserve_consolidation_slot(&mut self) -> Result<u8, CompactionError> {
+        self.verify_restart_allowance()?;
+        if self.synthesis_policy.is_none()
+            || self.next_chunk == 0
+            || self.synthesis_phase != SynthesisPhase::Accumulating
+        {
+            return Err(invalid_checkpoint());
+        }
+        let count = self
+            .consolidation_requests
+            .get_mut(self.next_chunk - 1)
+            .ok_or_else(invalid_checkpoint)?;
+        if *count >= 2 {
+            return Err(CompactionError::Provider(
+                "compaction consolidation request/repair budget exhausted; boundary unchanged"
+                    .into(),
+            ));
+        }
+        let attempt = *count;
+        *count += 1;
+        self.synthesis_phase = SynthesisPhase::ConsolidatingV1;
+        Ok(attempt)
+    }
+
+    /// Reserve before dispatch. Only an explicitly rejected response permits in-process repair;
+    /// restoration of an unresolved dispatch fails closed through `verify_policy`.
+    pub(super) async fn reserve_consolidation(
+        &mut self,
+        state: &ServerState,
+        session_id: SessionId,
+        key: &str,
+    ) -> Result<u8, CompactionError> {
+        let attempt = self.reserve_consolidation_slot()?;
+        self.save(state, session_id, key).await?;
+        compaction_recovery::transition(
+            state,
+            session_id,
+            compaction_recovery::Phase::ConsolidatingV1,
+        )
+        .await?;
+        Ok(attempt)
+    }
+
+    /// Record a complete, explicitly rejected response in the current process before repair.
+    /// Do not call for cancellation, interruption, transport failure or an unknown outcome.
+    pub(super) fn reject_consolidation_response(&mut self) -> Result<(), CompactionError> {
+        if self.synthesis_phase != SynthesisPhase::ConsolidatingV1 {
+            return Err(invalid_checkpoint());
+        }
+        self.synthesis_phase = SynthesisPhase::Accumulating;
+        Ok(())
+    }
+
+    /// Accept only a caller-validated consolidation. Independent scope and provenance cannot change.
+    pub(super) fn accept_consolidation(
+        &mut self,
+        evidence: &CompactionEvidence,
+    ) -> Result<(), CompactionError> {
+        let Some(policy) = &self.synthesis_policy else {
+            return Err(invalid_checkpoint());
+        };
+        if self.synthesis_phase != SynthesisPhase::ConsolidatingV1
+            || evidence.format != self.evidence.format
+            || digest(&evidence.current_scope)? != digest(&self.evidence.current_scope)?
+            || evidence.continuation.trim().is_empty()
+            || encode_compaction_evidence(evidence)?.chars().count() > policy.max_carry_chars
+        {
+            return Err(invalid_checkpoint());
+        }
+        self.evidence = evidence.clone();
+        self.synthesis_phase = SynthesisPhase::Accumulating;
+        Ok(())
     }
 
     pub(super) fn restore(&self) -> (CompactionEvidence, BTreeSet<u64>, BTreeSet<u64>) {
@@ -348,6 +718,34 @@ impl LocalCheckpoint {
     }
 }
 
+pub(super) fn initial_evidence_with_policy(
+    transcript: &CompactionTranscript,
+    max_carry_chars: usize,
+) -> Result<CompactionEvidence, CompactionError> {
+    let Some(summary) = transcript.previous_summary.as_deref() else {
+        return Ok(initial_evidence(transcript));
+    };
+    // Current-format evidence only. Historical conversion belongs to migration, not restoration.
+    if summary.len() > MAX_PAYLOAD {
+        return Err(invalid_checkpoint());
+    }
+    // An opaque portable recollection is source data, not a checkpoint representation.
+    // It is consumed whole by compaction_evidence_input; it grants no structured scope.
+    let Ok(evidence) = serde_json::from_str::<CompactionEvidence>(summary) else {
+        return Ok(CompactionEvidence {
+            format: COMPACTION_SUMMARY_FORMAT.into(),
+            current_scope: Vec::new(),
+            continuation: String::new(),
+        });
+    };
+    if evidence.format != COMPACTION_SUMMARY_FORMAT
+        || encode_compaction_evidence(&evidence)?.chars().count() > max_carry_chars
+    {
+        return Err(invalid_checkpoint());
+    }
+    Ok(evidence)
+}
+
 pub(super) fn initial_evidence(transcript: &CompactionTranscript) -> CompactionEvidence {
     transcript
         .previous_summary
@@ -360,6 +758,522 @@ pub(super) fn initial_evidence(transcript: &CompactionTranscript) -> CompactionE
             current_scope: Vec::new(),
             continuation: String::new(),
         })
+}
+
+/// Canonical identities to recheck in the same transaction that publishes supersession.
+pub(super) struct RestartFailureProof {
+    events: Vec<bcode_session::CompactionEventIdentity>,
+    operation_key: String,
+}
+
+/// Explicit maintenance evidence read, bounded to 512 exact canonical sequence positions.
+/// `start_sequence` selects the operation's Started trace; `finished_sequence` selects its
+/// complete bounded-repair rejection. This neither scans history nor classifies unknown formats.
+pub(super) async fn read_restart_failure_proof(
+    state: &ServerState,
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+    start_sequence: u64,
+    finished_sequence: u64,
+) -> Result<RestartFailureProof, CompactionError> {
+    request.validate().map_err(|_| invalid_checkpoint())?;
+    let length = finished_sequence
+        .checked_sub(start_sequence)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(invalid_checkpoint)?;
+    if length > 512
+        || start_sequence >= request.expected_checkpoint_sequence
+        || finished_sequence <= request.expected_checkpoint_sequence
+    {
+        return Err(invalid_checkpoint());
+    }
+    let events = state
+        .sessions
+        .session_events_range(request.session_id, start_sequence, finished_sequence, 512)
+        .await?;
+    validate_restart_failure_proof(request, &events)
+}
+
+fn validate_restart_failure_proof(
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+    events: &[bcode_session_models::SessionEvent],
+) -> Result<RestartFailureProof, CompactionError> {
+    if events.len() < 5
+        || events.len() > 512
+        || events
+            .iter()
+            .any(|event| event.session_id != request.session_id)
+        || events
+            .windows(2)
+            .any(|pair| pair[0].sequence.checked_add(1) != Some(pair[1].sequence))
+    {
+        return Err(invalid_checkpoint());
+    }
+    let first = events.first().ok_or_else(invalid_checkpoint)?;
+    let last = events.last().ok_or_else(invalid_checkpoint)?;
+    let terminal_identity =
+        bcode_session::compaction_event_identity(last).map_err(|_| invalid_checkpoint())?;
+    if terminal_identity.sequence != request.expected_terminal_sequence
+        || terminal_identity.sha256 != request.expected_terminal_sha256
+    {
+        return Err(invalid_checkpoint());
+    }
+    let SessionEventKind::TraceEvent { trace: started } = &first.kind else {
+        return Err(invalid_checkpoint());
+    };
+    let SessionEventKind::TraceEvent { trace: finished } = &last.kind else {
+        return Err(invalid_checkpoint());
+    };
+    if started.phase != SessionTracePhase::ContextCompactionStarted
+        || finished.phase != SessionTracePhase::ContextCompactionFinished
+        || started.turn_id != finished.turn_id
+    {
+        return Err(invalid_checkpoint());
+    }
+    let SessionTracePayload::ContextCompaction {
+        reason,
+        compacted: false,
+        message: Some(message),
+        ..
+    } = &finished.payload
+    else {
+        return Err(invalid_checkpoint());
+    };
+    if reason != "compaction_finished" {
+        return Err(invalid_checkpoint());
+    }
+    let (checkpoint, usages) = restart_attempt_evidence(request, &events[1..events.len() - 1])?;
+    validate_restart_rejection(request, &checkpoint, &usages, message)?;
+    Ok(RestartFailureProof {
+        operation_key: request.expected_operation_key.clone(),
+        events: events
+            .iter()
+            .map(bcode_session::compaction_event_identity)
+            .collect::<Result<_, _>>()
+            .map_err(|_| invalid_checkpoint())?,
+    })
+}
+
+type RestartRequestUsages = BTreeSet<(String, String)>;
+
+fn restart_attempt_evidence(
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+    events: &[bcode_session_models::SessionEvent],
+) -> Result<(LocalCheckpoint, RestartRequestUsages), CompactionError> {
+    let mut checkpoint = None;
+    let mut usages = BTreeSet::new();
+    for event in events {
+        if matches!(
+            event.kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        ) {
+            return Err(invalid_checkpoint());
+        }
+        if let SessionEventKind::TraceEvent { trace } = &event.kind
+            && matches!(
+                trace.phase,
+                SessionTracePhase::ContextCompactionStarted
+                    | SessionTracePhase::ContextCompactionFinished
+            )
+        {
+            return Err(invalid_checkpoint());
+        }
+        if let Some(envelope) =
+            bcode_session_models::CompactionSynthesisCheckpoint::from_event(event)
+                .map_err(|_| invalid_checkpoint())?
+        {
+            if envelope.operation_key != request.expected_operation_key
+                || event.sequence > request.expected_checkpoint_sequence
+            {
+                return Err(invalid_checkpoint());
+            }
+            if event.sequence == request.expected_checkpoint_sequence {
+                checkpoint = Some(LocalCheckpoint::decode(
+                    envelope
+                        .host_payload
+                        .as_deref()
+                        .ok_or_else(invalid_checkpoint)?,
+                )?);
+            }
+        }
+        if let SessionEventKind::ModelUsage { turn_id, usage } = &event.kind
+            && usage.terminal
+        {
+            let request_id = usage.request_id.as_deref().ok_or_else(invalid_checkpoint)?;
+            usages.insert((turn_id.clone(), request_id.to_owned()));
+        }
+    }
+    Ok((checkpoint.ok_or_else(invalid_checkpoint)?, usages))
+}
+
+fn validate_restart_rejection(
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+    checkpoint: &LocalCheckpoint,
+    usages: &RestartRequestUsages,
+    message: &str,
+) -> Result<(), CompactionError> {
+    let prefix = format!("{}-compact-{}-", request.session_id, checkpoint.boundary);
+    if checkpoint.synthesis_phase != SynthesisPhase::Accumulating
+        || checkpoint.requests.get(checkpoint.next_chunk) != Some(&2)
+        || usages.len()
+            != checkpoint
+                .requests
+                .iter()
+                .map(|count| usize::from(*count))
+                .sum::<usize>()
+        || usages
+            .iter()
+            .map(|(_, request_id)| request_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != usages.len()
+        || usages
+            .iter()
+            .any(|(turn_id, _)| !turn_id.starts_with(&prefix))
+    {
+        return Err(invalid_checkpoint());
+    }
+    let rejection = format!(
+        "compaction synthesis rejected after bounded repair; chunk={}/{} reason=",
+        checkpoint.next_chunk + 1,
+        checkpoint.manifest.len(),
+    );
+    // This is validation of a canonical diagnostic payload, not historical payload conversion.
+    // Unknown failure wording is unsupported rather than guessed from counters or usage alone.
+    if !message.starts_with("context compaction failed:")
+        || !message.contains(&rejection)
+        || !message.ends_with("; boundary unchanged")
+    {
+        return Err(invalid_checkpoint());
+    }
+    Ok(())
+}
+
+const RESTART_POINTER_FORMAT: &str = "bcode.compaction.supersession.v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestartPointer {
+    format: String,
+    request: bcode_session_models::SessionCompactionRestartRequest,
+    replacement_key: String,
+    replacement_payload_digest: String,
+    initial_replacement_payload: String,
+}
+
+/// Stable indexed discovery namespace, distinct from both operational namespaces.
+pub(super) fn restart_pointer_key(operation_key: &str) -> String {
+    format!(
+        "local-compaction-discovery-v1:{}",
+        hex::encode(Sha256::digest(operation_key.as_bytes()))
+    )
+}
+
+/// Publish both payloads in one ownership-fenced session transaction. Never append separately.
+/// The transaction must also establish authoritative terminal failure (not reservation exhaustion),
+/// compare canonical marker/source identities, and deduplicate the exact request operation ID.
+/// Old checkpoint events remain canonical; the pointer supersedes their lookup, not their bytes.
+pub(super) struct PreparedRestart {
+    pub(super) request: bcode_session_models::SessionCompactionRestartRequest,
+    pub(super) source: Vec<bcode_session::CompactionEventIdentity>,
+    pub(super) replacement_key: String,
+    pub(super) replacement_payload: String,
+    pub(super) pointer_payload: String,
+    pub(super) failure_evidence: Vec<bcode_session::CompactionEventIdentity>,
+}
+
+impl PreparedRestart {
+    /// Convert validated host preparation to the session domain's atomic compare-and-supersede.
+    pub(super) fn into_domain(
+        self,
+    ) -> Result<bcode_session::CompactionCheckpointRestart, CompactionError> {
+        let rejection = self
+            .failure_evidence
+            .last()
+            .cloned()
+            .ok_or_else(invalid_checkpoint)?;
+        Ok(bcode_session::CompactionCheckpointRestart {
+            pointer_key: restart_pointer_key(&self.request.expected_operation_key),
+            operation_key: self.request.expected_operation_key,
+            expected_checkpoint_sequence: self.request.expected_checkpoint_sequence,
+            expected_prior_marker: self.request.expected_prior_marker.map(|marker| {
+                bcode_session::CompactionEventIdentity {
+                    sequence: marker.sequence,
+                    sha256: marker.sha256,
+                }
+            }),
+            source: self.source,
+            rejection,
+            replacement_key: self.replacement_key,
+            replacement_payload: self.replacement_payload,
+            pointer_payload: self.pointer_payload,
+        })
+    }
+}
+
+/// Prepare a stable atomic request. An existing exact discovery pointer supplies the original
+/// initial checkpoint and deadline, never the subsequently advanced replacement checkpoint.
+pub(super) async fn prepare_restart_domain(
+    state: &ServerState,
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+    old: &LocalCheckpoint,
+    failure: &RestartFailureProof,
+    replacement: &LocalCheckpoint,
+    source: (&CompactionPlan, &CompactionTranscript, &[String]),
+) -> Result<bcode_session::CompactionCheckpointRestart, CompactionError> {
+    let (plan, transcript, chunks) = source;
+    let mut prepared =
+        prepare_restart(request, old, failure, replacement, plan, transcript, chunks)?;
+    if let Some(event) = state
+        .sessions
+        .session_compaction_checkpoint(
+            request.session_id,
+            &restart_pointer_key(&request.expected_operation_key),
+        )
+        .await?
+    {
+        let envelope = bcode_session_models::CompactionSynthesisCheckpoint::from_event(&event)
+            .map_err(|_| invalid_checkpoint())?
+            .ok_or_else(invalid_checkpoint)?;
+        if envelope.operation_key != restart_pointer_key(&request.expected_operation_key) {
+            return Err(invalid_checkpoint());
+        }
+        let payload = envelope
+            .host_payload
+            .as_deref()
+            .ok_or_else(invalid_checkpoint)?;
+        let pointer: RestartPointer =
+            serde_json::from_str(payload).map_err(|_| invalid_checkpoint())?;
+        if pointer.format != RESTART_POINTER_FORMAT
+            || pointer.request != *request
+            || pointer.replacement_key != prepared.replacement_key
+            || pointer.replacement_payload_digest != digest(&pointer.initial_replacement_payload)?
+        {
+            return Err(invalid_checkpoint());
+        }
+        let initial = LocalCheckpoint::decode(&pointer.initial_replacement_payload)?;
+        if initial.resolved_policy != replacement.resolved_policy
+            || initial.synthesis_policy != replacement.synthesis_policy
+            || initial.packing_policy != replacement.packing_policy
+            || initial.boundary != replacement.boundary
+            || initial.source_digest != replacement.source_digest
+            || initial.manifest != replacement.manifest
+        {
+            return Err(invalid_checkpoint());
+        }
+        prepared.replacement_payload = pointer.initial_replacement_payload;
+        payload.clone_into(&mut prepared.pointer_payload);
+    }
+    prepared.into_domain()
+}
+
+/// Prepare current-format work only. The caller holds serialized runtime ownership; publication
+/// still requires the atomic domain comparison described by `PreparedRestart`.
+pub(super) fn prepare_restart(
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+    old: &LocalCheckpoint,
+    failure: &RestartFailureProof,
+    replacement: &LocalCheckpoint,
+    plan: &CompactionPlan,
+    transcript: &CompactionTranscript,
+    chunks: &[String],
+) -> Result<PreparedRestart, CompactionError> {
+    request.validate().map_err(|_| invalid_checkpoint())?;
+    if failure.operation_key != request.expected_operation_key
+        || failure
+            .events
+            .first()
+            .is_none_or(|event| event.sequence >= request.expected_checkpoint_sequence)
+        || failure
+            .events
+            .last()
+            .is_none_or(|event| event.sequence <= request.expected_checkpoint_sequence)
+        || !failure
+            .events
+            .iter()
+            .any(|event| event.sequence == request.expected_checkpoint_sequence)
+        || old.checkpoint_sequence != request.expected_checkpoint_sequence
+        || old.synthesis_phase != SynthesisPhase::Accumulating
+        || old.boundary != replacement.boundary
+        || old.source_digest != replacement.source_digest
+        || replacement.next_chunk != 0
+        || replacement.requests.iter().any(|count| *count != 0)
+        || replacement
+            .consolidation_requests
+            .iter()
+            .any(|count| *count != 0)
+        || replacement.synthesis_policy.is_none()
+        || replacement.resolved_policy.is_none()
+    {
+        return Err(invalid_checkpoint());
+    }
+    // Rebuilding the entire frozen selection avoids treating partial accepted carry as complete
+    // coverage. Old accepted carry and allowances remain in their original canonical events.
+    replacement.verify(plan, transcript, chunks)?;
+    let source = plan
+        .compactable_prefix
+        .iter()
+        .map(bcode_session::compaction_event_identity)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid_checkpoint())?;
+    let replacement_key = format!("local-compaction-restart-v1:{}", request.operation_id);
+    let mut replacement = LocalCheckpoint::decode(&replacement.encode()?)?;
+    if replacement.restart_allowance.is_some() {
+        return Err(invalid_checkpoint());
+    }
+    replacement.restart_allowance = Some(RestartAllowance {
+        max_requests: request.budget.max_provider_requests,
+        deadline_ms: current_unix_millis()
+            .checked_add(u64::from(request.budget.timeout_ms))
+            .ok_or_else(invalid_checkpoint)?,
+    });
+    let replacement_payload = replacement.encode()?;
+    let pointer = RestartPointer {
+        format: RESTART_POINTER_FORMAT.into(),
+        request: request.clone(),
+        replacement_key: replacement_key.clone(),
+        replacement_payload_digest: digest(&replacement_payload)?,
+        initial_replacement_payload: replacement_payload.clone(),
+    };
+    let pointer_payload = serde_json::to_string(&pointer).map_err(|_| invalid_checkpoint())?;
+    if pointer_payload.len() > MAX_PAYLOAD {
+        return Err(invalid_checkpoint());
+    }
+    Ok(PreparedRestart {
+        request: request.clone(),
+        source,
+        replacement_key,
+        replacement_payload,
+        pointer_payload,
+        failure_evidence: failure.events.clone(),
+    })
+}
+
+/// Resolve at most eight explicit supersessions through exact indexed canonical checkpoints.
+/// Returned key must be used for every subsequent save/reservation/publication; never write a
+/// replacement checkpoint over its discovery pointer. Ordinary reads never replay or repair.
+pub(super) async fn load_resolved(
+    state: &ServerState,
+    session_id: SessionId,
+    key: &str,
+) -> Result<(String, Option<LocalCheckpoint>), CompactionError> {
+    let mut key = key.to_owned();
+    let mut visited = BTreeSet::new();
+    for _ in 0..=8 {
+        if !visited.insert(key.clone()) {
+            return Err(invalid_checkpoint());
+        }
+        let pointer_key = restart_pointer_key(&key);
+        let pointer_event = state
+            .sessions
+            .session_compaction_checkpoint(session_id, &pointer_key)
+            .await?;
+        let is_pointer = pointer_event.is_some();
+        let event = match pointer_event {
+            Some(event) => Some(event),
+            None => {
+                state
+                    .sessions
+                    .session_compaction_checkpoint(session_id, &key)
+                    .await?
+            }
+        };
+        let Some(event) = event else {
+            if visited.len() == 1 {
+                return Ok((key, None));
+            }
+            return Err(invalid_checkpoint());
+        };
+        let envelope = bcode_session_models::CompactionSynthesisCheckpoint::from_event(&event)
+            .map_err(|_| invalid_checkpoint())?
+            .ok_or_else(invalid_checkpoint)?;
+        if envelope.operation_key
+            != if is_pointer {
+                pointer_key.as_str()
+            } else {
+                key.as_str()
+            }
+        {
+            return Err(invalid_checkpoint());
+        }
+        let Some(payload) = envelope.host_payload.as_deref() else {
+            if visited.len() == 1 {
+                return Ok((key, None));
+            }
+            return Err(invalid_checkpoint());
+        };
+        if payload.len() > MAX_PAYLOAD {
+            return Err(invalid_checkpoint());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(payload).map_err(|_| invalid_checkpoint())?;
+        if is_pointer {
+            if value.get("format").and_then(serde_json::Value::as_str)
+                != Some(RESTART_POINTER_FORMAT)
+            {
+                return Err(invalid_checkpoint());
+            }
+            let pointer: RestartPointer =
+                serde_json::from_value(value).map_err(|_| invalid_checkpoint())?;
+            pointer
+                .request
+                .validate()
+                .map_err(|_| invalid_checkpoint())?;
+            if pointer.request.session_id != session_id
+                || pointer.request.expected_operation_key != key
+                || pointer.request.expected_checkpoint_sequence >= event.sequence
+                || pointer.replacement_key
+                    != format!(
+                        "local-compaction-restart-v1:{}",
+                        pointer.request.operation_id
+                    )
+                || pointer.replacement_payload_digest
+                    != digest(&pointer.initial_replacement_payload)?
+            {
+                return Err(invalid_checkpoint());
+            }
+            key = pointer.replacement_key;
+            continue;
+        }
+        let mut checkpoint = LocalCheckpoint::decode(payload)?;
+        checkpoint.checkpoint_sequence = event.sequence;
+        return Ok((key, Some(checkpoint)));
+    }
+    Err(invalid_checkpoint())
+}
+
+/// Read exactly the caller-selected canonical checkpoint, including after supersession.
+/// This is explicit restart evidence, not active-operation discovery or permission to resume it.
+pub(super) async fn load_archived_checkpoint(
+    state: &ServerState,
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+) -> Result<LocalCheckpoint, CompactionError> {
+    request.validate().map_err(|_| invalid_checkpoint())?;
+    let sequence = request.expected_checkpoint_sequence;
+    let events = state
+        .sessions
+        .session_events_range(request.session_id, sequence, sequence, 1)
+        .await?;
+    let [event] = events.as_slice() else {
+        return Err(invalid_checkpoint());
+    };
+    if event.sequence != sequence || event.session_id != request.session_id {
+        return Err(invalid_checkpoint());
+    }
+    let envelope = bcode_session_models::CompactionSynthesisCheckpoint::from_event(event)
+        .map_err(|_| invalid_checkpoint())?
+        .ok_or_else(invalid_checkpoint)?;
+    if envelope.operation_key != request.expected_operation_key {
+        return Err(invalid_checkpoint());
+    }
+    let mut checkpoint = LocalCheckpoint::decode(
+        envelope
+            .host_payload
+            .as_deref()
+            .ok_or_else(invalid_checkpoint)?,
+    )?;
+    checkpoint.checkpoint_sequence = sequence;
+    Ok(checkpoint)
 }
 
 pub(super) async fn load(
@@ -594,6 +1508,382 @@ mod tests {
                 .unwrap()
                 .packing_policy,
             "legacy-chars-v1"
+        );
+    }
+
+    fn capacity_policy() -> synthesis::SynthesisPolicy {
+        synthesis::SynthesisPolicy {
+            carry_chars: 24_000,
+            wire_bytes: 96_000,
+            section_chars: 12_000,
+        }
+    }
+
+    #[test]
+    fn capacity_policy_is_exact_and_old_exhausted_work_is_not_reset() {
+        let (_, plan, transcript, chunks) = fixture("Do not modify files.");
+        let mut legacy = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        legacy.reserve_slot(0).unwrap();
+        legacy.reserve_slot(0).unwrap();
+        let payload = legacy.encode().unwrap();
+        let mut restored = LocalCheckpoint::decode(&payload).unwrap();
+        assert!(restored.verify_policy(capacity_policy()).is_err());
+        assert!(restored.reserve_slot(0).is_err());
+        assert_eq!(restored.encode().unwrap(), payload);
+
+        let mut current =
+            LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, capacity_policy())
+                .unwrap();
+        let resolved = serde_json::json!({"version": 1, "estimator_version": 3, "maximum_retained_tokens": 8000});
+        assert!(current.verify_capacity_policy(&resolved).is_err());
+        assert!(current.capacity_policy_digest().is_err());
+        current.bind_capacity_policy(&resolved).unwrap();
+        let frozen_digest = current.capacity_policy_digest().unwrap();
+        assert!(current.bind_resolved_policy(&resolved).is_err());
+        let restored = LocalCheckpoint::decode(&current.encode().unwrap()).unwrap();
+        restored.verify_capacity_policy(&resolved).unwrap();
+        assert_eq!(restored.capacity_policy_digest().unwrap(), frozen_digest);
+        assert_eq!(
+            restored.resolved_policy::<serde_json::Value>().unwrap(),
+            resolved
+        );
+        let changed_budget = serde_json::json!({"version": 1, "estimator_version": 3, "maximum_retained_tokens": 8001});
+        assert!(restored.verify_capacity_policy(&changed_budget).is_err());
+        assert_ne!(frozen_digest, digest(&changed_budget).unwrap());
+        current.verify_policy(capacity_policy()).unwrap();
+        let mut changed = capacity_policy();
+        changed.section_chars -= 1;
+        assert!(current.verify_policy(changed).is_err());
+        let mut payload = serde_json::to_value(current).unwrap();
+        payload["synthesis_policy"]["format"] = serde_json::json!("future-policy");
+        assert!(LocalCheckpoint::decode(&payload.to_string()).is_err());
+    }
+
+    #[test]
+    fn consolidation_fences_ambiguous_calls_and_retains_finite_allowance() {
+        let (_, plan, transcript, chunks) = fixture("Do not modify files.");
+        let mut checkpoint =
+            LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, capacity_policy())
+                .unwrap();
+        assert!(checkpoint.reserve_consolidation_slot().is_err());
+        checkpoint.reserve_slot(0).unwrap();
+        let evidence = CompactionEvidence {
+            format: COMPACTION_SUMMARY_FORMAT.into(),
+            current_scope: vec![CompactionScope {
+                source_sequence: 1,
+                statement: "Do not modify files.".into(),
+                supersedes: Vec::new(),
+            }],
+            continuation: "Continue inspection.".into(),
+        };
+        checkpoint.accept(&evidence, &BTreeSet::from([1]), &BTreeSet::new());
+        assert!(checkpoint.accepted_chunk(0));
+        assert_eq!(checkpoint.reserve_consolidation_slot().unwrap(), 0);
+        let payload = checkpoint.encode().unwrap();
+        let restored = LocalCheckpoint::decode(&payload).unwrap();
+        assert!(!restored.accepted_chunk(0));
+        assert!(restored.verify_policy(capacity_policy()).is_err());
+        assert_eq!(restored.requests, checkpoint.requests);
+        assert_eq!(restored.consolidation_requests, vec![1; chunks.len()]);
+        let mut invalid = evidence.clone();
+        invalid.current_scope.clear();
+        assert!(checkpoint.accept_consolidation(&invalid).is_err());
+        assert_eq!(checkpoint.encode().unwrap(), payload);
+        assert!(checkpoint.reserve_consolidation_slot().is_err());
+        checkpoint.reject_consolidation_response().unwrap();
+        assert_eq!(checkpoint.reserve_consolidation_slot().unwrap(), 1);
+        assert!(checkpoint.reserve_consolidation_slot().is_err());
+        checkpoint.accept_consolidation(&evidence).unwrap();
+        let mut restored = LocalCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
+        restored.verify_policy(capacity_policy()).unwrap();
+        assert!(restored.accepted_chunk(0));
+        assert!(restored.reserve_consolidation_slot().is_err());
+        assert_eq!(restored.next_chunk, 1);
+        assert_eq!(restored.user_sequences, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn canonical_completed_rejection_proves_restart_but_reservations_alone_do_not() {
+        let (history, plan, transcript, chunks) = fixture("Do not modify files.");
+        let mut checkpoint = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        checkpoint.reserve_slot(0).unwrap();
+        checkpoint.reserve_slot(0).unwrap();
+        let session_id = history[0].session_id;
+        let mut request = bcode_session_models::SessionCompactionRestartRequest {
+            version: 1,
+            session_id,
+            operation_id: uuid::Uuid::new_v4(),
+            expected_operation_key: "failed-operation".into(),
+            expected_checkpoint_sequence: 4,
+            expected_terminal_sequence: 6,
+            expected_terminal_sha256: "ab".repeat(32),
+            expected_prior_marker: None,
+            budget: bcode_session_models::SessionCompactionRestartBudget {
+                max_provider_requests: 4,
+                timeout_ms: 60_000,
+            },
+        };
+        let mut events: Vec<_> = (1..=6)
+            .map(|sequence| user(session_id, sequence, "unused"))
+            .collect();
+        let trace = |phase, compacted, message| SessionEventKind::TraceEvent {
+            trace: Box::new(SessionTraceEvent {
+                timestamp_ms: 1,
+                turn_id: Some("owning-turn".into()),
+                phase,
+                payload: SessionTracePayload::ContextCompaction {
+                    reason: "compaction_finished".into(),
+                    projected_context_chars: 0,
+                    compacted,
+                    message,
+                },
+            }),
+        };
+        events[0].kind = trace(SessionTracePhase::ContextCompactionStarted, false, None);
+        events[3].kind = bcode_session_models::CompactionSynthesisCheckpoint {
+            version: 1,
+            operation_key: request.expected_operation_key.clone(),
+            host_payload: Some(checkpoint.encode().unwrap()),
+        }
+        .into_event_kind(1)
+        .unwrap();
+        for (index, request_number) in [(2, 1), (4, 2)] {
+            events[index].kind = SessionEventKind::ModelUsage {
+                turn_id: format!(
+                    "{session_id}-compact-{}-attempt-{request_number}",
+                    checkpoint.boundary
+                ),
+                usage: bcode_session_models::SessionTokenUsage {
+                    request_id: Some(format!("request-{request_number}")),
+                    terminal: true,
+                    ..Default::default()
+                },
+            };
+        }
+        events[5].kind = trace(
+            SessionTracePhase::ContextCompactionFinished,
+            false,
+            Some(format!(
+                "context compaction failed: model provider error: compaction synthesis rejected after bounded repair; chunk=1/{} reason=carry_budget; boundary unchanged",
+                chunks.len(),
+            )),
+        );
+        request.expected_terminal_sha256 =
+            bcode_session::compaction_event_identity(events.last().unwrap())
+                .unwrap()
+                .sha256;
+        assert!(validate_restart_failure_proof(&request, &events).is_ok());
+        let mut ambiguous = events.clone();
+        if let SessionEventKind::ModelUsage { usage, .. } = &mut ambiguous[4].kind {
+            usage.terminal = false;
+        }
+        assert!(validate_restart_failure_proof(&request, &ambiguous).is_err());
+        let mut unknown_failure = events.clone();
+        unknown_failure[5].kind = trace(
+            SessionTracePhase::ContextCompactionFinished,
+            false,
+            Some("context compaction failed: request interrupted".into()),
+        );
+        assert!(validate_restart_failure_proof(&request, &unknown_failure).is_err());
+        let mut gap = events;
+        gap.remove(1);
+        assert!(validate_restart_failure_proof(&request, &gap).is_err());
+    }
+
+    #[test]
+    fn prepared_restart_preserves_old_bytes_and_binds_distinct_identity_and_allowance() {
+        let (history, plan, transcript, chunks) = fixture("Do not modify files.");
+        let mut old = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        old.checkpoint_sequence = 10;
+        old.reserve_slot(0).unwrap();
+        old.reserve_slot(0).unwrap();
+        let old_payload = old.encode().unwrap();
+        let mut replacement =
+            LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, capacity_policy())
+                .unwrap();
+        replacement
+            .bind_capacity_policy(&serde_json::json!({"version": 1}))
+            .unwrap();
+        let request = bcode_session_models::SessionCompactionRestartRequest {
+            version: 1,
+            session_id: history[0].session_id,
+            operation_id: uuid::Uuid::new_v4(),
+            expected_operation_key: "old-operation".into(),
+            expected_checkpoint_sequence: 10,
+            expected_terminal_sequence: 11,
+            expected_terminal_sha256: "ab".repeat(32),
+            expected_prior_marker: None,
+            budget: bcode_session_models::SessionCompactionRestartBudget {
+                max_provider_requests: 3,
+                timeout_ms: 60_000,
+            },
+        };
+        let failure = RestartFailureProof {
+            operation_key: request.expected_operation_key.clone(),
+            events: [9, 10, 11]
+                .into_iter()
+                .map(|sequence| bcode_session::CompactionEventIdentity {
+                    sequence,
+                    sha256: "0".repeat(64),
+                })
+                .collect(),
+        };
+        let prepared = prepare_restart(
+            &request,
+            &old,
+            &failure,
+            &replacement,
+            &plan,
+            &transcript,
+            &chunks,
+        )
+        .unwrap();
+        assert_eq!(old.encode().unwrap(), old_payload);
+        assert_ne!(prepared.replacement_key, request.expected_operation_key);
+        let restored = LocalCheckpoint::decode(&prepared.replacement_payload).unwrap();
+        assert_eq!(restored.restart_allowance.unwrap().max_requests, 3);
+        let pointer: RestartPointer = serde_json::from_str(&prepared.pointer_payload).unwrap();
+        assert_eq!(pointer.request, request);
+        assert_eq!(
+            pointer.replacement_payload_digest,
+            digest(&prepared.replacement_payload).unwrap()
+        );
+        let domain = prepared.into_domain().unwrap();
+        assert_eq!(domain.operation_key, request.expected_operation_key);
+        assert_eq!(
+            domain.expected_checkpoint_sequence,
+            request.expected_checkpoint_sequence
+        );
+        assert_eq!(domain.rejection.sequence, 11);
+        assert_eq!(
+            domain.pointer_key,
+            restart_pointer_key(&request.expected_operation_key)
+        );
+        assert_ne!(domain.pointer_key, domain.operation_key);
+        assert_ne!(domain.pointer_key, domain.replacement_key);
+        let mut stale = request;
+        stale.expected_checkpoint_sequence += 1;
+        assert!(
+            prepare_restart(
+                &stale,
+                &old,
+                &failure,
+                &replacement,
+                &plan,
+                &transcript,
+                &chunks
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_restart_allowance_is_shared_by_all_request_phases_and_not_refunded() {
+        let (_, plan, transcript, chunks) = fixture("Do not modify files.");
+        let mut checkpoint =
+            LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, capacity_policy())
+                .unwrap();
+        checkpoint
+            .bind_capacity_policy(&serde_json::json!({"version": 1}))
+            .unwrap();
+        checkpoint.restart_allowance = Some(RestartAllowance {
+            max_requests: 1,
+            deadline_ms: current_unix_millis() + 60_000,
+        });
+        checkpoint.reserve_slot(0).unwrap();
+        let mut restored = LocalCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
+        assert!(restored.reserve_slot(0).is_err());
+        assert!(restored.reserve_consolidation_slot().is_err());
+        assert_eq!(restored.requests[0], 1);
+        restored.restart_allowance.as_mut().unwrap().deadline_ms = 1;
+        assert!(restored.verify_restart_allowance().is_err());
+    }
+
+    #[tokio::test]
+    async fn archived_checkpoint_read_uses_selected_sequence_after_retirement() {
+        let (_, plan, transcript, chunks) = fixture("Do not modify files.");
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let session = state
+            .sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap();
+        let session_id = session.id;
+        drop(session);
+        let mut checkpoint = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        checkpoint.reserve_slot(0).unwrap();
+        checkpoint.reserve_slot(0).unwrap();
+        checkpoint
+            .save(&state, session_id, "archived-operation")
+            .await
+            .unwrap();
+        let sequence = checkpoint.checkpoint_sequence;
+        let payload = checkpoint.encode().unwrap();
+        state
+            .sessions
+            .append_compaction_checkpoint(session_id, "archived-operation", None)
+            .await
+            .unwrap();
+        let mut request = bcode_session_models::SessionCompactionRestartRequest {
+            version: 1,
+            session_id,
+            operation_id: uuid::Uuid::new_v4(),
+            expected_operation_key: "archived-operation".into(),
+            expected_checkpoint_sequence: sequence,
+            expected_terminal_sequence: sequence + 2,
+            expected_terminal_sha256: "ab".repeat(32),
+            expected_prior_marker: None,
+            budget: bcode_session_models::SessionCompactionRestartBudget {
+                max_provider_requests: 4,
+                timeout_ms: 60_000,
+            },
+        };
+        assert!(
+            load(&state, session_id, "archived-operation")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut restored = load_archived_checkpoint(&state, &request).await.unwrap();
+        assert_eq!(restored.checkpoint_sequence, sequence);
+        assert_eq!(restored.encode().unwrap(), payload);
+        assert!(restored.reserve_slot(0).is_err());
+        request.expected_operation_key = "wrong-key".into();
+        assert!(load_archived_checkpoint(&state, &request).await.is_err());
+        request.expected_operation_key = "archived-operation".into();
+        request.expected_checkpoint_sequence = sequence + 1;
+        assert!(load_archived_checkpoint(&state, &request).await.is_err());
+        drop(state);
+    }
+
+    #[test]
+    fn capacity_carry_above_legacy_limit_survives_without_clipping() {
+        let (_, plan, mut transcript, chunks) = fixture("Continue investigation.");
+        let evidence = CompactionEvidence {
+            format: COMPACTION_SUMMARY_FORMAT.into(),
+            current_scope: Vec::new(),
+            continuation: "preserved chronology ".repeat(400),
+        };
+        let summary = encode_compaction_evidence(&evidence).unwrap();
+        assert!(summary.chars().count() > COMPACTION_MAX_CARRIED_SUMMARY_CHARS);
+        transcript.previous_summary = Some(summary);
+        let checkpoint =
+            LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, capacity_policy())
+                .unwrap();
+        let restored = LocalCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
+        restored.verify(&plan, &transcript, &chunks).unwrap();
+        assert_eq!(restored.restore().0.continuation, evidence.continuation);
+        transcript.previous_summary =
+            Some("Opaque portable recollection; not user authorization.".into());
+        let opaque =
+            LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, capacity_policy())
+                .unwrap();
+        assert!(opaque.restore().0.current_scope.is_empty());
+        assert!(
+            compaction_evidence_input(&transcript, None)
+                .unwrap()
+                .concat()
+                .contains("Opaque portable recollection; not user authorization.")
         );
     }
 

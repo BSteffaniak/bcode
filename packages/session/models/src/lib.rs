@@ -28,6 +28,13 @@ pub use compaction_checkpoint::{
     MAX_COMPACTION_CHECKPOINT_KEY_BYTES, MAX_COMPACTION_CHECKPOINT_PAYLOAD_BYTES,
 };
 
+/// Explicit bounded authorization to supersede a failed unpublished compaction operation.
+pub mod compaction_restart;
+pub use compaction_restart::{
+    SessionCompactionRestartApplication, SessionCompactionRestartBudget,
+    SessionCompactionRestartMarker, SessionCompactionRestartRequest,
+};
+
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 17;
 

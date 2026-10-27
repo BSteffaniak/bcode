@@ -973,6 +973,19 @@ impl SessionHandle {
         .await?
     }
 
+    pub async fn restart_compaction_checkpoint(
+        &self,
+        request: crate::CompactionCheckpointRestart,
+        timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.send(|reply| SessionCommand::RestartCompactionCheckpoint {
+            request,
+            timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn compaction_checkpoint(
         &self,
         key: String,
@@ -1459,6 +1472,11 @@ enum SessionCommand {
     },
     CommitCompactionCheckpoint {
         request: crate::CompactionCheckpointCommit,
+        timestamp_ms: u64,
+        reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
+    },
+    RestartCompactionCheckpoint {
+        request: crate::CompactionCheckpointRestart,
         timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
@@ -2264,6 +2282,16 @@ impl SessionActor {
             } => Box::pin(async move {
                 let result =
                     Box::pin(self.commit_compaction_checkpoint(request, timestamp_ms)).await;
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::RestartCompactionCheckpoint {
+                request,
+                timestamp_ms,
+                reply,
+            } => Box::pin(async move {
+                let result =
+                    Box::pin(self.restart_compaction_checkpoint(request, timestamp_ms)).await;
                 let _ = reply.send(result);
                 false
             }),
@@ -3224,6 +3252,79 @@ impl SessionActor {
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         Ok(marker)
+    }
+
+    async fn restart_compaction_checkpoint(
+        &mut self,
+        request: crate::CompactionCheckpointRestart,
+        timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.ensure_ownership()?;
+        request
+            .validate()
+            .map_err(SessionError::EventSerialization)?;
+        if self.store.is_none() {
+            let history = self
+                .state
+                .events
+                .as_ref()
+                .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+            if let Some(replacement) =
+                crate::compaction_checkpoint::memory_restart_retry(history, &request)?
+            {
+                return Ok(replacement);
+            }
+            crate::compaction_checkpoint::validate_memory_restart(history, &request)?;
+            let template = self.state.build_next_event(
+                SessionEventKind::SystemMessage {
+                    text: String::new(),
+                },
+                timestamp_ms,
+            );
+            let events = request
+                .events(&template)
+                .map_err(SessionError::EventSerialization)?;
+            let replacement = events[2].clone();
+            // All fallible work precedes these serialized, await-free applications.
+            for event in events {
+                self.state.apply_persisted_event(event, timestamp_ms);
+            }
+            self.state.load_status = SessionLoadStatusKind::Current;
+            self.refresh_snapshot();
+            return Ok(replacement);
+        }
+        let store = self
+            .store
+            .clone()
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        let _write_guard =
+            crate::lease::acquire_session_write_lock(&store.root_path(), self.state.summary.id)?;
+        self.ensure_session_db_for_write().await?;
+        self.refresh_state_from_db_for_write().await?;
+        self.ensure_ownership()?;
+        let template = self.state.build_next_event(
+            SessionEventKind::SystemMessage {
+                text: String::new(),
+            },
+            timestamp_ms,
+        );
+        let events = request
+            .events(&template)
+            .map_err(SessionError::EventSerialization)?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        let replacement = db.restart_compaction_checkpoint(&request, &events).await?;
+        if replacement.sequence == events[2].sequence {
+            for event in &events {
+                self.apply_appended_event(event, timestamp_ms).await?;
+            }
+            self.update_manifest_and_schedule_catalog().await;
+            self.state.load_status = SessionLoadStatusKind::Current;
+            self.refresh_snapshot();
+        }
+        Ok(replacement)
     }
 
     fn commit_memory_compaction_checkpoint(

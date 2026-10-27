@@ -8,6 +8,27 @@ use super::*;
 use bcode_session::context_recovery::{SummaryRecoveryError, SummaryRecoveryReader};
 use bcode_session_models::SessionSummaryRebuildRequest;
 
+tokio::task_local! {
+    static PROVIDER_REQUESTS_LEFT: std::cell::Cell<u32>;
+}
+
+/// Charge exactly once immediately before each provider dispatch, including repair and final
+/// consolidation. Non-rebuild callers have no allowance in this scope and are unaffected.
+/// Cancellation or an ambiguous dispatched request never refunds a charge.
+pub fn reserve_provider_request() -> Result<(), CompactionError> {
+    PROVIDER_REQUESTS_LEFT
+        .try_with(|remaining| {
+            let next = remaining.get().checked_sub(1).ok_or_else(|| {
+                CompactionError::Provider(
+            "summary reconstruction provider allowance exhausted; existing marker unchanged".into(),
+        )
+            })?;
+            remaining.set(next);
+            Ok(())
+        })
+        .unwrap_or(Ok(()))
+}
+
 fn recovery_error(_error: SummaryRecoveryError) -> CompactionError {
     // Storage diagnostics may contain private paths or payload details. Keep this public error
     // normalized; canonical readers retain their domain-specific error for internal diagnosis.
@@ -39,7 +60,10 @@ pub async fn rebuild_session_summary(
             "invalid summary reconstruction allowance".into(),
         ));
     }
-    let operation = rebuild_inner(state, request, selection, command_context, cancel_state);
+    let operation = PROVIDER_REQUESTS_LEFT.scope(
+        std::cell::Cell::new(request.budget.max_provider_requests),
+        rebuild_inner(state, request, selection, command_context, cancel_state),
+    );
     tokio::pin!(operation);
     tokio::select! {
         result = &mut operation => result,
@@ -52,28 +76,6 @@ pub async fn rebuild_session_summary(
             operation.await
         }
     }
-}
-
-// Conservative wire-fragment admission, not a second chunker. JSON escaping costs at most
-// six bytes per source byte. Each 2,000-byte engine fragment has under 256 bytes of framing;
-// therefore every closed 16,000-byte chunk contains at least 3,000 encoded bytes. Reserve two
-// attempts per possible chunk. The engine remains authoritative and rejects oversized input.
-fn summary_request_reservation(
-    transcript: &context_compaction::CompactionTranscript,
-) -> Result<u32, CompactionError> {
-    let encoded_upper = transcript
-        .previous_summary
-        .iter()
-        .chain(transcript.summary_input.iter())
-        .fold(0_usize, |total, text| {
-            let fragments = text.len().div_ceil(1_997).saturating_add(1);
-            total
-                .saturating_add(text.len().saturating_mul(6))
-                .saturating_add(fragments.saturating_mul(256))
-        });
-    let chunks = encoded_upper.div_ceil(3_000).clamp(1, 32);
-    u32::try_from(chunks.saturating_mul(2))
-        .map_err(|_| CompactionError::Provider("summary reconstruction allowance overflow".into()))
 }
 
 fn recovery_lines(page: Vec<bcode_session_models::SessionEvent>) -> Vec<String> {
@@ -113,7 +115,6 @@ async fn rebuild_inner(
     };
     let pin = reader.pin();
     let mut summary = None;
-    let mut requests_left = request.budget.max_provider_requests;
     let mut evidence_events = 0_usize;
     loop {
         if let Some(context) = command_context.as_deref_mut() {
@@ -148,19 +149,15 @@ async fn rebuild_inner(
             event_count: evidence_events,
             estimated_reclaimable_tokens: 0,
         };
-        requests_left = requests_left.checked_sub(summary_request_reservation(&transcript)?)
-            .ok_or_else(|| CompactionError::Provider(
-                "summary reconstruction provider allowance exhausted; existing marker unchanged".into(),
-            ))?;
         summary = Some(
-            context_compaction::collect_compaction_summary(
+            Box::pin(context_compaction::collect_compaction_summary(
                 state,
                 request.session_id,
                 selection,
                 &transcript,
                 command_context.as_deref_mut(),
                 cancel_state,
-            )
+            ))
             .await?,
         );
     }
@@ -171,6 +168,16 @@ async fn rebuild_inner(
                 "no canonical evidence available to reconstruct summary".into(),
             )
         })?;
+    context_compaction::validate_summary_publication(
+        state,
+        request.session_id,
+        selection,
+        pin.boundary,
+        &summary,
+        0,
+        cancel_state,
+    )
+    .await?;
     let marker = commit_rebuilt_summary(
         state,
         request.session_id,
@@ -238,16 +245,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn small_input_reserves_two_requests_not_sixty_four() {
-        let transcript = context_compaction::CompactionTranscript {
-            previous_summary: None,
-            summary_input: vec!["#1 user:\nRemain read only".into()],
-            compacted_through_sequence: 1,
-            event_count: 1,
-            estimated_reclaimable_tokens: 0,
-        };
-        assert_eq!(summary_request_reservation(&transcript).unwrap(), 2);
+    #[tokio::test]
+    async fn actual_request_allowance_covers_all_phases_without_upfront_overreservation() {
+        assert!(reserve_provider_request().is_ok());
+        PROVIDER_REQUESTS_LEFT
+            .scope(std::cell::Cell::new(4), async {
+                // Ordinary synthesis, bounded repair, consolidation, final consolidation.
+                for expected in (0..4).rev() {
+                    reserve_provider_request().unwrap();
+                    assert_eq!(PROVIDER_REQUESTS_LEFT.with(std::cell::Cell::get), expected);
+                }
+                assert!(reserve_provider_request().is_err());
+                assert_eq!(PROVIDER_REQUESTS_LEFT.with(std::cell::Cell::get), 0);
+            })
+            .await;
+        PROVIDER_REQUESTS_LEFT
+            .scope(std::cell::Cell::new(1), async {
+                reserve_provider_request().unwrap();
+                assert!(reserve_provider_request().is_err());
+            })
+            .await;
     }
 
     #[tokio::test]

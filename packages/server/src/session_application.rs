@@ -122,6 +122,43 @@ impl bcode_session_models::SessionCompactionOperation for ServerSessionCompactio
     }
 }
 
+/// Map known host-side compaction failures without exposing provider text or captured context.
+fn compaction_provider_failure(message: &str) -> SessionApplicationFailure {
+    let (code, detail) = if message.starts_with("compaction capacity policy rejected:")
+        || message.starts_with("compaction summary policy:")
+        || message.starts_with("compaction budget")
+    {
+        (
+            "compaction_capacity",
+            "compaction cannot fit the selected model capacity or required reclaim; accepted progress and boundary are unchanged",
+        )
+    } else if message.starts_with("compaction synthesis rejected after bounded repair;") {
+        (
+            "compaction_synthesis_rejected",
+            "compaction synthesis exhausted its bounded repair allowance; inspect session compaction-status for progress and the recorded rejection reason",
+        )
+    } else if message.starts_with("compaction request/repair budget exhausted") {
+        (
+            "compaction_allowance_exhausted",
+            "compaction attempt allowance is exhausted; retained progress requires explicit recovery rather than another identical retry",
+        )
+    } else if message.starts_with("compaction synthesis policy changed")
+        || message.starts_with("invalid or incompatible compaction checkpoint")
+        || message.starts_with("compaction consolidation outcome is unresolved")
+    {
+        (
+            "compaction_recovery_required",
+            "retained compaction state is incompatible or unresolved; preserve it and use explicit bounded recovery",
+        )
+    } else {
+        (
+            "provider_error",
+            "model provider failed during context compaction",
+        )
+    };
+    failure(code, detail)
+}
+
 fn compaction_failure(error: session_operations::CompactError) -> SessionApplicationFailure {
     use crate::CompactionError;
     match error {
@@ -148,10 +185,7 @@ fn compaction_failure(error: session_operations::CompactError) -> SessionApplica
                 "request_still_too_large",
                 "request remains too large after context compaction",
             ),
-            CompactionError::Provider(_) => failure(
-                "provider_error",
-                "model provider failed during context compaction",
-            ),
+            CompactionError::Provider(message) => compaction_provider_failure(&message),
             CompactionError::PlanUnavailable(_) | CompactionError::InsufficientProgress { .. } => {
                 failure(
                     "session_compaction_failed",
@@ -159,6 +193,28 @@ fn compaction_failure(error: session_operations::CompactError) -> SessionApplica
                 )
             }
         },
+    }
+}
+
+impl bcode_session_models::SessionCompactionRestartApplication for SessionApplicationHandle<'_> {
+    type CompactionOperation = ServerSessionCompactionOperation;
+
+    async fn begin_session_compaction_restart(
+        &self,
+        request: bcode_session_models::SessionCompactionRestartRequest,
+    ) -> Result<Self::CompactionOperation, SessionApplicationFailure> {
+        self.selected_location(request.session_id).await?;
+        request.validate().map_err(|_| {
+            failure(
+                "invalid_compaction_restart",
+                "invalid compaction restart authorization",
+            )
+        })?;
+        let completion =
+            session_operations::restart_compaction(self.state, self.client_id, request)
+                .await
+                .map_err(compaction_failure)?;
+        Ok(ServerSessionCompactionOperation { completion })
     }
 }
 
@@ -1915,6 +1971,33 @@ mod tests {
             assert!(std::ptr::eq(app.state, std::ptr::from_ref(&state)));
         }
         drop(state);
+    }
+
+    #[test]
+    fn compaction_host_failures_are_actionable_without_leaking_provider_text() {
+        for (message, code) in [
+            (
+                "compaction capacity policy rejected: private detail",
+                "compaction_capacity",
+            ),
+            (
+                "compaction synthesis rejected after bounded repair; private detail",
+                "compaction_synthesis_rejected",
+            ),
+            (
+                "compaction request/repair budget exhausted; private detail",
+                "compaction_allowance_exhausted",
+            ),
+            (
+                "compaction synthesis policy changed private detail",
+                "compaction_recovery_required",
+            ),
+            ("provider credential private detail", "provider_error"),
+        ] {
+            let error = compaction_provider_failure(message);
+            assert_eq!(error.code, code);
+            assert!(!error.message.contains("private detail"));
+        }
     }
 
     #[test]

@@ -6579,8 +6579,50 @@ enum SessionCommand {
     Compact {
         session_id: SessionId,
         /// Reconstruct the selected summary from bounded canonical history.
-        #[arg(long, requires = "expected_marker")]
+        #[arg(
+            long,
+            requires = "expected_marker",
+            conflicts_with = "restart_operation"
+        )]
         rebuild_summary: bool,
+        /// Restart one exact failed unpublished operation with explicitly new allowances.
+        #[arg(long, requires_all = ["restart_operation_id", "expected_operation_key", "expected_checkpoint_sequence", "expected_terminal_sequence", "expected_terminal_sha256", "restart_marker", "restart_max_provider_requests", "restart_timeout_ms"])]
+        restart_operation: bool,
+        /// Distinct new operation UUID; retain it unchanged if admission outcome is unknown.
+        #[arg(long, requires = "restart_operation")]
+        restart_operation_id: Option<uuid::Uuid>,
+        /// Exact old checkpoint namespace, including its original policy identity.
+        #[arg(long, requires = "restart_operation")]
+        expected_operation_key: Option<String>,
+        /// Canonical checkpoint event sequence, not the chunk index.
+        #[arg(long, requires = "restart_operation")]
+        expected_checkpoint_sequence: Option<u64>,
+        /// Exact canonical completed-rejection event sequence for this operation.
+        #[arg(long, requires = "restart_operation")]
+        expected_terminal_sequence: Option<u64>,
+        /// Exact canonical completed-rejection event SHA-256, not a display-text digest.
+        #[arg(long, requires = "restart_operation")]
+        expected_terminal_sha256: Option<String>,
+        /// Canonical prior marker sequence; pair with its exact digest, or assert absence.
+        #[arg(long, requires_all = ["restart_operation", "expected_prior_marker_sha256"], conflicts_with = "expected_no_prior_marker", group = "restart_marker")]
+        expected_prior_marker_sequence: Option<u64>,
+        /// Canonical prior marker SHA-256 from the session domain.
+        #[arg(long, requires_all = ["restart_operation", "expected_prior_marker_sequence"])]
+        expected_prior_marker_sha256: Option<String>,
+        /// Explicitly assert this operation had no prior compaction marker.
+        #[arg(
+            long,
+            requires = "restart_operation",
+            conflicts_with = "expected_prior_marker_sequence",
+            group = "restart_marker"
+        )]
+        expected_no_prior_marker: bool,
+        /// Explicit new provider-call allowance, including repair/consolidation attempts.
+        #[arg(long, requires = "restart_operation")]
+        restart_max_provider_requests: Option<u32>,
+        /// Explicit new elapsed-time allowance in milliseconds.
+        #[arg(long, requires = "restart_operation")]
+        restart_timeout_ms: Option<u32>,
         /// Exact latest marker selected for replacement.
         #[arg(long, requires = "rebuild_summary")]
         expected_marker: Option<u64>,
@@ -9214,6 +9256,17 @@ fn dispatch_non_ranking_session_command(
             session_id,
             json,
             rebuild_summary,
+            restart_operation,
+            restart_operation_id,
+            expected_operation_key,
+            expected_checkpoint_sequence,
+            expected_terminal_sequence,
+            expected_terminal_sha256,
+            expected_prior_marker_sequence,
+            expected_prior_marker_sha256,
+            expected_no_prior_marker,
+            restart_max_provider_requests,
+            restart_timeout_ms,
             expected_marker,
             rebuild_max_events,
             rebuild_max_pages,
@@ -9221,7 +9274,48 @@ fn dispatch_non_ranking_session_command(
             rebuild_max_provider_requests,
             rebuild_timeout_ms,
         } => Box::pin(async move {
-            if rebuild_summary {
+            if restart_operation {
+                let required = || {
+                    CliError::InvalidArguments(
+                        "compaction restart requires exact identities, an explicit prior marker or absence, and new bounded allowances".into(),
+                    )
+                };
+                let expected_prior_marker = match (
+                    expected_prior_marker_sequence,
+                    expected_prior_marker_sha256,
+                    expected_no_prior_marker,
+                ) {
+                    (Some(sequence), Some(sha256), false) => {
+                        Some(bcode_session_models::SessionCompactionRestartMarker {
+                            sequence,
+                            sha256,
+                        })
+                    }
+                    (None, None, true) => None,
+                    _ => return Err(required()),
+                };
+                Box::pin(restart_session_compaction(
+                    bcode_session_models::SessionCompactionRestartRequest {
+                        version: 1,
+                        session_id,
+                        operation_id: restart_operation_id.ok_or_else(required)?,
+                        expected_operation_key: expected_operation_key.ok_or_else(required)?,
+                        expected_checkpoint_sequence: expected_checkpoint_sequence
+                            .ok_or_else(required)?,
+                        expected_terminal_sequence: expected_terminal_sequence
+                            .ok_or_else(required)?,
+                        expected_terminal_sha256: expected_terminal_sha256.ok_or_else(required)?,
+                        expected_prior_marker,
+                        budget: bcode_session_models::SessionCompactionRestartBudget {
+                            max_provider_requests: restart_max_provider_requests
+                                .ok_or_else(required)?,
+                            timeout_ms: restart_timeout_ms.ok_or_else(required)?,
+                        },
+                    },
+                    json,
+                ))
+                .await?;
+            } else if rebuild_summary {
                 Box::pin(rebuild_session_summary(
                     bcode_session_models::SessionSummaryRebuildRequest {
                         session_id,
@@ -17672,6 +17766,53 @@ async fn set_session_skill(
         session_id,
         json,
     )
+}
+
+async fn restart_session_compaction(
+    request: bcode_session_models::SessionCompactionRestartRequest,
+    json: bool,
+) -> Result<(), CliError> {
+    use bcode_session_models::{
+        SessionCompactionOperation as _, SessionCompactionRestartApplication as _,
+    };
+    request.validate().map_err(CliError::InvalidArguments)?;
+    let session_id = request.session_id;
+    let operation_id = request.operation_id;
+    let client = BcodeClient::default_endpoint();
+    let operation = client
+        .begin_session_compaction_restart(request)
+        .await
+        .map_err(|failure| bcode_client::ClientError::Server {
+            code: failure.code,
+            message: failure.message,
+        })?;
+    let outcome =
+        operation
+            .complete()
+            .await
+            .map_err(|failure| bcode_client::ClientError::Server {
+                code: failure.code,
+                message: failure.message,
+            })?;
+    let (status, message) = match outcome {
+        bcode_session_models::SessionCompactionResult::Compacted(message) => {
+            ("compaction_restart_compacted", message)
+        }
+        bcode_session_models::SessionCompactionResult::Noop(message) => {
+            ("compaction_restart_noop", message)
+        }
+    };
+    if json {
+        print_json(&serde_json::json!({
+            "status": status,
+            "session_id": session_id,
+            "operation_id": operation_id,
+            "message": message,
+        }))
+    } else {
+        println!("{message}");
+        Ok(())
+    }
 }
 
 async fn rebuild_session_summary(
@@ -29111,6 +29252,118 @@ mod session_configuration_cli_tests {
             error,
             CliError::InvalidArguments(message) if message == "session deletion requires --yes"
         ));
+    }
+
+    #[test]
+    fn compaction_restart_requires_exact_selection_and_explicit_new_allowances() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let digest = "ab".repeat(32);
+        let base = vec![
+            "bcode",
+            "session",
+            "compact",
+            &session,
+            "--restart-operation",
+            "--restart-operation-id",
+            &operation_id,
+            "--expected-operation-key",
+            "local-compaction-v1:old",
+            "--expected-checkpoint-sequence",
+            "42",
+            "--expected-terminal-sequence",
+            "46",
+            "--expected-terminal-sha256",
+            &digest,
+            "--restart-max-provider-requests",
+            "16",
+            "--restart-timeout-ms",
+            "30000",
+        ];
+        assert!(
+            Cli::try_parse_from(&base).is_err(),
+            "absence must be explicit"
+        );
+        let mut with_marker = base.clone();
+        with_marker.extend([
+            "--expected-prior-marker-sequence",
+            "12",
+            "--expected-prior-marker-sha256",
+            &digest,
+        ]);
+        let parsed = Cli::try_parse_from(&with_marker).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::Compact {
+                    restart_operation: true,
+                    restart_operation_id: Some(id),
+                    expected_checkpoint_sequence: Some(42),
+                    expected_terminal_sequence: Some(46),
+                    expected_terminal_sha256: Some(terminal_digest),
+                    expected_prior_marker_sequence: Some(12),
+                    expected_no_prior_marker: false,
+                    restart_max_provider_requests: Some(16),
+                    restart_timeout_ms: Some(30_000),
+                    rebuild_summary: false,
+                    ..
+                },
+            }) if id.to_string() == operation_id && terminal_digest == digest
+        ));
+        for flag in [
+            "--restart-operation-id",
+            "--expected-operation-key",
+            "--expected-checkpoint-sequence",
+            "--expected-terminal-sequence",
+            "--expected-terminal-sha256",
+            "--restart-max-provider-requests",
+            "--restart-timeout-ms",
+            "--expected-prior-marker-sha256",
+            "--expected-prior-marker-sequence",
+        ] {
+            let mut incomplete = with_marker.clone();
+            let index = incomplete
+                .iter()
+                .position(|argument| *argument == flag)
+                .unwrap();
+            incomplete.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(incomplete).is_err(), "missing {flag}");
+        }
+        let mut absent = base.clone();
+        absent.push("--expected-no-prior-marker");
+        assert!(matches!(
+            Cli::try_parse_from(absent).unwrap().command,
+            Some(Commands::Session {
+                command: SessionCommand::Compact {
+                    restart_operation: true,
+                    expected_no_prior_marker: true,
+                    expected_prior_marker_sequence: None,
+                    ..
+                },
+            })
+        ));
+        for extras in [
+            vec!["--expected-no-prior-marker"],
+            vec!["--rebuild-summary", "--expected-marker", "12"],
+        ] {
+            let mut conflict = with_marker.clone();
+            conflict.extend(extras);
+            assert!(Cli::try_parse_from(conflict).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_selection_requires_restart_authorization() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        let unauthorized = [
+            "bcode",
+            "session",
+            "compact",
+            &session,
+            "--expected-checkpoint-sequence",
+            "42",
+        ];
+        assert!(Cli::try_parse_from(unauthorized).is_err());
     }
 
     #[test]

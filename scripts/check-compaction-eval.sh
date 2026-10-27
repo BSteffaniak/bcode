@@ -25,6 +25,7 @@ printf 'Compaction regression binary: %s\n' "${binary}"
 shasum -a 256 "${binary}"
 python3 -m unittest discover -s "${root}/fixtures/evals/compaction" -p 'test_*.py'
 python3 "${root}/fixtures/evals/compaction/run.py" --binary "${binary}"
+python3 "${root}/fixtures/evals/compaction/run_progressive.py" --binary "${binary}"
 for outcome in repair oversize-repair omit-scope-repair paraphrase-scope-repair near-limit; do
     python3 "${root}/fixtures/evals/compaction/run.py" --binary "${binary}" --outcome "${outcome}"
 done

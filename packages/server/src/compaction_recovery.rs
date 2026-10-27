@@ -15,7 +15,12 @@ mod tests;
 #[serde(deny_unknown_fields)]
 pub enum Phase {
     Safe,
-    Local { key: String, chunk: usize },
+    Local {
+        key: String,
+        chunk: usize,
+    },
+    /// Versioned section-consolidation dispatch; no accepted carry proves its outcome.
+    ConsolidatingV1,
     Native,
 }
 
@@ -243,7 +248,7 @@ pub async fn can_resume(
 ) -> Result<bool, bcode_session::SessionError> {
     match phase {
         Phase::Safe => Ok(true),
-        Phase::Native => Ok(false),
+        Phase::Native | Phase::ConsolidatingV1 => Ok(false),
         Phase::Local { key, chunk } => {
             context_compaction::accepted_recovery_chunk(state, session_id, key, *chunk).await
         }

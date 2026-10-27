@@ -540,6 +540,17 @@ impl FakeProviderPlugin {
                 model.is_default = model.model_id == selected;
             }
         }
+        if request
+            .provider_context
+            .settings
+            .get("fake_compaction_fixture")
+            .is_some_and(|value| value == "progressive-v1")
+        {
+            // Opt-in capacity fixture: immutable defaults for cache conformance stay unchanged.
+            for model in &mut list.models {
+                model.max_output_tokens = Some(16_000);
+            }
+        }
         json_response(&list)
     }
 
@@ -639,6 +650,9 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
+        if let Err(error) = compaction_control::capture_context(&request) {
+            return ServiceResponse::error("fake_context_capture_failed", &error);
+        }
         if let Some(error) = validate_fake_request(&request) {
             return json_response(&StartTurnResponse {
                 provider_turn_id: insert_fake_error_turn(&self.state, error),
@@ -1173,18 +1187,26 @@ fn fake_compaction_synthesis(
     } else {
         prompt
     };
+    if prompt.starts_with("Return only JSON with format bcode.compaction.section-consolidation.v1")
+        && request
+            .provider_context
+            .settings
+            .get("fake_compaction_fixture")
+            .is_some_and(|value| value == "scope-v1")
+    {
+        return Ok(serde_json::json!({"format":"bcode.compaction.section-consolidation.v1", "sections":{}}).to_string());
+    }
     if let Some(protocol) = request
         .provider_context
         .settings
         .get("fake_compaction_fixture")
     {
-        if protocol != "scope-v1" {
-            return Err(fake_structured_output_error(
-                &"unsupported fake compaction fixture protocol",
-            ));
+        return match protocol.as_str() {
+            "scope-v1" => compaction_fixture::synthesize(prompt),
+            "progressive-v1" => compaction_fixture::synthesize_progressive(prompt),
+            _ => Err("unsupported fake compaction fixture protocol".into()),
         }
-        return compaction_fixture::synthesize(prompt)
-            .map_err(|error| fake_structured_output_error(&error));
+        .map_err(|error| fake_structured_output_error(&error));
     }
     let prior = prompt
         .split_once("Prior structured synthesis: ")
@@ -1223,7 +1245,10 @@ fn fake_compaction_response(
         .metadata
         .get("bcode_request_kind")
         .is_some_and(|kind| kind == "compaction")
-        && user_text.contains("Prior structured synthesis:")
+        && (user_text.contains("Prior structured synthesis:")
+            || user_text.starts_with(
+                "Return only JSON with format bcode.compaction.section-consolidation.v1",
+            ))
     {
         return Some(fake_compaction_synthesis(request, user_text));
     }

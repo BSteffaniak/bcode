@@ -1,9 +1,35 @@
 //! Separate contracts for untrusted full summaries and host-preserving synthesis updates.
 
-use super::{
-    BTreeSet, COMPACTION_MAX_CARRIED_SUMMARY_CHARS, COMPACTION_SUMMARY_FORMAT, CompactionEvidence,
-    CompactionScope,
+#[cfg(test)]
+use super::COMPACTION_MAX_CARRIED_SUMMARY_CHARS;
+
+use super::{BTreeSet, COMPACTION_SUMMARY_FORMAT, CompactionEvidence, CompactionScope};
+
+#[path = "context_compaction_sections.rs"]
+mod sections;
+pub(super) use sections::{
+    SECTION_UPDATE_FORMAT, consolidate_response, consolidation_prompt, section_update_prompt,
 };
+
+/// Serialization/allocation guards derived from the resolved budget's independent resource
+/// bounds. These are neither preferred summary targets nor token-capacity acceptance criteria.
+/// The coordinator must validate the complete retained request with canonical semantic estimates
+/// after merging; passing these guards alone never authorizes publication.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SynthesisPolicy {
+    pub carry_chars: usize,
+    pub wire_bytes: usize,
+    pub section_chars: usize,
+}
+
+#[cfg(test)]
+impl SynthesisPolicy {
+    const LEGACY: Self = Self {
+        carry_chars: COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
+        wire_bytes: COMPACTION_MAX_CARRIED_SUMMARY_CHARS * 4,
+        section_chars: COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
+    };
+}
 
 pub(super) const UPDATE_FORMAT: &str = "bcode.compaction.scope-update.v1";
 
@@ -34,13 +60,13 @@ impl Rejection {
                 "invalid_json: return only the specified JSON object, without fences or extra fields"
             }
             Self::UnsupportedFormat => {
-                "unsupported_format: use bcode.compaction.scope-update.v1 or the strict legacy full-envelope schema"
+                "unsupported_format: use bcode.compaction.section-update.v1, bcode.compaction.scope-update.v1, or the strict full-envelope schema"
             }
             Self::EmptyContinuation => {
                 "empty_continuation: supply nonempty continuation facts, retaining relevant previous continuation"
             }
             Self::CarryBudget => {
-                "carry_budget: merged scope plus continuation exceeds 6000 encoded characters; shorten continuation/redundant NEW facts, never remove established scope to fit"
+                "carry_budget: merged scope plus continuation exceeds the supplied capacity allowance; shorten continuation/redundant NEW facts, never remove established scope to fit"
             }
             Self::InvalidSource => {
                 "invalid_source: scope must cite an eligible canonical user sequence; assistant/tool/legacy claims do not establish user provenance"
@@ -81,24 +107,32 @@ struct ScopeUpdate {
 
 /// Remaining JSON-encoded continuation characters, including escapes but excluding its quotes.
 /// This is an explicit carry budget, not a token estimate or permission to truncate evidence.
+#[cfg(test)]
 pub(super) fn continuation_budget(evidence: &CompactionEvidence) -> usize {
-    let mut skeleton = evidence.clone();
-    skeleton.continuation.clear();
-    let used = serde_json::to_string(&skeleton)
-        .map_or(COMPACTION_MAX_CARRIED_SUMMARY_CHARS, |text| {
-            text.chars().count()
-        });
-    COMPACTION_MAX_CARRIED_SUMMARY_CHARS.saturating_sub(used)
+    continuation_budget_with_policy(evidence, SynthesisPolicy::LEGACY)
 }
 
-fn decode(summary: &str) -> Result<serde_json::Value, Rejection> {
-    if summary.len() > COMPACTION_MAX_CARRIED_SUMMARY_CHARS * 4 {
+#[cfg(test)]
+pub(super) fn continuation_budget_with_policy(
+    evidence: &CompactionEvidence,
+    policy: SynthesisPolicy,
+) -> usize {
+    let mut skeleton = evidence.clone();
+    skeleton.continuation.clear();
+    let used =
+        serde_json::to_string(&skeleton).map_or(policy.carry_chars, |text| text.chars().count());
+    policy.carry_chars.saturating_sub(used)
+}
+
+fn decode(summary: &str, policy: SynthesisPolicy) -> Result<serde_json::Value, Rejection> {
+    if summary.len() > policy.wire_bytes {
         return Err(Rejection::WireBudget);
     }
     serde_json::from_str(summary).map_err(|_| Rejection::InvalidJson)
 }
 
 /// Strict full-envelope validation: missing or paraphrased carried scope is never repaired here.
+#[cfg(test)]
 pub(super) fn validate_full(
     summary: &str,
     prior: &CompactionEvidence,
@@ -106,13 +140,33 @@ pub(super) fn validate_full(
     new_user_sequences: &BTreeSet<u64>,
     reconcilable: &BTreeSet<u64>,
 ) -> Result<CompactionEvidence, Rejection> {
-    let evidence = serde_json::from_value(decode(summary)?).map_err(|_| Rejection::InvalidJson)?;
+    validate_full_with_policy(
+        summary,
+        prior,
+        user_sequences,
+        new_user_sequences,
+        reconcilable,
+        SynthesisPolicy::LEGACY,
+    )
+}
+
+pub(super) fn validate_full_with_policy(
+    summary: &str,
+    prior: &CompactionEvidence,
+    user_sequences: &BTreeSet<u64>,
+    new_user_sequences: &BTreeSet<u64>,
+    reconcilable: &BTreeSet<u64>,
+    policy: SynthesisPolicy,
+) -> Result<CompactionEvidence, Rejection> {
+    let evidence =
+        serde_json::from_value(decode(summary, policy)?).map_err(|_| Rejection::InvalidJson)?;
     validate_evidence(
         evidence,
         prior,
         user_sequences,
         new_user_sequences,
         reconcilable,
+        policy,
     )
 }
 
@@ -122,6 +176,7 @@ fn validate_evidence(
     user_sequences: &BTreeSet<u64>,
     new_user_sequences: &BTreeSet<u64>,
     reconcilable: &BTreeSet<u64>,
+    policy: SynthesisPolicy,
 ) -> Result<CompactionEvidence, Rejection> {
     if !reconcilable.is_subset(new_user_sequences) {
         return Err(Rejection::InvalidReconciliation);
@@ -132,11 +187,12 @@ fn validate_evidence(
     if evidence.continuation.trim().is_empty() {
         return Err(Rejection::EmptyContinuation);
     }
+    sections::validate_continuation(&evidence.continuation, policy)?;
     if serde_json::to_string(&evidence)
         .map_err(|_| Rejection::InvalidJson)?
         .chars()
         .count()
-        > COMPACTION_MAX_CARRIED_SUMMARY_CHARS
+        > policy.carry_chars
     {
         return Err(Rejection::CarryBudget);
     }
@@ -199,6 +255,7 @@ fn validate_evidence(
 /// Only this explicit update contract permits omitted unchanged scope. Legacy envelopes remain
 /// strict. The host copies protected statements, applies declared replacements, then validates the
 /// entire result with the same provenance, supersession, preservation and size rules.
+#[cfg(test)]
 pub(super) fn merge_response(
     summary: &str,
     prior: &CompactionEvidence,
@@ -206,14 +263,43 @@ pub(super) fn merge_response(
     new_user_sequences: &BTreeSet<u64>,
     reconcilable: &BTreeSet<u64>,
 ) -> Result<CompactionEvidence, Rejection> {
-    let value = decode(summary)?;
+    merge_response_with_policy(
+        summary,
+        prior,
+        user_sequences,
+        new_user_sequences,
+        reconcilable,
+        SynthesisPolicy::LEGACY,
+    )
+}
+
+pub(super) fn merge_response_with_policy(
+    summary: &str,
+    prior: &CompactionEvidence,
+    user_sequences: &BTreeSet<u64>,
+    new_user_sequences: &BTreeSet<u64>,
+    reconcilable: &BTreeSet<u64>,
+    policy: SynthesisPolicy,
+) -> Result<CompactionEvidence, Rejection> {
+    let value = decode(summary, policy)?;
+    if value.get("format").and_then(serde_json::Value::as_str) == Some(SECTION_UPDATE_FORMAT) {
+        return sections::merge(
+            value,
+            prior,
+            user_sequences,
+            new_user_sequences,
+            reconcilable,
+            policy,
+        );
+    }
     if value.get("format").and_then(serde_json::Value::as_str) != Some(UPDATE_FORMAT) {
-        return validate_full(
+        return validate_full_with_policy(
             summary,
             prior,
             user_sequences,
             new_user_sequences,
             reconcilable,
+            policy,
         );
     }
     let update: ScopeUpdate = serde_json::from_value(value).map_err(|_| Rejection::InvalidJson)?;
@@ -283,14 +369,40 @@ pub(super) fn merge_response(
         user_sequences,
         new_user_sequences,
         &reconciles,
+        policy,
     )
 }
 
-/// Rejected output is diagnostic data, never canonical source. Attach it whole only when bounded;
-/// source fragments and prior carry are always retained whole in the base prompt.
+/// Compatibility formatter for legacy test fixtures only.
+#[cfg(test)]
 pub(super) fn repair_prompt(base: &str, reason: Rejection, rejected: Option<&str>) -> String {
+    repair_prompt_with_policy(
+        base,
+        reason,
+        rejected,
+        SynthesisPolicy {
+            wire_bytes: COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
+            ..SynthesisPolicy::LEGACY
+        },
+    )
+}
+
+/// Rejected output is diagnostic data, never canonical source. Attach it whole only when its
+/// UTF-8 bytes fit the independent response wire guard; carry/section limits do not apply.
+/// Source fragments and prior carry are always retained whole in the base prompt.
+///
+/// Capacity planning must estimate the complete returned repair request, including this attachment
+/// and JSON escaping, before dispatch. A worst-case reservation can use a rejected string of
+/// `policy.wire_bytes` NUL bytes (six encoded characters per byte), passed through this exact
+/// formatter. Never reserve just `base` or assume the raw response byte bound caps escaped input.
+pub(super) fn repair_prompt_with_policy(
+    base: &str,
+    reason: Rejection,
+    rejected: Option<&str>,
+    policy: SynthesisPolicy,
+) -> String {
     let diagnostic = rejected
-        .filter(|text| text.chars().count() <= COMPACTION_MAX_CARRIED_SUMMARY_CHARS)
+        .filter(|text| text.len() <= policy.wire_bytes)
         .and_then(|text| serde_json::to_string(text).ok())
         .map_or_else(
             || {

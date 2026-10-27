@@ -1628,6 +1628,11 @@ pub enum Request {
     RebuildSessionSummary {
         request: bcode_session_models::SessionSummaryRebuildRequest,
     },
+    /// Explicit exact-checkpoint restart, not canonical-history reconstruction.
+    /// Appended to preserve all previous binary request discriminants.
+    RestartSessionCompaction {
+        request: bcode_session_models::SessionCompactionRestartRequest,
+    },
 }
 
 /// Server stop request policy.
@@ -4208,6 +4213,60 @@ mod child_wire_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compaction_restart_round_trips_through_actual_codec_without_changing_rebuild() {
+        use super::{Request, decode_request, encode_request};
+        use bcode_session_models::{
+            SessionCompactionRestartBudget, SessionCompactionRestartMarker,
+            SessionCompactionRestartRequest, SessionId, SessionSummaryRebuildBudget,
+            SessionSummaryRebuildRequest,
+        };
+
+        let session_id = SessionId::new();
+        let operation_id = SessionId::new().0;
+        for marker in [
+            None,
+            Some(SessionCompactionRestartMarker {
+                sequence: 12,
+                sha256: "ab".repeat(32),
+            }),
+        ] {
+            let request = Request::RestartSessionCompaction {
+                request: SessionCompactionRestartRequest {
+                    version: 1,
+                    session_id,
+                    operation_id,
+                    expected_operation_key: "local-compaction-v1:old".into(),
+                    expected_checkpoint_sequence: 42,
+                    expected_terminal_sequence: 46,
+                    expected_terminal_sha256: "cd".repeat(32),
+                    expected_prior_marker: marker,
+                    budget: SessionCompactionRestartBudget {
+                        max_provider_requests: 16,
+                        timeout_ms: 30_000,
+                    },
+                },
+            };
+            let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+            assert_eq!(decoded, request);
+            let Request::RestartSessionCompaction { request } = decoded else {
+                panic!("restart request")
+            };
+            request.validate().unwrap();
+        }
+        let request = Request::RebuildSessionSummary {
+            request: SessionSummaryRebuildRequest {
+                session_id,
+                expected_marker: 12,
+                budget: SessionSummaryRebuildBudget::default(),
+            },
+        };
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+    }
+
     #[test]
     fn committed_history_query_roundtrip_retains_pin_and_version() {
         let query = bcode_workflow::WorkflowCommittedHistoryQuery {

@@ -40,7 +40,7 @@ system instructions. Legacy attribution is not invented. Existing scope/superses
 remain in the synthesis path; incomplete, invalid or oversized output is rejected, not clipped.
 Request-only guidance and assembled provider requests are not portable summary sources.
 
-### Host-preserving synthesis updates
+### Scope-update compatibility contract
 
 Local synthesis uses `packages/server/src/context_compaction_synthesis.rs`. The model is asked for
 `bcode.compaction.scope-update.v1`, containing `current_scope`, `reconciles`, and `continuation`.
@@ -70,7 +70,7 @@ eligible supersession or unfinished-source reconciliation; reconciliation cannot
 an established provisional source without replacement scope. Free-text legacy summaries remain
 unverified derived input, not newly attributed user authorization.
 
-Supersession currently replaces an entire source-sequence scope group. The prompt requires the
+Legacy full-envelope supersession replaces an entire source-sequence scope group. The prompt requires the
 replacement to preserve independent applicable restrictions, but the validator does not mechanically
 prove that a partial correction retained every other restriction from that same source. Host copying
 protects unchanged groups; it does not establish semantic completeness of new scope, replacements or
@@ -99,6 +99,31 @@ Exhaustion reports a rejected synthesis and leaves the old marker unchanged; acc
 remain durable. Experimental packing budgets the real repair formatter, bounded diagnostic escaping
 and reconciliation eligibility as well as the original request, then checks actual request capacity
 again. Capacity checks can still reject work; reservations are not refunded.
+
+### Capacity-aware section synthesis
+
+Current local synthesis asks for `bcode.compaction.section-update.v1`. Its derived continuation
+contains versioned `decisions`, `active_work_blockers`, `findings_evidence`, and `background`
+sections. Ordinary updates append new evidence; omitted sections and established scope are
+host-preserved. Explicit consolidation replaces derived sections only and cannot advance source
+coverage or change user scope. Statement-targeted supersession names both the exact old statement
+and its newer user-attributed replacement, preserving independent siblings. Older full-envelope
+responses retain strict compatibility validation, including explicit provisional-source replacement.
+
+The old 6,000-character acceptance ceiling is not used for current capacity-aware operations.
+A frozen resolved policy uses the shared semantic estimator on complete before and retained
+requests, including real summary framing, retained history, system/tool overhead, output reserve,
+and safety margin. The preferred 2,000-token target is guidance, not an acceptance ceiling.
+Larger valid summaries may be accepted if the actual retained request fits and ordinary compaction
+reclaims space. Explicit same-boundary reconstruction uses capacity-only validation; it may grow.
+Independent allocation limits remain 65,536 summary bytes and 262,144 response bytes; they are not
+token estimates or a guarantee of retaining arbitrarily much information. Scope and coverage checks
+remain mandatory in addition to capacity checks.
+
+The complete resolved policy and resource guards are frozen in checkpoints. Append-only tail changes
+do not replenish request allowances; final assembled-request validation still checks actual capacity.
+Consolidation has independently persisted finite reservations and an explicit unresolved phase.
+Interrupted consolidation cannot be certified complete by an earlier accepted source chunk.
 
 ## Implemented durable local checkpoint path
 
@@ -153,9 +178,9 @@ chunk was accepted, and decode integrity does not establish semantic retention o
 
 Each provider attempt reserves and saves a slot before dispatch, including repairs and ambiguous
 interrupted attempts. Accepted chunks are skipped on resume; reservations are not refunded.
-The two-attempt-per-chunk limit survives cancellation/restart. The existing bounds remain: 32 base
-chunks, 2,000-byte fragments, legacy 16,000 input bound, 6,000 carried-summary characters and UTF-8
-byte guard. These are not interchangeable token units. The implementation does **not** provide the
+The two-attempt-per-chunk limit survives cancellation/restart. The source bounds remain: 32 base chunks, 2,000-byte fragments and legacy 16,000 input bound.
+Current carry uses the frozen capacity policy and independent byte guards described above; the
+6,000-character limit applies only to the legacy compatibility validator. These are not interchangeable token units. The implementation does **not** provide the
 previously proposed six independent reservation/creation/acceptance APIs, nor a general durable
 ledger of elapsed time, decoded bytes or every recovery allowance.
 

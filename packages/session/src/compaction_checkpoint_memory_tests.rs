@@ -90,6 +90,104 @@ async fn memory_compaction_commit_validates_and_atomically_retires_native_and_lo
     }
 }
 
+#[tokio::test]
+async fn memory_restart_is_atomic_fenced_and_idempotent() {
+    use crate::CompactionCheckpointRestart;
+    let manager = SessionManager::default();
+    let session = manager
+        .create_session(None, std::env::current_dir().unwrap())
+        .await
+        .unwrap();
+    let source = manager
+        .append_event(
+            session.id,
+            SessionEventKind::SystemMessage {
+                text: "source".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let checkpoint = manager
+        .append_compaction_checkpoint(session.id, "old", Some("consumed=2".into()))
+        .await
+        .unwrap();
+    // The host owns rejection semantics; the session primitive compares exact canonical bytes.
+    let rejection = manager
+        .append_event(
+            session.id,
+            SessionEventKind::SystemMessage {
+                text: "complete rejection".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let request = CompactionCheckpointRestart {
+        operation_key: "old".into(),
+        expected_checkpoint_sequence: checkpoint.sequence,
+        expected_prior_marker: None,
+        source: vec![compaction_event_identity(&source).unwrap()],
+        rejection: compaction_event_identity(&rejection).unwrap(),
+        replacement_key: "fresh".into(),
+        replacement_payload: "fresh allowance".into(),
+        pointer_key: "discovery".into(),
+        pointer_payload: "fresh".into(),
+    };
+    let original = manager.session_history(session.id).await.unwrap();
+    for field in 0..4 {
+        let mut stale = request.clone();
+        match field {
+            0 => stale.rejection.sha256 = "0".repeat(64),
+            1 => stale.source[0].sha256 = "0".repeat(64),
+            2 => stale.expected_checkpoint_sequence = rejection.sequence,
+            _ => {
+                stale.expected_prior_marker = Some(crate::CompactionEventIdentity {
+                    sequence: source.sequence,
+                    sha256: "0".repeat(64),
+                });
+            }
+        }
+        assert!(
+            manager
+                .restart_compaction_checkpoint(session.id, stale)
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.session_history(session.id).await.unwrap(), original);
+    }
+    let replacement = manager
+        .restart_compaction_checkpoint(session.id, request.clone())
+        .await
+        .unwrap();
+    let history = manager.session_history(session.id).await.unwrap();
+    assert_eq!(&history[..original.len()], &original);
+    assert_eq!(history.len(), original.len() + 4);
+    assert_eq!(history.last().unwrap().sequence, replacement.sequence + 1);
+    assert!(
+        CompactionSynthesisCheckpoint::from_event(&history[original.len() + 1])
+            .unwrap()
+            .unwrap()
+            .host_payload
+            .is_none()
+    );
+    assert_eq!(
+        manager
+            .restart_compaction_checkpoint(session.id, request.clone())
+            .await
+            .unwrap(),
+        replacement
+    );
+    assert_eq!(manager.session_history(session.id).await.unwrap(), history);
+    let mut conflict = request;
+    conflict.replacement_payload = "more allowance".into();
+    assert!(
+        manager
+            .restart_compaction_checkpoint(session.id, conflict)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.session_history(session.id).await.unwrap(), history);
+}
+
 fn marker(native: bool, boundary: u64) -> SessionEventKind {
     if native {
         SessionEventKind::ProviderContextCompacted {

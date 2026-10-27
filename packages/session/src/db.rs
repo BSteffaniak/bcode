@@ -2733,6 +2733,139 @@ impl SessionDb {
         Ok(())
     }
 
+    /// Atomically validate and supersede one unpublished operation. No generic transaction escape.
+    pub(crate) async fn restart_compaction_checkpoint(
+        &self,
+        request: &crate::CompactionCheckpointRestart,
+        events: &[SessionEvent; 4],
+    ) -> SessionDbResult<SessionEvent> {
+        use crate::compaction_event_identity;
+        let invalid = || SessionDbError::InvalidData(crate::CompactionCheckpointRestart::invalid());
+        request.validate().map_err(|_| invalid())?;
+        request
+            .validate_retry_events(events)
+            .map_err(|_| invalid())?;
+        let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
+        validate_storage_writer_contract(&*tx).await?;
+        if let Some(tail) = last_sequence(&*tx).await? {
+            let snapshot = projection_checkpoint_snapshot(&*tx).await?;
+            validate_projection_checkpoint_snapshot(&snapshot, tail)?;
+        }
+        if let Some(receipt) = self
+            .restart_checkpoint_at_key(&*tx, &request.receipt_key())
+            .await?
+        {
+            let replacement_sequence = request.retry_sequence(&receipt).map_err(|_| invalid())?;
+            let mut persisted = Vec::with_capacity(4);
+            for offset in 0..4 {
+                let sequence = receipt.sequence.checked_add(offset).ok_or_else(invalid)?;
+                persisted.push(self.restart_event_at(&*tx, sequence).await?);
+            }
+            let persisted: [SessionEvent; 4] = persisted.try_into().map_err(|_| invalid())?;
+            request
+                .validate_retry_events(&persisted)
+                .map_err(|_| invalid())?;
+            if persisted[2].sequence != replacement_sequence {
+                return Err(invalid());
+            }
+            tx.commit().await?;
+            return Ok(persisted[2].clone());
+        }
+        // Canonical generation, projection tail, marker, source and checkpoint are all
+        // checked in this same transaction, before any receipt or retirement is appended.
+        if events[0].sequence.checked_sub(1) != Some(request.fence()) {
+            return Err(invalid());
+        }
+        validate_append_preconditions_without_writer(&*tx, &events[0]).await?;
+        let comparison = request.comparison();
+        self.validate_compaction_prior_marker(&*tx, &comparison)
+            .await?;
+        let boundary = request.source.last().ok_or_else(invalid)?.sequence;
+        self.validate_compaction_source(&*tx, &comparison, &events[0], boundary)
+            .await?;
+        self.validate_compaction_retirement(&*tx, &comparison, &events[1])
+            .await?;
+        let rejection = self
+            .restart_event_at(&*tx, request.rejection.sequence)
+            .await?;
+        if compaction_event_identity(&rejection).map_err(|_| invalid())? != request.rejection
+            || self
+                .restart_checkpoint_at_key(&*tx, &request.replacement_key)
+                .await?
+                .is_some()
+        {
+            return Err(invalid());
+        }
+        // Validate the existing pointer's current-format evidence if it is present.
+        self.restart_checkpoint_at_key(&*tx, &request.pointer_key)
+            .await?;
+        for event in events {
+            validate_append_preconditions_without_writer(&*tx, event).await?;
+            append_event_projections(&*tx, event, Some(event.timestamp_ms)).await?;
+            validate_append_postconditions(&*tx, event).await?;
+        }
+        tx.commit().await?;
+        Ok(events[2].clone())
+    }
+
+    async fn restart_event_at(
+        &self,
+        db: &dyn Database,
+        sequence: u64,
+    ) -> SessionDbResult<SessionEvent> {
+        let rows = db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .where_eq("event_seq", seq_to_value(sequence))
+            .limit(1)
+            .execute(db)
+            .await?;
+        let invalid = || SessionDbError::InvalidData(crate::CompactionCheckpointRestart::invalid());
+        strict_event_from_row(rows.first().ok_or_else(invalid)?, self.session_id)
+    }
+
+    async fn restart_checkpoint_at_key(
+        &self,
+        db: &dyn Database,
+        key: &str,
+    ) -> SessionDbResult<Option<SessionEvent>> {
+        let invalid = || SessionDbError::InvalidData(crate::CompactionCheckpointRestart::invalid());
+        let indexes = db
+            .select("sqlite_master")
+            .columns(&["name"])
+            .where_eq("type", "index")
+            .where_eq("name", "idx_turn_evidence_sequence")
+            .limit(1)
+            .execute(db)
+            .await?;
+        if indexes.is_empty() {
+            return Err(invalid());
+        }
+        let rows = db
+            .select("turn_evidence")
+            .columns(&["event_seq"])
+            .where_eq("turn_id", key.to_owned())
+            .where_eq("evidence_kind", "compaction")
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute(db)
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let event = self
+            .restart_event_at(db, required_non_negative_u64(row, "event_seq")?)
+            .await?;
+        let checkpoint = bcode_session_models::CompactionSynthesisCheckpoint::from_event(&event)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        if checkpoint.operation_key != key {
+            return Err(invalid());
+        }
+        Ok(Some(event))
+    }
+
     async fn validate_compaction_prior_marker(
         &self,
         db: &dyn Database,
@@ -11799,6 +11932,162 @@ mod tests {
         assert_eq!(
             required_string(&rows[0], "payload").expect("payload"),
             payload
+        );
+    }
+
+    async fn assert_compaction_restart_fences(
+        db: &SessionDb,
+        request: &crate::CompactionCheckpointRestart,
+        template: &SessionEvent,
+        checkpoint: &SessionEvent,
+    ) {
+        // All comparison failures occur inside the transaction and leave even retirement absent.
+        for field in 0..4 {
+            let mut stale = request.clone();
+            match field {
+                0 => stale.expected_checkpoint_sequence = 2,
+                1 => stale.source[0].sha256 = "0".repeat(64),
+                2 => stale.rejection.sha256 = "0".repeat(64),
+                _ => {
+                    stale.expected_prior_marker = Some(crate::CompactionEventIdentity {
+                        sequence: 0,
+                        sha256: "0".repeat(64),
+                    });
+                }
+            }
+            let stale_events = stale.events(template).unwrap();
+            assert!(
+                db.restart_compaction_checkpoint(&stale, &stale_events)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(db.last_event_sequence().await.unwrap(), Some(2));
+            assert_eq!(
+                db.compaction_checkpoint("old").await.unwrap(),
+                Some(checkpoint.clone())
+            );
+            assert!(
+                db.compaction_checkpoint("replacement")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_restart_is_atomic_and_retry_survives_reopen() {
+        use bcode_session_models::CompactionSynthesisCheckpoint as Checkpoint;
+        let temp = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .unwrap();
+        let source = event(
+            id,
+            0,
+            SessionEventKind::SystemMessage {
+                text: "source".into(),
+            },
+        );
+        db.append_event(&source).await.unwrap();
+        let checkpoint = event(
+            id,
+            1,
+            Checkpoint {
+                version: 1,
+                operation_key: "old".into(),
+                host_payload: Some("consumed=2".into()),
+            }
+            .into_event_kind(0)
+            .unwrap(),
+        );
+        db.append_event(&checkpoint).await.unwrap();
+        let rejection = event(
+            id,
+            2,
+            SessionEventKind::SystemMessage {
+                text: "host-validated rejection".into(),
+            },
+        );
+        db.append_event(&rejection).await.unwrap();
+        let request = crate::CompactionCheckpointRestart {
+            operation_key: "old".into(),
+            expected_checkpoint_sequence: 1,
+            expected_prior_marker: None,
+            source: vec![crate::compaction_event_identity(&source).unwrap()],
+            rejection: crate::compaction_event_identity(&rejection).unwrap(),
+            replacement_key: "replacement".into(),
+            replacement_payload: "fresh explicit allowance".into(),
+            pointer_key: "discovery".into(),
+            pointer_payload: "replacement".into(),
+        };
+        let template = event(
+            id,
+            3,
+            SessionEventKind::SystemMessage {
+                text: String::new(),
+            },
+        );
+        let events = request.events(&template).unwrap();
+        assert_compaction_restart_fences(&db, &request, &template, &checkpoint).await;
+        let replacement = db
+            .restart_compaction_checkpoint(&request, &events)
+            .await
+            .unwrap();
+        assert_eq!(replacement, events[2]);
+        assert_eq!(
+            db.last_event_sequence().await.unwrap(),
+            Some(replacement.sequence + 1)
+        );
+        assert!(
+            Checkpoint::from_event(&db.compaction_checkpoint("old").await.unwrap().unwrap())
+                .unwrap()
+                .unwrap()
+                .host_payload
+                .is_none()
+        );
+        assert_eq!(
+            db.restart_event_at(db.database(), 1).await.unwrap(),
+            checkpoint
+        );
+        drop(db);
+        let db = SessionDb::open_existing_turso_in_root(id, temp.path())
+            .await
+            .unwrap();
+        assert_compaction_restart_retry(&db, &request, &replacement).await;
+    }
+
+    async fn assert_compaction_restart_retry(
+        db: &SessionDb,
+        request: &crate::CompactionCheckpointRestart,
+        replacement: &SessionEvent,
+    ) {
+        let retry_template = event(
+            replacement.session_id,
+            replacement.sequence + 2,
+            SessionEventKind::SystemMessage {
+                text: String::new(),
+            },
+        );
+        let retry_events = request.events(&retry_template).unwrap();
+        assert_eq!(
+            db.restart_compaction_checkpoint(request, &retry_events)
+                .await
+                .unwrap(),
+            *replacement
+        );
+        let mut conflict = request.clone();
+        conflict.replacement_payload = "extra allowance".into();
+        let conflict_events = conflict.events(&retry_template).unwrap();
+        assert!(
+            db.restart_compaction_checkpoint(&conflict, &conflict_events)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.last_event_sequence().await.unwrap(),
+            Some(replacement.sequence + 1)
         );
     }
 

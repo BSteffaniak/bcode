@@ -2,6 +2,46 @@
 use super::*;
 
 #[tokio::test]
+async fn consolidation_dispatch_never_uses_an_older_accepted_chunk_as_outcome_proof() {
+    let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+    let session = state
+        .sessions
+        .create_session(None, std::env::temp_dir())
+        .await
+        .unwrap();
+    let id = session.id;
+    drop(session);
+    let recovery = ModelTurnRecoveryState::default();
+    let rounds = ModelTurnRoundState::new(Some(5));
+    protect(
+        &state,
+        id,
+        "section-dispatch",
+        17,
+        (&recovery, &rounds, 3, 9),
+        async {
+            transition(&state, id, Phase::ConsolidatingV1)
+                .await
+                .unwrap();
+            let checkpoint = provider_retry_recovery::load(&state, id, "section-dispatch")
+                .await
+                .unwrap()
+                .unwrap();
+            let phase = checkpoint.compaction.unwrap();
+            assert!(matches!(phase, Phase::ConsolidatingV1));
+            assert!(!can_resume(&state, id, &phase).await.unwrap());
+            let wire = serde_json::to_string(&phase).unwrap();
+            let restored = serde_json::from_str::<Phase>(&wire).unwrap();
+            assert!(!can_resume(&state, id, &restored).await.unwrap());
+            assert!(serde_json::from_str::<Phase>("\"ConsolidatingV2\"").is_err());
+        },
+    )
+    .await
+    .unwrap();
+    drop(state);
+}
+
+#[tokio::test]
 async fn safe_point_persists_across_interrupted_future_and_retires_on_return() {
     let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
     let session = state

@@ -1441,8 +1441,34 @@ pub async fn cancel_turn(
     client_id: bcode_session_models::ClientId,
     expected_turn_id: Option<String>,
 ) -> Result<bool, super::ServerError> {
-    if let Some(turn_id) = expected_turn_id.as_deref()
-        && super::submission_recovery::end_interrupted_turn(state, session_id, turn_id).await?
+    // A verified live target is actor-owned. Do not run interrupted-work recovery
+    // queries before routing its cancellation; those queries cannot settle live work.
+    let live_target = if let Some(turn_id) = expected_turn_id.as_deref() {
+        let runtime = state
+            .session_runtimes
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
+        if let Some(runtime) = runtime {
+            runtime
+                .current_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|turn| turn.turn_id == turn_id)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !live_target
+        && let Some(turn_id) = expected_turn_id.as_deref()
+        && Box::pin(super::submission_recovery::end_interrupted_turn(
+            state, session_id, turn_id,
+        ))
+        .await?
     {
         return Ok(true);
     }
@@ -1552,6 +1578,34 @@ pub async fn compact(
     )
     .await;
     Ok(super::enqueue_compact_session_command(state, session_id, client_id, selection).await?)
+}
+
+/// Enqueue an explicitly authorized replacement operation without resetting old allowances.
+pub async fn restart_compaction(
+    state: &Arc<ServerState>,
+    client_id: bcode_session_models::ClientId,
+    request: bcode_session_models::SessionCompactionRestartRequest,
+) -> Result<tokio::sync::oneshot::Receiver<Result<String, super::CompactionError>>, CompactError> {
+    request
+        .validate()
+        .map_err(super::CompactionError::Provider)?;
+    let session_id = request.session_id;
+    if let Some(namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return Err(CompactError::IncompatibleActiveNamespace(namespace));
+    }
+    let selection = super::session_model_selection_with_runtime_context(
+        state,
+        session_id,
+        state.client_runtime_context(client_id).await,
+    )
+    .await;
+    Ok(super::enqueue_restart_session_compaction_command(
+        state, session_id, client_id, selection, request,
+    )
+    .await?)
 }
 
 /// Await the terminal result of an accepted compaction.
