@@ -10,6 +10,9 @@
 use super::*;
 use sha2::Digest as _;
 
+#[path = "context_compaction_auto_recovery.rs"]
+mod auto_recovery;
+
 #[path = "context_compaction_budget.rs"]
 mod budget;
 #[path = "context_compaction_checkpoint.rs"]
@@ -104,6 +107,30 @@ pub async fn restart_session_context(
     command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel: &TurnCancelState,
 ) -> Result<CompactionCompletion, CompactionError> {
+    restart_session_context_with_policy(
+        state,
+        request,
+        selection,
+        command_context,
+        cancel,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restart_session_context_with_policy(
+    state: &ServerState,
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+    selection: &SessionModelSelection,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel: &TurnCancelState,
+    planning: Option<CompactionPlanningPolicy>,
+    first_kept_sequence: Option<u64>,
+    progress_requirement: Option<CompactionProgressRequirement>,
+) -> Result<CompactionCompletion, CompactionError> {
     context_compaction_request_budget::scope(Box::pin(async {
         request.validate().map_err(CompactionError::Provider)?;
         if cancel.is_cancelled() { return Err(CompactionError::Cancelled); }
@@ -120,7 +147,11 @@ pub async fn restart_session_context(
         let history = state.sessions.activated_conversation_snapshot(session_id).await?.events;
         let plan = checkpoint::frozen_plan(&history, config.model.tool_output.context_chars, old.boundary)?;
         let transcript = compaction_transcript_from_plan(&plan);
-        let policy = resolve_summary_budget(state, session_id, selection, &history, old.boundary, 1, cancel).await?;
+        if first_kept_sequence.is_some_and(|cutoff| old.boundary >= cutoff) {
+            return Err(CompactionError::RecoveryRequired(CompactionRecoveryReason::PolicyChanged));
+        }
+        let policy = resolve_summary_budget(state, session_id, selection, &history, old.boundary,
+            progress_requirement.map_or(1, |requirement| requirement.minimum_reclaimable_tokens).max(1), cancel).await?;
         let (chunks, packing) = synthesis_chunks(state, session_id, selection, &transcript, cancel, Some(&policy)).await?;
         let mut replacement = checkpoint::LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, synthesis_limits(&policy))?;
         replacement.packing_policy = budget_packing_identity(&packing, &policy)?;
@@ -129,8 +160,15 @@ pub async fn restart_session_context(
         let replacement_key = restart.replacement_key.clone();
         if cancel.is_cancelled() { return Err(CompactionError::Cancelled); }
         state.sessions.restart_compaction_checkpoint(session_id, restart).await?;
-        compact_session_context_with_policy_key(state, session_id, selection, command_context, cancel,
-            replacement_key).await
+        if let Some(planning) = planning {
+            RESTART_KEY.scope(replacement_key, Box::pin(compact_session_context_with_policy(
+                state, session_id, selection, first_kept_sequence, command_context, cancel,
+                progress_requirement, planning,
+            ))).await
+        } else {
+            compact_session_context_with_policy_key(state, session_id, selection, command_context, cancel,
+                replacement_key).await
+        }
     })).await
 }
 
@@ -177,6 +215,25 @@ pub async fn prepare_compaction_recovery(
     selection: &SessionModelSelection,
     request: &bcode_session_models::SessionCompactionRecoveryDiscoveryRequest,
 ) -> Result<bcode_session_models::SessionCompactionRecoveryPreparation, CompactionError> {
+    let config = state.session_config(request.session_id).await;
+    prepare_compaction_recovery_with_policy(
+        state,
+        selection,
+        request,
+        CompactionPlanningPolicy::Proactive {
+            keep_recent_tokens: effective_compaction_config(&config, selection).keep_recent_tokens
+                as usize,
+        },
+    )
+    .await
+}
+
+async fn prepare_compaction_recovery_with_policy(
+    state: &ServerState,
+    selection: &SessionModelSelection,
+    request: &bcode_session_models::SessionCompactionRecoveryDiscoveryRequest,
+    planning: CompactionPlanningPolicy,
+) -> Result<bcode_session_models::SessionCompactionRecoveryPreparation, CompactionError> {
     use bcode_session_models::{
         SessionCompactionRecoveryBlocker as Blocker, SessionCompactionRecoveryPreparation,
         SessionCompactionRecoveryPrepareRequest, SessionHistoryDirection, SessionHistoryQuery,
@@ -195,10 +252,6 @@ pub async fn prepare_compaction_recovery(
         .await?
         .events;
     let config = state.session_config(request.session_id).await;
-    let planning = CompactionPlanningPolicy::Proactive {
-        keep_recent_tokens: effective_compaction_config(&config, selection).keep_recent_tokens
-            as usize,
-    };
     let key = format!(
         "{}:{:?}",
         checkpoint::operation_key(
@@ -527,7 +580,7 @@ async fn compact_session_context_with_policy(
     session_id: SessionId,
     selection: &SessionModelSelection,
     first_kept_sequence: Option<u64>,
-    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    mut command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
     progress_requirement: Option<CompactionProgressRequirement>,
     planning_policy: CompactionPlanningPolicy,
@@ -552,7 +605,7 @@ async fn compact_session_context_with_policy(
                     session_id,
                     selection,
                     first_kept_sequence,
-                    command_context,
+                    command_context.as_deref_mut(),
                     cancel_state,
                     progress_requirement,
                     planning_policy,
@@ -572,6 +625,25 @@ async fn compact_session_context_with_policy(
                     Some(message),
                 )
                 .await;
+                if matches!(
+                    &result,
+                    Err(CompactionError::RecoveryRequired(
+                        CompactionRecoveryReason::PolicyChanged
+                    ))
+                ) && RESTART_KEY.try_with(|_| ()).is_err()
+                {
+                    return Box::pin(auto_recovery::recover_policy_change(
+                        state,
+                        session_id,
+                        selection,
+                        command_context,
+                        cancel_state,
+                        first_kept_sequence,
+                        progress_requirement,
+                        planning_policy,
+                    ))
+                    .await;
+                }
                 result
             })),
         )

@@ -306,7 +306,20 @@ remains blocked, not merely awaiting a flag. Adaptive packing remains default-of
 quality and semantic retention across repeated compactions remain unproven. Structural validators
 do not make compaction lossless.
 
-## Explicit recovery of a failed unpublished operation
+## Automatic recovery of known policy incompatibilities
+
+An admitted manual or automatic compaction internally replaces a structurally valid original
+checkpoint whose known synthesis/capacity/packing policy is incompatible. It first records the
+failed attempt and verifies canonical terminal evidence for every old reserved provider request.
+The existing ownership-fenced atomic supersession preserves the original checkpoint and spent
+allowances, and gives one distinct replacement at most 64 provider requests and 300 seconds.
+The original planning mode, protected current-turn cutoff and reclaim requirement remain in force.
+Replacement operations never receive another automatic allowance; cancellation, corruption,
+unknown formats and uncertain provider outcomes do not authorize replacement. Normal session
+reads remain non-mutating. This is new bounded compaction work, not conversion of old summaries
+or a replay of their provider calls; no prepare/restart commands are needed for this supported case.
+
+## Explicit recovery of other failed unpublished operations
 
 This is distinct from rebuilding a committed summary. `session compact ID --prepare-restart`
 with `--restart-operation-id UUID`, `--restart-max-provider-requests N`, and

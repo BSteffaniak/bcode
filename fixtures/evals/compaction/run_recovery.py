@@ -121,37 +121,34 @@ class RecoveryDriver(Driver):
         self.configure("off")
         self.start()
         if self.mismatch:
-            self.compact("policy-mismatch")
-            mismatch = load_events([self.export("policy-mismatch.jsonl")])
-            failure = policy_failure(mismatch, old[-1]["sequence"])
-            self.save("policy-failure-evidence.json", json.dumps(failure, indent=2))
-            unchanged_prefix(old, mismatch)
-            current, envelope = retained_checkpoint(mismatch)
-            if current != old_event or envelope != old_envelope or markers(mismatch):
-                raise ValueError("policy mismatch rewrote/retired old checkpoint or published")
-            old = mismatch
-        operation = str(uuid.uuid4())
-        before_prepare = set(attempts(self.control))
-        result = self.run("session", "compact", self.session, "--prepare-restart",
-                          "--restart-operation-id", operation, "--restart-max-provider-requests", "128",
-                          "--restart-timeout-ms", "300000", "--json")
-        preparation = json.loads(result.stdout)
-        self.save("preparation.json", json.dumps(preparation, indent=2))
-        candidate = restart_candidate(preparation, self.session)
-        if candidate["expected_checkpoint_sequence"] != old_event["sequence"]:
-            raise ValueError("preparation silently selected another checkpoint")
-        observed = load_events([self.export("after-prepare.jsonl")])
-        if observed != old or set(attempts(self.control)) != before_prepare:
-            raise ValueError("read-only recovery preparation mutated history or dispatched")
-        # Wrong exact identity cannot borrow the candidate's settled-owner authority.
-        stale = dict(candidate, operation_id=str(uuid.uuid4()),
-                     expected_checkpoint_sequence=candidate["expected_checkpoint_sequence"] + 1)
-        self.compact("stale-candidate", stale)
-        after_stale = load_events([self.export("after-stale.jsonl")])
-        if markers(after_stale) or set(attempts(self.control)) != before_prepare:
-            raise ValueError("stale recovery candidate dispatched or published")
-        unchanged_prefix(old, after_stale)
-        self.compact("recovery", candidate, check=True)
+            # A normal compaction request must replace a settled incompatible operation
+            # internally. No preparation JSON or explicit restart is part of this path.
+            self.compact("automatic-policy-recovery", check=True)
+            operation = "automatic"
+            candidate = None
+        else:
+            operation = str(uuid.uuid4())
+            before_prepare = set(attempts(self.control))
+            result = self.run("session", "compact", self.session, "--prepare-restart",
+                              "--restart-operation-id", operation, "--restart-max-provider-requests", "128",
+                              "--restart-timeout-ms", "300000", "--json")
+            preparation = json.loads(result.stdout)
+            self.save("preparation.json", json.dumps(preparation, indent=2))
+            candidate = restart_candidate(preparation, self.session)
+            if candidate["expected_checkpoint_sequence"] != old_event["sequence"]:
+                raise ValueError("preparation silently selected another checkpoint")
+            observed = load_events([self.export("after-prepare.jsonl")])
+            if observed != old or set(attempts(self.control)) != before_prepare:
+                raise ValueError("read-only recovery preparation mutated history or dispatched")
+            # Wrong exact identity cannot borrow the candidate's settled-owner authority.
+            stale = dict(candidate, operation_id=str(uuid.uuid4()),
+                         expected_checkpoint_sequence=candidate["expected_checkpoint_sequence"] + 1)
+            self.compact("stale-candidate", stale)
+            after_stale = load_events([self.export("after-stale.jsonl")])
+            if markers(after_stale) or set(attempts(self.control)) != before_prepare:
+                raise ValueError("stale recovery candidate dispatched or published")
+            unchanged_prefix(old, after_stale)
+            self.compact("recovery", candidate, check=True)
         recovered = load_events([self.export("recovered.jsonl")])
         unchanged_prefix(old, recovered)
         selected = markers(recovered)
@@ -162,16 +159,19 @@ class RecoveryDriver(Driver):
         if recovered_boundary != json.loads(old_envelope["host_payload"])["boundary"]:
             raise ValueError("recovery changed the frozen failed-operation source boundary")
         count = set(attempts(self.control))
-        # Same identity may return its prior receipt, but must never repeat provider work.
-        self.compact("duplicate-candidate", candidate)
-        if set(attempts(self.control)) != count:
-            raise ValueError("duplicate recovery candidate redispatched provider work")
-        distinct = dict(candidate, operation_id=str(uuid.uuid4()))
-        self.compact("superseded-candidate", distinct)
-        final = load_events([self.export("final.jsonl")])
-        if set(attempts(self.control)) != count or len(markers(final)) != 1:
-            raise ValueError("superseded recovery candidate dispatched or republished")
-        unchanged_prefix(recovered, final)
+        if candidate is not None:
+            # Same identity may return its prior receipt, but must never repeat provider work.
+            self.compact("duplicate-candidate", candidate)
+            if set(attempts(self.control)) != count:
+                raise ValueError("duplicate recovery candidate redispatched provider work")
+            distinct = dict(candidate, operation_id=str(uuid.uuid4()))
+            self.compact("superseded-candidate", distinct)
+            final = load_events([self.export("final.jsonl")])
+            if set(attempts(self.control)) != count or len(markers(final)) != 1:
+                raise ValueError("superseded recovery candidate dispatched or republished")
+            unchanged_prefix(recovered, final)
+        else:
+            final = recovered
         self.stop()
         self.start()
         restarted = load_events([self.export("restarted.jsonl")])

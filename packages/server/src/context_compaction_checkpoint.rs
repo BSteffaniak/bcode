@@ -278,6 +278,12 @@ impl LocalCheckpoint {
         )
     }
 
+    /// Automatic replacement may happen once for an original operation, never replenish
+    /// a replacement operation's durable allowance on another configuration change.
+    pub(super) const fn is_original_operation(&self) -> bool {
+        self.restart_allowance.is_none()
+    }
+
     /// Decode the frozen budget into the planner's current typed contract.
     /// Absence is incompatible state, never permission to resolve and replace a spent budget.
     pub(super) fn resolved_policy<T: serde::de::DeserializeOwned>(
@@ -2492,6 +2498,171 @@ mod tests {
         assert_eq!(
             prepare_recovery(&state, &request).await.unwrap().blocker,
             Some(SessionCompactionRecoveryBlocker::CheckpointChanged)
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn ordinary_compaction_automatically_replaces_known_incompatible_checkpoint() {
+        Box::pin(automatic_policy_recovery_case(true, false)).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_compaction_never_replays_unsettled_incompatible_checkpoint() {
+        Box::pin(automatic_policy_recovery_case(false, false)).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_compaction_does_not_renew_replacement_allowances() {
+        Box::pin(automatic_policy_recovery_case(true, true)).await;
+    }
+
+    #[allow(clippy::too_many_lines)] // Full canonical fixture exercises ordinary admission through publication.
+    async fn automatic_policy_recovery_case(settled: bool, replacement: bool) {
+        let _guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = bcode_session::SessionManager::default();
+        let session = sessions
+            .create_session(None, root.path().to_owned())
+            .await
+            .unwrap();
+        let id = session.id;
+        drop(session);
+        for text in ["inspect only", "continue"] {
+            sessions
+                .append_event(
+                    id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.into(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )
+                .await
+                .unwrap();
+            sessions
+                .append_event(
+                    id,
+                    SessionEventKind::AssistantMessage {
+                        text: "resolved historical detail; ".repeat(160),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut state = crate::tests::test_server_state_with_fake_provider(sessions);
+        state.startup_config.skills.enabled = false;
+        state.startup_config.invariants.enabled = false;
+        state.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
+        state.startup_config.system_prompt.text = Some("Test compaction.".into());
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".into()),
+            model_id: Some("fake-echo".into()),
+            ..SessionModelSelection::default()
+        };
+        let history = state
+            .sessions
+            .activated_conversation_snapshot(id)
+            .await
+            .unwrap()
+            .events;
+        let planning = CompactionPlanningPolicy::Proactive {
+            keep_recent_tokens: 1,
+        };
+        let plan = structural_compaction_plan_with_policy(
+            &history,
+            state.startup_config.model.tool_output.context_chars,
+            planning,
+        )
+        .unwrap();
+        let transcript = compaction_transcript_from_plan(&plan);
+        let chunks = compaction_evidence_input(&transcript, None).unwrap();
+        let key = format!(
+            "{}:Local",
+            operation_key(
+                &history,
+                &selection,
+                state.startup_config.model.tool_output.context_chars,
+                planning
+            )
+            .unwrap()
+        );
+        append_context_compaction_trace(
+            &state,
+            id,
+            CompactionTraceKind::Started,
+            "compaction_started",
+            0,
+            false,
+            None,
+        )
+        .await;
+        let mut old = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        old.reserve_slot(0).unwrap();
+        if replacement {
+            old.restart_allowance = Some(RestartAllowance {
+                max_requests: 8,
+                deadline_ms: current_unix_millis() + 60_000,
+            });
+        }
+        old.save(&state, id, &key).await.unwrap();
+        state
+            .sessions
+            .append_event(
+                id,
+                SessionEventKind::ModelUsage {
+                    turn_id: format!("{id}-compact-{}-old-request", old.boundary),
+                    usage: bcode_session_models::SessionTokenUsage {
+                        request_id: Some("old-request".into()),
+                        terminal: settled,
+                        ..Default::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let old_payload = old.encode().unwrap();
+        append_context_compaction_trace(&state, id, CompactionTraceKind::Finished,
+            "compaction_finished", 0, false,
+            Some("context compaction failed: invalid or incompatible compaction checkpoint; boundary unchanged".into())).await;
+        let result = Box::pin(compact_session_context_with_limit(
+            &state,
+            id,
+            &selection,
+            None,
+            None,
+            &TurnCancelState::default(),
+            None,
+        ))
+        .await;
+        if settled && !replacement {
+            assert_eq!(
+                result.unwrap().compacted_through_sequence,
+                plan.compacted_through_sequence
+            );
+        } else {
+            assert!(matches!(result, Err(CompactionError::RecoveryRequired(_))));
+        }
+        let archived = state
+            .sessions
+            .session_events_range(id, old.checkpoint_sequence, old.checkpoint_sequence, 1)
+            .await
+            .unwrap();
+        let envelope =
+            bcode_session_models::CompactionSynthesisCheckpoint::from_event(&archived[0])
+                .unwrap()
+                .unwrap();
+        assert_eq!(envelope.host_payload.as_deref(), Some(old_payload.as_str()));
+        assert_eq!(
+            state
+                .sessions
+                .session_compaction_checkpoint(id, &restart_pointer_key(&key))
+                .await
+                .unwrap()
+                .is_some(),
+            settled && !replacement
         );
         drop(state);
     }
