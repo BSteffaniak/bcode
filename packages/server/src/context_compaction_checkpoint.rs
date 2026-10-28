@@ -3616,21 +3616,27 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_compaction_automatically_replaces_known_incompatible_checkpoint() {
-        Box::pin(automatic_policy_recovery_case(true, false)).await;
+        Box::pin(automatic_policy_recovery_case(true, false, false)).await;
     }
 
     #[tokio::test]
     async fn ordinary_compaction_never_replays_unsettled_incompatible_checkpoint() {
-        Box::pin(automatic_policy_recovery_case(false, false)).await;
+        Box::pin(automatic_policy_recovery_case(false, false, false)).await;
     }
 
     #[tokio::test]
     async fn ordinary_compaction_does_not_renew_replacement_allowances() {
-        Box::pin(automatic_policy_recovery_case(true, true)).await;
+        Box::pin(automatic_policy_recovery_case(true, true, false)).await;
+    }
+
+    #[tokio::test]
+    async fn manual_compact_abandons_missing_summary_response_through_runtime_admission() {
+        Box::pin(automatic_policy_recovery_case(false, false, true)).await;
+        Box::pin(automatic_policy_recovery_case(false, true, true)).await;
     }
 
     #[allow(clippy::too_many_lines)] // Full canonical fixture exercises ordinary admission through publication.
-    async fn automatic_policy_recovery_case(settled: bool, replacement: bool) {
+    async fn automatic_policy_recovery_case(settled: bool, replacement: bool, manual: bool) {
         let _guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         let root = tempfile::tempdir().unwrap();
         let sessions = bcode_session::SessionManager::default();
@@ -3656,19 +3662,35 @@ mod tests {
                 .append_event(
                     id,
                     SessionEventKind::AssistantMessage {
-                        text: "resolved historical detail; ".repeat(160),
+                        text: "resolved historical detail; ".repeat(
+                            if manual && text == "inspect only" {
+                                4000
+                            } else {
+                                160
+                            },
+                        ),
                     },
                 )
                 .await
                 .unwrap();
         }
-        let mut state = crate::tests::test_server_state_with_fake_provider(sessions);
-        state.startup_config.skills.enabled = false;
-        state.startup_config.invariants.enabled = false;
-        state.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
-        state.startup_config.system_prompt.text = Some("Test compaction.".into());
-        state.startup_config.model.compaction.keep_recent_tokens = 1;
-        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
+        let state = Arc::new({
+            let mut configured = crate::tests::test_server_state_with_fake_provider(sessions);
+            configured.startup_config.skills.enabled = false;
+            configured.startup_config.invariants.enabled = false;
+            configured.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
+            configured.startup_config.system_prompt.text = Some("Test compaction.".into());
+            configured
+                .startup_config
+                .model
+                .compaction
+                .keep_recent_tokens = 1;
+            configured.startup_config.model.compaction.backend =
+                bcode_config::CompactionBackend::Local;
+            configured.selected_provider_plugin_id = Some("bcode.fake-provider".into());
+            configured.selected_model_id = Some("fake-echo".into());
+            configured
+        });
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".into()),
             model_id: Some("fake-echo".into()),
@@ -3713,49 +3735,146 @@ mod tests {
         .await;
         let mut old = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
         old.reserve_slot(0).unwrap();
+        if manual {
+            assert!(chunks.len() >= 8);
+            let evidence = CompactionEvidence {
+                format: COMPACTION_SUMMARY_FORMAT.into(),
+                current_scope: vec![CompactionScope {
+                    source_sequence: history[0].sequence,
+                    statement: "inspect only".into(),
+                    supersedes: Vec::new(),
+                }],
+                continuation: "Seven accepted batches. Continue inspection.".into(),
+            };
+            for index in 0..7 {
+                if index > 0 {
+                    old.reserve_slot(index).unwrap();
+                }
+                old.accept(
+                    &evidence,
+                    &BTreeSet::from([history[0].sequence]),
+                    &BTreeSet::new(),
+                );
+            }
+            old.reserve_slot(7).unwrap();
+        }
         if replacement {
+            if manual {
+                let budget = resolve_summary_budget(
+                    &state,
+                    id,
+                    &selection,
+                    &history,
+                    old.boundary,
+                    1,
+                    &TurnCancelState::default(),
+                )
+                .await
+                .unwrap();
+                old.synthesis_policy =
+                    Some(CheckpointPolicy::from_policy(synthesis_limits(&budget)).unwrap());
+                old.consolidation_requests = vec![0; chunks.len()];
+                // Construct the historical fixture's frozen contract directly; binding APIs
+                // correctly forbid changing policy after reservations have been consumed.
+                old.resolved_policy = Some(serde_json::to_value(&budget).unwrap());
+            }
             old.restart_allowance = Some(RestartAllowance {
                 max_requests: 8,
-                deadline_ms: current_unix_millis() + 60_000,
+                deadline_ms: if manual {
+                    1
+                } else {
+                    current_unix_millis() + 60_000
+                },
             });
         }
         old.save(&state, id, &key).await.unwrap();
-        state
-            .sessions
-            .append_event(
-                id,
-                SessionEventKind::ModelUsage {
-                    turn_id: format!("{id}-compact-{}-old-request", old.boundary),
-                    usage: bcode_session_models::SessionTokenUsage {
-                        request_id: Some("old-request".into()),
-                        terminal: settled,
-                        ..Default::default()
+        for index in 0..if manual { 8 } else { 1 } {
+            state
+                .sessions
+                .append_event(
+                    id,
+                    SessionEventKind::ModelUsage {
+                        turn_id: format!("{id}-compact-{}-old-request-{index}", old.boundary),
+                        usage: bcode_session_models::SessionTokenUsage {
+                            request_id: Some(format!("old-request-{index}")),
+                            terminal: if manual { index < 7 } else { settled },
+                            ..Default::default()
+                        },
                     },
-                },
-            )
-            .await
-            .unwrap();
+                )
+                .await
+                .unwrap();
+        }
         let old_payload = old.encode().unwrap();
         append_context_compaction_trace(&state, id, CompactionTraceKind::Finished,
             "compaction_finished", 0, false,
             Some("context compaction failed: invalid or incompatible compaction checkpoint; boundary unchanged".into())).await;
-        let result = Box::pin(compact_session_context_with_limit(
-            &state,
-            id,
-            &selection,
-            None,
-            None,
-            &TurnCancelState::default(),
-            None,
-        ))
-        .await;
-        if settled && !replacement {
+        let result = if manual {
+            let completion = crate::session_operations::compact(&state, ClientId::new(), id)
+                .await
+                .unwrap();
+            let result = crate::session_operations::complete_compaction(completion).await;
+            assert!(
+                result.is_ok(),
+                "manual compact failed: {}",
+                result
+                    .as_ref()
+                    .err()
+                    .map_or(String::new(), ToString::to_string)
+            );
+            let pointer = state
+                .sessions
+                .session_compaction_checkpoint(id, &restart_pointer_key(&key))
+                .await
+                .unwrap()
+                .unwrap();
+            let envelope =
+                bcode_session_models::CompactionSynthesisCheckpoint::from_event(&pointer)
+                    .unwrap()
+                    .unwrap();
+            let pointer: RestartPointer =
+                serde_json::from_str(envelope.host_payload.as_deref().unwrap()).unwrap();
+            assert_eq!(pointer.request.version, 2);
+            assert_eq!(pointer.abandoned_responses, vec!["old-request-7"]);
+            let converted = LocalCheckpoint::decode(&pointer.initial_replacement_payload).unwrap();
+            assert_eq!(converted.consumed_requests(), 8);
+            assert!(
+                converted
+                    .evidence
+                    .current_scope
+                    .iter()
+                    .any(|scope| scope.statement == "inspect only")
+            );
+            let history = state.sessions.session_history(id).await.unwrap();
+            assert!(history.iter().any(|event| matches!(&event.kind, SessionEventKind::ContextCompacted { compacted_through_sequence, .. } if *compacted_through_sequence == plan.compacted_through_sequence)));
+            result
+                .map(|_| CompactionCompletion {
+                    message: "manual compaction completed".into(),
+                    compacted_through_sequence: plan.compacted_through_sequence,
+                })
+                .map_err(|error| CompactionError::Provider(error.to_string()))
+        } else {
+            Box::pin(compact_session_context_with_limit(
+                &state,
+                id,
+                &selection,
+                None,
+                None,
+                &TurnCancelState::default(),
+                None,
+            ))
+            .await
+        };
+        if manual || (settled && !replacement) {
             assert_eq!(
                 result.unwrap().compacted_through_sequence,
                 plan.compacted_through_sequence
             );
         } else {
-            assert!(matches!(result, Err(CompactionError::RecoveryRequired(_))));
+            assert!(matches!(
+                result,
+                Err(CompactionError::RecoveryRequired(_) | CompactionError::RecoveryBlocked(_))
+            ));
         }
         let archived = state
             .sessions
@@ -3774,7 +3893,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some(),
-            settled && !replacement
+            manual || (settled && !replacement)
         );
         drop(state);
     }

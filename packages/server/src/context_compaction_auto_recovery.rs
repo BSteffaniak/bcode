@@ -21,11 +21,20 @@ pub(super) async fn recover_policy_change(
     if cancel.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
+    // Explicit manual Compact authorizes fresh summary work while retaining the old charge
+    // and abandoning only its missing response. Background recovery still requires settlement.
+    let manual = state
+        .session_current_turn(session_id)
+        .await
+        .is_some_and(|turn| {
+            turn.kind == super::RuntimeOperationKind::ManualCompaction
+                && !turn.cancel_state.is_cancelled()
+        });
     let preparation = prepare_compaction_recovery_with_policy(
         state,
         selection,
         &bcode_session_models::SessionCompactionRecoveryDiscoveryRequest {
-            version: 1,
+            version: if manual { 2 } else { 1 },
             session_id,
             operation_id: uuid::Uuid::new_v4(),
             budget: bcode_session_models::SessionCompactionRestartBudget {

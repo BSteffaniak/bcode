@@ -385,8 +385,12 @@ missing outcomes remain unknown and counted as spent. Atomic supersession retain
 identities in its pointer and prevents publication through the retired checkpoint generation.
 No tools or project mutations are replayed. Cancellation, source/marker changes, concurrent owners,
 unknown formats, missing identities and conflicting evidence still block admission. Version-1 callers
-continue to require authoritative settlement. Ordinary manual compaction does not silently opt into
-abandonment or mint fresh allowances after a failed restart.
+continue to require authoritative settlement. An explicitly admitted manual Compact action uses
+version 2 when converting a blocked historical operation: it may abandon missing summary results,
+retains spent accounting and accepted evidence, and fences the old checkpoint before new synthesis.
+Background/model-turn recovery remains version 1. Repeated manual actions cannot replenish a
+converted operation's allowance or reopen cancelled work. No repair flags are needed for this
+manual recovery path.
 
 ## Explicit recovery of other failed unpublished operations
 
