@@ -51,8 +51,8 @@ enum Command {
 
 #[derive(Debug, Clone, Args)]
 pub struct ModelOptions {
-    /// Explicit Bcode provider configuration file for embedded inference.
-    #[arg(long, required = true)]
+    /// Configuration override; omit to discover the existing AI setup.
+    #[arg(long, default_value = "", value_parser = parse_config_path)]
     pub model_config: PathBuf,
     /// Configured model profile (not an authentication credential).
     #[arg(long)]
@@ -63,6 +63,12 @@ pub struct ModelOptions {
     /// Configured provider override, resolved by the model catalog.
     #[arg(long)]
     pub provider: Option<String>,
+    /// Custom provider endpoint override; credentials remain provider-owned.
+    #[arg(long)]
+    pub endpoint: Option<String>,
+    /// Existing configured authentication profile reference, never a credential.
+    #[arg(long)]
+    pub auth_profile: Option<String>,
     /// Configuration context to select from the explicit file.
     #[arg(long)]
     pub context: Option<String>,
@@ -484,6 +490,8 @@ async fn doctor(options: &Doctor, cancel: &Cancellation) -> Result<(), CliError>
             profile: options.profile.clone(),
             model: options.model.clone(),
             provider: options.provider.clone(),
+            endpoint: None,
+            auth_profile: None,
             context: options.context.clone(),
             max_output_tokens: 8192,
             model_timeout_seconds: 180,
@@ -521,6 +529,13 @@ async fn doctor(options: &Doctor, cancel: &Cancellation) -> Result<(), CliError>
             "{failures} diagnostic checks failed; resolve the errors above and rerun recap doctor"
         )))
     }
+}
+
+fn parse_config_path(value: &str) -> Result<PathBuf, String> {
+    if value.contains('\0') {
+        return Err("configuration path contains an invalid character".into());
+    }
+    Ok(PathBuf::from(value))
 }
 
 fn progress(stage: Stage) {
@@ -750,8 +765,11 @@ mod tests {
     }
 
     #[test]
-    fn create_without_conversation_requires_real_model_configuration() {
-        assert!(Cli::try_parse_from(["recap", "create", "--source", "lesson.mp4"]).is_err());
+    fn create_without_conversation_discovers_model_configuration() {
+        let automatic = Cli::try_parse_from(["recap", "create", "--source", "lesson.mp4"]).unwrap();
+        assert!(
+            matches!(automatic.command, Some(Command::Create(value)) if value.model.model_config.as_os_str().is_empty())
+        );
         let parsed = Cli::try_parse_from([
             "recap",
             "create",

@@ -39,6 +39,7 @@ import pty
 import select
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import termios
@@ -84,7 +85,7 @@ def resize(slave, columns, rows):
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
 
 
-def pty_case(binary, args, env, work, name, expected, steps=None, probe=None):
+def pty_case(binary, args, env, work, name, expected, steps=None, probe=None, preference=None):
     directory = work / name
     directory.mkdir()
     master, slave = pty.openpty()
@@ -138,10 +139,21 @@ def pty_case(binary, args, env, work, name, expected, steps=None, probe=None):
             (directory / f'{index:02d}.capture').write_bytes(capture)
             (directory / f'{index:02d}.grid.txt').write_text(grid)
             svg_grid(grid, directory / f'{index:02d}.svg')
+            report['frames'].append({'index': index, 'size': [columns, rows],
+                                     'step': step, 'matched': matched})
             require(matched, f'{name}: step {index} timed out: {step}; current grid: {grid!r}')
             require(not termios.tcgetattr(master)[3] & (termios.ICANON | termios.ECHO),
                     f'{name}: matched screen without raw mode')
-            report['frames'].append({'index': index, 'size': [columns, rows], 'step': step})
+            if 'selection' in step:
+                require(preference is not None, 'selection check needs preference path')
+                if step['selection'] is None:
+                    require(not preference.exists(), f'{name}: reset retained selection file')
+                else:
+                    saved = json.loads(preference.read_text())
+                    require(saved['version'] == 1, 'unknown saved selection version')
+                    require(all(saved['selection'].get(key) == value
+                                for key, value in step['selection'].items()),
+                            f'{name}: saved selection does not match requested nonsecret fields')
             if step.get('send'):
                 os.write(master, step['send'].encode())
         deadline = time.monotonic() + 15
@@ -150,6 +162,8 @@ def pty_case(binary, args, env, work, name, expected, steps=None, probe=None):
             if not steps:
                 require(termios.tcgetattr(master) == original,
                         f'{name}: headless command changed terminal mode')
+        require(b'acceptance-secret-must-not-be-printed' not in capture,
+                f'{name}: configuration secret entered terminal output')
         require(child.poll() is not None, f'{name}: did not exit naturally')
         for _ in range(20):
             before = len(capture)
@@ -191,27 +205,82 @@ def redirected(binary, args, env, work, name, expected):
                                 stdout=out, stderr=err, cwd=work, env=env, timeout=20)
     stdout = (work / f'{name}.stdout').read_bytes()
     stderr = (work / f'{name}.stderr').read_bytes()
+    require(b'acceptance-secret-must-not-be-printed' not in stdout + stderr,
+            f'{name}: configuration secret entered redirected output')
     require(result.returncode == expected, f'{name}: exit {result.returncode}, expected {expected}: {stderr!r}')
     require(b'\x1b' not in stdout + stderr, f'{name}: redirected output has terminal controls')
     return stdout, stderr
 
 
-def headless(binary, env, work, store):
+def controlled_connections(env, endpoint):
+    """Only synthetic config/auth references; never inherits the operator's credentials."""
+    directory = Path(env['XDG_CONFIG_HOME']) / 'bcode'
+    (directory / 'providers').mkdir(parents=True)
+    config = '''[model]
+profile = "acceptance-auto"
+[model.settings]
+base_url = "http://127.0.0.1:9/v1"
+[model.profiles.acceptance-auto]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-4.1"
+[model.profiles.acceptance-saved]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-4.1-mini"
+[model.profiles.acceptance-cli]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-4.1-nano"
+[auth.profiles.acceptance-account]
+backend = "env"
+provider_id = "openai"
+owner_plugin_id = "bcode.openai-compatible"
+scheme = "api_key"
+'''.replace('http://127.0.0.1:9/v1', endpoint)
+    (directory / 'bcode.toml').write_text(config)
+    (directory / 'providers' / 'acceptance-local.toml').write_text(config)
+    # An inert secret sentinel guards against raw configuration/prompt dumps.
+    (directory / 'providers' / 'sentinel.toml').write_text(
+        '# acceptance-secret-must-not-be-printed\n' + config)
+    return tree_digest(directory)
+
+
+def tree_digest(root):
+    """Record every owned fixture byte, not only the document revision."""
+    return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob('*') if path.is_file()}
+
+
+def headless(binary, env, work, store, headless_build=False):
     missing = str(work / 'does-not-exist.toml')
     cases = [
         ('bare', [], 0),
         ('help', ['--help'], 0),
         ('version', ['--version'], 0),
-        ('explicit-tui', ['tui'], 1),
+        ('explicit-tui', ['tui'], 2 if headless_build else 1),
         ('unknown', ['--definitely-invalid'], 2),
         ('positive-budget', ['--max-document-bytes', '0', 'inspect', 'missing'], 2),
         ('unsafe-id', ['inspect', '../outside'], 2),
+        ('create-autodiscovery-error', ['create', '--source', str(work / 'absent.mp4')], 1),
+        ('refine-autodiscovery-error', ['refine', 'missing', '--focus', 'Inspect source'], 1),
         ('create-error', ['create', '--source', str(work / 'absent.mp4'), '--model-config', missing], 1),
         ('refine-error', ['refine', 'missing', '--focus', 'Inspect source', '--model-config', missing], 1),
         ('inspect-missing', ['inspect', 'missing'], 1),
         ('export-missing', ['export', 'missing'], 1),
         ('doctor-error', ['doctor', '--ffmpeg', str(work / 'no-ffmpeg')], 1),
     ]
+    malformed = work / 'malformed.toml'
+    sentinel = 'acceptance-secret-must-not-be-printed'
+    malformed.write_text(f"api_key = '{sentinel}'\n[model\n")
+    before_store = tree_digest(store)
+    for command in [
+        ['create', '--source', str(work / 'absent.mp4')],
+        ['refine', 'unicode-field-notes', '--focus', 'Inspect source'],
+    ]:
+        out, err = redirected(binary, ['--store', str(store), *command,
+                                      '--model-config', str(malformed)],
+                              env, work, f'{command[0]}-malformed', 1)
+        require(sentinel.encode() not in out + err, 'malformed config leaked a secret')
+        require(bool(err), 'malformed override needs actionable diagnostic')
+        require(tree_digest(store) == before_store, 'malformed override mutated the store')
     for command in ['create', 'refine', 'inspect', 'export', 'doctor']:
         cases.append((f'{command}-help', [command, '--help'], 0))
     for name, args, code in cases:
@@ -306,6 +375,13 @@ def render_styled_artifacts(work, helper):
                                     stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=15)
             require(len(result.stdout) <= MAX_CAPTURE, 'styled snapshot exceeds output bound')
             snapshot = json.loads(result.stdout)
+            backgrounds = {terminal_color(snapshot['styles'][run['style']]['bg'], '#000000')
+                           for row in snapshot['rows'] for run in row['runs']}
+            if (evidence.parent.name in ['home-source-only-enter-validates',
+                                         'settings-escape-restores-home']
+                    and frame['index'] == (1 if evidence.parent.name.startswith('settings') else 0)):
+                require(len(backgrounds) >= 2,
+                        f'{evidence.parent.name}: styled frame lacks differentiated backgrounds')
             prefix.with_suffix('.styled.json').write_bytes(result.stdout)
             styled_svg(snapshot, prefix.with_suffix('.styled.svg'))
 
@@ -350,7 +426,11 @@ def main():
     parser.add_argument('--playwright-module', type=Path,
                         help='optional already-installed Playwright module for browser PNG grid artifacts')
     parser.add_argument('--headless-only', action='store_true', help='explicit partial acceptance; no TUI claim')
+    parser.add_argument('--headless-build', action='store_true',
+                        help='binary was built --no-default-features; implies --headless-only')
     args = parser.parse_args()
+    if args.headless_build:
+        args.headless_only = True
     binary = args.binary.resolve(strict=True)
     require(os.access(binary, os.X_OK), 'binary is not executable')
     work = args.artifacts.resolve()
@@ -364,24 +444,44 @@ def main():
                XDG_STATE_HOME=str(work / 'state'), TERM='xterm-256color', LANG='en_US.UTF-8',
                LC_ALL='en_US.UTF-8', NO_COLOR='1')
     (work / 'home').mkdir()
+    network_guard = socket.socket()
+    network_guard.bind(('127.0.0.1', 0))
+    network_guard.listen(16)
+    endpoint = f'http://127.0.0.1:{network_guard.getsockname()[1]}/v1'
+    env['OPENAI_BASE_URL'] = endpoint
+    config_before = controlled_connections(env, endpoint)
     evidence = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                 'headless_only': args.headless_only, 'accepted': False}
     try:
-        headless(binary, env, work, store)
+        headless(binary, env, work, store, args.headless_build)
         if not args.headless_only:
             require(args.grid_probe, '--grid-probe required for TUI acceptance')
             probe = args.grid_probe.resolve(strict=True)
             journeys = json.loads(args.plan.read_text()) if args.plan else default_journeys()
+            preference = Path(env['XDG_STATE_HOME']) / 'bcode' / 'recap' / 'selection.json'
             failures = []
             for journey in journeys:
+                if not journey.get('retain_preferences'):
+                    preference.unlink(missing_ok=True)
+                if journey.get('saved_profile'):
+                    preference.parent.mkdir(parents=True, exist_ok=True)
+                    preference.write_text(json.dumps({'version': 1, 'selection': {
+                        'profile': journey['saved_profile']}}))
                 name = journey['name']
                 require(name and all(c.isalnum() or c in '-_' for c in name), 'unsafe journey name')
                 child_env = dict(env)
                 child_env.pop('NO_COLOR', None)
                 child_env.update(journey.get('env', {}))
+                steps = json.loads(json.dumps(journey['steps'])
+                                   .replace('$ACCEPTANCE_CONFIG', str(Path(env['XDG_CONFIG_HOME']) / 'bcode' / 'providers' / 'acceptance-local.toml'))
+                                   .replace('$ACCEPTANCE_ENDPOINT', endpoint))
+                before_journey = tree_digest(store)
                 try:
                     pty_case(binary, ['--store', str(store), *journey.get('args', ['tui'])],
-                             child_env, work, name, journey.get('exit_code', 0), journey['steps'], probe)
+                             child_env, work, name, journey.get('exit_code', 0), steps, probe, preference)
+                    if (name.startswith(('settings-', 'autodiscovery-', 'home-source-', 'paste-enter-'))):
+                        require(tree_digest(store) == before_journey,
+                                f'{name}: launch/browse/settings or rejected create mutated the store')
                 except (AssertionError, OSError, subprocess.SubprocessError) as error:
                     failures.append({'journey': name, 'failure': str(error)})
             evidence['journey_failures'] = failures
@@ -392,6 +492,16 @@ def main():
         evidence['failure'] = str(error)
         raise
     finally:
+        try:
+            require(not select.select([network_guard], [], [], 0)[0],
+                    'launch/browse/settings attempted a provider connection')
+            require(tree_digest(Path(env['XDG_CONFIG_HOME']) / 'bcode') == config_before,
+                    'acceptance changed declarative Bcode configuration')
+            evidence['provider_connections'] = 0
+        except AssertionError as error:
+            evidence['accepted'] = False
+            evidence['safety_error'] = str(error)
+        network_guard.close()
         if args.styled_probe:
             try:
                 render_styled_artifacts(work, args.styled_probe.resolve(strict=True))
@@ -407,6 +517,8 @@ def main():
                 evidence['png_capture_error'] = str(error)
                 evidence['accepted'] = False
         (work / 'acceptance.json').write_text(json.dumps(evidence, indent=2))
+        if evidence.get('safety_error'):
+            raise AssertionError(evidence['safety_error'])
         if evidence.get('styled_capture_error') or evidence.get('png_capture_error'):
             raise AssertionError(evidence.get('styled_capture_error') or evidence['png_capture_error'])
 
@@ -415,6 +527,109 @@ def default_journeys():
     quit_key = '\x1b[21~'  # F10; no printable q can intercept source editing.
     theme_key = '\x1b[19~'  # F8 cycles dark -> light -> reduced ANSI palette.
     return [
+        {'name': 'autodiscovery-saved-before-auto', 'args': ['tui'],
+         'saved_profile': 'acceptance-saved', 'steps': [
+            {'expect': ['From video to perspective.', 'acceptance-saved'],
+             'send': '\x03'},
+        ], 'exit_code': 0},
+        {'name': 'autodiscovery-cli-before-saved', 'args': ['tui', '--profile', 'acceptance-cli'],
+         'saved_profile': 'acceptance-saved', 'steps': [
+            {'expect': ['From video to perspective.', 'acceptance-cli'],
+             'forbid': ['Using Profile: acceptance-saved'], 'send': '\x11'},
+        ], 'exit_code': 0},
+        {'name': 'settings-discovered-connections', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.', 'acceptance-auto'], 'send': '\x1b[18~'},
+            {'expect': ['YOUR CONNECTION', 'MODEL'], 'send': '\t'},
+            {'expect': ['YOUR CONNECTION'], 'send': '\r'},
+            {'expect': ['acceptance-auto', 'acceptance-saved', 'acceptance-local.toml'],
+             'send': '\x1b'},
+            {'expect': ['YOUR CONNECTION'], 'send': '\x1b'},
+            {'expect': ['From video to perspective.'], 'send': '\x03'},
+        ], 'exit_code': 0},
+        {'name': 'home-source-only-enter-validates', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.'],
+             'forbid': ['CONFIG FILE', 'EDITORIAL FOCUS', 'TRANSCRIPT', 'EXPORT PATH'],
+             'send': '\r'},
+            {'expect': ['Add a YouTube URL or a local video path first.'], 'send': '\x03'},
+        ], 'exit_code': 0},
+        {'name': 'settings-escape-restores-home', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.'], 'send': '\x1b[18~'},
+            {'expect': ['YOUR CONNECTION', 'CONNECTION', 'MODEL', 'No inference'],
+             'send': '\x1b'},
+            {'expect': ['From video to perspective.'], 'forbid': ['YOUR CONNECTION'],
+             'send': '\x11'},
+        ], 'exit_code': 0},
+        {'name': 'settings-custom-file-endpoint', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.', 'acceptance-auto'], 'send': '\x1b[18~'},
+            {'expect': ['YOUR CONNECTION', 'SEARCH CONNECTIONS'], 'send': 'zz-no-match'},
+            {'expect': ['zz-no-match'], 'send': '\t'},
+            {'expect': ['YOUR CONNECTION'], 'send': '\r'},
+            {'expect': ['Add custom connection'], 'send': '\r'},
+            {'expect': ['CONFIG FILE', 'ENDPOINT URL', 'AUTH REFERENCE'], 'send': '\x1b'},
+            {'expect': ['From video to perspective.'], 'send': '\x03'},
+        ], 'exit_code': 0},
+        {'name': 'settings-custom-save-auth-reference', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.', 'acceptance-auto'], 'send': '\x1b[18~'},
+            {'expect': ['YOUR CONNECTION', 'SEARCH CONNECTIONS'], 'send': 'zz-no-match'},
+            {'expect': ['zz-no-match'], 'send': '\t'},
+            {'expect': ['YOUR CONNECTION'], 'send': '\r'},
+            {'expect': ['Add custom connection'], 'send': '\r'},
+            {'expect': ['CONFIG FILE', 'ENDPOINT URL', 'AUTH REFERENCE'],
+             'send': '$ACCEPTANCE_CONFIG'},
+            {'expect': ['acceptance-local.toml'], 'send': '\t'},
+            {'expect': ['ENDPOINT URL'], 'send': '$ACCEPTANCE_ENDPOINT'},
+            {'expect': ['$ACCEPTANCE_ENDPOINT'], 'send': '\t'},
+            {'expect': ['AUTH REFERENCE'], 'send': 'acceptance-account'},
+            {'expect': ['acceptance-account'], 'send': '\t'},
+            {'expect': ['Save custom connection'], 'send': '\r'},
+            {'expect': ['connections discovered'], 'selection': {
+                'config_path': '$ACCEPTANCE_CONFIG', 'endpoint': '$ACCEPTANCE_ENDPOINT',
+                'auth_profile': 'acceptance-account'}, 'send': '\x1b'},
+            {'expect': ['From video to perspective.', 'Config: acceptance-local.toml'], 'send': '\x03'},
+        ], 'exit_code': 0},
+        {'name': 'settings-custom-retain-reset', 'args': ['tui'], 'retain_preferences': True,
+         'steps': [
+            {'expect': ['From video to perspective.', 'Config: acceptance-local.toml'], 'selection': {
+                'config_path': '$ACCEPTANCE_CONFIG', 'endpoint': '$ACCEPTANCE_ENDPOINT',
+                'auth_profile': 'acceptance-account'}, 'send': '\x1b[18~'},
+            {'expect': ['YOUR CONNECTION', 'MODEL'], 'send': '\t'},
+            {'expect': ['YOUR CONNECTION'], 'send': '\t'},
+            {'expect': ['YOUR CONNECTION'], 'send': '\t'},
+            {'expect': ['Refresh'], 'send': '\t'},
+            {'expect': ['Reset to Bcode defaults'], 'send': '\r'},
+            {'expect': ['connections discovered'], 'selection': None, 'send': '\x1b'},
+            {'expect': ['From video to perspective.', 'acceptance-auto'],
+             'forbid': ['Custom endpoint'], 'send': '\x11'},
+        ], 'exit_code': 0},
+        {'name': 'settings-model-dropdown-custom', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.', 'acceptance-auto'], 'send': '\x1b[18~'},
+            {'expect': ['YOUR CONNECTION', 'MODEL'], 'send': 'zz-no-match'},
+            {'expect': ['zz-no-match'], 'send': '\t'},
+            {'expect': ['YOUR CONNECTION'], 'send': '\t'},
+            {'expect': ['YOUR CONNECTION'], 'send': '\r'},
+            {'expect': ['Custom model ID'], 'send': '\x1b[F'},
+            {'expect': ['Custom model ID'], 'send': '\r'},
+            {'expect': ['CUSTOM MODEL ID', 'Use model ID'], 'send': '\x11'},
+        ], 'exit_code': 0},
+        {'name': 'settings-ctrl-c-restores-terminal', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.'], 'send': '\x1b[18~'},
+            {'expect': ['YOUR CONNECTION', 'MODEL'], 'send': '\x03'},
+        ], 'exit_code': 0},
+        {'name': 'paste-enter-starts-create', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.', 'acceptance-auto'],
+             'forbid': ['YOUR CONNECTION'],
+             'send': '\x1b[200~/recap-acceptance-missing-video.mp4\x1b[201~'},
+            {'expect': ['/recap-acceptance-missing-video.mp4'], 'send': '\r'},
+            {'expect': ['source I/O failed', 'gpt-4.1'],
+             'forbid': ['Open Settings (F7) before creating'], 'send': '\x03'},
+        ], 'exit_code': 0},
+        {'name': 'invalid-config-rejects-create',
+         'args': ['tui', '--model-config', 'does-not-exist.toml'], 'steps': [
+            {'expect': ['From video to perspective.'],
+             'send': '\x1b[200~/recap-acceptance-missing-video.mp4\x1b[201~'},
+            {'expect': ['/recap-acceptance-missing-video.mp4'], 'send': '\r'},
+            {'expect': ['Open Settings (F7) before creating'], 'send': '\x03'},
+        ], 'exit_code': 0},
         {'name': 'ctrl-c-exits-focused-source', 'args': ['tui'], 'steps': [
             {'expect': ['From video to perspective.'], 'send': 'editable source'},
             {'expect': ['editable source'], 'send': '\x03'},

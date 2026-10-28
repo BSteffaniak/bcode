@@ -46,6 +46,8 @@ pub struct AcquiredSource {
     pub video: PathBuf,
     /// Captions, possibly empty; absence is not a transcript.
     pub captions: Vec<SubtitleCue>,
+    /// Source-provided display title, when available. Never executable markup.
+    pub title: Option<String>,
     /// Keeps downloaded media alive; local input is not owned or removed.
     pub workspace: Option<tempfile::TempDir>,
 }
@@ -252,6 +254,7 @@ pub async fn acquire(
         return Ok(AcquiredSource {
             video: local_video(path, options.max_video_bytes)?,
             captions: vec![],
+            title: None,
             workspace: None,
         });
     }
@@ -317,7 +320,13 @@ pub async fn acquire(
     .map(Into::into)
     .collect();
     Box::pin(process::run(&request, cancel)).await?;
-    collect_download(workspace, options)
+    let mut acquired = collect_download(workspace, options)?;
+    acquired.title = metadata
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.trim().is_empty() && title.len() <= 4096)
+        .map(str::to_owned);
+    Ok(acquired)
 }
 fn collect_download(
     workspace: tempfile::TempDir,
@@ -350,6 +359,7 @@ fn collect_download(
             "downloader produced no video within budget",
         ))?,
         captions,
+        title: None,
         workspace: Some(workspace),
     })
 }

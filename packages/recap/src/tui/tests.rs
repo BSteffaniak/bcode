@@ -128,6 +128,13 @@ fn home_uses_layered_editorial_surfaces_and_real_source_control() {
             .any(|r| r.id.as_str() == "source.input")
     );
     assert!(hits.regions().iter().any(|r| r.id.as_str() == "generate"));
+    assert!(
+        !hits
+            .regions()
+            .iter()
+            .any(|r| matches!(r.id.as_str(), "config.input" | "profile.input"))
+    );
+    assert!(hits.regions().iter().any(|r| r.id.as_str() == "settings"));
     let backgrounds: std::collections::BTreeSet<_> = buffer
         .cells()
         .iter()
@@ -156,6 +163,220 @@ fn options_and_library_are_reachable_without_inference() {
             .any(|r| r.id.as_str() == "source.input")
     );
     assert!(app.active.is_none());
+}
+
+#[test]
+fn settings_escape_closes_without_quitting_and_discovery_never_invents_readiness() {
+    let mut app = App::new(TuiOptions::default());
+    assert!(app.connection_summary().contains("Discovering"));
+    app.action("settings");
+    let (_, hits) = paint(&app, 100, 40);
+    assert!(
+        hits.regions()
+            .iter()
+            .any(|region| region.id.as_str() == "settings.connections")
+    );
+    assert!(
+        hits.regions()
+            .iter()
+            .any(|region| region.id.as_str() == "settings.models")
+    );
+    app.terminal(&Event::Key(bmux_keyboard::KeyStroke::simple(
+        KeyCode::Escape,
+    )));
+    assert!(!app.settings_state.open);
+    assert!(!app.quitting);
+    assert_eq!(app.focused, 0);
+}
+
+#[test]
+fn stale_discovery_cannot_replace_selection_or_status() {
+    let mut app = App::new(TuiOptions::default());
+    app.settings_state.generation = 2;
+    let before = app.settings_state.status.clone();
+    app.update(RuntimeEvent::Message(Message::Discovered(
+        1,
+        Box::new(Err("obsolete".into())),
+    )))
+    .unwrap();
+    assert_eq!(app.settings_state.status, before);
+    assert!(app.settings_state.discovery.is_none());
+}
+
+#[test]
+fn source_enter_validates_in_place_instead_of_inserting_a_newline() {
+    let mut app = App::new(TuiOptions::default());
+    let (_, hits) = paint(&app, 100, 32);
+    commit_app(&mut app, &hits, &bmux_tui::focus::FocusTrap::new());
+    app.terminal(&Event::Key(bmux_keyboard::KeyStroke::simple(
+        KeyCode::Enter,
+    )));
+    assert!(app.status.contains("video"));
+    assert!(app.active.is_none());
+    assert_eq!(app.text(0), "");
+}
+
+#[test]
+fn settings_search_filters_real_dropdown_options_and_keeps_custom_entries() {
+    use crate::connections::{Connection, Discovery, Model, Selection};
+    let mut app = App::new(TuiOptions::default());
+    app.settings_state.discovery = Some(Discovery {
+        connections: vec![Connection {
+            label: "Local studio".into(),
+            selection: Selection::default(),
+        }],
+        models: vec![
+            Model {
+                id: "vision".into(),
+                provider: None,
+                label: "Vision model".into(),
+                images: true,
+            },
+            Model {
+                id: "text".into(),
+                provider: None,
+                label: "Text only".into(),
+                images: false,
+            },
+        ],
+        selected: Selection::default(),
+    });
+    app.rebuild_choices();
+    assert_eq!(app.settings_state.model_options.len(), 3);
+    assert_eq!(app.settings_state.connection_options.len(), 2);
+    *app.fields[6].borrow_mut() = TextInputState::new(TextEditBuffer::from_text("missing"));
+    app.rebuild_choices();
+    assert_eq!(app.settings_state.connection_options.len(), 1);
+    assert_eq!(app.settings_state.connection_options[0].id, "custom");
+    assert_eq!(app.settings_state.model_options[0].id, "default");
+    assert_eq!(app.settings_state.model_options[1].id, "custom");
+}
+
+#[test]
+fn settings_keyboard_tab_opens_real_connection_dropdown() {
+    let mut app = App::new(TuiOptions::default());
+    app.rebuild_choices();
+    app.action("settings");
+    let (_, hits) = paint(&app, 120, 40);
+    commit_app(&mut app, &hits, &bmux_tui::focus::FocusTrap::new());
+    assert_eq!(
+        app.router.focused().map(bmux_tui::hit::HitId::as_str),
+        Some("settings.search.input")
+    );
+    app.terminal(&Event::Key(bmux_keyboard::KeyStroke::simple(KeyCode::Tab)));
+    let (_, hits) = paint(&app, 120, 40);
+    commit_app(&mut app, &hits, &bmux_tui::focus::FocusTrap::new());
+    assert_eq!(
+        app.router.focused().map(bmux_tui::hit::HitId::as_str),
+        Some("settings.connections")
+    );
+    app.terminal(&Event::Key(bmux_keyboard::KeyStroke::simple(
+        KeyCode::Enter,
+    )));
+    assert!(app.settings_state.open);
+    assert!(app.settings_state.connection.get().is_open());
+}
+
+#[test]
+fn reader_title_stays_visible_after_narrow_resize() {
+    use bcode_recap::contracts::{GenerationIntent, Section, Source};
+    let mut app = App::new(TuiOptions::default());
+    app.document = Some(RecapDocument {
+        schema_version: 1,
+        id: "field-notes".into(),
+        revision: 1,
+        title: "Unicode field notes".into(),
+        source: Source {
+            id: "video".into(),
+            title: "Video".into(),
+            url: None,
+            duration_ms: 1000,
+        },
+        intent: GenerationIntent::default(),
+        transcript: vec![],
+        evidence: vec![],
+        assets: vec![],
+        sections: vec![Section {
+            id: "chapter".into(),
+            title: "日本語 motion".into(),
+            blocks: vec![],
+        }],
+    });
+    app.screen = Screen::Reader;
+    app.status = "Exported unicode-field-notes.html · HTML is ready to open".into();
+    app.rebuild_reader();
+    for (width, height) in [(120, 40), (40, 20), (120, 40)] {
+        let (buffer, _) = paint(&app, width, height);
+        let visible: String = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            visible.contains("Unicode field notes"),
+            "reader title missing at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn settings_viewport_uses_allocated_width_without_horizontal_reveal_drift() {
+    let mut app = App::new(TuiOptions::default());
+    app.action("settings");
+    for (width, height) in [(120, 40), (80, 30), (40, 20)] {
+        let (_, hits) = paint(&app, width, height);
+        commit_app(&mut app, &hits, &bmux_tui::focus::FocusTrap::new());
+        let (buffer, _) = paint(&app, width, height);
+        assert_eq!(app.settings_state.scroll.get().horizontal_offset(), 0);
+        let visible: String = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            visible.contains("YOUR CONNECTION"),
+            "settings heading clipped at {width}x{height}"
+        );
+        assert!(
+            visible.contains("MODEL"),
+            "model label clipped at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn cli_model_overrides_saved_preferences_but_settings_can_change_selection() {
+    use crate::connections::Selection;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selection.json");
+    crate::connections::save_preferences(
+        &path,
+        &Selection {
+            profile: Some("saved".into()),
+            model: Some("saved-model".into()),
+            ..Selection::default()
+        },
+    )
+    .unwrap();
+    let mut app = App::new(TuiOptions {
+        profile: Some("cli".into()),
+        model: Some("cli-model".into()),
+        ..TuiOptions::default()
+    });
+    let explicit = Selection {
+        profile: app.options.profile.clone(),
+        model: app.options.model.clone(),
+        ..Selection::default()
+    };
+    app.apply_selection(crate::connections::effective_selection_from(&explicit, &path).unwrap());
+    assert_eq!(app.options.profile.as_deref(), Some("cli"));
+    assert_eq!(app.options.model.as_deref(), Some("cli-model"));
+    app.apply_selection(Selection {
+        profile: Some("interactive".into()),
+        ..Selection::default()
+    });
+    assert_eq!(app.options.profile.as_deref(), Some("interactive"));
+    assert!(app.options.model.is_none());
 }
 
 #[test]

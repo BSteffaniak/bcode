@@ -1,5 +1,6 @@
 //! Recap's terminal shell. All effects enter the shared application adapter.
 mod images;
+mod settings;
 #[cfg(test)]
 mod tests;
 mod view;
@@ -34,13 +35,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FIELDS: [&str; 6] = [
+const FIELDS: [&str; 10] = [
     "source.input",
     "transcript.input",
     "focus.input",
     "config.input",
     "profile.input",
     "export-path.input",
+    "settings.search.input",
+    "settings.model.input",
+    "settings.endpoint.input",
+    "settings.auth.input",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +64,10 @@ struct Active {
 }
 
 enum Message {
+    Discovered(
+        u64,
+        Box<Result<(crate::connections::Discovery, crate::connections::Selection), String>>,
+    ),
     Start,
     Tick,
     Progress(u64, Stage),
@@ -74,6 +83,7 @@ struct App {
     preview_task: Option<tokio::task::JoinHandle<()>>,
     preview_sender: Option<tokio::sync::mpsc::Sender<Message>>,
     preview_permit: std::sync::Arc<tokio::sync::Semaphore>,
+    settings_state: settings::Settings,
     options: TuiOptions,
     fields: Vec<RefCell<TextInputState>>,
     focused: usize,
@@ -113,6 +123,10 @@ impl App {
                 .map_or_else(String::new, |p| p.display().to_string()),
             options.profile.clone().unwrap_or_default(),
             String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
         ];
         Self {
             preview: None,
@@ -121,6 +135,7 @@ impl App {
             preview_task: None,
             preview_sender: None,
             preview_permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            settings_state: settings::Settings::default(),
             options,
             fields: values
                 .into_iter()
@@ -212,10 +227,6 @@ impl App {
                 "Cancellation requested · waiting for the operation to settle safely".into();
         }
     }
-    fn sync_options(&mut self) {
-        self.options.model_config = (!self.text(3).is_empty()).then(|| PathBuf::from(self.text(3)));
-        self.options.profile = (!self.text(4).is_empty()).then(|| self.text(4));
-    }
     fn action(&mut self, action: &str) -> Update<Message> {
         if action == "quit" {
             self.quitting = true;
@@ -233,6 +244,9 @@ impl App {
         if self.active.is_some() {
             return Update::none();
         }
+        if let Some(update) = self.settings_action(action) {
+            return update;
+        }
         match action {
             "library-next" => {
                 self.library_offset =
@@ -246,7 +260,13 @@ impl App {
                 }
             }
             "chapter-prev" => self.chapter_offset = self.chapter_offset.saturating_sub(8),
+            "settings" | "settings-nav" => {
+                self.settings_state.open = !self.settings_state.open;
+                self.settings_state.dropdown_focus = 0;
+                self.focused = if self.settings_state.open { 6 } else { 0 };
+            }
             "home" => {
+                self.settings_state.open = false;
                 self.screen = Screen::Home;
                 self.refine = false;
                 self.focused = 0;
@@ -254,7 +274,7 @@ impl App {
             "chapters" => self.drawer = !self.drawer,
             "options" => {
                 self.refine = !self.refine;
-                self.focused = if self.refine { 1 } else { 3 };
+                self.focused = usize::from(self.refine);
             }
             "refine" => {
                 self.refine = !self.refine;
@@ -307,9 +327,22 @@ impl App {
     fn effect_action(&mut self, action: &str) -> Update<Message> {
         match action {
             "generate" => {
-                self.sync_options();
                 if self.text(0).is_empty() {
                     self.status = "Add a YouTube URL or a local video path first.".into();
+                    return Update::redraw();
+                }
+                if self
+                    .settings_state
+                    .discovery
+                    .as_ref()
+                    .is_none_or(|discovery| {
+                        discovery.selected.provider.is_none() || discovery.selected.model.is_none()
+                    })
+                {
+                    self.status = format!(
+                        "{} · Open Settings (F7) before creating",
+                        self.settings_state.status
+                    );
                     return Update::redraw();
                 }
                 let request = self.options.create_request(
@@ -318,15 +351,14 @@ impl App {
                     (!self.text(2).is_empty()).then(|| self.text(2)),
                     self.depth,
                 );
-                return self.admit(Request::Create(Box::new(request)));
+                return self.admit(Request::CreateAndExport(Box::new(request)));
             }
             "apply" => {
-                self.sync_options();
                 if let Some(document) = &self.document {
                     if self.text(2).is_empty() {
                         self.status = "Enter an editorial focus before refining.".into();
                     } else {
-                        return self.admit(Request::Refine(Box::new(
+                        return self.admit(Request::RefineAndExport(Box::new(
                             self.options
                                 .refine_request(document.id.clone(), self.text(2)),
                         )));
@@ -354,7 +386,7 @@ impl App {
         }
         Update::redraw()
     }
-    fn terminal(&mut self, event: &Event) -> Update<Message> {
+    fn global_terminal(&mut self, event: &Event) -> Option<Update<Message>> {
         // Quit belongs to the application, never to the focused editor or button.
         // Raw mode delivers Ctrl+C as input rather than generating SIGINT.
         if event.key().is_some_and(|key| {
@@ -363,12 +395,18 @@ impl App {
                     && !key.modifiers.alt
                     && matches!(key.key, KeyCode::Char('c' | 'C' | 'q' | 'Q')))
         }) {
-            return self.action("quit");
+            return Some(self.action("quit"));
         }
         if let Event::Resize(size) = event {
             self.size.set((size.width, size.height));
             self.layout.replace(None);
-            return Update::redraw();
+            return Some(Update::redraw());
+        }
+        None
+    }
+    fn terminal(&mut self, event: &Event) -> Update<Message> {
+        if let Some(update) = self.global_terminal(event) {
+            return update;
         }
         let focused = self.focused;
         let control_id = FIELDS
@@ -378,12 +416,24 @@ impl App {
             let _ = self.router.set_focused(&id);
         }
         let route = self.router.route(event.clone());
+        if self.settings_state.open {
+            let target = route.target.as_ref().map(bmux_tui::hit::HitId::as_str);
+            if let Some(update) = self.settings_event(event, target) {
+                return update;
+            }
+        }
         for (index, id) in FIELDS.iter().enumerate() {
             if route.targets(&bmux_tui::hit::HitId::new(*id)) {
                 self.focused = index;
+                self.settings_state.dropdown_focus = 0;
             }
         }
         if let Some(focus) = route.focus_changed.as_ref() {
+            self.settings_state.dropdown_focus = match focus.as_str() {
+                "settings.connections" => 1,
+                "settings.models" => 2,
+                _ => 0,
+            };
             self.focused = FIELDS
                 .iter()
                 .position(|id| *id == focus.as_str())
@@ -402,10 +452,20 @@ impl App {
             let action = match key.key {
                 KeyCode::Escape => Some(if self.active.is_some() {
                     "cancel"
+                } else if self.settings_state.open {
+                    "settings"
                 } else {
                     "home"
                 }),
-                KeyCode::F(2) => Some("generate"),
+                KeyCode::F(7) => Some("settings"),
+                KeyCode::Enter
+                    if self.screen == Screen::Home
+                        && !self.settings_state.open
+                        && self.focused == 0 =>
+                {
+                    Some("generate")
+                }
+                KeyCode::F(2) if !self.settings_state.open => Some("generate"),
                 KeyCode::F(3) => Some("chapters"),
                 KeyCode::F(4) => Some("refine"),
                 KeyCode::F(5) => Some("export"),
@@ -418,7 +478,6 @@ impl App {
                 return self.action(action);
             }
             if key.key == KeyCode::Tab {
-                self.focused = (self.focused + 1) % FIELDS.len();
                 return Update::redraw();
             }
         }
@@ -429,6 +488,9 @@ impl App {
             let policy = TextInputPolicy::chat_composer();
             let _ = TextInputControl::new(&policy)
                 .handle_event(&mut self.fields[self.focused].borrow_mut(), event);
+            if self.settings_state.open && self.focused == 6 {
+                self.rebuild_choices();
+            }
             return Update::redraw();
         }
         if self.active.is_none()
@@ -439,6 +501,78 @@ impl App {
         }
 
         Update::redraw()
+    }
+    fn install_discovery(
+        &mut self,
+        result: Result<(crate::connections::Discovery, crate::connections::Selection), String>,
+    ) {
+        match result {
+            Ok((discovery, selection)) => {
+                self.apply_selection(selection);
+                self.settings_state.status = format!(
+                    "{} connections discovered · Settings save automatically",
+                    discovery.connections.len()
+                );
+                self.settings_state.discovery = Some(discovery);
+                self.rebuild_choices();
+            }
+            Err(error) => {
+                self.settings_state.discovery = None;
+                self.settings_state.status = format!("{error} · Choose a config file in Settings");
+                self.rebuild_choices();
+            }
+        }
+    }
+    fn install_outcome(&mut self, result: Result<Outcome, String>) {
+        match result {
+            Ok(Outcome::Ready { document, export }) => {
+                self.document = Some(*document);
+                self.focused = usize::MAX;
+                self.screen = Screen::Reader;
+                self.chapter = 0;
+                self.refine = false;
+                match export {
+                    Ok(result) => {
+                        self.export = Some(result.path);
+                        self.status = "Recap ready · HTML exported · F6 opens your document".into();
+                    }
+                    Err(error) => {
+                        self.export = None;
+                        self.status = format!(
+                            "Recap saved · HTML export needs attention: {error} · F5 retry"
+                        );
+                    }
+                }
+                self.rebuild_reader();
+            }
+            Ok(Outcome::Document(document)) => {
+                self.document = Some(*document);
+                self.focused = usize::MAX;
+                self.screen = Screen::Reader;
+                self.chapter = 0;
+                self.refine = false;
+                self.export = None;
+                self.status = "Saved · source-grounded recap ready".into();
+                self.rebuild_reader();
+            }
+            Ok(Outcome::Catalog(page)) => {
+                self.recent = page.entries;
+                self.cursor = page.next;
+                self.library_offset = 0;
+                self.status = format!(
+                    "Local library · examined {} entries · browsing does not call a model",
+                    page.examined
+                );
+            }
+            Ok(Outcome::Exported(result)) => {
+                self.status = format!("Exported {} · HTML is ready to open", result.path.display());
+                self.export = Some(result.path);
+            }
+            Ok(Outcome::Opened) => {
+                self.status = "Opened exported HTML in the system viewer".into();
+            }
+            Err(error) => self.status = error,
+        }
     }
     fn rebuild_reader(&mut self) {
         self.preview_generation = self.preview_generation.saturating_add(1);
@@ -491,15 +625,25 @@ impl Program for App {
                     }
                 }
             }
+            RuntimeEvent::Message(Message::Discovered(id, result)) => {
+                if id != self.settings_state.generation {
+                    return Ok(Update::none());
+                }
+                self.install_discovery(*result);
+            }
             RuntimeEvent::Message(Message::Start) => {
-                return Ok(if let Some(id) = self.options.id.clone() {
+                let discovery = self.discover_connections(true);
+                let mut update = if let Some(id) = self.options.id.clone() {
                     self.admit(Request::Load { id })
                 } else {
                     self.admit(Request::List {
                         cursor: None,
                         limit: 24,
                     })
-                });
+                };
+                update.commands.extend(discovery.commands);
+                update.subscriptions.extend(discovery.subscriptions);
+                return Ok(update);
             }
             RuntimeEvent::Message(Message::Tick) => {
                 return Ok(if self.active.is_some() {
@@ -525,36 +669,7 @@ impl Program for App {
                     return Ok(Update::none());
                 }
                 self.active = None;
-                match *result {
-                    Ok(Outcome::Document(document)) => {
-                        self.document = Some(*document);
-                        self.focused = usize::MAX;
-                        self.screen = Screen::Reader;
-                        self.chapter = 0;
-                        self.refine = false;
-                        self.export = None;
-                        self.status = "Saved · source-grounded recap ready".into();
-                        self.rebuild_reader();
-                    }
-                    Ok(Outcome::Catalog(page)) => {
-                        self.recent = page.entries;
-                        self.cursor = page.next;
-                        self.library_offset = 0;
-                        self.status = format!(
-                            "Local library · examined {} entries · browsing does not call a model",
-                            page.examined
-                        );
-                    }
-                    Ok(Outcome::Exported(result)) => {
-                        self.status =
-                            format!("Exported {} · HTML is ready to open", result.path.display());
-                        self.export = Some(result.path);
-                    }
-                    Ok(Outcome::Opened) => {
-                        self.status = "Opened exported HTML in the system viewer".into();
-                    }
-                    Err(error) => self.status = error,
-                }
+                self.install_outcome(*result);
             }
             RuntimeEvent::Terminal(event) => return Ok(self.terminal(&event)),
             RuntimeEvent::Timer(_) => {}

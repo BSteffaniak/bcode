@@ -65,6 +65,10 @@ pub struct TuiOptions {
     pub model: Option<String>,
     #[arg(long)]
     pub provider: Option<String>,
+    #[arg(long)]
+    pub endpoint: Option<String>,
+    #[arg(long)]
+    pub auth_profile: Option<String>,
     #[arg(long, value_parser = crate::cli::document_id)]
     pub id: Option<String>,
     /// Export policy shared by form-created jobs; defaults come from the CLI schema.
@@ -83,6 +87,8 @@ impl Default for TuiOptions {
             context: None,
             model: None,
             provider: None,
+            endpoint: None,
+            auth_profile: None,
             id: None,
             #[cfg(feature = "tui")]
             output: OutputOptions::default(),
@@ -135,12 +141,18 @@ impl TuiOptions {
         model.context.clone_from(&self.context);
         model.model.clone_from(&self.model);
         model.provider.clone_from(&self.provider);
+        model.endpoint.clone_from(&self.endpoint);
+        model.auth_profile.clone_from(&self.auth_profile);
     }
 }
 
 /// A single operation, run directly against the same embedded engine as the CLI.
 #[derive(Debug)]
 pub enum Request {
+    #[cfg(feature = "tui")]
+    CreateAndExport(Box<Create>),
+    #[cfg(feature = "tui")]
+    RefineAndExport(Box<Refine>),
     Create(Box<Create>),
     Refine(Box<Refine>),
     Export {
@@ -164,6 +176,11 @@ pub enum Request {
 }
 #[derive(Debug)]
 pub enum Outcome {
+    #[cfg(feature = "tui")]
+    Ready {
+        document: Box<RecapDocument>,
+        export: Result<ExportResult, String>,
+    },
     Document(Box<RecapDocument>),
     Exported(ExportResult),
     #[cfg(feature = "tui")]
@@ -210,10 +227,58 @@ pub async fn execute(
     progress: &mut (impl FnMut(Stage) + Send),
 ) -> Result<Outcome, Error> {
     check_cancel(cancel)?;
+    let (request, automatic_export) = match request {
+        #[cfg(feature = "tui")]
+        Request::CreateAndExport(mut value) => {
+            value.output = available_output(&options.store, value.id.as_deref(), &value.output);
+            let output = value.output.clone();
+            (Request::Create(value), Some(output))
+        }
+        #[cfg(feature = "tui")]
+        Request::RefineAndExport(mut value) => {
+            value.output = available_output(&options.store, Some(&value.id), &value.output);
+            let output = value.output.clone();
+            (Request::Refine(value), Some(output))
+        }
+        other => (other, None::<OutputOptions>),
+    };
     let store = DocumentStore::new(&options.store, options.max_document_bytes);
+    let outcome = execute_job(options, &store, request, cancel, progress).await?;
+    #[cfg(feature = "tui")]
+    if let Some(output) = automatic_export
+        && let Outcome::Document(document) = outcome
+    {
+        progress(Stage::Export);
+        let export = export_document(&store, &document, &output).map_err(|_| {
+            "Recap saved, but HTML export failed. Choose another destination and export again."
+                .into()
+        });
+        return Ok(Outcome::Ready { document, export });
+    }
+    #[cfg(not(feature = "tui"))]
+    let _ = automatic_export;
+    Ok(outcome)
+}
+
+async fn execute_job(
+    options: &TuiOptions,
+    store: &DocumentStore,
+    request: Request,
+    cancel: &Cancellation,
+    progress: &mut (impl FnMut(Stage) + Send),
+) -> Result<Outcome, Error> {
     match request {
+        #[cfg(feature = "tui")]
+        Request::CreateAndExport(_) | Request::RefineAndExport(_) => {
+            unreachable!("export jobs normalized")
+        }
         Request::Create(value) => {
             crate::cli::nonempty(&value.source).map_err(Error::Action)?;
+            if value.source.starts_with("https://") {
+                source::youtube_url(&value.source)?;
+            } else {
+                source::local_video(Path::new(&value.source), value.budget.max_video_bytes)?;
+            }
             if let Some(id) = &value.id {
                 crate::cli::document_id(id).map_err(Error::Action)?;
             }
@@ -223,7 +288,7 @@ pub async fn execute(
             progress(Stage::ModelReadiness);
             let executor = configured_model(&value.model).await?;
             check_cancel(cancel)?;
-            create(store, &value, &executor, cancel, progress)
+            create(store.clone(), &value, &executor, cancel, progress)
                 .await
                 .map(|document| Outcome::Document(Box::new(document)))
                 .map_err(|error| model_job_error(error, &executor))
@@ -234,7 +299,7 @@ pub async fn execute(
             progress(Stage::ModelReadiness);
             let executor = configured_model(&value.model).await?;
             check_cancel(cancel)?;
-            refine(store, &value, &executor, cancel, progress)
+            refine(store.clone(), &value, &executor, cancel, progress)
                 .await
                 .map(|document| Outcome::Document(Box::new(document)))
                 .map_err(|error| model_job_error(error, &executor))
@@ -247,7 +312,7 @@ pub async fn execute(
         Request::Export { id, options } => {
             let document = store.load(&id)?;
             progress(Stage::Export);
-            let result = export_document(&store, &document, &options)?;
+            let result = export_document(store, &document, &options)?;
             progress(Stage::Complete);
             Ok(Outcome::Exported(result))
         }
@@ -293,6 +358,41 @@ pub async fn execute(
         }
     }
 }
+#[cfg(feature = "tui")]
+fn available_output(store: &Path, id: Option<&str>, requested: &OutputOptions) -> OutputOptions {
+    let mut output = requested.clone();
+    if output.output.is_some() {
+        return output;
+    }
+    let name = id.map_or_else(
+        || {
+            format!(
+                "recap-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            )
+        },
+        str::to_owned,
+    );
+    for suffix in 0..10_000 {
+        let file = if suffix == 0 {
+            format!("{name}.html")
+        } else {
+            format!("{name}-{suffix}.html")
+        };
+        let candidate = store.join(file);
+        if !candidate.exists() {
+            output.output = Some(candidate);
+            return output;
+        }
+    }
+    // A colliding final path still fails through the normal no-clobber write contract.
+    output.output = Some(store.join(format!("{name}.html")));
+    output
+}
+
 fn model_job_error(error: Error, executor: &crate::bcode_adapter::BcodeExecutor) -> Error {
     executor.failure().map_or(error, Error::ModelExecution)
 }
@@ -511,6 +611,8 @@ pub fn model_options(options: &ModelOptions) -> crate::bcode_adapter::BcodeOptio
         context: options.context.clone(),
         model: options.model.clone(),
         provider: options.provider.clone(),
+        endpoint: options.endpoint.clone(),
+        auth_profile: options.auth_profile.clone(),
         max_output_tokens: options.max_output_tokens,
         timeout: Duration::from_secs(options.model_timeout_seconds),
     }
@@ -527,9 +629,7 @@ pub async fn configured_model(
 
 pub fn preflight_model(options: &ModelOptions) -> Result<(), Error> {
     if options.model_config.as_os_str().is_empty() {
-        return Err(Error::Action(
-            "select a model configuration file before starting inference".into(),
-        ));
+        return Ok(());
     }
     if !std::fs::metadata(&options.model_config)
         .map_err(|_| {
@@ -781,11 +881,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("select a model configuration file")
-        );
+        assert!(matches!(error, Error::Source(_)));
         let refine = options.refine_request("../escape".into(), "Compare".into());
         let error = execute(
             &options,
@@ -796,7 +892,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, Error::Action(_)));
-        assert_eq!(stages, [Stage::ModelReadiness]);
+        assert!(stages.is_empty());
         assert!(!options.store.exists());
     }
 

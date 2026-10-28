@@ -171,14 +171,15 @@ impl Engine<'_> {
         )
         .await?;
         let evidence = source_evidence(&transcript, &visuals.assets);
+        let source_title = acquired.title.as_ref().unwrap_or(&request.source_title);
         let grounded = RecapDocument {
             schema_version: DOCUMENT_SCHEMA_VERSION,
             id: request.id.clone(),
             revision: 1,
-            title: request.source_title.clone(),
+            title: source_title.clone(),
             source: Source {
                 id: request.source_id.clone(),
-                title: request.source_title.clone(),
+                title: source_title.clone(),
                 url: match &request.input {
                     SourceInput::Youtube(url) => Some(source::youtube_url(url)?),
                     SourceInput::Local(_) => None,

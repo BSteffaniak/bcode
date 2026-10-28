@@ -5,6 +5,7 @@
 mod application;
 mod bcode_adapter;
 mod cli;
+mod connections;
 #[cfg(feature = "tui")]
 mod tui;
 

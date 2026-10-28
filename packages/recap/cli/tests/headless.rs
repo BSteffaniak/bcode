@@ -11,13 +11,19 @@ use std::{
 
 fn run(arguments: &[&str]) -> Output {
     let root = tempfile::tempdir().unwrap();
+    run_at(arguments, root.path())
+}
+
+fn run_at(arguments: &[&str], root: &std::path::Path) -> Output {
     let stdout = tempfile::tempfile().unwrap();
     let stderr = tempfile::tempfile().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_recap"))
         .args(arguments)
-        .current_dir(root.path())
+        .current_dir(root)
         .env_clear()
-        .env("HOME", root.path())
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("XDG_STATE_HOME", root.join(".state"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout.try_clone().unwrap()))
@@ -125,6 +131,60 @@ fn headless_operational_failures_remain_nonzero_without_entering_tui() {
         let output = run(&arguments);
         assert_eq!(output.status.code(), Some(1), "{arguments:?}");
         assert!(!output.stderr.is_empty(), "failure must be actionable");
+    }
+}
+
+#[test]
+fn missing_optional_model_config_is_an_operational_error_not_parser_rejection() {
+    for arguments in [
+        vec!["create", "--source", "absent.mp4"],
+        vec!["refine", "missing", "--focus", "Inspect source"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = run_at(&arguments, root.path());
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(!output.stderr.is_empty(), "failure must be actionable");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("required arguments"),
+            "model configuration is optional at the parser boundary"
+        );
+        assert!(!root.path().join(".recap").exists());
+    }
+}
+
+#[test]
+fn malformed_explicit_override_is_secret_safe_and_never_creates_a_store() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("malformed.toml");
+    // Deliberately invalid, with a sentinel that must never appear in diagnostics.
+    let sentinel = "acceptance-secret-must-not-be-printed";
+    let contents = format!("api_key = '{sentinel}'\n[model\n");
+    std::fs::write(&config, &contents).unwrap();
+    for arguments in [
+        vec![
+            "create",
+            "--source",
+            "absent.mp4",
+            "--model-config",
+            config.to_str().unwrap(),
+        ],
+        vec![
+            "refine",
+            "missing",
+            "--focus",
+            "Inspect source",
+            "--model-config",
+            config.to_str().unwrap(),
+        ],
+    ] {
+        let output = run_at(&arguments, root.path());
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(!output.stderr.is_empty());
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(!String::from_utf8_lossy(stream).contains(sentinel));
+        }
+        assert!(!root.path().join(".recap").exists());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), contents);
     }
 }
 

@@ -120,6 +120,312 @@ pub use bcode_tool::{
 /// Result alias for Bcode SDK operations.
 pub type Result<T> = std::result::Result<T, BcodeError>;
 
+/// Explicit selection overrides for Bcode's central configuration loader.
+#[cfg(feature = "config")]
+#[derive(Clone, Debug, Default)]
+pub struct ConfiguredModelOptions {
+    /// An exclusive local configuration file; absent uses normal Bcode configuration.
+    pub config_path: Option<PathBuf>,
+    /// Named model profile, resolved by Bcode.
+    pub profile: Option<String>,
+    /// Named configuration context.
+    pub context: Option<String>,
+    /// Model ID or centrally configured alias.
+    pub model: Option<String>,
+    /// Provider plugin ID.
+    pub provider: Option<String>,
+    /// Explicit configured authentication profile; replaces any selected auth pool.
+    pub auth_profile: Option<String>,
+    /// Provider-owned settings applied only to this SDK, never persisted to Bcode config.
+    pub settings: BTreeMap<String, String>,
+}
+
+/// Secret-free local discovery. Does not load plugins, authenticate, or contact providers.
+#[cfg(feature = "config")]
+#[derive(Clone, Debug)]
+pub struct ConfiguredModelDiscovery {
+    /// Available model profiles in this configuration context.
+    pub profiles: Vec<String>,
+    /// Available named contexts.
+    pub contexts: Vec<String>,
+    /// Effective profile reference, if selected.
+    pub profile: Option<String>,
+    /// Effective normalized provider plugin ID.
+    pub provider: Option<String>,
+    /// Effective model ID after central alias/profile resolution.
+    pub model: Option<String>,
+    /// Bundled normalized model metadata for the resolved provider.
+    pub models: Vec<bcode_model::ModelInfo>,
+    /// Supported provider configuration discovery directory.
+    pub provider_config_directory: PathBuf,
+    /// Bcode user state root, not a declarative configuration path.
+    pub state_directory: PathBuf,
+}
+
+#[cfg(feature = "config")]
+impl ConfiguredModelOptions {
+    fn selection(
+        &self,
+        config: &bcode_config::BcodeConfig,
+    ) -> bcode_config::ResolvedModelSelection {
+        let mut selection = if self.config_path.is_some()
+            || self.profile.is_some()
+            || self.context.is_some()
+            || self.model.is_some()
+            || self.provider.is_some()
+            || self.auth_profile.is_some()
+        {
+            config.resolved_model_selection_with_environment(
+                &bcode_config::ConfigEnvironmentSnapshot::new(BTreeMap::new(), PathBuf::from(".")),
+            )
+        } else {
+            config.resolved_model_selection()
+        };
+        if let Some(profile) = &self.auth_profile {
+            selection.auth_profile = config
+                .active_context
+                .as_deref()
+                .and_then(|context| bcode_config::contexts::qualify(context, profile).ok())
+                .or_else(|| Some(profile.clone()));
+            selection.auth_pool = None;
+        }
+        selection
+    }
+
+    fn load(&self) -> Result<bcode_config::BcodeConfig> {
+        use std::fmt::Write as _;
+        let invalid = || {
+            BcodeError::ProviderConfiguration(
+                "invalid model selection; check config path, context, profile, model and provider"
+                    .into(),
+            )
+        };
+        if self
+            .config_path
+            .as_ref()
+            .is_some_and(|path| !path.is_file())
+        {
+            return Err(invalid());
+        }
+        let mut overlay = String::new();
+        if let Some(context) = &self.context {
+            writeln!(
+                overlay,
+                "active_context = {}",
+                serde_json::to_string(context).map_err(|_| invalid())?
+            )
+            .map_err(|_| invalid())?;
+        }
+        if self.profile.is_some() || self.model.is_some() || self.provider.is_some() {
+            overlay.push_str("[model]\n");
+            for (key, value) in [
+                ("profile", &self.profile),
+                ("model_id", &self.model),
+                ("provider_plugin_id", &self.provider),
+            ] {
+                if let Some(value) = value {
+                    if value.trim().is_empty() {
+                        return Err(invalid());
+                    }
+                    writeln!(
+                        overlay,
+                        "{key} = {}",
+                        serde_json::to_string(value).map_err(|_| invalid())?
+                    )
+                    .map_err(|_| invalid())?;
+                }
+            }
+        }
+        let mut overrides =
+            bcode_config::ConfigLoadOverrides::from_env_with_cli(None, Some(overlay));
+        if let Some(path) = &self.config_path {
+            overrides.exclusive_config_path = Some(path.clone());
+        }
+        let mut config =
+            bcode_config::load_config_with_overrides(&overrides).map_err(|_| invalid())?;
+        if self
+            .profile
+            .as_ref()
+            .is_some_and(|name| !config.model.profiles.contains_key(name))
+        {
+            return Err(invalid());
+        }
+        if let Some(model) = &self.model {
+            config.model.model_id = Some(model.clone());
+        }
+        // Preserve the selected authentication profile while overriding its model through
+        // the same central alias resolver. Never switch accounts as a side effect of a model choice.
+        if let Some(model) = &self.model
+            && let Some(profile) = config.model.profile.clone()
+            && let Some(selected) = config.model.profiles.get_mut(&profile)
+        {
+            selected.model_id = Some(model.clone());
+        }
+        let resolved = self.selection(&config);
+        if resolved
+            .model_profile
+            .as_ref()
+            .is_some_and(|name| !config.model.profiles.contains_key(name))
+        {
+            return Err(invalid());
+        }
+        if self.context.as_ref().is_some_and(|context| {
+            config
+                .contexts
+                .as_ref()
+                .is_none_or(|contexts| !contexts.entries.contains_key(context))
+        }) {
+            return Err(invalid());
+        }
+        if self
+            .provider
+            .as_ref()
+            .is_some_and(|provider| resolved.provider_plugin_id.as_ref() != Some(provider))
+        {
+            return Err(invalid());
+        }
+        self.validate_auth_selection(&config, &resolved)?;
+        Ok(config)
+    }
+
+    fn validate_auth_selection(
+        &self,
+        config: &bcode_config::BcodeConfig,
+        resolved: &bcode_config::ResolvedModelSelection,
+    ) -> Result<()> {
+        let invalid = || {
+            BcodeError::ProviderConfiguration("authentication reference must name a configured profile owned by the selected provider".into())
+        };
+        if let Some(profile) = &self.auth_profile {
+            let name = resolved.auth_profile.as_ref().ok_or_else(invalid)?;
+            let auth = config.auth.profiles.get(name).ok_or_else(invalid)?;
+            if profile.trim().is_empty()
+                || auth.owner_plugin_id.as_ref() != resolved.provider_plugin_id.as_ref()
+            {
+                return Err(invalid());
+            }
+            if self.settings.contains_key("openai.base_url")
+                && auth.scheme.as_deref() != Some("api_key")
+            {
+                return Err(BcodeError::ProviderConfiguration("custom endpoint requires an explicitly selected API-key auth profile; subscription/OAuth credentials cannot be redirected".into()));
+            }
+        } else if self.settings.contains_key("openai.base_url") {
+            return Err(BcodeError::ProviderConfiguration(
+                "custom endpoint requires an explicit configured API-key authentication profile"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Inspect central configuration and bundled model metadata without provider requests.
+    ///
+    /// # Errors
+    /// Returns a secret-safe configuration error for an invalid explicit selection.
+    pub fn discover(&self) -> Result<ConfiguredModelDiscovery> {
+        let config = self.load()?;
+        let resolved = self.selection(&config);
+        let catalog = bcode_model_catalog::ModelCatalog::load_bundled().map_err(|_| {
+            BcodeError::ProviderConfiguration("bundled model catalog unavailable".into())
+        })?;
+        let configured_catalog_provider = configured_catalog_provider(&config, &resolved);
+        let catalog_provider = resolved
+            .settings
+            .get(bcode_model::CATALOG_PROVIDER_ID_SETTING)
+            .map(String::as_str)
+            .or(configured_catalog_provider.as_deref())
+            .or(resolved.provider_plugin_id.as_deref());
+        let mut models = catalog_provider.map_or_else(Vec::new, |provider| {
+            catalog.provider_models_as_model_info(provider)
+        });
+        // Configured profiles are additional centrally resolved local choices, not inferred
+        // from provider config filenames. Unknown capability claims remain unknown.
+        for profile in config.model.profiles.keys() {
+            if let Some(candidate) = config.resolved_model_profile(profile)
+                && candidate.provider_plugin_id == resolved.provider_plugin_id
+                && let Some(id) = candidate.model_id
+                && !models.iter().any(|model| model.model_id == id)
+            {
+                models.push(bcode_model::ModelInfo {
+                    model_id: id,
+                    display_name: config
+                        .model
+                        .profiles
+                        .get(profile)
+                        .and_then(|entry| entry.display_name.clone())
+                        .unwrap_or_else(|| profile.clone()),
+                    is_default: false,
+                    context_window: None,
+                    max_output_tokens: None,
+                    max_image_input_base64_bytes: None,
+                    capabilities: BTreeSet::new(),
+                    feature_support: bcode_model::ModelFeatureSupport::default(),
+                    reasoning: None,
+                    cache: bcode_model::ModelCacheInfo::default(),
+                    metadata_source: None,
+                    pricing: None,
+                    api_surface: None,
+                    visibility: bcode_model::ModelVisibility::default(),
+                });
+            }
+        }
+        Ok(ConfiguredModelDiscovery {
+            profiles: config.model.profiles.keys().cloned().collect(),
+            contexts: config.contexts.as_ref().map_or_else(Vec::new, |contexts| {
+                contexts.entries.keys().cloned().collect()
+            }),
+            profile: resolved.model_profile,
+            provider: resolved.provider_plugin_id,
+            model: resolved.model_id,
+            models,
+            provider_config_directory: bcode_config::config_launch_context(std::path::Path::new(
+                ".",
+            ))
+            .provider_config_directory,
+            state_directory: bcode_config::default_state_dir(),
+        })
+    }
+}
+
+// Catalog identity comes only from the selected declarative auth references. This reads
+// metadata, not credentials, and never scans unrelated accounts or guesses from URLs.
+#[cfg(feature = "config")]
+fn configured_catalog_provider(
+    config: &bcode_config::BcodeConfig,
+    selection: &bcode_config::ResolvedModelSelection,
+) -> Option<String> {
+    if let Some(name) = &selection.auth_profile {
+        return config
+            .auth
+            .profiles
+            .get(name)
+            .and_then(|profile| profile.provider_id.clone());
+    }
+    if let Some(name) = &selection.auth_pool {
+        let pool = config.auth.pools.get(name)?;
+        if let Some(provider) = &pool.automatic_provider {
+            return Some(provider.clone());
+        }
+        let identities: BTreeSet<&str> = pool
+            .profiles
+            .iter()
+            .map(|name| config.auth.profiles.get(name)?.provider_id.as_deref())
+            .collect::<Option<_>>()?;
+        if identities.len() == 1 {
+            return identities.first().map(|provider| (*provider).to_owned());
+        }
+        return None;
+    }
+    let provider = selection.provider_plugin_id.as_ref()?;
+    let binding = config.auth.bindings.get(provider)?;
+    config
+        .auth
+        .profiles
+        .get(binding.profile.as_ref().unwrap_or(provider))?
+        .provider_id
+        .clone()
+}
+
 /// Provider/model selector used by ergonomic SDK helpers and builders.
 ///
 /// A selector can hold just a model ID (`"gpt-4o-mini"`) or a provider-qualified model string
@@ -5314,6 +5620,69 @@ impl Bcode {
     #[cfg(feature = "config")]
     pub fn configured() -> Result<Self> {
         Ok(Self::builder().load_provider_defaults()?.build())
+    }
+
+    /// Build an embedded SDK with central selection and authentication resolution.
+    /// This does not contact a provider; callers may explicitly discover capabilities afterward.
+    ///
+    /// # Errors
+    /// Returns a secret-safe configuration error or a provider discovery error.
+    #[cfg(all(feature = "config", feature = "embedded-plugins"))]
+    pub async fn configured_embedded_with_options(
+        options: &ConfiguredModelOptions,
+        static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    ) -> Result<Self> {
+        let load_options = options.clone();
+        let config = tokio::task::spawn_blocking(move || load_options.load())
+            .await
+            .map_err(|_| {
+                BcodeError::ProviderConfiguration("model configuration loading interrupted".into())
+            })??;
+        let defaults = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
+        let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &selection,
+            static_plugins,
+        )?;
+        let resolved = options.selection(&config);
+        if resolved.model_id.is_none() || resolved.provider_plugin_id.is_none() {
+            return Err(BcodeError::ProviderConfiguration(
+                "no model selected; choose a configured profile or model and provider".into(),
+            ));
+        }
+        let mut auth = bcode_provider_auth::try_resolve_provider_request_context(
+            bcode_provider_auth::ProviderRequestContextResolution {
+                config: &config,
+                selection: resolved.clone(),
+            },
+        )
+        .map_err(|_| {
+            BcodeError::ProviderConfiguration(
+                "selected authentication unavailable; check Bcode auth configuration".into(),
+            )
+        })?;
+        if options.settings.contains_key("openai.base_url") {
+            let safe = |auth: &bcode_model::ProviderAuthContext| {
+                auth.scheme.as_deref() == Some("api_key")
+                    && auth
+                        .credentials
+                        .get("api_key")
+                        .is_some_and(|key| !key.value.trim().is_empty())
+                    && auth.credentials.keys().all(|key| key == "api_key")
+            };
+            if auth.auth.as_ref().is_none_or(|selected| !safe(selected))
+                || auth
+                    .auth_candidates
+                    .iter()
+                    .any(|candidate| !safe(&candidate.auth))
+            {
+                return Err(BcodeError::ProviderConfiguration("custom endpoint authentication must contain only the explicitly selected API key; OAuth/subscription credentials cannot be redirected".into()));
+            }
+        }
+        auth.settings.extend(options.settings.clone());
+        let mut builder = Self::builder().plugin_runtime(plugins);
+        builder.provider_registry = ProviderRegistry::from_resolved_model_selection(&resolved);
+        Ok(builder.provider_context(auth).build())
     }
 
     /// Build an embedded SDK handle from layered configuration and caller-provided static plugins.
@@ -10858,4 +11227,137 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
         latency_ms: runtime.latency_ms,
     });
     steps
+}
+
+#[cfg(all(test, feature = "config"))]
+mod configured_model_options_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_file_uses_central_profiles_aliases_and_normalized_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("arbitrary-connection-name.toml");
+        std::fs::write(
+            &path,
+            r#"
+[model]
+profile = "primary"
+[model.profiles.primary]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "unknown-configured-model"
+auth_profile = "account"
+[model.aliases.short]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "alias-target"
+[auth.profiles.account]
+backend = "env"
+provider_id = "openai"
+owner_plugin_id = "bcode.openai-compatible"
+scheme = "api_key"
+"#,
+        )
+        .unwrap();
+        let mut options = ConfiguredModelOptions {
+            config_path: Some(path),
+            ..Default::default()
+        };
+        let discovery = options.discover().unwrap();
+        assert_eq!(discovery.model.as_deref(), Some("unknown-configured-model"));
+        assert_eq!(discovery.profile.as_deref(), Some("primary"));
+        let expected = bcode_model_catalog::ModelCatalog::load_bundled()
+            .unwrap()
+            .provider_models_as_model_info("openai");
+        assert!(!expected.is_empty());
+        for model in expected {
+            assert!(
+                discovery
+                    .models
+                    .iter()
+                    .any(|item| item.model_id == model.model_id
+                        && item.capabilities == model.capabilities)
+            );
+        }
+        options.model = Some("short".into());
+        assert_eq!(
+            options.discover().unwrap().model.as_deref(),
+            Some("alias-target")
+        );
+        options.profile = Some("missing".into());
+        assert!(options.discover().is_err());
+    }
+
+    #[test]
+    fn explicit_auth_reference_replaces_pool_and_rejects_oauth_endpoint_redirection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("connection.toml");
+        std::fs::write(
+            &path,
+            r#"
+[model]
+profile = "primary"
+[model.profiles.primary]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "configured-model"
+auth_pool = "accounts"
+[auth.pools.accounts]
+profiles = ["subscription"]
+[auth.profiles.subscription]
+backend = "env"
+provider_id = "openai"
+owner_plugin_id = "bcode.openai-compatible"
+scheme = "chatgpt"
+[auth.profiles.key]
+backend = "env"
+provider_id = "openai"
+owner_plugin_id = "bcode.openai-compatible"
+scheme = "api_key"
+"#,
+        )
+        .unwrap();
+        let mut options = ConfiguredModelOptions {
+            config_path: Some(path),
+            auth_profile: Some("key".into()),
+            ..Default::default()
+        };
+        let config = options.load().unwrap();
+        let selection = options.selection(&config);
+        assert_eq!(selection.auth_profile.as_deref(), Some("key"));
+        assert!(selection.auth_pool.is_none());
+        options
+            .settings
+            .insert("openai.base_url".into(), "https://custom.example/v1".into());
+        assert!(options.discover().is_ok());
+        options.auth_profile = Some("subscription".into());
+        assert!(options.discover().is_err());
+        options.auth_profile = None;
+        assert!(options.discover().is_err());
+        options.auth_profile = Some("none".into());
+        assert!(options.discover().is_err());
+        options.auth_profile = Some("missing".into());
+        assert!(options.discover().is_err());
+    }
+
+    #[test]
+    fn unsupported_external_configuration_fails_secret_safe_without_inference() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid.toml");
+        std::fs::write(&path, "invalid = [SECRET_DO_NOT_EXPOSE").unwrap();
+        let error = ConfiguredModelOptions {
+            config_path: Some(path),
+            ..Default::default()
+        }
+        .discover()
+        .unwrap_err();
+        assert!(!error.to_string().contains("SECRET_DO_NOT_EXPOSE"));
+        let options = ConfiguredModelOptions {
+            config_path: Some("https://example.invalid/config.toml".into()),
+            ..Default::default()
+        };
+        assert!(options.discover().is_err());
+        let options = ConfiguredModelOptions {
+            config_path: Some(directory.path().join("missing.toml")),
+            ..Default::default()
+        };
+        assert!(options.discover().is_err());
+    }
 }

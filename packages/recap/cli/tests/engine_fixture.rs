@@ -148,6 +148,19 @@ async fn engine_fixture_generate_refine_export_and_cancel() {
         transcript: Some("WEBVTT\n\n00:00.000 --> 00:02.000\nThe test pattern changes.\n".into()),
         intent: GenerationIntent::default(),
     };
+    let cancelled = Cancellation::default();
+    cancelled.cancel();
+    let mut cancelled_stages = Vec::new();
+    assert!(
+        engine
+            .generate(&request, &cancelled, &mut |stage| cancelled_stages
+                .push(stage))
+            .await
+            .is_err()
+    );
+    assert!(!cancelled_stages.contains(&Stage::Complete));
+    assert!(!root.join("store").join("unicode-field-notes.json").exists());
+    assert!(!root.join("recap.html").exists());
     let mut stages = Vec::new();
     let initial = engine
         .generate(&request, &Cancellation::default(), &mut |stage| {

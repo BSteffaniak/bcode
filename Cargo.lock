@@ -2851,7 +2851,9 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "base64 0.22.1",
  "bcode",
+ "bcode_config",
  "bcode_model",
+ "bcode_model_catalog",
  "bcode_openai_compatible_provider_plugin",
  "bcode_plugin",
  "bcode_recap",
@@ -2869,6 +2871,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "url 2.5.8",
 ]
 
 [[package]]

@@ -21,7 +21,9 @@ bcode = { workspace = true, features = [
     "embedded-plugins",
     "openai-compatible-provider",
 ] }
+bcode_config.workspace = true
 bcode_model.workspace = true
+bcode_model_catalog.workspace = true
 bcode_openai_compatible_provider_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
@@ -50,6 +52,7 @@ bmux_tui_components = { workspace = true, optional = true, features = [
     "radio-group",
     "scroll-view",
     "selectable-list",
+    "select-dropdown",
     "stepper",
     "text-input",
     "text-input-box",
@@ -79,6 +82,7 @@ tokio = { workspace = true, features = [
     "signal",
     "time",
 ] }
+url.workspace = true
 
 [dev-dependencies]
 bmux_terminal_grid.workspace = true

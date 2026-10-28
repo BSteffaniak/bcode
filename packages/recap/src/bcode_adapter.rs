@@ -9,14 +9,19 @@ use bcode_recap::{
 };
 use std::{sync::Mutex, time::Duration};
 
-/// Explicit standalone configuration; no ambient selection substitution.
+/// Resolve through Bcode's configured selection and provider authentication.
 #[derive(Clone, Debug)]
 pub struct BcodeOptions {
+    /// Empty means Bcode's normal layered configuration.
     pub config_path: std::path::PathBuf,
     pub profile: Option<String>,
     pub context: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// Request-only provider-owned base URL override.
+    pub endpoint: Option<String>,
+    /// Configured authentication profile reference.
+    pub auth_profile: Option<String>,
     /// Normalized provider output-token ceiling.
     pub max_output_tokens: u32,
     /// Deadline for one model composition operation.
@@ -163,19 +168,35 @@ impl BcodeExecutor {
             max_output_tokens: Some(options.max_output_tokens),
             ..bcode_model::ModelParameters::default()
         };
-        let providers = [bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
-            bcode_openai_compatible_provider_plugin::static_plugin(),
-        )];
-        let sdk = Bcode::configured_embedded_from_file(
-            options.config_path,
-            options.profile.as_deref(),
-            options.context.as_deref(),
-            options.model.as_deref(),
-            options.provider.as_deref(),
-            &providers,
+        let selected = crate::connections::effective_selection(&crate::connections::Selection {
+            config_path: (!options.config_path.as_os_str().is_empty())
+                .then_some(options.config_path),
+            profile: options.profile,
+            context: options.context,
+            model: options.model,
+            provider: options.provider,
+            endpoint: options.endpoint,
+            auth_profile: options.auth_profile,
+        })
+        .map_err(|_| ModelError::Unavailable)?;
+        let sdk = crate::connections::resolve(&selected)
+            .await
+            .map_err(|_| ModelError::Unavailable)?;
+        let selector = sdk
+            .default_model_selector()
+            .cloned()
+            .ok_or(ModelError::Unavailable)?;
+        let owner = selector
+            .provider_plugin_id()
+            .ok_or(ModelError::Unavailable)?
+            .to_owned();
+        let context = sdk.provider_context().clone();
+        let sdk = tokio::time::timeout(
+            options.timeout.min(Duration::from_secs(10)),
+            sdk.discover_provider(owner, context, Some(selector.model_id().to_owned())),
         )
         .await
+        .map_err(|_| ModelError::Unavailable)?
         .map_err(|_| ModelError::Unavailable)?;
         Ok(Self {
             sdk,
@@ -300,6 +321,8 @@ mod tests {
                 context: None,
                 model: None,
                 provider: None,
+                endpoint: None,
+                auth_profile: None,
                 max_output_tokens,
                 timeout,
             };

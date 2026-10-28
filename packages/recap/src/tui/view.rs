@@ -76,13 +76,13 @@ impl Palette {
             _ => Self::dark(),
         }
     }
-    const fn text(self) -> Style {
+    pub(super) const fn text(self) -> Style {
         Style::new().fg(self.ink)
     }
-    const fn quiet(self) -> Style {
+    pub(super) const fn quiet(self) -> Style {
         Style::new().fg(self.muted)
     }
-    const fn title(self) -> Style {
+    pub(super) const fn title(self) -> Style {
         Style::new().fg(self.ink).add_modifier(Modifier::BOLD)
     }
 }
@@ -107,10 +107,15 @@ const fn density(width: u16, height: u16) -> Density {
 }
 
 impl App {
-    fn label(text: impl Into<String>, style: Style) -> TextBlock {
+    pub(super) fn label(text: impl Into<String>, style: Style) -> TextBlock {
         TextBlock::new(text.into()).style(style)
     }
-    fn button<'a>(&'a self, id: &str, label: &'a str, index: usize) -> ButtonComponent<'a, 'a> {
+    pub(super) fn button<'a>(
+        &'a self,
+        id: &str,
+        label: &'a str,
+        index: usize,
+    ) -> ButtonComponent<'a, 'a> {
         let p = self.palette;
         ButtonComponent::new(id.to_owned(), label, &self.buttons[index])
             .filled()
@@ -122,7 +127,7 @@ impl App {
                 disabled: p.quiet(),
             })
     }
-    fn field<'a>(
+    pub(super) fn field<'a>(
         &'a self,
         index: usize,
         label: &'a str,
@@ -197,17 +202,21 @@ impl App {
                 .content_style(p.text().bg(p.base)),
             );
         }
-        let header = Row::new()
-            .gap(2)
-            .child(Self::label(
-                "◈  R E C A P",
-                Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
-            ))
-            .flex_child(1, Self::label("  A clearer view.", p.quiet()))
+        let mut header = Row::new().gap(2).child(Self::label(
+            "◈  R E C A P",
+            Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
+        ));
+        if mode != Density::Narrow {
+            header = header.flex_child(1, Self::label("  A clearer view.", p.quiet()));
+        }
+        let header = header
             .child(self.button("home", "Home", 0))
+            .child(self.button("settings-nav", "Settings", 66))
             .child(self.button("theme", "◐", 1));
         let body = if self.active.is_some() {
             self.working()
+        } else if self.settings_state.open {
+            self.settings_view()
         } else {
             match self.screen {
                 Screen::Home => self.home(mode),
@@ -217,7 +226,11 @@ impl App {
         let footer = Column::new()
             .child(Self::label(self.status.clone(), p.quiet()))
             .child(Self::label(
-                "F2 Generate   F3 Chapters   F4 Focus   F5 Export   F6 Open   F8 Theme   F10/Ctrl+C Quit",
+                if mode == Density::Narrow {
+                    "F7 Settings · F6 Open · F10/Ctrl+C Quit"
+                } else {
+                    "Enter Create   F7 Settings   F2 Generate   F3 Chapters   F4 Focus   F5 Export   F6 Open   F10/Ctrl+C Quit"
+                },
                 Style::new().fg(p.accent),
             ));
         Element::new(
@@ -257,17 +270,8 @@ impl App {
                     "EDITORIAL FOCUS · OPTIONAL",
                     "What should this recap bring into focus?",
                 ));
-        } else {
-            form = form.child(
-                Row::new()
-                    .gap(1)
-                    .flex_child(
-                        1,
-                        self.field(3, "MODEL CONFIG", "Explicit Bcode config path"),
-                    )
-                    .flex_child(1, self.field(4, "PROFILE", "Profile name")),
-            );
         }
+        form = form.child(Self::label(self.connection_summary(), p.quiet()));
         form = form.child(
             Row::new()
                 .gap(1)
@@ -275,22 +279,25 @@ impl App {
                 .child(self.button(
                     "options",
                     if self.refine {
-                        "Model settings"
+                        "Hide source options"
                     } else {
                         "Source options"
                     },
                     8,
                 ))
-                .child(self.button(
-                    "depth",
-                    match self.depth {
-                        bcode_recap::contracts::Depth::Brief => "Brief",
-                        bcode_recap::contracts::Depth::Standard => "Standard",
-                        bcode_recap::contracts::Depth::Detailed => "Detailed",
-                    },
-                    3,
-                )),
+                .child(self.button("settings", "Settings", 67)),
         );
+        if self.refine {
+            form = form.child(self.button(
+                "depth",
+                match self.depth {
+                    bcode_recap::contracts::Depth::Brief => "Depth · Brief",
+                    bcode_recap::contracts::Depth::Standard => "Depth · Standard",
+                    bcode_recap::contracts::Depth::Detailed => "Depth · Detailed",
+                },
+                3,
+            ));
+        }
         let form = Surface::new(form)
             .background(Style::new().bg(p.panel))
             .content_style(p.text().bg(p.panel))
