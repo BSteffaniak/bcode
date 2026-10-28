@@ -142,10 +142,40 @@ struct ContractContinuation {
     terminal_sha256: String,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpgradeSeed {
+    evidence: CompactionEvidence,
+    users: BTreeSet<u64>,
+    unfinished: BTreeSet<u64>,
+    source_start: usize,
+    source_complete: bool,
+    max_requests: u32,
+    #[serde(default)]
+    pending: bool,
+    spent_requests: u32,
+    source_checkpoint: u64,
+    source_sha256: String,
+}
+
+impl UpgradeSeed {
+    pub(super) const fn source_start(&self) -> usize {
+        self.source_start
+    }
+    pub(super) const fn complete(&self) -> bool {
+        self.source_complete
+    }
+    pub(super) const fn evidence(&self) -> &CompactionEvidence {
+        &self.evidence
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct LocalCheckpoint {
     format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upgrade: Option<UpgradeSeed>,
     #[serde(default = "legacy_packing_policy")]
     pub(super) packing_policy: String,
     #[serde(default)]
@@ -185,6 +215,7 @@ impl LocalCheckpoint {
             format: CHECKPOINT_FORMAT.into(),
             packing_policy: legacy_packing_policy(),
             synthesis_policy: None,
+            upgrade: None,
             resolved_policy: None,
             restart_allowance: None,
             contract_continuation: None,
@@ -215,6 +246,7 @@ impl LocalCheckpoint {
             format: CHECKPOINT_FORMAT.into(),
             packing_policy: legacy_packing_policy(),
             synthesis_policy: Some(CheckpointPolicy::from_policy(policy)?),
+            upgrade: None,
             resolved_policy: None,
             restart_allowance: None,
             contract_continuation: None,
@@ -300,7 +332,9 @@ impl LocalCheckpoint {
     /// Automatic replacement may happen once for an original operation, never replenish
     /// a replacement operation's durable allowance on another configuration change.
     pub(super) const fn is_original_operation(&self) -> bool {
-        self.restart_allowance.is_none() && self.contract_continuation.is_none()
+        self.upgrade.is_none()
+            && self.restart_allowance.is_none()
+            && self.contract_continuation.is_none()
     }
 
     /// Decode the frozen budget into the planner's current typed contract.
@@ -336,11 +370,13 @@ impl LocalCheckpoint {
 
     /// Total reserved requests, including corrective work; no old counter is ever reset.
     fn consumed_requests(&self) -> u32 {
-        self.requests
-            .iter()
-            .chain(&self.consolidation_requests)
-            .map(|count| u32::from(*count))
-            .sum::<u32>()
+        self.upgrade.as_ref().map_or(0, |seed| seed.spent_requests)
+            + self
+                .requests
+                .iter()
+                .chain(&self.consolidation_requests)
+                .map(|count| u32::from(*count))
+                .sum::<u32>()
             + self
                 .contract_continuation
                 .as_ref()
@@ -372,18 +408,35 @@ impl LocalCheckpoint {
         Ok(())
     }
 
+    fn verify_upgrade(&self) -> Result<(), CompactionError> {
+        if self.upgrade.as_ref().is_some_and(|seed| {
+            seed.source_checkpoint == 0
+                || seed.source_sha256.len() != 64
+                || seed.spent_requests > 2048
+                || seed.max_requests != seed.spent_requests.saturating_add(64)
+                || !self.packing_policy.starts_with("capacity-summary-v2")
+                || self.restart_allowance.is_some()
+                || self.contract_continuation.is_some()
+                || self.consumed_requests() > seed.max_requests
+        }) {
+            return Err(invalid_checkpoint());
+        }
+        Ok(())
+    }
+
     pub(super) fn decode(payload: &str) -> Result<Self, CompactionError> {
         if payload.len() > MAX_PAYLOAD {
             return Err(invalid_checkpoint());
         }
         let checkpoint: Self = serde_json::from_str(payload).map_err(|_| invalid_checkpoint())?;
+        checkpoint.verify_upgrade()?;
         checkpoint.verify_contract_continuation()?;
         if checkpoint
             .restart_allowance
             .as_ref()
             .is_some_and(|allowance| {
                 allowance.max_requests == 0
-                    || allowance.max_requests > 2_048
+                    || allowance.max_requests > 4096
                     || allowance.deadline_ms == 0
                     || checkpoint.resolved_policy.is_none()
                     || checkpoint.contract_continuation.as_ref().map_or_else(
@@ -436,7 +489,7 @@ impl LocalCheckpoint {
             || checkpoint.requests.len() != checkpoint.manifest.len()
             || checkpoint.next_chunk > checkpoint.manifest.len()
             || checkpoint.requests.iter().any(|count| *count > 2)
-            || checkpoint.requests[..checkpoint.next_chunk].contains(&0)
+            || (checkpoint.requests[..checkpoint.next_chunk].contains(&0) && !checkpoint.upgrade.as_ref().is_some_and(|seed| seed.source_complete && checkpoint.next_chunk == checkpoint.manifest.len()))
             || checkpoint
                 .requests
                 .iter()
@@ -493,8 +546,14 @@ impl LocalCheckpoint {
         {
             return Err(invalid_checkpoint());
         }
-        let mut unfinished = BTreeSet::new();
-        let mut known = prior_scope_sequences(transcript.previous_summary.as_deref());
+        let mut unfinished = self
+            .upgrade
+            .as_ref()
+            .map_or_else(BTreeSet::new, |seed| seed.unfinished.clone());
+        let mut known = self.upgrade.as_ref().map_or_else(
+            || prior_scope_sequences(transcript.previous_summary.as_deref()),
+            |seed| seed.users.clone(),
+        );
         for chunk in chunks.iter().take(self.next_chunk) {
             known.extend(chunk_user_sequences(chunk));
             update_unfinished_sources(&mut unfinished, chunk);
@@ -514,11 +573,12 @@ impl LocalCheckpoint {
             || (self.next_chunk == 0
                 && (self.user_sequences != known
                     || digest(&self.evidence)?
-                        != digest(&match &self.synthesis_policy {
-                            Some(policy) => {
+                        != digest(&match (&self.upgrade, &self.synthesis_policy) {
+                            (Some(seed), _) => seed.evidence.clone(),
+                            (None, Some(policy)) => {
                                 initial_evidence_with_policy(transcript, policy.max_carry_chars)?
                             }
-                            None => initial_evidence(transcript),
+                            (None, None) => initial_evidence(transcript),
                         })?))
         {
             return Err(invalid_checkpoint());
@@ -567,20 +627,27 @@ impl LocalCheckpoint {
             budgets: Some(CompactionInspectionBudgets {
                 provider_requests: Some(CompactionInspectionCount {
                     done: u64::from(self.consumed_requests()),
-                    total: self.contract_continuation.as_ref().map_or_else(
+                    total: self.upgrade.as_ref().map_or_else(
                         || {
-                            self.restart_allowance.as_ref().map_or_else(
+                            self.contract_continuation.as_ref().map_or_else(
                                 || {
-                                    total.saturating_mul(if self.synthesis_policy.is_some() {
-                                        4
-                                    } else {
-                                        2
-                                    })
+                                    self.restart_allowance.as_ref().map_or_else(
+                                        || {
+                                            total.saturating_mul(
+                                                if self.synthesis_policy.is_some() {
+                                                    4
+                                                } else {
+                                                    2
+                                                },
+                                            )
+                                        },
+                                        |allowance| u64::from(allowance.max_requests),
+                                    )
                                 },
-                                |allowance| u64::from(allowance.max_requests),
+                                |grant| u64::from(grant.baseline_requests).saturating_add(64),
                             )
                         },
-                        |grant| u64::from(grant.baseline_requests).saturating_add(64),
+                        |seed| u64::from(seed.max_requests),
                     ),
                 }),
                 source_events: None,
@@ -733,8 +800,14 @@ impl LocalCheckpoint {
         session_id: SessionId,
         key: &str,
     ) -> Result<(), CompactionError> {
+        let changed = self.upgrade.is_some() || self.contract_continuation.is_some();
+        if let Some(seed) = &mut self.upgrade {
+            seed.pending = false;
+        }
         if let Some(grant) = &mut self.contract_continuation {
             grant.pending = false;
+        }
+        if changed {
             self.save(state, session_id, key).await?;
         }
         Ok(())
@@ -762,6 +835,15 @@ impl LocalCheckpoint {
     /// Recheck immediately before final publication; reaching the call cap after a completed
     /// response is allowed, but an elapsed explicit restart deadline is not.
     pub(super) fn verify_publication_deadline(&self) -> Result<(), CompactionError> {
+        if let Some(seed) = &self.upgrade {
+            if seed.pending
+                || self.next_chunk != self.manifest.len()
+                || self.synthesis_phase != SynthesisPhase::Accumulating
+            {
+                return Err(invalid_checkpoint());
+            }
+            return Ok(());
+        }
         if let Some(grant) = &self.contract_continuation {
             // An automatic dispatch deadline limits additional provider spending, not the
             // validity of already accepted, settled evidence. Explicit restart contracts below
@@ -791,6 +873,19 @@ impl LocalCheckpoint {
     }
 
     fn verify_restart_allowance(&self) -> Result<(), CompactionError> {
+        if let Some(seed) = &self.upgrade {
+            if seed.pending {
+                return Err(CompactionError::Provider(
+                    "compaction request settlement is unresolved; boundary unchanged".into(),
+                ));
+            }
+            if self.consumed_requests() >= seed.max_requests {
+                return Err(CompactionError::Provider(
+                    "compaction provider request allowance exhausted; boundary unchanged".into(),
+                ));
+            }
+            return Ok(());
+        }
         if let Some(grant) = &self.contract_continuation {
             return if grant.pending
                 || grant.reserved >= 64
@@ -862,6 +957,9 @@ impl LocalCheckpoint {
             return Ok(grant.requests - 1);
         }
         let attempt = *count;
+        if let Some(seed) = &mut self.upgrade {
+            seed.pending = true;
+        }
         *count += 1;
         if let Some(grant) = &mut self.contract_continuation {
             grant.reserved += 1;
@@ -891,6 +989,9 @@ impl LocalCheckpoint {
         let attempt = *count;
         *count += 1;
         self.synthesis_phase = SynthesisPhase::ConsolidatingV1;
+        if let Some(seed) = &mut self.upgrade {
+            seed.pending = true;
+        }
         if let Some(grant) = &mut self.contract_continuation {
             grant.reserved += 1;
             grant.pending = true;
@@ -946,6 +1047,57 @@ impl LocalCheckpoint {
         self.evidence = evidence.clone();
         self.synthesis_phase = SynthesisPhase::Accumulating;
         Ok(())
+    }
+
+    pub(super) fn needs_upgrade(&self) -> bool {
+        bcode_session_migration::is_character_compaction(&self.packing_policy)
+    }
+
+    pub(super) const fn upgrade_seed(&self) -> Option<&UpgradeSeed> {
+        self.upgrade.as_ref()
+    }
+
+    /// Historical decoding is migration-owned. Caller must prove settlement and atomically
+    /// supersede this exact checkpoint before admitting any request using the returned seed.
+    pub(super) fn migration_seed(
+        &self,
+        transcript: &CompactionTranscript,
+    ) -> Result<UpgradeSeed, CompactionError> {
+        let converted = bcode_session_migration::convert_character_compaction(
+            &self.encode()?,
+            self.checkpoint_sequence,
+            transcript.previous_summary.as_deref(),
+            &transcript.summary_input,
+        )
+        .map_err(|_| invalid_checkpoint())?;
+        if converted.reserved_requests != self.consumed_requests() {
+            return Err(invalid_checkpoint());
+        }
+        Ok(UpgradeSeed {
+            evidence: self.evidence.clone(),
+            users: self.user_sequences.clone(),
+            unfinished: self.unfinished.clone(),
+            source_start: converted.accepted_bytes,
+            source_complete: self.next_chunk == self.manifest.len(),
+            max_requests: self
+                .consumed_requests()
+                .checked_add(64)
+                .ok_or_else(invalid_checkpoint)?,
+            pending: false,
+            spent_requests: self.consumed_requests(),
+            source_checkpoint: converted.checkpoint_sequence,
+            source_sha256: converted.checkpoint_sha256,
+        })
+    }
+
+    pub(super) fn apply_migration_seed(&mut self, seed: UpgradeSeed) {
+        self.evidence = seed.evidence.clone();
+        self.user_sequences.clone_from(&seed.users);
+        self.unfinished.clone_from(&seed.unfinished);
+        if seed.source_complete {
+            self.next_chunk = self.manifest.len();
+        }
+        self.upgrade = Some(seed);
     }
 
     pub(super) fn restore(&self) -> (CompactionEvidence, BTreeSet<u64>, BTreeSet<u64>) {
@@ -1525,6 +1677,10 @@ fn validate_restart_rejection(
             .chain(&checkpoint.consolidation_requests)
             .map(|count| usize::from(*count))
             .sum::<usize>()
+            + checkpoint
+                .contract_continuation
+                .as_ref()
+                .map_or(0, |grant| usize::from(grant.requests))
         || usages
             .iter()
             .map(|(_, request_id)| request_id)
@@ -1553,12 +1709,18 @@ fn validate_restart_rejection(
     let consolidation = message
         .contains("compaction consolidation outcome is unresolved; boundary unchanged")
         || message.contains("derived consolidation rejected:");
+    let migration = checkpoint.needs_upgrade()
+        && (message
+            .contains("explicit compaction restart allowance exhausted; boundary unchanged")
+            || message
+                .contains("explicit compaction restart deadline exhausted; boundary unchanged")
+            || message.contains("compaction corrective deadline exhausted; boundary unchanged"));
     let cancelled_consolidation = checkpoint.synthesis_phase == SynthesisPhase::ConsolidatingV1
         && message == "context compaction failed: compaction cancelled";
     if !cancelled_consolidation
         && (!message.starts_with("context compaction failed:")
             || !message.ends_with("; boundary unchanged")
-            || !(bounded_repair || incompatible || consolidation))
+            || !(bounded_repair || incompatible || consolidation || migration))
     {
         return Err(invalid_checkpoint());
     }
@@ -1718,7 +1880,11 @@ pub(super) fn prepare_restart(
         || replacement.synthesis_phase != SynthesisPhase::Accumulating
         || old.boundary != replacement.boundary
         || old.source_digest != replacement.source_digest
-        || replacement.next_chunk != 0
+        || (replacement.next_chunk != 0
+            && !replacement.upgrade.as_ref().is_some_and(|seed| {
+                seed.source_complete && replacement.next_chunk == replacement.manifest.len()
+            }))
+        || (replacement.upgrade.is_some() && !old.needs_upgrade())
         || replacement.requests.iter().any(|count| *count != 0)
         || replacement
             .consolidation_requests
@@ -1726,6 +1892,12 @@ pub(super) fn prepare_restart(
             .any(|count| *count != 0)
         || replacement.synthesis_policy.is_none()
         || replacement.resolved_policy.is_none()
+        || replacement.upgrade.as_ref().is_some_and(|seed| {
+            old.migration_seed(transcript)
+                .and_then(|expected| digest(&expected))
+                .ok()
+                != digest(seed).ok()
+        })
     {
         return Err(invalid_checkpoint());
     }
@@ -1744,11 +1916,19 @@ pub(super) fn prepare_restart(
         return Err(invalid_checkpoint());
     }
     replacement.restart_allowance = Some(RestartAllowance {
-        max_requests: request.budget.max_provider_requests,
+        max_requests: replacement
+            .upgrade
+            .as_ref()
+            .map_or(0, |seed| seed.spent_requests)
+            .checked_add(request.budget.max_provider_requests)
+            .ok_or_else(invalid_checkpoint)?,
         deadline_ms: current_unix_millis()
             .checked_add(u64::from(request.budget.timeout_ms))
             .ok_or_else(invalid_checkpoint)?,
     });
+    if replacement.upgrade.is_some() {
+        replacement.restart_allowance = None;
+    }
     let replacement_payload = replacement.encode()?;
     let pointer = RestartPointer {
         format: RESTART_POINTER_FORMAT.into(),
@@ -1819,10 +1999,9 @@ pub(super) async fn load_resolved(
             return Err(invalid_checkpoint());
         }
         let Some(payload) = envelope.host_payload.as_deref() else {
-            if visited.len() == 1 {
-                return Ok((key, None));
-            }
-            return Err(invalid_checkpoint());
+            // A verified supersession chain may end at an explicitly retired replacement.
+            // Absence is not retirement; missing linked records still fail above.
+            return Ok((key, None));
         };
         if payload.len() > MAX_PAYLOAD {
             return Err(invalid_checkpoint());
@@ -3096,17 +3275,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let (chunks, packing) = synthesis_chunks(
-            &state,
-            id,
-            &selection,
-            &transcript,
-            &cancel,
-            Some(&budget),
-            Some("legacy-chars-v1"),
-        )
-        .await
-        .unwrap();
+        let chunks = compaction_evidence_input(&transcript, Some(&cancel)).unwrap();
+        let packing = "legacy-chars-v1".to_owned();
         assert!(chunks.len() > 1);
         let mut old = LocalCheckpoint::create_with_policy(
             &plan,
@@ -3186,7 +3356,7 @@ mod tests {
         old.save(&state, id, &key).await.unwrap();
         let original_sequence = old.checkpoint_sequence;
         let original_payload = old.encode().unwrap();
-        for request in 0..3 {
+        for request in 0..if completed { 4 } else { 3 } {
             state
                 .sessions
                 .append_event(
@@ -3203,7 +3373,24 @@ mod tests {
                 .await
                 .unwrap();
         }
-        append_context_compaction_trace(&state, id, CompactionTraceKind::Finished, "compaction_finished", 0, false, Some(format!("context compaction failed: provider error: compaction synthesis rejected after bounded repair; chunk=2/{} reason=invalid_json; boundary unchanged", chunks.len()))).await;
+        let failure_message = if completed {
+            "context compaction failed: provider error: compaction corrective deadline exhausted; boundary unchanged".to_owned()
+        } else {
+            format!(
+                "context compaction failed: provider error: compaction synthesis rejected after bounded repair; chunk=2/{} reason=invalid_json; boundary unchanged",
+                chunks.len()
+            )
+        };
+        append_context_compaction_trace(
+            &state,
+            id,
+            CompactionTraceKind::Finished,
+            "compaction_finished",
+            0,
+            false,
+            Some(failure_message),
+        )
+        .await;
         let result = Box::pin(compact_session_context_with_limit(
             &state, id, &selection, None, None, &cancel, None,
         ))
@@ -3230,11 +3417,12 @@ mod tests {
                 !after
                     .events
                     .iter()
-                    .any(|event| event.sequence > original_sequence + 3
+                    .any(|event| event.sequence > original_sequence + 4
                         && matches!(&event.kind, SessionEventKind::ModelUsage { .. }))
             );
         }
-        assert!(load(&state, id, &key).await.unwrap().is_none()); // Successful publication retires operational carry.
+        let (_, active) = load_resolved(&state, id, &key).await.unwrap();
+        assert!(active.is_none()); // Successful publication retires converted carry.
         let page = state
             .sessions
             .session_history_page(
@@ -3256,16 +3444,25 @@ mod tests {
                     bcode_session_models::CompactionSynthesisCheckpoint::from_event(event)
                         .ok()
                         .flatten()?;
-                (envelope.operation_key == key)
-                    .then_some(envelope.host_payload)
-                    .flatten()
+                envelope.host_payload
             })
             .find_map(|payload| LocalCheckpoint::decode(&payload).ok())
             .unwrap();
-        assert_eq!(resumed.requests[0], 1);
-        assert_eq!(resumed.requests[1], 2);
-        assert!(resumed.contract_continuation.is_some());
-        assert_eq!(resumed.next_chunk, chunks.len());
+        assert_eq!(
+            resumed
+                .requests
+                .iter()
+                .map(|count| u32::from(*count))
+                .sum::<u32>(),
+            u32::from(!completed)
+        );
+        assert!(resumed.upgrade.is_some());
+        assert!(resumed.packing_policy.starts_with("capacity-summary-v2"));
+        assert_eq!(
+            resumed.upgrade.as_ref().unwrap().spent_requests,
+            if completed { 4 } else { 3 }
+        );
+        assert_eq!(resumed.next_chunk, resumed.manifest.len());
         assert!(
             resumed
                 .evidence

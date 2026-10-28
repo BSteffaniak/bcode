@@ -1,28 +1,43 @@
-//! Experimental token packing, explicitly enabled through resolved compaction configuration.
-//! Production defaults retain byte-identical legacy chunks.
+//! Capacity-aware complete-request packing for the single local synthesis engine.
+//! Historical test fixtures do not select production execution paths.
 
 use super::{
     BTreeSet, COMPACTION_MAX_CARRIED_SUMMARY_CHARS, COMPACTION_MAX_CHUNKS,
     COMPACTION_MAX_SUMMARY_INPUT_CHARS, COMPACTION_SUMMARY_FORMAT, CompactionError,
     CompactionEvidence, ContentBlock, MessageRole, ModelMessage, ModelTurnRequest,
-    compaction_capacity_tokens, local_request_estimate, synthesis,
+    local_request_estimate, synthesis,
 };
 
 use super::budget::ResolvedSummaryPolicy;
+#[cfg(test)]
+use super::compaction_capacity_tokens;
 
 /// Persisted packing identity. Changing request-fit semantics requires explicit supersession.
 pub(super) const ALGORITHM_ID: &str = "adaptive-complete-request-v2";
 
 #[derive(Clone, Copy)]
 pub(super) enum PackingGate {
+    #[cfg(test)]
     Disabled,
+    #[cfg(test)]
     Experimental,
     Capacity,
+}
+
+impl PackingGate {
+    const fn disabled(self) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::Disabled => true,
+            _ => false,
+        }
+    }
 }
 
 /// Merge existing bounded chronological chunks only when the complete original AND repair
 /// requests fit. No fragment is clipped or split, and order/coverage remains byte-exact.
 /// Carry reservation is token-guided planning headroom, never a substitute for actual validation.
+#[cfg(test)]
 pub(super) fn pack(
     gate: PackingGate,
     source: &[String],
@@ -68,7 +83,7 @@ pub(super) fn pack_with_policy(
     policy: &ResolvedSummaryPolicy,
 ) -> Result<Vec<String>, CompactionError> {
     policy.validate()?;
-    if matches!(gate, PackingGate::Disabled) {
+    if gate.disabled() {
         return Ok(source.to_vec());
     }
     pack_bounded(
@@ -125,7 +140,7 @@ fn pack_bounded(
     carry_bytes: usize,
     policy: Option<&ResolvedSummaryPolicy>,
 ) -> Result<Vec<String>, CompactionError> {
-    if matches!(gate, PackingGate::Disabled) {
+    if gate.disabled() {
         return Ok(source.to_vec());
     }
     if (!matches!(gate, PackingGate::Capacity) && source.len() > COMPACTION_MAX_CHUNKS)

@@ -154,10 +154,12 @@ async fn restart_session_context_with_policy(
         }
         let policy = resolve_summary_budget(state, session_id, selection, &history, old.boundary,
             progress_requirement.map_or(1, |requirement| requirement.minimum_reclaimable_tokens).max(1), cancel).await?;
-        let (chunks, packing) = synthesis_chunks(state, session_id, selection, &transcript, cancel, Some(&policy), Some(&old.packing_policy)).await?;
+        let seed = if old.needs_upgrade() { Some(old.migration_seed(&transcript)?) } else { None };
+        let (chunks, packing) = synthesis_chunks(state, session_id, selection, &transcript, cancel, Some(&policy), seed.as_ref()).await?;
         let mut replacement = checkpoint::LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, synthesis_limits(&policy))?;
         replacement.packing_policy = budget_packing_identity(&packing, &policy)?;
         replacement.bind_capacity_policy(&policy)?;
+        if let Some(seed) = seed { replacement.apply_migration_seed(seed); }
         let restart = checkpoint::prepare_restart_domain(state, request, &old, &proof, &replacement, (&plan, &transcript, &chunks)).await?;
         let replacement_key = restart.replacement_key.clone();
         if cancel.is_cancelled() { return Err(CompactionError::Cancelled); }
@@ -798,6 +800,14 @@ async fn compact_session_context_with_policy_inner(
 
     // Appending a new admitted tail must not reset accepted work or its original allowances.
     // Retain the original complete policy; final actual-request validation still checks the tail.
+    if local_checkpoint
+        .as_ref()
+        .is_some_and(checkpoint::LocalCheckpoint::needs_upgrade)
+    {
+        return Err(CompactionError::RecoveryRequired(
+            CompactionRecoveryReason::PolicyChanged,
+        ));
+    }
     let summary_budget = if let Some(checkpoint) = &local_checkpoint {
         let policy: budget::ResolvedSummaryPolicy = checkpoint.resolved_policy()?;
         policy.validate()?;
@@ -831,7 +841,7 @@ async fn compact_session_context_with_policy_inner(
         Some(&summary_budget),
         local_checkpoint
             .as_ref()
-            .map(|checkpoint| checkpoint.packing_policy.as_str()),
+            .and_then(checkpoint::LocalCheckpoint::upgrade_seed),
     )
     .await?;
     let packing_policy = budget_packing_identity(&packing_policy, &summary_budget)?;
@@ -2144,7 +2154,7 @@ async fn prepare_synthesis(
         transcript,
         cancel_state,
         Some(summary_budget),
-        checkpoint.map(|(checkpoint, _)| checkpoint.packing_policy.as_str()),
+        checkpoint.and_then(|(checkpoint, _)| checkpoint.upgrade_seed()),
     )
     .await?;
     let packing_policy = budget_packing_identity(&packing_policy, summary_budget)?;
@@ -2304,12 +2314,7 @@ async fn synthesize_chunk(
         synthesis_policy,
     )
     .map_err(|reason| CompactionError::Provider(reason.guidance()))?;
-    let replacement = checkpoint
-        .as_ref()
-        .is_none_or(|(checkpoint, _)| checkpoint.packing_policy.starts_with("capacity-summary-v2"));
-    if replacement {
-        prompt = replacement_summary_prompt(&prompt);
-    }
+    prompt = replacement_summary_prompt(&prompt);
     evidence = Box::pin(repair_synthesis_chunk(
         state,
         session_id,
@@ -2321,11 +2326,7 @@ async fn synthesize_chunk(
         checkpoint,
         index,
         total_chunks,
-        if replacement {
-            response::ResponseContract::Replace
-        } else {
-            response::ResponseContract::Update
-        },
+        response::ResponseContract::Replace,
         &prompt,
         &evidence,
         &user_sequences,
@@ -2609,35 +2610,27 @@ async fn synthesis_chunks(
     transcript: &CompactionTranscript,
     cancel_state: &TurnCancelState,
     policy: Option<&budget::ResolvedSummaryPolicy>,
-    frozen_packing: Option<&str>,
+    seed: Option<&checkpoint::UpgradeSeed>,
 ) -> Result<(Vec<String>, String), CompactionError> {
-    let modern = frozen_packing.is_none_or(|packing| packing.starts_with("capacity-summary-v2"));
-    // Bounded source serialization is an operational allocation guard, not a summary target.
-    // Legacy manifests retain their original fragment count and byte identity.
-    let chunks = compaction_evidence_input_bounded(
-        transcript,
-        Some(cancel_state),
-        if modern { 4096 } else { COMPACTION_MAX_CHUNKS },
-    )?;
-    let config = state.session_config(session_id).await;
-    if frozen_packing.is_some_and(|packing| packing.starts_with("legacy-chars-v1")) {
-        return Ok((
-            packing::pack(
-                packing::PackingGate::Disabled,
-                &chunks,
-                &build_compaction_request(
-                    session_id,
-                    String::new(),
-                    bcode_model::ProviderRequestContext::default(),
-                    "",
-                    String::new(),
-                ),
-                0,
-                None,
-            )?,
-            "legacy-chars-v1".into(),
-        ));
+    let mut chunks = compaction_evidence_input_bounded(transcript, Some(cancel_state), 4096)?;
+    if let Some(seed) = seed {
+        let source = chunks.concat();
+        let remaining = source.get(seed.source_start()..).ok_or_else(|| {
+            CompactionError::Provider(
+                "converted compaction source offset is invalid; boundary unchanged".into(),
+            )
+        })?;
+        if seed.complete() && !remaining.is_empty() {
+            return Err(CompactionError::Provider(
+                "converted complete source has an unprocessed suffix; boundary unchanged".into(),
+            ));
+        }
+        chunks = remaining.lines().map(|line| format!("{line}\n")).collect();
+        if chunks.is_empty() {
+            chunks.push(String::new());
+        }
     }
+    let config = state.session_config(session_id).await;
     let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
@@ -2679,14 +2672,10 @@ async fn synthesis_chunks(
     .map_err(|_| CompactionError::Provider("cannot identify experimental packing policy".into()))?;
     let packing_identity = format!(
         "{}:{}",
-        if frozen_packing.is_none_or(|packing| packing.starts_with("capacity-summary-v2")) {
-            "capacity-summary-v2"
-        } else {
-            packing::ALGORITHM_ID
-        },
+        "capacity-summary-v2",
         hex::encode(sha2::Sha256::digest(semantics))
     );
-    let packed = if modern {
+    let packed = {
         let full_source = chunks.concat();
         let limits = policy.map_or(
             synthesis::SynthesisPolicy {
@@ -2696,7 +2685,13 @@ async fn synthesis_chunks(
             },
             synthesis_limits,
         );
-        let prior = checkpoint::initial_evidence_with_policy(transcript, limits.carry_chars)?;
+        let prior = seed
+            .map(checkpoint::UpgradeSeed::evidence)
+            .cloned()
+            .map_or_else(
+                || checkpoint::initial_evidence_with_policy(transcript, limits.carry_chars),
+                Ok,
+            )?;
         let prompt = replacement_summary_prompt(
             &synthesis::section_update_prompt(
                 &prior,
@@ -2739,25 +2734,6 @@ async fn synthesis_chunks(
             &chunks,
             &packing_template,
             policy,
-        )?
-    } else if let Some(policy) = policy {
-        packing::pack_with_policy(
-            if modern {
-                packing::PackingGate::Capacity
-            } else {
-                packing::PackingGate::Experimental
-            },
-            &chunks,
-            &template,
-            policy,
-        )?
-    } else {
-        packing::pack(
-            packing::PackingGate::Experimental,
-            &chunks,
-            &template,
-            window,
-            status.max_output_tokens,
         )?
     };
     Ok((packed, packing_identity))

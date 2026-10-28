@@ -38,7 +38,7 @@ pub(super) async fn recover_policy_change(
     .await?;
     let request = preparation.restart.ok_or_else(unavailable)?;
     let checkpoint = checkpoint::load_archived_checkpoint(state, &request).await?;
-    if !checkpoint.is_original_operation() {
+    if !checkpoint.is_original_operation() && !checkpoint.needs_upgrade() {
         return Err(unavailable());
     }
     // The existing compare-and-supersede transaction preserves original bytes and counters,

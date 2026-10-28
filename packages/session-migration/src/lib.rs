@@ -10,6 +10,8 @@
 
 mod backup;
 mod classification;
+mod compaction;
+pub use compaction::{CompactionConversion, convert_character_compaction, is_character_compaction};
 mod codec;
 mod diagnosis;
 mod execution;

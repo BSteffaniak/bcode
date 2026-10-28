@@ -306,12 +306,25 @@ remains blocked, not merely awaiting a flag. Adaptive packing remains default-of
 quality and semantic retention across repeated compactions remain unproven. Structural validators
 do not make compaction lossless.
 
+## Single local execution engine
+
+All admitted local synthesis uses capacity-first packing and replacement narrative updates.
+Fixed-character packing is not a runtime execution option. The migration domain reconstructs
+known historical source manifests solely to validate conversion, never to dispatch old batches.
+An ownership-fenced atomic supersession preserves the original canonical checkpoint, verifies
+terminal request settlement, retains accepted evidence and carries every consumed reservation
+forward. Only the unprocessed source suffix is repacked. Complete accepted selections require no
+new synthesis request. Unknown formats and unproved settlement remain explicit blockers.
+Conversion has one durable additional request allowance; daemon restart and repeated submission
+cannot replenish it. Its dispatch allowance cannot invalidate a complete settled candidate.
+
 ## Modern capacity-first synthesis
 
 New local operations try the complete selected source in one request, using the canonical
 estimator and actual request schema. Only infeasible complete inputs use chronological packing.
-Legacy checkpoints retain their original packing identity and manifests; the old experimental
-config switch is retained for config compatibility, not as the new-operation default.
+Retired character-batched checkpoints are converted once through migration-owned source validation;
+their old packing policy is never used for dispatch. The old experimental config switch remains
+parseable but does not select an execution engine.
 Section-update v2 replaces supplied derived narrative sections while protecting instruction
 provenance and exact supersession targets. V1 remains append-only for old responses/checkpoints.
 Allocation/serialization guards still fail closed rather than clipping content. Reference-backed

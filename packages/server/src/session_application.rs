@@ -125,8 +125,23 @@ impl bcode_session_models::SessionCompactionOperation for ServerSessionCompactio
 /// Map known host-side compaction failures without exposing provider text or captured context.
 fn compaction_provider_failure(message: &str) -> SessionApplicationFailure {
     let (code, detail) = if message
-        == "explicit compaction restart deadline exhausted; boundary unchanged"
+        == "compaction request settlement is unresolved; boundary unchanged"
     {
+        (
+            "compaction_request_unsettled",
+            "compaction stopped because a reserved provider request has no verified settled outcome; accepted work is retained and the boundary is unchanged; automatic replay is blocked",
+        )
+    } else if message == "compaction provider request allowance exhausted; boundary unchanged" {
+        (
+            "compaction_request_budget_exhausted",
+            "compaction stopped because its durable provider-request allowance is exhausted; accepted work and spent accounting are retained and the boundary is unchanged",
+        )
+    } else if message == "explicit compaction restart allowance exhausted; boundary unchanged" {
+        (
+            "compaction_restart_allowance_exhausted",
+            "compaction stopped because its retained restart deadline or request allowance was exhausted; accepted work is retained and the boundary is unchanged",
+        )
+    } else if message == "explicit compaction restart deadline exhausted; boundary unchanged" {
         (
             "compaction_restart_deadline_exhausted",
             "compaction publication blocked: the retained restart deadline expired; accepted work is preserved and the context boundary is unchanged. Repeating the same request cannot extend that deadline",
