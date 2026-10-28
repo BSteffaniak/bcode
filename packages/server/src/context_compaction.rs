@@ -147,14 +147,26 @@ async fn restart_session_context_with_policy(
         }).ok_or_else(|| CompactionError::Provider("restart requires bounded canonical completed-failure evidence".into()))?;
         let proof = checkpoint::read_restart_failure_proof(state, request, started.sequence, request.expected_terminal_sequence).await?;
         let history = state.sessions.activated_conversation_snapshot(session_id).await?.events;
-        let plan = checkpoint::frozen_plan(&history, config.model.tool_output.context_chars, old.boundary)?;
+        let frozen = checkpoint::frozen_plan(&history, config.model.tool_output.context_chars, old.boundary)?;
+        // A retired batching manifest may cover too little history for today's continuation.
+        // Supersede it with a fresh complete selection, never by extending accepted carry.
+        let plan = if old.needs_upgrade() {
+            let eligible = history.iter().filter(|event| first_kept_sequence.is_none_or(|cutoff| event.sequence < cutoff)).cloned().collect::<Vec<_>>();
+            let candidate = structural_compaction_plan_with_coverage(
+                &eligible, config.model.tool_output.context_chars,
+                planning.unwrap_or_else(|| CompactionPlanningPolicy::Proactive {
+                    keep_recent_tokens: effective_compaction_config(&config, selection).keep_recent_tokens as usize,
+                }), 4096,
+            ).map_err(CompactionError::PlanUnavailable)?;
+            if candidate.compacted_through_sequence > old.boundary { candidate } else { frozen }
+        } else { frozen };
         let transcript = compaction_transcript_from_plan(&plan);
-        if first_kept_sequence.is_some_and(|cutoff| old.boundary >= cutoff) {
+        if first_kept_sequence.is_some_and(|cutoff| plan.compacted_through_sequence >= cutoff) {
             return Err(CompactionError::RecoveryRequired(CompactionRecoveryReason::PolicyChanged));
         }
-        let policy = resolve_summary_budget(state, session_id, selection, &history, old.boundary,
+        let policy = resolve_summary_budget(state, session_id, selection, &history, plan.compacted_through_sequence,
             progress_requirement.map_or(1, |requirement| requirement.minimum_reclaimable_tokens).max(1), cancel).await?;
-        let seed = if old.needs_upgrade() { Some(old.migration_seed(&transcript)?) } else { None };
+        let seed = if old.needs_upgrade() && plan.compacted_through_sequence == old.boundary { Some(old.migration_seed(&transcript)?) } else { None };
         let (chunks, packing) = synthesis_chunks(state, session_id, selection, &transcript, cancel, Some(&policy), seed.as_ref()).await?;
         let mut replacement = checkpoint::LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, synthesis_limits(&policy))?;
         replacement.packing_policy = budget_packing_identity(&packing, &policy)?;
@@ -729,6 +741,16 @@ async fn compact_session_context_with_policy_inner(
                 .into(),
         ));
     }
+    // Retired manifests must reach explicit supersession before their old prefix can reject
+    // today's reclaim requirement. Recovery validates settlement before selecting fresh work.
+    if local_checkpoint
+        .as_ref()
+        .is_some_and(checkpoint::LocalCheckpoint::needs_upgrade)
+    {
+        return Err(CompactionError::RecoveryRequired(
+            CompactionRecoveryReason::PolicyChanged,
+        ));
+    }
     let plan = match local_checkpoint.as_ref() {
         Some(checkpoint) => checkpoint::frozen_plan(
             &history,
@@ -803,14 +825,6 @@ async fn compact_session_context_with_policy_inner(
 
     // Appending a new admitted tail must not reset accepted work or its original allowances.
     // Retain the original complete policy; final actual-request validation still checks the tail.
-    if local_checkpoint
-        .as_ref()
-        .is_some_and(checkpoint::LocalCheckpoint::needs_upgrade)
-    {
-        return Err(CompactionError::RecoveryRequired(
-            CompactionRecoveryReason::PolicyChanged,
-        ));
-    }
     let summary_budget = if let Some(checkpoint) = &local_checkpoint {
         let policy: budget::ResolvedSummaryPolicy = checkpoint.resolved_policy()?;
         policy.validate()?;

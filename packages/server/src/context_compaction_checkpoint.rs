@@ -1945,6 +1945,30 @@ pub(super) async fn prepare_restart_domain(
 
 /// Prepare current-format work only. The caller holds serialized runtime ownership; publication
 /// still requires the atomic domain comparison described by `PreparedRestart`.
+// Expansion is fresh synthesis, never a claim that partial carry covers new source.
+// Prove the old selection is an unchanged prefix before admitting the larger one.
+fn validates_legacy_expansion(
+    old: &LocalCheckpoint,
+    replacement: &LocalCheckpoint,
+    plan: &CompactionPlan,
+) -> Result<bool, CompactionError> {
+    Ok(old.needs_upgrade()
+        && replacement.upgrade.is_none()
+        && replacement.boundary > old.boundary
+        && plan
+            .compactable_prefix
+            .iter()
+            .any(|event| event.sequence == old.boundary)
+        && source_digest(
+            &plan
+                .compactable_prefix
+                .iter()
+                .filter(|event| event.sequence <= old.boundary)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )? == old.source_digest)
+}
+
 pub(super) fn prepare_restart(
     request: &bcode_session_models::SessionCompactionRestartRequest,
     old: &LocalCheckpoint,
@@ -1955,6 +1979,7 @@ pub(super) fn prepare_restart(
     chunks: &[String],
 ) -> Result<PreparedRestart, CompactionError> {
     request.validate().map_err(|_| invalid_checkpoint())?;
+    let expanded_legacy_source = validates_legacy_expansion(old, replacement, plan)?;
     if failure.operation_key != request.expected_operation_key
         || failure
             .events
@@ -1970,8 +1995,9 @@ pub(super) fn prepare_restart(
             .any(|event| event.sequence == request.expected_checkpoint_sequence)
         || old.checkpoint_sequence != request.expected_checkpoint_sequence
         || replacement.synthesis_phase != SynthesisPhase::Accumulating
-        || old.boundary != replacement.boundary
-        || old.source_digest != replacement.source_digest
+        || (!expanded_legacy_source
+            && (old.boundary != replacement.boundary
+                || old.source_digest != replacement.source_digest))
         || (replacement.next_chunk != 0
             && !replacement.upgrade.as_ref().is_some_and(|seed| {
                 seed.source_complete && replacement.next_chunk == replacement.manifest.len()
@@ -2312,6 +2338,33 @@ mod tests {
         let transcript = compaction_transcript_from_plan(&plan);
         let chunks = compaction_evidence_input(&transcript, None).expect("chunks");
         (history, plan, transcript, chunks)
+    }
+
+    #[test]
+    fn legacy_expansion_requires_unchanged_source_and_rejects_modern_operations() {
+        let (history, plan, transcript, chunks) = fixture("Preserve original instructions.");
+        let mut old = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        let expanded = frozen_plan(&history, 2000, 2).unwrap();
+        let expanded_transcript = compaction_transcript_from_plan(&expanded);
+        let expanded_chunks = compaction_evidence_input(&expanded_transcript, None).unwrap();
+        let replacement = LocalCheckpoint::create_with_policy(
+            &expanded,
+            &expanded_transcript,
+            &expanded_chunks,
+            capacity_policy(),
+        )
+        .unwrap();
+        assert!(validates_legacy_expansion(&old, &replacement, &expanded).unwrap());
+        let altered = vec![
+            user(history[0].session_id, 1, "Altered instructions"),
+            history[1].clone(),
+        ];
+        let altered = frozen_plan(&altered, 2000, 2).unwrap();
+        assert!(!validates_legacy_expansion(&old, &replacement, &altered).unwrap());
+        old = LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, capacity_policy())
+            .unwrap();
+        old.packing_policy = "adaptive-complete-request-v1:policy-digest".into();
+        assert!(!validates_legacy_expansion(&old, &replacement, &expanded).unwrap());
     }
 
     #[test]
@@ -3616,27 +3669,87 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_compaction_automatically_replaces_known_incompatible_checkpoint() {
-        Box::pin(automatic_policy_recovery_case(true, false, false)).await;
+        Box::pin(automatic_policy_recovery_case(
+            true,
+            false,
+            false,
+            RecoverySource::Frozen,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn ordinary_compaction_never_replays_unsettled_incompatible_checkpoint() {
-        Box::pin(automatic_policy_recovery_case(false, false, false)).await;
+        Box::pin(automatic_policy_recovery_case(
+            false,
+            false,
+            false,
+            RecoverySource::Frozen,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn ordinary_compaction_does_not_renew_replacement_allowances() {
-        Box::pin(automatic_policy_recovery_case(true, true, false)).await;
+        Box::pin(automatic_policy_recovery_case(
+            true,
+            true,
+            false,
+            RecoverySource::Frozen,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn manual_compact_abandons_missing_summary_response_through_runtime_admission() {
-        Box::pin(automatic_policy_recovery_case(false, false, true)).await;
-        Box::pin(automatic_policy_recovery_case(false, true, true)).await;
+        Box::pin(automatic_policy_recovery_case(
+            false,
+            false,
+            true,
+            RecoverySource::Frozen,
+        ))
+        .await;
+        Box::pin(automatic_policy_recovery_case(
+            false,
+            true,
+            true,
+            RecoverySource::Frozen,
+        ))
+        .await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum RecoverySource {
+        Frozen,
+        Expanded,
+    }
+
+    #[tokio::test]
+    async fn automatic_policy_recovery_expands_retired_prefix_to_fit_continuation() {
+        Box::pin(automatic_policy_recovery_case(
+            true,
+            false,
+            false,
+            RecoverySource::Expanded,
+        ))
+        .await;
+        Box::pin(automatic_policy_recovery_case(
+            false,
+            false,
+            false,
+            RecoverySource::Expanded,
+        ))
+        .await;
     }
 
     #[allow(clippy::too_many_lines)] // Full canonical fixture exercises ordinary admission through publication.
-    async fn automatic_policy_recovery_case(settled: bool, replacement: bool, manual: bool) {
+    async fn automatic_policy_recovery_case(
+        settled: bool,
+        replacement: bool,
+        manual: bool,
+        source: RecoverySource,
+    ) {
+        let expand = matches!(source, RecoverySource::Expanded);
         let _guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         let root = tempfile::tempdir().unwrap();
         let sessions = bcode_session::SessionManager::default();
@@ -3646,7 +3759,11 @@ mod tests {
             .unwrap();
         let id = session.id;
         drop(session);
-        for text in ["inspect only", "continue"] {
+        for text in if expand {
+            vec!["inspect only", "additional historical work", "continue"]
+        } else {
+            vec!["inspect only", "continue"]
+        } {
             sessions
                 .append_event(
                     id,
@@ -3733,7 +3850,24 @@ mod tests {
             None,
         )
         .await;
-        let mut old = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        let old_plan = if expand {
+            frozen_plan(
+                &history,
+                state.startup_config.model.tool_output.context_chars,
+                history[1].sequence,
+            )
+            .unwrap()
+        } else {
+            frozen_plan(
+                &history,
+                state.startup_config.model.tool_output.context_chars,
+                plan.compacted_through_sequence,
+            )
+            .unwrap()
+        };
+        let old_transcript = compaction_transcript_from_plan(&old_plan);
+        let old_chunks = compaction_evidence_input(&old_transcript, None).unwrap();
+        let mut old = LocalCheckpoint::create(&old_plan, &old_transcript, &old_chunks).unwrap();
         old.reserve_slot(0).unwrap();
         if manual {
             assert!(chunks.len() >= 8);
@@ -3861,7 +3995,10 @@ mod tests {
                 None,
                 None,
                 &TurnCancelState::default(),
-                None,
+                expand.then_some(CompactionProgressRequirement {
+                    minimum_reclaimable_tokens: transcript.estimated_reclaimable_tokens / 2,
+                    previous_compacted_through_sequence: Some(old.boundary),
+                }),
             ))
             .await
         };

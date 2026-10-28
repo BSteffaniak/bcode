@@ -371,7 +371,12 @@ The existing ownership-fenced atomic supersession preserves the original checkpo
 allowances, and gives one distinct replacement at most 64 provider requests and 300 seconds.
 The original planning mode, protected current-turn cutoff and reclaim requirement remain in force.
 Replacement operations never receive another automatic allowance; cancellation, corruption,
-unknown formats and uncertain provider outcomes do not authorize replacement. Normal session
+unknown formats and uncertain provider outcomes do not authorize replacement. For a retired
+batching manifest, fresh synthesis may select a larger structurally complete prefix when the
+old prefix cannot support continuation capacity. The host verifies that the old source remains
+an unchanged prefix, respects the current-turn cutoff, and retains the archived checkpoint and
+spent requests. Expanded selections do not reuse partial accepted carry or claim it covers new
+source. Normal session
 reads remain non-mutating. This is new bounded compaction work, not conversion of old summaries
 or a replay of their provider calls; no prepare/restart commands are needed for this supported case.
 
