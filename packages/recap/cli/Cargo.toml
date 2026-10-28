@@ -88,7 +88,7 @@ name              = "render_preview"
 required-features = ["tui"]
 
 [features]
-default = []
+default = ["tui"]
 fail-on-warnings = []
 tui = [
     "dep:bmux_keyboard",

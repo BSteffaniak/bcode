@@ -14,12 +14,14 @@ Install `ffmpeg` and `ffprobe` for media processing. YouTube input additionally 
 
 ## Terminal application
 
-The default build is headless-only and excludes terminal rendering/input dependencies. Enable the optional TUI explicitly:
+The TUI is enabled by default. Build normally for terminal support, or disable default features for a lightweight headless-only executable:
 
 ```sh
-cargo build -p bcode_recap_cli --features tui
-# Or install with terminal support:
-cargo install --path packages/recap/cli --features tui
+cargo build -p bcode_recap_cli
+# Headless only, without terminal rendering/input dependencies:
+cargo build -p bcode_recap_cli --no-default-features
+# Likewise for installation:
+cargo install --path packages/recap/cli --no-default-features
 ```
 
 Without `tui`, bare `recap` prints help even in a terminal, and the `tui` subcommand is not present. All one-shot commands are available in either build.

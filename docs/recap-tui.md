@@ -1,6 +1,6 @@
 # Recap terminal application
 
-The terminal application is opt-in: build with `cargo build -p bcode_recap_cli --features tui`. Default features remain empty; a default build includes only one-shot commands and bare invocation prints help. Direct BMUX terminal/image dependencies and the terminal module are compiled only with `tui`. The optional shared BMUX-host compatibility adapter in `bcode_plugin` is separately gated by `bmux-host`, keeping its transitive terminal dependencies out of the headless graph.
+The terminal application is enabled by default: build with `cargo build -p bcode_recap_cli`. For a headless-only build, use `--no-default-features`; bare invocation then prints help and the `tui` subcommand is absent. Direct BMUX terminal/image dependencies and the terminal module are compiled only with `tui`. The optional shared BMUX-host compatibility adapter in `bcode_plugin` is separately gated by `bmux-host`, keeping its transitive terminal dependencies out of the headless graph.
 
 With `tui` enabled, Recap's standalone executable supports two presentation paths over the same application operations:
 
