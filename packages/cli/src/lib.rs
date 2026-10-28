@@ -6582,6 +6582,9 @@ enum SessionCommand {
         /// Prepare a bounded exact restart candidate without admitting provider work.
         #[arg(long, requires_all = ["restart_operation_id", "restart_max_provider_requests", "restart_timeout_ms"], conflicts_with_all = ["restart_operation", "rebuild_summary", "restart_request"])]
         prepare_restart: bool,
+        /// Abandon unresolved summary responses, retaining spent requests; may incur duplicate model cost.
+        #[arg(long, requires = "prepare_restart")]
+        abandon_unresolved: bool,
         /// Execute the exact restart request emitted by preparation, after review.
         #[arg(long, conflicts_with_all = ["restart_operation", "rebuild_summary", "prepare_restart"])]
         restart_request: Option<PathBuf>,
@@ -9279,6 +9282,7 @@ fn dispatch_non_ranking_session_command(
         SessionCommand::Compact {
             session_id,
             prepare_restart,
+            abandon_unresolved,
             restart_request,
             json,
             rebuild_summary,
@@ -9312,7 +9316,7 @@ fn dispatch_non_ranking_session_command(
                 let preparation = client
                     .prepare_session_compaction_recovery(
                         bcode_session_models::SessionCompactionRecoveryDiscoveryRequest {
-                            version: 1,
+                            version: if abandon_unresolved { 2 } else { 1 },
                             session_id,
                             operation_id: restart_operation_id.ok_or_else(required)?,
                             budget: bcode_session_models::SessionCompactionRestartBudget {

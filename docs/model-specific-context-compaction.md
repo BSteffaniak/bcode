@@ -375,6 +375,19 @@ unknown formats and uncertain provider outcomes do not authorize replacement. No
 reads remain non-mutating. This is new bounded compaction work, not conversion of old summaries
 or a replay of their provider calls; no prepare/restart commands are needed for this supported case.
 
+## Explicit abandonment of unresolved summary responses
+
+Version-2 compaction restart requests explicitly authorize abandoning unresolved summary results,
+not declaring provider settlement. `session compact --prepare-restart --abandon-unresolved` prepares
+an exact candidate without provider work; executing that candidate is a separate authorized admission.
+Every reservation must have a unique canonical request identity. Completed usages remain completed;
+missing outcomes remain unknown and counted as spent. Atomic supersession retains abandoned request
+identities in its pointer and prevents publication through the retired checkpoint generation.
+No tools or project mutations are replayed. Cancellation, source/marker changes, concurrent owners,
+unknown formats, missing identities and conflicting evidence still block admission. Version-1 callers
+continue to require authoritative settlement. Ordinary manual compaction does not silently opt into
+abandonment or mint fresh allowances after a failed restart.
+
 ## Explicit recovery of other failed unpublished operations
 
 This is distinct from rebuilding a committed summary. `session compact ID --prepare-restart`

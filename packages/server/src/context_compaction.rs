@@ -305,7 +305,7 @@ async fn prepare_compaction_recovery_with_policy(
     checkpoint::prepare_recovery(
         state,
         &SessionCompactionRecoveryPrepareRequest {
-            version: 1,
+            version: request.version,
             session_id: request.session_id,
             operation_id: request.operation_id,
             expected_operation_key: key,
@@ -346,6 +346,9 @@ pub enum CompactionError {
         estimated_tokens: u64,
         threshold_tokens: u64,
     },
+    /// Recovery assessment identified a specific safe, public blocker.
+    #[error("compaction recovery blocked: {0:?}; accepted work retained; boundary unchanged")]
+    RecoveryBlocked(bcode_session_models::SessionCompactionRecoveryBlocker),
     #[error("{0}")]
     RecoveryRequired(CompactionRecoveryReason),
     #[error("provider error: {0}")]

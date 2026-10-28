@@ -42,7 +42,7 @@ pub use compaction_restart::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionCompactionRecoveryDiscoveryRequest {
-    /// Discovery contract version; only one is supported.
+    /// 1 requires proven settlement; 2 prepares explicit unresolved-response abandonment.
     pub version: u32,
     /// Canonical session in the selected state location.
     pub session_id: SessionId,

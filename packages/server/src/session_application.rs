@@ -217,6 +217,36 @@ fn compaction_failure(error: session_operations::CompactError) -> SessionApplica
                 "request_still_too_large",
                 "request remains too large after context compaction",
             ),
+            CompactionError::RecoveryBlocked(blocker) => {
+                use bcode_session_models::SessionCompactionRecoveryBlocker as Blocker;
+                let (code, detail) = match blocker {
+                    Blocker::UnsettledRequests => (
+                        "compaction_recovery_request_unsettled",
+                        "compaction recovery cannot verify a settled outcome for every reserved provider request; automatic replay is blocked; accepted work is retained and the context boundary is unchanged",
+                    ),
+                    Blocker::EvidenceUnavailable => (
+                        "compaction_recovery_evidence_incomplete",
+                        "compaction recovery evidence is missing or exceeds this bounded inspection; accepted work is retained and no provider request was dispatched by recovery",
+                    ),
+                    Blocker::CheckpointChanged => (
+                        "compaction_recovery_checkpoint_changed",
+                        "the selected compaction checkpoint changed during assessment; no recovery was published; refresh status before retrying",
+                    ),
+                    Blocker::AlreadySuperseded => (
+                        "compaction_recovery_operation_superseded",
+                        "the selected compaction operation was superseded; recovery must resolve its canonical successor before proceeding",
+                    ),
+                    Blocker::UnsupportedCheckpoint => (
+                        "compaction_recovery_format_unsupported",
+                        "the saved compaction checkpoint could not be validated for conversion; accepted work is retained and no recovery request was dispatched",
+                    ),
+                    Blocker::UnsupportedFailure => (
+                        "compaction_recovery_failure_unproven",
+                        "canonical evidence does not prove a supported settled compaction failure; automatic recovery did not dispatch provider work; accepted work is retained",
+                    ),
+                };
+                failure(code, detail)
+            }
             CompactionError::RecoveryRequired(reason) => {
                 use crate::context_compaction::CompactionRecoveryReason;
                 let detail = match reason {
@@ -252,7 +282,10 @@ impl bcode_session_models::SessionCompactionRecoveryDiscoveryApplication
     ) -> Result<bcode_session_models::SessionCompactionRecoveryPreparation, SessionApplicationFailure>
     {
         self.selected_location(request.session_id).await?;
-        if request.version != 1 || request.operation_id.is_nil() || !request.budget.is_valid() {
+        if !matches!(request.version, 1 | 2)
+            || request.operation_id.is_nil()
+            || !request.budget.is_valid()
+        {
             return Err(failure(
                 "invalid_compaction_restart",
                 "invalid recovery preparation request",
@@ -2102,6 +2135,35 @@ mod tests {
             before,
             state.sessions.session_history(session.id).await.unwrap()
         );
+    }
+
+    #[test]
+    fn recovery_blockers_reach_the_application_without_becoming_policy_errors() {
+        use bcode_session_models::SessionCompactionRecoveryBlocker as Blocker;
+        for (blocker, code) in [
+            (
+                Blocker::UnsettledRequests,
+                "compaction_recovery_request_unsettled",
+            ),
+            (
+                Blocker::EvidenceUnavailable,
+                "compaction_recovery_evidence_incomplete",
+            ),
+            (
+                Blocker::UnsupportedFailure,
+                "compaction_recovery_failure_unproven",
+            ),
+            (
+                Blocker::AlreadySuperseded,
+                "compaction_recovery_operation_superseded",
+            ),
+        ] {
+            let error = compaction_failure(session_operations::CompactError::Compaction(
+                crate::CompactionError::RecoveryBlocked(blocker),
+            ));
+            assert_eq!(error.code, code);
+            assert!(!error.message.contains("prepare explicit"));
+        }
     }
 
     #[test]

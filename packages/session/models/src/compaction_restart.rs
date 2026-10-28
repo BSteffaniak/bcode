@@ -41,6 +41,10 @@ impl SessionCompactionRestartBudget {
 
 /// Compare-and-supersede authorization for one exact checkpoint and prior marker.
 ///
+/// Version 2 explicitly authorizes abandoning unresolved summary response results, retaining
+/// spent accounting and fencing late results by atomic supersession. It never certifies settlement
+/// or permits replay of tools or other committed side effects.
+///
 /// Version 1 supports current-format, failed unpublished operations only. Unsupported versions,
 /// stale identities, unknown payloads, unresolved provider outcomes, or non-quiescent ownership
 /// must fail closed without retirement. `None` explicitly asserts that no prior marker exists.
@@ -53,7 +57,7 @@ impl SessionCompactionRestartBudget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionCompactionRestartRequest {
-    /// Request compatibility version; only 1 is supported.
+    /// Version 1 requires settlement; version 2 explicitly abandons unresolved summary results.
     pub version: u32,
     /// Canonical session in the selected state location.
     pub session_id: SessionId,
@@ -85,7 +89,7 @@ impl SessionCompactionRestartRequest {
     /// Rejects unsupported versions, invalid identities, keys, digests, or allowances without
     /// echoing potentially private checkpoint keys. The server must also validate canonical state.
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 || self.operation_id.is_nil() || !self.budget.is_valid() {
+        if !matches!(self.version, 1 | 2) || self.operation_id.is_nil() || !self.budget.is_valid() {
             return Err("invalid or unsupported compaction restart request".into());
         }
         CompactionSynthesisCheckpoint::validate_key(&self.expected_operation_key)?;
@@ -118,7 +122,7 @@ fn valid_digest(digest: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Caller-selected bounds and exact identities for read-only recovery preparation.
+/// Version 1 requires proven settlement; version 2 explicitly requests response abandonment.
 ///
 /// Preparation neither admits work nor authorizes replay. Unsupported or incomplete evidence
 /// returns a blocker; callers must not silently choose another checkpoint or increase bounds.
@@ -148,7 +152,7 @@ impl SessionCompactionRecoveryPrepareRequest {
     /// Rejects unsupported versions, empty/oversized identities, invalid order or allowances.
     pub fn validate(&self) -> Result<(), String> {
         CompactionSynthesisCheckpoint::validate_key(&self.expected_operation_key)?;
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
             || self.operation_id.is_nil()
             || !self.budget.is_valid()
             || self.expected_checkpoint_sequence == 0
@@ -312,7 +316,7 @@ mod tests {
             prepare
         );
         let mut future = encoded;
-        future["version"] = 2.into();
+        future["version"] = 3.into();
         assert!(
             serde_json::from_value::<SessionCompactionRecoveryPrepareRequest>(future)
                 .unwrap()
@@ -355,6 +359,8 @@ mod tests {
         let original = request();
         let mut value = original.clone();
         value.version = 2;
+        assert!(value.validate().is_ok()); // Explicit response abandonment is a different contract.
+        value.version = 3;
         assert!(value.validate().is_err());
         value = original.clone();
         value.operation_id = Uuid::nil();

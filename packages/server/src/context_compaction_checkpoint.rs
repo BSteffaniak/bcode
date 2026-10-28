@@ -1299,7 +1299,7 @@ pub(super) async fn prepare_recovery(
         .transpose()
         .map_err(|_| invalid_checkpoint())?;
     let candidate = SessionCompactionRestartRequest {
-        version: 1,
+        version: request.version,
         session_id: request.session_id,
         operation_id: request.operation_id,
         expected_operation_key: request.expected_operation_key.clone(),
@@ -1327,20 +1327,7 @@ pub(super) async fn prepare_recovery(
     }
     let evidence = &events[start..];
     if select_restart_failure_proof(&candidate, evidence).is_err() {
-        result.blocker = Some(match restart_attempt_evidence(&candidate, evidence) {
-            Ok((checkpoint, usages))
-                if usages.len()
-                    != checkpoint
-                        .requests
-                        .iter()
-                        .chain(&checkpoint.consolidation_requests)
-                        .map(|count| usize::from(*count))
-                        .sum::<usize>() =>
-            {
-                Blocker::UnsettledRequests
-            }
-            _ => Blocker::UnsupportedFailure,
-        });
+        result.blocker = Some(restart_failure_blocker(&candidate, evidence));
         return Ok(result);
     }
     result.blocker = None;
@@ -1352,6 +1339,7 @@ pub(super) async fn prepare_recovery(
 pub(super) struct RestartFailureProof {
     events: Vec<bcode_session::CompactionEventIdentity>,
     operation_key: String,
+    abandoned_responses: Vec<String>,
 }
 
 /// Explicit maintenance evidence read, paginated with aggregate event/byte bounds.
@@ -1477,6 +1465,51 @@ fn validate_restart_tail(
     Ok(())
 }
 
+/// Diagnose only complete operation-local activation windows. Older operations sharing a
+/// source boundary cannot supply settlement for the selected operation's reservations.
+fn restart_failure_blocker(
+    request: &bcode_session_models::SessionCompactionRestartRequest,
+    events: &[bcode_session_models::SessionEvent],
+) -> bcode_session_models::SessionCompactionRecoveryBlocker {
+    use bcode_session_models::SessionCompactionRecoveryBlocker as Blocker;
+    let Some(terminal) = events
+        .iter()
+        .position(|event| event.sequence == request.expected_terminal_sequence)
+    else {
+        return Blocker::EvidenceUnavailable;
+    };
+    for (index, event) in events[..terminal].iter().enumerate().rev() {
+        if event.sequence >= request.expected_checkpoint_sequence
+            || !matches!(&event.kind,
+            SessionEventKind::TraceEvent { trace } if trace.phase == SessionTracePhase::ContextCompactionStarted)
+        {
+            continue;
+        }
+        let window = &events[index..=terminal];
+        if validate_settled_attempts(window).is_err() {
+            continue;
+        }
+        if let Ok((checkpoint, usages)) =
+            restart_attempt_evidence(request, &window[1..window.len() - 1])
+        {
+            let reserved = checkpoint
+                .requests
+                .iter()
+                .chain(&checkpoint.consolidation_requests)
+                .map(|count| usize::from(*count))
+                .sum::<usize>()
+                + checkpoint
+                    .contract_continuation
+                    .as_ref()
+                    .map_or(0, |grant| usize::from(grant.requests));
+            if usages.len() < reserved {
+                return Blocker::UnsettledRequests;
+            }
+        }
+    }
+    Blocker::UnsupportedFailure
+}
+
 fn select_restart_failure_proof(
     request: &bcode_session_models::SessionCompactionRestartRequest,
     events: &[bcode_session_models::SessionEvent],
@@ -1551,7 +1584,30 @@ fn validate_restart_failure_proof(
     validate_settled_attempts(events)?;
     let (checkpoint, usages) = restart_attempt_evidence(request, &events[1..events.len() - 1])?;
     validate_restart_rejection(request, &checkpoint, &usages, message)?;
+    let abandoned_responses = if request.version == 2 {
+        events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ModelUsage { turn_id, usage }
+                    if !usage.terminal
+                        && turn_id.starts_with(&format!(
+                            "{}-compact-{}-",
+                            request.session_id, checkpoint.boundary
+                        )) =>
+                {
+                    let id = usage.request_id.as_ref()?;
+                    (!usages.contains(&(turn_id.clone(), id.clone()))).then_some(id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(RestartFailureProof {
+        abandoned_responses,
         operation_key: request.expected_operation_key.clone(),
         events: events
             .iter()
@@ -1623,6 +1679,7 @@ fn restart_attempt_evidence(
         .ok_or_else(invalid_checkpoint)?;
     let prefix = format!("{}-compact-{boundary}-", request.session_id);
     let mut checkpoint = None;
+    let mut observed = BTreeSet::new();
     let mut usages = BTreeSet::new();
     for event in events {
         if matches!(
@@ -1651,6 +1708,12 @@ fn restart_attempt_evidence(
             }
         }
         if let SessionEventKind::ModelUsage { turn_id, usage } = &event.kind
+            && turn_id.starts_with(&prefix)
+        {
+            let request_id = usage.request_id.as_deref().ok_or_else(invalid_checkpoint)?;
+            observed.insert((turn_id.clone(), request_id.to_owned()));
+        }
+        if let SessionEventKind::ModelUsage { turn_id, usage } = &event.kind
             && usage.terminal
             && turn_id.starts_with(&prefix)
         {
@@ -1660,7 +1723,30 @@ fn restart_attempt_evidence(
             }
         }
     }
-    Ok((checkpoint.ok_or_else(invalid_checkpoint)?, usages))
+    let checkpoint = checkpoint.ok_or_else(invalid_checkpoint)?;
+    if request.version == 2 {
+        let reserved = checkpoint
+            .requests
+            .iter()
+            .chain(&checkpoint.consolidation_requests)
+            .map(|count| usize::from(*count))
+            .sum::<usize>()
+            + checkpoint
+                .contract_continuation
+                .as_ref()
+                .map_or(0, |grant| usize::from(grant.requests));
+        if observed.len() != reserved
+            || observed
+                .iter()
+                .map(|(_, id)| id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != observed.len()
+        {
+            return Err(invalid_checkpoint());
+        }
+    }
+    Ok((checkpoint, usages))
 }
 
 fn validate_restart_rejection(
@@ -1670,23 +1756,26 @@ fn validate_restart_rejection(
     message: &str,
 ) -> Result<(), CompactionError> {
     let prefix = format!("{}-compact-{}-", request.session_id, checkpoint.boundary);
-    if usages.len()
-        != checkpoint
-            .requests
-            .iter()
-            .chain(&checkpoint.consolidation_requests)
-            .map(|count| usize::from(*count))
-            .sum::<usize>()
-            + checkpoint
-                .contract_continuation
-                .as_ref()
-                .map_or(0, |grant| usize::from(grant.requests))
-        || usages
-            .iter()
-            .map(|(_, request_id)| request_id)
-            .collect::<BTreeSet<_>>()
-            .len()
-            != usages.len()
+    let reserved = checkpoint
+        .requests
+        .iter()
+        .chain(&checkpoint.consolidation_requests)
+        .map(|count| usize::from(*count))
+        .sum::<usize>()
+        + checkpoint
+            .contract_continuation
+            .as_ref()
+            .map_or(0, |grant| usize::from(grant.requests));
+    if (if request.version == 2 {
+        usages.len() > reserved
+    } else {
+        usages.len() != reserved
+    }) || usages
+        .iter()
+        .map(|(_, request_id)| request_id)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != usages.len()
         || usages
             .iter()
             .any(|(turn_id, _)| !turn_id.starts_with(&prefix))
@@ -1732,6 +1821,8 @@ const RESTART_POINTER_FORMAT: &str = "bcode.compaction.supersession.v1";
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestartPointer {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    abandoned_responses: Vec<String>,
     format: String,
     request: bcode_session_models::SessionCompactionRestartRequest,
     replacement_key: String,
@@ -1830,6 +1921,7 @@ pub(super) async fn prepare_restart_domain(
             serde_json::from_str(payload).map_err(|_| invalid_checkpoint())?;
         if pointer.format != RESTART_POINTER_FORMAT
             || pointer.request != *request
+            || pointer.abandoned_responses != failure.abandoned_responses
             || pointer.replacement_key != prepared.replacement_key
             || pointer.replacement_payload_digest != digest(&pointer.initial_replacement_payload)?
         {
@@ -1931,6 +2023,7 @@ pub(super) fn prepare_restart(
     }
     let replacement_payload = replacement.encode()?;
     let pointer = RestartPointer {
+        abandoned_responses: failure.abandoned_responses.clone(),
         format: RESTART_POINTER_FORMAT.into(),
         request: request.clone(),
         replacement_key: replacement_key.clone(),
@@ -2676,6 +2769,39 @@ mod tests {
             usage.terminal = false;
         }
         assert!(select_restart_failure_proof(&retry_request, &missing_usage).is_err());
+        assert_eq!(
+            restart_failure_blocker(&retry_request, &missing_usage),
+            bcode_session_models::SessionCompactionRecoveryBlocker::UnsettledRequests
+        );
+        let mut mixed = missing_usage.clone();
+        let mut unrelated = events[3].clone();
+        unrelated.sequence = 0;
+        unrelated.kind = bcode_session_models::CompactionSynthesisCheckpoint {
+            version: 1,
+            operation_key: "unrelated-predecessor".into(),
+            host_payload: Some(checkpoint.encode().unwrap()),
+        }
+        .into_event_kind(0)
+        .unwrap();
+        mixed.insert(0, unrelated);
+        assert_eq!(
+            restart_failure_blocker(&retry_request, &mixed),
+            bcode_session_models::SessionCompactionRecoveryBlocker::UnsettledRequests
+        );
+        assert!(select_restart_failure_proof(&retry_request, &mixed).is_err());
+        let mut abandon_request = retry_request.clone();
+        abandon_request.version = 2;
+        assert!(select_restart_failure_proof(&abandon_request, &mixed).is_ok());
+        // Abandonment does not weaken activation ownership or marker fencing.
+        let mut wrong_owner = mixed.clone();
+        if let SessionEventKind::TraceEvent { trace } = &mut wrong_owner.last_mut().unwrap().kind {
+            trace.turn_id = Some("foreign".into());
+        }
+        abandon_request.expected_terminal_sha256 =
+            bcode_session::compaction_event_identity(wrong_owner.last().unwrap())
+                .unwrap()
+                .sha256;
+        assert!(select_restart_failure_proof(&abandon_request, &wrong_owner).is_err());
         let mut mismatched_owner = retried;
         if let SessionEventKind::TraceEvent { trace } = &mut mismatched_owner[7].kind {
             trace.turn_id = Some("foreign-turn".into());
@@ -2761,6 +2887,7 @@ mod tests {
             },
         };
         let failure = RestartFailureProof {
+            abandoned_responses: Vec::new(),
             operation_key: request.expected_operation_key.clone(),
             events: [9, 10, 11]
                 .into_iter()
@@ -2901,6 +3028,7 @@ mod tests {
             .bind_capacity_policy(&serde_json::json!({"version": 1}))
             .unwrap();
         let proof = RestartFailureProof {
+            abandoned_responses: Vec::new(),
             operation_key: request.expected_operation_key.clone(),
             events: [9, 10, 11]
                 .into_iter()
