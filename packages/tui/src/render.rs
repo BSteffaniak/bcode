@@ -311,7 +311,6 @@ use bmux_tui::prelude::{Line, Span, Style};
 #[cfg(test)]
 use bmux_tui::style::Color;
 use bmux_tui::style::Modifier;
-use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
 use super::app::{BmuxApp, DaemonConnectionState, composer_policy};
@@ -1623,12 +1622,15 @@ fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
         return 0;
     }
     let content_width = area.width.saturating_sub(4).max(1);
-    let rows = TextInputControl::new(&composer_policy())
-        .visible_rows_for_width(app.composer_state(), content_width);
+    let rows = app.composer_state().rows_with_trailing_exclusion(
+        content_width,
+        super::composer_submit::trailing_exclusion(area.size()),
+        MAX_COMPOSER_ROWS,
+    );
     let content_rows = rows.clamp(1, MAX_COMPOSER_ROWS);
     content_rows
-        .saturating_add(3)
-        .min(area.height.saturating_sub(2).max(4))
+        .saturating_add(2)
+        .min(area.height.saturating_sub(2).max(3))
         .min(area.height)
 }
 
@@ -5864,11 +5866,27 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
     *app.composer_state_mut() = state.into_inner();
     let inner = composer_content_area(area, theme);
     app.set_composer_content_area(inner);
-    frame.push_hit(
-        HitRegion::new("composer", inner)
-            .role(HitRole::TextInput)
-            .layer(1),
-    );
+    let exclusion = super::composer_submit::trailing_exclusion(area.size());
+    for region in [
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
+        Rect::new(
+            inner.x,
+            inner.bottom().saturating_sub(1),
+            inner.width.saturating_sub(exclusion),
+            inner.height.min(1),
+        ),
+    ] {
+        frame.push_hit(
+            HitRegion::new("composer", region)
+                .role(HitRole::TextInput)
+                .layer(1),
+        );
+    }
     if !app.cursor_visible() {
         frame.set_cursor(bmux_tui::geometry::Point::new(inner.x, inner.y), false);
     }

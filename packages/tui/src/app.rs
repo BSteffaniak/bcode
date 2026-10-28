@@ -2609,6 +2609,14 @@ impl BmuxApp {
 
     /// Store the composer content area from the latest render.
     pub fn set_composer_content_area(&mut self, area: Rect) {
+        let panel_size = bmux_tui::geometry::Size::new(
+            area.width.saturating_add(4),
+            area.height.saturating_add(2),
+        );
+        self.composer_state_mut().set_trailing_exclusion(
+            super::composer_submit::trailing_exclusion(panel_size),
+            &composer_policy(),
+        );
         self.session_ui
             .composer
             .set_content_area(area, &composer_policy());

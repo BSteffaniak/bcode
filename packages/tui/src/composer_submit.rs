@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 
 use bmux_tui::chrome::Border;
 use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutId};
-use bmux_tui::composition::{Align, Column, Row, SizeBox, Surface};
+use bmux_tui::composition::{Align, Row, Stack, Surface};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitMap, HitRegion};
@@ -105,7 +105,8 @@ impl ComposerSubmit {
                 state.set(ButtonState::new());
                 continue;
             };
-            let button = Button::new(label);
+            let (left, right) = control_padding(id);
+            let button = Button::new(label).filled_padding(left, right);
             if hit.area.width < button.width()
                 || hit.area.contains(mouse.position)
                     && hits
@@ -196,6 +197,44 @@ fn menu_items(enabled: bool) -> [MenuItem; 2] {
     ]
 }
 
+fn control_padding(id: &str) -> (u16, u16) {
+    if id == SEND { (1, 0) } else { (1, 1) }
+}
+
+fn controls(submit: &ComposerSubmit, styles: ButtonStyles) -> impl Component + '_ {
+    let (send_left, send_right) = control_padding(SEND);
+    let (more_left, more_right) = control_padding(MORE);
+    Row::new()
+        .child(
+            ButtonComponent::new(SEND, "Send", &submit.send)
+                .filled()
+                .padding(send_left, send_right)
+                .styles(styles),
+        )
+        .child(
+            ButtonComponent::new(MORE, "▾", &submit.more)
+                .filled()
+                .padding(more_left, more_right)
+                .styles(styles),
+        )
+}
+
+/// Right-edge reservation derived from the same controls used for paint and hits.
+#[must_use]
+pub fn trailing_exclusion(size: bmux_tui::geometry::Size) -> u16 {
+    let submit = ComposerSubmit::default();
+    let width = controls(&submit, ButtonStyles::default())
+        .layout(Constraints::new(0, u64::MAX, 0, None), &mut LayoutCx::new())
+        .size
+        .width;
+    let available = size.width.saturating_sub(4);
+    if size.height >= 3 && width < u64::from(available) {
+        u16::try_from(width).unwrap_or(u16::MAX)
+    } else {
+        0
+    }
+}
+
 /// Presentation policy for the native composer and its submission controls.
 #[derive(Clone, Copy)]
 pub struct ComposerPresentation {
@@ -229,22 +268,13 @@ pub fn panel<'a>(
         pressed: theme.selection,
         disabled: theme.muted,
     };
-    let buttons = Row::new()
-        .child(
-            ButtonComponent::new(SEND, "Send", &submit.send)
-                .filled()
-                .styles(styles),
-        )
-        .child(
-            ButtonComponent::new(MORE, "▾", &submit.more)
-                .filled()
-                .styles(styles),
-        );
-    let button_layout = buttons.layout(Constraints::loose(size), &mut LayoutCx::new());
-    let visible =
-        size.height >= 4 && button_layout.size.width <= u64::from(size.width.saturating_sub(4));
-    let footer = Align::new(buttons).horizontal(bmux_tui::composition::HorizontalAlignment::End);
+    let buttons = controls(submit, styles);
+    let exclusion = trailing_exclusion(size);
+    let overlay = Align::new(buttons)
+        .horizontal(bmux_tui::composition::HorizontalAlignment::End)
+        .vertical(bmux_tui::composition::VerticalAlignment::End);
     let editor = TextInputComponent::new("composer.editor", state, policy)
+        .trailing_exclusion(exclusion)
         .placeholder("Ask Bcode…", theme.muted)
         .style(theme.text)
         .selection_style(theme.selection)
@@ -254,11 +284,11 @@ pub fn panel<'a>(
             border: theme.focused,
             surface: theme.raised,
         },
-        Column::new()
-            .flex(bmux_tui::composition::Flex::new(1, editor))
+        Stack::new()
+            .child(editor)
             .child(bmux_tui::composition::Visibility::new(
-                SizeBox::new(footer).height(1),
-                visible,
+                overlay,
+                exclusion > 0,
             )),
     )
 }
@@ -445,6 +475,91 @@ mod tests {
     }
 
     #[test]
+    fn compact_controls_share_the_last_editor_row_without_a_footer() {
+        let submit = ComposerSubmit::default();
+        let state = RefCell::new(TextInputState::default());
+        let policy = super::super::app::composer_policy();
+        let size = bmux_tui::geometry::Size::new(30, 3);
+        let component = panel(
+            &state,
+            &policy,
+            &submit,
+            ComposerPresentation {
+                theme: TuiTheme::for_theme_id("terminal-native"),
+                focused: true,
+                enabled: true,
+                size,
+            },
+        );
+        let layout = component.layout(Constraints::tight(size), &mut LayoutCx::new());
+        let editor = layout
+            .find_logical_rect(&LayoutId::new("composer.editor"))
+            .unwrap();
+        let send = layout.find_logical_rect(&LayoutId::new(SEND)).unwrap();
+        let more = layout.find_logical_rect(&LayoutId::new(MORE)).unwrap();
+        assert_eq!(editor.height, 1);
+        assert_eq!(send.y, editor.y);
+        assert_eq!(more.x, send.x + send.width);
+        assert_eq!(send.width, 5);
+        assert_eq!(more.width, 3);
+        assert_eq!(u64::from(trailing_exclusion(size)), send.width + more.width);
+        assert_eq!(send.x + send.width + more.width, editor.x + editor.width);
+    }
+
+    #[test]
+    fn editor_reflows_only_the_bottom_row_and_reclaims_space_after_deletion() {
+        let submit = ComposerSubmit::default();
+        let state = RefCell::new(TextInputState::default());
+        let policy = super::super::app::composer_policy();
+        let theme = TuiTheme::for_theme_id("terminal-native");
+        for (text, height, expected_rows) in [
+            ("abc", 3, 1),
+            ("abcdefghijklmnopqr", 4, 2),
+            ("abc", 3, 1),
+            ("中👩‍💻e\u{301}", 3, 1),
+        ] {
+            state.borrow_mut().buffer_mut().clear();
+            state.borrow_mut().buffer_mut().insert_str(text);
+            let size = bmux_tui::geometry::Size::new(22, height);
+            let component = panel(
+                &state,
+                &policy,
+                &submit,
+                ComposerPresentation {
+                    theme,
+                    focused: true,
+                    enabled: true,
+                    size,
+                },
+            );
+            let layout = component.layout(Constraints::tight(size), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, size.width, size.height));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            let editor = layout
+                .find_logical_rect(&LayoutId::new("composer.editor"))
+                .unwrap();
+            let more = frame
+                .hits()
+                .regions()
+                .iter()
+                .find(|hit| hit.id.as_str() == MORE)
+                .unwrap();
+            let cursor = frame.cursor().unwrap().position;
+            assert!(cursor.y < more.area.y || cursor.x < more.area.x - 5);
+            assert_eq!(
+                state.borrow().rows_with_trailing_exclusion(
+                    u16::try_from(editor.width).unwrap(),
+                    trailing_exclusion(size),
+                    8,
+                ),
+                expected_rows
+            );
+            assert_eq!(state.borrow().vertical_scroll(), 0);
+        }
+    }
+
+    #[test]
     fn repeated_menu_hover_consumes_events_without_structural_redraw() {
         let mut submit = ComposerSubmit::default();
         let area = Rect::new(0, 0, 60, 15);
@@ -537,7 +652,7 @@ mod tests {
                 for hit in hits.regions() {
                     assert_eq!(hit.area.intersection(area), hit.area);
                 }
-                if width < 17 || height < 4 {
+                if width <= 12 || height < 3 {
                     assert!(!hits.regions().iter().any(|hit| hit.id.as_str() == SEND));
                 }
                 if hits.regions().iter().any(|hit| hit.id.as_str() == MORE) {

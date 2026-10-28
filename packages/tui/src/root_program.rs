@@ -12729,8 +12729,20 @@ mod tests {
                 bmux_tui::event::MouseEvent::new(kind, position),
             ));
         }
-        assert_eq!(model.chat.queued_effect_count(), 1);
         assert!(model.chat.app.composer().is_empty());
+        let (effects, _) = model.chat.pending_effects.drain_runtime();
+        let submissions: Vec<_> = effects
+            .into_iter()
+            .filter_map(|(_, effect)| {
+                if let super::super::effects::TuiEffect::SubmitMessage { request } = effect {
+                    Some(request)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].message, "hello from the Send button");
         // A second release cannot submit an empty draft or duplicate the request.
         model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
             bmux_tui::event::MouseEvent::new(
@@ -12738,9 +12750,81 @@ mod tests {
                 position,
             ),
         ));
-        let queued_effects = model.chat.queued_effect_count();
+        let (effects, _) = model.chat.pending_effects.drain_runtime();
         drop(model);
-        assert_eq!(queued_effects, 1);
+        assert!(!effects.iter().any(|(_, effect)| matches!(
+            effect,
+            super::super::effects::TuiEffect::SubmitMessage { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn submission_menu_hover_damages_only_the_popup_and_repeated_hover_is_idle() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui_runtime::Presenter;
+        let mut model = root_test_model();
+        model.chat.app.replace_composer_with("hello");
+        let mut output = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut output, Rect::new(0, 0, 60, 15));
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        let arrow = model
+            .committed_hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "composer.send.more")
+            .unwrap()
+            .area;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+                kind,
+                Point::new(arrow.x, arrow.y),
+            )));
+        }
+        model.invalidation = super::super::invalidation::UiInvalidation::Structural;
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        let popup = model
+            .committed_hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "composer.send.menu.bounds")
+            .unwrap()
+            .area;
+        let item = model
+            .committed_hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "composer.send.menu.queue")
+            .unwrap()
+            .area;
+        let event = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Move,
+            Point::new(item.x, item.y),
+        ));
+        let invalidation = model.handle_basic_terminal_event(event.clone());
+        assert_eq!(
+            invalidation,
+            super::super::invalidation::UiInvalidation::Paint
+        );
+        let damage = model.select_presentation_damage(invalidation, &[]);
+        assert!(matches!(damage, bmux_tui::damage::Damage::Regions(_)));
+        assert_eq!(
+            *model.chat.app.composer_submit.pointer_damage.borrow(),
+            [arrow, popup]
+        );
+        assert_eq!(
+            model.handle_basic_terminal_event(event),
+            super::super::invalidation::UiInvalidation::None
+        );
+        drop(model);
     }
 
     #[tokio::test]
@@ -13698,17 +13782,17 @@ mod tests {
                     "program" => Err(bmux_tui_runtime::RuntimeError::Program {
                         error: std::io::Error::other("terminal input failed").into(),
                         cleanup_error: None,
-                        output,
+                        output: Box::new(output),
                     }),
                     "cleanup" => Err(bmux_tui_runtime::RuntimeError::Program {
                         error: std::io::Error::other("original failure").into(),
                         cleanup_error: Some(std::io::Error::other("restoration failure").into()),
-                        output,
+                        output: Box::new(output),
                     }),
                     "presenter" => Err(bmux_tui_runtime::RuntimeError::Presenter {
                         error: std::io::Error::other("terminal writer failed").into(),
                         cleanup_error: None,
-                        output,
+                        output: Box::new(output),
                     }),
                     _ => Ok(output),
                 }
