@@ -1891,7 +1891,13 @@ impl BcodeRuntimeModel {
                         self.draft_autosave.observe(&self.chat, Instant::now());
                     }
                     if outcome.handled {
-                        return super::invalidation::UiInvalidation::Structural;
+                        return if outcome.structural {
+                            super::invalidation::UiInvalidation::Structural
+                        } else if outcome.redraw {
+                            super::invalidation::UiInvalidation::Paint
+                        } else {
+                            super::invalidation::UiInvalidation::None
+                        };
                     }
                 }
                 if !self.loop_state.modal_foreground()
@@ -2923,7 +2929,15 @@ impl BcodeRuntimeModel {
             });
             if !temporal_damage.contains(&super::app::TemporalDamage::Full) {
                 let damage = bmux_tui::damage::Damage::regions(
-                    regions,
+                    regions.chain(
+                        self.chat
+                            .app
+                            .composer_submit
+                            .pointer_damage
+                            .borrow()
+                            .iter()
+                            .copied(),
+                    ),
                     self.committed_area,
                     bmux_tui::damage::DamagePolicy {
                         max_regions: 64,
@@ -3843,6 +3857,12 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         &mut self,
         event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
     ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+        self.chat
+            .app
+            .composer_submit
+            .pointer_damage
+            .borrow_mut()
+            .clear();
         self.synchronize_selection_lifecycle();
         self.synchronize_composer_interaction();
         let mut temporal_damage = Vec::new();
@@ -4421,7 +4441,14 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         self.fast_temporal_presentation = self.transcript_selection.phase()
             == bmux_tui::selection::SelectionGesturePhase::Idle
             && self.invalidation == super::invalidation::UiInvalidation::Paint
-            && !temporal_damage.is_empty()
+            && (!temporal_damage.is_empty()
+                || !self
+                    .chat
+                    .app
+                    .composer_submit
+                    .pointer_damage
+                    .borrow()
+                    .is_empty())
             && !temporal_damage.contains(&super::app::TemporalDamage::Full)
             && !temporal_damage.contains(&super::app::TemporalDamage::Transcript)
             && !self.presentation_damage.is_full();

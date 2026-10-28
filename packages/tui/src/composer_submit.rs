@@ -30,6 +30,8 @@ pub struct ComposerSubmit {
     menu: Cell<MenuState>,
     open: bool,
     anchor: Cell<Option<Rect>>,
+    /// Pointer-only repaint region, reset before each runtime update.
+    pub pointer_damage: RefCell<Vec<Rect>>,
 }
 
 impl Default for ComposerSubmit {
@@ -40,6 +42,7 @@ impl Default for ComposerSubmit {
             menu: Cell::new(MenuState::new(None)),
             open: false,
             anchor: Cell::new(None),
+            pointer_damage: RefCell::new(Vec::new()),
         }
     }
 }
@@ -47,6 +50,10 @@ impl Default for ComposerSubmit {
 /// Result of routing a pointer event through the composer controls.
 pub struct PointerOutcome {
     pub handled: bool,
+    /// True when visible state changed, independently of event consumption.
+    pub redraw: bool,
+    /// Opening/closing or submitting requires rebuilding the scene.
+    pub structural: bool,
     pub placement: Option<bcode_ipc::PromptPlacement>,
 }
 
@@ -86,8 +93,11 @@ impl ComposerSubmit {
     }
 
     pub fn mouse(&mut self, hits: &HitMap, mouse: MouseEvent, enabled: bool) -> PointerOutcome {
+        self.pointer_damage.borrow_mut().clear();
         self.set_enabled(enabled);
         let mut handled = false;
+        let mut redraw = false;
+        let mut structural = false;
         let mut placement = None;
         let event = Event::Mouse(mouse);
         for (id, label, state) in [(SEND, "Send", &self.send), (MORE, "▾", &self.more)] {
@@ -105,9 +115,14 @@ impl ComposerSubmit {
                 state.set(ButtonState::new());
                 continue;
             }
-            let mut value = state.get();
+            let previous = state.get();
+            let mut value = previous;
             let outcome = button.handle_event(hit.area, &mut value, &event);
             state.set(value);
+            if previous != value {
+                redraw = true;
+                self.pointer_damage.borrow_mut().push(hit.area);
+            }
             handled |= outcome.needs_redraw() || hit.area.contains(mouse.position);
             if outcome == ButtonOutcome::Pressed {
                 if id == MORE {
@@ -119,6 +134,8 @@ impl ComposerSubmit {
                 }
                 return PointerOutcome {
                     handled: true,
+                    redraw: true,
+                    structural: true,
                     placement,
                 };
             }
@@ -130,10 +147,15 @@ impl ComposerSubmit {
                 .find(|hit| hit.id.as_str() == MENU_BOUNDS)
                 .map(|hit| hit.area)
             {
-                let mut state = self.menu.get();
+                let previous = self.menu.get();
+                let mut state = previous;
                 let outcome =
                     Menu::new(&menu_items(enabled)).handle_event(area, &mut state, &event);
                 self.menu.set(state);
+                if state != previous {
+                    redraw = true;
+                    self.pointer_damage.borrow_mut().push(area);
+                }
                 if let MenuOutcome::Activated { index, .. } = outcome {
                     placement = Some(if index == 0 {
                         bcode_ipc::PromptPlacement::Steering
@@ -141,6 +163,8 @@ impl ComposerSubmit {
                         bcode_ipc::PromptPlacement::FollowUp
                     });
                     self.open = false;
+                    structural = true;
+                    redraw = true;
                 }
                 handled |=
                     area.contains(mouse.position) || !matches!(outcome, MenuOutcome::Ignored);
@@ -149,12 +173,19 @@ impl ComposerSubmit {
                 {
                     self.dismiss();
                     handled = true;
+                    structural = true;
+                    redraw = true;
                 }
             } else {
                 handled = true;
             }
         }
-        PointerOutcome { handled, placement }
+        PointerOutcome {
+            handled,
+            redraw,
+            structural,
+            placement,
+        }
     }
 }
 
@@ -411,6 +442,26 @@ mod tests {
             click(&mut submit, &hits, SEND, true).placement,
             Some(bcode_ipc::PromptPlacement::Steering)
         );
+    }
+
+    #[test]
+    fn repeated_menu_hover_consumes_events_without_structural_redraw() {
+        let mut submit = ComposerSubmit::default();
+        let area = Rect::new(0, 0, 60, 15);
+        let hits = draw(&mut submit, area, "hello");
+        click(&mut submit, &hits, MORE, true);
+        let hits = draw(&mut submit, area, "hello");
+        let position = point(&hits, "composer.send.menu.queue");
+        let changed = submit.mouse(&hits, MouseEvent::new(MouseEventKind::Move, position), true);
+        assert!(changed.handled);
+        assert!(changed.redraw);
+        assert!(!changed.structural);
+        assert!(!submit.pointer_damage.borrow().is_empty());
+        let unchanged = submit.mouse(&hits, MouseEvent::new(MouseEventKind::Move, position), true);
+        assert!(unchanged.handled);
+        assert!(!unchanged.redraw);
+        assert!(!unchanged.structural);
+        assert!(submit.pointer_damage.borrow().is_empty());
     }
 
     #[test]
