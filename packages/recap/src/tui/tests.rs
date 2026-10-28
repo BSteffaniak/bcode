@@ -19,6 +19,30 @@ fn paint(app: &App, width: u16, height: u16) -> (Buffer, bmux_tui::hit::HitMap) 
 }
 
 #[test]
+fn failure_details_remain_painted_after_home_and_resize() {
+    let mut app = App::new(TuiOptions::default());
+    app.install_outcome(Err(
+        "HTTP 403 Forbidden · No model request was made. · diagnostic operation-test".into(),
+    ));
+    assert_eq!(app.screen, Screen::Diagnostics);
+    for (width, height) in [(120, 40), (40, 20)] {
+        let (buffer, _) = paint(&app, width, height);
+        let visible: String = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(visible.contains("HTTP 403 Forbidden"));
+        assert!(visible.contains("No model request was made."));
+    }
+    app.action("home");
+    assert_eq!(app.screen, Screen::Home);
+    app.action("diagnostics");
+    assert_eq!(app.screen, Screen::Diagnostics);
+    assert!(!app.failure_lines.is_empty());
+}
+
+#[test]
 fn old_preview_completion_is_rejected_after_navigation() {
     let mut app = App::new(TuiOptions::default());
     app.preview_generation = 2;

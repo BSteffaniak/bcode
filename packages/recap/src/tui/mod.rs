@@ -52,6 +52,7 @@ const FIELDS: [&str; 10] = [
 enum Screen {
     Home,
     Reader,
+    Diagnostics,
 }
 
 struct Active {
@@ -99,6 +100,7 @@ struct App {
     active: Option<Active>,
     sequence: u64,
     status: String,
+    failure_lines: Vec<bmux_tui::text::Line>,
     export: Option<PathBuf>,
     quitting: bool,
     refine: bool,
@@ -155,6 +157,7 @@ impl App {
             sequence: 0,
             status: "Your next perspective starts here. No model runs until you choose Generate."
                 .into(),
+            failure_lines: Vec::new(),
             export: None,
             quitting: false,
             refine: false,
@@ -264,6 +267,10 @@ impl App {
                 self.settings_state.open = !self.settings_state.open;
                 self.settings_state.dropdown_focus = 0;
                 self.focused = if self.settings_state.open { 6 } else { 0 };
+            }
+            "diagnostics" if !self.failure_lines.is_empty() => {
+                self.screen = Screen::Diagnostics;
+                self.scroll.set(ScrollViewState::default());
             }
             "home" => {
                 self.settings_state.open = false;
@@ -470,6 +477,7 @@ impl App {
                 KeyCode::F(4) => Some("refine"),
                 KeyCode::F(5) => Some("export"),
                 KeyCode::F(6) => Some("open"),
+                KeyCode::F(9) => Some("diagnostics"),
                 KeyCode::F(8) => Some("theme"),
                 KeyCode::F(10) => Some("quit"),
                 _ => None,
@@ -525,6 +533,9 @@ impl App {
     }
     fn install_outcome(&mut self, result: Result<Outcome, String>) {
         match result {
+            Ok(Outcome::Checked) => {
+                self.status = "Source acquisition checked".into();
+            }
             Ok(Outcome::Ready { document, export }) => {
                 self.document = Some(*document);
                 self.focused = usize::MAX;
@@ -571,7 +582,19 @@ impl App {
             Ok(Outcome::Opened) => {
                 self.status = "Opened exported HTML in the system viewer".into();
             }
-            Err(error) => self.status = error,
+            Err(error) => {
+                self.failure_lines = error
+                    .split(" · ")
+                    .map(|part| {
+                        bmux_tui::text::Line::from_spans(vec![bmux_tui::text::Span::raw(
+                            part.to_owned(),
+                        )])
+                    })
+                    .collect();
+                self.status = "Operation failed · F9 details · F7 Settings".into();
+                self.screen = Screen::Diagnostics;
+                self.scroll.set(ScrollViewState::default());
+            }
         }
     }
     fn rebuild_reader(&mut self) {

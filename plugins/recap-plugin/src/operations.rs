@@ -1,5 +1,6 @@
 //! Canonical-workspace confined direct recap library operations.
 use bcode_plugin_sdk::NativeServiceContext;
+use bcode_recap::diagnostics::{Event, Observer as _, Operation, Status};
 use bcode_recap::{
     contracts::GenerationIntent,
     engine::{Engine, EngineOptions, GenerateRequest},
@@ -202,7 +203,77 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|_| "recap runtime unavailable")?;
-    let cancel = operation_cancellation(context, invocation, &root);
+    let identity = tempfile::Builder::new()
+        .prefix("operation-")
+        .tempdir()
+        .map_err(|_| "diagnostic identity unavailable")?;
+    let operation_id = identity
+        .path()
+        .file_name()
+        .ok_or("diagnostic identity unavailable")?
+        .to_string_lossy()
+        .into_owned();
+    let observer = Operation::new(operation_id);
+    let cancel = operation_cancellation(context, invocation, &root)
+        .observed(std::sync::Arc::new(observer.clone()));
+    let result = run_engine(
+        Invocation {
+            context,
+            operation,
+            args,
+            root: &root,
+            id,
+            store_root: &store_root,
+        },
+        &engine,
+        &runtime,
+        &cancel,
+    );
+    observer.observe(Event::Terminal {
+        status: if result.is_ok() {
+            Status::Succeeded
+        } else if cancel.is_cancelled() {
+            Status::Cancelled
+        } else {
+            Status::Failed
+        },
+        code: if result.is_ok() { "ok" } else { "recap_failed" }.into(),
+    });
+    result.map_err(|error| {
+        let report = observer.report();
+        format!(
+            "{error}; diagnostic {}; phase {:?}; model executor invoked={}; revision committed={}",
+            report.operation_id,
+            report.phase(),
+            report.inference_started(),
+            report.committed()
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Invocation<'a> {
+    context: &'a NativeServiceContext,
+    operation: &'a str,
+    args: &'a BTreeMap<String, String>,
+    root: &'a Path,
+    id: &'a str,
+    store_root: &'a Path,
+}
+fn run_engine(
+    invocation: Invocation<'_>,
+    engine: &Engine<'_>,
+    runtime: &tokio::runtime::Runtime,
+    cancel: &Cancellation,
+) -> Result<String, String> {
+    let Invocation {
+        context,
+        operation,
+        args,
+        root,
+        id,
+        store_root,
+    } = invocation;
     runtime.block_on(async {
         let operation = async {
             let mut progress = |_| {
@@ -217,31 +288,31 @@ pub fn run(
             match operation {
                 "recap.create" => {
                     let request = GenerateRequest {
-                        id: id.clone(),
-                        source_id: id.clone(),
-                        source_title: id.clone(),
-                        input: source(args, &root)?,
-                        transcript: transcript(args, &root)?,
+                        id: id.to_owned(),
+                        source_id: id.to_owned(),
+                        source_title: id.to_owned(),
+                        input: source(args, root)?,
+                        transcript: transcript(args, root)?,
                         intent,
                     };
                     let document = engine
-                        .generate(&request, &cancel, &mut progress)
+                        .generate(&request, cancel, &mut progress)
                         .await
                         .map_err(super::diagnostics::engine)?;
                     serde_json::to_string(&document).map_err(|_| "recap encoding failed".into())
                 }
                 "recap.refine" => {
                     let document = engine
-                        .refine(id, intent, &cancel, &mut progress)
+                        .refine(id, intent, cancel, &mut progress)
                         .await
                         .map_err(super::diagnostics::engine)?;
                     serde_json::to_string(&document).map_err(|_| "recap encoding failed".into())
                 }
                 "recap.export" => {
                     let export = engine
-                        .export(id, &cancel, &mut progress)
+                        .export(id, cancel, &mut progress)
                         .map_err(super::diagnostics::engine)?;
-                    publish_export(&store_root, id, &export.html)
+                    publish_export(store_root, id, &export.html)
                 }
                 _ => Err("unsupported recap operation".into()),
             }

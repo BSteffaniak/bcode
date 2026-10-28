@@ -34,6 +34,7 @@ pub struct BcodeExecutor {
     parameters: bcode_model::ModelParameters,
     timeout: Duration,
     failure: Mutex<Option<ModelFailure>>,
+    selection: (String, String, Option<String>),
 }
 /// Allowlisted SDK failure category; never contains provider text or response content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,7 +89,7 @@ impl ModelFailure {
             Self::Sdk => "model_sdk",
         }
     }
-    const fn classify(error: &bcode::BcodeError) -> Self {
+    pub(crate) const fn classify(error: &bcode::BcodeError) -> Self {
         use bcode::{BcodeError, RuntimeError};
         match error {
             BcodeError::Runtime(error) => match error {
@@ -133,6 +134,18 @@ impl ModelFailure {
     }
 }
 impl BcodeExecutor {
+    /// Report normalized selected identities without endpoint/authentication data.
+    pub fn observe_selection(&self, cancellation: &Cancellation) {
+        cancellation.emit(bcode_recap::diagnostics::Event::ModelSelection {
+            provider: bcode_recap::diagnostics::identity(&self.selection.0),
+            model: bcode_recap::diagnostics::identity(&self.selection.1),
+            profile: self
+                .selection
+                .2
+                .as_deref()
+                .map(bcode_recap::diagnostics::identity),
+        });
+    }
     /// Last failed invocation's bounded diagnostic category, without raw SDK data.
     #[must_use]
     pub fn failure(&self) -> Option<ModelFailure> {
@@ -160,9 +173,9 @@ impl BcodeExecutor {
     /// Load enabled provider plugins and resolve the configured selection, without a daemon.
     /// # Errors
     /// Returns a secret-safe unavailable error when configuration/discovery fails.
-    pub async fn configured(options: BcodeOptions) -> Result<Self, ModelError> {
+    pub async fn configured(options: BcodeOptions) -> Result<Self, ModelFailure> {
         if options.max_output_tokens == 0 || options.timeout.is_zero() {
-            return Err(ModelError::Unavailable);
+            return Err(ModelFailure::Configuration);
         }
         let parameters = bcode_model::ModelParameters {
             max_output_tokens: Some(options.max_output_tokens),
@@ -178,31 +191,41 @@ impl BcodeExecutor {
             endpoint: options.endpoint,
             auth_profile: options.auth_profile,
         })
-        .map_err(|_| ModelError::Unavailable)?;
+        .map_err(|_| ModelFailure::Configuration)?;
+        let effective_profile = selected.profile.clone();
         let sdk = crate::connections::resolve(&selected)
             .await
-            .map_err(|_| ModelError::Unavailable)?;
+            .map_err(|error| match error {
+                crate::connections::ConnectionError::Model(failure) => failure,
+                _ => ModelFailure::Configuration,
+            })?;
         let selector = sdk
             .default_model_selector()
             .cloned()
-            .ok_or(ModelError::Unavailable)?;
+            .ok_or(ModelFailure::Configuration)?;
         let owner = selector
             .provider_plugin_id()
-            .ok_or(ModelError::Unavailable)?
+            .ok_or(ModelFailure::Configuration)?
             .to_owned();
+        let selection = (
+            owner.clone(),
+            selector.model_id().to_owned(),
+            effective_profile,
+        );
         let context = sdk.provider_context().clone();
         let sdk = tokio::time::timeout(
             options.timeout.min(Duration::from_secs(10)),
             sdk.discover_provider(owner, context, Some(selector.model_id().to_owned())),
         )
         .await
-        .map_err(|_| ModelError::Unavailable)?
-        .map_err(|_| ModelError::Unavailable)?;
+        .map_err(|_| ModelFailure::Timeout)?
+        .map_err(|error| ModelFailure::classify(&error))?;
         Ok(Self {
             sdk,
             parameters,
             timeout: options.timeout,
             failure: Mutex::new(None),
+            selection,
         })
     }
 }
@@ -328,7 +351,7 @@ mod tests {
             };
             assert!(matches!(
                 BcodeExecutor::configured(options).await,
-                Err(ModelError::Unavailable)
+                Err(ModelFailure::Configuration)
             ));
         }
     }

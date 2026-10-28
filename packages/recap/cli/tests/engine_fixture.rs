@@ -126,6 +126,26 @@ fn real_video(root: &Path) -> std::path::PathBuf {
     video
 }
 
+fn assert_diagnostics(report: &bcode_recap::diagnostics::Report) {
+    use bcode_recap::diagnostics::{Event, Phase};
+    assert!(report.inference_started());
+    assert!(report.committed());
+    for expected in [
+        Phase::Probe,
+        Phase::Extraction,
+        Phase::Composition,
+        Phase::ValidationOutput,
+        Phase::Storage,
+    ] {
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|e| matches!(e.event, Event::Phase { phase } if phase == expected))
+        );
+    }
+}
+
 #[tokio::test]
 async fn engine_fixture_generate_refine_export_and_cancel() {
     let temporary = tempfile::tempdir().unwrap();
@@ -162,12 +182,15 @@ async fn engine_fixture_generate_refine_export_and_cancel() {
     assert!(!root.join("store").join("unicode-field-notes.json").exists());
     assert!(!root.join("recap.html").exists());
     let mut stages = Vec::new();
+    let operation = bcode_recap::diagnostics::Operation::new("fixture-operation".into());
+    let observed_cancel = Cancellation::default().observed(std::sync::Arc::new(operation.clone()));
     let initial = engine
-        .generate(&request, &Cancellation::default(), &mut |stage| {
+        .generate(&request, &observed_cancel, &mut |stage| {
             stages.push(stage);
         })
         .await
         .unwrap();
+    assert_diagnostics(&operation.report());
     assert_eq!(stages.last(), Some(&Stage::Complete));
     assert_eq!(initial.revision, 1);
     let refined = engine

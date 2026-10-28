@@ -4,6 +4,7 @@
 //! Independent video understanding, visual recap composition, and portable export.
 pub mod composition;
 pub mod contracts;
+pub mod diagnostics;
 pub mod engine;
 pub mod export;
 pub mod media;

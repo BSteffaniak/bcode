@@ -133,6 +133,9 @@ impl Engine<'_> {
         stage(cancel, progress, Stage::Acquisition)?;
         let acquired = source::acquire(&request.input, &self.options.acquisition, cancel).await?;
         stage(cancel, progress, Stage::Media)?;
+        cancel.emit(crate::diagnostics::Event::Phase {
+            phase: crate::diagnostics::Phase::Probe,
+        });
         let metadata = media::probe(&acquired.video, &self.options.tools, cancel).await?;
         let maximum = Duration::try_from_secs_f64(self.options.acquisition.max_duration_seconds)
             .map_err(|_| EngineError::Invalid("duration limit"))?;
@@ -157,6 +160,9 @@ impl Engine<'_> {
             &request.intent,
             &self.options.media,
         );
+        cancel.emit(crate::diagnostics::Event::Phase {
+            phase: crate::diagnostics::Phase::Extraction,
+        });
         let visuals = media::extract_visuals(
             &acquired.video,
             &metadata,
@@ -267,6 +273,7 @@ impl Engine<'_> {
         fs::File::open(&destination)?.sync_all()?;
         check_cancelled(cancel)?;
         self.store.save(&prepared.document, None)?;
+        cancel.emit(crate::diagnostics::Event::Committed);
         progress(Stage::Complete);
         Ok(prepared.document)
     }
@@ -308,6 +315,7 @@ impl Engine<'_> {
         )?;
         stage(cancel, progress, Stage::Storage)?;
         self.store.save(&candidate, Some(previous.revision))?;
+        cancel.emit(crate::diagnostics::Event::Committed);
         progress(Stage::Complete);
         Ok(candidate)
     }
@@ -502,7 +510,19 @@ fn stage(
     progress: &mut (dyn FnMut(Stage) + Send),
     next: Stage,
 ) -> Result<(), EngineError> {
+    use crate::diagnostics::{Event, Phase};
     check_cancelled(cancel)?;
+    let phase = match next {
+        Stage::Acquisition => Some(Phase::Acquisition),
+        Stage::Media => Some(Phase::Media),
+        Stage::Composition => Some(Phase::Composition),
+        Stage::Storage => Some(Phase::Storage),
+        Stage::Export => Some(Phase::Export),
+        Stage::Complete => None,
+    };
+    if let Some(phase) = phase {
+        cancel.emit(Event::Phase { phase });
+    }
     progress(next);
     check_cancelled(cancel)
 }

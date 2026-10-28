@@ -9,6 +9,68 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+#[test]
+fn acquisition_failure_exports_safe_report_from_actual_binary() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let tool = root.path().join("yt-dlp");
+    std::fs::write(&tool, "#!/bin/sh\ncase \"$*\" in\n*--version*) echo 2026.06.09;;\n*--dump-single-json*) echo '{\"id\":\"fJwhaC_Fn-8\",\"duration\":827}';;\n*) echo 'ERROR: unable to download video data: HTTP Error 403: Forbidden PRIVATE_TOKEN https://signed.invalid/?token=SECRET' >&2; exit 1;;\nesac\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let report = root.path().join("diagnostic.json");
+    let output = run_at(
+        &[
+            "--diagnostic-report",
+            report.to_str().unwrap(),
+            "doctor",
+            "--source",
+            "https://youtu.be/fJwhaC_Fn-8",
+            "--yt-dlp",
+            tool.to_str().unwrap(),
+            "--ffmpeg",
+            "/usr/bin/true",
+            "--ffprobe",
+            "/usr/bin/true",
+        ],
+        root.path(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("HTTP 403 Forbidden"), "{error}");
+    assert!(error.contains("No model request was made"));
+    let bytes = std::fs::read(&report).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["inference_started"], false);
+    assert_eq!(value["committed"], false);
+    assert!(
+        value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["event"]["http_status"] == 403)
+    );
+    for text in [error.as_ref(), std::str::from_utf8(&bytes).unwrap()] {
+        assert!(!text.contains("PRIVATE_TOKEN"));
+        assert!(!text.contains("signed.invalid"));
+        assert!(!text.contains("SECRET"));
+    }
+    let prior = bytes;
+    let _ = run_at(
+        &[
+            "--diagnostic-report",
+            report.to_str().unwrap(),
+            "export",
+            "missing",
+        ],
+        root.path(),
+    );
+    assert_eq!(
+        prior,
+        std::fs::read(&report).unwrap(),
+        "reports must never clobber existing evidence"
+    );
+}
+
 fn run(arguments: &[&str]) -> Output {
     let root = tempfile::tempdir().unwrap();
     run_at(arguments, root.path())

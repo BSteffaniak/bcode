@@ -63,10 +63,129 @@ pub enum SourceError {
     /// External acquisition failed.
     #[error(transparent)]
     Process(#[from] process::ProcessError),
+    /// Allowlisted download failure; raw executable output is discarded.
+    #[error("{stage}: {failure} (exit {exit_code:?})")]
+    Acquisition {
+        /// Failed acquisition phase.
+        stage: AcquisitionStage,
+        /// Safe diagnostic category, not raw executable text.
+        failure: AcquisitionFailure,
+        /// Exit status when available.
+        exit_code: Option<i32>,
+    },
     /// Invalid downloader metadata.
     #[error("invalid downloader metadata")]
     Metadata(#[from] serde_json::Error),
 }
+/// Acquisition phase attached to safe downloader failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionStage {
+    /// Resolving source metadata.
+    Metadata,
+    /// Downloading video and captions (yt-dlp may fail either).
+    Download,
+}
+impl std::fmt::Display for AcquisitionStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Metadata => "YouTube metadata",
+            Self::Download => "YouTube video/caption download",
+        })
+    }
+}
+/// Allowlisted facts extracted from bounded downloader diagnostics, never executable text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionFailure {
+    /// Downloader explicitly reported HTTP 403, not its cause.
+    Forbidden,
+    /// Downloader explicitly reported HTTP 429.
+    RateLimited,
+    /// Authentication or access restriction was reported.
+    AccessRequired,
+    /// Selected source format was unavailable.
+    FormatUnavailable,
+    /// A challenge/runtime dependency was reported.
+    ChallengeRuntime,
+    /// No supported classification was established.
+    Unknown,
+}
+impl std::fmt::Display for AcquisitionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Forbidden => "HTTP 403 Forbidden; update yt-dlp in your package environment and verify its JavaScript runtime/challenge support; access may still be restricted",
+            Self::RateLimited => "HTTP 429 Too Many Requests; wait before explicitly retrying",
+            Self::AccessRequired => "source requires authentication or is restricted; Recap never loads browser cookies automatically",
+            Self::FormatUnavailable => "requested video format unavailable; check downloader version and source availability",
+            Self::ChallengeRuntime => "JavaScript challenge/runtime support unavailable; use an up-to-date yt-dlp with its supported runtime and challenge package",
+            Self::Unknown => "downloader failed; cause unclassified; check source availability and downloader setup",
+        })
+    }
+}
+fn classify_download(stderr: &[u8]) -> AcquisitionFailure {
+    // Inspect only diagnostic lines, not arbitrary URLs, title output or echoed arguments.
+    for line in String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| line.starts_with("ERROR:") || line.starts_with("WARNING:"))
+    {
+        if line.contains("HTTP Error 403:") {
+            return AcquisitionFailure::Forbidden;
+        }
+        if line.contains("HTTP Error 429:") {
+            return AcquisitionFailure::RateLimited;
+        }
+        if line.contains("Requested format is not available") {
+            return AcquisitionFailure::FormatUnavailable;
+        }
+        if line.contains("Sign in to confirm")
+            || line.contains("Private video")
+            || line.contains("members-only")
+        {
+            return AcquisitionFailure::AccessRequired;
+        }
+        if line.contains("challenge solving failed")
+            || line.contains("No supported JavaScript runtime")
+        {
+            return AcquisitionFailure::ChallengeRuntime;
+        }
+    }
+    AcquisitionFailure::Unknown
+}
+async fn download_process(
+    request: &ProcessRequest,
+    cancel: &Cancellation,
+    stage: AcquisitionStage,
+) -> Result<process::ProcessOutput, SourceError> {
+    cancel.emit(crate::diagnostics::Event::Phase {
+        phase: match stage {
+            AcquisitionStage::Metadata => crate::diagnostics::Phase::Metadata,
+            AcquisitionStage::Download => crate::diagnostics::Phase::Download,
+        },
+    });
+    process::run_inspected(request, cancel, |exit_code, stderr| {
+        let failure = classify_download(stderr);
+        cancel.emit(crate::diagnostics::Event::AcquisitionFailed {
+            phase: match stage {
+                AcquisitionStage::Metadata => crate::diagnostics::Phase::Metadata,
+                AcquisitionStage::Download => crate::diagnostics::Phase::Download,
+            },
+            exit_code,
+            http_status: match failure {
+                AcquisitionFailure::Forbidden => Some(403),
+                AcquisitionFailure::RateLimited => Some(429),
+                _ => None,
+            },
+        });
+        SourceError::Acquisition {
+            stage,
+            failure,
+            exit_code,
+        }
+    })
+    .await
+}
+
 /// Validate only known `YouTube` URL forms and discard unrelated query arguments.
 /// # Errors
 /// Rejects credentials, non-HTTPS, foreign hosts, playlists and malformed IDs.
@@ -205,11 +324,25 @@ pub fn parse_subtitles(input: &str) -> Result<Vec<SubtitleCue>, SourceError> {
     }
     Ok(cues)
 }
+fn format_selection(max_bytes: u64) -> String {
+    // Prefer a single video-only file: Recap consumes stills/silent clips and captions.
+    // Every fallback retains both height and caller-selected byte constraints.
+    format!(
+        "bestvideo[ext=mp4][height<=720][filesize<=?{max_bytes}]/bestvideo[ext=webm][height<=720][filesize<=?{max_bytes}]/best[ext=mp4][height<=720][filesize<=?{max_bytes}]/best[ext=webm][height<=720][filesize<=?{max_bytes}]"
+    )
+}
 fn downloader_request(options: &AcquisitionOptions, workspace: &Path, url: &str) -> ProcessRequest {
     ProcessRequest {
         program: options.yt_dlp.clone(),
         args: [
             "--ignore-config",
+            "--js-runtimes",
+            "node",
+            "--js-runtimes",
+            "bun",
+            "--js-runtimes",
+            "quickjs",
+            "--no-remote-components",
             "--no-playlist",
             "--no-warnings",
             "--socket-timeout",
@@ -276,8 +409,11 @@ pub async fn acquire(
         .prefix("recap-source-")
         .tempdir_in(root)?;
     let mut request = downloader_request(options, workspace.path(), &url);
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&Box::pin(process::run(&request, cancel)).await?.stdout)?;
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &download_process(&request, cancel, AcquisitionStage::Metadata)
+            .await?
+            .stdout,
+    )?;
     if metadata.get("id").and_then(serde_json::Value::as_str)
         != url.strip_prefix("https://www.youtube.com/watch?v=")
     {
@@ -295,6 +431,13 @@ pub async fn acquire(
     let size = options.max_video_bytes.to_string();
     request.args = [
         "--ignore-config",
+        "--js-runtimes",
+        "node",
+        "--js-runtimes",
+        "bun",
+        "--js-runtimes",
+        "quickjs",
+        "--no-remote-components",
         "--no-playlist",
         "--no-warnings",
         "--socket-timeout",
@@ -304,7 +447,7 @@ pub async fn acquire(
         "--max-filesize",
         &size,
         "--format",
-        "best[ext=mp4][height<=720][filesize<=?256M]/best[height<=720]",
+        &format_selection(options.max_video_bytes),
         "--write-subs",
         "--write-auto-subs",
         "--sub-langs",
@@ -319,7 +462,7 @@ pub async fn acquire(
     .iter()
     .map(Into::into)
     .collect();
-    Box::pin(process::run(&request, cancel)).await?;
+    download_process(&request, cancel, AcquisitionStage::Download).await?;
     let mut acquired = collect_download(workspace, options)?;
     acquired.title = metadata
         .get("title")
@@ -473,6 +616,87 @@ pub fn resolve_transcript(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn downloader_classification_never_echoes_untrusted_output() {
+        use super::*;
+        for (text, expected) in [
+            (
+                "ERROR: unable to download video data: HTTP Error 403: Forbidden secret=https://signed/?token=PRIVATE\u{1b}[2J",
+                AcquisitionFailure::Forbidden,
+            ),
+            (
+                "ERROR: HTTP Error 429: Too Many Requests",
+                AcquisitionFailure::RateLimited,
+            ),
+            (
+                "ERROR: Requested format is not available",
+                AcquisitionFailure::FormatUnavailable,
+            ),
+            (
+                "WARNING: No supported JavaScript runtime could be found",
+                AcquisitionFailure::ChallengeRuntime,
+            ),
+            (
+                "ERROR: Sign in to confirm your age",
+                AcquisitionFailure::AccessRequired,
+            ),
+            (
+                "https://example.com/HTTP Error 403: SECRET",
+                AcquisitionFailure::Unknown,
+            ),
+            (
+                "PRIVATE unknown failure\u{1b}[2J",
+                AcquisitionFailure::Unknown,
+            ),
+        ] {
+            let failure = classify_download(text.as_bytes());
+            assert_eq!(failure, expected);
+            let error = SourceError::Acquisition {
+                stage: AcquisitionStage::Download,
+                failure,
+                exit_code: Some(1),
+            };
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains("PRIVATE"));
+                assert!(!rendered.contains("signed"));
+                assert!(!rendered.contains('\u{1b}'));
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_failed_downloader_reports_phase_without_raw_stderr() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("downloader");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' 'ERROR: unable to download video data: HTTP Error 403: Forbidden PRIVATE' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let request = ProcessRequest {
+            program: script,
+            args: vec![],
+            cwd: None,
+            timeout: Duration::from_secs(2),
+            max_output_bytes: 1024,
+            file_budget: None,
+        };
+        let error = download_process(
+            &request,
+            &Cancellation::default(),
+            AcquisitionStage::Download,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SourceError::Acquisition {
+                stage: AcquisitionStage::Download,
+                failure: AcquisitionFailure::Forbidden,
+                exit_code: Some(1)
+            }
+        ));
+        assert!(!format!("{error:?}").contains("PRIVATE"));
+    }
     use super::*;
     #[test]
     fn validates_youtube_hosts_and_ids() {

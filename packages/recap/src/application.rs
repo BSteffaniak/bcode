@@ -53,6 +53,9 @@ pub struct TuiOptions {
     pub store: PathBuf,
     #[arg(skip = 8_u64 * 1024 * 1024)]
     pub max_document_bytes: u64,
+    /// Explicit secret-safe report destination; never overwritten or written implicitly.
+    #[arg(long)]
+    pub diagnostic_report: Option<PathBuf>,
     #[arg(long)]
     pub source: Option<String>,
     #[arg(long)]
@@ -81,6 +84,7 @@ impl Default for TuiOptions {
         Self {
             store: ".recap".into(),
             max_document_bytes: 8 * 1024 * 1024,
+            diagnostic_report: None,
             source: None,
             model_config: None,
             profile: None,
@@ -149,6 +153,10 @@ impl TuiOptions {
 /// A single operation, run directly against the same embedded engine as the CLI.
 #[derive(Debug)]
 pub enum Request {
+    CheckSource {
+        source: String,
+        tools: crate::cli::Tools,
+    },
     #[cfg(feature = "tui")]
     CreateAndExport(Box<Create>),
     #[cfg(feature = "tui")]
@@ -176,7 +184,7 @@ pub enum Request {
 }
 #[derive(Debug)]
 pub enum Outcome {
-    #[cfg(feature = "tui")]
+    Checked,
     Ready {
         document: Box<RecapDocument>,
         export: Result<ExportResult, String>,
@@ -218,9 +226,81 @@ pub struct CatalogEntry {
     pub error: Option<String>,
 }
 
+const fn reportable(request: &Request) -> bool {
+    match request {
+        Request::Create(_)
+        | Request::Refine(_)
+        | Request::Export { .. }
+        | Request::CheckSource { .. } => true,
+        #[cfg(feature = "tui")]
+        Request::CreateAndExport(_) | Request::RefineAndExport(_) => true,
+        #[cfg(feature = "tui")]
+        _ => false,
+    }
+}
+
 /// Execute with cooperative cancellation and bounded semantic progress callbacks.
 /// Create/refine return the committed document; export is a separate UI action.
 pub async fn execute(
+    options: &TuiOptions,
+    request: Request,
+    cancel: &Cancellation,
+    progress: &mut (impl FnMut(Stage) + Send),
+) -> Result<Outcome, Error> {
+    use bcode_recap::diagnostics::{Event, Observer as _, Operation, Phase, Status};
+    let identity = tempfile::Builder::new().prefix("operation-").tempdir()?;
+    let id = identity
+        .path()
+        .file_name()
+        .ok_or_else(|| Error::Action("cannot allocate operation ID".into()))?
+        .to_string_lossy()
+        .into_owned();
+    let operation = Operation::new(id);
+    let cancel = cancel.observed(std::sync::Arc::new(operation.clone()));
+    cancel.emit(Event::Phase {
+        phase: Phase::Validation,
+    });
+    let report_path = reportable(&request)
+        .then_some(options.diagnostic_report.as_deref())
+        .flatten();
+    let result = if let Some(path) = report_path {
+        match check_report_destination(path) {
+            Ok(()) => execute_inner(options, request, &cancel, progress).await,
+            Err(error) => Err(error),
+        }
+    } else {
+        execute_inner(options, request, &cancel, progress).await
+    };
+    let (status, code) = match &result {
+        Ok(Outcome::Ready { export: Err(_), .. }) => (Status::ExportFailed, "export_failed"),
+        Ok(_) => (Status::Succeeded, "ok"),
+        Err(_) if cancel.is_cancelled() => (Status::Cancelled, "cancelled"),
+        Err(error) => (Status::Failed, diagnostic_code(error)),
+    };
+    operation.observe(Event::Terminal {
+        status,
+        code: code.into(),
+    });
+    let report = operation.report();
+    if let Some(path) = report_path {
+        // Explicit destination, atomic no-clobber write: never append unbounded logs or overwrite files.
+        let saved = serde_json::to_vec_pretty(&report)
+            .map_err(Error::Json)
+            .and_then(|bytes| write_output(path, &bytes, false));
+        if saved.is_err() {
+            return Err(Error::DiagnosticWrite {
+                report: Box::new(report),
+                source: result.err().map(Box::new),
+            });
+        }
+    }
+    result.map_err(|source| Error::Operation {
+        report: Box::new(report),
+        source: Box::new(source),
+    })
+}
+
+async fn execute_inner(
     options: &TuiOptions,
     request: Request,
     cancel: &Cancellation,
@@ -240,14 +320,24 @@ pub async fn execute(
             let output = value.output.clone();
             (Request::Refine(value), Some(output))
         }
+        Request::Create(value) => {
+            let output = value.output.clone();
+            (Request::Create(value), Some(output))
+        }
+        Request::Refine(value) => {
+            let output = value.output.clone();
+            (Request::Refine(value), Some(output))
+        }
         other => (other, None::<OutputOptions>),
     };
     let store = DocumentStore::new(&options.store, options.max_document_bytes);
     let outcome = execute_job(options, &store, request, cancel, progress).await?;
-    #[cfg(feature = "tui")]
     if let Some(output) = automatic_export
         && let Outcome::Document(document) = outcome
     {
+        cancel.emit(bcode_recap::diagnostics::Event::Phase {
+            phase: bcode_recap::diagnostics::Phase::Export,
+        });
         progress(Stage::Export);
         let export = export_document(&store, &document, &output).map_err(|_| {
             "Recap saved, but HTML export failed. Choose another destination and export again."
@@ -255,8 +345,6 @@ pub async fn execute(
         });
         return Ok(Outcome::Ready { document, export });
     }
-    #[cfg(not(feature = "tui"))]
-    let _ = automatic_export;
     Ok(outcome)
 }
 
@@ -267,42 +355,38 @@ async fn execute_job(
     cancel: &Cancellation,
     progress: &mut (impl FnMut(Stage) + Send),
 ) -> Result<Outcome, Error> {
+    #[cfg(not(feature = "tui"))]
+    let _ = options;
     match request {
+        Request::CheckSource { source, tools } => {
+            check_tool(&tools.yt_dlp, "yt-dlp", cancel).await?;
+            let input = SourceInput::Youtube(source::youtube_url(&source)?);
+            let mut config = engine_options(std::env::temp_dir());
+            config.acquisition.yt_dlp = tools.yt_dlp;
+            let _source = source::acquire(&input, &config.acquisition, cancel).await?;
+            Ok(Outcome::Checked)
+        }
         #[cfg(feature = "tui")]
         Request::CreateAndExport(_) | Request::RefineAndExport(_) => {
             unreachable!("export jobs normalized")
         }
-        Request::Create(value) => {
-            crate::cli::nonempty(&value.source).map_err(Error::Action)?;
-            if value.source.starts_with("https://") {
-                source::youtube_url(&value.source)?;
-            } else {
-                source::local_video(Path::new(&value.source), value.budget.max_video_bytes)?;
-            }
-            if let Some(id) = &value.id {
-                crate::cli::document_id(id).map_err(Error::Action)?;
-            }
-            if let Some(focus) = &value.focus {
-                crate::cli::nonempty(focus).map_err(Error::Action)?;
-            }
-            progress(Stage::ModelReadiness);
-            let executor = configured_model(&value.model).await?;
-            check_cancel(cancel)?;
-            create(store.clone(), &value, &executor, cancel, progress)
-                .await
-                .map(|document| Outcome::Document(Box::new(document)))
-                .map_err(|error| model_job_error(error, &executor))
-        }
+        Request::Create(value) => create_job(*value, store, cancel, progress).await,
         Request::Refine(value) => {
             crate::cli::document_id(&value.id).map_err(Error::Action)?;
             crate::cli::nonempty(&value.focus).map_err(Error::Action)?;
+            cancel.emit(bcode_recap::diagnostics::Event::Phase {
+                phase: bcode_recap::diagnostics::Phase::ModelReadiness,
+            });
             progress(Stage::ModelReadiness);
             let executor = configured_model(&value.model).await?;
+            executor.observe_selection(cancel);
             check_cancel(cancel)?;
-            refine(store.clone(), &value, &executor, cancel, progress)
+            let result = refine(store.clone(), &value, &executor, cancel, progress)
                 .await
                 .map(|document| Outcome::Document(Box::new(document)))
-                .map_err(|error| model_job_error(error, &executor))
+                .map_err(|error| model_job_error(error, &executor));
+            drop(executor);
+            result
         }
         #[cfg(feature = "tui")]
         Request::Load { id } => store
@@ -311,6 +395,9 @@ async fn execute_job(
             .map_err(Error::from),
         Request::Export { id, options } => {
             let document = store.load(&id)?;
+            cancel.emit(bcode_recap::diagnostics::Event::Phase {
+                phase: bcode_recap::diagnostics::Phase::Export,
+            });
             progress(Stage::Export);
             let result = export_document(store, &document, &options)?;
             progress(Stage::Complete);
@@ -358,6 +445,39 @@ async fn execute_job(
         }
     }
 }
+async fn create_job(
+    value: Create,
+    store: &DocumentStore,
+    cancel: &Cancellation,
+    progress: &mut (impl FnMut(Stage) + Send),
+) -> Result<Outcome, Error> {
+    crate::cli::nonempty(&value.source).map_err(Error::Action)?;
+    if value.source.starts_with("https://") {
+        source::youtube_url(&value.source)?;
+    } else {
+        source::local_video(Path::new(&value.source), value.budget.max_video_bytes)?;
+    }
+    if let Some(id) = &value.id {
+        crate::cli::document_id(id).map_err(Error::Action)?;
+    }
+    if let Some(focus) = &value.focus {
+        crate::cli::nonempty(focus).map_err(Error::Action)?;
+    }
+    cancel.emit(bcode_recap::diagnostics::Event::Phase {
+        phase: bcode_recap::diagnostics::Phase::ModelReadiness,
+    });
+    progress(Stage::ModelReadiness);
+    let executor = configured_model(&value.model).await?;
+    executor.observe_selection(cancel);
+    check_cancel(cancel)?;
+    let result = create(store.clone(), &value, &executor, cancel, progress)
+        .await
+        .map(|document| Outcome::Document(Box::new(document)))
+        .map_err(|error| model_job_error(error, &executor));
+    drop(executor);
+    result
+}
+
 #[cfg(feature = "tui")]
 fn available_output(store: &Path, id: Option<&str>, requested: &OutputOptions) -> OutputOptions {
     let mut output = requested.clone();
@@ -486,6 +606,16 @@ fn list(
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{message}", message = operation_message(report, source))]
+    Operation {
+        report: Box<bcode_recap::diagnostics::Report>,
+        source: Box<Self>,
+    },
+    #[error("{message}", message = diagnostic_write_message(report, source.as_deref()))]
+    DiagnosticWrite {
+        report: Box<bcode_recap::diagnostics::Report>,
+        source: Option<Box<Self>>,
+    },
     #[error("model operation failed ({code}); no automatic retry was performed", code = .0.code())]
     ModelExecution(crate::bcode_adapter::ModelFailure),
     #[error("operation cancelled")]
@@ -504,6 +634,140 @@ pub enum Error {
     Source(#[from] bcode_recap::source::SourceError),
     #[error(transparent)]
     Export(#[from] bcode_recap::export::ExportError),
+}
+
+fn check_report_destination(path: &Path) -> Result<(), Error> {
+    if path.symlink_metadata().is_ok() {
+        return Err(Error::Action(
+            "diagnostic destination already exists; choose a new --diagnostic-report file".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    tempfile::NamedTempFile::new_in(parent).map_err(|_| {
+        Error::Action(
+            "diagnostic destination is not writable; choose another --diagnostic-report file"
+                .into(),
+        )
+    })?;
+    Ok(())
+}
+fn diagnostic_write_message(
+    report: &bcode_recap::diagnostics::Report,
+    source: Option<&Error>,
+) -> String {
+    let original = source.map_or_else(
+        || format!("Operation completed; committed={}", report.committed()),
+        |error| operation_message(report, error),
+    );
+    format!(
+        "{original} · diagnostic report could not be written; choose a new writable --diagnostic-report file · diagnostic {}",
+        report.operation_id
+    )
+}
+
+fn safe_error(error: &Error) -> String {
+    match error {
+        Error::ModelExecution(failure) => {
+            use crate::bcode_adapter::ModelFailure;
+            let guidance = match failure {
+                ModelFailure::ProviderAuth => {
+                    "Check the selected provider authentication/profile; no account fallback was attempted"
+                }
+                ModelFailure::Configuration => {
+                    "Check model config, profile/context and saved Settings selection; no model fallback was attempted"
+                }
+                ModelFailure::Timeout => {
+                    "Model operation exceeded its deadline; inspect before explicitly retrying"
+                }
+                ModelFailure::RateLimited => {
+                    "Provider reported a rate limit; wait before explicitly retrying"
+                }
+                ModelFailure::ProviderNetwork => {
+                    "Provider network request failed; check connectivity"
+                }
+                ModelFailure::ProviderExecutionUnverified | ModelFailure::ProviderAfterOutput => {
+                    "Provider execution outcome requires review; do not assume there were no effects or retry blindly"
+                }
+                ModelFailure::StructuredJson
+                | ModelFailure::StructuredSchema
+                | ModelFailure::StructuredDecode
+                | ModelFailure::StructuredRepair => {
+                    "Structured model output failed validation; no fabricated fallback was saved"
+                }
+                _ => {
+                    "Check provider availability and selected model capabilities; no automatic retry was performed"
+                }
+            };
+            format!("model operation failed ({}); {guidance}", failure.code())
+        }
+        Error::Io(_) | Error::Engine(bcode_recap::engine::EngineError::Io(_)) => {
+            "File operation failed; check workspace/store access and free disk space".into()
+        }
+        Error::Json(_) => {
+            "Invalid document serialization; no raw content is included in diagnostics".into()
+        }
+        _ => error
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(1800)
+            .collect(),
+    }
+}
+
+fn operation_message(report: &bcode_recap::diagnostics::Report, source: &Error) -> String {
+    let facts = if report.inference_started() {
+        "Model executor was invoked; provider effects/billing are not inferred."
+    } else {
+        "No model request was made."
+    };
+    let committed = if report.committed() {
+        "A revision was committed; inspect it before retrying."
+    } else {
+        "No revision commit was observed."
+    };
+    format!(
+        "{} · code {} · phase {:?} · {} · {} · diagnostic {}",
+        safe_error(source),
+        diagnostic_code(source),
+        report.phase(),
+        facts,
+        committed,
+        report.operation_id
+    )
+}
+const fn diagnostic_code(error: &Error) -> &'static str {
+    use bcode_recap::{
+        engine::EngineError,
+        process::ProcessError,
+        source::{AcquisitionFailure, SourceError},
+    };
+    match error {
+        Error::Source(SourceError::Acquisition { failure, .. })
+        | Error::Engine(EngineError::Source(SourceError::Acquisition { failure, .. })) => {
+            match failure {
+                AcquisitionFailure::Forbidden => "youtube_http_403",
+                AcquisitionFailure::RateLimited => "youtube_http_429",
+                AcquisitionFailure::AccessRequired => "youtube_access_required",
+                AcquisitionFailure::FormatUnavailable => "youtube_format_unavailable",
+                AcquisitionFailure::ChallengeRuntime => "youtube_challenge_runtime",
+                AcquisitionFailure::Unknown => "youtube_download_failed",
+            }
+        }
+        Error::Engine(EngineError::Source(SourceError::Process(ProcessError::Timeout))) => {
+            "acquisition_timeout"
+        }
+        Error::ModelExecution(failure) => failure.code(),
+        Error::Cancelled | Error::Engine(EngineError::Cancelled) => "cancelled",
+        Error::Engine(EngineError::Composition(_)) => "composition_failed",
+        Error::Engine(EngineError::Media(_)) => "media_failed",
+        Error::Export(_) => "export_failed",
+        Error::Io(_) => "filesystem_failed",
+        _ => "operation_failed",
+    }
 }
 
 pub fn export_document(
@@ -580,6 +844,7 @@ pub async fn check_tool(
     name: &str,
     cancellation: &Cancellation,
 ) -> Result<(), Error> {
+    use bcode_recap::diagnostics::{Event, Tool};
     let request = ProcessRequest {
         program: program.to_owned(),
         args: vec![
@@ -598,9 +863,29 @@ pub async fn check_tool(
     if cancellation.is_cancelled() {
         return Err(Error::Action("operation cancelled".into()));
     }
-    process::run(&request, cancellation).await.map_err(|_| Error::Action(format!(
+    let output = process::run(&request, cancellation).await.map_err(|_| Error::Action(format!(
         "{name} unavailable or failed its version check; install {name} or select its executable with --{name}"
     )))?;
+    let tool = match name {
+        "yt-dlp" => Tool::YtDlp,
+        "ffmpeg" => Tool::Ffmpeg,
+        _ => Tool::Ffprobe,
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version = text
+        .split_whitespace()
+        .find(|word| {
+            word.bytes().next().is_some_and(|b| b.is_ascii_digit())
+                && word.len() <= 32
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+        })
+        .unwrap_or("unknown");
+    cancellation.emit(Event::ToolVersion {
+        tool,
+        version: version.into(),
+    });
     Ok(())
 }
 
@@ -622,9 +907,9 @@ pub async fn configured_model(
     options: &ModelOptions,
 ) -> Result<crate::bcode_adapter::BcodeExecutor, Error> {
     preflight_model(options)?;
-    crate::bcode_adapter::BcodeExecutor::configured(model_options(options)).await.map_err(|_| Error::Action(
-        "embedded model configuration failed; check --model-config, --profile/--context, provider authentication and multimodal model support; no fallback model was used".into()
-    ))
+    crate::bcode_adapter::BcodeExecutor::configured(model_options(options))
+        .await
+        .map_err(Error::ModelExecution)
 }
 
 pub fn preflight_model(options: &ModelOptions) -> Result<(), Error> {
@@ -857,6 +1142,28 @@ pub async fn refine(
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_and_report_write_errors_preserve_safe_facts() {
+        use bcode_recap::diagnostics::{Event, Observer as _, Operation, Phase};
+        let operation = Operation::new("operation-test".into());
+        operation.observe(Event::Phase {
+            phase: Phase::Composition,
+        });
+        operation.observe(Event::InferenceStarted);
+        let error = Error::ModelExecution(crate::bcode_adapter::ModelFailure::ProviderAuth);
+        let message = operation_message(&operation.report(), &error);
+        assert!(message.contains("provider_auth"));
+        assert!(message.contains("authentication"));
+        assert!(message.contains("executor was invoked"));
+        let combined = diagnostic_write_message(&operation.report(), Some(&error));
+        assert!(combined.contains("provider_auth"));
+        assert!(combined.contains("report could not be written"));
+        let hostile = Error::Io(std::io::Error::other(
+            "PRIVATE_TOKEN https://signed.invalid/secret\u{1b}[2J",
+        ));
+        assert!(!operation_message(&operation.report(), &hostile).contains("PRIVATE_TOKEN"));
+    }
+
     #[tokio::test]
     async fn incomplete_forms_validate_without_spending_or_store_mutation() {
         let directory = tempfile::tempdir().unwrap();
@@ -881,7 +1188,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, Error::Source(_)));
+        assert!(
+            matches!(error, Error::Operation { source, .. } if matches!(*source, Error::Source(_)))
+        );
         let refine = options.refine_request("../escape".into(), "Compare".into());
         let error = execute(
             &options,
@@ -891,7 +1200,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, Error::Action(_)));
+        assert!(
+            matches!(error, Error::Operation { source, .. } if matches!(*source, Error::Action(_)))
+        );
         assert!(stages.is_empty());
         assert!(!options.store.exists());
     }
@@ -988,7 +1299,9 @@ mod tests {
             &mut |stage| stages.push(stage),
         )
         .await;
-        assert!(matches!(outcome, Err(Error::Cancelled)));
+        assert!(
+            matches!(outcome, Err(Error::Operation { source, .. }) if matches!(*source, Error::Cancelled))
+        );
         assert!(stages.is_empty());
         assert!(!options.store.exists());
     }

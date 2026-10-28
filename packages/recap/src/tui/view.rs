@@ -221,15 +221,24 @@ impl App {
             match self.screen {
                 Screen::Home => self.home(mode),
                 Screen::Reader => self.reader(mode),
+                Screen::Diagnostics => Element::new(
+                    TextViewComponent::new("diagnostics", &self.failure_lines, &self.scroll)
+                        .styles(TextViewStyles {
+                            empty: p.quiet(),
+                            text: p.text(),
+                            background: Style::new().bg(p.panel),
+                            scrollbar: ScrollbarStyles::default(),
+                        }),
+                ),
             }
         };
         let footer = Column::new()
             .child(Self::label(self.status.clone(), p.quiet()))
             .child(Self::label(
                 if mode == Density::Narrow {
-                    "F7 Settings · F6 Open · F10/Ctrl+C Quit"
+                    "F7 Settings · F9 Details · F10/Ctrl+C Quit"
                 } else {
-                    "Enter Create   F7 Settings   F2 Generate   F3 Chapters   F4 Focus   F5 Export   F6 Open   F10/Ctrl+C Quit"
+                    "Enter Create   F7 Settings   F2 Generate   F3 Chapters   F4 Focus   F5 Export   F6 Open   F9 Details   F10/Ctrl+C Quit"
                 },
                 Style::new().fg(p.accent),
             ));

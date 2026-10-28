@@ -620,7 +620,7 @@ def default_journeys():
              'forbid': ['YOUR CONNECTION'],
              'send': '\x1b[200~/recap-acceptance-missing-video.mp4\x1b[201~'},
             {'expect': ['/recap-acceptance-missing-video.mp4'], 'send': '\r'},
-            {'expect': ['source I/O failed', 'gpt-4.1'],
+            {'expect': ['source I/O failed', 'No model request was made', 'diagnostic operation-'],
              'forbid': ['Open Settings (F7) before creating'], 'send': '\x03'},
         ], 'exit_code': 0},
         {'name': 'invalid-config-rejects-create',
@@ -681,7 +681,7 @@ def default_journeys():
             {'expect': ['Add a YouTube URL or a local video path first.'], 'forbid': ['Source & captions'], 'send': quit_key},
         ]},
         {'name': 'reader-load-error-teardown', 'args': ['tui', '--id', 'missing'], 'env': {'NO_COLOR': '1'},
-         'steps': [{'expect': ['From video to perspective.', 'storage', 'failed'], 'send': quit_key}]},
+         'steps': [{'expect': ['storage', 'failed', 'diagnostic operation-'], 'send': quit_key}]},
     ]
 
 

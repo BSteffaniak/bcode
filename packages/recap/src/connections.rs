@@ -50,6 +50,8 @@ pub enum ConnectionError {
         "Bcode selection is invalid or unavailable; check config path, context, profile, model, provider and authentication in Settings"
     )]
     Configuration,
+    #[error("model initialization failed ({code})", code = .0.code())]
+    Model(crate::bcode_adapter::ModelFailure),
     #[error(
         "custom endpoint must be an HTTP(S) URL without credentials, query or fragment; select the OpenAI-compatible provider and an explicit configured API-key auth profile (OAuth/subscriptions cannot be redirected)"
     )]
@@ -337,7 +339,9 @@ pub async fn resolve(selection: &Selection) -> Result<bcode::Bcode, ConnectionEr
     )];
     bcode::Bcode::configured_embedded_with_options(&options, &providers)
         .await
-        .map_err(|_| ConnectionError::Configuration)
+        .map_err(|error| {
+            ConnectionError::Model(crate::bcode_adapter::ModelFailure::classify(&error))
+        })
 }
 
 #[derive(Serialize, Deserialize)]

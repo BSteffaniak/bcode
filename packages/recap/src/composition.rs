@@ -138,6 +138,7 @@ impl Composer<'_> {
         if input_text.len() > self.limits.input_bytes {
             return Err(CompositionError::Budget);
         }
+        cancellation.emit(crate::diagnostics::Event::InferenceStarted);
         let response = self
             .executor
             .execute(
@@ -151,6 +152,9 @@ impl Composer<'_> {
             )
             .await?;
         check_cancelled(cancellation)?;
+        cancellation.emit(crate::diagnostics::Event::Phase {
+            phase: crate::diagnostics::Phase::ValidationOutput,
+        });
         if serde_json::to_vec(&response)?.len() > self.limits.response_bytes {
             return Err(CompositionError::Budget);
         }

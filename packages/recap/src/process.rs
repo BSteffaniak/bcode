@@ -14,7 +14,11 @@ type AdmissionSlot = Arc<std::sync::Mutex<Option<Arc<dyn ProcessAdmission>>>>;
 
 /// Cooperative cancellation shared by acquisition and media processing.
 #[derive(Clone, Debug, Default)]
-pub struct Cancellation(Arc<AtomicBool>, AdmissionSlot);
+pub struct Cancellation(
+    Arc<AtomicBool>,
+    AdmissionSlot,
+    Option<Arc<dyn crate::diagnostics::Observer>>,
+);
 
 /// Caller-injected authorization for each fully constructed literal process request.
 pub trait ProcessAdmission: Send + Sync + std::fmt::Debug {
@@ -25,6 +29,17 @@ pub trait ProcessAdmission: Send + Sync + std::fmt::Debug {
 }
 
 impl Cancellation {
+    /// Scope an observer to this clone while retaining cancellation and process admission.
+    #[must_use]
+    pub fn observed(&self, observer: Arc<dyn crate::diagnostics::Observer>) -> Self {
+        Self(self.0.clone(), self.1.clone(), Some(observer))
+    }
+    /// Emit a renderer-neutral semantic fact. No implicit persistence.
+    pub fn emit(&self, event: crate::diagnostics::Event) {
+        if let Some(observer) = &self.2 {
+            observer.observe(event);
+        }
+    }
     /// Install a process admission capability before starting the pipeline.
     pub fn set_process_admission(&self, admission: Arc<dyn ProcessAdmission>) {
         *self
@@ -105,7 +120,7 @@ async fn read_bounded(
         result.extend_from_slice(&chunk[..count]);
     }
 }
-/// Run a process, concurrently drain bounded output, and kill/reap on failure.
+/// Run a process, discarding untrusted failure output at the public boundary.
 ///
 /// # Errors
 /// Returns an error on cancellation, deadline, output overflow, I/O or nonzero exit.
@@ -113,6 +128,27 @@ pub async fn run(
     request: &ProcessRequest,
     cancellation: &Cancellation,
 ) -> Result<ProcessOutput, ProcessError> {
+    run_inspected(request, cancellation, |code, _| ProcessError::Failed(code)).await
+}
+
+// Only domain adapters inspect bounded failed output. It must never become an error string.
+pub(crate) async fn run_inspected<E: From<ProcessError>>(
+    request: &ProcessRequest,
+    cancellation: &Cancellation,
+    classify: impl FnOnce(Option<i32>, &[u8]) -> E,
+) -> Result<ProcessOutput, E> {
+    let (success, code, output) = run_status(request, cancellation).await?;
+    if success {
+        Ok(output)
+    } else {
+        Err(classify(code, &output.stderr))
+    }
+}
+
+async fn run_status(
+    request: &ProcessRequest,
+    cancellation: &Cancellation,
+) -> Result<(bool, Option<i32>, ProcessOutput), ProcessError> {
     if cancellation.is_cancelled() {
         return Err(ProcessError::Cancelled);
     }
@@ -153,10 +189,11 @@ pub async fn run(
                 read_bounded(stdout, request.max_output_bytes),
                 read_bounded(stderr, request.max_output_bytes)
             )?;
-            if !status.success() {
-                return Err(ProcessError::Failed(status.code()));
-            }
-            Ok(ProcessOutput { stdout, stderr })
+            Ok((
+                status.success(),
+                status.code(),
+                ProcessOutput { stdout, stderr },
+            ))
         };
         tokio::select! {
             result = work => result,

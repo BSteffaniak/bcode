@@ -25,6 +25,9 @@ struct Cli {
     /// Private recap document/media directory (independent of Bcode state).
     #[arg(long, global = true, default_value = ".recap")]
     store: PathBuf,
+    /// Write a bounded secret-safe operation report to a new file (never overwritten).
+    #[arg(long, global = true)]
+    diagnostic_report: Option<PathBuf>,
     /// Maximum bytes in one stored recap document.
     #[arg(long, global = true, default_value = "8388608", value_parser = positive_u64)]
     max_document_bytes: u64,
@@ -221,6 +224,9 @@ struct Inspect {
 struct Doctor {
     #[command(flatten)]
     tools: Tools,
+    /// Exercise real bounded `YouTube` acquisition (downloads video/captions, never inference).
+    #[arg(long)]
+    source: Option<String>,
     /// Also validate this explicit embedded model configuration, without inference.
     #[arg(long)]
     model_config: Option<PathBuf>,
@@ -337,6 +343,7 @@ pub async fn main() -> ExitCode {
                 Some(Command::Tui(options)) => options,
                 _ => application::TuiOptions::default(),
             };
+            options.diagnostic_report = arguments.diagnostic_report;
             options.store = arguments.store;
             options.max_document_bytes = arguments.max_document_bytes;
             return match crate::tui::run(options).await {
@@ -395,6 +402,7 @@ fn report_export(result: &application::ExportResult) {
 async fn run(arguments: Cli, cancel: &Cancellation) -> Result<(), CliError> {
     let options = application::TuiOptions {
         store: arguments.store,
+        diagnostic_report: arguments.diagnostic_report,
         max_document_bytes: arguments.max_document_bytes,
         ..application::TuiOptions::default()
     };
@@ -443,7 +451,25 @@ async fn run(arguments: Cli, cancel: &Cancellation) -> Result<(), CliError> {
             .await?;
             finish_generation(&store, outcome, &output)
         }
-        Some(Command::Doctor(value)) => doctor(&value, cancel).await,
+        Some(Command::Doctor(value)) => {
+            doctor(&value, cancel).await?;
+            if let Some(source) = &value.source {
+                application::execute(
+                    &options,
+                    application::Request::CheckSource {
+                        source: source.clone(),
+                        tools: value.tools.clone(),
+                    },
+                    cancel,
+                    &mut progress,
+                )
+                .await?;
+                eprintln!(
+                    "Source video and captions acquired successfully. No model request was made; no recap was saved."
+                );
+            }
+            Ok(())
+        }
         #[cfg(feature = "tui")]
         Some(Command::Tui(_)) => Err(CliError::Action(
             "interactive routing was not initialized".into(),
@@ -459,7 +485,14 @@ fn finish_generation(
     outcome: application::Outcome,
     output: &OutputOptions,
 ) -> Result<(), CliError> {
-    if let application::Outcome::Document(document) = outcome {
+    if let application::Outcome::Ready { document, export } = outcome {
+        eprintln!(
+            "Saved {} revision {}. Re-export anytime with: recap export {}",
+            document.id, document.revision, document.id
+        );
+        let result = export.map_err(CliError::Action)?;
+        report_export(&result);
+    } else if let application::Outcome::Document(document) = outcome {
         eprintln!(
             "Saved {} revision {}. Re-export anytime with: recap export {}",
             document.id, document.revision, document.id
@@ -521,7 +554,7 @@ async fn doctor(options: &Doctor, cancel: &Cancellation) -> Result<(), CliError>
     }
     if failures == 0 {
         eprintln!(
-            "Ready. yt-dlp is needed only for YouTube; ffmpeg and ffprobe are required for visual extraction."
+            "Tools available. Source availability/download was NOT checked by these version checks; use doctor --source URL. yt-dlp is needed only for YouTube; ffmpeg and ffprobe are required for visual extraction."
         );
         Ok(())
     } else {
