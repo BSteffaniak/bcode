@@ -72,6 +72,12 @@ struct Marker {
 /// # Errors
 /// Returns an error for malformed evidence, marker payloads, source gaps, or oversized markers.
 pub fn synthesize(prompt: &str) -> Result<String, String> {
+    let instructions = prompt
+        .split_once("Prior structured synthesis: ")
+        .map_or("", |(instructions, _)| instructions);
+    if instructions.contains("bcode.compaction.section-update.v2") {
+        return synthesize_progressive(prompt);
+    }
     synthesize_inner(prompt, false)
 }
 
@@ -94,10 +100,19 @@ pub fn synthesize_progressive(prompt: &str) -> Result<String, String> {
     let instructions = prompt
         .split_once("Prior structured synthesis: ")
         .map_or("", |(instructions, _)| instructions);
-    if !instructions.contains("bcode.compaction.section-update.v1") {
+    let replacement = instructions.contains("bcode.compaction.section-update.v2");
+    if !replacement && !instructions.contains("bcode.compaction.section-update.v1") {
         return synthesize(prompt);
     }
-    synthesize_inner(prompt, true)
+    let output = synthesize_inner(prompt, true)?;
+    if replacement {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&output).map_err(|error| error.to_string())?;
+        value["format"] = serde_json::json!("bcode.compaction.section-update.v2");
+        serde_json::to_string(&value).map_err(|error| error.to_string())
+    } else {
+        Ok(output)
+    }
 }
 
 /// Deliberately stubborn consolidation: retain every section without shortening or advancing

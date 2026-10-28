@@ -5,6 +5,7 @@ use super::{
     SynthesisPolicy, UPDATE_FORMAT,
 };
 
+pub(in super::super) const SECTION_REPLACE_FORMAT: &str = "bcode.compaction.section-update.v2";
 pub(in super::super) const SECTION_UPDATE_FORMAT: &str = "bcode.compaction.section-update.v1";
 
 /// Current response instructions; source attribution and request capacity remain host-owned.
@@ -192,11 +193,17 @@ pub(super) fn merge(
     reconcilable: &BTreeSet<u64>,
     policy: SynthesisPolicy,
 ) -> Result<CompactionEvidence, Rejection> {
-    super::super::response::ResponseContract::Update
-        .validate(&serde_json::to_string(&value).map_err(|_| Rejection::InvalidJson)?)?;
+    let replacement =
+        value.get("format").and_then(serde_json::Value::as_str) == Some(SECTION_REPLACE_FORMAT);
+    let contract = if replacement {
+        super::super::response::ResponseContract::Replace
+    } else {
+        super::super::response::ResponseContract::Update
+    };
+    contract.validate(&serde_json::to_string(&value).map_err(|_| Rejection::InvalidJson)?)?;
     let update: Update = serde_json::from_value(value)
         .map_err(|error| super::super::response::decode_error(&error))?;
-    if update.format != SECTION_UPDATE_FORMAT {
+    if update.format != SECTION_UPDATE_FORMAT && update.format != SECTION_REPLACE_FORMAT {
         return Err(Rejection::UnsupportedFormat);
     }
     let mut protected = prior.clone();
@@ -242,8 +249,12 @@ pub(super) fn merge(
             scope.source_sequence != target.source_sequence || scope.statement != target.statement
         });
     }
-    let continuation =
-        Sections::from_prior(&prior.continuation)?.append(update.sections, policy)?;
+    let sections = Sections::from_prior(&prior.continuation)?;
+    let continuation = if replacement {
+        sections.apply(update.sections, policy)?
+    } else {
+        sections.append(update.sections, policy)?
+    };
     let wire = serde_json::json!({
         "format": UPDATE_FORMAT,
         "current_scope": update.current_scope,

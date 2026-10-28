@@ -24,7 +24,7 @@ pub(super) struct SynthesisPolicy {
 
 #[cfg(test)]
 impl SynthesisPolicy {
-    const LEGACY: Self = Self {
+    pub(super) const LEGACY: Self = Self {
         carry_chars: COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
         wire_bytes: COMPACTION_MAX_CARRIED_SUMMARY_CHARS * 4,
         section_chars: COMPACTION_MAX_CARRIED_SUMMARY_CHARS,
@@ -309,7 +309,13 @@ pub(super) fn merge_response_with_policy(
     policy: SynthesisPolicy,
 ) -> Result<CompactionEvidence, Rejection> {
     let value = decode(summary, policy)?;
-    if value.get("format").and_then(serde_json::Value::as_str) == Some(SECTION_UPDATE_FORMAT) {
+    if value
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|format| {
+            format == SECTION_UPDATE_FORMAT || format == sections::SECTION_REPLACE_FORMAT
+        })
+    {
         return sections::merge(
             value,
             prior,

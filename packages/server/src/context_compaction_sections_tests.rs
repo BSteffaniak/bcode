@@ -117,6 +117,29 @@ fn repair_reservation_accounts_for_worst_case_json_escaping_and_base() {
 }
 
 #[test]
+fn replacement_sections_remove_obsolete_narrative_but_preserve_independent_instructions() {
+    let prior = prior();
+    let mut response = update(&serde_json::json!({
+        "background": "", "decisions": "Implemented typed API; verification passed",
+        "active_work_blockers": "", "findings_evidence": "Check passed"
+    }));
+    response["format"] = serde_json::json!(SECTION_REPLACE_FORMAT);
+    let accepted = merge_update(&response, &prior).unwrap();
+    assert_eq!(accepted.current_scope.len(), prior.current_scope.len());
+    assert_eq!(
+        accepted.current_scope[0].statement,
+        prior.current_scope[0].statement
+    );
+    let sections = Sections::from_prior(&accepted.continuation).unwrap();
+    assert!(sections.background.is_empty());
+    assert_eq!(
+        sections.decisions,
+        "Implemented typed API; verification passed"
+    );
+    assert!(sections.active_work_blockers.is_empty());
+}
+
+#[test]
 fn legacy_text_and_unchanged_sections_are_preserved_exactly() {
     let prior = prior();
     let accepted = merge_update(

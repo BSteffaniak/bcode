@@ -5,17 +5,20 @@ use super::synthesis::{Rejection, sections};
 #[derive(Clone, Copy)]
 pub(super) enum ResponseContract {
     Update,
+    Replace,
     Consolidation,
 }
 
 impl ResponseContract {
     pub(super) fn validate(self, text: &str) -> Result<(), Rejection> {
         use std::sync::OnceLock;
+        static REPLACE: OnceLock<jsonschema::Validator> = OnceLock::new();
         static UPDATE: OnceLock<jsonschema::Validator> = OnceLock::new();
         static CONSOLIDATION: OnceLock<jsonschema::Validator> = OnceLock::new();
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|error| decode_error(&error))?;
         let slot = match self {
+            Self::Replace => &REPLACE,
             Self::Update => &UPDATE,
             Self::Consolidation => &CONSOLIDATION,
         };
@@ -79,7 +82,7 @@ impl ResponseContract {
 
     pub(super) fn request(self) -> bcode_model::StructuredOutputRequest {
         let (name, schema) = match self {
-            Self::Update => (
+            Self::Update | Self::Replace => (
                 "compaction_section_update",
                 serde_json::to_value(schemars::schema_for!(sections::Update)),
             ),
@@ -91,6 +94,7 @@ impl ResponseContract {
         let mut schema = schema.expect("compaction schema is serializable");
         schema["properties"]["format"]["const"] = serde_json::Value::String(
             match self {
+                Self::Replace => sections::SECTION_REPLACE_FORMAT,
                 Self::Update => sections::SECTION_UPDATE_FORMAT,
                 Self::Consolidation => sections::CONSOLIDATION_FORMAT,
             }
@@ -121,12 +125,16 @@ mod tests {
 
     #[test]
     fn response_schemas_accept_null_as_unchanged_and_reject_wrong_shapes() {
-        for contract in [ResponseContract::Update, ResponseContract::Consolidation] {
+        for contract in [
+            ResponseContract::Update,
+            ResponseContract::Replace,
+            ResponseContract::Consolidation,
+        ] {
             let request = contract.request();
             let validator = jsonschema::validator_for(&request.schema).unwrap();
             let mut response = match contract {
-                ResponseContract::Update => serde_json::json!({
-                    "format": sections::SECTION_UPDATE_FORMAT,
+                ResponseContract::Update | ResponseContract::Replace => serde_json::json!({
+                    "format": request.schema["properties"]["format"]["const"],
                     "current_scope": [], "reconciles": [], "supersedes_statements": [],
                     "sections": {"decisions": null}
                 }),

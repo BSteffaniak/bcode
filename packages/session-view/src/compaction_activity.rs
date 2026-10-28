@@ -9,8 +9,14 @@ use bcode_session_view_models::SessionRuntimeViewState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionActivityUpdate {
     /// Start or refresh compaction with bounded, public diagnostic text only.
-    Active { detail: String },
+    Active {
+        detail: String,
+    },
     /// Compaction stopped; model request preparation may continue.
+    /// Compaction stopped unsuccessfully; do not imply model dispatch is proceeding.
+    Failed {
+        detail: String,
+    },
     PreparingModelRequest,
 }
 
@@ -33,6 +39,37 @@ pub fn compaction_activity_update(
     runtime: &SessionRuntimeViewState,
     compaction_active: bool,
 ) -> Option<CompactionActivityUpdate> {
+    if let SessionTracePayload::ProviderEvent { event_type, detail } = &trace.payload
+        && event_type == bcode_session_models::COMPACTION_PROGRESS_OBSERVATION_EVENT
+    {
+        if runtime.cancelling
+            || runtime.active_turn_id.is_none()
+            || trace.turn_id.as_deref() != runtime.active_turn_id.as_deref()
+            || !compaction_active
+        {
+            return None;
+        }
+        let progress = detail.as_deref().and_then(|detail| {
+            serde_json::from_str::<bcode_session_models::CompactionProgressObservation>(detail).ok()
+        })?;
+        progress.validate().ok()?;
+        let detail = match progress.phase {
+            bcode_session_models::CompactionInspectionPhase::Validating => {
+                "validating resumed request".to_owned()
+            }
+            bcode_session_models::CompactionInspectionPhase::Publishing => {
+                "publishing compaction summary".to_owned()
+            }
+            _ => {
+                let chunks = progress.chunks?;
+                format!(
+                    "summarizing history: {}/{} batches accepted",
+                    chunks.done, chunks.total
+                )
+            }
+        };
+        return Some(CompactionActivityUpdate::Active { detail });
+    }
     let SessionTracePayload::ContextCompaction { message, .. } = &trace.payload else {
         return None;
     };
@@ -52,6 +89,14 @@ pub fn compaction_activity_update(
                 .filter(|message| !message.trim().is_empty())?;
             Some(CompactionActivityUpdate::Active {
                 detail: diagnostic_detail(message),
+            })
+        }
+        SessionTracePhase::ContextCompactionFinished
+            if compaction_active
+                && matches!(&trace.payload, SessionTracePayload::ContextCompaction { compacted: false, message: Some(message), .. } if message.starts_with("context compaction failed:")) =>
+        {
+            Some(CompactionActivityUpdate::Failed {
+                detail: diagnostic_detail(message.as_deref().unwrap_or("compaction failed")),
             })
         }
         SessionTracePhase::ContextCompactionFinished
@@ -83,6 +128,22 @@ fn diagnostic_detail(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_compaction_does_not_claim_model_request_preparation() {
+        let event = trace(
+            SessionTracePhase::ContextCompactionFinished,
+            Some("context compaction failed: deadline exhausted; boundary unchanged"),
+        );
+        assert!(matches!(
+            compaction_activity_update(&event, &runtime(Some("turn-1"), false), true),
+            Some(CompactionActivityUpdate::Failed { .. })
+        ));
+        assert_eq!(
+            compaction_activity_update(&event, &runtime(Some("turn-2"), false), true),
+            None
+        );
+    }
 
     fn runtime(turn: Option<&str>, cancelling: bool) -> SessionRuntimeViewState {
         SessionRuntimeViewState {

@@ -432,7 +432,7 @@ impl LocalCheckpoint {
         };
         if checkpoint.format != CHECKPOINT_FORMAT
             || checkpoint.manifest.is_empty()
-            || checkpoint.manifest.len() > COMPACTION_MAX_CHUNKS
+            || checkpoint.manifest.len() > if checkpoint.packing_policy.starts_with("capacity-summary-v2") { 4096 } else { COMPACTION_MAX_CHUNKS }
             || checkpoint.requests.len() != checkpoint.manifest.len()
             || checkpoint.next_chunk > checkpoint.manifest.len()
             || checkpoint.requests.iter().any(|count| *count > 2)
@@ -549,7 +549,15 @@ impl LocalCheckpoint {
             return;
         };
         let observation = CompactionProgressObservation {
-            version: 1,
+            version: if matches!(
+                phase,
+                bcode_session_models::CompactionInspectionPhase::Validating
+                    | bcode_session_models::CompactionInspectionPhase::Publishing
+            ) {
+                2
+            } else {
+                1
+            },
             phase,
             chunks: Some(CompactionInspectionCount {
                 done: u64::try_from(self.next_chunk).unwrap_or(u64::MAX),
@@ -755,13 +763,15 @@ impl LocalCheckpoint {
     /// response is allowed, but an elapsed explicit restart deadline is not.
     pub(super) fn verify_publication_deadline(&self) -> Result<(), CompactionError> {
         if let Some(grant) = &self.contract_continuation {
-            return if current_unix_millis() >= grant.deadline_ms {
-                Err(CompactionError::Provider(
-                    "compaction corrective deadline exhausted; boundary unchanged".into(),
-                ))
-            } else {
-                Ok(())
-            };
+            // An automatic dispatch deadline limits additional provider spending, not the
+            // validity of already accepted, settled evidence. Explicit restart contracts below
+            // retain their original publication semantics.
+            if grant.pending
+                || self.next_chunk != self.manifest.len()
+                || self.synthesis_phase != SynthesisPhase::Accumulating
+            {
+                return Err(invalid_checkpoint());
+            }
         }
         if self
             .restart_allowance
@@ -2061,7 +2071,12 @@ mod tests {
         let mut resumed = LocalCheckpoint::decode(&resumed.encode().unwrap()).unwrap();
         assert!(resumed.reserve_slot(0).is_err());
         resumed.contract_continuation.as_mut().unwrap().deadline_ms = 1;
+        assert!(resumed.verify_restart_allowance().is_err());
+        // Completed accepted evidence can finalize after dispatch expiry, but unresolved work cannot.
         assert!(resumed.verify_publication_deadline().is_err());
+        resumed.contract_continuation.as_mut().unwrap().pending = false;
+        resumed.next_chunk = resumed.manifest.len();
+        assert!(resumed.verify_publication_deadline().is_ok());
     }
 
     #[tokio::test]
@@ -2863,6 +2878,141 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // One end-to-end retained-checkpoint lifecycle.
     async fn ordinary_compaction_resumes_settled_contract_failure_preserving_accepted_chunks() {
+        Box::pin(retained_contract_failure_case(false)).await;
+    }
+
+    #[tokio::test]
+    async fn feasible_compaction_dispatches_once_and_publishes_source_backed_scope() {
+        let _guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = bcode_session::SessionManager::default();
+        let session = sessions
+            .create_session(None, root.path().to_owned())
+            .await
+            .unwrap();
+        let id = session.id;
+        drop(session);
+        for text in [
+            "BCODE_FIXTURE_SCOPE {\"key\":\"scope\",\"statement\":\"Review only; do not modify files\"}",
+            "continue",
+        ] {
+            sessions
+                .append_event(
+                    id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: text.into(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )
+                .await
+                .unwrap();
+            sessions
+                .append_event(
+                    id,
+                    SessionEventKind::AssistantMessage {
+                        text: "Historical investigation detail. ".repeat(24),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut state = crate::tests::test_server_state_with_fake_provider(sessions);
+        state.startup_config.skills.enabled = false;
+        state.startup_config.invariants.enabled = false;
+        state.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
+        state.startup_config.system_prompt.text = Some("Test compaction".into());
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
+        let mut selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".into()),
+            model_id: Some("fake-echo".into()),
+            ..SessionModelSelection::default()
+        };
+        selection
+            .provider_context
+            .settings
+            .insert("fake_compaction_fixture".into(), "scope-v1".into());
+        Box::pin(compact_session_context_with_limit(
+            &state,
+            id,
+            &selection,
+            None,
+            None,
+            &TurnCancelState::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let history = state.sessions.session_history(id).await.unwrap();
+        let requests: BTreeSet<_> = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ModelUsage { usage, .. } if usage.terminal => {
+                    usage.request_id.as_ref()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 1);
+        let summary = history
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ContextCompacted { summary, .. } => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        let evidence: CompactionEvidence = serde_json::from_str(summary).unwrap();
+        assert!(
+            evidence
+                .current_scope
+                .iter()
+                .any(|scope| scope.statement == "Review only; do not modify files")
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn capacity_default_uses_one_batch_for_feasible_complete_history() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = bcode_session::SessionManager::default();
+        let session = sessions
+            .create_session(None, root.path().to_owned())
+            .await
+            .unwrap();
+        let id = session.id;
+        drop(session);
+        let state = crate::tests::test_server_state_with_fake_provider(sessions);
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".into()),
+            model_id: Some("fake-echo".into()),
+            ..SessionModelSelection::default()
+        };
+        let (_, _, transcript, _) = fixture("Keep this instruction. ".repeat(760).as_str());
+        assert!(compaction_evidence_input(&transcript, None).unwrap().len() > 1);
+        let (batches, identity) = synthesis_chunks(
+            &state,
+            id,
+            &selection,
+            &transcript,
+            &TurnCancelState::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(identity.starts_with("capacity-summary-v2"));
+        assert_eq!(batches.len(), 1);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn completed_expired_automatic_carry_publishes_without_new_provider_requests() {
+        Box::pin(retained_contract_failure_case(true)).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn retained_contract_failure_case(completed: bool) {
         let _guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         let root = tempfile::tempdir().unwrap();
         let sessions = bcode_session::SessionManager::default();
@@ -2933,10 +3083,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let (chunks, packing) =
-            synthesis_chunks(&state, id, &selection, &transcript, &cancel, Some(&budget))
-                .await
-                .unwrap();
+        let (chunks, packing) = synthesis_chunks(
+            &state,
+            id,
+            &selection,
+            &transcript,
+            &cancel,
+            Some(&budget),
+            Some("legacy-chars-v1"),
+        )
+        .await
+        .unwrap();
         assert!(chunks.len() > 1);
         let mut old = LocalCheckpoint::create_with_policy(
             &plan,
@@ -2986,6 +3143,27 @@ mod tests {
         );
         old.reserve_slot(1).unwrap();
         old.reserve_slot(1).unwrap();
+        if completed {
+            old.contract_continuation = Some(ContractContinuation {
+                version: 1,
+                contract: "section-schema-v1".into(),
+                chunk: 1,
+                requests: 1,
+                baseline_requests: old.consumed_requests(),
+                reserved: 1,
+                pending: false,
+                deadline_ms: 1,
+                terminal_sequence: 1,
+                terminal_sha256: "a".repeat(64),
+            });
+            for _ in 1..chunks.len() {
+                old.accept(
+                    &accepted,
+                    &BTreeSet::from([history[0].sequence]),
+                    &BTreeSet::new(),
+                );
+            }
+        }
         old.save(&state, id, &key).await.unwrap();
         let original_sequence = old.checkpoint_sequence;
         let original_payload = old.encode().unwrap();
@@ -3016,6 +3194,27 @@ mod tests {
             result.compacted_through_sequence,
             plan.compacted_through_sequence
         );
+        if completed {
+            let after = state
+                .sessions
+                .session_history_page(
+                    id,
+                    bcode_session_models::SessionHistoryQuery {
+                        cursor: None,
+                        limit: 512,
+                        direction: bcode_session_models::SessionHistoryDirection::Backward,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                !after
+                    .events
+                    .iter()
+                    .any(|event| event.sequence > original_sequence + 3
+                        && matches!(&event.kind, SessionEventKind::ModelUsage { .. }))
+            );
+        }
         assert!(load(&state, id, &key).await.unwrap().is_none()); // Successful publication retires operational carry.
         let page = state
             .sessions

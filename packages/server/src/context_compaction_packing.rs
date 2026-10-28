@@ -17,6 +17,7 @@ pub(super) const ALGORITHM_ID: &str = "adaptive-complete-request-v2";
 pub(super) enum PackingGate {
     Disabled,
     Experimental,
+    Capacity,
 }
 
 /// Merge existing bounded chronological chunks only when the complete original AND repair
@@ -127,7 +128,7 @@ fn pack_bounded(
     if matches!(gate, PackingGate::Disabled) {
         return Ok(source.to_vec());
     }
-    if source.len() > COMPACTION_MAX_CHUNKS
+    if (!matches!(gate, PackingGate::Capacity) && source.len() > COMPACTION_MAX_CHUNKS)
         || source
             .iter()
             .any(|chunk| chunk.len() > COMPACTION_MAX_SUMMARY_INPUT_CHARS)
@@ -170,9 +171,22 @@ fn pack_bounded(
         // independent maximum wire allocation (which may exceed the model's entire window).
         let prompt = format!(
             "Host reconciliation eligibility for this chunk (source sequences): {}. Only these unfinished sources may appear in reconciles.\n{}",
-            "9".repeat(chunk.len()),
+            if matches!(gate, PackingGate::Capacity) {
+                super::chunk_user_sequences(chunk)
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                "9".repeat(chunk.len())
+            },
             prompt,
         );
+        let prompt = if matches!(gate, PackingGate::Capacity) {
+            super::replacement_summary_prompt(&prompt)
+        } else {
+            prompt
+        };
         let repair = synthesis::repair_prompt_with_policy(
             &prompt,
             synthesis::Rejection::InvalidSupersession,

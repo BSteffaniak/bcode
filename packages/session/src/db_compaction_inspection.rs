@@ -284,7 +284,9 @@ fn normalize(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
             entry.phase = Some(CompactionInspectionPhase::Committed);
         }
         SessionEventKind::TraceEvent { trace } => match &trace.payload {
-            SessionTracePayload::ContextCompaction { .. } => {
+            SessionTracePayload::ContextCompaction {
+                compacted, message, ..
+            } => {
                 entry.phase = match trace.phase {
                     SessionTracePhase::ContextCompactionStarted => {
                         Some(CompactionInspectionPhase::Started)
@@ -303,7 +305,24 @@ fn normalize(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
                         ));
                     }
                 };
-                entry.blocker = Some(CompactionInspectionBlocker::ProgressNotRecorded);
+                entry.blocker =
+                    if trace.phase == SessionTracePhase::ContextCompactionFinished && !compacted {
+                        Some(
+                            if message.as_deref().is_some_and(|message| {
+                                message.contains("deadline exhausted")
+                                    || message.contains("allowance exhausted")
+                                    || message.contains("budget exhausted")
+                            }) {
+                                CompactionInspectionBlocker::BudgetExhausted
+                            } else {
+                                CompactionInspectionBlocker::ProgressNotRecorded
+                            },
+                        )
+                    } else if *compacted {
+                        None
+                    } else {
+                        Some(CompactionInspectionBlocker::ProgressNotRecorded)
+                    };
             }
             SessionTracePayload::ProviderEvent { event_type, detail }
                 if event_type == COMPACTION_PROGRESS_OBSERVATION_EVENT =>

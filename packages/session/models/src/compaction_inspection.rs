@@ -21,6 +21,10 @@ pub const MAX_COMPACTION_INSPECTION_CANDIDATES: usize = 200;
 pub enum CompactionInspectionPhase {
     Started,
     Synthesizing,
+    /// Accepted sources are complete; host is checking the complete resumed request.
+    Validating,
+    /// Candidate passed host checks; publication is ownership fenced.
+    Publishing,
     Finished,
     Skipped,
     Blocked,
@@ -101,7 +105,15 @@ impl CompactionProgressObservation {
     /// # Errors
     /// Returns a content-free blocker for unknown versions or inconsistent counts.
     pub fn validate(&self) -> Result<(), CompactionInspectionBlocker> {
-        if self.version != 1 {
+        if self.version != 1 && self.version != 2 {
+            return Err(CompactionInspectionBlocker::UnsupportedFormat);
+        }
+        if self.version == 1
+            && matches!(
+                self.phase,
+                CompactionInspectionPhase::Validating | CompactionInspectionPhase::Publishing
+            )
+        {
             return Err(CompactionInspectionBlocker::UnsupportedFormat);
         }
         let mut counts = vec![self.chunks];

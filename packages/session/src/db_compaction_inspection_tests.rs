@@ -134,11 +134,17 @@ fn structured_progress_versions_counts_and_restart_are_explicit() {
         CompactionInspectionResume::Restarted
     );
     progress.version = 2;
+    progress.phase = CompactionInspectionPhase::Validating;
+    assert!(progress.validate().is_ok());
+    progress.phase = CompactionInspectionPhase::Publishing;
+    assert!(progress.validate().is_ok());
+    progress.version = 3;
     assert_eq!(
         progress.validate(),
         Err(CompactionInspectionBlocker::UnsupportedFormat)
     );
     progress.version = 1;
+    progress.phase = CompactionInspectionPhase::Synthesizing;
     progress.chunks = Some(CompactionInspectionCount { done: 6, total: 5 });
     assert_eq!(
         progress.validate(),

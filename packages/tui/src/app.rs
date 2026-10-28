@@ -6161,6 +6161,10 @@ impl BmuxApp {
             Some(CompactionActivityUpdate::Active { detail }) => {
                 self.set_activity(ActivityState::Compacting { detail });
             }
+            Some(CompactionActivityUpdate::Failed { detail }) => {
+                self.set_activity(ActivityState::Idle);
+                self.status = detail;
+            }
             Some(CompactionActivityUpdate::PreparingModelRequest) => {
                 self.set_activity(ActivityState::PreparingModelRequest);
             }

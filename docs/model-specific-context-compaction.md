@@ -306,6 +306,21 @@ remains blocked, not merely awaiting a flag. Adaptive packing remains default-of
 quality and semantic retention across repeated compactions remain unproven. Structural validators
 do not make compaction lossless.
 
+## Modern capacity-first synthesis
+
+New local operations try the complete selected source in one request, using the canonical
+estimator and actual request schema. Only infeasible complete inputs use chronological packing.
+Legacy checkpoints retain their original packing identity and manifests; the old experimental
+config switch is retained for config compatibility, not as the new-operation default.
+Section-update v2 replaces supplied derived narrative sections while protecting instruction
+provenance and exact supersession targets. V1 remains append-only for old responses/checkpoints.
+Allocation/serialization guards still fail closed rather than clipping content. Reference-backed
+oversized checkpoints are not implemented by this path.
+
+Automatic corrective deadlines gate provider dispatch, not accepted evidence publication.
+Completed settled checkpoints can finish host-only validation/commit after dispatch expiry;
+explicit restart deadlines retain their original semantics. Pending requests cannot finalize.
+
 ## Automatic response-contract continuation
 
 Local synthesis and derived consolidation request separate typed JSON schemas through provider/model
