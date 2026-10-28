@@ -376,7 +376,11 @@ batching manifest, fresh synthesis may select a larger structurally complete pre
 old prefix cannot support continuation capacity. The host verifies that the old source remains
 an unchanged prefix, respects the current-turn cutoff, and retains the archived checkpoint and
 spent requests. Expanded selections do not reuse partial accepted carry or claim it covers new
-source. Normal session
+source. The session transaction fences replacement source against the exact rejection event,
+not the older checkpoint: source appended after that checkpoint is eligible, but source at or
+after the rejection is not. Exact source hashes, checkpoint identity, prior marker and tail
+remain checked atomically. Failed automatic recovery records its final error separately from
+the intermediate incompatibility that triggered it. Normal session
 reads remain non-mutating. This is new bounded compaction work, not conversion of old summaries
 or a replay of their provider calls; no prepare/restart commands are needed for this supported case.
 

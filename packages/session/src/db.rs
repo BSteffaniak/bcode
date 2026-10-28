@@ -11959,12 +11959,13 @@ mod tests {
                     });
                 }
             }
-            let stale_events = stale.events(template).unwrap();
-            assert!(
-                db.restart_compaction_checkpoint(&stale, &stale_events)
-                    .await
-                    .is_err()
-            );
+            if let Ok(stale_events) = stale.events(template) {
+                assert!(
+                    db.restart_compaction_checkpoint(&stale, &stale_events)
+                        .await
+                        .is_err()
+                );
+            }
             assert_eq!(db.last_event_sequence().await.unwrap(), Some(2));
             assert_eq!(
                 db.compaction_checkpoint("old").await.unwrap(),
@@ -12024,6 +12025,97 @@ mod tests {
             pointer_payload: "replacement".into(),
         };
         (checkpoint, request)
+    }
+
+    #[tokio::test]
+    async fn durable_restart_can_select_history_appended_after_old_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .unwrap();
+        let (_, mut request) = compaction_restart_fixture(&db, id).await;
+        let old_rejection = db.restart_event_at(&**db.db, 2).await.unwrap();
+        let added = event(
+            id,
+            3,
+            SessionEventKind::SystemMessage {
+                text: "history appended after the old checkpoint".into(),
+            },
+        );
+        db.append_event(&added).await.unwrap();
+        request.source.extend([
+            crate::compaction_event_identity(&old_rejection).unwrap(),
+            crate::compaction_event_identity(&added).unwrap(),
+        ]);
+        let rejection = event(
+            id,
+            4,
+            SessionEventKind::SystemMessage {
+                text: "latest host-validated rejection".into(),
+            },
+        );
+        db.append_event(&rejection).await.unwrap();
+        request.rejection = crate::compaction_event_identity(&rejection).unwrap();
+        let template = event(
+            id,
+            5,
+            SessionEventKind::SystemMessage {
+                text: String::new(),
+            },
+        );
+        for case in 0..5 {
+            let mut invalid = request.clone();
+            match case {
+                0 => {
+                    invalid.source.remove(1);
+                }
+                1 => invalid.source[1].sha256 = "0".repeat(64),
+                2 => invalid.source.push(invalid.rejection.clone()),
+                3 => invalid.rejection.sequence = invalid.expected_checkpoint_sequence,
+                _ => invalid.expected_checkpoint_sequence += 1,
+            }
+            if let Ok(events) = invalid.events(&template) {
+                assert!(
+                    db.restart_compaction_checkpoint(&invalid, &events)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(db.last_event_sequence().await.unwrap(), Some(4));
+            assert!(
+                db.compaction_checkpoint("replacement")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let events = request.events(&template).unwrap();
+        let replacement = db
+            .restart_compaction_checkpoint(&request, &events)
+            .await
+            .unwrap();
+        assert_eq!(replacement.sequence, 7);
+        assert_eq!(db.restart_event_at(&**db.db, 3).await.unwrap(), added);
+        assert_eq!(
+            db.restart_compaction_checkpoint(&request, &events)
+                .await
+                .unwrap(),
+            replacement
+        );
+        assert_eq!(db.last_event_sequence().await.unwrap(), Some(8));
+        drop(db);
+        let reopened = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .restart_compaction_checkpoint(&request, &events)
+                .await
+                .unwrap(),
+            replacement
+        );
+        assert_eq!(reopened.last_event_sequence().await.unwrap(), Some(8));
     }
 
     #[tokio::test]

@@ -102,7 +102,10 @@ impl CompactionCheckpointRestart {
             || self
                 .source
                 .last()
-                .is_some_and(|source| source.sequence >= self.expected_checkpoint_sequence)
+                // A fresh replacement may include history appended after the old checkpoint.
+                // It must still precede the exact host-validated rejection fence.
+                .is_some_and(|source| source.sequence >= self.rejection.sequence)
+            || self.rejection.sequence <= self.expected_checkpoint_sequence
             || self
                 .expected_prior_marker
                 .as_ref()

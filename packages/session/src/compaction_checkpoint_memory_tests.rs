@@ -141,6 +141,69 @@ async fn memory_restart_fixture() -> (
 }
 
 #[tokio::test]
+async fn memory_restart_can_select_history_appended_after_old_checkpoint() {
+    let (manager, id, _, old_rejection, mut request) = memory_restart_fixture().await;
+    let added = manager
+        .append_event(
+            id,
+            SessionEventKind::SystemMessage {
+                text: "new history after the old checkpoint".into(),
+            },
+        )
+        .await
+        .unwrap();
+    request.source.extend([
+        compaction_event_identity(&old_rejection).unwrap(),
+        compaction_event_identity(&added).unwrap(),
+    ]);
+    let rejection = manager
+        .append_event(
+            id,
+            SessionEventKind::SystemMessage {
+                text: "latest host-validated rejection".into(),
+            },
+        )
+        .await
+        .unwrap();
+    request.rejection = compaction_event_identity(&rejection).unwrap();
+    let before = manager.session_history(id).await.unwrap();
+    for case in 0..5 {
+        let mut invalid = request.clone();
+        match case {
+            0 => {
+                invalid.source.remove(1);
+            }
+            1 => invalid.source[1].sha256 = "0".repeat(64),
+            2 => invalid.source.push(invalid.rejection.clone()),
+            3 => invalid.rejection.sequence = invalid.expected_checkpoint_sequence,
+            _ => invalid.expected_checkpoint_sequence += 1,
+        }
+        assert!(
+            manager
+                .restart_compaction_checkpoint(id, invalid)
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.session_history(id).await.unwrap(), before);
+    }
+    let replacement = manager
+        .restart_compaction_checkpoint(id, request.clone())
+        .await
+        .unwrap();
+    let after = manager.session_history(id).await.unwrap();
+    assert_eq!(&after[..before.len()], &before);
+    assert_eq!(after.len(), before.len() + 4);
+    assert_eq!(
+        manager
+            .restart_compaction_checkpoint(id, request)
+            .await
+            .unwrap(),
+        replacement
+    );
+    assert_eq!(manager.session_history(id).await.unwrap(), after);
+}
+
+#[tokio::test]
 async fn memory_restart_is_atomic_fenced_and_idempotent() {
     let (manager, session_id, source, rejection, request) = memory_restart_fixture().await;
     let original = manager.session_history(session_id).await.unwrap();

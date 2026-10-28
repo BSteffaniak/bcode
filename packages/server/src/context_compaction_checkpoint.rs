@@ -3722,6 +3722,7 @@ mod tests {
     enum RecoverySource {
         Frozen,
         Expanded,
+        ManualExpanded,
     }
 
     #[tokio::test]
@@ -3742,6 +3743,17 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn manual_compaction_recovers_history_appended_after_retired_checkpoint() {
+        Box::pin(automatic_policy_recovery_case(
+            true,
+            false,
+            false,
+            RecoverySource::ManualExpanded,
+        ))
+        .await;
+    }
+
     #[allow(clippy::too_many_lines)] // Full canonical fixture exercises ordinary admission through publication.
     async fn automatic_policy_recovery_case(
         settled: bool,
@@ -3749,7 +3761,8 @@ mod tests {
         manual: bool,
         source: RecoverySource,
     ) {
-        let expand = matches!(source, RecoverySource::Expanded);
+        let expand = !matches!(source, RecoverySource::Frozen);
+        let manual_expansion = matches!(source, RecoverySource::ManualExpanded);
         let _guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         let root = tempfile::tempdir().unwrap();
         let sessions = bcode_session::SessionManager::default();
@@ -3939,6 +3952,52 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Reproduce a long-lived checkpoint: new compactable history arrives after it was saved.
+        if expand {
+            for text in [
+                "additional work after checkpoint",
+                "latest retained exchange",
+            ] {
+                state
+                    .sessions
+                    .append_event(
+                        id,
+                        SessionEventKind::UserMessage {
+                            client_id: ClientId::new(),
+                            text: text.into(),
+                            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                state
+                    .sessions
+                    .append_event(
+                        id,
+                        SessionEventKind::AssistantMessage {
+                            text: "resolved new historical detail; ".repeat(160),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let expanded_history = state
+            .sessions
+            .activated_conversation_snapshot(id)
+            .await
+            .unwrap()
+            .events;
+        let plan = structural_compaction_plan_with_policy(
+            &expanded_history,
+            state.startup_config.model.tool_output.context_chars,
+            planning,
+        )
+        .unwrap();
+        let transcript = compaction_transcript_from_plan(&plan);
+        if expand {
+            assert!(plan.compacted_through_sequence > old.checkpoint_sequence);
+        }
         let old_payload = old.encode().unwrap();
         append_context_compaction_trace(&state, id, CompactionTraceKind::Finished,
             "compaction_finished", 0, false,
@@ -3987,6 +4046,17 @@ mod tests {
                     compacted_through_sequence: plan.compacted_through_sequence,
                 })
                 .map_err(|error| CompactionError::Provider(error.to_string()))
+        } else if manual_expansion {
+            let completion = crate::session_operations::compact(&state, ClientId::new(), id)
+                .await
+                .unwrap();
+            crate::session_operations::complete_compaction(completion)
+                .await
+                .map(|_| CompactionCompletion {
+                    message: "manual expanded compaction completed".into(),
+                    compacted_through_sequence: plan.compacted_through_sequence,
+                })
+                .map_err(|error| CompactionError::Provider(error.to_string()))
         } else {
             Box::pin(compact_session_context_with_limit(
                 &state,
@@ -4007,11 +4077,24 @@ mod tests {
                 result.unwrap().compacted_through_sequence,
                 plan.compacted_through_sequence
             );
+            let canonical = state.sessions.session_history(id).await.unwrap();
+            assert!(canonical.iter().any(|event| matches!(&event.kind,
+                SessionEventKind::ContextCompacted { compacted_through_sequence, .. }
+                    if *compacted_through_sequence == plan.compacted_through_sequence)));
         } else {
             assert!(matches!(
                 result,
                 Err(CompactionError::RecoveryRequired(_) | CompactionError::RecoveryBlocked(_))
             ));
+            if !replacement {
+                let recorded = state.sessions.session_history(id).await.unwrap();
+                assert!(recorded.iter().any(|event| matches!(&event.kind,
+                    SessionEventKind::TraceEvent { trace }
+                    if trace.phase == SessionTracePhase::ContextCompactionFinished
+                        && matches!(&trace.payload, SessionTracePayload::ContextCompaction {
+                            reason, compacted: false, message: Some(message), ..
+                        } if reason == "compaction_recovery_failed" && message.starts_with("context compaction failed:")))));
+            }
         }
         let archived = state
             .sessions

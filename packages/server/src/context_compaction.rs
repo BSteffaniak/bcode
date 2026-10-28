@@ -651,7 +651,7 @@ async fn compact_session_context_with_policy(
                     ))
                 ) && RESTART_KEY.try_with(|_| ()).is_err()
                 {
-                    return Box::pin(auto_recovery::recover_policy_change(
+                    let recovered = Box::pin(auto_recovery::recover_policy_change(
                         state,
                         session_id,
                         selection,
@@ -662,6 +662,14 @@ async fn compact_session_context_with_policy(
                         planning_policy,
                     ))
                     .await;
+                    if let Err(error) = &recovered {
+                        append_context_compaction_trace(
+                            state, session_id, CompactionTraceKind::Finished,
+                            "compaction_recovery_failed", 0, false,
+                            Some(format!("context compaction failed: {error}")),
+                        ).await;
+                    }
+                    return recovered;
                 }
                 if matches!(&result, Err(CompactionError::Provider(message))
                     if (message.starts_with("compaction synthesis rejected after bounded repair;")
