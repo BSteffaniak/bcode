@@ -769,7 +769,7 @@ fn operation_message(report: &bcode_recap::diagnostics::Report, source: &Error) 
         report.operation_id
     )
 }
-const fn diagnostic_code(error: &Error) -> &'static str {
+fn diagnostic_code(error: &Error) -> &'static str {
     use bcode_recap::{
         engine::EngineError,
         process::ProcessError,
@@ -790,6 +790,14 @@ const fn diagnostic_code(error: &Error) -> &'static str {
         Error::Engine(EngineError::Source(SourceError::Process(ProcessError::Timeout))) => {
             "acquisition_timeout"
         }
+        Error::Source(SourceError::Invalid("no timestamped captions"))
+        | Error::Engine(EngineError::Source(SourceError::Invalid("no timestamped captions"))) => {
+            "captions_no_text"
+        }
+        Error::Source(SourceError::Invalid("reversed or zero-duration caption"))
+        | Error::Engine(EngineError::Source(SourceError::Invalid(
+            "reversed or zero-duration caption",
+        ))) => "captions_invalid_timing",
         Error::ModelExecution(failure) => failure.code(),
         Error::Cancelled | Error::Engine(EngineError::Cancelled) => "cancelled",
         Error::Engine(EngineError::Composition(_)) => "composition_failed",

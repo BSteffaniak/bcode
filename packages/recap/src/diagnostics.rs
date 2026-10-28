@@ -17,6 +17,8 @@ pub enum Phase {
     Metadata,
     /// Video/caption acquisition.
     Download,
+    /// Decode downloaded timestamped captions.
+    Captions,
     /// Local acquisition.
     Acquisition,
     /// Probe source media tracks/duration.

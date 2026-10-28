@@ -285,18 +285,24 @@ fn timestamp(value: &str) -> Option<f64> {
 }
 /// Parse bounded `WebVTT` or SRT cues, preserving source times.
 /// # Errors
-/// Rejects oversized input, malformed timing, reversed/empty cues and excessive cues.
+/// Rejects oversized input, malformed/reversed timing, no textual cues and excessive cues.
+/// Blank cues have no transcript content and are ignored after validating their timing.
 pub fn parse_subtitles(input: &str) -> Result<Vec<SubtitleCue>, SourceError> {
     if input.len() > 4 * 1024 * 1024 {
         return Err(SourceError::Invalid("subtitle byte budget"));
     }
     let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
     let mut cues = Vec::new();
+    let mut cue_count = 0;
     for block in normalized.split("\n\n") {
         let lines: Vec<_> = block.lines().collect();
         let Some(index) = lines.iter().position(|line| line.contains("-->")) else {
             continue;
         };
+        cue_count += 1;
+        if cue_count > 50_000 {
+            return Err(SourceError::Invalid("caption count budget"));
+        }
         let (start, end) = lines[index]
             .split_once("-->")
             .ok_or(SourceError::Invalid("caption timing"))?;
@@ -307,17 +313,17 @@ pub fn parse_subtitles(input: &str) -> Result<Vec<SubtitleCue>, SourceError> {
             .and_then(timestamp)
             .ok_or(SourceError::Invalid("caption end"))?;
         let text = lines[index + 1..].join("\n");
-        if end <= start || text.trim().is_empty() {
-            return Err(SourceError::Invalid("empty or reversed caption"));
+        if end <= start {
+            return Err(SourceError::Invalid("reversed or zero-duration caption"));
+        }
+        if text.trim().is_empty() {
+            continue;
         }
         cues.push(SubtitleCue {
             start_seconds: start,
             end_seconds: end,
             text,
         });
-        if cues.len() > 50_000 {
-            return Err(SourceError::Invalid("caption count budget"));
-        }
     }
     if cues.is_empty() {
         return Err(SourceError::Invalid("no timestamped captions"));
@@ -463,7 +469,7 @@ pub async fn acquire(
     .map(Into::into)
     .collect();
     download_process(&request, cancel, AcquisitionStage::Download).await?;
-    let mut acquired = collect_download(workspace, options)?;
+    let mut acquired = collect_download(workspace, options, cancel)?;
     acquired.title = metadata
         .get("title")
         .and_then(serde_json::Value::as_str)
@@ -474,7 +480,11 @@ pub async fn acquire(
 fn collect_download(
     workspace: tempfile::TempDir,
     options: &AcquisitionOptions,
+    cancel: &Cancellation,
 ) -> Result<AcquiredSource, SourceError> {
+    cancel.emit(crate::diagnostics::Event::Phase {
+        phase: crate::diagnostics::Phase::Captions,
+    });
     let mut video = None;
     let mut captions = vec![];
     for entry in std::fs::read_dir(workspace.path())? {
@@ -616,6 +626,26 @@ pub fn resolve_transcript(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn youtube_blank_cues_are_valid_but_do_not_become_transcript() {
+        let input = "WEBVTT\n\n00:01.000 --> 00:02.000 align:start position:0%\nActual words\n\n00:02.000 --> 00:02.010 align:start position:0%\n \n \n\n00:02.010 --> 00:03.000\nMore words\n";
+        let cues = super::parse_subtitles(input).unwrap();
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "Actual words");
+        assert!((cues[1].start_seconds - 2.010).abs() < f64::EPSILON);
+        assert_eq!(cues[1].text, "More words");
+        assert!(super::parse_subtitles("WEBVTT\n\n00:02.000 --> 00:01.000\n \n").is_err());
+        assert!(super::parse_subtitles("WEBVTT\n\n00:02.000 --> 00:02.000\n \n").is_err());
+        assert!(super::parse_subtitles("WEBVTT\n\n00:01.000 --> 00:02.000\n \n").is_err());
+        let excessive = format!(
+            "WEBVTT\n\n{}",
+            "00:01.000 --> 00:02.000\n \n\n".repeat(50_001)
+        );
+        assert!(matches!(
+            super::parse_subtitles(&excessive),
+            Err(super::SourceError::Invalid("caption count budget"))
+        ));
+    }
     #[test]
     fn downloader_classification_never_echoes_untrusted_output() {
         use super::*;
