@@ -377,7 +377,7 @@ impl App {
                     let mut options = self.options.output_options();
                     options.output =
                         (!self.text(5).is_empty()).then(|| PathBuf::from(self.text(5)));
-                    return self.admit(Request::Export {
+                    return self.admit(Request::ExportCopy {
                         id: document.id.clone(),
                         options,
                     });
@@ -576,6 +576,9 @@ impl App {
                 );
             }
             Ok(Outcome::Exported(result)) => {
+                if self.screen == Screen::Diagnostics && self.document.is_some() {
+                    self.screen = Screen::Reader;
+                }
                 self.status = format!("Exported {} · HTML is ready to open", result.path.display());
                 self.export = Some(result.path);
             }

@@ -163,6 +163,11 @@ pub enum Request {
     RefineAndExport(Box<Refine>),
     Create(Box<Create>),
     Refine(Box<Refine>),
+    #[cfg(feature = "tui")]
+    ExportCopy {
+        id: String,
+        options: OutputOptions,
+    },
     Export {
         id: String,
         options: OutputOptions,
@@ -233,7 +238,9 @@ const fn reportable(request: &Request) -> bool {
         | Request::Export { .. }
         | Request::CheckSource { .. } => true,
         #[cfg(feature = "tui")]
-        Request::CreateAndExport(_) | Request::RefineAndExport(_) => true,
+        Request::CreateAndExport(_) | Request::RefineAndExport(_) | Request::ExportCopy { .. } => {
+            true
+        }
         #[cfg(feature = "tui")]
         _ => false,
     }
@@ -328,6 +335,20 @@ async fn execute_inner(
             let output = value.output.clone();
             (Request::Refine(value), Some(output))
         }
+        #[cfg(feature = "tui")]
+        Request::ExportCopy {
+            id,
+            options: output,
+        } => {
+            let output = available_output(&options.store, Some(&id), &output);
+            (
+                Request::Export {
+                    id,
+                    options: output,
+                },
+                None,
+            )
+        }
         other => (other, None::<OutputOptions>),
     };
     let store = DocumentStore::new(&options.store, options.max_document_bytes);
@@ -367,7 +388,7 @@ async fn execute_job(
             Ok(Outcome::Checked)
         }
         #[cfg(feature = "tui")]
-        Request::CreateAndExport(_) | Request::RefineAndExport(_) => {
+        Request::CreateAndExport(_) | Request::RefineAndExport(_) | Request::ExportCopy { .. } => {
             unreachable!("export jobs normalized")
         }
         Request::Create(value) => create_job(*value, store, cancel, progress).await,
@@ -618,6 +639,8 @@ pub enum Error {
     },
     #[error("model operation failed ({code}); no automatic retry was performed", code = .0.code())]
     ModelExecution(crate::bcode_adapter::ModelFailure),
+    #[error("output {} already exists; choose another export destination or use --output FILE / --force in the CLI", .0.display())]
+    OutputExists(PathBuf),
     #[error("operation cancelled")]
     Cancelled,
     #[error("{0}")]
@@ -719,12 +742,19 @@ fn safe_error(error: &Error) -> String {
 }
 
 fn operation_message(report: &bcode_recap::diagnostics::Report, source: &Error) -> String {
-    let facts = if report.inference_started() {
+    let export_only = report.phase() == Some(bcode_recap::diagnostics::Phase::Export)
+        && !report.inference_started()
+        && !report.committed();
+    let facts = if export_only {
+        "Export-only operation; no model request was needed."
+    } else if report.inference_started() {
         "Model executor was invoked; provider effects/billing are not inferred."
     } else {
         "No model request was made."
     };
-    let committed = if report.committed() {
+    let committed = if export_only {
+        "The saved recap was not modified by this export attempt."
+    } else if report.committed() {
         "A revision was committed; inspect it before retrying."
     } else {
         "No revision commit was observed."
@@ -764,6 +794,7 @@ const fn diagnostic_code(error: &Error) -> &'static str {
         Error::Cancelled | Error::Engine(EngineError::Cancelled) => "cancelled",
         Error::Engine(EngineError::Composition(_)) => "composition_failed",
         Error::Engine(EngineError::Media(_)) => "media_failed",
+        Error::OutputExists(_) => "export_destination_exists",
         Error::Export(_) => "export_failed",
         Error::Io(_) => "filesystem_failed",
         _ => "operation_failed",
@@ -827,10 +858,7 @@ pub fn write_output(path: &Path, bytes: &[u8], force: bool) -> Result<(), Error>
     } else {
         staged.persist_noclobber(path).map_err(|error| {
             if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                Error::Action(format!(
-                    "output {} already exists; choose --output or pass --force",
-                    path.display()
-                ))
+                Error::OutputExists(path.to_owned())
             } else {
                 Error::Io(error.error)
             }
@@ -1141,6 +1169,82 @@ pub async fn refine(
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repeated_interactive_exports_preserve_existing_files_and_revision() {
+        use bcode_recap::contracts::{GenerationIntent, Source};
+        let root = tempfile::tempdir().unwrap();
+        let options = TuiOptions {
+            store: root.path().join("store"),
+            ..TuiOptions::default()
+        };
+        let document = RecapDocument {
+            schema_version: 1,
+            id: "exported".into(),
+            revision: 1,
+            title: "Saved recap".into(),
+            source: Source {
+                id: "video".into(),
+                title: "Video".into(),
+                url: None,
+                duration_ms: 1000,
+            },
+            intent: GenerationIntent::default(),
+            transcript: vec![],
+            evidence: vec![],
+            assets: vec![],
+            sections: vec![],
+        };
+        let store = DocumentStore::new(&options.store, options.max_document_bytes);
+        store.save(&document, None).unwrap();
+        std::fs::create_dir_all(store.asset_directory(&document.id).unwrap()).unwrap();
+        let original = options.store.join("exported.html");
+        std::fs::write(&original, "existing HTML must remain intact").unwrap();
+        for suffix in [1, 2] {
+            let outcome = execute(
+                &options,
+                Request::ExportCopy {
+                    id: document.id.clone(),
+                    options: OutputOptions::default(),
+                },
+                &Cancellation::default(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+            let Outcome::Exported(result) = outcome else {
+                panic!("expected export")
+            };
+            assert_eq!(
+                result.path,
+                options.store.join(format!("exported-{suffix}.html"))
+            );
+            assert!(result.path.is_file());
+        }
+        let error = execute(
+            &options,
+            Request::ExportCopy {
+                id: document.id.clone(),
+                options: OutputOptions {
+                    output: Some(original.clone()),
+                    ..OutputOptions::default()
+                },
+            },
+            &Cancellation::default(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("export_destination_exists"));
+        assert!(message.contains("saved recap was not modified"));
+        assert!(!message.contains("No revision commit was observed"));
+        assert_eq!(
+            std::fs::read_to_string(original).unwrap(),
+            "existing HTML must remain intact"
+        );
+        assert_eq!(store.load(&document.id).unwrap().revision, 1);
+    }
 
     #[test]
     fn model_and_report_write_errors_preserve_safe_facts() {
