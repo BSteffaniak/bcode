@@ -318,8 +318,12 @@ Allocation/serialization guards still fail closed rather than clipping content. 
 oversized checkpoints are not implemented by this path.
 
 Automatic corrective deadlines gate provider dispatch, not accepted evidence publication.
-Completed settled checkpoints can finish host-only validation/commit after dispatch expiry;
-explicit restart deadlines retain their original semantics. Pending requests cannot finalize.
+Completed settled checkpoints can finish host-only validation/commit after dispatch expiry.
+When a corrective grant follows a restart, finalization uses that same grant rather than
+reapplying the older restart deadline; pending or incomplete corrective work cannot publish.
+Explicit restart operations without a corrective grant retain their publication deadline.
+Public application errors distinguish restart deadline expiry, corrective deadline expiry, and
+corrective allowance exhaustion without exposing provider response bodies or credentials.
 
 ## Automatic response-contract continuation
 

@@ -772,6 +772,11 @@ impl LocalCheckpoint {
             {
                 return Err(invalid_checkpoint());
             }
+            // Dispatch already selects the corrective grant instead of the superseded restart
+            // allowance. Finalization must use the same authority: once settled and complete,
+            // neither dispatch deadline invalidates accepted work. Explicit restart operations
+            // without a corrective grant retain the publication deadline below.
+            return Ok(());
         }
         if self
             .restart_allowance
@@ -2076,7 +2081,15 @@ mod tests {
         assert!(resumed.verify_publication_deadline().is_err());
         resumed.contract_continuation.as_mut().unwrap().pending = false;
         resumed.next_chunk = resumed.manifest.len();
+        resumed.restart_allowance = Some(RestartAllowance {
+            max_requests: 64,
+            deadline_ms: 1,
+        });
         assert!(resumed.verify_publication_deadline().is_ok());
+        resumed.contract_continuation.as_mut().unwrap().pending = true;
+        assert!(resumed.verify_publication_deadline().is_err());
+        resumed.contract_continuation = None;
+        assert!(resumed.verify_publication_deadline().is_err()); // Explicit-only deadline is not waived.
     }
 
     #[tokio::test]
@@ -3144,6 +3157,12 @@ mod tests {
         old.reserve_slot(1).unwrap();
         old.reserve_slot(1).unwrap();
         if completed {
+            // Regression: automatic correction can follow a restart whose older deadline expired.
+            // Dispatch uses the corrective grant; publication must not revive the older veto.
+            old.restart_allowance = Some(RestartAllowance {
+                max_requests: 64,
+                deadline_ms: 1,
+            });
             old.contract_continuation = Some(ContractContinuation {
                 version: 1,
                 contract: "section-schema-v1".into(),

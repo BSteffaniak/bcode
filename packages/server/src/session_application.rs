@@ -124,7 +124,24 @@ impl bcode_session_models::SessionCompactionOperation for ServerSessionCompactio
 
 /// Map known host-side compaction failures without exposing provider text or captured context.
 fn compaction_provider_failure(message: &str) -> SessionApplicationFailure {
-    let (code, detail) = if message.starts_with("compaction capacity policy rejected:")
+    let (code, detail) = if message
+        == "explicit compaction restart deadline exhausted; boundary unchanged"
+    {
+        (
+            "compaction_restart_deadline_exhausted",
+            "compaction publication blocked: the retained restart deadline expired; accepted work is preserved and the context boundary is unchanged. Repeating the same request cannot extend that deadline",
+        )
+    } else if message == "compaction corrective deadline exhausted; boundary unchanged" {
+        (
+            "compaction_corrective_deadline_exhausted",
+            "compaction stopped: the corrective dispatch deadline expired; accepted work is preserved and the context boundary is unchanged",
+        )
+    } else if message == "compaction corrective allowance exhausted; boundary unchanged" {
+        (
+            "compaction_corrective_allowance_exhausted",
+            "compaction cannot dispatch another corrective request: its allowance expired, is exhausted, or has an unsettled request; accepted work is preserved and the context boundary is unchanged",
+        )
+    } else if message.starts_with("compaction capacity policy rejected:")
         || message.starts_with("compaction summary policy:")
         || message.starts_with("compaction budget")
     {
@@ -2070,6 +2087,40 @@ mod tests {
             before,
             state.sessions.session_history(session.id).await.unwrap()
         );
+    }
+
+    #[test]
+    fn compaction_deadline_failures_survive_application_error_mapping() {
+        for (message, code, expected) in [
+            (
+                "explicit compaction restart deadline exhausted; boundary unchanged",
+                "compaction_restart_deadline_exhausted",
+                "restart deadline expired",
+            ),
+            (
+                "compaction corrective deadline exhausted; boundary unchanged",
+                "compaction_corrective_deadline_exhausted",
+                "corrective dispatch deadline expired",
+            ),
+            (
+                "compaction corrective allowance exhausted; boundary unchanged",
+                "compaction_corrective_allowance_exhausted",
+                "unsettled request",
+            ),
+        ] {
+            let error = compaction_failure(session_operations::CompactError::Compaction(
+                crate::CompactionError::Provider(message.into()),
+            ));
+            assert_eq!(error.code, code);
+            assert!(error.message.contains(expected));
+            assert!(error.message.contains("boundary is unchanged"));
+            assert!(error.message.contains("preserved"));
+        }
+        let secret = compaction_provider_failure(
+            "explicit compaction restart deadline exhausted; boundary unchanged SECRET credential",
+        );
+        assert_eq!(secret.code, "provider_error");
+        assert!(!secret.message.contains("SECRET"));
     }
 
     #[test]
