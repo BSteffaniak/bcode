@@ -77,12 +77,12 @@ class RecoveryDriver(Driver):
         text = self.config.read_text().replace('fake_compaction_pause = "true"', 'fake_compaction_pause = "false"')
         text = text.replace('fake_compaction_fixture = "scope-v1"',
                             'fake_compaction_fixture = "scope-v1"\nfake_compaction_outcome = "' +
-                            ("malformed" if self.fail_synthesis else "success") + '"')
+                            (("fail" if self.mismatch else "malformed") if self.fail_synthesis else "success") + '"')
         if self.mismatch and not self.fail_synthesis:
-            # A real supported policy switch changes chunk identity; never fabricate
-            # an upgrade checkpoint by mutating canonical storage.
-            text = text.replace('backend = "local"',
-                                'backend = "local"\nexperimental_adaptive_packing = true')
+            # The progressive fake model advertises a different output capacity, which
+            # changes the production packing identity without changing discovery/source.
+            text = text.replace('fake_compaction_fixture = "scope-v1"',
+                                'fake_compaction_fixture = "progressive-v1"')
         self.config.write_text(text)
 
     def compact(self, name, candidate=None, check=False):
@@ -90,9 +90,12 @@ class RecoveryDriver(Driver):
         if candidate is not None:
             request = self.save(name + "-request.json", json.dumps(candidate, indent=2))
             args += ["--restart-request", str(request)]
-        result = self.run(*args, check=check)
+        result = self.run(*args, check=False)
         self.save(name + ".json", result.stdout)
         self.save(name + ".stderr", result.stderr)
+        if check and result.returncode:
+            self.export(name + "-failure-history.jsonl")
+            raise ValueError(f"{name} failed: {result.stderr}")
         return result
 
     def execute(self):

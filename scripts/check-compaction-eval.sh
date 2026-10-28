@@ -67,9 +67,9 @@ for interruption in cancel restart crash; do
 done
 wait_batch
 
-# Compare identical larger inputs through both production packing paths.
-run_case packing-off run_automatic.py --source-repeat 5500 --timeout-secs 300
-run_case packing-on run_automatic.py --source-repeat 5500 --adaptive-packing
+# Compare identical multi-request inputs; the retired packing switch must be a no-op.
+run_case packing-off run_automatic.py --source-repeat 18000 --timeout-secs 300
+run_case packing-on run_automatic.py --source-repeat 18000 --adaptive-packing
 wait_batch
 off="$(python3 -c 'import sys; print(next(line.strip().removeprefix("Artifacts retained: ") for line in open(sys.argv[1]) if line.startswith("Artifacts retained: ")))' "${logs}/packing-off.log")"
 on="$(python3 -c 'import sys; print(next(line.strip().removeprefix("Artifacts retained: ") for line in open(sys.argv[1]) if line.startswith("Artifacts retained: ")))' "${logs}/packing-on.log")"

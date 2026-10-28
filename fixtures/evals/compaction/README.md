@@ -147,7 +147,12 @@ check must pass in every cycle; invented authorization, revived obsolete scope, 
 or falsely verified outcomes fail immediately. The overall threshold is 95%, with at least 90% per
 case. Report category/cycle breakdowns and all failures, not merely a combined average.
 
-Compare baseline `experimental_adaptive_packing=false` against candidate `true` using identical
+The legacy `experimental_adaptive_packing` switch no longer selects a production packing path:
+capacity-first synthesis is unconditional. The offline gate compares identical multi-request
+inputs with the switch off/on and requires equal request/chunk counts, in addition to the full
+canonical acceptance checks in both arms. The automatic interruption corpus exceeds one real
+synthesis request so cancellation/restart/crash tests retain an accepted prefix to resume.
+For comparisons of genuinely different packing implementations, use identical
 provider/model/auth selection, parameters, source batches, padding and allowances. Use at least
 three paired repetitions per case (record supported seeds); retain all failures, repairs and
 attempts. Candidate must satisfy absolute gates and not regress any case or critical outcome

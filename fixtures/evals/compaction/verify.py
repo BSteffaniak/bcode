@@ -78,6 +78,34 @@ def verify_fixture_scope(events, through, evidence):
             raise ValueError("supersession lacks same-key canonical user support")
 
 
+def continuation_facts(evidence):
+    """Decode fixture facts from supported continuation contracts, rejecting ambiguity."""
+    state = json.loads(evidence["continuation"])
+    if not isinstance(state, dict):
+        raise ValueError("continuation must be an object")
+    if "format" not in state:
+        facts = state.get("facts")
+        if not isinstance(facts, dict):
+            raise ValueError("legacy fixture continuation lacks facts")
+        return facts
+    if state["format"] != "bcode.compaction.continuation-sections.v1":
+        raise ValueError("unsupported continuation format")
+    facts = {}
+    for section in ("decisions", "active_work_blockers", "findings_evidence", "background"):
+        if not isinstance(state.get(section), str):
+            raise ValueError("invalid continuation section")
+    for line in state["findings_evidence"].splitlines():
+        if not line.strip():
+            continue
+        additions = json.loads(line)
+        if not isinstance(additions, dict) or any(not isinstance(value, str) for value in additions.values()):
+            raise ValueError("invalid fixture evidence facts")
+        if facts.keys() & additions.keys():
+            raise ValueError("duplicate fixture evidence fact")
+        facts.update(additions)
+    return facts
+
+
 def verify_scope(events, selected):
     """Verify retention, chronology, user attribution and request-only isolation."""
     if not selected:
@@ -86,8 +114,7 @@ def verify_scope(events, selected):
         payload = event["kind"].get("context_compacted", event["kind"].get("provider_context_compacted"))
         verify_fixture_scope(events, payload["compacted_through_sequence"], evidence)
     latest = selected[-1][1]
-    state = json.loads(latest["continuation"])
-    if state["facts"].get("early") != "violet-7391":
+    if continuation_facts(latest).get("early") != "violet-7391":
         raise ValueError("early fact did not survive real compaction")
     statements = {scope["statement"] for scope in latest["current_scope"]}
     expected = {"No network access", "Read-only analysis; do not edit files"}
@@ -103,8 +130,7 @@ def verify(paths):
     if len({event["kind"][next(iter(event["kind"]))]["compacted_through_sequence"] for event, _ in selected}) < 2:
         raise ValueError("compaction coverage did not advance")
     verify_scope(events, selected)
-    first = json.loads(selected[0][1]["continuation"])
-    if first["facts"].get("early") != "violet-7391":
+    if continuation_facts(selected[0][1]).get("early") != "violet-7391":
         raise ValueError("early fact did not survive first real compaction")
     print(f"PASS: {len(selected)} advancing real markers; early fact, corrected role, independent restriction")
     print("LIMIT: caller must verify distinct daemon process/artifact identity and restarted request completion.")

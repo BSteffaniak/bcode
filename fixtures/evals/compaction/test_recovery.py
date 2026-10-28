@@ -28,7 +28,8 @@ class RecoveryOracleTests(unittest.TestCase):
             driver.fail_synthesis = False
             driver.configure("off")
             config = tomllib.loads(driver.config.read_text())
-            self.assertTrue(config["model"]["compaction"]["experimental_adaptive_packing"])
+            self.assertEqual(config["model"]["profiles"]["offline"]["settings"]["fake_compaction_fixture"], "progressive-v1")
+            self.assertNotIn("experimental_adaptive_packing", config["model"]["compaction"])
             self.assertEqual(config["model"]["provider_plugin_id"], "bcode.fake-provider")
             self.assertEqual(config["model"]["profiles"]["offline"]["settings"]["fake_compaction_outcome"], "success")
             pressure = ConsolidationDriver.__new__(ConsolidationDriver)

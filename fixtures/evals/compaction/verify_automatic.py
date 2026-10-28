@@ -260,7 +260,8 @@ def verify_automatic(work):
         scope["supersedes"] = []
     if prior != expected_carry:
         raise ValueError("resumed provider carry differs from durably accepted canonical checkpoint")
-    if json.loads(prior["continuation"])["facts"].get("early") != "violet-7391":
+    from verify import continuation_facts
+    if continuation_facts(prior).get("early") != "violet-7391":
         raise ValueError("accepted synthesis was not carried into resumed provider request")
     final_event, _ = selected[-1]
     kind = final_event["kind"][next(iter(final_event["kind"]))]
@@ -311,13 +312,13 @@ def compare_packing(disabled, enabled):
         workloads.append(canonical_user_workload(seed))
     if workloads[0] != workloads[1]:
         raise ValueError("packing comparison canonical user workloads differ")
-    if reports[1]["planned_chunks"] < 2:
-        raise ValueError("packing-on workload did not retain multiple real chunks")
-    if reports[1]["synthesis_requests"] >= reports[0]["synthesis_requests"]:
-        raise ValueError("adaptive packing did not reduce real synthesis request count")
+    if any(report["planned_chunks"] < 2 for report in reports):
+        raise ValueError("packing comparison did not exercise multiple real chunks")
+    if reports[0] != reports[1]:
+        raise ValueError("retired adaptive-packing switch changed capacity-first request counts")
     report = {"schema": "bcode.compaction.packing_comparison.v1", "sha256": identities[0]["sha256"],
               "canonical_user_sources_equal": True, "off": reports[0], "on": reports[1],
-              "requests_saved": reports[0]["synthesis_requests"] - reports[1]["synthesis_requests"]}
+              "requests_saved": 0, "retired_switch_is_noop": True}
     print(json.dumps(report, indent=2))
     return report
 

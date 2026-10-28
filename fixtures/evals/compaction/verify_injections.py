@@ -11,20 +11,39 @@ def verify_injections(control, outcome):
         if ready["outcome"] != outcome or not finished.get("response_ok"):
             raise ValueError("injection did not finish with the selected response")
         text = (path / "response.json").read_text()
-        attempts.append((ready, text))
+        prior = None
+        request_path = path / "request.json"
+        if request_path.exists():
+            request = json.loads(request_path.read_text())
+            for message in request["messages"]:
+                for block in message.get("content", []):
+                    prompt = block.get("text", "")
+                    if "Prior structured synthesis: " in prompt:
+                        prior = json.loads(prompt.split("Prior structured synthesis: ", 1)[1]
+                                           .split("\n\nSource fragments (JSON lines):\n", 1)[0])
+        attempts.append((ready, text, prior))
     if not attempts:
         raise ValueError("no actual controlled synthesis attempts")
     if outcome == "near-limit":
-        for _, text in attempts:
+        for _, text, _ in attempts:
             if len(text) != 5924:
                 raise ValueError("near-limit complete serialized carry is not 5924 characters")
-            json.loads(json.loads(text)["continuation"])
+            response = json.loads(text)
+            if "continuation" in response:
+                json.loads(response["continuation"])
+            elif response.get("format") == "bcode.compaction.section-update.v2":
+                background = response["sections"]["background"].strip()
+                if not background.startswith("BCODE_FIXTURE_STATE_V1 "):
+                    raise ValueError("near-limit response lost fixture state")
+                json.loads(background.removeprefix("BCODE_FIXTURE_STATE_V1 "))
+            else:
+                raise ValueError("unsupported near-limit response contract")
     if outcome.endswith("repair"):
         observed = False
-        for initial, text in attempts:
+        for initial, text, prior in attempts:
             if initial["correction"]:
                 continue
-            corrections = [candidate for ready, candidate in attempts
+            corrections = [candidate for ready, candidate, _ in attempts
                            if ready["correction"] and ready["source_sha256"] == initial["source_sha256"]]
             if not corrections:
                 if outcome in ("omit-scope-repair", "paraphrase-scope-repair"):
@@ -46,13 +65,16 @@ def verify_injections(control, outcome):
                 observed = True
             else:
                 bad = json.loads(text)["current_scope"]
-                for correction in corrections:
-                    good = json.loads(correction)["current_scope"]
-                    if outcome == "omit-scope-repair" and len(good) == len(bad) + 1:
+                if prior is None or not prior.get("current_scope"):
+                    continue
+                expected = prior["current_scope"]
+                if outcome == "omit-scope-repair" and bad == expected[1:]:
+                    observed = True
+                if outcome == "paraphrase-scope-repair" and bad:
+                    mutated = [dict(scope) for scope in expected]
+                    mutated[0]["statement"] += " (paraphrased)"
+                    if bad == mutated:
                         observed = True
-                    if outcome == "paraphrase-scope-repair" and bad and good:
-                        if bad[0]["statement"] == good[0]["statement"] + " (paraphrased)":
-                            observed = True
             for correction in corrections:
                 json.loads(correction)
         if not observed:

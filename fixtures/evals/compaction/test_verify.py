@@ -19,6 +19,25 @@ class VerifierTests(unittest.TestCase):
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name)
 
+    def test_fixture_facts_support_legacy_and_sectioned_continuations(self):
+        from verify import continuation_facts
+        legacy = {"continuation": json.dumps({"facts": {"early": "violet-7391"}})}
+        self.assertEqual(continuation_facts(legacy), {"early": "violet-7391"})
+        sections = {"format": "bcode.compaction.continuation-sections.v1", "decisions": "",
+                    "active_work_blockers": "", "findings_evidence": '{"early":"violet-7391"}\n{"late":"kept"}',
+                    "background": 'BCODE_FIXTURE_STATE_V1 {"facts":{}}'}
+        def decode(value):
+            return continuation_facts({"continuation": json.dumps(value)})
+        self.assertEqual(decode(sections), {"early": "violet-7391", "late": "kept"})
+        for invalid in (dict(sections, format="future"), dict(sections, findings_evidence=[]),
+                        dict(sections, findings_evidence='{"early":3}'),
+                        dict(sections, findings_evidence='{"early":"first"}\n{"early":"second"}')):
+            with self.assertRaises(ValueError):
+                decode(invalid)
+        # Background claims cannot mask loss of the actual evidence section.
+        missing = dict(sections, findings_evidence="", background=json.dumps({"facts": {"early": "violet-7391"}}))
+        self.assertNotIn("early", decode(missing))
+
     def test_cross_run_workload_ignores_only_local_event_offsets(self):
         from verify_automatic import canonical_user_workload
 

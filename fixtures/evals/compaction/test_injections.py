@@ -1,8 +1,8 @@
-"""Synthetic delivery-verifier tests, not successful integration artifacts."""
+"""Fault delivery must be backed by captured carry, not incremental-update shape."""
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 from verify_injections import verify_injections
 
@@ -22,6 +22,12 @@ class InjectionEvidenceTests(unittest.TestCase):
         (path / "response.json").write_text(response)
         return path
 
+    def carry(self, path, scopes):
+        prompt = "Prior structured synthesis: " + json.dumps({"current_scope": scopes})
+        prompt += "\n\nSource fragments (JSON lines):\n"
+        (path / "request.json").write_text(json.dumps({
+            "messages": [{"content": [{"text": prompt}]}]}))
+
     def test_missing_delivery_is_not_coverage(self):
         with self.assertRaisesRegex(ValueError, "no actual"):
             verify_injections(self.root, "repair")
@@ -40,18 +46,21 @@ class InjectionEvidenceTests(unittest.TestCase):
             verify_injections(self.root, "repair")
 
     def test_scope_omission_requires_observed_effect_not_just_setting(self):
-        self.attempt("omit-scope-repair", '{"current_scope":[]}')
+        initial = self.attempt("omit-scope-repair", '{"current_scope":[]}')
         path = self.attempt("omit-scope-repair", '{"current_scope":[]}', correction=True, name="correction")
         with self.assertRaisesRegex(ValueError, "no effective"):
             verify_injections(self.root, "omit-scope-repair")
-        (path / "response.json").write_text('{"current_scope":[{"source_sequence":7,"statement":"read only"}]}')
+        scopes = [{"source_sequence": 7, "statement": "read only"}]
+        self.carry(initial, scopes)
+        (path / "response.json").write_text(json.dumps({"current_scope": scopes}))
         verify_injections(self.root, "omit-scope-repair")
 
     def test_uncorrected_new_scope_does_not_hide_required_effective_repair(self):
         self.attempt("omit-scope-repair", '{"current_scope":[{"statement":"new"}]}', source="first")
         with self.assertRaisesRegex(ValueError, "no effective"):
             verify_injections(self.root, "omit-scope-repair")
-        self.attempt("omit-scope-repair", '{"current_scope":[]}', source="later", name="bad")
+        initial = self.attempt("omit-scope-repair", '{"current_scope":[]}', source="later", name="bad")
+        self.carry(initial, [{"statement": "retained"}])
         self.attempt("omit-scope-repair", '{"current_scope":[{"statement":"retained"}]}',
                      correction=True, source="later", name="fixed")
         verify_injections(self.root, "omit-scope-repair")
@@ -65,3 +74,49 @@ class InjectionEvidenceTests(unittest.TestCase):
         (path / "response.json").write_text(json.dumps({"continuation": "x" * 5924}))
         with self.assertRaisesRegex(ValueError, "complete serialized"):
             verify_injections(self.root, "near-limit")
+
+
+class InjectionTests(unittest.TestCase):
+    def test_scope_fault_requires_effective_change_to_captured_carry(self):
+        carried = [{"statement": "No network access", "source_sequence": 2, "supersedes": []}]
+        for outcome in ("omit-scope-repair", "paraphrase-scope-repair"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                bad = [] if outcome == "omit-scope-repair" else [
+                    dict(carried[0], statement="No network access (paraphrased)")]
+                for name, correction, scope in (("initial", False, bad), ("repair", True, [])):
+                    attempt = root / f"attempt-{name}"
+                    attempt.mkdir()
+                    (attempt / "ready.json").write_text(json.dumps({
+                        "outcome": outcome, "correction": correction, "source_sha256": "same-source"}))
+                    (attempt / "finished.json").write_text(json.dumps({"response_ok": True}))
+                    (attempt / "response.json").write_text(json.dumps({"current_scope": scope}))
+                # An empty incremental update alone is not evidence of lost scope.
+                with self.assertRaises(ValueError):
+                    verify_injections(root, outcome)
+                request = root / "attempt-initial" / "request.json"
+                prompt = "Prior structured synthesis: " + json.dumps({"current_scope": carried})
+                prompt += "\n\nSource fragments (JSON lines):\n"
+                request.write_text(json.dumps({"messages": [{"content": [{"text": prompt}]}]}))
+                self.assertTrue(verify_injections(root, outcome)["fault_delivery_only"])
+                (root / "attempt-initial" / "response.json").write_text(
+                    json.dumps({"current_scope": carried}))
+                with self.assertRaises(ValueError):
+                    verify_injections(root, outcome)
+
+    def test_near_limit_section_update_requires_intact_fixture_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            attempt = Path(directory) / "attempt-initial"
+            attempt.mkdir()
+            (attempt / "ready.json").write_text(json.dumps({"outcome": "near-limit"}))
+            (attempt / "finished.json").write_text(json.dumps({"response_ok": True}))
+            for background, accepted in (("BCODE_FIXTURE_STATE_V1 {}", True), ("lost state", False)):
+                response = {"format": "bcode.compaction.section-update.v2",
+                            "sections": {"background": background}}
+                response["sections"]["background"] += " " * (5924 - len(json.dumps(response)))
+                (attempt / "response.json").write_text(json.dumps(response))
+                if accepted:
+                    self.assertTrue(verify_injections(directory, "near-limit")["fault_delivery_only"])
+                else:
+                    with self.assertRaises(ValueError):
+                        verify_injections(directory, "near-limit")

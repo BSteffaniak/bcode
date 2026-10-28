@@ -31,7 +31,7 @@ struct Control {
     timeout: Duration,
     outcome: String,
     correction: bool,
-    has_carried_scope: bool,
+    carried_scope: Option<Value>,
 }
 
 impl Control {
@@ -96,23 +96,22 @@ impl Control {
             .map_err(|_| "cannot create compaction scratch attempt")?
             .keep();
         let prompt = last_user_text(&request.messages);
-        let has_carried_scope = source_prompt(&prompt)
+        let carried_scope = source_prompt(&prompt)
             .split_once("Prior structured synthesis: ")
             .and_then(|(_, rest)| rest.split_once("\n\nSource fragments (JSON lines):\n"))
             .and_then(|(prior, _)| serde_json::from_str::<Value>(prior).ok())
-            .and_then(|prior| {
+            .filter(|prior| {
                 prior
                     .get("current_scope")
                     .and_then(Value::as_array)
-                    .map(|scopes| !scopes.is_empty())
-            })
-            .unwrap_or(false);
+                    .is_some_and(|scopes| !scopes.is_empty())
+            });
         let control = Self {
             directory,
             pause,
             timeout: Duration::from_millis(timeout),
             outcome: outcome.to_owned(),
-            has_carried_scope,
+            carried_scope,
             correction: request
                 .metadata
                 .contains_key("bcode_structured_result_correction_attempt")
@@ -223,9 +222,19 @@ impl Control {
                 mutate_synthesis(text, &self.outcome)
             }
             "omit-scope-repair" | "paraphrase-scope-repair"
-                if !self.correction && self.has_carried_scope =>
+                if !self.correction && self.carried_scope.is_some() =>
             {
-                mutate_synthesis(text, self.outcome.trim_end_matches("-repair"))
+                // Incremental omission means unchanged, not deletion. Mutate the actual
+                // full carried envelope so the preservation validator sees a real fault.
+                text?;
+                mutate_synthesis(
+                    Ok(self
+                        .carried_scope
+                        .as_ref()
+                        .expect("guarded carry")
+                        .to_string()),
+                    self.outcome.trim_end_matches("-repair"),
+                )
             }
             _ => text,
         }
@@ -267,11 +276,13 @@ fn mutate_synthesis(
                     let padding = TARGET
                         .checked_sub(encoded.chars().count())
                         .ok_or("fixture carry already exceeds near-limit target")?;
-                    let continuation = value["continuation"]
-                        .as_str()
-                        .ok_or("missing continuation")?;
-                    value["continuation"] =
-                        Value::String(format!("{continuation}{}", " ".repeat(padding)));
+                    let continuation = if value.get("continuation").is_some() {
+                        &mut value["continuation"]
+                    } else {
+                        &mut value["sections"]["background"]
+                    };
+                    let text = continuation.as_str().ok_or("missing narrative section")?;
+                    *continuation = Value::String(format!("{text}{}", " ".repeat(padding)));
                 }
                 _ => return Err("unsupported synthesis mutation".into()),
             }
@@ -445,7 +456,7 @@ mod tests {
             timeout: Duration::from_millis(20),
             outcome: outcome.into(),
             correction,
-            has_carried_scope: true,
+            carried_scope: None,
         }
     }
 
@@ -602,9 +613,9 @@ mod tests {
                     persistent["current_scope"].as_array().unwrap().last(),
                     original["current_scope"].as_array().unwrap().last()
                 );
-                let candidate = control(scratch.path(), &repair, correction)
-                    .response(Ok(text.clone()))
-                    .unwrap();
+                let mut repair_control = control(scratch.path(), &repair, correction);
+                repair_control.carried_scope = Some(original.clone());
+                let candidate = repair_control.response(Ok(text.clone())).unwrap();
                 if correction {
                     assert_eq!(candidate, text);
                 } else {

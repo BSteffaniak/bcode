@@ -18,7 +18,7 @@ from verify_automatic import accepted_checkpoint, admitted_turn, attempts, verif
 
 
 class Driver:
-    def __init__(self, binary, interruption, timeout, adaptive_packing=False, source_repeat=1800,
+    def __init__(self, binary, interruption, timeout, adaptive_packing=False, source_repeat=18000,
                  legacy_restart_cancel=False):
         self.legacy_restart_cancel = legacy_restart_cancel
         self.adaptive_packing = adaptive_packing
@@ -387,14 +387,14 @@ def main():
                         help="Historical workaround only; does NOT prove automatic recovery")
     parser.add_argument("--timeout-secs", type=int, default=60)
     parser.add_argument("--adaptive-packing", action="store_true", help="Opt into real experimental adaptive packing")
-    parser.add_argument("--source-repeat", type=int, default=1800, help="Bounded canonical source size for paired packing trials")
+    parser.add_argument("--source-repeat", type=int, default=18000, help="Bounded source size; default exceeds one capacity-first synthesis request")
     args = parser.parse_args()
     if not args.binary.is_absolute() or not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         parser.error("--binary requires an explicit absolute executable path")
     if not 1 <= args.timeout_secs <= 300:
         parser.error("timeout must be 1..300 seconds")
-    if not 1800 <= args.source_repeat <= 6000:
-        parser.error("source repeat must be 1800..6000")
+    if not 1800 <= args.source_repeat <= 24000:
+        parser.error("source repeat must be 1800..24000")
     if args.legacy_restart_cancel and args.interruption == "cancel":
         parser.error("legacy restart cancellation applies only to restart/crash")
     driver = Driver(args.binary, args.interruption, args.timeout_secs, args.adaptive_packing,
