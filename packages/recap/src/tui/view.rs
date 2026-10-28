@@ -181,7 +181,7 @@ impl App {
                             p.text(),
                         ))
                         .child(Self::label(
-                            "Resize to 34 × 13 or larger. F10 closes safely.",
+                            "Resize to 34 × 13 or larger. F10 / Ctrl+C closes safely.",
                             p.quiet(),
                         ))
                         .child(Self::label(
@@ -217,7 +217,7 @@ impl App {
         let footer = Column::new()
             .child(Self::label(self.status.clone(), p.quiet()))
             .child(Self::label(
-                "F2 Generate   F3 Chapters   F4 Focus   F5 Export   F6 Open   F8 Theme   F10 Quit",
+                "F2 Generate   F3 Chapters   F4 Focus   F5 Export   F6 Open   F8 Theme   F10/Ctrl+C Quit",
                 Style::new().fg(p.accent),
             ));
         Element::new(

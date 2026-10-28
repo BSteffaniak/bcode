@@ -355,6 +355,16 @@ impl App {
         Update::redraw()
     }
     fn terminal(&mut self, event: &Event) -> Update<Message> {
+        // Quit belongs to the application, never to the focused editor or button.
+        // Raw mode delivers Ctrl+C as input rather than generating SIGINT.
+        if event.key().is_some_and(|key| {
+            key.key == KeyCode::F(10)
+                || (key.modifiers.ctrl
+                    && !key.modifiers.alt
+                    && matches!(key.key, KeyCode::Char('c' | 'C' | 'q' | 'Q')))
+        }) {
+            return self.action("quit");
+        }
         if let Event::Resize(size) = event {
             self.size.set((size.width, size.height));
             self.layout.replace(None);

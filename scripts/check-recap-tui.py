@@ -415,6 +415,17 @@ def default_journeys():
     quit_key = '\x1b[21~'  # F10; no printable q can intercept source editing.
     theme_key = '\x1b[19~'  # F8 cycles dark -> light -> reduced ANSI palette.
     return [
+        {'name': 'ctrl-c-exits-focused-source', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.'], 'send': 'editable source'},
+            {'expect': ['editable source'], 'send': '\x03'},
+        ], 'exit_code': 0},
+        {'name': 'ctrl-q-exits-focused-refinement', 'args': ['tui', '--id', 'unicode-field-notes'], 'steps': [
+            {'expect': ['Unicode field notes'], 'send': '\x1b[14~'},
+            {'expect': ['REFINE THIS RECAP'], 'send': '\x11'},
+        ], 'exit_code': 0},
+        {'name': 'f10-exits-focused-source', 'args': ['tui'], 'steps': [
+            {'expect': ['From video to perspective.'], 'send': quit_key},
+        ], 'exit_code': 0},
         {'name': 'palette-cycle-resize-teardown', 'args': ['tui', '--id', 'unicode-field-notes'], 'steps': [
             {'expect': ['Unicode field notes', '日本語'], 'send': theme_key},
             {'expect': ['Unicode field notes', '日本語'], 'send': theme_key},

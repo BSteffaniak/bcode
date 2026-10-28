@@ -34,7 +34,7 @@ recap --store /absolute/path/recaps tui --id existing-recap
 
 Bare `recap` opens the BMUX terminal application only with terminal stdin/stdout/stderr; otherwise it prints help. Explicit `recap tui` requires a terminal. Existing one-shot subcommands remain headless even in a terminal: no alternate screen, prompts or implicit browser opening.
 
-The TUI has source/model fields, source/transcript options, a bounded local library, stage/elapsed-time progress, a chapter reader, optional focus refinement, HTML export and explicit browser opening. `F2` generates, `F3` toggles chapters/library, `F4` opens focus/source options, `F5` exports, `F6` opens exported HTML, `F8` cycles themes, and `F10` quits. Tab and mouse navigate controls. Escape requests cancellation while working. Themes are currently per-launch presentation choices; `NO_COLOR` starts monochrome. Native still previews depend on the terminal's advertised BMUX image capabilities; HTML remains the video-playback surface. A theme change does not rewrite model configuration.
+The TUI has source/model fields, source/transcript options, a bounded local library, stage/elapsed-time progress, a chapter reader, optional focus refinement, HTML export and explicit browser opening. `F2` generates, `F3` toggles chapters/library, `F4` opens focus/source options, `F5` exports, `F6` opens exported HTML, `F8` cycles themes, and `F10`, `Ctrl+C`, or `Ctrl+Q` quits. Tab and mouse navigate controls. Escape requests cancellation while working. Themes are currently per-launch presentation choices; `NO_COLOR` starts monochrome. Native still previews depend on the terminal's advertised BMUX image capabilities; HTML remains the video-playback surface. A theme change does not rewrite model configuration.
 
 ## Generate
 

@@ -194,3 +194,80 @@ fn committed_source_and_options_focus_accept_unicode_without_shortcut_collisions
     }
     assert_eq!(app.text(2), "Compare motion");
 }
+
+fn quit_keys() -> [bmux_keyboard::KeyStroke; 3] {
+    use bmux_keyboard::{KeyStroke, Modifiers};
+    [
+        KeyStroke::simple(KeyCode::F(10)),
+        KeyStroke {
+            key: KeyCode::Char('c'),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        },
+        KeyStroke {
+            key: KeyCode::Char('q'),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        },
+    ]
+}
+
+#[test]
+fn quit_shortcuts_are_global_in_editors_buttons_and_tiny_viewports() {
+    use bmux_tui_runtime::Lifecycle;
+    for key in quit_keys() {
+        for (width, height) in [(120, 40), (40, 18), (1, 1), (0, 0)] {
+            for target in ["source.input", "config.input", "generate", "theme"] {
+                let mut app = App::new(TuiOptions::default());
+                let (_, hits) = paint(&app, width, height);
+                app.router.commit_scene(hits, None);
+                app.focused = FIELDS
+                    .iter()
+                    .position(|id| *id == target)
+                    .unwrap_or(usize::MAX);
+                let _ = app
+                    .router
+                    .set_focused(&bmux_tui::focus::FocusId::new(target));
+                let update = app.terminal(&Event::Key(key));
+                assert_eq!(update.lifecycle, Lifecycle::Exit);
+                assert!(app.quitting);
+                assert_eq!(app.text(0), "");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn quit_shortcuts_cancel_active_work_and_wait_for_settlement() {
+    use bmux_tui_runtime::Lifecycle;
+    for key in quit_keys() {
+        let mut app = App::new(TuiOptions::default());
+        let cancel = Cancellation::default();
+        app.active = Some(Active {
+            id: 17,
+            cancel: cancel.clone(),
+            started: Instant::now(),
+            stage: Some(Stage::Composition),
+            cancelling: false,
+            task: tokio::spawn(async {}),
+        });
+        let update = app.terminal(&Event::Key(key));
+        assert_ne!(update.lifecycle, Lifecycle::Exit);
+        assert!(cancel.is_cancelled());
+        assert!(app.active.as_ref().unwrap().cancelling);
+        let active = app.active.as_mut().unwrap();
+        (&mut active.task).await.unwrap();
+        let settled = app
+            .update(RuntimeEvent::Message(Message::Settled(
+                17,
+                Box::new(Err("cancelled".into())),
+            )))
+            .unwrap();
+        assert_eq!(settled.lifecycle, Lifecycle::Exit);
+        assert!(app.active.is_none());
+    }
+}
