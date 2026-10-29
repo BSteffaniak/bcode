@@ -111,7 +111,46 @@ impl Composer<'_> {
         previous: Option<&RecapDocument>,
         cancellation: &Cancellation,
     ) -> Result<RecapDocument, CompositionError> {
+        self.compose_with_policy(
+            grounded,
+            images,
+            intent,
+            previous,
+            &crate::analysis_contracts::DetailedPolicy::default(),
+            cancellation,
+        )
+        .await
+    }
+
+    /// Compose with explicit comprehensive-analysis allowances.
+    ///
+    /// # Errors
+    /// Rejects invalid grounding, exhausted budgets, incomplete analysis, cancellation
+    /// and model failures without modifying a prior revision.
+    pub async fn compose_with_policy(
+        &self,
+        grounded: &RecapDocument,
+        images: Vec<ImageAsset>,
+        intent: GenerationIntent,
+        previous: Option<&RecapDocument>,
+        policy: &crate::analysis_contracts::DetailedPolicy,
+        cancellation: &Cancellation,
+    ) -> Result<RecapDocument, CompositionError> {
         check_cancelled(cancellation)?;
+        if intent.depth == crate::contracts::Depth::Detailed {
+            grounded.validate()?;
+            validate_images(grounded, &images, self.limits)?;
+            return crate::detailed::compose_detailed(
+                self.executor,
+                grounded,
+                images,
+                intent,
+                previous,
+                policy,
+                cancellation,
+            )
+            .await;
+        }
         grounded.validate()?;
         validate_images(grounded, &images, self.limits)?;
         if grounded.evidence.is_empty() {

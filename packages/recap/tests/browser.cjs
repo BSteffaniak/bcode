@@ -40,6 +40,65 @@ async function pollElement(locator, predicate, label) {
   throw new Error(`Timed out: ${label}`);
 }
 
+// Asset-level stress coverage, not a substitute for the real-engine file acceptance below.
+async function checkDenseReader(browser) {
+  const assets = path.join(__dirname, '../src/export_assets');
+  const css = fs.readFileSync(path.join(assets, 'recap.css'), 'utf8');
+  const script = fs.readFileSync(path.join(assets, 'recap.js'), 'utf8');
+  const count = 160;
+  const title = index => `Chapter ${index + 1}: 深い理解 — café 👩🏽‍💻 and a carefully explained source`;
+  const links = Array.from({ length: count }, (_, index) => `<li><a href="#chapter-${index}">${title(index)}</a></li>`).join('');
+  const chapters = Array.from({ length: count }, (_, index) => `<section class="chapter" id="chapter-${index}"><h2>${title(index)}</h2><div class="prose"><p>${('Substantive explanation with context, qualifications, and source detail. '.repeat(24) + '\n\n').repeat(3)}End of chapter ${index + 1}.</p></div><a class="back-to-contents" href="#contents">Back to contents ↑</a></section>`).join('');
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>${css}</style></head><body><div class="shell"><div class="hero"><h1>A detailed readable video</h1></div><div class="layout"><nav id="contents" class="contents" aria-label="Recap chapters"><h2>In this recap</h2><details open><summary>Browse chapters</summary><ol>${links}</ol></details></nav><main id="main">${chapters}</main></div></div><script>${script}</script></body></html>`;
+  for (const javaScriptEnabled of [true, false]) {
+    const context = await browser.newContext({ javaScriptEnabled, offline: true, reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } });
+    try {
+      const page = await context.newPage();
+      const errors = [];
+      page.on('pageerror', error => errors.push(error.message));
+      await page.setContent(html);
+      assert.equal(await page.locator('.contents li').count(), count);
+      assert.equal(await page.locator('.chapter').count(), count);
+      assert.ok(await page.locator('main').textContent().then(text => text.includes('End of chapter 160.')));
+      assert.equal(await page.locator('.contents').evaluate(element => element.getBoundingClientRect().height < innerHeight), true, 'desktop contents must fit the viewport');
+      const last = page.locator('.contents a').last();
+      await last.focus();
+      await page.keyboard.press('Enter');
+      await pollElement(page.locator('#chapter-159'), element => Math.abs(element.getBoundingClientRect().top) < 200, 'last chapter navigation');
+      if (javaScriptEnabled) {
+        await pollElement(last, element => element.getAttribute('aria-current') === 'location', 'last chapter highlighting');
+        // Scrolling within a very tall chapter must not lose the current chapter.
+        await page.locator('#chapter-80').evaluate(element => scrollTo(0, element.offsetTop + 500));
+        await pollElement(page.locator('.contents a').nth(80), element => element.hasAttribute('aria-current'), 'long chapter highlighting');
+        assert.equal(await page.locator('.contents a[aria-current]').count(), 1);
+        const search = page.getByRole('searchbox', { name: 'Find a chapter' });
+        await search.fill('Chapter 160:');
+        assert.equal(await page.locator('.contents li:visible').count(), 1);
+        assert.equal(await page.locator('.chapter:visible').count(), count, 'search must not hide document content');
+        await search.fill('no chapter matches this');
+        assert.equal(await page.getByRole('status').textContent(), '0 of 160 chapters');
+        await search.press('Escape');
+        assert.equal(await page.locator('.contents li:visible').count(), count);
+      } else {
+        assert.equal(await page.getByRole('searchbox').count(), 0);
+      }
+      for (const width of [390, 320, 1280]) {
+        await page.setViewportSize({ width, height: 844 });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px reader must not overflow`);
+        await last.focus();
+        await page.keyboard.press('Enter');
+        await pollElement(page.locator('#chapter-159'), element => Math.abs(element.getBoundingClientRect().top) < 200, 'resized last chapter navigation');
+      }
+      await page.locator('.back-to-contents').last().click();
+      await page.locator('.contents summary').click();
+      assert.equal(await page.locator('.contents details').getAttribute('open'), null);
+      assert.equal(await page.locator('.chapter:visible').count(), count);
+      assert.deepEqual(errors, []);
+    } finally { await context.close(); }
+  }
+  console.log('PASS dense reader assets: 160 long chapters, JS on/off, keyboard navigation, search, active chapter, mobile/desktop');
+}
+
 (async () => {
   const playwright = discoverPlaywright();
   if (!playwright) {
@@ -52,17 +111,22 @@ async function pollElement(locator, predicate, label) {
     console.log(`Executable present: ${fs.existsSync(playwright.chromium.executablePath())}`);
     return;
   }
+  const denseOnly = process.argv.includes('--dense');
   const inspection = process.argv[2] === '--inspect';
   const html = inspection ? path.resolve(process.argv[3]) : path.join(path.resolve(process.argv[2] || ''), 'recap.html');
   const directory = inspection ? path.resolve(process.argv[4] || '/tmp/recap-live-browser') : path.dirname(html);
-  fs.mkdirSync(directory, { recursive: true });
-  assert.ok(fs.existsSync(html), 'real-engine acceptance must generate recap.html first');
+  if (!denseOnly) {
+    fs.mkdirSync(directory, { recursive: true });
+    assert.ok(fs.existsSync(html), 'real-engine acceptance must generate recap.html first');
+  }
   const executable = process.env.RECAP_CHROMIUM_EXECUTABLE;
   // Playwright's cached Chromium may omit proprietary H.264 decoding. A real MP4
   // acceptance therefore defaults to already-installed Chrome, never an install.
   const browser = await playwright.chromium.launch({ headless: true, ...(executable ? { executablePath: executable } : { channel: 'chrome' }) });
   console.log(`Browser: ${executable || 'installed Google Chrome (H.264-capable)'}`);
   try {
+    await checkDenseReader(browser);
+    if (denseOnly) return;
     for (const javaScriptEnabled of [true, false]) {
       console.log(`Checking offline file, JavaScript ${javaScriptEnabled ? 'enabled' : 'disabled'}`);
       const context = await browser.newContext({ javaScriptEnabled, offline: true, viewport: { width: 1280, height: 900 } });

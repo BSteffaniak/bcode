@@ -44,6 +44,14 @@ The standalone application retains a maximum of 128 events per operation, includ
 
 Reports exclude prompts, captions, source URLs, signed URLs, frames, credentials, raw executable output, and provider payloads. Failed operations show their phase, diagnostic ID and safe guidance in CLI/TUI; TUI failures have a scrollable details view retrievable with F9 after navigation. Plugin failures include phase and inference/commit observations without changing successful document response contracts. A successful save followed by failed HTML export remains a committed revision with an export failure, not a failed generation or a successful export.
 
+## Comprehensive Detailed generation
+
+`Detailed` is a source-information-preserving readable adaptation, while Brief and Standard retain selective recap behavior. The portable library owns a multi-stage pipeline behind an injected typed analysis executor: window inventories, inspected visual observations, item-accounted chapter planning, chapter composition, source-based auditing, and bounded targeted repair. Final assembly does not summarize chapters again. Chapter count follows source content rather than a fixed editorial cap.
+
+Source windows and information items carry host-validated evidence identities. Extraction and model-declared coverage are not proof of semantic completeness: audits compare drafts to source evidence, and the reader must retain unresolved acquisition or inspection limitations. Sampled frames do not establish complete visual coverage. Focus changes emphasis rather than implicitly restricting Detailed's coverage.
+
+Resource allowances are distinct from editorial coverage. Exhausted allowances and unsupported analysis execution fail explicitly rather than silently falling back to Standard. Intermediate analysis is operation-local; no implicit durable prompt/checkpoint cache is introduced. The existing versioned document shape and unknown-version rejection remain authoritative. Prior revisions remain unchanged until a validated successor commits.
+
 ## Acceptance
 
 Deterministic model adapters test pipeline mechanics, not live model quality. Local media tests must exercise actual extraction, composition, storage, and export. Browser acceptance opens `file://` output offline, with JavaScript enabled and disabled, verifies embedded media behavior, and inspects narrow and wide layouts. YouTube acquisition and live model quality require separate real-path evidence; a supplied transcript or precomposed JSON does not establish those capabilities.

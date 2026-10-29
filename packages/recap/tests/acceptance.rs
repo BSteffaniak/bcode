@@ -46,20 +46,7 @@ impl ModelExecutor for DeterministicModel {
             let grounded: RecapDocument =
                 serde_json::from_value(input["untrusted_source"].clone()).unwrap();
             let intent: GenerationIntent = serde_json::from_value(input["intent"].clone()).unwrap();
-            assert_eq!(
-                grounded.transcript.len(),
-                1,
-                "caller-supplied captions must survive acquisition"
-            );
-            assert_eq!(grounded.transcript[0].text, "The test pattern changes.");
-            assert_eq!(
-                request.images.len(),
-                grounded
-                    .assets
-                    .iter()
-                    .filter(|asset| asset.mime_type.starts_with("image/"))
-                    .count()
-            );
+            validate_received_grounding(&request, &grounded);
             let clip = grounded
                 .assets
                 .iter()
@@ -139,6 +126,23 @@ impl ModelExecutor for DeterministicModel {
     }
 }
 
+fn validate_received_grounding(request: &ModelRequest, grounded: &RecapDocument) {
+    assert_eq!(
+        grounded.transcript.len(),
+        1,
+        "caller-supplied captions must survive acquisition"
+    );
+    assert_eq!(grounded.transcript[0].text, "The test pattern changes.");
+    assert_eq!(
+        request.images.len(),
+        grounded
+            .assets
+            .iter()
+            .filter(|asset| asset.mime_type.starts_with("image/"))
+            .count()
+    );
+}
+
 fn validate_received_images(request: &ModelRequest) {
     assert!(!request.instructions.contains(HOSTILE));
     assert!(
@@ -171,6 +175,8 @@ fn options(root: &Path) -> EngineOptions {
             ..MediaBudget::default()
         },
         composition: CompositionLimits::default(),
+        detailed: bcode_recap::analysis_contracts::DetailedPolicy::default(),
+        inspection: bcode_recap::media::InspectionBudget::default(),
         export: ExportBudget::default(),
     }
 }
@@ -220,6 +226,197 @@ fn request(path: std::path::PathBuf) -> GenerateRequest {
         transcript: Some("WEBVTT\n\n00:00.000 --> 00:02.000\nThe test pattern changes.\n".into()),
         intent: GenerationIntent::default(),
     }
+}
+
+#[derive(Default)]
+struct DetailedInspectionProbe {
+    inspected: AtomicUsize,
+}
+
+impl ModelExecutor for DetailedInspectionProbe {
+    fn execute<'a>(&'a self, _request: ModelRequest, _cancel: &'a Cancellation) -> ModelFuture<'a> {
+        panic!("Detailed must use the staged analysis interface")
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: bcode_recap::model::AnalysisRequest,
+        _cancel: &'a Cancellation,
+    ) -> bcode_recap::model::AnalysisFuture<'a> {
+        use bcode_recap::analysis_contracts::{AnalysisResponse, AnalysisStage};
+        Box::pin(async move {
+            match request.stage {
+                AnalysisStage::ExtractionInventory => {
+                    let window = &request.input["window"];
+                    let speech = request.input["untrusted_source"]["evidence"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|evidence| {
+                            !evidence["transcript_segment_ids"]
+                                .as_array()
+                                .unwrap()
+                                .is_empty()
+                        })
+                        .unwrap();
+                    let response = serde_json::json!({
+                        "window_id": window["id"],
+                        "items": [{"id":"pattern", "window_id":window["id"], "range":speech["range"],
+                            "kind":"fact", "text":"The test pattern changes.", "evidence_ids":[speech["id"]]}],
+                        "limitations":[]
+                    });
+                    AnalysisResponse::from_json_slice(
+                        request.stage,
+                        &serde_json::to_vec(&response).unwrap(),
+                        request.max_response_bytes,
+                    )
+                }
+                AnalysisStage::VisualInspection => {
+                    assert!(!request.images.is_empty());
+                    assert!(
+                        request.images.len() <= 4,
+                        "composition image cap must constrain inspection extraction"
+                    );
+                    let assets = request.input["untrusted_source"]["assets"]
+                        .as_array()
+                        .unwrap();
+                    for image in &request.images {
+                        assert!(image.bytes.starts_with(&[0xff, 0xd8, 0xff]));
+                        let asset = assets
+                            .iter()
+                            .find(|asset| asset["id"].as_str() == Some(image.asset_id.as_str()))
+                            .unwrap();
+                        let evidence_id = format!("evidence-{}", image.asset_id);
+                        assert!(
+                            request.input["untrusted_source"]["evidence"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|evidence| evidence["id"].as_str()
+                                    == Some(evidence_id.as_str())
+                                    && evidence["range"] == asset["range"])
+                        );
+                    }
+                    self.inspected.store(request.images.len(), Ordering::SeqCst);
+                    // Stop before editorial stages: this fixture proves actual adaptive
+                    // extraction/registration/admission, not model quality or success.
+                    Err(bcode_recap::model::ModelError::Unavailable)
+                }
+                _ => panic!("inspection probe must stop before editorial stages"),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn detailed_real_video_uses_adaptive_inspection_with_effective_image_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let model = DetailedInspectionProbe::default();
+    let mut configured = options(root.path());
+    configured.composition.images = 4;
+    configured.inspection.min_spacing_ms = 0;
+    assert_eq!(configured.inspection.max_candidates, 96);
+    let mut input = request(video(root.path()).await);
+    input.intent.depth = Depth::Detailed;
+    let engine = Engine {
+        executor: &model,
+        store: DocumentStore::new(root.path().join("store"), 1_000_000),
+        options: configured,
+    };
+    let error = engine
+        .prepare(&input, &Cancellation::default(), &mut |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EngineError::Composition(bcode_recap::composition::CompositionError::Model(
+            bcode_recap::model::ModelError::Unavailable
+        ))
+    ));
+    assert_eq!(model.inspected.load(Ordering::SeqCst), 4);
+    assert!(
+        engine.store.load(&input.id).is_err(),
+        "failed analysis must not commit"
+    );
+}
+
+#[tokio::test]
+async fn detailed_rejects_unusable_effective_inspection_bound_before_inference() {
+    let root = tempfile::tempdir().unwrap();
+    let model = DetailedInspectionProbe::default();
+    let mut configured = options(root.path());
+    configured.composition.images = 1;
+    let mut input = request(video(root.path()).await);
+    input.intent.depth = Depth::Detailed;
+    let engine = Engine {
+        executor: &model,
+        store: DocumentStore::new(root.path().join("store"), 1_000_000),
+        options: configured,
+    };
+    assert!(matches!(
+        engine
+            .prepare(&input, &Cancellation::default(), &mut |_| {})
+            .await,
+        Err(EngineError::Invalid(_))
+    ));
+    assert_eq!(model.inspected.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn unreferenced_inspection_evidence_is_retained_but_not_read_by_export() {
+    let root = tempfile::tempdir().unwrap();
+    let model = DeterministicModel::default();
+    let engine = Engine {
+        executor: &model,
+        store: DocumentStore::new(root.path().join("store"), 1_000_000),
+        options: options(root.path()),
+    };
+    let document = engine
+        .generate(
+            &request(video(root.path()).await),
+            &Cancellation::default(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    let used: std::collections::BTreeSet<_> = document
+        .sections
+        .iter()
+        .flat_map(|section| &section.blocks)
+        .flat_map(|block| match &block.content {
+            BlockContent::Text { .. } => vec![],
+            BlockContent::Image { asset_id, .. } | BlockContent::Clip { asset_id, .. } => {
+                vec![asset_id.as_str()]
+            }
+            BlockContent::Comparison { items } => {
+                items.iter().map(|item| item.asset_id.as_str()).collect()
+            }
+        })
+        .collect();
+    let unused = document
+        .assets
+        .iter()
+        .find(|asset| !used.contains(asset.id.as_str()))
+        .expect("fixture provides more evidence than publication uses");
+    fs::remove_file(
+        engine
+            .store
+            .asset_directory(&document.id)
+            .unwrap()
+            .join(unused.path.as_str()),
+    )
+    .unwrap();
+    let html = engine
+        .export(&document.id, &Cancellation::default(), &mut |_| {})
+        .unwrap();
+    assert!(
+        html.report.degradations.is_empty(),
+        "unreferenced evidence must not be embedded or read"
+    );
+    assert_eq!(
+        engine.store.load(&document.id).unwrap().assets,
+        document.assets
+    );
 }
 
 #[tokio::test]
@@ -275,7 +472,9 @@ async fn real_video_generate_export_refine_and_missing_offline_asset() {
     assert!(html.report.embedded_media_bytes > 100);
     let focus = GenerationIntent {
         focus: Some("Explain the changing pattern".into()),
-        depth: Depth::Detailed,
+        // This fixture exercises the selective single-pass adapter. Detailed's
+        // staged analysis uses the separate real-media inspection test below.
+        depth: Depth::Standard,
     };
     let refined = engine
         .refine(

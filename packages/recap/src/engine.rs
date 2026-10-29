@@ -62,6 +62,10 @@ pub struct EngineOptions {
     pub media: MediaBudget,
     /// Model context and response allowances.
     pub composition: CompositionLimits,
+    /// Comprehensive analysis policy, independent of editorial chapter count.
+    pub detailed: crate::analysis_contracts::DetailedPolicy,
+    /// Adaptive visual observation allowances for Detailed generation.
+    pub inspection: media::InspectionBudget,
     /// Portable export limits.
     pub export: ExportBudget,
 }
@@ -154,28 +158,18 @@ impl Engine<'_> {
             acquired.captions.clone()
         };
         let transcript = source::transcript_segments(&captions, metadata.duration_ms)?;
-        let (times, clips) = select_moments(
-            metadata.duration_ms,
-            &transcript,
-            &request.intent,
-            &self.options.media,
-        );
         cancel.emit(crate::diagnostics::Event::Phase {
             phase: crate::diagnostics::Phase::Extraction,
         });
-        let visuals = media::extract_visuals(
-            &acquired.video,
-            &metadata,
-            &media::VisualSelection {
-                frame_times_ms: &times,
-                clips: &clips,
-            },
-            &self.options.acquisition.workspace,
-            &self.options.tools,
-            &self.options.media,
-            cancel,
-        )
-        .await?;
+        let (visuals, observation_note) = self
+            .prepare_visuals(
+                &acquired.video,
+                &metadata,
+                &transcript,
+                &request.intent,
+                cancel,
+            )
+            .await?;
         let evidence = source_evidence(&transcript, &visuals.assets);
         let source_title = acquired.title.as_ref().unwrap_or(&request.source_title);
         let grounded = RecapDocument {
@@ -211,13 +205,105 @@ impl Engine<'_> {
             self.options.composition.image_bytes,
         )?;
         stage(cancel, progress, Stage::Composition)?;
-        let document = Composer {
+        let mut document = Composer {
             executor: self.executor,
             limits: self.options.composition,
         }
-        .compose(&grounded, images, request.intent.clone(), None, cancel)
+        .compose_with_policy(
+            &grounded,
+            images,
+            request.intent.clone(),
+            None,
+            &self.options.detailed,
+            cancel,
+        )
         .await?;
+        if let Some(note) = observation_note {
+            append_observation_note(&mut document, note);
+            document.validate()?;
+        }
         Ok(PreparedRecap { document, visuals })
+    }
+
+    // Keep acquisition/composition orchestration separate from the two visual policies.
+    async fn prepare_visuals(
+        &self,
+        video: &std::path::Path,
+        metadata: &media::VideoMetadata,
+        transcript: &[crate::contracts::TranscriptSegment],
+        intent: &GenerationIntent,
+        cancel: &Cancellation,
+    ) -> Result<(VisualAssets, Option<String>), EngineError> {
+        let detailed = intent.depth == crate::contracts::Depth::Detailed;
+        let (visuals, observation_note) = if detailed && self.options.detailed.inspect_visuals {
+            self.options
+                .detailed
+                .validate()
+                .map_err(CompositionError::from)?;
+            let (inspection, inspection_media, policy_limited) = inspection_limits(&self.options)?;
+            let targeted = if intent
+                .focus
+                .as_deref()
+                .is_some_and(|focus| !focus.trim().is_empty())
+            {
+                let focus_media = MediaBudget {
+                    max_frames: self.options.media.max_frames.min(inspection.max_candidates),
+                    ..self.options.media.clone()
+                };
+                select_moments(metadata.duration_ms, transcript, intent, &focus_media).0
+            } else {
+                Vec::new()
+            };
+            let candidates = media::discover_visual_candidates(
+                video,
+                metadata,
+                transcript,
+                &targeted,
+                &self.options.tools,
+                &inspection,
+                cancel,
+            )
+            .await?;
+            let note = visual_observation_note(
+                candidates.candidates.len(),
+                inspection.max_candidates,
+                policy_limited || candidates.scene_limit_reached || candidates.selection_limited,
+            );
+            let frames = media::extract_inspection_frames(
+                video,
+                metadata,
+                &candidates,
+                &self.options.acquisition.workspace,
+                &self.options.tools,
+                &inspection_media,
+                cancel,
+            )
+            .await?;
+            (frames.visuals, Some(note))
+        } else {
+            let (times, clips) = select_moments(
+                metadata.duration_ms,
+                transcript,
+                intent,
+                &self.options.media,
+            );
+            let visuals = media::extract_visuals(
+                video,
+                metadata,
+                &media::VisualSelection {
+                    frame_times_ms: &times,
+                    clips: &clips,
+                },
+                &self.options.acquisition.workspace,
+                &self.options.tools,
+                &self.options.media,
+                cancel,
+            )
+            .await?;
+            let note = detailed.then(|| "Visual analysis was disabled by policy. Extracted source images are available, but visual-only information has not been systematically inspected; this edition does not establish complete visual coverage.".to_owned());
+            (visuals, note)
+        };
+        Ok((visuals, observation_note))
     }
 
     /// Generate and persist a new document; no existing document/assets are replaced.
@@ -301,12 +387,41 @@ impl Engine<'_> {
             self.options.composition.image_bytes,
         )?;
         stage(cancel, progress, Stage::Composition)?;
-        let candidate = Composer {
+        let detailed = intent.depth == crate::contracts::Depth::Detailed;
+        // Host observations describe acquisition policy, not source facts to be
+        // re-inventoried or rewritten by the model. Restore them verbatim below.
+        let mut composition_source = previous.clone();
+        composition_source
+            .sections
+            .retain(|section| !is_observation_note(section));
+        let mut candidate = Composer {
             executor: self.executor,
             limits: self.options.composition,
         }
-        .compose(&previous, images, intent, Some(&previous), cancel)
+        .compose_with_policy(
+            &composition_source,
+            images,
+            intent,
+            Some(&composition_source),
+            &self.options.detailed,
+            cancel,
+        )
         .await?;
+        preserve_observation_notes(&previous, &mut candidate);
+        if detailed && !previous.sections.iter().any(is_observation_note) {
+            let count = previous
+                .assets
+                .iter()
+                .filter(|asset| asset.mime_type.starts_with("image/"))
+                .count();
+            append_observation_note(
+                &mut candidate,
+                format!(
+                    "This refinement can inspect only the {count} previously registered source images. No new video frames were acquired. Visual-only information between these samples may be absent; complete visual coverage has not been established."
+                ),
+            );
+        }
+        candidate.validate()?;
         stage(cancel, progress, Stage::Export)?;
         let _export = export::export_html(
             &candidate,
@@ -341,6 +456,99 @@ impl Engine<'_> {
         check_cancelled(cancel)?;
         progress(Stage::Complete);
         Ok(result)
+    }
+}
+
+/// Derive an explicit inspection envelope without broadening publication limits.
+fn inspection_limits(
+    options: &EngineOptions,
+) -> Result<(media::InspectionBudget, MediaBudget, bool), EngineError> {
+    let mut inspection = options.inspection.clone();
+    let requested = inspection.max_candidates;
+    inspection.max_candidates = requested.min(options.composition.images).min(128);
+    if inspection.max_candidates < 2 {
+        return Err(EngineError::Invalid(
+            "Detailed inspection requires at least two image slots",
+        ));
+    }
+    inspection.temporal_anchors = inspection.temporal_anchors.min(inspection.max_candidates);
+    let mut extraction = options.media.clone();
+    extraction.max_frames = inspection.max_candidates;
+    extraction.max_clips = 0;
+    extraction.max_width = extraction.max_width.min(640);
+    extraction.max_asset_bytes = extraction
+        .max_asset_bytes
+        .min(u64::try_from(options.composition.image_bytes).unwrap_or(u64::MAX))
+        .min(u64::try_from(options.detailed.allowances.max_image_bytes).unwrap_or(u64::MAX));
+    if extraction.max_asset_bytes == 0 {
+        return Err(EngineError::Invalid(
+            "Detailed inspection image byte budget",
+        ));
+    }
+    Ok((
+        inspection,
+        extraction,
+        requested > options.composition.images.min(128),
+    ))
+}
+
+fn visual_observation_note(count: usize, effective_limit: usize, limited: bool) -> String {
+    let status = if limited || count >= effective_limit {
+        "The visual sample budget was reduced by policy, or candidate-selection limits were reached; additional source moments may not have been inspected. "
+    } else {
+        ""
+    };
+    format!(
+        "{status}This edition inspected {count} sampled source frames (effective limit: {effective_limit}), selected using scene changes, transcript cues, temporal anchors and any requested focus. These are bounded observations, not a complete inspection of the video. Visual-only details, brief changes and unreadable text between or within samples may be absent. Only imagery referenced in the document is published; the remaining inspected images are retained as source evidence for refinement."
+    )
+}
+
+const OBSERVATION_TITLE: &str = "Visual observation limits";
+const OBSERVATION_PREFIX: &str = "host-visual-observations-";
+
+fn is_observation_note(section: &crate::contracts::Section) -> bool {
+    section.title == OBSERVATION_TITLE && section.id.starts_with(OBSERVATION_PREFIX)
+}
+
+fn append_observation_note(document: &mut RecapDocument, text: String) {
+    // Avoid colliding with any model-authored section or block identity.
+    let mut index = 0_u64;
+    let (section_id, block_id) = loop {
+        let section_id = format!("{OBSERVATION_PREFIX}{index}");
+        let block_id = format!("{OBSERVATION_PREFIX}text-{index}");
+        if !document.sections.iter().any(|section| {
+            section.id == section_id || section.blocks.iter().any(|block| block.id == block_id)
+        }) {
+            break (section_id, block_id);
+        }
+        index += 1;
+    };
+    document.sections.push(crate::contracts::Section {
+        id: section_id,
+        title: OBSERVATION_TITLE.into(),
+        blocks: vec![crate::contracts::Block {
+            id: block_id,
+            evidence_ids: vec![],
+            content: crate::contracts::BlockContent::Text { text },
+        }],
+    });
+}
+
+fn preserve_observation_notes(previous: &RecapDocument, candidate: &mut RecapDocument) {
+    for prior in previous
+        .sections
+        .iter()
+        .filter(|section| is_observation_note(section))
+    {
+        if let Some(section) = candidate
+            .sections
+            .iter_mut()
+            .find(|section| section.id == prior.id)
+        {
+            section.clone_from(prior);
+        } else {
+            candidate.sections.push(prior.clone());
+        }
     }
 }
 
@@ -538,6 +746,46 @@ fn check_cancelled(cancel: &Cancellation) -> Result<(), EngineError> {
 mod tests {
     use super::*;
     use crate::contracts::{Depth, TimeRange, TranscriptSegment};
+
+    #[test]
+    fn host_visual_limit_note_is_readable_and_does_not_claim_full_coverage() {
+        let note = visual_observation_note(48, 48, true);
+        assert!(note.contains("visual sample budget"));
+        assert!(note.contains("48 sampled source frames"));
+        assert!(note.contains("not a complete inspection"));
+        let note = visual_observation_note(3, 48, false);
+        assert!(!note.contains("limits were reached"));
+        assert!(note.contains("Visual-only details"));
+    }
+
+    #[test]
+    fn observation_notes_survive_refinement_without_changing_grounding() {
+        let mut previous = crate::contracts::RecapDocument {
+            schema_version: DOCUMENT_SCHEMA_VERSION,
+            id: "notes".into(),
+            revision: 1,
+            title: "Source".into(),
+            source: Source {
+                id: "source".into(),
+                title: "Source".into(),
+                url: None,
+                duration_ms: 1000,
+            },
+            intent: GenerationIntent::default(),
+            transcript: vec![],
+            evidence: vec![],
+            assets: vec![],
+            sections: vec![],
+        };
+        append_observation_note(&mut previous, visual_observation_note(2, 48, true));
+        let mut candidate = previous.clone();
+        candidate.sections[0].blocks.clear();
+        preserve_observation_notes(&previous, &mut candidate);
+        assert_eq!(candidate.sections, previous.sections);
+        assert_eq!(candidate.assets, previous.assets);
+        assert_eq!(candidate.evidence, previous.evidence);
+        candidate.validate().unwrap();
+    }
 
     #[test]
     fn focused_source_moments_prioritize_explanation_and_extract_real_motion() {

@@ -359,9 +359,379 @@ pub fn sample_frame_times(duration_ms: u64, count: usize) -> Vec<u64> {
         })
         .collect()
 }
+/// Why a frame was requested for inspection; this is not publication evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateReason {
+    /// Explicit source position selected by the caller for closer inspection.
+    Targeted,
+    /// A bounded ffmpeg scene-change observation.
+    SceneChange,
+    /// A source transcript cue boundary.
+    TranscriptCue,
+    /// Temporal anchor, including the source tail.
+    TemporalAnchor,
+}
+/// An inspection request, separate from the document's published asset registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualCandidate {
+    /// Source position in milliseconds.
+    pub time_ms: u64,
+    /// Selection provenance; not a claim about image contents.
+    pub reason: CandidateReason,
+}
+/// Explicit Detailed inspection budgets; Standard media defaults are unchanged.
+#[derive(Clone, Debug)]
+pub struct InspectionBudget {
+    /// Maximum merged candidates, no more than 128.
+    pub max_candidates: usize,
+    /// Maximum scene observations, no more than 128.
+    pub max_scene_candidates: usize,
+    /// Number of evenly distributed transcript cue positions.
+    pub max_transcript_candidates: usize,
+    /// Number of temporal anchors (at least two for nonempty video).
+    pub temporal_anchors: usize,
+    /// Minimum distance between merged candidates. Targeted positions take priority.
+    pub min_spacing_ms: u64,
+    /// Deadline for the scene detector, independent of extraction deadlines.
+    pub scene_timeout: Duration,
+}
+impl Default for InspectionBudget {
+    fn default() -> Self {
+        Self {
+            max_candidates: 96,
+            max_scene_candidates: 48,
+            max_transcript_candidates: 24,
+            temporal_anchors: 12,
+            min_spacing_ms: 500,
+            scene_timeout: Duration::from_secs(120),
+        }
+    }
+}
+/// Bounded observations only. No set of these samples proves complete visual coverage.
+#[derive(Debug)]
+pub struct VisualCandidates {
+    /// Sorted unique source positions to inspect before choosing published assets.
+    pub candidates: Vec<VisualCandidate>,
+    /// Detector hit its observation cap; later scenes may not have been scanned.
+    pub scene_limit_reached: bool,
+    /// Merge/spacing budgets omitted some candidate positions.
+    pub selection_limited: bool,
+}
+fn validate_inspection_budget(budget: &InspectionBudget) -> Result<(), MediaError> {
+    if !(2..=128).contains(&budget.max_candidates)
+        || !(1..=128).contains(&budget.max_scene_candidates)
+        || budget.max_transcript_candidates > 128
+        || !(2..=128).contains(&budget.temporal_anchors)
+        || budget.scene_timeout.is_zero()
+    {
+        return Err(MediaError::Invalid("inspection budget"));
+    }
+    Ok(())
+}
+fn scene_times(bytes: &[u8], duration_ms: u64, cap: usize) -> Result<Vec<u64>, MediaError> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| MediaError::Invalid("scene output encoding"))?;
+    let mut times = Vec::new();
+    for line in text.lines().filter(|line| line.contains("showinfo")) {
+        if let Some(value) = line
+            .split_once("pts_time:")
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+        {
+            let time = value
+                .parse::<f64>()
+                .ok()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= 604_800.0)
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                .filter(|time| *time < duration_ms)
+                .ok_or(MediaError::Invalid("scene timestamp"))?;
+            if times.len() >= cap {
+                return Err(MediaError::Invalid("scene output budget"));
+            }
+            times.push(time);
+        }
+    }
+    Ok(times)
+}
+/// Deterministically combine bounded scene observations, source cues, caller targets,
+/// and temporal anchors.
+///
+/// This pure planner is also usable by headless hosts with their
+/// own scene detector. Samples never imply complete visual coverage.
+/// # Errors
+/// Rejects invalid budgets, out-of-source positions and excessive candidate/cue counts.
+pub fn plan_visual_candidates(
+    duration_ms: u64,
+    scenes: &[u64],
+    transcript: &[crate::contracts::TranscriptSegment],
+    targeted: &[u64],
+    budget: &InspectionBudget,
+) -> Result<VisualCandidates, MediaError> {
+    validate_inspection_budget(budget)?;
+    if duration_ms == 0
+        || duration_ms > 604_800_000
+        || targeted.len() > budget.max_candidates
+        || transcript.len() > 50_000
+        || scenes.len() > budget.max_scene_candidates
+        || targeted
+            .iter()
+            .chain(scenes)
+            .any(|time| *time >= duration_ms)
+        || transcript
+            .iter()
+            .any(|segment| segment.range.validate(duration_ms).is_err())
+    {
+        return Err(MediaError::Invalid("inspection source positions or budget"));
+    }
+    let mut candidates: Vec<VisualCandidate> = Vec::new();
+    let mut limited = false;
+    let mut insert = |time_ms, reason| {
+        if candidates
+            .iter()
+            .any(|candidate| candidate.time_ms == time_ms)
+        {
+            return;
+        }
+        if candidates.len() >= budget.max_candidates
+            || (reason != CandidateReason::Targeted
+                && candidates
+                    .iter()
+                    .any(|candidate| candidate.time_ms.abs_diff(time_ms) < budget.min_spacing_ms))
+        {
+            limited = true;
+        } else {
+            candidates.push(VisualCandidate { time_ms, reason });
+        }
+    };
+    for time in targeted {
+        insert(*time, CandidateReason::Targeted);
+    }
+    // Reserve temporal distribution before scene/cue density can consume the budget.
+    for index in 0..budget.temporal_anchors {
+        let denominator = u64::try_from(budget.temporal_anchors - 1).unwrap_or(127);
+        let numerator = u64::try_from(index).unwrap_or(127);
+        // Stay inside the final half-second rather than requesting a position
+        // after the last displayed frame (container duration includes its hold).
+        // These remain samples, not proof of complete tail inspection.
+        let last = duration_ms.saturating_sub(500).max((duration_ms - 1) / 2);
+        let time =
+            (last / denominator) * numerator + (last % denominator) * numerator / denominator;
+        insert(time, CandidateReason::TemporalAnchor);
+    }
+    for time in scenes {
+        insert(*time, CandidateReason::SceneChange);
+    }
+    let count = transcript.len().min(budget.max_transcript_candidates);
+    for index in 0..count {
+        let position = if count == 1 {
+            0
+        } else {
+            index * (transcript.len() - 1) / (count - 1)
+        };
+        insert(
+            transcript[position].range.start_ms,
+            CandidateReason::TranscriptCue,
+        );
+    }
+    candidates.sort_by_key(|candidate| candidate.time_ms);
+    Ok(VisualCandidates {
+        candidates,
+        scene_limit_reached: scenes.len() == budget.max_scene_candidates,
+        selection_limited: limited || transcript.len() > count,
+    })
+}
+/// Detect scene changes at bounded decode resolution/rate, then merge transcript and
+/// targeted positions with temporal anchors.
+///
+/// This samples, never establishes complete
+/// visual coverage. Detector exhaustion/failure is explicit, not a transcript-only fallback.
+/// No frames are published or added to a document by this function.
+/// # Errors
+/// Rejects invalid budgets/ranges, excessive transcript count, tool failure or cancellation.
+pub async fn discover_visual_candidates(
+    video: &Path,
+    metadata: &VideoMetadata,
+    transcript: &[crate::contracts::TranscriptSegment],
+    targeted: &[u64],
+    tools: &MediaTools,
+    budget: &InspectionBudget,
+    cancel: &Cancellation,
+) -> Result<VisualCandidates, MediaError> {
+    // Validate all caller input before launching a subprocess.
+    plan_visual_candidates(metadata.duration_ms, &[], transcript, targeted, budget)?;
+    let video = source::local_video(video, u64::MAX)?;
+    let request = ProcessRequest {
+        program: tools.ffmpeg.clone(),
+        args: [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-protocol_whitelist",
+            "file",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
+            "-i",
+        ]
+        .iter()
+        .map(Into::into)
+        .chain(std::iter::once(video.into_os_string()))
+        .chain([
+            "-map".into(),
+            "0:V:0".into(),
+            "-threads".into(),
+            "1".into(),
+            "-an".into(),
+            "-sn".into(),
+            "-dn".into(),
+            "-vf".into(),
+            "fps=2,scale=160:-2,select=gt(scene\\,0.3),showinfo".into(),
+            "-frames:v".into(),
+            budget.max_scene_candidates.to_string().into(),
+            "-fps_mode".into(),
+            "vfr".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ])
+        .collect(),
+        cwd: None,
+        timeout: budget.scene_timeout,
+        max_output_bytes: 256 * 1024,
+        file_budget: None,
+    };
+    let output = Box::pin(process::run(&request, cancel)).await?;
+    let scenes = scene_times(
+        &output.stderr,
+        metadata.duration_ms,
+        budget.max_scene_candidates,
+    )?;
+    plan_visual_candidates(metadata.duration_ms, &scenes, transcript, targeted, budget)
+}
+/// Temporary inspection images, deliberately separate from a published asset selection.
+///
+/// The directory remains owned for the lifetime of this value. Callers may retain
+/// these images in the host evidence registry for refinement; doing so is not a
+/// publication choice. Renderers/exporters should read only assets referenced by blocks.
+#[derive(Debug)]
+pub struct InspectionFrames {
+    /// Private analysis images; do not automatically register these in a document.
+    pub visuals: VisualAssets,
+}
+/// Extract bounded candidate JPEGs using a caller-selected inspection media budget.
+/// Published media budgets are not changed or consumed implicitly.
+/// # Errors
+/// Rejects more than 128 candidates and any ordinary media extraction failure.
+pub async fn extract_inspection_frames(
+    video: &Path,
+    metadata: &VideoMetadata,
+    candidates: &VisualCandidates,
+    workspace: &Path,
+    tools: &MediaTools,
+    budget: &MediaBudget,
+    cancel: &Cancellation,
+) -> Result<InspectionFrames, MediaError> {
+    if candidates.candidates.len() > 128 {
+        return Err(MediaError::Invalid("inspection frame budget"));
+    }
+    let times: Vec<_> = candidates
+        .candidates
+        .iter()
+        .map(|candidate| candidate.time_ms)
+        .collect();
+    let visuals = extract_visuals(
+        video,
+        metadata,
+        &VisualSelection {
+            frame_times_ms: &times,
+            clips: &[],
+        },
+        workspace,
+        tools,
+        budget,
+        cancel,
+    )
+    .await?;
+    Ok(InspectionFrames { visuals })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_candidates_are_bounded_deterministic_and_retain_tail_anchor() {
+        let budget = InspectionBudget {
+            max_candidates: 6,
+            temporal_anchors: 3,
+            min_spacing_ms: 0,
+            ..InspectionBudget::default()
+        };
+        let transcript = vec![crate::contracts::TranscriptSegment {
+            id: "cue-original".into(),
+            range: TimeRange {
+                start_ms: 7000,
+                end_ms: 8000,
+            },
+            text: "untrusted cue".into(),
+        }];
+        let result =
+            plan_visual_candidates(10_000, &[2000, 3000], &transcript, &[6500], &budget).unwrap();
+        assert_eq!(result.candidates.len(), 6);
+        assert!(result.selection_limited);
+        assert!(result.candidates.iter().any(|c| c.time_ms == 9500));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.time_ms == 6500 && c.reason == CandidateReason::Targeted)
+        );
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.reason == CandidateReason::SceneChange)
+        );
+        let again =
+            plan_visual_candidates(10_000, &[2000, 3000], &transcript, &[6500], &budget).unwrap();
+        assert_eq!(result.candidates, again.candidates);
+    }
+    #[test]
+    fn transcript_positions_and_scene_exhaustion_are_explicit() {
+        let budget = InspectionBudget {
+            max_scene_candidates: 1,
+            temporal_anchors: 2,
+            min_spacing_ms: 0,
+            ..InspectionBudget::default()
+        };
+        let transcript = vec![crate::contracts::TranscriptSegment {
+            id: "cue".into(),
+            range: TimeRange {
+                start_ms: 7000,
+                end_ms: 8000,
+            },
+            text: "new subject".into(),
+        }];
+        let result = plan_visual_candidates(10_000, &[2000], &transcript, &[], &budget).unwrap();
+        assert!(result.scene_limit_reached);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.time_ms == 7000 && c.reason == CandidateReason::TranscriptCue)
+        );
+        assert!(plan_visual_candidates(10_000, &[], &transcript, &[10_000], &budget).is_err());
+        let tiny = plan_visual_candidates(1, &[], &[], &[], &budget).unwrap();
+        assert_eq!(tiny.candidates.len(), 1);
+    }
+    #[test]
+    fn parses_only_showinfo_timestamps_and_rejects_bad_or_excessive_output() {
+        let bytes = b"unrelated pts_time:9\n[Parsed_showinfo_3] n: 0 pts: 1 pts_time:1.5 pos: 3\n";
+        assert_eq!(scene_times(bytes, 10_000, 1).unwrap(), vec![1500]);
+        assert!(scene_times(bytes, 1000, 1).is_err());
+        assert!(scene_times(bytes, 10_000, 0).is_err());
+        assert!(scene_times(b"[showinfo] pts_time:nan", 10_000, 2).is_err());
+    }
     #[test]
     fn validates_metadata_and_video_requirement() {
         let valid = br#"{"format":{"duration":"12.5"},"streams":[{"codec_type":"video","width":1920,"height":1080},{"codec_type":"audio"}]}"#;

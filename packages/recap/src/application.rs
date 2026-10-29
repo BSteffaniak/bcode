@@ -11,6 +11,23 @@ pub enum Stage {
     Media,
     /// Running grounded model composition.
     Composition,
+    /// Detailed source inventory and outline analysis.
+    Analysis,
+    /// Detailed chapter composition.
+    Writing,
+    /// Source coverage audit.
+    Audit,
+    /// Bounded source-grounded repair.
+    Repair,
+    /// Latest bounded aggregate analysis progress; no source content or identities.
+    AnalysisProgress {
+        /// Semantic analysis phase.
+        phase: bcode_recap::diagnostics::Phase,
+        /// Completed work units.
+        completed: u64,
+        /// Planned work units, when known.
+        total: Option<u64>,
+    },
     /// Committing a validated revision.
     Storage,
     /// Rendering offline HTML.
@@ -18,6 +35,26 @@ pub enum Stage {
     /// The requested operation has completed.
     Complete,
 }
+impl From<bcode_recap::diagnostics::Phase> for Stage {
+    fn from(phase: bcode_recap::diagnostics::Phase) -> Self {
+        use bcode_recap::diagnostics::Phase;
+        match phase {
+            Phase::Validation | Phase::ModelReadiness => Self::ModelReadiness,
+            Phase::Metadata | Phase::Download | Phase::Captions | Phase::Acquisition => {
+                Self::Acquisition
+            }
+            Phase::Probe | Phase::Extraction | Phase::Media => Self::Media,
+            Phase::Composition | Phase::ValidationOutput => Self::Composition,
+            Phase::Analysis => Self::Analysis,
+            Phase::Writing => Self::Writing,
+            Phase::Audit => Self::Audit,
+            Phase::Repair => Self::Repair,
+            Phase::Storage => Self::Storage,
+            Phase::Export => Self::Export,
+        }
+    }
+}
+
 impl From<bcode_recap::engine::Stage> for Stage {
     fn from(stage: bcode_recap::engine::Stage) -> Self {
         match stage {
@@ -246,6 +283,42 @@ const fn reportable(request: &Request) -> bool {
     }
 }
 
+/// Retain the caller observer and coalesce count updates into one fixed-size slot.
+struct ProgressObserver {
+    parent: Cancellation,
+    operation: bcode_recap::diagnostics::Operation,
+    latest: std::sync::Arc<std::sync::Mutex<Option<Stage>>>,
+}
+impl std::fmt::Debug for ProgressObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProgressObserver")
+            .finish_non_exhaustive()
+    }
+}
+impl bcode_recap::diagnostics::Observer for ProgressObserver {
+    fn observe(&self, event: bcode_recap::diagnostics::Event) {
+        if let bcode_recap::diagnostics::Event::AnalysisProgress {
+            phase,
+            completed,
+            total,
+        } = &event
+        {
+            *self
+                .latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Stage::AnalysisProgress {
+                    phase: *phase,
+                    completed: *completed,
+                    total: *total,
+                });
+        }
+        self.parent.emit(event.clone());
+        bcode_recap::diagnostics::Observer::observe(&self.operation, event);
+    }
+}
+
 /// Execute with cooperative cancellation and bounded semantic progress callbacks.
 /// Create/refine return the committed document; export is a separate UI action.
 pub async fn execute(
@@ -263,21 +336,62 @@ pub async fn execute(
         .to_string_lossy()
         .into_owned();
     let operation = Operation::new(id);
-    let cancel = cancel.observed(std::sync::Arc::new(operation.clone()));
+    let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cancel = cancel.observed(std::sync::Arc::new(ProgressObserver {
+        parent: cancel.clone(),
+        operation: operation.clone(),
+        latest: latest.clone(),
+    }));
     cancel.emit(Event::Phase {
         phase: Phase::Validation,
     });
     let report_path = reportable(&request)
         .then_some(options.diagnostic_report.as_deref())
         .flatten();
-    let result = if let Some(path) = report_path {
-        match check_report_destination(path) {
-            Ok(()) => execute_inner(options, request, &cancel, progress).await,
-            Err(error) => Err(error),
+    let progress = std::sync::Mutex::new(progress);
+    let result = {
+        let mut forward = |stage| {
+            let counts = latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(counts) = counts {
+                progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)(counts);
+            }
+            progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)(stage);
+        };
+        let work = async {
+            if let Some(path) = report_path {
+                check_report_destination(path)?;
+            }
+            execute_inner(options, request, &cancel, &mut forward).await
+        };
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                result = &mut work => break result,
+                () = tokio::time::sleep(Duration::from_millis(25)) => {
+                    let counts = latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                    if let Some(counts) = counts {
+                        progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner)(counts);
+                    }
+                }
+            }
         }
-    } else {
-        execute_inner(options, request, &cancel, progress).await
     };
+    let counts = latest
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(counts) = counts {
+        progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)(counts);
+    }
     let (status, code) = match &result {
         Ok(Outcome::Ready { export: Err(_), .. }) => (Status::ExportFailed, "export_failed"),
         Ok(_) => (Status::Succeeded, "ok"),
@@ -1003,6 +1117,8 @@ pub fn engine_options(workspace: PathBuf) -> EngineOptions {
         tools: MediaTools::default(),
         media: MediaBudget::default(),
         composition: CompositionLimits::default(),
+        detailed: bcode_recap::analysis_contracts::DetailedPolicy::default(),
+        inspection: bcode_recap::media::InspectionBudget::default(),
         export: ExportBudget::default(),
     }
 }
@@ -1039,6 +1155,9 @@ pub fn apply_composition_limits(
     options.composition.input_bytes = convert(model.max_prompt_bytes)?;
     options.composition.response_bytes = convert(model.max_response_bytes)?;
     options.composition.image_bytes = convert(model.max_model_image_bytes)?;
+    options.detailed.allowances.max_input_bytes = options.composition.input_bytes;
+    options.detailed.allowances.max_response_bytes = options.composition.response_bytes;
+    options.detailed.allowances.max_image_bytes = options.composition.image_bytes;
     Ok(())
 }
 
@@ -1081,7 +1200,72 @@ pub fn create_options(options: &Create) -> Result<EngineOptions, Error> {
     configuration.media.operation_timeout = configuration.acquisition.timeout;
     apply_composition_limits(&mut configuration, &options.model)?;
     configuration.composition.images = configuration.media.max_frames;
+    for (value, target) in [
+        (
+            options.detailed_max_model_calls,
+            &mut configuration.detailed.allowances.max_model_calls,
+        ),
+        (
+            options.detailed_max_source_windows,
+            &mut configuration.detailed.allowances.max_source_windows,
+        ),
+        (
+            options.detailed_max_repair_rounds,
+            &mut configuration.detailed.allowances.max_repair_rounds,
+        ),
+    ] {
+        if let Some(value) = value {
+            *target = usize::try_from(value)
+                .map_err(|_| Error::Action("Detailed allowance exceeds platform limits".into()))?;
+        }
+    }
+    configuration
+        .detailed
+        .validate()
+        .map_err(|_| Error::Action("invalid Detailed allowances".into()))?;
     Ok(configuration)
+}
+
+/// Adapt actual typed model stages to standalone progress without interpreting source content.
+struct ProgressExecutor<'a, F> {
+    executor: &'a dyn ModelExecutor,
+    progress: &'a std::sync::Mutex<F>,
+}
+
+impl<F: FnMut(Stage) + Send> ModelExecutor for ProgressExecutor<'_, F> {
+    fn execute<'a>(
+        &'a self,
+        request: bcode_recap::model::ModelRequest,
+        cancellation: &'a Cancellation,
+    ) -> bcode_recap::model::ModelFuture<'a> {
+        self.executor.execute(request, cancellation)
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: bcode_recap::model::AnalysisRequest,
+        cancellation: &'a Cancellation,
+    ) -> bcode_recap::model::AnalysisFuture<'a> {
+        use bcode_recap::{
+            diagnostics::{Event, Phase},
+            model::AnalysisStage,
+        };
+        let phase = match request.stage {
+            AnalysisStage::ExtractionInventory
+            | AnalysisStage::Outline
+            | AnalysisStage::VisualInspection => Phase::Analysis,
+            AnalysisStage::ChapterComposition => Phase::Writing,
+            AnalysisStage::SourceAudit => Phase::Audit,
+            AnalysisStage::SourceRepair => Phase::Repair,
+        };
+        if !cancellation.is_cancelled() {
+            cancellation.emit(Event::Phase { phase });
+            self.progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)(phase.into());
+        }
+        self.executor.execute_analysis(request, cancellation)
+    }
 }
 
 pub async fn create(
@@ -1119,8 +1303,13 @@ pub async fn create(
         .map(read_transcript)
         .transpose()?;
     let configuration = create_options(options)?;
-    let engine = Engine {
+    let progress = std::sync::Mutex::new(progress);
+    let executor = ProgressExecutor {
         executor,
+        progress: &progress,
+    };
+    let engine = Engine {
+        executor: &executor,
         store,
         options: configuration,
     };
@@ -1144,7 +1333,11 @@ pub async fn create(
         },
     };
     let document = engine
-        .generate(&request, cancel, &mut |stage| progress(stage.into()))
+        .generate(&request, cancel, &mut |stage| {
+            progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)(stage.into());
+        })
         .await?;
     Ok(document)
 }
@@ -1159,8 +1352,13 @@ pub async fn refine(
     let previous = store.load(&options.id)?;
     let mut configuration = engine_options(std::env::temp_dir());
     apply_composition_limits(&mut configuration, &options.model)?;
-    let engine = Engine {
+    let progress = std::sync::Mutex::new(progress);
+    let executor = ProgressExecutor {
         executor,
+        progress: &progress,
+    };
+    let engine = Engine {
+        executor: &executor,
         store,
         options: configuration,
     };
@@ -1168,10 +1366,114 @@ pub async fn refine(
     intent.focus = Some(options.focus.clone());
     let document = engine
         .refine(&options.id, intent, cancel, &mut |stage| {
-            progress(stage.into());
+            progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)(stage.into());
         })
         .await?;
     Ok(document)
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use bcode_recap::model::{
+        AnalysisRequest, AnalysisStage, ModelError, ModelFuture, ModelRequest,
+    };
+
+    #[test]
+    fn analysis_counts_are_coalesced_and_preserve_the_caller_observer() {
+        use bcode_recap::diagnostics::{Event, Observer as _, Operation, Phase};
+        let parent = Operation::new("parent".into());
+        let operation = Operation::new("operation".into());
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observer = ProgressObserver {
+            parent: Cancellation::default().observed(std::sync::Arc::new(parent.clone())),
+            operation: operation.clone(),
+            latest: latest.clone(),
+        };
+        for completed in 0..200 {
+            observer.observe(Event::AnalysisProgress {
+                phase: Phase::Writing,
+                completed,
+                total: Some(200),
+            });
+        }
+        assert_eq!(
+            latest.lock().unwrap().take(),
+            Some(Stage::AnalysisProgress {
+                phase: Phase::Writing,
+                completed: 199,
+                total: Some(200),
+            })
+        );
+        assert!(latest.lock().unwrap().is_none());
+        for report in [parent.report(), operation.report()] {
+            assert!(report.events.len() <= 128);
+            assert!(matches!(
+                report.events.last().unwrap().event,
+                Event::AnalysisProgress { completed: 199, .. }
+            ));
+        }
+    }
+
+    struct UnsupportedExecutor;
+    impl ModelExecutor for UnsupportedExecutor {
+        fn execute<'a>(
+            &'a self,
+            _request: ModelRequest,
+            _cancel: &'a Cancellation,
+        ) -> ModelFuture<'a> {
+            Box::pin(async { Err(ModelError::Unavailable) })
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_analysis_reports_real_stages_without_downgrading_unsupported_execution() {
+        let mut stages = Vec::new();
+        let progress = std::sync::Mutex::new(|stage| stages.push(stage));
+        let executor = ProgressExecutor {
+            executor: &UnsupportedExecutor,
+            progress: &progress,
+        };
+        let cancel = Cancellation::default();
+        for stage in [
+            AnalysisStage::ExtractionInventory,
+            AnalysisStage::Outline,
+            AnalysisStage::VisualInspection,
+            AnalysisStage::ChapterComposition,
+            AnalysisStage::SourceAudit,
+            AnalysisStage::SourceRepair,
+        ] {
+            assert_eq!(
+                executor
+                    .execute_analysis(
+                        AnalysisRequest {
+                            stage,
+                            instructions: "trusted policy".into(),
+                            input: serde_json::json!({}),
+                            images: vec![],
+                            max_response_bytes: 1024,
+                        },
+                        &cancel
+                    )
+                    .await,
+                Err(ModelError::Unavailable)
+            );
+        }
+        drop(progress);
+        assert_eq!(
+            stages,
+            [
+                Stage::Analysis,
+                Stage::Analysis,
+                Stage::Analysis,
+                Stage::Writing,
+                Stage::Audit,
+                Stage::Repair
+            ]
+        );
+    }
 }
 
 #[cfg(all(test, feature = "tui"))]

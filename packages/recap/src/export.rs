@@ -150,8 +150,14 @@ pub fn export_html(
         .iter()
         .map(|asset| (asset.id.as_str(), asset))
         .collect();
+    let evidence = document
+        .evidence
+        .iter()
+        .map(|evidence| (evidence.id.as_str(), evidence.range))
+        .collect();
     let renderer = Renderer {
         document,
+        evidence,
         root: &root,
         budget,
         report,
@@ -194,13 +200,13 @@ fn render_document(mut renderer: Renderer<'_>) -> HtmlExport {
     if let Some(url) = &renderer.source_url {
         external_link(&mut html, url, "Open original video ↗", "");
     }
-    html.push_str("</div></div><div class=\"layout\"><nav class=\"contents\" aria-label=\"Recap chapters\"><h2>In this recap</h2><ol>");
+    html.push_str("</div></div><div class=\"layout\"><nav id=\"contents\" class=\"contents\" aria-label=\"Recap chapters\"><h2>In this recap</h2><details open><summary>Browse chapters</summary><ol>");
     for (index, section) in document.sections.iter().enumerate() {
         let _ = write!(html, "<li><a href=\"#chapter-{index}\">");
         escape(&mut html, &section.title);
         html.push_str("</a></li>");
     }
-    html.push_str("</ol></nav><main id=\"main\">");
+    html.push_str("</ol></details></nav><main id=\"main\">");
     for (index, section) in document.sections.iter().enumerate() {
         let _ = write!(
             html,
@@ -212,7 +218,9 @@ fn render_document(mut renderer: Renderer<'_>) -> HtmlExport {
         for block in &section.blocks {
             renderer.block(&mut html, block);
         }
-        html.push_str("</section>");
+        html.push_str(
+            "<a class=\"back-to-contents\" href=\"#contents\">Back to contents ↑</a></section>",
+        );
     }
     html.push_str("<aside class=\"notice\" aria-label=\"Export limits\"><strong>This offline edition</strong><p>This is a selected recap, not the complete source video. Media is embedded only when it passes format, path, and size checks. Browser playback support can vary.</p><p>");
     escape(
@@ -255,6 +263,7 @@ struct Renderer<'a> {
     report: ExportReport,
     source_url: Option<url::Url>,
     assets: BTreeMap<&'a str, &'a Asset>,
+    evidence: BTreeMap<&'a str, TimeRange>,
 }
 
 impl Renderer<'_> {
@@ -263,7 +272,17 @@ impl Renderer<'_> {
             BlockContent::Text { text } => {
                 html.push_str("<div class=\"prose\"><p>");
                 escape(html, text);
-                html.push_str("</p></div>");
+                html.push_str("</p>");
+                if !block.evidence_ids.is_empty() {
+                    html.push_str("<div class=\"source-evidence\" aria-label=\"Supporting source moments\"><span>Source moments </span>");
+                    for id in &block.evidence_ids {
+                        if let Some(range) = self.evidence.get(id.as_str()) {
+                            self.source_time(html, *range);
+                        }
+                    }
+                    html.push_str("</div>");
+                }
+                html.push_str("</div>");
             }
             BlockContent::Image { asset_id, caption } => self.media(html, asset_id, caption, false),
             BlockContent::Clip { asset_id, caption } => self.media(html, asset_id, caption, true),
@@ -275,9 +294,11 @@ impl Renderer<'_> {
                 html.push_str("</div>");
             }
         }
-        for evidence in &self.document.evidence {
-            if block.evidence_ids.contains(&evidence.id) {
-                self.source_time(html, evidence.range);
+        if !matches!(&block.content, BlockContent::Text { .. }) {
+            for id in &block.evidence_ids {
+                if let Some(range) = self.evidence.get(id.as_str()) {
+                    self.source_time(html, *range);
+                }
             }
         }
     }
@@ -778,6 +799,74 @@ mod tests {
         assert!(!semantic.contains("src=\"https:"));
         assert!(!semantic.contains("src=\"http:"));
         assert!(semantic.contains("connect-src 'none'"));
+    }
+
+    #[test]
+    fn dense_text_export_preserves_every_chapter_and_exact_evidence_ranges() {
+        let (root, mut document) = fixture();
+        document.evidence = vec![crate::contracts::Evidence {
+            id: "support".into(),
+            range: TimeRange {
+                start_ms: 12_500,
+                end_ms: 14_750,
+            },
+            transcript_segment_ids: vec![],
+        }];
+        document.sections = (0..160)
+            .map(|index| Section {
+                id: format!("section-{index}"),
+                title: format!("Chapter {index} < & 深い理解"),
+                blocks: vec![Block {
+                    id: format!("text-{index}"),
+                    evidence_ids: if index % 2 == 0 {
+                        vec!["support".into()]
+                    } else {
+                        vec![]
+                    },
+                    content: BlockContent::Text {
+                        text: format!(
+                            "Opening {index}.\n\n{}\nFinal qualification {index}.",
+                            "A detailed explanation with essential context. ".repeat(80)
+                        ),
+                    },
+                }],
+            })
+            .collect();
+        let export = export_html(&document, root.path(), ExportBudget::default()).unwrap();
+        let semantic = export.html.split("<script>").next().unwrap();
+        for index in 0..160 {
+            assert!(semantic.contains(&format!("href=\"#chapter-{index}\"")));
+            assert!(semantic.contains(&format!("Final qualification {index}.")));
+            assert!(semantic.contains(&format!("Chapter {index} &lt; &amp; 深い理解")));
+            let chapter = semantic
+                .split_once(&format!(
+                    "<section class=\"chapter\" id=\"chapter-{index}\""
+                ))
+                .unwrap()
+                .1
+                .split_once("</section>")
+                .unwrap()
+                .0;
+            assert_eq!(
+                chapter.matches("0:12.500–0:14.750").count(),
+                usize::from(index % 2 == 0),
+                "each grounded chapter gets one source moment; editorial text gets none"
+            );
+        }
+        assert_eq!(semantic.matches("Supporting source moments").count(), 80);
+        assert_eq!(semantic.matches("0:12.500–0:14.750").count(), 80);
+        assert!(semantic.contains("#t=12"));
+        assert_eq!(export.report.embedded_media_bytes, 0);
+        assert!(export.report.degradations.is_empty());
+
+        document.source.url = None;
+        let local = export_html(&document, root.path(), ExportBudget::default()).unwrap();
+        assert!(
+            local
+                .html
+                .contains("<span class=\"time\">0:12.500–0:14.750</span>")
+        );
+        assert!(!local.html.contains("#t=12"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use std::{io::Write, path::PathBuf, process::ExitCode};
     about = "Turn a video into a grounded, offline visual recap"
 )]
 #[command(
-    after_help = "Examples:\n  recap create --source lesson.mp4 --model-config provider.toml\n  recap create --source https://youtu.be/VIDEO_ID_11 --focus 'Explain the technique' --model-config provider.toml\n  recap refine my-recap --focus 'Expand the comparison' --model-config provider.toml\n  recap export my-recap --output recap.html\n  recap doctor\n\nNo conversation is needed. Create performs real visual model inference and exports one self-contained HTML file. Model configuration is explicit; no Bcode daemon or global state is changed."
+    after_help = "Examples:\n  recap create --source lesson.mp4 --model-config provider.toml\n  recap create --source https://youtu.be/VIDEO_ID_11 --focus 'Explain the technique' --model-config provider.toml\n  recap refine my-recap --focus 'Expand the comparison' --model-config provider.toml\n  recap export my-recap --output recap.html\n  recap doctor\n\nNo conversation is needed. Create performs real visual model inference and exports one self-contained HTML file. Model configuration is explicit; no Bcode daemon or global state is changed. Headless creation defaults to Standard. Interactive Detailed mode analyzes source coverage, writes chapters, then audits and repairs omissions within explicit resource allowances. It is not merely a longer summary and never silently falls back to Standard; failure preserves existing revisions."
 )]
 struct Cli {
     /// Private recap document/media directory (independent of Bcode state).
@@ -107,9 +107,18 @@ pub struct Tools {
 
 #[derive(Debug, Clone, Args)]
 pub struct Create {
-    /// Renderer-selected semantic detail; headless default remains Standard.
-    #[arg(skip)]
+    /// Semantic detail: Detailed preserves source information through analysis/audit.
+    #[arg(long, default_value = "standard", value_parser = parse_depth)]
     pub depth: bcode_recap::contracts::Depth,
+    /// Detailed model-call allowance; exhaustion fails rather than downgrading.
+    #[arg(long, value_parser = positive_u64)]
+    pub detailed_max_model_calls: Option<u64>,
+    /// Detailed source-window allowance, not an editorial chapter cap.
+    #[arg(long, value_parser = positive_u64)]
+    pub detailed_max_source_windows: Option<u64>,
+    /// Detailed repair-round allowance; zero audits without attempting repairs.
+    #[arg(long)]
+    pub detailed_max_repair_rounds: Option<u64>,
     /// Existing video path or supported `YouTube` URL.
     #[arg(long)]
     pub source: String,
@@ -238,6 +247,16 @@ struct Doctor {
     provider: Option<String>,
     #[arg(long)]
     context: Option<String>,
+}
+
+fn parse_depth(value: &str) -> Result<bcode_recap::contracts::Depth, String> {
+    use bcode_recap::contracts::Depth;
+    match value {
+        "brief" => Ok(Depth::Brief),
+        "standard" => Ok(Depth::Standard),
+        "detailed" => Ok(Depth::Detailed),
+        _ => Err("depth must be brief, standard, or detailed".into()),
+    }
 }
 
 fn positive_u64(value: &str) -> Result<u64, String> {
@@ -575,10 +594,15 @@ fn progress(stage: Stage) {
     eprintln!(
         "{}",
         match stage {
+            Stage::AnalysisProgress { .. } => return,
             Stage::ModelReadiness => "Resolving explicit embedded model configuration (no daemon)…",
             Stage::Acquisition => "Acquiring source and available captions…",
             Stage::Media => "Probing source and extracting real visual evidence…",
             Stage::Composition => "Composing grounded visual recap with configured model…",
+            Stage::Analysis => "Analyzing source coverage and chapter outline…",
+            Stage::Writing => "Writing source-grounded chapters…",
+            Stage::Audit => "Auditing source coverage…",
+            Stage::Repair => "Repairing source coverage gaps…",
             Stage::Storage => "Committing validated recap revision…",
             Stage::Export => "Rendering self-contained HTML…",
             Stage::Complete => "Recap revision committed.",
@@ -768,9 +792,73 @@ mod tests {
         assert_eq!(engine.composition.response_bytes, 2048);
         assert_eq!(engine.composition.image_bytes, 8192);
         assert_eq!(engine.composition.images, 4);
+        assert_eq!(engine.detailed.allowances.max_input_bytes, 4096);
+        assert_eq!(engine.detailed.allowances.max_response_bytes, 2048);
+        assert_eq!(engine.detailed.allowances.max_image_bytes, 8192);
         assert_eq!(engine.media.max_frames, 4);
         assert_eq!(engine.media.max_clips, 0);
         assert_eq!(engine.media.operation_timeout, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn detailed_cli_allowances_reach_engine_without_changing_standard_defaults() {
+        let baseline = Cli::try_parse_from(["recap", "create", "--source", "video.mp4"]).unwrap();
+        let Some(Command::Create(baseline)) = baseline.command else {
+            panic!("expected create")
+        };
+        assert_eq!(baseline.depth, bcode_recap::contracts::Depth::Standard);
+        let defaults = bcode_recap::analysis_contracts::DetailedPolicy::default();
+        let baseline_engine = create_options(&baseline).unwrap();
+        assert_eq!(
+            baseline_engine.detailed.allowances.max_model_calls,
+            defaults.allowances.max_model_calls
+        );
+        assert_eq!(
+            baseline_engine.detailed.allowances.max_source_windows,
+            defaults.allowances.max_source_windows
+        );
+        assert_eq!(
+            baseline_engine.detailed.allowances.max_repair_rounds,
+            defaults.allowances.max_repair_rounds
+        );
+        assert_eq!(
+            baseline_engine.detailed.allowances.max_input_bytes,
+            baseline_engine.composition.input_bytes
+        );
+        let parsed = Cli::try_parse_from([
+            "recap",
+            "create",
+            "--source",
+            "video.mp4",
+            "--depth",
+            "detailed",
+            "--detailed-max-model-calls",
+            "37",
+            "--detailed-max-source-windows",
+            "19",
+            "--detailed-max-repair-rounds",
+            "0",
+        ])
+        .unwrap();
+        let Some(Command::Create(options)) = parsed.command else {
+            panic!("expected create")
+        };
+        assert_eq!(options.depth, bcode_recap::contracts::Depth::Detailed);
+        let engine = create_options(&options).unwrap();
+        assert_eq!(engine.detailed.allowances.max_model_calls, 37);
+        assert_eq!(engine.detailed.allowances.max_source_windows, 19);
+        assert_eq!(engine.detailed.allowances.max_repair_rounds, 0);
+        for (flag, value) in [
+            ("--depth", "unknown"),
+            ("--detailed-max-model-calls", "0"),
+            ("--detailed-max-source-windows", "0"),
+            ("--detailed-max-repair-rounds", "-1"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["recap", "create", "--source", "video.mp4", flag, value])
+                    .is_err()
+            );
+        }
     }
 
     #[test]

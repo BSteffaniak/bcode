@@ -4,7 +4,11 @@ use base64::Engine as _;
 use bcode::{Bcode, MessageRole, ModelMessage, StructuredOutputOptions};
 use bcode_model::{ContentBlock, ImageContent, ImageMetadata};
 use bcode_recap::{
-    model::{ModelError, ModelExecutor, ModelFuture, ModelRequest, ModelResponse},
+    analysis_contracts::analysis_response_schema,
+    model::{
+        AnalysisFuture, AnalysisRequest, AnalysisResponse, ModelError, ModelExecutor, ModelFuture,
+        ModelRequest, ModelResponse,
+    },
     process::Cancellation,
 };
 use std::{sync::Mutex, time::Duration};
@@ -236,67 +240,104 @@ impl ModelExecutor for BcodeExecutor {
         cancellation: &'a Cancellation,
     ) -> ModelFuture<'a> {
         Box::pin(async move {
-            *self
-                .failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            if cancellation.is_cancelled() {
-                return Err(ModelError::Cancelled);
-            }
             let max_bytes = request.max_response_bytes;
-            let mut content = vec![ContentBlock::Text {
-                text: request.input_text,
-            }];
-            for image in request.images {
-                content.push(ContentBlock::Text {
-                    text: format!("Source asset: {}", image.asset_id),
-                });
-                content.push(ContentBlock::Image {
-                    image: ImageContent {
-                        mime_type: image.mime_type,
-                        data_base64: base64::engine::general_purpose::STANDARD.encode(image.bytes),
-                        metadata: ImageMetadata::default(),
-                    },
-                });
-            }
-            let agent = self
-                .sdk
-                .agent()
-                .system(request.instructions)
-                .parameters(self.parameters.clone())
-                .timeout(self.timeout)
-                .build();
-            let result = {
-                let token = bcode::CancellationToken::new();
-                let operation = agent.generate_object_from_messages::<serde_json::Value>(
-                    vec![ModelMessage {
-                        role: MessageRole::User,
-                        content,
-                    }],
-                    StructuredOutputOptions::json_schema(
-                        "recap",
-                        bcode_recap::model::response_schema(),
-                    ),
-                    token.clone(),
-                );
-                tokio::pin!(operation);
-                loop {
-                    tokio::select! {
-                        result = &mut operation => break result.map_err(|error| self.execution_error(&error))?,
-                        () = tokio::time::sleep(Duration::from_millis(25)) => {
-                            if cancellation.is_cancelled() {
-                                token.cancel();
-                                let _ = operation.await;
-                                return Err(ModelError::Cancelled);
-                            }
+            let encoded = self
+                .execute_structured(request, bcode_recap::model::response_schema(), cancellation)
+                .await?;
+            ModelResponse::from_json(&encoded, max_bytes)
+        })
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: AnalysisRequest,
+        cancellation: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async move {
+            let stage = request.stage;
+            let max_bytes = request.max_response_bytes;
+            let request = ModelRequest {
+                instructions: request.instructions,
+                input_text: serde_json::to_string(&request.input)
+                    .map_err(|_| ModelError::InvalidResponse)?,
+                images: request.images,
+                max_response_bytes: max_bytes,
+            };
+            let encoded = self
+                .execute_structured(request, analysis_response_schema(stage), cancellation)
+                .await?;
+            AnalysisResponse::from_json_slice(stage, &encoded, max_bytes)
+        })
+    }
+}
+
+impl BcodeExecutor {
+    async fn execute_structured(
+        &self,
+        request: ModelRequest,
+        schema: serde_json::Value,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<u8>, ModelError> {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if cancellation.is_cancelled() {
+            return Err(ModelError::Cancelled);
+        }
+        let max_bytes = request.max_response_bytes;
+        let mut content = vec![ContentBlock::Text {
+            text: request.input_text,
+        }];
+        for image in request.images {
+            content.push(ContentBlock::Text {
+                text: format!("Source asset: {}", image.asset_id),
+            });
+            content.push(ContentBlock::Image {
+                image: ImageContent {
+                    mime_type: image.mime_type,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(image.bytes),
+                    metadata: ImageMetadata::default(),
+                },
+            });
+        }
+        let agent = self
+            .sdk
+            .agent()
+            .system(request.instructions)
+            .parameters(self.parameters.clone())
+            .timeout(self.timeout)
+            .build();
+        let result = {
+            let token = bcode::CancellationToken::new();
+            let operation = agent.generate_object_from_messages::<serde_json::Value>(
+                vec![ModelMessage {
+                    role: MessageRole::User,
+                    content,
+                }],
+                StructuredOutputOptions::json_schema("recap", schema),
+                token.clone(),
+            );
+            tokio::pin!(operation);
+            loop {
+                tokio::select! {
+                    result = &mut operation => break result.map_err(|error| self.execution_error(&error))?,
+                    () = tokio::time::sleep(Duration::from_millis(25)) => {
+                        if cancellation.is_cancelled() {
+                            token.cancel();
+                            let _ = operation.await;
+                            return Err(ModelError::Cancelled);
                         }
                     }
                 }
-            };
-            drop(agent);
-            let encoded = serde_json::to_vec(&result).map_err(|_| ModelError::InvalidResponse)?;
-            ModelResponse::from_json(&encoded, max_bytes)
-        })
+            }
+        };
+        drop(agent);
+        let encoded = serde_json::to_vec(&result).map_err(|_| ModelError::InvalidResponse)?;
+        if encoded.len() > max_bytes {
+            return Err(ModelError::InvalidResponse);
+        }
+        Ok(encoded)
     }
 }
 

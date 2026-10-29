@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{contracts::Section, process::Cancellation};
 
+pub use crate::analysis_contracts::{AnalysisRequest, AnalysisResponse, AnalysisStage};
+
 /// An in-memory source image, with identity matching the document asset registry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageAsset {
@@ -182,6 +184,10 @@ pub enum ModelError {
 pub type ModelFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ModelResponse, ModelError>> + Send + 'a>>;
 
+/// Object-safe future for a typed analysis result.
+pub type AnalysisFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AnalysisResponse, ModelError>> + Send + 'a>>;
+
 /// Injected executor shared by standalone and Bcode-hosted adapters.
 ///
 /// Implementations must honor cancellation while awaiting the model, bound response
@@ -193,6 +199,20 @@ pub trait ModelExecutor: Send + Sync {
         request: ModelRequest,
         cancellation: &'a Cancellation,
     ) -> ModelFuture<'a>;
+
+    /// Execute one typed analysis stage with the stage-specific strict schema.
+    ///
+    /// Existing Standard-only adapters remain source compatible and return
+    /// [`ModelError::Unavailable`] for unsupported analysis. Implementations must
+    /// preserve source/instruction separation, enforce request/response bounds,
+    /// honor cancellation, and return a result matching `request.stage`.
+    fn execute_analysis<'a>(
+        &'a self,
+        _request: AnalysisRequest,
+        _cancellation: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async { Err(ModelError::Unavailable) })
+    }
 }
 
 #[cfg(test)]

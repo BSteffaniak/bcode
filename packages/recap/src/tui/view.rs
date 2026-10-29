@@ -182,7 +182,15 @@ impl App {
                             Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
                         ))
                         .child(Self::label(
-                            "A little more room, a better perspective.",
+                            self.document
+                                .as_ref()
+                                .and_then(|document| document.sections.get(self.chapter))
+                                .map_or_else(
+                                    || "A little more room, a better perspective.".into(),
+                                    |section| {
+                                        format!("Chapter {} · {}", self.chapter + 1, section.title)
+                                    },
+                                ),
                             p.text(),
                         ))
                         .child(Self::label(
@@ -296,15 +304,19 @@ impl App {
                 ))
                 .child(self.button("settings", "Settings", 67)),
         );
-        if self.refine {
-            form = form.child(self.button(
-                "depth",
-                match self.depth {
-                    bcode_recap::contracts::Depth::Brief => "Depth · Brief",
-                    bcode_recap::contracts::Depth::Standard => "Depth · Standard",
-                    bcode_recap::contracts::Depth::Detailed => "Depth · Detailed",
-                },
-                3,
+        form = form.child(self.button(
+            "depth",
+            match self.depth {
+                bcode_recap::contracts::Depth::Brief => "Depth · Brief",
+                bcode_recap::contracts::Depth::Standard => "Depth · Standard",
+                bcode_recap::contracts::Depth::Detailed => "Depth · Detailed — readable video",
+            },
+            3,
+        ));
+        if self.depth == bcode_recap::contracts::Depth::Detailed {
+            form = form.child(Self::label(
+                "Detailed inventories the source, writes chapters, audits coverage and repairs gaps. More model work; limitations remain explicit.",
+                p.quiet(),
             ));
         }
         let form = Surface::new(form)
@@ -378,13 +390,33 @@ impl App {
             .active
             .as_ref()
             .expect("working screen has an operation");
-        let stage = active.stage;
+        let (stage, counts) = match active.stage {
+            Some(Stage::AnalysisProgress {
+                phase,
+                completed,
+                total,
+            }) => (
+                Some(Stage::from(phase)),
+                Some(total.map_or_else(
+                    || format!("{completed} work units completed · total not yet known"),
+                    |total| format!("{completed} / {total} work units completed"),
+                )),
+            ),
+            stage => (stage, None),
+        };
         let steps = [
             (Stage::ModelReadiness, "00  Model readiness"),
             (Stage::Acquisition, "01  Source & captions"),
             (Stage::Media, "02  Source visuals"),
             (Stage::Composition, "03  Compose perspective"),
-            (Stage::Storage, "04  Validate & save"),
+            (
+                Stage::Analysis,
+                "Analysis · source inventory & chapter plan",
+            ),
+            (Stage::Writing, "Writing · source-grounded chapters"),
+            (Stage::Audit, "Audit · source coverage"),
+            (Stage::Repair, "Repair · identified coverage gaps"),
+            (Stage::Storage, "Validate & save"),
         ];
         let mut body = Column::new()
             .gap(1)
@@ -416,18 +448,18 @@ impl App {
                 ),
                 p.quiet(),
             ));
+        // Only the active stage is asserted: inactive stages may be skipped, repeated,
+        // or revisited during repair. Keep cancellation visible on short terminals.
         for (current, label) in steps {
-            body = body.child(Self::label(
-                format!(
-                    "{}  {label}",
-                    if stage == Some(current) { "◉" } else { "·" }
-                ),
-                if stage == Some(current) {
-                    Style::new().fg(p.accent)
-                } else {
-                    p.quiet()
-                },
-            ));
+            if stage == Some(current) {
+                body = body.child(Self::label(
+                    format!("◉  {label}"),
+                    Style::new().fg(p.accent),
+                ));
+            }
+        }
+        if let Some(counts) = counts {
+            body = body.child(Self::label(counts, p.quiet()));
         }
         body = body
             .child(Self::label(
@@ -459,6 +491,11 @@ impl App {
                 background: Style::new().bg(p.panel),
                 scrollbar: ScrollbarStyles::default(),
             });
+        let reading = super::reader::RetainedReader {
+            view: reading,
+            revision: self.preview_generation,
+            layout: &self.reader_layout,
+        };
         let mut reader_body = Column::new();
         if !self.image_capabilities.any_supported() {
             reader_body=reader_body.child(Self::label("SOURCE IMAGES · captions shown here; this terminal does not advertise image support",p.quiet()));
@@ -473,21 +510,25 @@ impl App {
             .padding(LogicalInsets::all(1));
         Element::new(content)
     }
-    fn reader(&self, mode: Density) -> Element<'_> {
+    fn chapter_contents<'a>(&'a self, document: &'a RecapDocument) -> Column<'a> {
         let p = self.palette;
-        let Some(document) = &self.document else {
-            return Element::new(Self::label("Choose a recap from Home.", p.quiet()));
-        };
-        let actions = Row::new()
-            .gap(1)
-            .child(self.button("chapters", "Chapters", 7))
-            .child(self.button("refine", "Refine focus", 8))
-            .child(self.button("export", "Export HTML", 9))
-            .child(self.button("open", "Open HTML", 4));
-        let content = self.reader_content();
         let mut chapters = Column::new()
             .gap(1)
-            .child(Self::label("CONTENTS", Style::new().fg(p.violet)))
+            .child(
+                Row::new()
+                    .child(Self::label("CONTENTS ▶", Style::new().fg(p.violet)))
+                    .flex_child(
+                        1,
+                        self.button(
+                            &format!("chapter-{}", self.chapter),
+                            document
+                                .sections
+                                .get(self.chapter)
+                                .map_or("No chapters", |section| section.title.as_str()),
+                            48,
+                        ),
+                    ),
+            )
             .child(Self::label(
                 format!(
                     "{} {} · revision {}",
@@ -501,24 +542,67 @@ impl App {
                 ),
                 p.quiet(),
             ));
+        let (chapter_start, chapter_end) = self.chapter_window();
         for (index, section) in document
             .sections
             .iter()
             .enumerate()
-            .skip(self.chapter_offset)
-            .take(8)
+            .skip(chapter_start)
+            .take(chapter_end.saturating_sub(chapter_start))
         {
-            chapters = chapters.child(self.button(
-                &format!("chapter-{index}"),
-                &section.title,
-                index % 8 + 40,
-            ));
+            if index == self.chapter {
+                continue;
+            }
+            chapters = chapters.child(
+                Row::new()
+                    .child(Self::label(
+                        if index == self.chapter { "▶" } else { "·" },
+                        p.quiet(),
+                    ))
+                    .flex_child(
+                        1,
+                        self.button(
+                            &format!("chapter-{index}"),
+                            &section.title,
+                            index - chapter_start + 40,
+                        ),
+                    ),
+            );
         }
-        if self.chapter_offset > 0 {
+        if chapter_start > 0 {
             chapters = chapters.child(self.button("chapter-prev", "← Earlier chapters", 77));
         }
-        if self.chapter_offset + 8 < document.sections.len() {
+        if chapter_end < document.sections.len() {
             chapters = chapters.child(self.button("chapter-next", "Later chapters →", 78));
+        }
+        chapters
+    }
+    fn reader(&self, mode: Density) -> Element<'_> {
+        let p = self.palette;
+        let Some(document) = &self.document else {
+            return Element::new(Self::label("Choose a recap from Home.", p.quiet()));
+        };
+        let actions = Row::new()
+            .gap(1)
+            .child(self.button("chapters", "Chapters", 7))
+            .child(self.button("refine", "Refine focus", 8))
+            .child(self.button("export", "Export HTML", 9))
+            .child(self.button("open", "Open HTML", 4));
+        let content = self.reader_content();
+        let chapters = self.chapter_contents(document);
+        // On collapsed layouts, contents replaces the reader form entirely.
+        // Export/refinement fields must not consume the drawer's flex allocation.
+        if mode != Density::Wide && self.drawer {
+            return Element::new(
+                Surface::new(
+                    Column::new()
+                        .child(self.button("chapters", "Close contents · F3", 7))
+                        .flex(Flex::new(1, chapters)),
+                )
+                .background(Style::new().bg(p.panel))
+                .content_style(p.text().bg(p.panel))
+                .padding(LogicalInsets::all(1)),
+            );
         }
         let middle = if mode == Density::Wide {
             Element::new(
@@ -527,20 +611,27 @@ impl App {
                     .flex_child(1, Surface::new(chapters).padding(LogicalInsets::all(1)))
                     .flex_child(3, content),
             )
-        } else if self.drawer {
-            Element::new(
-                Surface::new(chapters)
-                    .background(Style::new().bg(p.panel))
-                    .content_style(p.text().bg(p.panel))
-                    .padding(LogicalInsets::all(1)),
-            )
         } else {
             Element::new(content)
         };
         let mut body = Column::new()
-            .gap(1)
+            .gap(u64::from(mode == Density::Wide))
             .child(Self::label(document.title.clone(), p.title()))
             .child(actions)
+            .child(Self::label(
+                format!(
+                    "Chapter {} / {} · F11 previous · F12 next",
+                    self.chapter + 1,
+                    document.sections.len()
+                ),
+                p.quiet(),
+            ))
+            .child(
+                Row::new()
+                    .flex_child(1, self.button("previous-section", "← Previous", 75))
+                    .flex_child(1, self.button("next-section", "Next →", 76))
+                    .flex_child(1, self.button("last-section", "Last chapter", 79)),
+            )
             .flex(Flex::new(1, middle));
         if self.refine {
             body = body
@@ -578,8 +669,9 @@ pub(super) fn reader_lines(
             Style::new().fg(p.violet),
         );
         push(section.title.clone(), p.title());
+        push("Source times refer to the original video; playback is available in HTML. Reported coverage limitations remain in chapter text, including the final chapter.".into(), p.quiet());
         push(String::new(), p.text());
-        for block in section.blocks.iter().take(128) {
+        for block in &section.blocks {
             match &block.content {
                 BlockContent::Text { text } => push(text.clone(), p.text()),
                 BlockContent::Image { asset_id, caption } => {
@@ -620,7 +712,7 @@ pub(super) fn reader_lines(
                     }
                 }
             }
-            for id in block.evidence_ids.iter().take(8) {
+            for id in &block.evidence_ids {
                 if let Some(evidence) = document.evidence.iter().find(|e| e.id == *id) {
                     push(
                         format!(
@@ -639,7 +731,17 @@ pub(super) fn reader_lines(
 }
 fn timestamp(ms: u64) -> String {
     let s = ms / 1000;
-    format!("{:02}:{:02}.{:03}", s / 60, s % 60, ms % 1000)
+    if s >= 3600 {
+        format!(
+            "{:02}:{:02}:{:02}.{:03}",
+            s / 3600,
+            (s / 60) % 60,
+            s % 60,
+            ms % 1000
+        )
+    } else {
+        format!("{:02}:{:02}.{:03}", s / 60, s % 60, ms % 1000)
+    }
 }
 
 #[cfg(test)]
@@ -654,7 +756,60 @@ mod tests {
         assert_eq!(density(140, 40), Density::Wide);
     }
     #[test]
+    fn reader_retains_every_block_and_source_reference() {
+        use bcode_recap::contracts::{
+            Block, Evidence, GenerationIntent, Section, Source, TimeRange,
+        };
+        let document = RecapDocument {
+            schema_version: 1,
+            id: "long-reader".into(),
+            revision: 1,
+            title: "Long source".into(),
+            source: Source {
+                id: "source".into(),
+                title: "Source".into(),
+                url: None,
+                duration_ms: 7_200_000,
+            },
+            intent: GenerationIntent::default(),
+            transcript: vec![],
+            assets: vec![],
+            evidence: (0..12)
+                .map(|index| Evidence {
+                    id: format!("e-{index}"),
+                    range: TimeRange {
+                        start_ms: index * 1000,
+                        end_ms: index * 1000 + 999,
+                    },
+                    transcript_segment_ids: vec![],
+                })
+                .collect(),
+            sections: vec![Section {
+                id: "chapter".into(),
+                title: "日本語 👩‍💻 e\u{301}".into(),
+                blocks: (0..160)
+                    .map(|index| Block {
+                        id: format!("b-{index}"),
+                        evidence_ids: (0..12).map(|id| format!("e-{id}")).collect(),
+                        content: BlockContent::Text {
+                            text: format!("Complete paragraph {index}"),
+                        },
+                    })
+                    .collect(),
+            }],
+        };
+        let lines = reader_lines(Some(&document), 0, &Palette::dark());
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_str()))
+            .collect();
+        assert!(text.contains("Complete paragraph 159"));
+        assert!(text.contains("00:11.000"));
+        assert!(text.contains("日本語 👩‍💻 e\u{301}"));
+    }
+    #[test]
     fn source_times_are_not_percentages() {
+        assert_eq!(timestamp(3_725_999), "01:02:05.999");
         assert_eq!(timestamp(125_999), "02:05.999");
         assert_eq!(timestamp(0), "00:00.000");
     }

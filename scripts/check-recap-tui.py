@@ -663,6 +663,15 @@ def default_journeys():
             {'resize': [0, 0], 'alive': True, 'timeout': 1},
             {'resize': [120, 40], 'expect': ['Compare motion', 'YOUR LIBRARY'], 'send': quit_key},
         ]},
+        {'name': 'reader-chapter-keyboard-boundaries',
+         'args': ['tui', '--id', 'unicode-field-notes'], 'steps': [
+            {'expect': ['Unicode field notes', 'Chapter 1 / 1'], 'send': '\x1b[24~'},
+            {'expect': ['Unicode field notes', 'Chapter 1 / 1'], 'send': '\x1b[23~'},
+            {'expect': ['Unicode field notes', 'Chapter 1 / 1'], 'send': '\x1b[13~'},
+            {'expect': ['CONTENTS', 'Motion and evidence'], 'resize': [40, 20]},
+            {'expect': ['CONTENTS', 'Motion and evidence'], 'resize': [120, 40]},
+            {'expect': ['CONTENTS', 'Motion and evidence'], 'send': quit_key},
+        ]},
         {'name': 'reader-unicode-refine-export', 'args': ['tui', '--id', 'unicode-field-notes'], 'steps': [
             {'expect': ['Unicode field notes', '日本語'], 'send': '\x1b[13~'},
             {'expect': ['CONTENTS', 'Motion and evidence'], 'send': '\x1b[13~'},

@@ -12,6 +12,7 @@ pub fn engine(error: EngineError) -> String {
         EngineError::Source(_) => "recap_source_unavailable: check local video/transcript access or downloader configuration".into(),
         EngineError::Media(MediaError::Invalid(reason)) => format!("recap_media_invalid: {reason}; check video duration, tracks and extraction limits"),
         EngineError::Media(_) => "recap_media_unavailable: check media workspace access and metadata".into(),
+        EngineError::Composition(CompositionError::Model(bcode_recap::model::ModelError::Unavailable)) => "recap_model_unavailable: select an admitted executor supporting the requested mode; Detailed requires typed analysis and never falls back to Standard".into(),
         EngineError::Composition(CompositionError::Model(error)) => format!("recap_model_failed: {error}; check admitted profile and structured/image capabilities"),
         EngineError::Composition(CompositionError::Invalid(reason)) => format!("recap_grounding_invalid: {reason}; model output must reference actual evidence/assets"),
         EngineError::Composition(CompositionError::Budget) => "recap_context_budget: source evidence exceeds configured composition limits".into(),
@@ -37,6 +38,17 @@ fn process(error: &ProcessError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_analysis_is_actionable_without_a_standard_fallback() {
+        let message = super::engine(bcode_recap::engine::EngineError::Composition(
+            bcode_recap::composition::CompositionError::Model(
+                bcode_recap::model::ModelError::Unavailable,
+            ),
+        ));
+        assert!(message.starts_with("recap_model_unavailable:"));
+        assert!(message.contains("never falls back to Standard"));
+    }
+
     #[test]
     fn diagnostics_omit_untrusted_io_and_json_details() {
         let error = bcode_recap::engine::EngineError::Io(std::io::Error::other(

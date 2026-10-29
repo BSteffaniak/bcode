@@ -31,6 +31,14 @@ pub enum Phase {
     Media,
     /// Model composition and validation.
     Composition,
+    /// Detailed source inventory and outline analysis.
+    Analysis,
+    /// Detailed chapter composition.
+    Writing,
+    /// Source coverage audit.
+    Audit,
+    /// Source-grounded repair of identified gaps.
+    Repair,
     /// Durable revision commit.
     Storage,
     /// HTML generation/write.
@@ -57,6 +65,15 @@ pub enum Event {
     Phase { phase: Phase },
     /// Phase ended; elapsed duration is monotonic and bounded to this operation.
     PhaseFinished { phase: Phase, duration_ms: u64 },
+    /// Bounded aggregate progress, without source identities or editorial content.
+    AnalysisProgress {
+        /// Semantic stage, not a provider operation or source label.
+        phase: Phase,
+        /// Number of completed work units.
+        completed: u64,
+        /// Total planned work units, when known.
+        total: Option<u64>,
+    },
     /// Actual model executor invocation, not readiness.
     InferenceStarted,
     /// Durable document commit succeeded.
@@ -235,6 +252,39 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detailed_progress_is_count_only_bounded_and_terminal_stable() {
+        let operation = Operation::new("test-detailed".into());
+        for phase in [Phase::Analysis, Phase::Writing, Phase::Audit, Phase::Repair] {
+            operation.observe(Event::Phase { phase });
+            operation.observe(Event::AnalysisProgress {
+                phase,
+                completed: 2,
+                total: Some(3),
+            });
+        }
+        let json = serde_json::to_value(operation.report()).unwrap();
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"]["kind"] == "analysis_progress")
+                .count(),
+            4
+        );
+        operation.observe(Event::Terminal {
+            status: Status::Failed,
+            code: "coverage_incomplete".into(),
+        });
+        let terminal = serde_json::to_value(operation.report()).unwrap();
+        operation.observe(Event::AnalysisProgress {
+            phase: Phase::Repair,
+            completed: 3,
+            total: Some(3),
+        });
+        assert_eq!(serde_json::to_value(operation.report()).unwrap(), terminal);
+    }
     #[test]
     fn terminal_is_stable_and_phase_durations_close() {
         let op = Operation::new("test".into());

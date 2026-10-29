@@ -7,7 +7,11 @@ use bcode_plugin_sdk::{
     ServiceBridge, ServiceBridgeRequest, ServiceBridgeResponse, ServiceCancellation,
 };
 use bcode_recap::{
-    model::{ModelError, ModelExecutor, ModelFuture, ModelRequest, ModelResponse},
+    analysis_contracts::analysis_response_schema,
+    model::{
+        AnalysisFuture, AnalysisRequest, AnalysisResponse, ModelError, ModelExecutor, ModelFuture,
+        ModelRequest, ModelResponse,
+    },
     process::Cancellation,
 };
 use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
@@ -75,87 +79,136 @@ impl HostExecutor {
 impl ModelExecutor for HostExecutor {
     fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
         Box::pin(async move {
-            if cancel.is_cancelled() || self.cancellation.is_cancelled() {
-                return Err(ModelError::Cancelled);
-            }
             let max_bytes = request.max_response_bytes;
             let input = structured_request(request)?;
-            let request_bytes = serde_json::to_vec(&input)
-                .map_err(|_| ModelError::ExecutionFailed)?
-                .len();
-            eprintln!(
-                "recap_model_request: serialized_bytes={request_bytes} image_count={}",
-                input
-                    .messages
-                    .iter()
-                    .flat_map(|message| &message.content)
-                    .filter(|block| matches!(block, ContentBlock::Image { .. }))
-                    .count()
-            );
-            let scope_id = input.scope_id.clone();
-            input.validate_public().map_err(|reason| {
-                eprintln!("recap_model_request_rejected: {reason}");
-                ModelError::ExecutionFailed
-            })?;
-            let started: wire::StartResponse = self.call(wire::OP_START_STRUCTURED, &input)?;
-            let turn = wire::TurnRequest {
-                scope_id: scope_id.clone(),
-                turn_id: started.turn_id.clone(),
-            };
-            let mut cursor = 0;
-            let mut text = String::new();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            let result = loop {
-                if cancel.is_cancelled()
-                    || self.cancellation.is_cancelled()
-                    || tokio::time::Instant::now() >= deadline
-                {
-                    let _: Result<bcode_model::AckResponse, _> = self.call(wire::OP_CANCEL, &turn);
-                    break Err(ModelError::Cancelled);
-                }
-                let page: wire::PollResponse = match self.call(
-                    wire::OP_POLL,
-                    wire::PollRequest {
-                        scope_id: scope_id.clone(),
-                        turn_id: started.turn_id.clone(),
-                        after_sequence: cursor,
-                    },
-                ) {
-                    Ok(page) => page,
-                    Err(error) => break Err(error),
-                };
-                let mut failed = false;
-                for event in page.events {
-                    match event.event {
-                        ProviderTurnEvent::TextDelta { text: delta }
-                        | ProviderTurnEvent::Output {
-                            event: bcode_model::ProviderOutputEvent::TextDelta { text: delta },
-                            ..
-                        } => text.push_str(&delta),
-                        ProviderTurnEvent::Error { .. } | ProviderTurnEvent::Cancelled => {
-                            failed = true;
-                        }
-                        _ => {}
-                    }
-                }
-                if failed || text.len() > max_bytes {
-                    break Err(ModelError::ExecutionFailed);
-                }
-                cursor = page.next_sequence;
-                if page.terminal {
-                    break ModelResponse::from_json(text.as_bytes(), max_bytes);
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            };
-            // Finish is explicit and never triggers retry of an uncertain model operation.
-            let _: Result<bcode_model::AckResponse, _> = self.call(wire::OP_CANCEL, &turn);
-            let _: Result<bcode_model::AckResponse, _> = self.call(wire::OP_FINISH, &turn);
-            result
+            let text = self.execute_structured(input, max_bytes, cancel).await?;
+            ModelResponse::from_json(text.as_bytes(), max_bytes)
+        })
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: AnalysisRequest,
+        cancel: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async move {
+            let stage = request.stage;
+            let max_bytes = request.max_response_bytes;
+            let input = structured_analysis_request(request)?;
+            let text = self.execute_structured(input, max_bytes, cancel).await?;
+            AnalysisResponse::from_json_slice(stage, text.as_bytes(), max_bytes)
         })
     }
 }
 
+impl HostExecutor {
+    async fn execute_structured(
+        &self,
+        input: wire::StructuredStartRequest,
+        max_bytes: usize,
+        cancel: &Cancellation,
+    ) -> Result<String, ModelError> {
+        if cancel.is_cancelled() || self.cancellation.is_cancelled() {
+            return Err(ModelError::Cancelled);
+        }
+        let request_bytes = serde_json::to_vec(&input)
+            .map_err(|_| ModelError::ExecutionFailed)?
+            .len();
+        eprintln!(
+            "recap_model_request: serialized_bytes={request_bytes} image_count={}",
+            input
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|block| matches!(block, ContentBlock::Image { .. }))
+                .count()
+        );
+        let scope_id = input.scope_id.clone();
+        input.validate_public().map_err(|reason| {
+            eprintln!("recap_model_request_rejected: {reason}");
+            ModelError::ExecutionFailed
+        })?;
+        let started: wire::StartResponse = self.call(wire::OP_START_STRUCTURED, &input)?;
+        let turn = wire::TurnRequest {
+            scope_id: scope_id.clone(),
+            turn_id: started.turn_id.clone(),
+        };
+        let mut cursor = 0;
+        let mut text = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let result = loop {
+            if cancel.is_cancelled()
+                || self.cancellation.is_cancelled()
+                || tokio::time::Instant::now() >= deadline
+            {
+                let _: Result<bcode_model::AckResponse, _> = self.call(wire::OP_CANCEL, &turn);
+                break Err(ModelError::Cancelled);
+            }
+            let page: wire::PollResponse = match self.call(
+                wire::OP_POLL,
+                wire::PollRequest {
+                    scope_id: scope_id.clone(),
+                    turn_id: started.turn_id.clone(),
+                    after_sequence: cursor,
+                },
+            ) {
+                Ok(page) => page,
+                Err(error) => break Err(error),
+            };
+            let mut failed = false;
+            for event in page.events {
+                match event.event {
+                    ProviderTurnEvent::TextDelta { text: delta }
+                    | ProviderTurnEvent::Output {
+                        event: bcode_model::ProviderOutputEvent::TextDelta { text: delta },
+                        ..
+                    } => text.push_str(&delta),
+                    ProviderTurnEvent::Error { .. } | ProviderTurnEvent::Cancelled => {
+                        failed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if failed || text.len() > max_bytes {
+                break Err(ModelError::ExecutionFailed);
+            }
+            cursor = page.next_sequence;
+            if page.terminal {
+                break Ok(text);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        // Finish is explicit and never triggers retry of an uncertain model operation.
+        let _: Result<bcode_model::AckResponse, _> = self.call(wire::OP_CANCEL, &turn);
+        let _: Result<bcode_model::AckResponse, _> = self.call(wire::OP_FINISH, &turn);
+        result
+    }
+}
+
+fn structured_analysis_request(
+    request: AnalysisRequest,
+) -> Result<wire::StructuredStartRequest, ModelError> {
+    let schema = analysis_response_schema(request.stage);
+    structured_request_with_schema(
+        ModelRequest {
+            instructions: request.instructions,
+            input_text: serde_json::to_string(&request.input)
+                .map_err(|_| ModelError::InvalidResponse)?,
+            images: request.images,
+            max_response_bytes: request.max_response_bytes,
+        },
+        schema,
+    )
+}
+
 fn structured_request(request: ModelRequest) -> Result<wire::StructuredStartRequest, ModelError> {
+    structured_request_with_schema(request, bcode_recap::model::response_schema())
+}
+
+fn structured_request_with_schema(
+    request: ModelRequest,
+    schema: serde_json::Value,
+) -> Result<wire::StructuredStartRequest, ModelError> {
     let mut content = vec![ContentBlock::Text {
         text: request.input_text,
     }];
@@ -200,7 +253,7 @@ fn structured_request(request: ModelRequest) -> Result<wire::StructuredStartRequ
         ],
         output: bcode_model::StructuredOutputRequest {
             name: "recap".into(),
-            schema: bcode_recap::model::response_schema(),
+            schema,
             strict: true,
         },
         max_output_tokens: Some(8192),
@@ -211,6 +264,80 @@ fn structured_request(request: ModelRequest) -> Result<wire::StructuredStartRequ
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use bcode_recap::model::AnalysisStage;
+
+    #[test]
+    fn analysis_requests_preserve_stage_schema_source_channels_and_token_compatibility() {
+        for stage in [
+            AnalysisStage::ExtractionInventory,
+            AnalysisStage::Outline,
+            AnalysisStage::ChapterComposition,
+            AnalysisStage::SourceAudit,
+            AnalysisStage::SourceRepair,
+            AnalysisStage::VisualInspection,
+        ] {
+            let input = structured_analysis_request(AnalysisRequest {
+                stage,
+                instructions: "trusted analysis policy".into(),
+                input: serde_json::json!({"source": "untrusted caption"}),
+                images: vec![bcode_recap::model::ImageAsset {
+                    asset_id: "frame-1".into(),
+                    mime_type: "image/jpeg".into(),
+                    bytes: vec![1, 2, 3],
+                }],
+                max_response_bytes: 1024,
+            })
+            .unwrap();
+            input.validate_public().unwrap();
+            assert_eq!(input.output.schema, analysis_response_schema(stage));
+            assert_eq!(input.max_output_tokens, Some(8192));
+            assert_eq!(input.messages[0].role, MessageRole::System);
+            assert_eq!(
+                input.messages[0].content,
+                vec![ContentBlock::Text {
+                    text: "trusted analysis policy".into()
+                }]
+            );
+            assert_eq!(input.messages[1].role, MessageRole::User);
+            assert!(
+                matches!(&input.messages[1].content[0], ContentBlock::Text { text } if text.contains("untrusted caption"))
+            );
+            assert!(
+                matches!(&input.messages[1].content[2], ContentBlock::Image { image } if image.data_base64 == "AQID")
+            );
+            let standard = br#"{"title":"not analysis","sections":[],"image_choices":[]}"#;
+            assert_eq!(
+                AnalysisResponse::from_json_slice(stage, standard, 1024),
+                Err(ModelError::InvalidResponse)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_analysis_never_requires_a_host_bridge() {
+        let executor = HostExecutor {
+            bridge: ServiceBridge::default(),
+            invocation_id: "cancelled-test".into(),
+            cancellation: ServiceCancellation::default(),
+        };
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let result = executor
+            .execute_analysis(
+                AnalysisRequest {
+                    stage: AnalysisStage::Outline,
+                    instructions: "policy".into(),
+                    input: serde_json::json!({}),
+                    images: vec![],
+                    max_response_bytes: 1024,
+                },
+                &cancel,
+            )
+            .await;
+        assert_eq!(result, Err(ModelError::Cancelled));
+    }
+
     #[test]
     fn generated_multimodal_request_round_trips_host_contract_without_losing_frames() {
         let request = bcode_recap::model::ModelRequest {

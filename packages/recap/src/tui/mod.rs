@@ -1,5 +1,6 @@
 //! Recap's terminal shell. All effects enter the shared application adapter.
 mod images;
+mod reader;
 mod settings;
 #[cfg(test)]
 mod tests;
@@ -94,6 +95,7 @@ struct App {
     library_offset: usize,
     chapter_offset: usize,
     lines: Vec<bmux_tui::text::Line>,
+    reader_layout: RefCell<reader::ReaderLayout>,
     scroll: Cell<ScrollViewState>,
     recent: Vec<application::CatalogEntry>,
     cursor: Option<application::CatalogCursor>,
@@ -150,6 +152,7 @@ impl App {
             library_offset: 0,
             chapter_offset: 0,
             lines: Vec::new(),
+            reader_layout: RefCell::new(reader::ReaderLayout::default()),
             scroll: Cell::new(ScrollViewState::default()),
             recent: Vec::new(),
             cursor: None,
@@ -256,13 +259,11 @@ impl App {
                     (self.library_offset + 6).min(self.recent.len().saturating_sub(1));
             }
             "library-prev" => self.library_offset = self.library_offset.saturating_sub(6),
-            "chapter-next" => {
-                if let Some(document) = &self.document {
-                    self.chapter_offset =
-                        (self.chapter_offset + 8).min(document.sections.len().saturating_sub(1));
-                }
-            }
-            "chapter-prev" => self.chapter_offset = self.chapter_offset.saturating_sub(8),
+            "chapter-next" => self.page_chapters(true),
+            "chapter-prev" => self.page_chapters(false),
+            "previous-section" => self.select_chapter(self.chapter.saturating_sub(1)),
+            "next-section" => self.select_chapter(self.chapter.saturating_add(1)),
+            "last-section" => self.select_chapter(usize::MAX),
             "settings" | "settings-nav" => {
                 self.settings_state.open = !self.settings_state.open;
                 self.settings_state.dropdown_focus = 0;
@@ -323,9 +324,8 @@ impl App {
                     .strip_prefix("chapter-")
                     .and_then(|n| n.parse::<usize>().ok())
                 {
-                    self.chapter = index;
+                    self.select_chapter(index);
                     self.drawer = false;
-                    self.rebuild_reader();
                 }
             }
         }
@@ -464,6 +464,8 @@ impl App {
                 } else {
                     "home"
                 }),
+                KeyCode::F(11) if self.screen == Screen::Reader => Some("previous-section"),
+                KeyCode::F(12) if self.screen == Screen::Reader => Some("next-section"),
                 KeyCode::F(7) => Some("settings"),
                 KeyCode::Enter
                     if self.screen == Screen::Home
@@ -598,6 +600,42 @@ impl App {
                 self.screen = Screen::Diagnostics;
                 self.scroll.set(ScrollViewState::default());
             }
+        }
+    }
+    fn page_chapters(&mut self, forward: bool) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let (start, end) = self.chapter_window();
+        self.chapter = if forward {
+            end.min(document.sections.len().saturating_sub(1))
+        } else {
+            start.saturating_sub(self.chapter_page_size())
+        };
+        self.chapter_offset = self.chapter;
+        self.rebuild_reader();
+    }
+    // Page size limits presentation only, never document content.
+    fn chapter_page_size(&self) -> usize {
+        usize::from(self.size.get().1.saturating_sub(24) / 2).clamp(1, 8)
+    }
+    fn chapter_window(&self) -> (usize, usize) {
+        let count = self.document.as_ref().map_or(0, |doc| doc.sections.len());
+        let page = self.chapter_page_size();
+        let start = if self.chapter < self.chapter_offset {
+            self.chapter
+        } else if self.chapter >= self.chapter_offset.saturating_add(page) {
+            self.chapter.saturating_sub(page - 1)
+        } else {
+            self.chapter_offset
+        };
+        (start, start.saturating_add(page).min(count))
+    }
+    fn select_chapter(&mut self, index: usize) {
+        if let Some(document) = &self.document {
+            self.chapter = index.min(document.sections.len().saturating_sub(1));
+            self.chapter_offset = self.chapter_window().0;
+            self.rebuild_reader();
         }
     }
     fn rebuild_reader(&mut self) {

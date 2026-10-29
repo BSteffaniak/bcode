@@ -11,5 +11,5 @@ mod tui;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    cli::main().await
+    Box::pin(cli::main()).await
 }

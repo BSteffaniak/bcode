@@ -412,6 +412,8 @@ fn engine_options(store_root: &Path) -> EngineOptions {
         tools: bcode_recap::media::MediaTools::default(),
         media: bcode_recap::media::MediaBudget::default(),
         composition: bcode_recap::composition::CompositionLimits::default(),
+        detailed: bcode_recap::analysis_contracts::DetailedPolicy::default(),
+        inspection: bcode_recap::media::InspectionBudget::default(),
         export: bcode_recap::export::ExportBudget::default(),
     }
 }

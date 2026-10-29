@@ -73,6 +73,27 @@ CSS, JavaScript, images, and selected silent clips are embedded. Reading works o
 
 `plugins/recap-plugin` calls the Rust library directly and contributes create/refine/export/inspect operations. Model execution requires explicit model-host admission under a configured profile; loading the plugin alone does not grant inference authority. Its tools remain subject to normal agent policy and permissions. See `docs/recap-architecture.md` and the plugin documentation for boundaries and configuration.
 
+## Detailed readable editions
+
+Choose **Detailed** in source options or pass `--depth detailed` to `create`.
+Brief and Standard remain selective recaps. Detailed processes timestamped source
+windows, inventories substantive information, plans chapters, writes them separately,
+and audits against source evidence with bounded targeted repair. Chapter count follows
+the material rather than an editorial cap. Optional focus changes emphasis, not coverage.
+
+Detailed performs multiple model requests and can take substantially longer and consume
+more usage than Standard. Resource allowances remain explicit: CLI callers can set
+`--detailed-max-model-calls`, `--detailed-max-source-windows`, and
+`--detailed-max-repair-rounds`; library callers configure `EngineOptions::detailed`
+and `EngineOptions::inspection`. Exhausted allowances fail rather than quietly producing
+a shorter Standard document. Model adapters without typed analysis support fail explicitly.
+
+Adaptive scene/transcript sampling improves visual evidence, but sampled frames do not
+prove complete visual coverage or motion understanding. Reading notes preserve inspection
+limitations. Audits and evidence references are safeguards, not a guarantee of factual or
+semantic completeness. Intermediate analysis remains operation-local; no implicit durable
+checkpoint cache is created. Existing documents remain readable without conversion.
+
 ## Validation
 
 ```sh

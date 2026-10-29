@@ -97,6 +97,8 @@ fn options(root: &Path) -> EngineOptions {
             ..MediaBudget::default()
         },
         composition: CompositionLimits::default(),
+        detailed: bcode_recap::analysis_contracts::DetailedPolicy::default(),
+        inspection: bcode_recap::media::InspectionBudget::default(),
         export: ExportBudget::default(),
     }
 }

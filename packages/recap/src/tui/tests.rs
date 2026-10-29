@@ -18,6 +18,185 @@ fn paint(app: &App, width: u16, height: u16) -> (Buffer, bmux_tui::hit::HitMap) 
     (buffer, hits)
 }
 
+#[tokio::test]
+async fn analysis_counts_render_real_units_and_reject_stale_operations() {
+    use bcode_recap::diagnostics::Phase;
+    let mut app = App::new(TuiOptions::default());
+    app.active = Some(Active {
+        id: 42,
+        cancel: Cancellation::default(),
+        started: Instant::now(),
+        stage: Some(Stage::Analysis),
+        cancelling: false,
+        task: tokio::spawn(async {}),
+    });
+    for (phase, label) in [
+        (Phase::Analysis, "Analysis"),
+        (Phase::Writing, "Writing"),
+        (Phase::Audit, "Audit"),
+        (Phase::Repair, "Repair"),
+    ] {
+        for (completed, total, expected) in [
+            (3, Some(12), "3 / 12 work units completed"),
+            (4, None, "4 work units completed · total not yet known"),
+            (0, Some(0), "0 / 0 work units completed"),
+            (13, Some(12), "13 / 12 work units completed"),
+        ] {
+            let stage = Stage::AnalysisProgress {
+                phase,
+                completed,
+                total,
+            };
+            app.update(RuntimeEvent::Message(Message::Progress(42, stage)))
+                .unwrap();
+            app.update(RuntimeEvent::Message(Message::Progress(41, Stage::Storage)))
+                .unwrap();
+            assert_eq!(app.active.as_ref().unwrap().stage, Some(stage));
+            let (buffer, _) = paint(&app, 120, 40);
+            let visible: String = buffer
+                .cells()
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect();
+            assert!(visible.contains(label));
+            assert!(visible.contains(expected));
+            assert!(!visible.contains('%'));
+        }
+    }
+    app.update(RuntimeEvent::Message(Message::Progress(42, Stage::Storage)))
+        .unwrap();
+    let (buffer, _) = paint(&app, 120, 40);
+    let visible: String = buffer
+        .cells()
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect();
+    assert!(visible.contains("Validate & save"));
+    assert!(!visible.contains("work units completed"));
+}
+
+#[test]
+fn retained_reader_cache_reuses_measurement_and_replaces_resize_entries() {
+    use bmux_tui::{component::Component, text::Line};
+    use bmux_tui_components::text_view::TextViewComponent;
+    let lines = vec![Line::raw(
+        "日本語 👩‍💻 e\u{301} long reader paragraph ".repeat(1000),
+    )];
+    let scroll = Cell::new(ScrollViewState::default());
+    let view = TextViewComponent::new("reader", &lines, &scroll);
+    let mut cache = reader::ReaderLayout::default();
+    let constraints = Constraints::tight(Size::new(60, 12));
+    let mut first = LayoutCx::new();
+    let original = cache.resolve(&view, 1, constraints, &mut first);
+    assert!(first.measured_nodes() > 0);
+    let mut reused = LayoutCx::new();
+    let again = cache.resolve(&view, 1, constraints, &mut reused);
+    assert_eq!(reused.measured_nodes(), 0);
+    assert_eq!(original.size, again.size);
+    for width in [0, 1, 2, 20, 80, 120, 40] {
+        let mut cx = LayoutCx::new();
+        let constraints = Constraints::tight(Size::new(width, 12));
+        let cached = cache.resolve(&view, 1, constraints, &mut cx);
+        let direct = view.layout(constraints, &mut LayoutCx::new());
+        assert_eq!(cached.size, direct.size);
+        assert_eq!(cache.entries(), 1);
+    }
+    let mut changed = LayoutCx::new();
+    cache.resolve(&view, 2, constraints, &mut changed);
+    assert!(changed.measured_nodes() > 0);
+    assert_eq!(cache.entries(), 1);
+}
+
+fn long_reader() -> App {
+    use bcode_recap::contracts::{GenerationIntent, Section, Source};
+    let mut app = App::new(TuiOptions::default());
+    app.document = Some(RecapDocument {
+        schema_version: 1,
+        id: "long-reader".into(),
+        revision: 1,
+        title: "Long reader".into(),
+        source: Source {
+            id: "source".into(),
+            title: "Source".into(),
+            url: None,
+            duration_ms: 7_200_000,
+        },
+        intent: GenerationIntent::default(),
+        transcript: vec![],
+        evidence: vec![],
+        assets: vec![],
+        sections: (0..300)
+            .map(|index| Section {
+                id: format!("chapter-{index}"),
+                title: format!("Chapter {index} 日本語 👩‍💻"),
+                blocks: vec![],
+            })
+            .collect(),
+    });
+    app.screen = Screen::Reader;
+    app.rebuild_reader();
+    app
+}
+
+#[test]
+fn selected_chapter_is_in_window_after_navigation_and_resize() {
+    let mut app = long_reader();
+    for size in [(120, 40), (80, 30), (40, 20), (20, 8), (0, 0)] {
+        app.size.set(size);
+        for index in [0, 8, 129, 299, 12] {
+            app.select_chapter(index);
+            let (start, end) = app.chapter_window();
+            assert!((start..end).contains(&app.chapter));
+            assert_eq!(app.chapter, index);
+        }
+    }
+    app.size.set((120, 40));
+    app.select_chapter(299);
+    app.action("next-section");
+    assert_eq!(app.chapter, 299);
+    app.action("previous-section");
+    assert_eq!(app.chapter, 298);
+    app.action("chapter-prev");
+    let (start, end) = app.chapter_window();
+    assert!((start..end).contains(&app.chapter));
+    app.drawer = true;
+    for (width, height) in [(120, 40), (40, 20), (34, 13), (80, 30), (120, 40)] {
+        let (buffer, hits) = paint(&app, width, height);
+        let selected = hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == format!("chapter-{}", app.chapter))
+            .unwrap_or_else(|| {
+                panic!("selected chapter lost its visible hit region at {width}x{height}")
+            });
+        assert!(selected.visible);
+        assert!(selected.area.width > 0 && selected.area.height > 0);
+        assert!(selected.area.x.saturating_add(selected.area.width) <= width);
+        assert!(selected.area.y.saturating_add(selected.area.height) <= height);
+        let mut painted = String::new();
+        for y in selected.area.y..selected.area.y + selected.area.height {
+            for x in selected.area.x..selected.area.x + selected.area.width {
+                painted.push_str(
+                    &buffer.cells()[usize::from(y) * usize::from(width) + usize::from(x)].symbol,
+                );
+            }
+        }
+        assert!(
+            painted.contains("Chapter"),
+            "selected chapter hit must contain its visible label"
+        );
+        if width < 112 {
+            assert!(
+                !hits
+                    .regions()
+                    .iter()
+                    .any(|hit| hit.id.as_str() == "export-path.input"),
+                "collapsed contents must replace the export form, not register hidden inputs"
+            );
+        }
+    }
+}
+
 #[test]
 fn failure_details_remain_painted_after_home_and_resize() {
     let mut app = App::new(TuiOptions::default());

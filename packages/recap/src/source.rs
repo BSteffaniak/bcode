@@ -554,6 +554,70 @@ pub fn transcript_segments(
         })
         .collect()
 }
+/// Produce an analysis-only projection of rolling captions, retaining surviving source IDs.
+///
+/// Persist the original transcript: a fully repeated overlapping cue is omitted only here.
+/// Exact whitespace-delimited suffix/prefix matches are removed only for temporally
+/// overlapping/touching cues. Case and punctuation remain significant. At most 256 words
+/// are compared at a boundary; uncertain longer repetition is retained, never guessed away.
+/// # Errors
+/// Rejects inputs beyond the existing caption count/byte budgets or invalid ranges.
+pub fn deduplicate_rolling_captions(
+    segments: &[crate::contracts::TranscriptSegment],
+) -> Result<Vec<crate::contracts::TranscriptSegment>, SourceError> {
+    if segments.len() > 50_000 {
+        return Err(SourceError::Invalid("caption count budget"));
+    }
+    let mut total = 0_usize;
+    for segment in segments {
+        total = total
+            .checked_add(segment.text.len())
+            .ok_or(SourceError::Invalid("subtitle byte budget"))?;
+        if total > 4 * 1024 * 1024 {
+            return Err(SourceError::Invalid("subtitle byte budget"));
+        }
+        if segment.range.start_ms >= segment.range.end_ms || segment.text.trim().is_empty() {
+            return Err(SourceError::Invalid("invalid caption"));
+        }
+    }
+    let mut result = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        let mut projected = segment.clone();
+        if let Some(previous) = index.checked_sub(1).map(|i| &segments[i])
+            && segment.range.start_ms >= previous.range.start_ms
+            && segment.range.start_ms <= previous.range.end_ms
+        {
+            let previous_words: Vec<_> = previous.text.split_whitespace().rev().take(256).collect();
+            let current_words: Vec<_> = segment.text.split_whitespace().take(256).collect();
+            let overlap = (1..=previous_words.len().min(current_words.len()))
+                .rev()
+                .find(|count| {
+                    previous_words[..*count]
+                        .iter()
+                        .rev()
+                        .copied()
+                        .eq(current_words[..*count].iter().copied())
+                })
+                .unwrap_or(0);
+            if overlap > 0 {
+                // Slice at an original UTF-8 word boundary, not a reconstructed string.
+                let mut words = segment.text.split_whitespace();
+                for _ in 0..overlap {
+                    words.next();
+                }
+                if let Some(next) = words.next() {
+                    let offset = next.as_ptr() as usize - segment.text.as_ptr() as usize;
+                    segment.text[offset..].clone_into(&mut projected.text);
+                } else {
+                    continue;
+                }
+            }
+        }
+        result.push(projected);
+    }
+    Ok(result)
+}
+
 /// Explicit argument-vector transcription command. The canonical input video path is
 /// appended to `args`; the command must emit timestamped VTT/SRT on standard output.
 #[derive(Clone, Debug)]
@@ -626,6 +690,50 @@ pub fn resolve_transcript(
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn caption(id: &str, start: u64, end: u64, text: &str) -> crate::contracts::TranscriptSegment {
+        crate::contracts::TranscriptSegment {
+            id: id.into(),
+            range: crate::contracts::TimeRange {
+                start_ms: start,
+                end_ms: end,
+            },
+            text: text.into(),
+        }
+    }
+    #[test]
+    fn rolling_projection_retains_novel_words_and_original_identity() {
+        let source = vec![
+            caption("a", 0, 2000, "hello world"),
+            caption("b", 1000, 3000, "hello world and 語🙂"),
+            caption("c", 2000, 4000, "and 語🙂! new ending"),
+        ];
+        let result = deduplicate_rolling_captions(&source).unwrap();
+        assert_eq!(result[1].text, "and 語🙂");
+        // Changed punctuation is uncertain: do not erase source words.
+        assert_eq!(result[2].text, "and 語🙂! new ending");
+        assert_eq!(result[1].id, "b");
+        assert_eq!(result[1].range, source[1].range);
+        assert_eq!(source[1].text, "hello world and 語🙂");
+    }
+    #[test]
+    fn repeated_rolling_cues_do_not_erase_later_novel_tail_or_nonoverlapping_repetition() {
+        let source = vec![
+            caption("a", 0, 2000, "a b"),
+            caption("b", 1000, 3000, "a b"),
+            caption("c", 2000, 4000, "a b c d"),
+            caption("d", 5000, 6000, "c d"),
+        ];
+        let result = deduplicate_rolling_captions(&source).unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|s| (s.id.as_str(), s.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a", "a b"), ("c", "c d"), ("d", "c d")]
+        );
+    }
     #[test]
     fn youtube_blank_cues_are_valid_but_do_not_become_transcript() {
         let input = "WEBVTT\n\n00:01.000 --> 00:02.000 align:start position:0%\nActual words\n\n00:02.000 --> 00:02.010 align:start position:0%\n \n \n\n00:02.010 --> 00:03.000\nMore words\n";
@@ -727,7 +835,6 @@ mod tests {
         ));
         assert!(!format!("{error:?}").contains("PRIVATE"));
     }
-    use super::*;
     #[test]
     fn validates_youtube_hosts_and_ids() {
         assert!(

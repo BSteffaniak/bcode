@@ -200,7 +200,9 @@ pub enum Depth {
     /// A useful visual recap, the noninteractive default.
     #[default]
     Standard,
-    /// A more comprehensive recap.
+    /// A source-information-preserving recap without an editorial chapter cap.
+    /// Explicit resource limits may prevent completion but must not silently
+    /// turn Detailed into a selective summary.
     Detailed,
 }
 
