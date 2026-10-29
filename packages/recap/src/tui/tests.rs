@@ -758,7 +758,7 @@ fn duration_approval_retains_exact_request_and_changes_only_duration() {
             .create_request("another".into(), None, None, Depth::Detailed)
             .budget
             .max_duration_seconds,
-        7200
+        0
     );
 }
 

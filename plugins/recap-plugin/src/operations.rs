@@ -403,10 +403,10 @@ fn engine_options(store_root: &Path) -> EngineOptions {
         acquisition: AcquisitionOptions {
             yt_dlp: PathBuf::from("yt-dlp"),
             workspace: store_root.to_path_buf(),
-            max_video_bytes: 512 * 1024 * 1024,
-            max_duration_seconds: 7200.0,
+            max_video_bytes: 0,
+            max_duration_seconds: 0.0,
             caption_language: "en".into(),
-            timeout: Duration::from_secs(120),
+            timeout: Duration::ZERO,
         },
         transcription: None,
         tools: bcode_recap::media::MediaTools::default(),

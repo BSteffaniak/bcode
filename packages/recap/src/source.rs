@@ -30,13 +30,13 @@ pub struct AcquisitionOptions {
     pub yt_dlp: PathBuf,
     /// Existing directory under caller ownership. A unique child is created.
     pub workspace: PathBuf,
-    /// Maximum downloaded video bytes.
+    /// Maximum downloaded video bytes; zero means no caller-imposed limit.
     pub max_video_bytes: u64,
-    /// Maximum source duration.
+    /// Maximum source duration; zero means no caller-imposed limit.
     pub max_duration_seconds: f64,
     /// Preferred subtitle language (simple language tag only).
     pub caption_language: String,
-    /// Per-operation deadline.
+    /// Per-operation deadline; zero disables it.
     pub timeout: Duration,
 }
 /// Source media and optional real timestamped captions.
@@ -173,26 +173,31 @@ async fn download_process(
             AcquisitionStage::Download => crate::diagnostics::Phase::Download,
         },
     });
-    process::run_inspected(request, cancel, |exit_code, stderr| {
-        let failure = classify_download(stderr);
-        cancel.emit(crate::diagnostics::Event::AcquisitionFailed {
-            phase: match stage {
-                AcquisitionStage::Metadata => crate::diagnostics::Phase::Metadata,
-                AcquisitionStage::Download => crate::diagnostics::Phase::Download,
-            },
-            exit_code,
-            http_status: match failure {
-                AcquisitionFailure::Forbidden => Some(403),
-                AcquisitionFailure::RateLimited => Some(429),
-                _ => None,
-            },
-        });
-        SourceError::Acquisition {
-            stage,
-            failure,
-            exit_code,
-        }
-    })
+    process::run_inspected(
+        request,
+        cancel,
+        stage == AcquisitionStage::Metadata,
+        |exit_code, stderr| {
+            let failure = classify_download(stderr);
+            cancel.emit(crate::diagnostics::Event::AcquisitionFailed {
+                phase: match stage {
+                    AcquisitionStage::Metadata => crate::diagnostics::Phase::Metadata,
+                    AcquisitionStage::Download => crate::diagnostics::Phase::Download,
+                },
+                exit_code,
+                http_status: match failure {
+                    AcquisitionFailure::Forbidden => Some(403),
+                    AcquisitionFailure::RateLimited => Some(429),
+                    _ => None,
+                },
+            });
+            SourceError::Acquisition {
+                stage,
+                failure,
+                exit_code,
+            }
+        },
+    )
     .await
 }
 
@@ -209,12 +214,12 @@ pub fn check_duration(actual: f64, limit: f64) -> Result<(), SourceError> {
             })
             .map_err(|_| SourceError::Invalid("invalid source duration"))
     };
-    if !actual.is_finite() || actual <= 0.0 || !limit.is_finite() || limit <= 0.0 {
+    if !actual.is_finite() || actual <= 0.0 || !limit.is_finite() || limit < 0.0 {
         return Err(SourceError::Invalid(
             "video duration is unavailable or invalid",
         ));
     }
-    if actual > limit {
+    if limit > 0.0 && actual > limit {
         return Err(SourceError::DurationExceeded {
             actual_seconds: seconds(actual)?,
             limit_seconds: seconds(limit)?,
@@ -276,7 +281,7 @@ pub fn youtube_url(input: &str) -> Result<String, SourceError> {
 pub fn local_video(path: &Path, max_bytes: u64) -> Result<PathBuf, SourceError> {
     let path = path.canonicalize()?;
     let metadata = path.metadata()?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
+    if !metadata.is_file() || metadata.len() == 0 || (max_bytes > 0 && metadata.len() > max_bytes) {
         return Err(SourceError::Invalid(
             "video is not a bounded nonempty regular file",
         ));
@@ -368,6 +373,9 @@ pub fn parse_subtitles(input: &str) -> Result<Vec<SubtitleCue>, SourceError> {
     Ok(cues)
 }
 fn format_selection(max_bytes: u64) -> String {
+    if max_bytes == 0 {
+        return "bestvideo[ext=mp4][height<=720]/bestvideo[ext=webm][height<=720]/best[ext=mp4][height<=720]/best[ext=webm][height<=720]".into();
+    }
     // Prefer a single video-only file: Recap consumes stills/silent clips and captions.
     // Every fallback retains both height and caller-selected byte constraints.
     format!(
@@ -405,7 +413,11 @@ fn downloader_request(options: &AcquisitionOptions, workspace: &Path, url: &str)
         max_output_bytes: 4 * 1024 * 1024,
         file_budget: Some((
             workspace.to_owned(),
-            options.max_video_bytes.saturating_add(8 * 1024 * 1024),
+            if options.max_video_bytes == 0 {
+                0
+            } else {
+                options.max_video_bytes.saturating_add(8 * 1024 * 1024)
+            },
         )),
     }
 }
@@ -433,10 +445,7 @@ pub async fn acquire(
     if cancel.is_cancelled() {
         return Err(process::ProcessError::Cancelled.into());
     }
-    if options.max_video_bytes == 0
-        || !options.max_duration_seconds.is_finite()
-        || options.max_duration_seconds <= 0.0
-    {
+    if !options.max_duration_seconds.is_finite() || options.max_duration_seconds < 0.0 {
         return Err(SourceError::Invalid("acquisition budget"));
     }
     if let SourceInput::Local(path) = input {
@@ -492,8 +501,6 @@ pub async fn acquire(
         "15",
         "--retries",
         "1",
-        "--max-filesize",
-        &size,
         "--format",
         &format_selection(options.max_video_bytes),
         "--write-subs",
@@ -510,6 +517,12 @@ pub async fn acquire(
     .iter()
     .map(Into::into)
     .collect();
+    if options.max_video_bytes > 0 {
+        request
+            .args
+            .splice(0..0, ["--max-filesize".into(), size.into()]);
+    }
+    request.args.insert(0, "--no-progress".into());
     download_process(&request, cancel, AcquisitionStage::Download).await?;
     let mut acquired = collect_download(workspace, options, cancel)?;
     acquired.title = metadata
@@ -843,6 +856,51 @@ mod tests {
             }
         }
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_large_noisy_download_has_no_default_acquisition_cutoffs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("downloader");
+        // Sparse source exceeds the former 256 MiB cap without allocating that much disk.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$*" in
+*--dump-single-json*) printf '%s' '{"id":"lXUZvyajciY","duration":8768,"is_live":false}';;
+*)
+  /usr/bin/head -c 5000000 /dev/zero
+  /usr/bin/head -c 5000000 /dev/zero >&2
+  /bin/dd if=/dev/zero of=source.mp4 bs=1 count=1 seek=300000000 2>/dev/null
+  ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut options = AcquisitionOptions {
+            yt_dlp: script,
+            workspace: directory.path().into(),
+            max_video_bytes: 0,
+            max_duration_seconds: 0.0,
+            caption_language: "en".into(),
+            timeout: Duration::ZERO,
+        };
+        let input = SourceInput::Youtube("https://www.youtube.com/watch?v=lXUZvyajciY".into());
+        let acquired = acquire(&input, &options, &Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(acquired.video.metadata().unwrap().len(), 300_000_001);
+        options.max_video_bytes = 1024;
+        assert!(
+            acquire(&input, &options, &Cancellation::default())
+                .await
+                .is_err()
+        );
+        assert!(check_duration(8768.0, 0.0).is_ok());
+        assert!(check_duration(f64::NAN, 0.0).is_err());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn duration_approval_blocks_download_until_explicitly_raised() {

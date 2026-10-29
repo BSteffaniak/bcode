@@ -162,11 +162,11 @@ pub struct Create {
 
 #[derive(Debug, Clone, Args)]
 pub struct CreateBudget {
-    /// Maximum source bytes (also enforced for local files).
-    #[arg(long, default_value = "268435456", value_parser = positive_u64)]
+    /// Optional maximum source bytes (also enforced for local files); zero means unlimited.
+    #[arg(long, default_value = "0")]
     pub max_video_bytes: u64,
-    /// Maximum source duration in seconds.
-    #[arg(long, default_value = "7200", value_parser = positive_u64)]
+    /// Optional maximum source duration in seconds; zero means unlimited.
+    #[arg(long, default_value = "0")]
     pub max_duration_seconds: u64,
     /// Maximum sampled source frames.
     #[arg(long, default_value = "12", value_parser = clap::value_parser!(u32).range(1..))]
@@ -183,8 +183,8 @@ pub struct CreateBudget {
     /// Maximum total extracted media bytes.
     #[arg(long, default_value = "25165824", value_parser = positive_u64)]
     pub max_media_bytes: u64,
-    /// Deadline for each acquisition/media subprocess, in seconds.
-    #[arg(long, default_value = "120", value_parser = positive_u64)]
+    /// Optional acquisition/media subprocess deadline in seconds; zero disables it.
+    #[arg(long, default_value = "0")]
     pub operation_timeout_seconds: u64,
 }
 
@@ -972,20 +972,35 @@ mod tests {
     }
 
     #[test]
-    fn zero_budgets_are_rejected() {
-        assert!(
-            Cli::try_parse_from([
-                "recap",
-                "create",
-                "--source",
-                "lesson.mp4",
-                "--model-config",
-                "provider.toml",
-                "--max-video-bytes",
-                "0"
-            ])
-            .is_err()
-        );
+    fn acquisition_limits_are_opt_in() {
+        for flag in [
+            "--max-video-bytes",
+            "--max-duration-seconds",
+            "--operation-timeout-seconds",
+        ] {
+            for value in ["0", "12345"] {
+                let parsed =
+                    Cli::try_parse_from(["recap", "create", "--source", "lesson.mp4", flag, value])
+                        .unwrap();
+                let Some(Command::Create(request)) = parsed.command else {
+                    panic!("expected create")
+                };
+                let budget = request.budget;
+                let selected = match flag {
+                    "--max-video-bytes" => budget.max_video_bytes,
+                    "--max-duration-seconds" => budget.max_duration_seconds,
+                    _ => budget.operation_timeout_seconds,
+                };
+                assert_eq!(selected, value.parse::<u64>().unwrap());
+            }
+        }
+        let parsed = Cli::try_parse_from(["recap", "create", "--source", "lesson.mp4"]).unwrap();
+        let Some(Command::Create(request)) = parsed.command else {
+            panic!("expected create")
+        };
+        assert_eq!(request.budget.max_video_bytes, 0);
+        assert_eq!(request.budget.max_duration_seconds, 0);
+        assert_eq!(request.budget.operation_timeout_seconds, 0);
     }
 
     #[test]

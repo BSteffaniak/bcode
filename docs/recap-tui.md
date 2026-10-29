@@ -26,7 +26,19 @@ HTML remains the full-fidelity portable reader. Terminal presentation adapts doc
 
 Validate real terminal entry and restoration in a PTY, plus subprocess behavior with closed stdin and redirected stdout/stderr. Capture home/reader/working/error states at multiple sizes and inspect visible output. Layout checks include long source titles/paths, CJK, emoji, combining marks, focus, resize and clipping. Pipeline tests and offline HTML acceptance remain separate from terminal visual acceptance. A semantic grid capture without styled-cell data is not proof of palette quality.
 
-## Per-video duration approval
+## Source acquisition
+
+Normal creation has no application-imposed video-size, video-duration, or acquisition
+wall-clock cutoff. Cancellation remains available. Download progress/log streams are
+drained continuously with bounded diagnostic retention; verbose downloads do not fail
+because of their log volume. Structured metadata must still fit the bounded parser.
+
+Advanced callers can explicitly opt into `--max-video-bytes`,
+`--max-duration-seconds`, or `--operation-timeout-seconds`; zero (the default) disables
+that limit. Source validation, workspace confinement, model context/output constraints,
+and sampled-media limits are separate and remain enforced.
+
+### Explicit duration limits
 
 When a known video duration exceeds the current acquisition allowance, creation pauses
 before download/model generation and offers **Run anyway for this video** and **Cancel**

@@ -31,7 +31,9 @@ fn process(error: &ProcessError) -> String {
         ProcessError::Io(_) => "recap_process_io: executable could not start or its streams could not be read".into(),
         ProcessError::Cancelled => "recap_process_cancelled: media work cancelled".into(),
         ProcessError::Timeout => "recap_process_timeout: media operation exceeded its deadline".into(),
-        ProcessError::OutputLimit => "recap_process_budget: media output exceeded byte/file limits".into(),
+        ProcessError::OutputLimit => "recap_process_output: structured media output is too large to parse safely".into(),
+        ProcessError::FileLimit => "recap_process_file_limit: download exceeded the explicitly configured file limit".into(),
+        ProcessError::InvalidWorkspace => "recap_process_workspace: media executable produced an invalid workspace".into(),
         ProcessError::Failed(code) => format!("recap_process_failed: media executable exited with code {code:?}; validate source format and executable availability"),
     }
 }

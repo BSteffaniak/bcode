@@ -77,11 +77,12 @@ pub struct ProcessRequest {
     pub args: Vec<OsString>,
     /// Optional working directory.
     pub cwd: Option<PathBuf>,
-    /// Wall-clock deadline.
+    /// Wall-clock deadline; zero disables the deadline.
     pub timeout: Duration,
     /// Maximum bytes retained from each output stream.
     pub max_output_bytes: usize,
-    /// Optional flat owned workspace and aggregate on-disk byte budget, polled while running.
+    /// Optional flat owned workspace and aggregate byte limit, polled while running.
+    /// A zero byte limit checks workspace safety without limiting disk usage.
     pub file_budget: Option<(PathBuf, u64)>,
 }
 /// Successful bounded subprocess output.
@@ -89,7 +90,7 @@ pub struct ProcessRequest {
 pub struct ProcessOutput {
     /// Standard output bytes.
     pub stdout: Vec<u8>,
-    /// Standard error bytes.
+    /// Bounded standard-error tail; older diagnostic bytes may be discarded.
     pub stderr: Vec<u8>,
 }
 /// Errors deliberately omit executable output, which can contain secrets.
@@ -107,9 +108,15 @@ pub enum ProcessError {
     /// Deadline exceeded.
     #[error("subprocess deadline exceeded")]
     Timeout,
-    /// Untrusted output exceeded its budget.
-    #[error("subprocess output exceeded budget")]
+    /// Structured output exceeded the retained parsing limit.
+    #[error("subprocess structured output is too large to parse safely")]
     OutputLimit,
+    /// An explicitly configured workspace byte limit was exceeded.
+    #[error("download exceeded the explicitly configured file limit")]
+    FileLimit,
+    /// An adapter created unsafe or excessive workspace entries.
+    #[error("subprocess produced an invalid workspace")]
+    InvalidWorkspace,
     /// Nonzero or signal exit, without exposing raw stderr.
     #[error("subprocess failed (exit code {0:?})")]
     Failed(Option<i32>),
@@ -117,6 +124,7 @@ pub enum ProcessError {
 async fn read_bounded(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     limit: usize,
+    require_complete: bool,
 ) -> Result<Vec<u8>, ProcessError> {
     let mut result = Vec::new();
     let mut chunk = vec![0; 8192];
@@ -125,10 +133,15 @@ async fn read_bounded(
         if count == 0 {
             return Ok(result);
         }
-        if count > limit.saturating_sub(result.len()) {
+        if require_complete && count > limit.saturating_sub(result.len()) {
             return Err(ProcessError::OutputLimit);
         }
-        result.extend_from_slice(&chunk[..count]);
+        // Drain noisy progress streams to EOF, retaining only a bounded tail.
+        // Structured stdout remains complete-or-error: never parse truncated JSON.
+        let retained = count.min(limit);
+        let excess = result.len().saturating_add(retained).saturating_sub(limit);
+        result.drain(..excess);
+        result.extend_from_slice(&chunk[count - retained..count]);
     }
 }
 /// Run a process, discarding untrusted failure output at the public boundary.
@@ -139,16 +152,20 @@ pub async fn run(
     request: &ProcessRequest,
     cancellation: &Cancellation,
 ) -> Result<ProcessOutput, ProcessError> {
-    run_inspected(request, cancellation, |code, _| ProcessError::Failed(code)).await
+    run_inspected(request, cancellation, true, |code, _| {
+        ProcessError::Failed(code)
+    })
+    .await
 }
 
 // Only domain adapters inspect bounded failed output. It must never become an error string.
 pub(crate) async fn run_inspected<E: From<ProcessError>>(
     request: &ProcessRequest,
     cancellation: &Cancellation,
+    require_stdout: bool,
     classify: impl FnOnce(Option<i32>, &[u8]) -> E,
 ) -> Result<ProcessOutput, E> {
-    let (success, code, output) = run_status(request, cancellation).await?;
+    let (success, code, output) = run_status(request, cancellation, require_stdout).await?;
     if success {
         Ok(output)
     } else {
@@ -159,6 +176,7 @@ pub(crate) async fn run_inspected<E: From<ProcessError>>(
 async fn run_status(
     request: &ProcessRequest,
     cancellation: &Cancellation,
+    require_stdout: bool,
 ) -> Result<(bool, Option<i32>, ProcessOutput), ProcessError> {
     if cancellation.is_cancelled() {
         return Err(ProcessError::Cancelled);
@@ -197,8 +215,8 @@ async fn run_status(
         let work = async {
             let (status, stdout, stderr) = tokio::try_join!(
                 async { child.wait().await.map_err(ProcessError::from) },
-                read_bounded(stdout, request.max_output_bytes),
-                read_bounded(stderr, request.max_output_bytes)
+                read_bounded(stdout, request.max_output_bytes, require_stdout),
+                read_bounded(stderr, request.max_output_bytes, false)
             )?;
             Ok((
                 status.success(),
@@ -208,19 +226,19 @@ async fn run_status(
         };
         tokio::select! {
             result = work => result,
-            () = tokio::time::sleep(request.timeout) => Err(ProcessError::Timeout),
+            () = tokio::time::sleep(request.timeout), if !request.timeout.is_zero() => Err(ProcessError::Timeout),
             error = async {
                 loop {
                     if let Some((root, limit)) = &request.file_budget {
                         let checked = (|| -> Result<(), ProcessError> {
                             let mut bytes = 0_u64;
                             for (index, entry) in std::fs::read_dir(root)?.enumerate() {
-                                if index >= 128 { return Err(ProcessError::OutputLimit); }
+                                if index >= 128 { return Err(ProcessError::InvalidWorkspace); }
                                 let metadata = entry?.path().symlink_metadata()?;
-                                if !metadata.is_file() || metadata.file_type().is_symlink() { return Err(ProcessError::OutputLimit); }
-                                bytes = bytes.checked_add(metadata.len()).ok_or(ProcessError::OutputLimit)?;
+                                if !metadata.is_file() || metadata.file_type().is_symlink() { return Err(ProcessError::InvalidWorkspace); }
+                                bytes = bytes.checked_add(metadata.len()).ok_or(ProcessError::FileLimit)?;
                             }
-                            if bytes > *limit { return Err(ProcessError::OutputLimit); }
+                            if *limit > 0 && bytes > *limit { return Err(ProcessError::FileLimit); }
                             Ok(())
                         })();
                         if let Err(error) = checked { break error; }
@@ -283,6 +301,48 @@ mod tests {
             Err(ProcessError::Cancelled)
         ));
     }
+    #[tokio::test]
+    async fn progress_streams_are_drained_with_bounded_tail_retention() {
+        let data = vec![b'x'; 5 * 1024 * 1024];
+        let mut data = data;
+        data.extend_from_slice(b"end");
+        assert_eq!(
+            read_bounded(data.as_slice(), 128, false).await.unwrap(),
+            data[data.len() - 128..]
+        );
+        assert!(matches!(
+            read_bounded(data.as_slice(), 128, true).await,
+            Err(ProcessError::OutputLimit)
+        ));
+        assert!(
+            read_bounded(data.as_slice(), 0, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_deadline_process_remains_cancellable() {
+        let request = ProcessRequest {
+            program: "/usr/bin/yes".into(),
+            args: vec![],
+            cwd: None,
+            timeout: Duration::ZERO,
+            max_output_bytes: 128,
+            file_budget: None,
+        };
+        let cancel = Cancellation::default();
+        let cancellation = cancel.clone();
+        let timer = async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(run_status(&request, &cancel, false), timer);
+        assert!(matches!(result, Err(ProcessError::Cancelled)));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn limits_and_deadline_are_enforced() {

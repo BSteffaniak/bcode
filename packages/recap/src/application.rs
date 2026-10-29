@@ -1225,10 +1225,10 @@ pub fn engine_options(workspace: PathBuf) -> EngineOptions {
         acquisition: AcquisitionOptions {
             yt_dlp: "yt-dlp".into(),
             workspace,
-            max_video_bytes: 256 * 1024 * 1024,
-            max_duration_seconds: 7200.0,
+            max_video_bytes: 0,
+            max_duration_seconds: 0.0,
             caption_language: "en".into(),
-            timeout: Duration::from_secs(120),
+            timeout: Duration::ZERO,
         },
         transcription: None,
         tools: MediaTools::default(),
