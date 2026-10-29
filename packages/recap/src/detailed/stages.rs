@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::json;
 
 use super::{
-    CompositionError, Operation, Result, frames_for, sources_for,
+    CompositionError, Operation, Result, frames_for,
+    ownership::{Finding, Ownership},
+    sources_for,
     validation::{self, check, exact_ids, validate_outline},
 };
 use crate::{
@@ -175,7 +177,8 @@ async fn audit_scoped(
     } else {
         vec![]
     };
-    let input = json!({"purpose":purpose,"items":items,"dispositions":dispositions,"chapters":chapters,
+    let required_checked_item_ids: Vec<_> = items.iter().map(|item| &item.id).collect();
+    let input = json!({"purpose":purpose,"required_checked_item_ids":required_checked_item_ids,"items":items,"dispositions":dispositions,"chapters":chapters,
         "source_coverage_ledger":ledger,
         "untrusted_sources":sources_for(document, windows)});
     // A source window can feed many chapters. Partition that fan-out instead of
@@ -219,17 +222,24 @@ async fn audit_scoped(
     }
     let response = op.call(AnalysisStage::SourceAudit,
         input, frames,
-        "Independently compare actual source against actual chapter blocks. Check EVERY supplied \
+        "checked_item_ids MUST contain exactly required_checked_item_ids, each once and no others. \
+         When required_checked_item_ids is [], return checked_item_ids: []. NEVER copy identities \
+         from source_coverage_ledger, chapters, evidence or windows into checked_item_ids. This \
+         exact accounting does not replace semantic source review, including when the list is empty. \
+         Independently compare actual source against actual chapter blocks. Check EVERY supplied \
          inventory item in THIS BATCH's items, including duplicates and exclusions. The complete \
          source_coverage_ledger records source-wide inventory text, dispositions and chapter owners, \
          NOT proof of rendered coverage. Items owned by chapters absent from this batch are checked \
          in those chapters' batches: do NOT report them missing here. Verify batch items against \
          actual blocks, never ledger claims. Independently compare ALL source details against the \
-         complete ledger: genuinely substantive details absent from that inventory are still \
-         extraction omissions and must be reported with existing batch chapter targets. \
+         complete ledger AND actual rendered blocks. Absence from inventory alone is NOT a \
+         written omission: the chapter may already explain the source point faithfully. Report a \
+         Missing issue only when substantive source meaning is also absent or loses specifics in \
+         actual supplied blocks. Faithful paraphrase counts; do not demand verbatim wording or \
+         stylistic additions. For a real omission name existing batch chapter targets. \
          Find unsupported additions, contradictions, lost specifics and inadequate \
-         visuals. A substantive source point missing from the \
-         inventory is still an audit failure. If it has no inventory identity, use empty item_ids \
+         visuals. A source point absent from inventory AND inadequately represented in the \
+         rendered chapter is still an audit failure. If it has no inventory identity, use empty item_ids \
          and name existing chapter_ids that should explain it, with the exact source-grounded \
          correction in description. Never invent an item ID. Non-substantive/duplicate declarations are not evidence. Check excluded substantive \
          claims rather than accepting the outline's rationale. Return all checked IDs, grounded \
@@ -239,6 +249,9 @@ async fn audit_scoped(
         unreachable!()
     };
     validation::validate_audit(&audit, items, chapters)?;
+    op.cancel.measure(crate::diagnostics::Measurement::Audit {
+        findings: u64::try_from(audit.issues.len()).unwrap_or(u64::MAX),
+    });
     Ok((audit.issues, audit.limitations))
 }
 
@@ -249,49 +262,34 @@ fn batch_items(
     selected: &[ChapterComposition],
     first: bool,
 ) -> Vec<InformationItem> {
+    let ownership = Ownership::new(outline);
     items
         .iter()
         .filter(|item| {
-            let owners = audit_owners(&item.id, outline);
-            owners
-                .iter()
-                .any(|owner| selected.iter().any(|chapter| chapter.section.id == *owner))
-                || (first
-                    && !owners
+            let owners: Vec<_> = ownership.owners(&item.id).collect();
+            owners.iter().any(|owner| {
+                selected
+                    .iter()
+                    .any(|chapter| chapter.section.id.as_str() == owner.as_str())
+            }) || (first
+                && !owners.iter().any(|owner| {
+                    chapters
                         .iter()
-                        .any(|owner| chapters.iter().any(|chapter| chapter.section.id == *owner)))
+                        .any(|chapter| chapter.section.id.as_str() == owner.as_str())
+                }))
         })
         .cloned()
         .collect()
 }
 
-fn audit_owners(item_id: &str, outline: &Outline) -> Vec<String> {
-    let Some(decision) = outline
-        .dispositions
-        .iter()
-        .find(|decision| decision.item_id == item_id)
-    else {
-        return vec![];
-    };
-    if decision.disposition == crate::analysis_contracts::DispositionKind::Duplicate {
-        outline
-            .dispositions
-            .iter()
-            .filter(|target| decision.duplicate_of.contains(&target.item_id))
-            .flat_map(|target| target.chapter_ids.iter().cloned())
-            .collect()
-    } else {
-        decision.chapter_ids.clone()
-    }
-}
-
 fn audit_ledger(items: &[InformationItem], outline: &Outline) -> serde_json::Value {
+    let ownership = Ownership::new(outline);
     json!(
         items
             .iter()
             .map(|item| json!({"item":item,
         "disposition":outline.dispositions.iter().find(|decision| decision.item_id == item.id),
-        "chapter_ids":audit_owners(&item.id, outline)}))
+        "chapter_ids":ownership.owners(&item.id).collect::<Vec<_>>()}))
             .collect::<Vec<_>>()
     )
 }
@@ -322,8 +320,10 @@ pub(super) async fn consistency(
     chapters: &[ChapterComposition],
     limitations: &mut Vec<String>,
 ) -> Result<()> {
-    // Each source window is inspected independently, including excluded information
-    // and windows with no retained inventory. No aggregate document request exists.
+    // This is a fresh final direct-source omission check, not a reuse of clean
+    // repair-round receipts. Every window is inspected independently, including
+    // excluded information and windows with no retained inventory. Neither prior
+    // findings nor repair-success claims are supplied as evidence of completeness.
     for window in windows {
         let items: Vec<_> = inventory
             .iter()
@@ -461,11 +461,20 @@ pub(super) async fn repair(
     inventory: &[InformationItem],
     outline: &Outline,
     chapters: &mut [ChapterComposition],
-    issues: &[CoverageIssue],
+    findings: &[Finding],
+    preservation: &[Finding],
 ) -> Result<()> {
+    let issues: Vec<_> = findings
+        .iter()
+        .map(|finding| finding.issue.clone())
+        .collect();
+    let finding_windows: BTreeMap<_, _> = findings
+        .iter()
+        .map(|finding| (finding.issue.id.as_str(), &finding.window_ids))
+        .collect();
     // Findings sharing a chapter are one connected repair unit. A replacement
-    // sees every accumulated finding for that unit and the latest complete text.
-    for (target_ids, findings) in repair_groups(outline, issues)? {
+    // sees current findings separately from historical preservation context.
+    for (target_ids, findings) in repair_groups(outline, &issues)? {
         let targets: Vec<_> = outline
             .chapters
             .iter()
@@ -477,55 +486,67 @@ pub(super) async fn repair(
             .filter(|item| targets.iter().any(|plan| plan.item_ids.contains(&item.id)))
             .cloned()
             .collect();
-        let relevant: Vec<_> = windows
-            .iter()
-            .filter(|window| {
-                items.iter().any(|item| item.window_id == window.id)
-                    || findings
-                        .iter()
-                        .any(|issue| issue.id.starts_with(&format!("{}-", window.id)))
-            })
-            .collect();
         let current: Vec<_> = chapters
             .iter()
             .filter(|chapter| targets.iter().any(|plan| plan.id == chapter.section.id))
             .cloned()
             .collect();
+        let preservation: Vec<_> = preservation
+            .iter()
+            .filter(|finding| {
+                finding
+                    .issue
+                    .chapter_ids
+                    .iter()
+                    .any(|id| target_ids.contains(id))
+            })
+            .map(|finding| &finding.issue)
+            .collect();
+        let relevant = repair_windows(windows, &items, &findings, &finding_windows, &current);
         let frames = frames_for(images, &relevant);
         let allowed_assets: Vec<_> = frames.iter().map(|frame| frame.asset_id.clone()).collect();
-        let allowed_evidence: Vec<_> = relevant
-            .iter()
-            .flat_map(|window| window.evidence_ids.iter().cloned())
-            .chain(current.iter().flat_map(|chapter| {
-                chapter
-                    .section
-                    .blocks
-                    .iter()
-                    .flat_map(|block| block.evidence_ids.iter().cloned())
-            }))
-            .collect();
+        check(
+            current
+                .iter()
+                .flat_map(|chapter| &chapter.image_choices)
+                .all(|choice| allowed_assets.contains(&choice.asset_id)),
+            "repair current illustration has no supplied frame",
+        )?;
+        let allowed_evidence = repair_evidence(&relevant, &current);
         let response = op
             .call(
                 AnalysisStage::SourceRepair,
-                json!({"issues":findings,"chapter_plans":targets,"items":items,"chapters":current,
+                json!({"issues":findings,"preservation_context":preservation,"chapter_plans":targets,"items":items,"chapters":current,
                 "allowed_evidence_ids":allowed_evidence,"allowed_asset_ids":allowed_assets,
                 "untrusted_sources":sources_for(document, &relevant)}),
                 frames,
                 "Repair only these explicit findings by replacing the indicated complete chapters. \
-             Preserve section IDs, every assigned item, evidence and unrelated content. The issues \
-             include earlier successful corrections: satisfy ALL of them simultaneously and preserve \
-             their corrected text in the latest supplied chapters. Never rebuild from inventory alone. No final \
+             Preserve section IDs, every assigned item, evidence and unrelated content. Only issues \
+             are active correction requests. preservation_context records historical corrections: \
+             retain their meaning already present in current text; do NOT repeat, append or rewrite \
+             them merely because they appear there, and do not include their IDs in addressed_issue_ids. \
+             Keep unrelated blocks and illustrations unchanged. An active Contradiction finding \
+             for a chapter may correct factual captions/labels while keeping block IDs, evidence, \
+             media variants and asset identities/order unchanged. Do not substitute imagery to fix \
+             caption facts. Never rebuild from inventory alone. No final \
              summary. Use only allowed_evidence_ids and allowed_asset_ids. Every selected asset \
-             needs supplied bytes and an image_choices explanation. Do not claim a finding \
-             resolved without corrected actual block text.",
+             needs supplied bytes and an image_choices explanation. Restore the local source's \
+             explanation and examples, exact quantities, conditions, caveats and procedure order \
+             as readable prose, not a checklist of issue descriptions. Separately labeled boundary \
+             context aids interpretation but does not establish newly assigned source coverage. \
+             Do not claim a finding resolved without corrected actual block text.",
             )
             .await?;
         let AnalysisResponse::SourceRepair(repair) = response else {
             unreachable!()
         };
-        for chapter in &repair.chapters {
-            validation::validate_choices(document, &chapter.image_choices, Some(&allowed_assets))?;
-        }
+        validate_repair_illustrations(
+            document,
+            &repair.chapters,
+            &current,
+            &findings,
+            &allowed_assets,
+        )?;
         apply_repair(
             document,
             &targets,
@@ -535,8 +556,146 @@ pub(super) async fn repair(
             repair,
             &allowed_evidence,
         )?;
+        op.cancel.measure(crate::diagnostics::Measurement::Repair {
+            chapters: u64::try_from(targets.len()).unwrap_or(u64::MAX),
+        });
     }
     Ok(())
+}
+
+fn repair_evidence(windows: &[&SourceWindow], chapters: &[ChapterComposition]) -> Vec<String> {
+    windows
+        .iter()
+        .flat_map(|window| window.evidence_ids.iter().cloned())
+        .chain(chapters.iter().flat_map(|chapter| {
+            chapter
+                .section
+                .blocks
+                .iter()
+                .flat_map(|block| block.evidence_ids.iter().cloned())
+        }))
+        .collect()
+}
+
+/// Close repair input over assigned source, findings and existing imagery.
+fn repair_windows<'a>(
+    windows: &'a [SourceWindow],
+    items: &[InformationItem],
+    findings: &[CoverageIssue],
+    finding_windows: &BTreeMap<&str, &BTreeSet<String>>,
+    current: &[ChapterComposition],
+) -> Vec<&'a SourceWindow> {
+    windows
+        .iter()
+        .filter(|window| {
+            items.iter().any(|item| item.window_id == window.id)
+                || findings.iter().any(|issue| {
+                    finding_windows
+                        .get(issue.id.as_str())
+                        .is_some_and(|ids| ids.contains(&window.id))
+                })
+                || current.iter().any(|chapter| {
+                    chapter.section.blocks.iter().any(|block| {
+                        block
+                            .evidence_ids
+                            .iter()
+                            .any(|id| window.evidence_ids.contains(id))
+                    }) || chapter
+                        .image_choices
+                        .iter()
+                        .any(|choice| window.asset_ids.contains(&choice.asset_id))
+                })
+        })
+        .collect()
+}
+
+/// Preserve unrelated imagery and require actual supplied frames for all choices.
+fn validate_repair_illustrations(
+    document: &RecapDocument,
+    replacements: &[ChapterComposition],
+    current: &[ChapterComposition],
+    findings: &[CoverageIssue],
+    allowed_assets: &[String],
+) -> Result<()> {
+    for chapter in replacements {
+        validation::validate_choices(document, &chapter.image_choices, Some(allowed_assets))?;
+        let prior = current
+            .iter()
+            .find(|prior| prior.section.id == chapter.section.id)
+            .ok_or(CompositionError::Invalid(
+                "repair changed unrelated chapter",
+            ))?;
+        // Findings identify chapters, not blocks. A factual contradiction can
+        // correct captions, but cannot authorize replacing the underlying media.
+        let caption_change = findings.iter().any(|issue| {
+            issue.kind == crate::analysis_contracts::CoverageIssueKind::Contradiction
+                && issue.chapter_ids.contains(&chapter.section.id)
+        });
+        let visual_change = findings.iter().any(|issue| {
+            issue.kind == crate::analysis_contracts::CoverageIssueKind::InadequateVisual
+                && issue.chapter_ids.contains(&chapter.section.id)
+        });
+        if !visual_change {
+            for block in &prior.section.blocks {
+                if !matches!(block.content, BlockContent::Text { .. }) {
+                    check(
+                        chapter.section.blocks.iter().any(|replacement| {
+                            replacement == block
+                                || (caption_change && same_illustration_media(block, replacement))
+                        }),
+                        "repair changed unrelated illustration",
+                    )?;
+                }
+            }
+            check(
+                prior
+                    .image_choices
+                    .iter()
+                    .all(|choice| chapter.image_choices.contains(choice)),
+                "repair discarded current illustration explanation",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Compare media identity independently from source-grounded caption prose.
+/// Asset identity fixes time/raster geometry through the immutable source registry.
+fn same_illustration_media(prior: &Block, replacement: &Block) -> bool {
+    if prior.id != replacement.id || prior.evidence_ids != replacement.evidence_ids {
+        return false;
+    }
+    match (&prior.content, &replacement.content) {
+        (
+            BlockContent::Image {
+                asset_id: prior, ..
+            },
+            BlockContent::Image {
+                asset_id: replacement,
+                ..
+            },
+        )
+        | (
+            BlockContent::Clip {
+                asset_id: prior, ..
+            },
+            BlockContent::Clip {
+                asset_id: replacement,
+                ..
+            },
+        ) => prior == replacement,
+        (
+            BlockContent::Comparison { items: prior },
+            BlockContent::Comparison { items: replacement },
+        ) => {
+            prior.len() == replacement.len()
+                && prior
+                    .iter()
+                    .zip(replacement)
+                    .all(|(a, b)| a.asset_id == b.asset_id)
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn append_limitations(
@@ -609,7 +768,7 @@ fn apply_repair(
             .collect::<Vec<_>>(),
         targets.iter().map(|plan| plan.id.as_str()),
     )?;
-    for replacement in repair.chapters {
+    for replacement in &repair.chapters {
         let plan = targets
             .iter()
             .find(|plan| plan.id == replacement.section.id)
@@ -621,10 +780,18 @@ fn apply_repair(
             .filter(|item| plan.item_ids.contains(&item.id))
             .cloned()
             .collect();
-        validation::validate_repaired_chapter(document, plan, &replacement, &assigned, additional)?;
+        check(
+            chapters
+                .iter()
+                .any(|chapter| chapter.section.id == replacement.section.id),
+            "repair invented chapter",
+        )?;
+        validation::validate_repaired_chapter(document, plan, replacement, &assigned, additional)?;
+    }
+    for replacement in repair.chapters {
         let target = chapters
             .iter_mut()
-            .find(|chapter| chapter.section.id == plan.id)
+            .find(|chapter| chapter.section.id == replacement.section.id)
             .ok_or(CompositionError::Invalid("repair invented chapter"))?;
         *target = replacement;
     }

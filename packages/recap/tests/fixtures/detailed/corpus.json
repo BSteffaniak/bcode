@@ -4,6 +4,12 @@
     {
       "id": "dense_numbers_examples_caveats",
       "title": "Queue sizing experiment",
+      "forbidden_claims": [
+        "Four workers reduce memory to 75 MiB",
+        "A timed-out write never committed",
+        "The results include cold starts",
+        "The queue drains in 12 seconds even with new arrivals"
+      ],
       "duration_ms": 360000,
       "observations": [
         {"id":"baseline","start_ms":10000,"end_ms":30000,"transcript":"At 120 requests per second, one worker has a median latency of 18 milliseconds and a p95 of 240 milliseconds."},
@@ -104,6 +110,10 @@
     {
       "id":"visual_only",
       "title":"Silent control-panel demonstration",
+      "forbidden_claims": [
+        "Switching to AUTO fixed the wiring fault",
+        "The images prove the temperature fell because of AUTO mode"
+      ],
       "duration_ms":120000,
       "observations":[
         {"id":"before","start_ms":20000,"end_ms":21000,"visual":{"asset_id":"panel_before","description":"A panel displays mode MANUAL, setpoint 42 degrees Celsius, and a red FAULT lamp. No spoken words or subtitles."}},

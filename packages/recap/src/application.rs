@@ -297,6 +297,10 @@ impl std::fmt::Debug for ProgressObserver {
     }
 }
 impl bcode_recap::diagnostics::Observer for ProgressObserver {
+    fn measure(&self, measurement: bcode_recap::diagnostics::Measurement) {
+        self.parent.measure(measurement);
+        bcode_recap::diagnostics::Observer::measure(&self.operation, measurement);
+    }
     fn observe(&self, event: bcode_recap::diagnostics::Event) {
         if let bcode_recap::diagnostics::Event::AnalysisProgress {
             phase,
@@ -513,7 +517,7 @@ async fn execute_job(
                 phase: bcode_recap::diagnostics::Phase::ModelReadiness,
             });
             progress(Stage::ModelReadiness);
-            let executor = configured_model(&value.model).await?;
+            let executor = observed_model(&value.model, cancel).await?;
             executor.observe_selection(cancel);
             check_cancel(cancel)?;
             let result = refine(store.clone(), &value, &executor, cancel, progress)
@@ -602,7 +606,7 @@ async fn create_job(
         phase: bcode_recap::diagnostics::Phase::ModelReadiness,
     });
     progress(Stage::ModelReadiness);
-    let executor = configured_model(&value.model).await?;
+    let executor = observed_model(&value.model, cancel).await?;
     executor.observe_selection(cancel);
     check_cancel(cancel)?;
     let result = create(store.clone(), &value, &executor, cancel, progress)
@@ -1053,6 +1057,18 @@ pub fn model_options(options: &ModelOptions) -> crate::bcode_adapter::BcodeOptio
     }
 }
 
+async fn observed_model(
+    options: &ModelOptions,
+    cancel: &Cancellation,
+) -> Result<crate::bcode_adapter::BcodeExecutor, Error> {
+    let executor = configured_model(options).await?;
+    Ok(if let Some(observer) = cancel.observer() {
+        executor.with_observer(observer)
+    } else {
+        executor
+    })
+}
+
 pub async fn configured_model(
     options: &ModelOptions,
 ) -> Result<crate::bcode_adapter::BcodeExecutor, Error> {
@@ -1201,6 +1217,14 @@ pub fn create_options(options: &Create) -> Result<EngineOptions, Error> {
     apply_composition_limits(&mut configuration, &options.model)?;
     configuration.composition.images = configuration.media.max_frames;
     for (value, target) in [
+        (
+            options.detailed_max_concurrent_requests,
+            &mut configuration.detailed.max_concurrent_requests,
+        ),
+        (
+            options.detailed_max_in_flight_bytes,
+            &mut configuration.detailed.max_in_flight_bytes,
+        ),
         (
             options.detailed_max_model_calls,
             &mut configuration.detailed.allowances.max_model_calls,
@@ -1415,6 +1439,26 @@ mod progress_tests {
                 Event::AnalysisProgress { completed: 199, .. }
             ));
         }
+    }
+
+    #[test]
+    fn measurements_forward_to_parent_and_report_without_event_payloads() {
+        use bcode_recap::diagnostics::Operation;
+        let parent = Operation::new("parent-metrics".into());
+        let operation = Operation::new("child-metrics".into());
+        let cancel = Cancellation::default()
+            .observed(std::sync::Arc::new(parent.clone()))
+            .observed(std::sync::Arc::new(ProgressObserver {
+                parent: Cancellation::default().observed(std::sync::Arc::new(parent.clone())),
+                operation: operation.clone(),
+                latest: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            }));
+        cancel.measure(bcode_recap::diagnostics::Measurement::Audit { findings: 3 });
+        for metrics in [parent.measurements(), operation.measurements()] {
+            assert_eq!(metrics.audits, 1);
+            assert_eq!(metrics.audit_findings, 3);
+        }
+        assert!(cancel.observer().is_some());
     }
 
     struct UnsupportedExecutor;

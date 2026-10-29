@@ -825,14 +825,17 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            error,
-            SourceError::Acquisition {
-                stage: AcquisitionStage::Download,
-                failure: AcquisitionFailure::Forbidden,
-                exit_code: Some(1)
-            }
-        ));
+        assert!(
+            matches!(
+                error,
+                SourceError::Acquisition {
+                    stage: AcquisitionStage::Download,
+                    failure: AcquisitionFailure::Forbidden,
+                    exit_code: Some(1)
+                }
+            ),
+            "unexpected acquisition category: {error:?}"
+        );
         assert!(!format!("{error:?}").contains("PRIVATE"));
     }
     #[test]

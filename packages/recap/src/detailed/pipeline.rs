@@ -7,8 +7,13 @@ use super::{
     check_cancelled, frames_for, namespace_items, relevant_windows, sources_for, stages,
     validation, window_source,
 };
+use super::{
+    execution::PreparedCall,
+    ownership::{Findings, Ownership},
+};
 use crate::analysis_contracts::{ChapterComposition, Outline};
 use serde_json::json;
+use std::collections::BTreeMap;
 
 pub(super) fn admit(
     grounded: &RecapDocument,
@@ -68,17 +73,24 @@ pub(super) async fn inventory(
 ) -> Result<(Vec<InformationItem>, Vec<String>)> {
     let mut inventory = Vec::new();
     let mut limitations = Vec::new();
+    let response_limit = op.policy.allowances.max_response_bytes;
+    let inspect_visuals = op.policy.inspect_visuals;
+    let requests = windows.iter().flat_map(|window| {
+        let text = PreparedCall::new(AnalysisStage::ExtractionInventory,
+            json!({"window":window,"untrusted_source":window_source(grounded,window)}), vec![],
+            "Inventory ALL substantive information in this source window; keep exact details. Return this window_id. Empty inventory requires an honest limitation.", response_limit);
+        let frames: Vec<_> = images.iter().filter(|image| window.asset_ids.contains(&image.asset_id)).cloned().collect();
+        let visual = (inspect_visuals && !frames.is_empty()).then(|| PreparedCall::new(
+            AnalysisStage::VisualInspection,
+            json!({"window":window,"untrusted_source":window_source(grounded,window)}), frames,
+            "Inspect every supplied frame, especially visual-only information, diagrams, code and labels absent from speech. Return all inspected asset IDs and grounded items.", response_limit));
+        std::iter::once(text).chain(visual)
+    });
+    let mut responses = op.run(Box::new(requests)).await?.into_iter();
     for window in windows {
-        let source = window_source(grounded, window);
-        let response = op
-            .call(
-                AnalysisStage::ExtractionInventory,
-                json!({"window": window, "untrusted_source": source}),
-                vec![],
-                "Inventory ALL substantive information in this source window; keep exact details. \
-             Return this window_id. Empty inventory requires an honest limitation.",
-            )
-            .await?;
+        let response = responses
+            .next()
+            .ok_or(CompositionError::Invalid("missing inventory response"))?;
         let AnalysisResponse::ExtractionInventory(mut extracted) = response else {
             unreachable!()
         };
@@ -96,10 +108,9 @@ pub(super) async fn inventory(
             .cloned()
             .collect();
         if op.policy.inspect_visuals && !frames.is_empty() {
-            let response = op.call(AnalysisStage::VisualInspection,
-                json!({"window":window, "untrusted_source":source}), frames.clone(),
-                "Inspect every supplied frame, especially visual-only information, diagrams, code \
-                 and labels absent from speech. Return all inspected asset IDs and grounded items.").await?;
+            let response = responses
+                .next()
+                .ok_or(CompositionError::Invalid("missing visual response"))?;
             let AnalysisResponse::VisualInspection(mut visual) = response else {
                 unreachable!()
             };
@@ -158,7 +169,8 @@ pub(super) async fn chapters(
         outline,
     } = *source;
     let mut chapters = Vec::new();
-    for plan in &outline.chapters {
+    let response_limit = op.policy.allowances.max_response_bytes;
+    let requests = outline.chapters.iter().map(|plan| {
         let items: Vec<_> = inventory
             .iter()
             .filter(|item| plan.item_ids.contains(&item.id))
@@ -167,7 +179,7 @@ pub(super) async fn chapters(
         let relevant = relevant_windows(windows, &items);
         let frames = frames_for(images, &relevant);
         let allowed = validation::ChapterSources::derive(grounded, &items, &relevant, &frames);
-        let response = op.call(AnalysisStage::ChapterComposition,
+        PreparedCall::new(AnalysisStage::ChapterComposition,
             json!({"chapter":plan, "items":items, "intent":intent,
                 "allowed_evidence_ids":allowed.evidence_ids, "allowed_asset_ids":allowed.asset_ids,
                 "untrusted_sources":sources_for(grounded, &relevant),
@@ -178,7 +190,24 @@ pub(super) async fn chapters(
                 Every evidence reference MUST be in allowed_evidence_ids. Only allowed_asset_ids \
                 have supplied frame bytes and may be selected. Assigned item evidence supports \
                 the text; additional allowed evidence supports supplied illustrations, not unrelated \
-                claims from source context. Explain every selected asset in image_choices.").await?;
+                claims from source context. Explain every selected asset in image_choices. \
+                Write a faithful readable adaptation, not an inventory recital: connect the source's \
+                explanations, worked examples and reasons in source order. Preserve exact quantities, \
+                units, conditions, negations, caveats and procedure order. Use the supplied local source \
+                to disambiguate assigned items, not to invent bridging facts or import other topics. \
+                Any separately labeled preceding context explains boundaries only; do not claim it as \
+                newly assigned coverage. Focus changes emphasis, never excludes substantive material.", response_limit)
+    });
+    let responses = op.run(Box::new(requests)).await?;
+    for (plan, response) in outline.chapters.iter().zip(responses) {
+        let items: Vec<_> = inventory
+            .iter()
+            .filter(|item| plan.item_ids.contains(&item.id))
+            .cloned()
+            .collect();
+        let relevant = relevant_windows(windows, &items);
+        let frames = frames_for(images, &relevant);
+        let allowed = validation::ChapterSources::derive(grounded, &items, &relevant, &frames);
         let AnalysisResponse::ChapterComposition(chapter) = response else {
             unreachable!()
         };
@@ -186,6 +215,38 @@ pub(super) async fn chapters(
         chapters.push(chapter);
     }
     Ok(chapters)
+}
+
+/// Full rendered review input for one source window, including fallback targets.
+fn coverage_chapters(
+    chapters: &[ChapterComposition],
+    inventory: &[InformationItem],
+    window: &SourceWindow,
+    items: &[InformationItem],
+) -> Vec<ChapterComposition> {
+    let mut relevant: Vec<_> = chapters
+        .iter()
+        .filter(|chapter| {
+            chapter.section.blocks.iter().any(|block| {
+                block
+                    .evidence_ids
+                    .iter()
+                    .any(|id| window.evidence_ids.contains(id))
+            }) || chapter
+                .covered_item_ids
+                .iter()
+                .any(|id| items.iter().any(|item| &item.id == id))
+        })
+        .cloned()
+        .collect();
+    if relevant.is_empty() {
+        // Even a window completely missed by extraction needs an existing
+        // repair target. The nearest chapter is context, not invented coverage.
+        if let Some(chapter) = stages::nearest_chapter(chapters, inventory, window) {
+            relevant.push(chapter.clone());
+        }
+    }
+    relevant
 }
 
 pub(super) async fn coverage(
@@ -202,41 +263,31 @@ pub(super) async fn coverage(
         outline,
     } = *source;
     // First compare each entire source window directly, including excluded items.
-    // Repairs are only proposals: every changed chapter is validated and every source
-    // window is checked again after a repair. No model declaration resolves a finding.
-    let mut repair_history: Vec<crate::analysis_contracts::CoverageIssue> = Vec::new();
+    // A clean source audit is reusable only while its entire selected chapter
+    // input is unchanged. This invalidates every window sharing a changed chapter,
+    // including old/new evidence links and nearest-chapter fallback selection.
+    // Final independent consistency never consumes these operation-local receipts.
+    let ownership = Ownership::new(outline);
+    let mut repair_history = Findings::default();
+    let mut candidates = vec![chapters.to_vec()];
+    let mut clean: BTreeMap<String, (Vec<ChapterComposition>, Vec<String>)> = BTreeMap::new();
     for round in 0..=op.policy.allowances.max_repair_rounds {
         let mut issues = Vec::new();
-        let mut audit_limits = Vec::new();
         for window in windows {
+            op.cancelled()?;
             let items: Vec<_> = inventory
                 .iter()
                 .filter(|item| item.window_id == window.id)
                 .cloned()
                 .collect();
-            let mut relevant: Vec<_> = chapters
-                .iter()
-                .filter(|chapter| {
-                    chapter.section.blocks.iter().any(|block| {
-                        block
-                            .evidence_ids
-                            .iter()
-                            .any(|id| window.evidence_ids.contains(id))
-                    }) || chapter
-                        .covered_item_ids
-                        .iter()
-                        .any(|id| items.iter().any(|item| &item.id == id))
-                })
-                .cloned()
-                .collect();
-            if relevant.is_empty() {
-                // Even a window completely missed by extraction needs an existing
-                // repair target. The nearest chapter is context, not invented coverage.
-                if let Some(chapter) = stages::nearest_chapter(chapters, inventory, window) {
-                    relevant.push(chapter.clone());
-                }
+            let relevant = coverage_chapters(chapters, inventory, window, &items);
+            if clean
+                .get(&window.id)
+                .is_some_and(|(reviewed, _)| *reviewed == relevant)
+            {
+                continue;
             }
-            let (mut found, limits) = audit(
+            let (found, limits) = audit(
                 op,
                 grounded,
                 images,
@@ -248,26 +299,31 @@ pub(super) async fn coverage(
                 inventory,
             )
             .await?;
-            for issue in &mut found {
-                issue.id = format!("{}-{}", window.id, issue.id);
+            if found.is_empty() {
+                clean.insert(window.id.clone(), (relevant, limits));
+            } else {
+                clean.remove(&window.id);
             }
-            issues.extend(found);
-            audit_limits.extend(limits);
+            issues.extend(
+                found
+                    .into_iter()
+                    .map(|issue| ownership.finding(issue, [window.id.clone()].into())),
+            );
         }
         if issues.is_empty() {
-            limitations.extend(audit_limits);
+            limitations.extend(clean.into_values().flat_map(|(_, limits)| limits));
             break;
         }
         if round == op.policy.allowances.max_repair_rounds {
             return Err(CompositionError::Invalid("unresolved source coverage gaps"));
         }
-        for issue in issues {
-            if let Some(prior) = repair_history.iter_mut().find(|prior| prior.id == issue.id) {
-                *prior = issue;
-            } else {
-                repair_history.push(issue);
-            }
-        }
+        let current = repair_history.record(issues);
+        let preservation: Vec<_> = repair_history
+            .entries()
+            .iter()
+            .filter(|prior| !current.iter().any(|open| open.issue.id == prior.issue.id))
+            .cloned()
+            .collect();
         repair(
             op,
             grounded,
@@ -276,9 +332,15 @@ pub(super) async fn coverage(
             inventory,
             outline,
             chapters,
-            &repair_history,
+            &current,
+            &preservation,
         )
         .await?;
+        check(
+            !candidates.iter().any(|prior| prior.as_slice() == chapters),
+            "source repair made no progress or repeated a candidate",
+        )?;
+        candidates.push(chapters.to_vec());
     }
     Ok(())
 }

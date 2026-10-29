@@ -453,6 +453,29 @@ fn scene_times(bytes: &[u8], duration_ms: u64, cap: usize) -> Result<Vec<u64>, M
     }
     Ok(times)
 }
+/// Visit endpoints, then progressively bisect the remaining observations. This
+/// keeps a tight selection budget from taking only the beginning of a source.
+fn distributed_times(mut times: Vec<u64>) -> Vec<u64> {
+    times.sort_unstable();
+    times.dedup();
+    if times.len() < 3 {
+        return times;
+    }
+    let mut ordered = vec![times[0], times[times.len() - 1]];
+    let mut pending = vec![(1, times.len() - 1)];
+    let mut cursor = 0;
+    while let Some(&(start, end)) = pending.get(cursor) {
+        cursor += 1;
+        if start < end {
+            let middle = start + (end - start) / 2;
+            ordered.push(times[middle]);
+            pending.push((start, middle));
+            pending.push((middle + 1, end));
+        }
+    }
+    ordered
+}
+
 /// Deterministically combine bounded scene observations, source cues, caller targets,
 /// and temporal anchors.
 ///
@@ -518,20 +541,30 @@ pub fn plan_visual_candidates(
             (last / denominator) * numerator + (last % denominator) * numerator / denominator;
         insert(time, CandidateReason::TemporalAnchor);
     }
-    for time in scenes {
-        insert(*time, CandidateReason::SceneChange);
-    }
+    let scene_order = distributed_times(scenes.to_vec());
     let count = transcript.len().min(budget.max_transcript_candidates);
-    for index in 0..count {
-        let position = if count == 1 {
-            0
-        } else {
-            index * (transcript.len() - 1) / (count - 1)
-        };
-        insert(
-            transcript[position].range.start_ms,
-            CandidateReason::TranscriptCue,
-        );
+    let cues = distributed_times(
+        (0..count)
+            .map(|index| {
+                let position = if count == 1 {
+                    0
+                } else {
+                    index * (transcript.len() - 1) / (count - 1)
+                };
+                transcript[position].range.start_ms
+            })
+            .collect(),
+    );
+    // Alternate source classes rather than letting dense scene observations
+    // exhaust all capacity before a transcript cue is considered. Within each
+    // class, inspect both ends before progressively filling interior positions.
+    for index in 0..scene_order.len().max(cues.len()) {
+        if let Some(time) = cues.get(index) {
+            insert(*time, CandidateReason::TranscriptCue);
+        }
+        if let Some(time) = scene_order.get(index) {
+            insert(*time, CandidateReason::SceneChange);
+        }
     }
     candidates.sort_by_key(|candidate| candidate.time_ms);
     Ok(VisualCandidates {
@@ -696,6 +729,104 @@ mod tests {
             plan_visual_candidates(10_000, &[2000, 3000], &transcript, &[6500], &budget).unwrap();
         assert_eq!(result.candidates, again.candidates);
     }
+    #[test]
+    fn dense_opening_scenes_do_not_starve_late_transcript_cues() {
+        let budget = InspectionBudget {
+            max_candidates: 5,
+            temporal_anchors: 2,
+            min_spacing_ms: 100,
+            ..InspectionBudget::default()
+        };
+        let transcript = vec![crate::contracts::TranscriptSegment {
+            id: "late-caveat".into(),
+            range: TimeRange {
+                start_ms: 8_000,
+                end_ms: 9_000,
+            },
+            text: "Important final qualification".into(),
+        }];
+        let result = plan_visual_candidates(
+            10_000,
+            &[1_000, 1_500, 2_000, 2_500, 3_000],
+            &transcript,
+            &[],
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(result.candidates.len(), 5);
+        assert!(result.selection_limited);
+        assert!(result.candidates.iter().any(|candidate| {
+            candidate.time_ms == 8_000 && candidate.reason == CandidateReason::TranscriptCue
+        }));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.time_ms == 0)
+        );
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.time_ms == 9_500)
+        );
+        assert!(
+            result
+                .candidates
+                .windows(2)
+                .all(|pair| pair[0].time_ms < pair[1].time_ms)
+        );
+    }
+
+    #[test]
+    fn scene_order_and_duplicates_do_not_bias_tight_selection() {
+        let budget = InspectionBudget {
+            max_candidates: 4,
+            temporal_anchors: 2,
+            min_spacing_ms: 0,
+            ..InspectionBudget::default()
+        };
+        let first =
+            plan_visual_candidates(10_000, &[1_000, 2_000, 3_000, 8_000], &[], &[], &budget)
+                .unwrap();
+        let shuffled = plan_visual_candidates(
+            10_000,
+            &[3_000, 8_000, 1_000, 2_000, 1_000],
+            &[],
+            &[],
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(first.candidates, shuffled.candidates);
+        assert!(
+            first
+                .candidates
+                .iter()
+                .any(|candidate| candidate.time_ms == 8_000)
+        );
+        assert!(first.selection_limited);
+        // Explicit targets win both capacity and nearby-source spacing conflicts.
+        let targeted = plan_visual_candidates(
+            10_000,
+            &[1_000, 2_000, 3_000, 8_000],
+            &[],
+            &[1_001, 7_999, 5_000, 6_000],
+            &InspectionBudget {
+                min_spacing_ms: 500,
+                ..budget
+            },
+        )
+        .unwrap();
+        assert_eq!(targeted.candidates.len(), 4);
+        assert!(
+            targeted
+                .candidates
+                .iter()
+                .all(|candidate| candidate.reason == CandidateReason::Targeted)
+        );
+        assert!(targeted.selection_limited);
+    }
+
     #[test]
     fn transcript_positions_and_scene_exhaustion_are_explicit() {
         let budget = InspectionBudget {

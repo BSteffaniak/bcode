@@ -397,6 +397,38 @@ pub(super) fn validate_repaired_chapter(
     Ok(())
 }
 
+/// Count-only classification: never retains or renders rejected identity strings.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct AuditIdentityCounts {
+    pub missing: usize,
+    pub unknown: usize,
+    pub duplicate: usize,
+    pub malformed: usize,
+}
+
+impl AuditIdentityCounts {
+    pub fn inspect(actual: &[String], expected: &BTreeSet<&str>) -> Self {
+        let mut seen = BTreeSet::new();
+        let mut counts = Self::default();
+        for value in actual {
+            counts.malformed += usize::from(id(value).is_err());
+            if !seen.insert(value.as_str()) {
+                counts.duplicate += 1;
+            }
+        }
+        counts.missing = expected.difference(&seen).count();
+        counts.unknown = seen.difference(expected).count();
+        counts
+    }
+
+    fn validate(&self) -> Result<()> {
+        check(self.malformed == 0, "audit checked identities malformed")?;
+        check(self.duplicate == 0, "audit checked identities duplicate")?;
+        check(self.unknown == 0, "audit checked identities unknown")?;
+        check(self.missing == 0, "audit checked identities missing")
+    }
+}
+
 /// Findings with no inventory identity still need a validated chapter target.
 pub(super) fn validate_audit(
     audit: &crate::analysis_contracts::SourceAudit,
@@ -405,7 +437,7 @@ pub(super) fn validate_audit(
 ) -> Result<()> {
     use crate::analysis_contracts::CoverageIssueKind;
     let item_ids: BTreeSet<_> = items.iter().map(|item| item.id.as_str()).collect();
-    exact_ids(&audit.checked_item_ids, item_ids.iter().copied())?;
+    AuditIdentityCounts::inspect(&audit.checked_item_ids, &item_ids).validate()?;
     ids(&audit
         .issues
         .iter()
@@ -439,4 +471,55 @@ pub(super) fn validate_audit(
         "empty audit limitation",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod audit_identity_tests {
+    use super::*;
+
+    #[test]
+    fn checked_identity_failures_are_counted_without_exposing_payloads() {
+        let expected = ["required"].into();
+        for (actual, counts, category) in [
+            (
+                vec![],
+                AuditIdentityCounts {
+                    missing: 1,
+                    ..AuditIdentityCounts::default()
+                },
+                "audit checked identities missing",
+            ),
+            (
+                vec!["required".into(), "private-ledger-id".into()],
+                AuditIdentityCounts {
+                    unknown: 1,
+                    ..AuditIdentityCounts::default()
+                },
+                "audit checked identities unknown",
+            ),
+            (
+                vec!["required".into(), "required".into()],
+                AuditIdentityCounts {
+                    duplicate: 1,
+                    ..AuditIdentityCounts::default()
+                },
+                "audit checked identities duplicate",
+            ),
+        ] {
+            let result = AuditIdentityCounts::inspect(&actual, &expected);
+            assert_eq!(result, counts);
+            assert!(
+                matches!(result.validate(), Err(CompositionError::Invalid(message)) if message == category)
+            );
+        }
+        assert!(
+            AuditIdentityCounts::inspect(&[], &BTreeSet::new())
+                .validate()
+                .is_ok()
+        );
+        let counts = AuditIdentityCounts::inspect(&["private-ledger-id".into()], &expected);
+        assert_eq!(counts.missing, 1);
+        assert_eq!(counts.unknown, 1);
+        assert!(!format!("{counts:?}").contains("private-ledger-id"));
+    }
 }

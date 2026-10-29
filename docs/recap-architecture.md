@@ -50,7 +50,15 @@ Reports exclude prompts, captions, source URLs, signed URLs, frames, credentials
 
 Source windows and information items carry host-validated evidence identities. Extraction and model-declared coverage are not proof of semantic completeness: audits compare drafts to source evidence, and the reader must retain unresolved acquisition or inspection limitations. Sampled frames do not establish complete visual coverage. Focus changes emphasis rather than implicitly restricting Detailed's coverage.
 
-Resource allowances are distinct from editorial coverage. Exhausted allowances and unsupported analysis execution fail explicitly rather than silently falling back to Standard. Intermediate analysis is operation-local; no implicit durable prompt/checkpoint cache is introduced. The existing versioned document shape and unknown-version rejection remain authoritative. Prior revisions remain unchanged until a validated successor commits.
+Resource allowances are distinct from editorial coverage. Independent extraction and chapter calls execute in pre-reserved bounded waves, with deterministic result ordering and no automatic retry. Each standalone request uses its own SDK runtime turn owner; it retains the configured provider, authentication context, model selection and policy rather than sharing a superseding turn scope. In-flight byte reservations cover dispatched request/image payloads and allowed responses, not total process memory.
+
+Source windows use the transcript planner's nearby sentence/pause boundaries, keep exactly one primary owner per cue, and label bounded preceding context separately. Temporal coverage includes visual-only gaps. Full source envelopes are budgeted, including escaped text and metadata.
+
+Initial coverage audits inspect every source window. A repair-round audit may reuse a clean result only when its complete selected chapter input is unchanged; changed shared chapters invalidate every affected window. Final source, chapter and boundary checks remain independent passes. Findings have host-owned operation-local identity and source provenance. Repairs separate active corrections from historical preservation context, validate the whole replacement group before applying it, retain unrelated illustrations, and reject unchanged or cyclic candidates. These checks establish mechanics and provenance, not semantic truth.
+
+Explicit diagnostic export uses report version 2 with a versioned count-only measurement aggregate. Version-1 consumers must not interpret missing measurements as zero usage or a successful outcome. Aggregate terminal/commit observations survive bounded event eviction. SDK invocation, provider acceptance and billing remain distinct; unavailable normalized token usage stays unknown. No request content is retained by these counters.
+
+Exhausted allowances and unsupported analysis execution fail explicitly rather than silently falling back to Standard. Intermediate analysis is operation-local; no implicit durable prompt/checkpoint cache is introduced. The existing versioned document shape and unknown-version rejection remain authoritative. Prior revisions remain unchanged until a validated successor commits.
 
 ## Acceptance
 

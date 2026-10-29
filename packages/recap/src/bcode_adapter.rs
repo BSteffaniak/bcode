@@ -5,13 +5,17 @@ use bcode::{Bcode, MessageRole, ModelMessage, StructuredOutputOptions};
 use bcode_model::{ContentBlock, ImageContent, ImageMetadata};
 use bcode_recap::{
     analysis_contracts::analysis_response_schema,
+    diagnostics::{CallOutcome, Measurement, Observer, RequestStage, TokenUsage},
     model::{
         AnalysisFuture, AnalysisRequest, AnalysisResponse, ModelError, ModelExecutor, ModelFuture,
         ModelRequest, ModelResponse,
     },
     process::Cancellation,
 };
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 /// Resolve through Bcode's configured selection and provider authentication.
 #[derive(Clone, Debug)]
@@ -39,6 +43,7 @@ pub struct BcodeExecutor {
     timeout: Duration,
     failure: Mutex<Option<ModelFailure>>,
     selection: (String, String, Option<String>),
+    observer: Option<Arc<dyn Observer>>,
 }
 /// Allowlisted SDK failure category; never contains provider text or response content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +235,7 @@ impl BcodeExecutor {
             timeout: options.timeout,
             failure: Mutex::new(None),
             selection,
+            observer: None,
         })
     }
 }
@@ -242,7 +248,12 @@ impl ModelExecutor for BcodeExecutor {
         Box::pin(async move {
             let max_bytes = request.max_response_bytes;
             let encoded = self
-                .execute_structured(request, bcode_recap::model::response_schema(), cancellation)
+                .execute_structured(
+                    request,
+                    bcode_recap::model::response_schema(),
+                    RequestStage::Composition,
+                    cancellation,
+                )
                 .await?;
             ModelResponse::from_json(&encoded, max_bytes)
         })
@@ -264,7 +275,12 @@ impl ModelExecutor for BcodeExecutor {
                 max_response_bytes: max_bytes,
             };
             let encoded = self
-                .execute_structured(request, analysis_response_schema(stage), cancellation)
+                .execute_structured(
+                    request,
+                    analysis_response_schema(stage),
+                    request_stage(stage),
+                    cancellation,
+                )
                 .await?;
             AnalysisResponse::from_json_slice(stage, &encoded, max_bytes)
         })
@@ -272,11 +288,38 @@ impl ModelExecutor for BcodeExecutor {
 }
 
 impl BcodeExecutor {
+    /// Attach an explicit run-scoped count-only observer; nothing is persisted implicitly.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     async fn execute_structured(
         &self,
         request: ModelRequest,
         schema: serde_json::Value,
+        stage: RequestStage,
         cancellation: &Cancellation,
+    ) -> Result<Vec<u8>, ModelError> {
+        let mut timing = RequestTiming::new(self.observer.as_deref(), stage, &request);
+        let result = self
+            .execute_structured_inner(request, schema, cancellation, &mut timing)
+            .await;
+        timing.outcome = match &result {
+            Ok(_) => CallOutcome::Succeeded,
+            Err(ModelError::Cancelled) => CallOutcome::Cancelled,
+            Err(_) => CallOutcome::Failed,
+        };
+        result
+    }
+
+    async fn execute_structured_inner(
+        &self,
+        request: ModelRequest,
+        schema: serde_json::Value,
+        cancellation: &Cancellation,
+        timing: &mut RequestTiming<'_>,
     ) -> Result<Vec<u8>, ModelError> {
         *self
             .failure
@@ -304,12 +347,18 @@ impl BcodeExecutor {
         let agent = self
             .sdk
             .agent()
+            // Each recap request is an independent turn. SDK runtime clones share one
+            // active-turn owner, so reusing that owner would supersede concurrent calls.
+            // The configured Recap SDK uses default runtime settings. Auth/selection,
+            // agent permission policy and request cancellation remain on this builder.
+            .runtime(bcode::AgentRuntime::default())
             .system(request.instructions)
             .parameters(self.parameters.clone())
             .timeout(self.timeout)
             .build();
         let result = {
             let token = bcode::CancellationToken::new();
+            timing.invoked();
             let operation = agent.generate_object_from_messages::<serde_json::Value>(
                 vec![ModelMessage {
                     role: MessageRole::User,
@@ -321,11 +370,15 @@ impl BcodeExecutor {
             tokio::pin!(operation);
             loop {
                 tokio::select! {
-                    result = &mut operation => break result.map_err(|error| self.execution_error(&error))?,
+                    result = &mut operation => {
+                        timing.inference_finished();
+                        break result.map_err(|error| self.execution_error(&error))?;
+                    },
                     () = tokio::time::sleep(Duration::from_millis(25)) => {
                         if cancellation.is_cancelled() {
                             token.cancel();
                             let _ = operation.await;
+                            timing.inference_finished();
                             return Err(ModelError::Cancelled);
                         }
                     }
@@ -341,8 +394,321 @@ impl BcodeExecutor {
     }
 }
 
+const fn request_stage(stage: bcode_recap::model::AnalysisStage) -> RequestStage {
+    use bcode_recap::model::AnalysisStage;
+    match stage {
+        AnalysisStage::ExtractionInventory => RequestStage::Inventory,
+        AnalysisStage::Outline => RequestStage::Outline,
+        AnalysisStage::ChapterComposition => RequestStage::Chapter,
+        AnalysisStage::SourceAudit => RequestStage::Audit,
+        AnalysisStage::SourceRepair => RequestStage::Repair,
+        AnalysisStage::VisualInspection => RequestStage::VisualInspection,
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+// Drop reports interrupted futures too; it never retains request content or SDK payloads.
+struct RequestTiming<'a> {
+    observer: Option<&'a dyn Observer>,
+    stage: RequestStage,
+    started: Instant,
+    inference_started: Option<Instant>,
+    inference_ms: Option<u64>,
+    outcome: CallOutcome,
+}
+impl<'a> RequestTiming<'a> {
+    fn new(
+        observer: Option<&'a dyn Observer>,
+        stage: RequestStage,
+        request: &ModelRequest,
+    ) -> Self {
+        if let Some(observer) = observer {
+            let bytes = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+            observer.measure(Measurement::Request {
+                stage,
+                context_bytes: bytes(request.instructions.len())
+                    .saturating_add(bytes(request.input_text.len())),
+                image_bytes: request.images.iter().fold(0_u64, |sum, image| {
+                    sum.saturating_add(bytes(image.bytes.len()))
+                }),
+                images: bytes(request.images.len()),
+            });
+        }
+        Self {
+            observer,
+            stage,
+            started: Instant::now(),
+            inference_started: None,
+            inference_ms: None,
+            outcome: CallOutcome::Interrupted,
+        }
+    }
+    fn invoked(&mut self) {
+        self.inference_started = Some(Instant::now());
+        if let Some(observer) = self.observer {
+            observer.measure(Measurement::Invocation { stage: self.stage });
+        }
+    }
+    fn inference_finished(&mut self) {
+        self.inference_ms = self.inference_started.map(elapsed_ms);
+    }
+}
+impl Drop for RequestTiming<'_> {
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer {
+            observer.measure(Measurement::Finished {
+                stage: self.stage,
+                request_ms: elapsed_ms(self.started),
+                inference_ms: self
+                    .inference_ms
+                    .or_else(|| self.inference_started.map(elapsed_ms)),
+                outcome: self.outcome,
+                // The current structured SDK API exposes no usage. Never invent estimates.
+                usage: TokenUsage::default(),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[derive(Clone)]
+    struct OverlappingProvider {
+        started: std::sync::Arc<tokio::sync::Barrier>,
+        next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        release: std::sync::Arc<[tokio::sync::Notify; 3]>,
+    }
+
+    impl bcode::InProcessModelProvider for OverlappingProvider {
+        fn run_turn(
+            &self,
+            request: bcode_model::ModelTurnRequest,
+            context: bcode::InProcessProviderContext,
+        ) -> bcode::InProcessProviderFuture<'_> {
+            Box::pin(async move {
+                assert_eq!(request.model_id, "test");
+                assert_eq!(request.parameters.max_output_tokens, Some(37));
+                assert_eq!(
+                    request.provider_context.model_profile.as_deref(),
+                    Some("offline-profile")
+                );
+                assert_eq!(
+                    request.provider_context.auth_profile.as_deref(),
+                    Some("offline-auth")
+                );
+                assert_eq!(
+                    request
+                        .provider_context
+                        .settings
+                        .get("test-setting")
+                        .map(String::as_str),
+                    Some("retained")
+                );
+                assert!(request.tools.is_empty());
+                let index = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(index < 3, "unexpected retry or additional invocation");
+                self.started.wait().await;
+                self.release[index].notified().await;
+                assert!(!context.cancellation().is_cancelled());
+                context
+                    .events()
+                    .emit(bcode_model::ProviderTurnEvent::TextDelta {
+                        text: "{\"ok\":true}".into(),
+                    })
+                    .unwrap();
+                Ok(bcode::InProcessProviderOutcome::EndTurn)
+            })
+        }
+    }
+
+    fn concurrent_test_registry() -> bcode::ProviderRegistry {
+        let mut features = bcode_model::ModelFeatureSupport::default();
+        features.structured_output.insert(
+            bcode_model::StructuredOutputMode::StrictJsonSchema,
+            bcode_model::CapabilitySupport::Supported {
+                source: bcode_model::CapabilitySource::ProviderApi,
+                mechanism: bcode_model::CapabilityMechanism::Native,
+                fidelity: bcode_model::CapabilityFidelity::Exact,
+                execution: bcode_model::CapabilityExecution::Direct,
+            },
+        );
+        bcode::ProviderRegistry::new()
+            .provider_capabilities(bcode_model::ProviderCapabilities {
+                provider_id: "test".into(),
+                display_name: "Offline test provider".into(),
+                capabilities: std::collections::BTreeSet::new(),
+                feature_support: features.clone(),
+                auth_schemes: std::collections::BTreeSet::new(),
+                retry_rules: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
+            })
+            .provider_models(
+                "test",
+                bcode_model::ModelList {
+                    models: vec![bcode_model::ModelInfo {
+                        model_id: "test".into(),
+                        display_name: "Offline test model".into(),
+                        is_default: true,
+                        context_window: None,
+                        max_output_tokens: None,
+                        max_image_input_base64_bytes: None,
+                        api_surface: None,
+                        capabilities: std::collections::BTreeSet::new(),
+                        feature_support: features,
+                        reasoning: None,
+                        cache: bcode_model::ModelCacheInfo::default(),
+                        metadata_source: None,
+                        pricing: None,
+                        visibility: bcode_model::ModelVisibility::default(),
+                    }],
+                    catalog: bcode_model::ModelCatalogHints::default(),
+                },
+            )
+            .default_model(bcode::ModelSelector::with_provider("test", "test"))
+    }
+
+    #[tokio::test]
+    async fn shared_executor_concurrent_calls_do_not_supersede_or_cancel_siblings() {
+        use super::*;
+        let started = Arc::new(tokio::sync::Barrier::new(4));
+        let release = Arc::new(std::array::from_fn(|_| tokio::sync::Notify::new()));
+        let provider = OverlappingProvider {
+            started: started.clone(),
+            next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            release: release.clone(),
+        };
+        let sdk = Bcode::builder()
+            .provider_factory(move || {
+                Box::new(bcode::InProcessModelProviderAdapter::new(provider.clone()))
+            })
+            .provider_registry(concurrent_test_registry())
+            .provider_context(bcode_model::ProviderRequestContext {
+                model_profile: Some("offline-profile".into()),
+                auth_profile: Some("offline-auth".into()),
+                settings: [("test-setting".into(), "retained".into())].into(),
+                ..bcode_model::ProviderRequestContext::default()
+            })
+            .build();
+        let executor = Arc::new(BcodeExecutor {
+            sdk,
+            parameters: bcode_model::ModelParameters {
+                max_output_tokens: Some(37),
+                ..bcode_model::ModelParameters::default()
+            },
+            timeout: Duration::from_secs(5),
+            failure: Mutex::new(None),
+            selection: ("test".into(), "test".into(), None),
+            observer: None,
+        });
+        let cancellation = Cancellation::default();
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..3 {
+            let executor = executor.clone();
+            let cancellation = cancellation.clone();
+            calls.spawn(async move {
+                executor.execute_structured(
+                    ModelRequest {
+                        instructions: "Return the requested object".into(),
+                        input_text: "test".into(),
+                        images: Vec::new(),
+                        max_response_bytes: 1024,
+                    },
+                    serde_json::json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}),
+                    RequestStage::Inventory,
+                    &cancellation,
+                ).await
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // No sleeps: all three provider rounds must be active before any may complete.
+            tokio::select! {
+                _ = started.wait() => {}
+                result = calls.join_next() => panic!("adapter finished before all provider rounds entered: {result:?}"),
+            }
+            release[0].notify_one();
+            let first = calls.join_next().await.unwrap().unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&first).unwrap(),
+                serde_json::json!({"ok":true})
+            );
+            // The first agent and invoker have now dropped while two siblings remain active.
+            assert!(!cancellation.is_cancelled());
+            release[1].notify_one();
+            release[2].notify_one();
+            while let Some(result) = calls.join_next().await {
+                let encoded = result.unwrap().unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+                    serde_json::json!({"ok":true})
+                );
+            }
+        })
+        .await
+        .expect("concurrent independent calls must finish without cancellation or deadlock");
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(executor.failure(), None);
+    }
+    #[test]
+    fn count_only_timing_reports_invocation_and_interrupted_drop() {
+        use bcode_recap::diagnostics::{Operation, RequestStage};
+        let operation = Operation::new("adapter-test".into());
+        let request = bcode_recap::model::ModelRequest {
+            instructions: "PRIVATE".into(),
+            input_text: "秘密".into(),
+            images: vec![bcode_recap::model::ImageAsset {
+                asset_id: "private-asset".into(),
+                mime_type: "image/png".into(),
+                bytes: vec![1, 2, 3],
+            }],
+            max_response_bytes: 10,
+        };
+        {
+            let mut timing =
+                super::RequestTiming::new(Some(&operation), RequestStage::Inventory, &request);
+            timing.invoked();
+            timing.inference_finished();
+        }
+        let measurements = operation.measurements();
+        let counts = &measurements.stages[&RequestStage::Inventory];
+        assert_eq!(counts.requests, 1);
+        assert_eq!(counts.invocations, 1);
+        assert_eq!(counts.interrupted, 1);
+        assert_eq!(counts.context_bytes, 13);
+        assert_eq!(counts.image_bytes, 3);
+        assert_eq!(counts.images, 1);
+        assert_eq!(counts.inference_timing_samples, 1);
+        assert_eq!(counts.usage.input_tokens, None);
+        let json = serde_json::to_string(&measurements).unwrap();
+        assert!(!json.contains("PRIVATE"));
+        assert!(!json.contains("秘密"));
+        assert!(!json.contains("private-asset"));
+    }
+
+    #[test]
+    fn pre_invocation_failure_does_not_claim_inference() {
+        use bcode_recap::diagnostics::{CallOutcome, Operation, RequestStage};
+        let operation = Operation::new("adapter-test".into());
+        let request = bcode_recap::model::ModelRequest {
+            instructions: String::new(),
+            input_text: String::new(),
+            images: Vec::new(),
+            max_response_bytes: 10,
+        };
+        {
+            let mut timing =
+                super::RequestTiming::new(Some(&operation), RequestStage::Composition, &request);
+            timing.outcome = CallOutcome::Cancelled;
+        }
+        let measurements = operation.measurements();
+        let counts = &measurements.stages[&RequestStage::Composition];
+        assert_eq!(counts.requests, 1);
+        assert_eq!(counts.invocations, 0);
+        assert_eq!(counts.cancelled, 1);
+        assert_eq!(counts.inference_timing_samples, 0);
+    }
     use super::*;
 
     #[test]

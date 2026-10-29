@@ -119,6 +119,12 @@ pub struct Create {
     /// Detailed repair-round allowance; zero audits without attempting repairs.
     #[arg(long)]
     pub detailed_max_repair_rounds: Option<u64>,
+    /// Maximum concurrent independent Detailed model requests.
+    #[arg(long, value_parser = positive_u64)]
+    pub detailed_max_concurrent_requests: Option<u64>,
+    /// Aggregate request/image/response byte reservation allowed in flight.
+    #[arg(long, value_parser = positive_u64)]
+    pub detailed_max_in_flight_bytes: Option<u64>,
     /// Existing video path or supported `YouTube` URL.
     #[arg(long)]
     pub source: String,
@@ -838,6 +844,10 @@ mod tests {
             "19",
             "--detailed-max-repair-rounds",
             "0",
+            "--detailed-max-concurrent-requests",
+            "2",
+            "--detailed-max-in-flight-bytes",
+            "8388608",
         ])
         .unwrap();
         let Some(Command::Create(options)) = parsed.command else {
@@ -848,9 +858,13 @@ mod tests {
         assert_eq!(engine.detailed.allowances.max_model_calls, 37);
         assert_eq!(engine.detailed.allowances.max_source_windows, 19);
         assert_eq!(engine.detailed.allowances.max_repair_rounds, 0);
+        assert_eq!(engine.detailed.max_concurrent_requests, 2);
+        assert_eq!(engine.detailed.max_in_flight_bytes, 8 * 1024 * 1024);
         for (flag, value) in [
             ("--depth", "unknown"),
             ("--detailed-max-model-calls", "0"),
+            ("--detailed-max-concurrent-requests", "0"),
+            ("--detailed-max-in-flight-bytes", "0"),
             ("--detailed-max-source-windows", "0"),
             ("--detailed-max-repair-rounds", "-1"),
         ] {

@@ -1,0 +1,82 @@
+{
+  "id": "qualified_interview_disagreement",
+  "title": "Cooling trial: association, disagreement, and a late correction",
+  "duration_ms": 900000,
+  "observations": [
+    {
+      "id": "researcher",
+      "start_ms": 10000,
+      "end_ms": 40000,
+      "transcript": "Dr Lin: In our non-randomized trial of 24 machines, the median fell from 80 to 68 degrees Celsius after the fan and firmware were both changed. That is a 12-degree drop, not a 12-percent drop. We cannot attribute it to the fan alone."
+    },
+    {
+      "id": "operator",
+      "start_ms": 120000,
+      "end_ms": 150000,
+      "transcript": "Operator Reyes: I disagree that this establishes a general improvement. Two of the 24 machines overheated during high humidity; our usual dry-room tests missed that condition."
+    },
+    {
+      "id": "mechanism",
+      "start_ms": 260000,
+      "end_ms": 290000,
+      "transcript": "Dr Lin: The proposed mechanism is that more airflow removes heat faster. It is a hypothesis, not a measured explanation; the simultaneous firmware change confounds this comparison."
+    },
+    {
+      "id": "conditional_advice",
+      "start_ms": 500000,
+      "end_ms": 530000,
+      "transcript": "Reyes: If humidity exceeds 70 percent, keep the old cooling profile until the wet-room test passes. I am not recommending that every installation roll back."
+    },
+    {
+      "id": "late_correction",
+      "start_ms": 870000,
+      "end_ms": 895000,
+      "transcript": "Dr Lin: One correction before we close: the 68-degree median excludes the two overheated machines because their sensors stopped logging. The trial enrolled 24, but only 22 contributed to that median. This is not an all-machine success rate."
+    }
+  ],
+  "items": [
+    {
+      "id": "trial_numbers",
+      "summary": "Lin reports a non-randomized trial of 24 machines: median 80 to 68 degrees Celsius, a 12-degree drop, not a 12-percent drop.",
+      "required_fragments": ["Lin", "non-randomized", "24 machines", "80 to 68 degrees Celsius", "12-degree drop", "not a 12-percent drop"],
+      "evidence_ids": ["researcher"],
+      "standard_required": true
+    },
+    {
+      "id": "operator_disagreement",
+      "summary": "Reyes disputes general improvement: two of the 24 machines overheated in high humidity, a condition missed by dry-room tests.",
+      "required_fragments": ["Reyes disputes", "two of the 24", "overheated in high humidity", "missed by dry-room tests"],
+      "evidence_ids": ["operator"],
+      "standard_required": true
+    },
+    {
+      "id": "causal_hypothesis",
+      "summary": "Greater airflow removing heat faster is a hypothesis, not a measured explanation; the simultaneous firmware change prevents attributing the drop to the fan alone.",
+      "required_fragments": ["airflow removing heat faster", "hypothesis, not a measured explanation", "simultaneous firmware change", "prevents attributing the drop to the fan alone"],
+      "evidence_ids": ["mechanism"],
+      "standard_required": false
+    },
+    {
+      "id": "conditional_recommendation",
+      "summary": "Reyes says if humidity exceeds 70 percent, keep the old cooling profile until the wet-room test passes; this is not a recommendation for every installation to roll back.",
+      "required_fragments": ["if humidity exceeds 70 percent", "keep the old cooling profile", "until the wet-room test passes", "not a recommendation for every installation"],
+      "evidence_ids": ["conditional_advice"],
+      "standard_required": false
+    },
+    {
+      "id": "corrected_denominator",
+      "summary": "Late correction: only 22 of 24 machines contributed to the 68-degree median; the two overheated machines were excluded because their sensors stopped logging, not because they succeeded.",
+      "required_fragments": ["only 22 of 24", "68-degree median", "two overheated machines were excluded", "because their sensors stopped logging", "not because they succeeded"],
+      "evidence_ids": ["late_correction"],
+      "standard_required": false
+    }
+  ],
+  "forbidden_claims": [
+    "The fan alone caused the temperature drop",
+    "All 24 machines contributed to the median",
+    "Lin and Reyes agree this proves general improvement",
+    "Every installation must roll back",
+    "The temperature fell by 12 percent",
+    "The two overheated machines were excluded because they succeeded"
+  ]
+}

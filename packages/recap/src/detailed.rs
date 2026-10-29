@@ -15,6 +15,8 @@ use crate::{
     process::Cancellation,
 };
 
+mod execution;
+mod ownership;
 mod pipeline;
 mod stages;
 mod validation;
@@ -58,98 +60,17 @@ impl Operation<'_> {
         images: Vec<ImageAsset>,
         task: &str,
     ) -> Result<AnalysisResponse> {
-        self.cancelled()?;
-        let limits = &self.policy.allowances;
-        let bytes = images.iter().try_fold(0usize, |n, image| {
-            n.checked_add(image.bytes.len())
-                .ok_or(CompositionError::Budget)
-        })?;
-        let instructions = format!("{POLICY}\n{task}");
-        if self.calls >= limits.max_model_calls
-            || serde_json::to_vec(&input)?
-                .len()
-                .saturating_add(instructions.len())
-                > limits.max_input_bytes
-            || bytes > limits.max_image_bytes
-        {
-            return Err(CompositionError::Budget);
-        }
-        let input_size = serde_json::to_vec(&input)?
-            .len()
-            .saturating_add(instructions.len());
-        self.input_bytes = self
-            .input_bytes
-            .checked_add(input_size)
-            .ok_or(CompositionError::Budget)?;
-        self.image_bytes = self
-            .image_bytes
-            .checked_add(bytes)
-            .ok_or(CompositionError::Budget)?;
-        let operation_input = limits
-            .max_input_bytes
-            .checked_mul(limits.max_model_calls)
-            .ok_or(CompositionError::Budget)?;
-        let operation_images = limits
-            .max_image_bytes
-            .checked_mul(limits.max_model_calls)
-            .ok_or(CompositionError::Budget)?;
-        if self.input_bytes > operation_input || self.image_bytes > operation_images {
-            return Err(CompositionError::Budget);
-        }
-        self.calls += 1;
-        let (phase, progress_index) = match stage {
-            AnalysisStage::ExtractionInventory
-            | AnalysisStage::VisualInspection
-            | AnalysisStage::Outline => (crate::diagnostics::Phase::Analysis, 0),
-            AnalysisStage::ChapterComposition => (crate::diagnostics::Phase::Writing, 1),
-            AnalysisStage::SourceAudit => (crate::diagnostics::Phase::Audit, 2),
-            AnalysisStage::SourceRepair => (crate::diagnostics::Phase::Repair, 3),
-        };
-        self.cancel.emit(crate::diagnostics::Event::Phase { phase });
-        self.cancel
-            .emit(crate::diagnostics::Event::AnalysisProgress {
-                phase,
-                completed: self.completed[progress_index],
-                total: None,
-            });
-        self.cancel
-            .emit(crate::diagnostics::Event::InferenceStarted);
-        let response = self
-            .executor
-            .execute_analysis(
-                AnalysisRequest {
-                    stage,
-                    input,
-                    instructions,
-                    images,
-                    max_response_bytes: limits.max_response_bytes,
-                },
-                self.cancel,
-            )
-            .await?;
-        self.cancelled()?;
-        check(response.stage() == stage, "analysis stage mismatch")?;
-        // Typed executors must obey the same output bound as wire adapters.
-        let size = match &response {
-            AnalysisResponse::ExtractionInventory(value) => serde_json::to_vec(value)?,
-            AnalysisResponse::Outline(value) => serde_json::to_vec(value)?,
-            AnalysisResponse::ChapterComposition(value) => serde_json::to_vec(value)?,
-            AnalysisResponse::SourceAudit(value) => serde_json::to_vec(value)?,
-            AnalysisResponse::SourceRepair(value) => serde_json::to_vec(value)?,
-            AnalysisResponse::VisualInspection(value) => serde_json::to_vec(value)?,
-        }
-        .len();
-        if size > limits.max_response_bytes {
-            return Err(CompositionError::Budget);
-        }
-        self.completed[progress_index] = self.completed[progress_index].saturating_add(1);
-        self.cancel
-            .emit(crate::diagnostics::Event::AnalysisProgress {
-                phase,
-                completed: self.completed[progress_index],
-                total: None,
-            });
-        Ok(response)
+        let call = execution::PreparedCall::new(
+            stage,
+            input,
+            images,
+            task,
+            self.policy.allowances.max_response_bytes,
+        )?;
+        self.run(Box::new(std::iter::once(Ok(call))))
+            .await?
+            .pop()
+            .ok_or(CompositionError::Invalid("missing analysis response"))
     }
 
     fn cancelled(&self) -> Result<()> {
@@ -247,79 +168,11 @@ fn source_windows(
     policy: &DetailedPolicy,
     cancel: &Cancellation,
 ) -> Result<Vec<SourceWindow>> {
-    let mut windows = Vec::new();
-    let mut start = 0;
-    while start < document.source.duration_ms {
-        check_cancelled(cancel)?;
-        let end = start
-            .saturating_add(policy.window_duration_ms)
-            .min(document.source.duration_ms);
-        let range = TimeRange {
-            start_ms: start,
-            end_ms: end,
-        };
-        let mut pending = vec![range];
-        while let Some(range) = pending.pop() {
-            check_cancelled(cancel)?;
-            if windows.len().saturating_add(pending.len()) >= policy.allowances.max_source_windows {
-                return Err(CompositionError::Budget);
-            }
-            let window = SourceWindow {
-                id: format!("window-{}", windows.len()),
-                range,
-                transcript_ids: document
-                    .transcript
-                    .iter()
-                    .filter(|s| overlaps(s.range, range))
-                    .map(|s| s.id.clone())
-                    .collect(),
-                evidence_ids: document
-                    .evidence
-                    .iter()
-                    .filter(|e| overlaps(e.range, range))
-                    .map(|e| e.id.clone())
-                    .collect(),
-                asset_ids: document
-                    .assets
-                    .iter()
-                    .filter(|a| a.mime_type.starts_with("image/") && overlaps(a.range, range))
-                    .map(|a| a.id.clone())
-                    .collect(),
-            };
-            // Leave room for stage policy, identity envelope, inventory and auditing.
-            let source_bytes = serde_json::to_vec(&window_source(document, &window))?.len();
-            if source_bytes > policy.allowances.max_input_bytes / 4 {
-                let middle = range.start_ms + (range.end_ms - range.start_ms) / 2;
-                if middle == range.start_ms {
-                    return Err(CompositionError::Budget);
-                }
-                pending.push(TimeRange {
-                    start_ms: middle,
-                    end_ms: range.end_ms,
-                });
-                pending.push(TimeRange {
-                    start_ms: range.start_ms,
-                    end_ms: middle,
-                });
-            } else {
-                windows.push(window);
-            }
-        }
-        if end == document.source.duration_ms {
-            break;
-        }
-        start = end - policy.window_overlap_ms;
-    }
-    Ok(windows)
+    crate::source_analysis::detailed_windows(document, policy, cancel)
 }
 
 fn window_source(document: &RecapDocument, window: &SourceWindow) -> Value {
-    json!({
-        "range":window.range,
-        "transcript":document.transcript.iter().filter(|s| window.transcript_ids.contains(&s.id)).collect::<Vec<_>>(),
-        "evidence":document.evidence.iter().filter(|e| window.evidence_ids.contains(&e.id)).collect::<Vec<_>>(),
-        "assets":document.assets.iter().filter(|a| window.asset_ids.contains(&a.id)).collect::<Vec<_>>()
-    })
+    crate::source_analysis::detailed_window_source(document, window)
 }
 
 fn relevant_windows<'a>(

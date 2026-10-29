@@ -90,6 +90,20 @@ pub struct DetailedPolicy {
     pub window_overlap_ms: u64,
     /// Whether to inspect source frames in addition to textual evidence.
     pub inspect_visuals: bool,
+    /// Maximum independent model requests executing concurrently.
+    #[serde(default = "default_concurrency")]
+    pub max_concurrent_requests: usize,
+    /// Maximum aggregate reserved request, image and response bytes in flight.
+    #[serde(default = "default_in_flight_bytes")]
+    pub max_in_flight_bytes: usize,
+}
+
+const fn default_concurrency() -> usize {
+    3
+}
+
+const fn default_in_flight_bytes() -> usize {
+    24 * 1024 * 1024
 }
 
 impl Default for DetailedPolicy {
@@ -99,6 +113,8 @@ impl Default for DetailedPolicy {
             window_duration_ms: 180_000,
             window_overlap_ms: 10_000,
             inspect_visuals: true,
+            max_concurrent_requests: default_concurrency(),
+            max_in_flight_bytes: default_in_flight_bytes(),
         }
     }
 }
@@ -110,7 +126,9 @@ impl DetailedPolicy {
     /// Returns [`ModelError::InvalidResponse`] for zero essential allowances or invalid windows.
     pub const fn validate(&self) -> Result<(), ModelError> {
         let limits = &self.allowances;
-        if self.window_duration_ms == 0
+        if self.max_concurrent_requests == 0
+            || self.max_in_flight_bytes == 0
+            || self.window_duration_ms == 0
             || self.window_overlap_ms >= self.window_duration_ms
             || limits.max_model_calls == 0
             || limits.max_input_bytes == 0
@@ -696,6 +714,24 @@ mod tests {
         assert!(!report.is_complete());
         report.dispositions[1] = report.dispositions[0].clone();
         assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn policy_defaults_old_serialized_inputs_and_rejects_zero_scheduling_limits() {
+        let mut value = serde_json::to_value(DetailedPolicy::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("max_concurrent_requests");
+        value.as_object_mut().unwrap().remove("max_in_flight_bytes");
+        let mut policy: DetailedPolicy = serde_json::from_value(value).unwrap();
+        assert_eq!(policy.max_concurrent_requests, 3);
+        assert_eq!(policy.max_in_flight_bytes, 24 * 1024 * 1024);
+        policy.max_concurrent_requests = 0;
+        assert!(policy.validate().is_err());
+        policy.max_concurrent_requests = 1;
+        policy.max_in_flight_bytes = 0;
+        assert!(policy.validate().is_err());
     }
 
     #[test]

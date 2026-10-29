@@ -44,6 +44,8 @@ struct AnnotatedExecutor<'a> {
     source: RecapDocument,
     images: Vec<ImageAsset>,
     omit: Option<&'a str>,
+    second_omit: Option<&'a str>,
+    group_chapter: bool,
     ineffective_repair: bool,
     trace: Mutex<Trace>,
 }
@@ -82,6 +84,8 @@ impl<'a> AnnotatedExecutor<'a> {
             source,
             images,
             omit,
+            second_omit: None,
+            group_chapter: false,
             ineffective_repair,
             trace: Mutex::default(),
         }
@@ -229,7 +233,8 @@ impl<'a> AnnotatedExecutor<'a> {
         let mut choices = Vec::new();
         for (index, item) in items.iter().enumerate() {
             let annotation = self.annotation(item);
-            let dropped = omit && self.omit == Some(annotation.id.as_str());
+            let dropped =
+                omit && [self.omit, self.second_omit].contains(&Some(annotation.id.as_str()));
             let content = annotation.visual_asset_id.as_ref().map_or_else(
                 || BlockContent::Text {
                     text: if dropped {
@@ -351,21 +356,33 @@ impl<'a> AnnotatedExecutor<'a> {
                 .position(|annotation| annotation.id == self.annotation(item).id)
                 .unwrap()
         });
-        let chapters: Vec<_> = items
+        let chapters: Vec<_> = if self.group_chapter {
+            vec![ChapterPlan {
+                id: "interview".into(),
+                title: self.case.title.clone(),
+                item_ids: items.iter().map(|item| item.id.clone()).collect(),
+            }]
+        } else {
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| ChapterPlan {
+                    id: format!("chapter-{index}"),
+                    title: self.annotation(item).id.clone(),
+                    item_ids: vec![item.id.clone()],
+                })
+                .collect()
+        };
+        let dispositions = items
             .iter()
-            .enumerate()
-            .map(|(index, item)| ChapterPlan {
-                id: format!("chapter-{index}"),
-                title: self.annotation(item).id.clone(),
-                item_ids: vec![item.id.clone()],
-            })
-            .collect();
-        let dispositions = chapters
-            .iter()
-            .map(|chapter| ItemDisposition {
-                item_id: chapter.item_ids[0].clone(),
+            .map(|item| ItemDisposition {
+                item_id: item.id.clone(),
                 disposition: DispositionKind::Retained,
-                chapter_ids: vec![chapter.id.clone()],
+                chapter_ids: chapters
+                    .iter()
+                    .filter(|chapter| chapter.item_ids.contains(&item.id))
+                    .map(|chapter| chapter.id.clone())
+                    .collect(),
                 duplicate_of: vec![],
                 reason: "Distinct substantive annotated source information".into(),
             })
@@ -410,6 +427,8 @@ impl<'a> AnnotatedExecutor<'a> {
                     ),
                 })
             })
+            // Reveal one independent defect per audit to exercise sequential repairs.
+            .take(if self.group_chapter { 1 } else { usize::MAX })
             .collect();
         let mut trace = self.trace.lock().unwrap();
         trace.findings += issues.len();
@@ -430,7 +449,7 @@ impl<'a> AnnotatedExecutor<'a> {
         let plans: Vec<ChapterPlan> = decode(&request.input["chapter_plans"]);
         let items: Vec<InformationItem> = decode(&request.input["items"]);
         let current: Vec<ChapterComposition> = decode(&request.input["chapters"]);
-        assert_eq!(issues.len(), 1);
+        assert!(!issues.is_empty());
         assert_eq!(plans.len(), 1, "repair must be narrowly targeted");
         assert_eq!(current.len(), 1);
         assert!(
@@ -447,7 +466,29 @@ impl<'a> AnnotatedExecutor<'a> {
                     .filter(|item| plan.item_ids.contains(&item.id))
                     .cloned()
                     .collect();
-                self.render(plan, &assigned, self.ineffective_repair)
+                let mut proposal = current
+                    .iter()
+                    .find(|chapter| chapter.section.id == plan.id)
+                    .expect("repair must receive the current complete chapter")
+                    .clone();
+                if !self.ineffective_repair {
+                    let corrected = self.render(plan, &assigned, false);
+                    // Preserve the current chapter, including earlier corrections and
+                    // unrelated text. Only active issues authorize new corrections;
+                    // historical preservation context is not a request to rebuild.
+                    for (item, block) in assigned.iter().zip(corrected.section.blocks) {
+                        if issues.iter().any(|issue| issue.item_ids.contains(&item.id)) {
+                            let target = proposal
+                                .section
+                                .blocks
+                                .iter_mut()
+                                .find(|current| current.id == block.id)
+                                .expect("active correction must target an existing block");
+                            *target = block;
+                        }
+                    }
+                }
+                proposal
             })
             .collect();
         self.trace.lock().unwrap().repairs += 1;
@@ -587,7 +628,7 @@ async fn corpus_survives_actual_staged_composition_and_targeted_repair() {
 }
 
 #[tokio::test]
-async fn claimed_repair_without_restored_content_is_reaudited_and_rejected() {
+async fn claimed_repair_without_restored_content_is_rejected() {
     let corpus = corpus();
     let case = corpus
         .cases
@@ -610,15 +651,62 @@ async fn claimed_repair_without_restored_content_is_reaudited_and_rejected() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(
-        error,
-        CompositionError::Invalid("unresolved source coverage gaps")
-    ));
     assert_eq!(executor.source, before);
     let trace = executor.trace.lock().unwrap();
-    assert_eq!(trace.repairs, policy().allowances.max_repair_rounds);
-    assert!(trace.findings > trace.repairs);
+    match error {
+        CompositionError::Invalid("source repair made no progress or repeated a candidate") => {
+            // A verified identical candidate cannot restore the missing meaning.
+            // Rejecting it immediately legitimately avoids another source audit.
+            assert_eq!(trace.repairs, 1);
+            assert_eq!(trace.findings, 1);
+        }
+        CompositionError::Invalid("unresolved source coverage gaps") => {
+            // Re-auditing until the repair allowance is exhausted is also safe.
+            assert_eq!(trace.repairs, policy().allowances.max_repair_rounds);
+            assert!(trace.findings > trace.repairs);
+        }
+        other => {
+            panic!("expected source-coverage or verified no-progress rejection, got {other:?}")
+        }
+    }
     assert_eq!(trace.clean_audits_after_repair, 0);
+}
+
+#[tokio::test]
+async fn sequential_repairs_preserve_the_earlier_fix_and_nonfocus_content() {
+    let corpus = corpus();
+    let case = corpus
+        .cases
+        .iter()
+        .find(|case| case.id == "qualified_interview_disagreement")
+        .unwrap();
+    let mut executor = AnnotatedExecutor::new(case, Some("causal_hypothesis"), false);
+    executor.second_omit = Some("corrected_denominator");
+    executor.group_chapter = true;
+    let mut allowance = policy();
+    allowance.window_duration_ms = case.duration_ms;
+    allowance.allowances.max_repair_rounds = 3;
+    let output = compose_detailed(
+        &executor,
+        &executor.source,
+        executor.images.clone(),
+        GenerationIntent {
+            depth: Depth::Detailed,
+            focus: Some("Emphasize the temperature measurements".into()),
+        },
+        None,
+        &allowance,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    output.validate().unwrap();
+    assert!(coverage(case, &output, Depth::Detailed).is_complete());
+    let trace = executor.trace.lock().unwrap();
+    assert!(trace.repairs >= 2);
+    assert_eq!(trace.findings, 2);
+    assert!(trace.clean_audits_after_repair >= 2);
+    drop(trace);
 }
 
 #[tokio::test]

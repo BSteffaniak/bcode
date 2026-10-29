@@ -7,6 +7,13 @@ an acquired full transcript.
 
 ## Scenarios and expected substance
 
+`interview.json` extends the same annotation format through `corpus()` with
+`qualified_interview_disagreement`: a non-randomized 24-machine comparison,
+degrees versus percent, attributed disagreement, a confounded causal hypothesis,
+a humidity-conditional recommendation, and a late correction to the median's
+22-machine denominator. Neither speaker's claim implies consensus. The reason
+for exclusion (failed logging) must not become evidence of success.
+
 * `dense_numbers_examples_caveats`: six units covering baseline quantities, a
   latency/memory tradeoff, worked arithmetic and its arrival assumption,
   measurement limitations, a sustained alert threshold, and ambiguous-write
@@ -55,12 +62,52 @@ solely for oracle/contract tests; it is not a model implementation.
 `coverage` looks only at emitted content blocks, not headings, unused transcript,
 or source metadata. It detects missing canonical items, wrong annotated evidence,
 wrong visual asset, repeated full explanations, and reversed present prerequisites.
-It allows multiple substantive items in one block or section. Its exact-phrase
-matching is deliberately narrow: paraphrases can fail; misleading additions or
-negations beyond the tested canonical phrases can pass. It is not an entailment,
-readability, contradiction, or live-quality evaluator. Unknown claims require
-separate source review. Empty `sections` in a grounding document do not constitute
-a composed recap.
+It allows multiple substantive items in one block or section. Matching ignores
+case and whitespace but is deliberately narrow: paraphrases can fail. Optional
+`forbidden_claims` flag specific source-annotated false assertions even when all
+required phrases survive. These are synthetic negative controls, not a general
+contradiction detector: unlisted additions, negations, or quotations of a forbidden
+claim can be misclassified. Unknown claims require separate source review.
+Empty `sections` in a grounding document do not constitute a composed recap.
+
+## Baseline/candidate comparison rubric (not yet run live)
+
+Use identical source bytes/transcript, media sampling, resource allowances,
+configuration/profile, focus and depth. Record artifact identity and source hashes.
+Evaluate Standard separately: selective coverage is legitimate there, not in
+Detailed. Keep the answer key out of all model inputs. Preserve both failures
+and successes; exporting is not permission to waive semantic failures.
+
+1. **Mechanical gate:** contract/evidence validity, complete source-window transport,
+   cancellation/resource failure behavior, stable prior revision, retained earlier
+   repairs, focus not excluding unrelated material, and final audit. Run both
+   `detailed_quality` and `detailed_acceptance` targets. Fixture phrase/known-false
+   checks are deterministic regression signals, not semantic acceptance scores.
+2. **Blind source review:** shuffle baseline/candidate labels. Independently mark
+   each annotated unit preserved / partially preserved / absent / contradicted,
+   with a source timestamp and output block. Check numbers with units/denominators,
+   attribution, logical conditions, causal direction/uncertainty, examples and
+   procedure prerequisites. Review *every added claim* for source support, not
+   just matched IDs. Any substantive omission, distortion, or unsafe procedure
+   change blocks a Detailed quality pass; no aggregate score may hide it.
+3. **Editorial comparison, separately reported:** judge readable video adaptation,
+   explanatory continuity, useful visuals, nonredundancy and navigation on a 1–5
+   anchored scale (1 impedes understanding, 3 understandable with friction,
+   5 clear without substantive loss). Do not penalize synonyms, capitalization,
+   whitespace, headings or chapter grouping as factual errors. A concise rendering
+   cannot win by discarding an example or caveat. Resolve reviewer disagreements
+   against the source, recording uncertainty rather than guessing.
+4. **Performance, separately reported:** on authorized future paired runs record
+   wall time, model calls, input/output usage, repair rounds and failures. Compare
+   per case and report medians/ranges, not just pooled totals; use repeated pairs
+   before a speed claim. No persistent prompt/checkpoint cache is assumed.
+
+The new controls are hand-authored synthetic annotations, not independent human
+inter-rater validation or a representative video benchmark. Only two silent
+panel states are present: there is no motion, real OCR, perception or extraction
+quality evidence. Late content has intentional transcript gaps. No baseline or
+candidate live inference, browser export, real source acquisition, or measured
+speed/quality improvement is established by these fixtures.
 
 ## Acceptance still requiring integration
 

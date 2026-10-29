@@ -84,9 +84,23 @@ the material rather than an editorial cap. Optional focus changes emphasis, not 
 Detailed performs multiple model requests and can take substantially longer and consume
 more usage than Standard. Resource allowances remain explicit: CLI callers can set
 `--detailed-max-model-calls`, `--detailed-max-source-windows`, and
-`--detailed-max-repair-rounds`; library callers configure `EngineOptions::detailed`
+`--detailed-max-repair-rounds`, `--detailed-max-concurrent-requests`, and
+`--detailed-max-in-flight-bytes`; library callers configure `EngineOptions::detailed`
 and `EngineOptions::inspection`. Exhausted allowances fail rather than quietly producing
 a shorter Standard document. Model adapters without typed analysis support fail explicitly.
+
+Independent extraction and chapter requests execute in bounded waves (default three),
+with deterministic source/chapter assembly. In-flight byte reservations include request,
+image and response allowances; they do not bound total process memory. Set concurrency to
+one for serial execution. Repairs reuse previously clean source checks only when their
+complete selected chapter inputs are unchanged; final source checks remain independent.
+Unchanged or cyclic repair candidates fail early rather than spending every repair round.
+
+Explicit `--diagnostic-report` export now uses report version 2, including fixed-size
+aggregate measurements that survive bounded event-log eviction. Readers must dispatch on
+the report version; version 1 has no measurement aggregate. Counts distinguish SDK
+invocations from provider acceptance, and unavailable token usage remains unknown.
+No raw source, prompts or credentials are included in these measurements.
 
 Adaptive scene/transcript sampling improves visual evidence, but sampled frames do not
 prove complete visual coverage or motion understanding. Reading notes preserve inspection

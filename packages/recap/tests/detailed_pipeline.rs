@@ -121,7 +121,10 @@ impl ModelExecutor for Typed {
             if self.corrupt_stage == Some(request.stage) {
                 match &mut response {
                     AnalysisResponse::ExtractionInventory(value) => {
-                        value.items[0].range.end_ms = 999_999;
+                        // Visual-only windows legitimately have no text items.
+                        // Corrupt the echoed host identity in every window rather
+                        // than indexing an optional inventory entry.
+                        value.window_id = "fabricated-window".into();
                     }
                     AnalysisResponse::VisualInspection(value) => {
                         value.inspected_asset_ids.push("fake-frame".into());
@@ -366,6 +369,17 @@ impl Typed {
     }
     fn stage_audit(&self, request: &AnalysisRequest) -> AnalysisResponse {
         let input = &request.input;
+        let required: Vec<String> =
+            serde_json::from_value(input["required_checked_item_ids"].clone()).unwrap();
+        let items_for_identity: Vec<InformationItem> =
+            serde_json::from_value(input["items"].clone()).unwrap();
+        assert_eq!(
+            required,
+            items_for_identity
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>()
+        );
 
         let items: Vec<InformationItem> = serde_json::from_value(input["items"].clone()).unwrap();
         let chapters: Vec<ChapterComposition> =
@@ -831,6 +845,16 @@ async fn fanout_audits_scope_items_but_keep_complete_source_ledger() {
         .collect();
     assert_eq!(checked.len(), 16);
     for request in audits {
+        let required = request.input["required_checked_item_ids"]
+            .as_array()
+            .unwrap();
+        assert!(
+            required.len()
+                < request.input["source_coverage_ledger"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+        );
         assert!(request.input["chapters"].as_array().unwrap().len() < 16);
         assert_eq!(
             request.input["source_coverage_ledger"]
@@ -946,10 +970,15 @@ async fn fabricated_inventory_ids_fail_before_outlining() {
         .await
         .is_err()
     );
-    assert_eq!(
-        *model.calls.lock().unwrap(),
-        [AnalysisStage::ExtractionInventory]
-    );
+    let calls = model.calls.lock().unwrap().clone();
+    assert!(calls.contains(&AnalysisStage::ExtractionInventory));
+    // Independent extraction may already be dispatched, but untrusted inventory
+    // must never cross the outline/composition barrier.
+    assert!(calls.iter().all(|stage| matches!(
+        stage,
+        AnalysisStage::ExtractionInventory | AnalysisStage::VisualInspection
+    )));
+    assert_eq!(model.standard_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1059,6 +1088,30 @@ async fn every_stage_rejects_fabricated_or_incomplete_identity_sets() {
             .is_err(),
             "accepted corrupt {stage:?}"
         );
+        let calls = model.calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&stage),
+            "corruption fixture did not reach {stage:?}"
+        );
+        match stage {
+            AnalysisStage::ExtractionInventory | AnalysisStage::VisualInspection => {
+                assert!(calls.iter().all(|call| matches!(
+                    call,
+                    AnalysisStage::ExtractionInventory | AnalysisStage::VisualInspection
+                )));
+            }
+            AnalysisStage::Outline => {
+                assert!(!calls.contains(&AnalysisStage::ChapterComposition));
+            }
+            AnalysisStage::ChapterComposition => {
+                assert!(!calls.contains(&AnalysisStage::SourceAudit));
+            }
+            AnalysisStage::SourceAudit => {
+                assert!(!calls.contains(&AnalysisStage::SourceRepair));
+            }
+            AnalysisStage::SourceRepair => {}
+        }
+        assert_eq!(model.standard_calls.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -1289,5 +1342,971 @@ async fn aggregate_document_larger_than_a_request_completes_with_bounded_consist
                 .iter()
                 .any(|source| source["window"]["id"] == format!("window-{index}"))
         }));
+    }
+}
+
+/// Deliberately finish independent calls out of order, retaining normal typed validation.
+#[derive(Default)]
+struct ConcurrentTyped {
+    inner: Typed,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    fail_extraction: bool,
+}
+
+impl ModelExecutor for ConcurrentTyped {
+    fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
+        self.inner.execute(request, cancel)
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: AnalysisRequest,
+        cancel: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async move {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let delay = if request.stage == AnalysisStage::ExtractionInventory {
+                8
+            } else {
+                1
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            let result = self.inner.execute_analysis(request.clone(), cancel).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if self.fail_extraction && request.stage == AnalysisStage::ExtractionInventory {
+                Err(ModelError::Unavailable)
+            } else {
+                result
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn independent_calls_overlap_but_assembly_is_identical_to_serial() {
+    let (grounded, images, mut policy) = source();
+    policy.max_concurrent_requests = 1;
+    let serial_model = ConcurrentTyped::default();
+    let serial = compose_detailed(
+        &serial_model,
+        &grounded,
+        images.clone(),
+        intent(),
+        None,
+        &policy,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(serial_model.peak.load(Ordering::SeqCst), 1);
+    policy.max_concurrent_requests = 3;
+    let parallel_model = ConcurrentTyped::default();
+    let parallel = compose_detailed(
+        &parallel_model,
+        &grounded,
+        images,
+        intent(),
+        None,
+        &policy,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parallel, serial);
+    assert_eq!(parallel_model.peak.load(Ordering::SeqCst), 3);
+    assert_eq!(parallel_model.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn wave_budget_is_reserved_before_any_executor_invocation() {
+    let (grounded, images, mut policy) = source();
+    policy.allowances.max_model_calls = 1;
+    policy.max_concurrent_requests = 3;
+    let model = Typed::default();
+    assert!(matches!(
+        compose_detailed(
+            &model,
+            &grounded,
+            images,
+            intent(),
+            None,
+            &policy,
+            &Cancellation::default()
+        )
+        .await,
+        Err(CompositionError::Budget)
+    ));
+    assert!(model.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_wave_drains_without_retry_or_later_dispatch() {
+    let (grounded, images, policy) = source();
+    let model = ConcurrentTyped {
+        fail_extraction: true,
+        ..ConcurrentTyped::default()
+    };
+    assert!(
+        compose_detailed(
+            &model,
+            &grounded,
+            images,
+            intent(),
+            None,
+            &policy,
+            &Cancellation::default()
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(model.active.load(Ordering::SeqCst), 0);
+    let calls = model.inner.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|stage| matches!(
+        stage,
+        AnalysisStage::ExtractionInventory | AnalysisStage::VisualInspection
+    )));
+}
+
+#[tokio::test]
+async fn unchanged_repair_fails_before_spending_all_repair_rounds() {
+    let (grounded, images, mut policy) = source();
+    policy.allowances.max_repair_rounds = 8;
+    let model = Typed {
+        scenarios: BTreeSet::from([Scenario::OmitLate, Scenario::RefuseRepair]),
+        ..Typed::default()
+    };
+    assert!(matches!(
+        compose_detailed(
+            &model,
+            &grounded,
+            images,
+            intent(),
+            None,
+            &policy,
+            &Cancellation::default()
+        )
+        .await,
+        Err(CompositionError::Invalid(
+            "source repair made no progress or repeated a candidate"
+        ))
+    ));
+    assert_eq!(
+        model
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|stage| **stage == AnalysisStage::SourceRepair)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn in_flight_payload_ceiling_fails_before_dispatch() {
+    let (grounded, images, mut policy) = source();
+    policy.max_in_flight_bytes = policy.allowances.max_response_bytes;
+    let model = Typed::default();
+    assert!(matches!(
+        compose_detailed(
+            &model,
+            &grounded,
+            images,
+            intent(),
+            None,
+            &policy,
+            &Cancellation::default()
+        )
+        .await,
+        Err(CompositionError::Budget)
+    ));
+    assert!(model.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn byte_reservation_reduces_parallelism_without_changing_output() {
+    let (grounded, images, mut policy) = source();
+    policy.max_concurrent_requests = 1;
+    let probe = Typed::default();
+    let expected = compose_detailed(
+        &probe,
+        &grounded,
+        images.clone(),
+        intent(),
+        None,
+        &policy,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    let ceiling = probe
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| {
+            serde_json::to_vec(&request.input).unwrap().len()
+                + request.instructions.len()
+                + request
+                    .images
+                    .iter()
+                    .map(|image| image.bytes.len())
+                    .sum::<usize>()
+                + request.max_response_bytes
+        })
+        .max()
+        .unwrap();
+    assert!(ceiling < 2 * policy.allowances.max_response_bytes);
+    policy.max_concurrent_requests = 3;
+    policy.max_in_flight_bytes = ceiling;
+    let model = ConcurrentTyped::default();
+    let actual = compose_detailed(
+        &model,
+        &grounded,
+        images,
+        intent(),
+        None,
+        &policy,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(model.peak.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancellation_drains_the_wave_and_admits_no_chapter_work() {
+    let (grounded, images, policy) = source();
+    let cancel = Cancellation::default();
+    let model = ConcurrentTyped {
+        inner: Typed {
+            cancel_stage: Some(AnalysisStage::ExtractionInventory),
+            ..Typed::default()
+        },
+        ..ConcurrentTyped::default()
+    };
+    assert!(matches!(
+        compose_detailed(&model, &grounded, images, intent(), None, &policy, &cancel).await,
+        Err(CompositionError::Model(ModelError::Cancelled))
+    ));
+    assert_eq!(model.active.load(Ordering::SeqCst), 0);
+    assert!(
+        model
+            .inner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|stage| matches!(
+                stage,
+                AnalysisStage::ExtractionInventory | AnalysisStage::VisualInspection
+            ))
+    );
+}
+
+#[derive(Default)]
+struct OscillatingRepair {
+    inner: Typed,
+    original: Mutex<Option<Vec<ChapterComposition>>>,
+}
+
+impl ModelExecutor for OscillatingRepair {
+    fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
+        self.inner.execute(request, cancel)
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: AnalysisRequest,
+        cancel: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async move {
+            if request.stage != AnalysisStage::SourceRepair {
+                return self.inner.execute_analysis(request, cancel).await;
+            }
+            let issues: Vec<CoverageIssue> =
+                serde_json::from_value(request.input["issues"].clone()).unwrap();
+            let mut current: Vec<ChapterComposition> =
+                serde_json::from_value(request.input["chapters"].clone()).unwrap();
+            let mut original = self.original.lock().unwrap();
+            let prior = original.clone();
+            if prior.is_none() {
+                *original = Some(current.clone());
+            }
+            drop(original);
+            if let Some(prior) = prior {
+                current = prior;
+            } else {
+                for chapter in &mut current {
+                    if let BlockContent::Text { text } = &mut chapter.section.blocks[0].content {
+                        text.push_str(" Still incomplete.");
+                    }
+                }
+            }
+            Ok(AnalysisResponse::SourceRepair(SourceRepair {
+                addressed_issue_ids: issues.into_iter().map(|issue| issue.id).collect(),
+                chapters: current,
+                unresolved_issue_ids: vec![],
+            }))
+        })
+    }
+}
+
+#[tokio::test]
+async fn repair_cycle_fails_even_when_each_proposal_changes_text() {
+    let (grounded, images, mut policy) = source();
+    policy.allowances.max_repair_rounds = 8;
+    let model = OscillatingRepair {
+        inner: Typed {
+            scenarios: BTreeSet::from([Scenario::OmitLate]),
+            ..Typed::default()
+        },
+        ..OscillatingRepair::default()
+    };
+    assert!(matches!(
+        compose_detailed(
+            &model,
+            &grounded,
+            images,
+            intent(),
+            None,
+            &policy,
+            &Cancellation::default()
+        )
+        .await,
+        Err(CompositionError::Invalid(
+            "source repair made no progress or repeated a candidate"
+        ))
+    ));
+}
+
+#[derive(Debug, Default)]
+struct PipelineMeasurements(Mutex<Vec<bcode_recap::diagnostics::Measurement>>);
+
+impl bcode_recap::diagnostics::Observer for PipelineMeasurements {
+    fn observe(&self, _: bcode_recap::diagnostics::Event) {}
+
+    fn measure(&self, measurement: bcode_recap::diagnostics::Measurement) {
+        self.0.lock().unwrap().push(measurement);
+    }
+}
+
+#[tokio::test]
+async fn validated_audits_and_applied_repair_groups_emit_measurements() {
+    use bcode_recap::diagnostics::Measurement;
+    let (grounded, images, policy) = source();
+    let model = Typed {
+        scenarios: BTreeSet::from([Scenario::OmitLate]),
+        ..Typed::default()
+    };
+    let measurements = Arc::new(PipelineMeasurements::default());
+    let cancel = Cancellation::default().observed(measurements.clone());
+    compose_detailed(&model, &grounded, images, intent(), None, &policy, &cancel)
+        .await
+        .unwrap();
+    let measurements = measurements.0.lock().unwrap().clone();
+    assert!(measurements.iter().any(
+        |measurement| matches!(measurement, Measurement::Audit { findings } if *findings > 0)
+    ));
+    assert!(
+        measurements
+            .iter()
+            .any(|measurement| matches!(measurement, Measurement::Audit { findings: 0 }))
+    );
+    let repaired: u64 = measurements
+        .iter()
+        .filter_map(|measurement| match measurement {
+            Measurement::Repair { chapters } => Some(*chapters),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(repaired, 1);
+}
+
+#[test]
+fn detailed_composition_future_is_send_for_spawned_frontends() {
+    fn assert_send<T: Send>(_: T) {}
+    let (grounded, images, policy) = source();
+    let model = Typed::default();
+    let cancel = Cancellation::default();
+    assert_send(compose_detailed(
+        &model,
+        &grounded,
+        images,
+        intent(),
+        None,
+        &policy,
+        &cancel,
+    ));
+}
+
+#[derive(Default)]
+struct IncrementalAuditModel {
+    inner: Typed,
+    shared_chapter: bool,
+}
+
+impl ModelExecutor for IncrementalAuditModel {
+    fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
+        self.inner.execute(request, cancel)
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: AnalysisRequest,
+        cancel: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async move {
+            let mut response = self.inner.execute_analysis(request.clone(), cancel).await?;
+            match &mut response {
+                AnalysisResponse::Outline(outline) if self.shared_chapter => {
+                    let removed = outline.chapters.remove(1);
+                    let owner = outline.chapters[0].id.clone();
+                    outline.chapters[0].item_ids.extend(removed.item_ids);
+                    for disposition in &mut outline.dispositions {
+                        for chapter in &mut disposition.chapter_ids {
+                            if *chapter == removed.id {
+                                chapter.clone_from(&owner);
+                            }
+                        }
+                    }
+                }
+                AnalysisResponse::ChapterComposition(chapter) => {
+                    let items: Vec<InformationItem> =
+                        serde_json::from_value(request.input["items"].clone()).unwrap();
+                    chapter.section.blocks = items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| {
+                            let text = if item.range.start_ms == 1000 {
+                                "An incomplete source explanation."
+                            } else {
+                                &item.text
+                            };
+                            block(
+                                &format!("{}-block-{index}", chapter.section.id),
+                                &item.evidence_ids[0],
+                                text,
+                            )
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+            Ok(response)
+        })
+    }
+}
+
+async fn check_incremental_audits(shared_chapter: bool) {
+    let (mut grounded, _, mut policy) = source();
+    grounded.source.duration_ms = 3000;
+    grounded.assets.clear();
+    grounded.transcript = (0..3)
+        .map(|index| TranscriptSegment {
+            id: format!("words-{index}"),
+            range: TimeRange {
+                start_ms: index * 1000,
+                end_ms: (index + 1) * 1000,
+            },
+            text: format!(
+                "Source fact {index}: keep quantity {} and its qualification.",
+                index + 19
+            ),
+        })
+        .collect();
+    grounded.evidence = grounded
+        .transcript
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| Evidence {
+            id: format!("e-{index}"),
+            range: segment.range,
+            transcript_segment_ids: vec![segment.id.clone()],
+        })
+        .collect();
+    policy.inspect_visuals = false;
+    let model = IncrementalAuditModel {
+        inner: Typed {
+            scenarios: BTreeSet::from([Scenario::Aggregate]),
+            ..Typed::default()
+        },
+        shared_chapter,
+    };
+    let result = compose_detailed(
+        &model,
+        &grounded,
+        vec![],
+        intent(),
+        None,
+        &policy,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    for segment in &grounded.transcript {
+        assert!(result.sections.iter().flat_map(|section| &section.blocks).any(|block|
+            matches!(&block.content, BlockContent::Text { text } if text.contains(&segment.text))));
+    }
+    let requests = model.inner.requests.lock().unwrap().clone();
+    for index in 0..3 {
+        let window = format!("window-{index}");
+        let direct = requests
+            .iter()
+            .filter(|request| {
+                request.input["purpose"] == "direct_source_coverage"
+                    && request.input["untrusted_sources"][0]["window"]["id"] == window
+            })
+            .count();
+        let expected = if index == 1 || (shared_chapter && index == 0) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            direct, expected,
+            "wrong incremental review count for {window}"
+        );
+        let final_checks = requests
+            .iter()
+            .filter(|request| {
+                request.input["purpose"] == "independent_final_consistency_source"
+                    && request.input["untrusted_sources"][0]["window"]["id"] == window
+            })
+            .count();
+        assert_eq!(
+            final_checks, 1,
+            "final independent source check missing for {window}"
+        );
+    }
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.stage == AnalysisStage::SourceRepair)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn incremental_repairs_skip_unchanged_clean_source_windows() {
+    check_incremental_audits(false).await;
+}
+
+#[tokio::test]
+async fn shared_changed_chapter_invalidates_all_its_source_windows() {
+    check_incremental_audits(true).await;
+}
+
+struct CorrectionModel {
+    inner: Typed,
+    already_written: bool,
+    discard_illustration: bool,
+}
+
+impl ModelExecutor for CorrectionModel {
+    fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
+        self.inner.execute(request, cancel)
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: AnalysisRequest,
+        cancel: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async move {
+            let mut response = self.inner.execute_analysis(request.clone(), cancel).await?;
+            if let AnalysisResponse::ChapterComposition(chapter) = &mut response
+                && self.already_written
+                && chapter
+                    .covered_item_ids
+                    .iter()
+                    .any(|id| id.starts_with("window-0-"))
+            {
+                chapter.section.blocks.push(block(
+                    "already-written",
+                    "e-early",
+                    "Commit boundary is irreversible.",
+                ));
+            }
+            if !self.already_written {
+                if let AnalysisResponse::SourceAudit(audit) = &mut response {
+                    let chapters: Vec<ChapterComposition> =
+                        serde_json::from_value(request.input["chapters"].clone()).unwrap();
+                    if let Some(chapter) = chapters.iter().find(|chapter| chapter.section.blocks.iter().any(|block|
+                        matches!(&block.content, BlockContent::Image { asset_id, .. } if asset_id == "frame"))) {
+                        let corrected = chapter.section.blocks.iter().any(|block|
+                            matches!(&block.content, BlockContent::Text { text } if text.contains("Commit boundary is irreversible.")));
+                        if !corrected {
+                            audit.issues.push(CoverageIssue { id: "local-caveat".into(), kind: CoverageIssueKind::Missing,
+                                item_ids: vec![], chapter_ids: vec![chapter.section.id.clone()],
+                                description: "Commit boundary is irreversible.".into() });
+                        }
+                    }
+                }
+                if let AnalysisResponse::SourceRepair(repair) = &mut response {
+                    let current: Vec<ChapterComposition> =
+                        serde_json::from_value(request.input["chapters"].clone()).unwrap();
+                    let allowed: Vec<String> =
+                        serde_json::from_value(request.input["allowed_asset_ids"].clone()).unwrap();
+                    let supplied: BTreeSet<_> = request
+                        .images
+                        .iter()
+                        .map(|image| image.asset_id.clone())
+                        .collect();
+                    assert_eq!(allowed.into_iter().collect::<BTreeSet<_>>(), supplied);
+                    assert!(supplied.contains("frame"));
+                    for chapter in &mut repair.chapters {
+                        chapter.section.blocks.push(block(
+                            &format!("{}-corrected", chapter.section.id),
+                            "e-early",
+                            "Commit boundary is irreversible.",
+                        ));
+                        if !self.discard_illustration {
+                            let prior = current
+                                .iter()
+                                .find(|prior| prior.section.id == chapter.section.id)
+                                .unwrap();
+                            chapter.section.blocks.extend(
+                                prior
+                                    .section
+                                    .blocks
+                                    .iter()
+                                    .filter(|block| {
+                                        !matches!(block.content, BlockContent::Text { .. })
+                                    })
+                                    .cloned(),
+                            );
+                            chapter.image_choices.clone_from(&prior.image_choices);
+                        }
+                    }
+                }
+            }
+            Ok(response)
+        })
+    }
+}
+
+#[tokio::test]
+async fn source_point_missing_from_inventory_but_already_written_needs_no_repair() {
+    let (mut grounded, images, policy) = source();
+    grounded.transcript[0]
+        .text
+        .push_str(" Commit boundary is irreversible.");
+    let model = CorrectionModel {
+        inner: Typed {
+            scenarios: BTreeSet::from([Scenario::UnseenPoint]),
+            ..Typed::default()
+        },
+        already_written: true,
+        discard_illustration: false,
+    };
+    let result = compose_detailed(
+        &model,
+        &grounded,
+        images,
+        intent(),
+        None,
+        &policy,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.sections.iter().flat_map(|section| &section.blocks).any(|block|
+        matches!(&block.content, BlockContent::Text { text } if text == "Commit boundary is irreversible.")));
+    assert!(
+        !model
+            .inner
+            .calls
+            .lock()
+            .unwrap()
+            .contains(&AnalysisStage::SourceRepair)
+    );
+}
+
+#[tokio::test]
+async fn text_repair_retains_supplied_current_illustrations_or_is_rejected() {
+    for discard_illustration in [false, true] {
+        let (mut grounded, images, policy) = source();
+        grounded.transcript[0]
+            .text
+            .push_str(" Commit boundary is irreversible.");
+        grounded.evidence.push(Evidence {
+            id: "e-frame".into(),
+            range: grounded.assets[0].range,
+            transcript_segment_ids: vec![],
+        });
+        let model = CorrectionModel {
+            inner: Typed {
+                scenarios: BTreeSet::from([Scenario::Illustration]),
+                ..Typed::default()
+            },
+            already_written: false,
+            discard_illustration,
+        };
+        let result = compose_detailed(
+            &model,
+            &grounded,
+            images,
+            intent(),
+            None,
+            &policy,
+            &Cancellation::default(),
+        )
+        .await;
+        if discard_illustration {
+            assert!(matches!(
+                result,
+                Err(CompositionError::Invalid(
+                    "repair changed unrelated illustration"
+                ))
+            ));
+        } else {
+            let result = result.unwrap();
+            assert!(result.sections.iter().flat_map(|section| &section.blocks).any(|block|
+                matches!(&block.content, BlockContent::Image { asset_id, .. } if asset_id == "frame")));
+        }
+        assert_eq!(
+            model
+                .inner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|stage| **stage == AnalysisStage::SourceRepair)
+                .count(),
+            1
+        );
+    }
+}
+
+struct EmptyAuditInventory {
+    inner: Typed,
+    fabricate_final_checked: bool,
+}
+
+impl ModelExecutor for EmptyAuditInventory {
+    fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
+        self.inner.execute(request, cancel)
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: AnalysisRequest,
+        cancel: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async move {
+            let mut response = self.inner.execute_analysis(request.clone(), cancel).await?;
+            if let AnalysisResponse::ExtractionInventory(inventory) = &mut response
+                && inventory.window_id == "window-0"
+            {
+                inventory.items.clear();
+                inventory.limitations.push("Text inventory unavailable in this window; direct source review remains required.".into());
+            }
+            if let AnalysisResponse::SourceAudit(audit) = &mut response
+                && request.input["purpose"] == "independent_final_consistency_source"
+                && request.input["required_checked_item_ids"] == serde_json::json!([])
+                && self.fabricate_final_checked
+            {
+                audit.checked_item_ids.push("chapter-0".into());
+            }
+            Ok(response)
+        })
+    }
+}
+
+#[tokio::test]
+async fn final_source_audit_requires_empty_checked_list_for_empty_inventory() {
+    for fabricate_final_checked in [false, true] {
+        let (grounded, images, policy) = source();
+        let model = EmptyAuditInventory {
+            inner: Typed::default(),
+            fabricate_final_checked,
+        };
+        let result = compose_detailed(
+            &model,
+            &grounded,
+            images,
+            intent(),
+            None,
+            &policy,
+            &Cancellation::default(),
+        )
+        .await;
+        if fabricate_final_checked {
+            assert!(matches!(
+                result,
+                Err(CompositionError::Invalid(
+                    "audit checked identities unknown"
+                ))
+            ));
+        } else {
+            assert!(result.is_ok());
+        }
+        let requests = model.inner.requests.lock().unwrap().clone();
+        let empty_final = requests
+            .iter()
+            .find(|request| {
+                request.input["purpose"] == "independent_final_consistency_source"
+                    && request.input["required_checked_item_ids"] == serde_json::json!([])
+            })
+            .unwrap();
+        assert!(!empty_final.input["chapters"].as_array().unwrap().is_empty());
+        assert!(
+            !empty_final.input["untrusted_sources"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+struct CaptionCorrectionModel {
+    inner: Typed,
+    substitute_image: bool,
+}
+
+impl ModelExecutor for CaptionCorrectionModel {
+    fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
+        self.inner.execute(request, cancel)
+    }
+
+    fn execute_analysis<'a>(
+        &'a self,
+        request: AnalysisRequest,
+        cancel: &'a Cancellation,
+    ) -> AnalysisFuture<'a> {
+        Box::pin(async move {
+            let mut response = self.inner.execute_analysis(request.clone(), cancel).await?;
+            match &mut response {
+                AnalysisResponse::ChapterComposition(chapter) => {
+                    for block in &mut chapter.section.blocks {
+                        if let BlockContent::Image { caption, .. } = &mut block.content {
+                            *caption = "Source temperature: 83C".into();
+                        }
+                    }
+                }
+                AnalysisResponse::SourceAudit(audit) => {
+                    let chapters: Vec<ChapterComposition> =
+                        serde_json::from_value(request.input["chapters"].clone()).unwrap();
+                    for chapter in chapters {
+                        if chapter.section.blocks.iter().any(|block|
+                            matches!(&block.content, BlockContent::Image { caption, .. } if caption.contains("83C"))) {
+                            audit.issues.push(CoverageIssue {
+                                id: "caption-contradiction".into(), kind: CoverageIssueKind::Contradiction,
+                                item_ids: vec![], chapter_ids: vec![chapter.section.id],
+                                description: "The source says 38C, not 83C; correct the caption.".into(),
+                            });
+                        }
+                    }
+                }
+                AnalysisResponse::SourceRepair(repair) => {
+                    let mut current: Vec<ChapterComposition> =
+                        serde_json::from_value(request.input["chapters"].clone()).unwrap();
+                    for chapter in &mut current {
+                        for block in &mut chapter.section.blocks {
+                            if let BlockContent::Image { asset_id, caption } = &mut block.content {
+                                *caption = "Source temperature: 38C".into();
+                                if self.substitute_image {
+                                    *asset_id = "replacement-frame".into();
+                                }
+                            }
+                        }
+                        if self.substitute_image {
+                            for choice in &mut chapter.image_choices {
+                                if choice.asset_id == "frame" {
+                                    choice.asset_id = "replacement-frame".into();
+                                }
+                            }
+                        }
+                    }
+                    repair.chapters = current;
+                }
+                _ => {}
+            }
+            Ok(response)
+        })
+    }
+}
+
+#[tokio::test]
+async fn factual_caption_repair_preserves_media_and_rejects_unmotivated_substitution() {
+    for substitute_image in [false, true] {
+        let (mut grounded, mut images, policy) = source();
+        grounded.transcript[0]
+            .text
+            .push_str(" Source temperature: 38C.");
+        grounded.evidence.push(Evidence {
+            id: "e-frame".into(),
+            range: grounded.assets[0].range,
+            transcript_segment_ids: vec![],
+        });
+        // An alternative is grounded, supplied and permitted by ordinary asset
+        // validation: only illustration-preservation validation must reject it.
+        let mut alternative = grounded.assets[0].clone();
+        alternative.id = "replacement-frame".into();
+        alternative.path = AssetPath::new("replacement-frame.png").unwrap();
+        grounded.assets.push(alternative);
+        let mut frame = images[0].clone();
+        frame.asset_id = "replacement-frame".into();
+        images.push(frame);
+        let model = CaptionCorrectionModel {
+            inner: Typed {
+                scenarios: BTreeSet::from([Scenario::Illustration]),
+                ..Typed::default()
+            },
+            substitute_image,
+        };
+        let result = compose_detailed(
+            &model,
+            &grounded,
+            images,
+            intent(),
+            None,
+            &policy,
+            &Cancellation::default(),
+        )
+        .await;
+        if substitute_image {
+            assert!(matches!(
+                result,
+                Err(CompositionError::Invalid(
+                    "repair changed unrelated illustration"
+                ))
+            ));
+        } else {
+            let document = result.unwrap();
+            let image = document.sections.iter().flat_map(|section| &section.blocks).find(|block|
+                matches!(&block.content, BlockContent::Image { asset_id, .. } if asset_id == "frame")).unwrap();
+            assert_eq!(image.evidence_ids, ["e-frame"]);
+            assert!(
+                matches!(&image.content, BlockContent::Image { caption, .. } if caption.contains("38C") && !caption.contains("83C"))
+            );
+        }
+        let requests = model.inner.requests.lock().unwrap().clone();
+        let repair = requests
+            .iter()
+            .find(|request| request.stage == AnalysisStage::SourceRepair)
+            .unwrap();
+        let allowed: Vec<String> =
+            serde_json::from_value(repair.input["allowed_asset_ids"].clone()).unwrap();
+        assert!(allowed.contains(&"replacement-frame".into()));
+        assert!(
+            repair
+                .images
+                .iter()
+                .any(|image| image.asset_id == "replacement-frame")
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.stage == AnalysisStage::SourceRepair)
+                .count(),
+            1
+        );
     }
 }

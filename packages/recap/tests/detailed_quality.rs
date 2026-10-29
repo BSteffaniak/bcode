@@ -216,3 +216,163 @@ fn unknown_document_schema_rejects_without_modifying_the_prior_revision() {
     assert_eq!(serde_json::to_vec(&original).unwrap(), prior_bytes);
     assert_eq!(original.revision, 1);
 }
+
+#[test]
+fn complete_item_words_do_not_excuse_known_false_additions() {
+    for case in corpus().cases {
+        for claim in &case.forbidden_claims {
+            let mut document = case.expected_document(Depth::Detailed);
+            document.sections[0]
+                .blocks
+                .push(bcode_recap::contracts::Block {
+                    id: "unsupported-addition".into(),
+                    // An existing reference is not proof of support for a new assertion.
+                    evidence_ids: vec![case.observations[0].id.clone()],
+                    content: BlockContent::Text {
+                        text: claim.clone(),
+                    },
+                });
+            document.validate().unwrap();
+            let report = coverage(&case, &document, Depth::Detailed);
+            assert!(report.missing.is_empty());
+            assert_eq!(report.distorted.as_slice(), std::slice::from_ref(claim));
+            assert!(!report.is_complete(), "{}: {claim}", case.id);
+        }
+    }
+}
+
+#[test]
+fn interview_loses_meaning_when_numbers_attribution_or_qualifiers_change() {
+    let corpus = corpus();
+    let case = case(&corpus, "qualified_interview_disagreement");
+    for (index, original, replacement) in [
+        (0, "12-degree", "12-percent"),
+        (1, "Reyes disputes", "Reyes endorses"),
+        (
+            2,
+            "hypothesis, not a measured explanation",
+            "measured explanation",
+        ),
+        (3, "if humidity exceeds 70 percent", "at any humidity"),
+        (
+            4,
+            "because their sensors stopped logging",
+            "because they succeeded",
+        ),
+    ] {
+        let mut document = case.expected_document(Depth::Detailed);
+        let BlockContent::Text { text } = &mut document.sections[index].blocks[0].content else {
+            panic!("expected interview text");
+        };
+        assert!(text.contains(original));
+        *text = text.replace(original, replacement);
+        document.validate().unwrap();
+        // IDs, evidence and every other fact remain intact; content still fails.
+        assert_eq!(
+            coverage(case, &document, Depth::Detailed).missing,
+            [case.items[index].id.clone()]
+        );
+    }
+}
+
+#[test]
+fn earlier_repair_cannot_be_lost_when_a_later_detail_is_restored() {
+    let corpus = corpus();
+    let case = case(&corpus, "qualified_interview_disagreement");
+    let repaired = case.expected_document(Depth::Detailed);
+    assert!(coverage(case, &repaired, Depth::Detailed).is_complete());
+    let mut regression = repaired.clone();
+    regression.sections[2].blocks[0].content = BlockContent::Text {
+        text: "The fan explains the improvement.".into(),
+    };
+    // A later correction survives, but cannot compensate for the earlier causal caveat.
+    assert_eq!(regression.sections[4], repaired.sections[4]);
+    assert_eq!(
+        coverage(case, &regression, Depth::Detailed).missing,
+        ["causal_hypothesis"]
+    );
+}
+
+#[test]
+fn numeric_and_logical_mutations_fail_across_source_categories() {
+    let corpus = corpus();
+    for (case_id, item_id, original, replacement) in [
+        (
+            "dense_numbers_examples_caveats",
+            "baseline_quantities",
+            "median 18 ms",
+            "median 180 ms",
+        ),
+        (
+            "tutorial_order",
+            "verify_both",
+            "240 records",
+            "2400 records",
+        ),
+        (
+            "visual_only",
+            "final_state",
+            "cause is not established",
+            "cause is established",
+        ),
+        (
+            "repetition",
+            "security_exception",
+            "invalidate immediately",
+            "invalidate eventually",
+        ),
+        (
+            "late_video_details",
+            "firmware_exception",
+            "firmware 1.4 only",
+            "all firmware",
+        ),
+    ] {
+        let case = case(&corpus, case_id);
+        let index = case
+            .items
+            .iter()
+            .position(|item| item.id == item_id)
+            .unwrap();
+        let mut document = case.expected_document(Depth::Detailed);
+        let text = match &mut document.sections[index].blocks[0].content {
+            BlockContent::Text { text } => text,
+            BlockContent::Image { caption, .. } => caption,
+            _ => panic!("expected text or image"),
+        };
+        assert!(text.contains(original));
+        *text = text.replace(original, replacement);
+        document.validate().unwrap();
+        assert_eq!(
+            coverage(case, &document, Depth::Detailed).missing,
+            [item_id],
+            "{case_id}"
+        );
+    }
+}
+
+#[test]
+fn cosmetic_case_whitespace_and_section_titles_do_not_change_coverage() {
+    for case in corpus().cases {
+        let mut document = case.expected_document(Depth::Detailed);
+        for section in &mut document.sections {
+            section.title = "Editorial heading".into();
+            for block in &mut section.blocks {
+                let text = match &mut block.content {
+                    BlockContent::Text { text } => text,
+                    BlockContent::Image { caption, .. } | BlockContent::Clip { caption, .. } => {
+                        caption
+                    }
+                    BlockContent::Comparison { .. } => continue,
+                };
+                *text = text.to_uppercase().replace(' ', "  \n ");
+            }
+        }
+        document.validate().unwrap();
+        assert!(
+            coverage(&case, &document, Depth::Detailed).is_complete(),
+            "{}",
+            case.id
+        );
+    }
+}

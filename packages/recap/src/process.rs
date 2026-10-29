@@ -40,6 +40,17 @@ impl Cancellation {
             observer.observe(event);
         }
     }
+    /// Emit operation-local count-only telemetry without persisting source data.
+    pub fn measure(&self, measurement: crate::diagnostics::Measurement) {
+        if let Some(observer) = &self.2 {
+            observer.measure(measurement);
+        }
+    }
+    /// Explicit clone of the operation-local telemetry observer, if installed.
+    #[must_use]
+    pub fn observer(&self) -> Option<Arc<dyn crate::diagnostics::Observer>> {
+        self.2.clone()
+    }
     /// Install a process admission capability before starting the pipeline.
     pub fn set_process_admission(&self, admission: Arc<dyn ProcessAdmission>) {
         *self

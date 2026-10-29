@@ -36,6 +36,10 @@ pub struct Case {
     pub observations: Vec<Observation>,
     /// Distinct substantive facts; repetitions share one expected item.
     pub items: Vec<Item>,
+    /// Known false assertions, independently annotated from this source.
+    /// Exact negative controls only; absence does not prove entailment.
+    #[serde(default)]
+    pub forbidden_claims: Vec<String>,
 }
 
 /// One source interval. Visual descriptions are annotations, never spoken words.
@@ -87,7 +91,10 @@ pub struct Item {
 /// Load and check the committed corpus. Malformed test data is a test failure.
 #[must_use]
 pub fn corpus() -> Corpus {
-    let corpus: Corpus = serde_json::from_str(include_str!("corpus.json")).unwrap();
+    let mut corpus: Corpus = serde_json::from_str(include_str!("corpus.json")).unwrap();
+    corpus
+        .cases
+        .push(serde_json::from_str(include_str!("interview.json")).unwrap());
     assert_eq!(corpus.schema_version, 1, "unsupported annotation version");
     let mut case_ids = BTreeSet::new();
     for case in &corpus.cases {
@@ -174,6 +181,13 @@ impl Case {
                 assert!(items.contains(predecessor.as_str()));
             }
         }
+        assert!(self.forbidden_claims.iter().all(|claim| {
+            !claim.trim().is_empty()
+                && self
+                    .items
+                    .iter()
+                    .all(|item| !normalized(&item.summary).contains(&normalized(claim)))
+        }));
         assert!(self.items.iter().any(|item| item.standard_required));
         assert!(self.items.iter().any(|item| !item.standard_required));
         self.grounded(Depth::Detailed).validate().unwrap();
@@ -286,6 +300,8 @@ pub struct Coverage {
     pub unsupported: Vec<String>,
     /// Same item fully restated in multiple blocks (not merely cited twice).
     pub repeated: Vec<String>,
+    /// Known false assertions appearing in reader-visible content.
+    pub distorted: Vec<String>,
     /// Present tutorial/visual items emitted before their present prerequisite.
     pub out_of_order: Vec<String>,
 }
@@ -298,6 +314,7 @@ impl Coverage {
             && self.unsupported.is_empty()
             && self.repeated.is_empty()
             && self.out_of_order.is_empty()
+            && self.distorted.is_empty()
     }
 }
 
@@ -311,24 +328,31 @@ pub fn coverage(case: &Case, document: &RecapDocument, depth: Depth) -> Coverage
         .flat_map(|section| &section.blocks)
         .collect();
     let mut report = Coverage::default();
+    for claim in &case.forbidden_claims {
+        if blocks
+            .iter()
+            .any(|block| normalized(&block_text(&block.content)).contains(&normalized(claim)))
+        {
+            report.distorted.push(claim.clone());
+        }
+    }
     let mut positions = std::collections::BTreeMap::new();
     for item in &case.items {
         let matches: Vec<_> = blocks
             .iter()
             .enumerate()
             .filter_map(|(index, block)| {
-                let text = block_text(&block.content).to_lowercase();
+                let text = normalized(&block_text(&block.content));
                 if !item
                     .required_fragments
                     .iter()
-                    .all(|fragment| text.contains(&fragment.to_lowercase()))
+                    .all(|fragment| text.contains(&normalized(fragment)))
                 {
                     return None;
                 }
                 Some((
                     index,
-                    text.find(&item.required_fragments[0].to_lowercase())
-                        .unwrap(),
+                    text.find(&normalized(&item.required_fragments[0])).unwrap(),
                     *block,
                 ))
             })
@@ -367,6 +391,13 @@ pub fn coverage(case: &Case, document: &RecapDocument, depth: Depth) -> Coverage
         }
     }
     report
+}
+
+fn normalized(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn block_text(content: &BlockContent) -> String {
