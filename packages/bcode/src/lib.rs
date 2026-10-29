@@ -298,14 +298,24 @@ impl ConfiguredModelOptions {
         };
         if let Some(profile) = &self.auth_profile {
             let name = resolved.auth_profile.as_ref().ok_or_else(invalid)?;
-            let auth = config.auth.profiles.get(name).ok_or_else(invalid)?;
-            if profile.trim().is_empty()
-                || auth.owner_plugin_id.as_ref() != resolved.provider_plugin_id.as_ref()
-            {
+            if profile.trim().is_empty() {
+                return Err(invalid());
+            }
+            bcode_provider_auth::inspect_auth_selection(
+                &bcode_provider_auth::ProviderRequestContextResolution {
+                    config,
+                    selection: resolved.clone(),
+                },
+            )
+            .map_err(|_| invalid())?;
+            let auth = config.auth.profiles.get(name);
+            if auth.is_some_and(|auth| {
+                auth.owner_plugin_id.as_ref() != resolved.provider_plugin_id.as_ref()
+            }) {
                 return Err(invalid());
             }
             if self.settings.contains_key("openai.base_url")
-                && auth.scheme.as_deref() != Some("api_key")
+                && auth.is_none_or(|auth| auth.scheme.as_deref() != Some("api_key"))
             {
                 return Err(BcodeError::ProviderConfiguration("custom endpoint requires an explicitly selected API-key auth profile; subscription/OAuth credentials cannot be redirected".into()));
             }
@@ -11335,6 +11345,64 @@ scheme = "api_key"
         assert!(options.discover().is_err());
         options.auth_profile = Some("missing".into());
         assert!(options.discover().is_err());
+    }
+
+    #[test]
+    fn explicit_runtime_account_uses_canonical_metadata_and_rejects_foreign_or_missing_accounts() {
+        const CHILD: &str = "BCODE_SDK_RUNTIME_ACCOUNT_TEST";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let mut options = ConfiguredModelOptions {
+                config_path: Some(path.into()),
+                auth_profile: Some("runtime-account".into()),
+                ..Default::default()
+            };
+            assert!(options.discover().is_ok());
+            options.auth_profile = Some("foreign-account".into());
+            assert!(options.discover().is_err());
+            options.auth_profile = Some("missing-account".into());
+            assert!(options.discover().is_err());
+            options.auth_profile = Some("runtime-account".into());
+            options.settings.insert(
+                "openai.base_url".into(),
+                "https://untrusted.example/v1".into(),
+            );
+            assert!(options.discover().is_err());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[model]\nprovider_plugin_id = 'bcode.openai-compatible'\nmodel_id = 'fixture-model'\n",
+        )
+        .unwrap();
+        let profile = bcode_config::RuntimeAuthProfile {
+            provider_id: "openai".into(),
+            owner_plugin_id: "bcode.openai-compatible".into(),
+            backend: "sshenv".into(),
+            scheme: "oauth".into(),
+            storage_profile: "unused-test-account".into(),
+            vault: directory.path().join("nonexistent-vault"),
+            map: BTreeMap::new(),
+            device_seal: None,
+        };
+        let mut foreign = profile.clone();
+        foreign.owner_plugin_id = "foreign.plugin".into();
+        let registry = bcode_config::RuntimeAuthSubscriptions {
+            profiles: BTreeMap::from([
+                ("runtime-account".into(), profile),
+                ("foreign-account".into(), foreign),
+            ]),
+            ..Default::default()
+        };
+        let registry_path = directory.path().join("subscriptions.json");
+        std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "configured_model_options_tests::explicit_runtime_account_uses_canonical_metadata_and_rejects_foreign_or_missing_accounts", "--nocapture"])
+            .env(CHILD, config)
+            .env("BCODE_AUTH_SUBSCRIPTIONS", registry_path)
+            .status().unwrap();
+        assert!(status.success());
     }
 
     #[test]

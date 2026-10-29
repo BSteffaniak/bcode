@@ -1131,8 +1131,9 @@ async fn every_stage_rejects_fabricated_or_incomplete_identity_sets() {
 }
 
 #[tokio::test]
-async fn coordinator_routes_detailed_without_calling_standard() {
-    let (grounded, images, policy) = source();
+async fn coordinator_routes_legacy_detailed_without_calling_standard() {
+    let (grounded, images, mut policy) = source();
+    policy.source_passages = false;
     let model = Typed::default();
     let composer = Composer {
         executor: &model,

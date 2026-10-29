@@ -60,11 +60,12 @@ Explicit diagnostic export uses report version 2 with a versioned count-only mea
 
 Exhausted allowances and unsupported analysis execution fail explicitly rather than silently falling back to Standard. Intermediate analysis is operation-local; no implicit durable prompt/checkpoint cache is introduced. The existing versioned document shape and unknown-version rejection remain authoritative. Prior revisions remain unchanged until a validated successor commits.
 
-## Experimental source-aligned passages
+## Source-aligned Detailed passages
 
-`DetailedPolicy::source_passages` (default false; hidden standalone opt-in
-`--experimental-source-passages`) selects an operation-local alternative. Persisted
-documents and existing Standard/Detailed defaults are unchanged.
+Detailed normally uses source-aligned passages across the standalone CLI, TUI and
+plugin/library engine. No opt-in flag is required. Persisted documents and Standard
+behavior remain unchanged. Library integrators may explicitly set
+`DetailedPolicy::source_passages` to false to retain the legacy inventory pipeline.
 
 The existing bounded source planner supplies immutable primary units and separately
 labeled preceding context. Initial writers receive original source directly and run
@@ -77,14 +78,14 @@ whether a model's allegation is true.
 
 Assembly preserves source order without another summarization pass. Independent final
 reviews receive primary source, exact adjacent source units labeled context-only, and
-adjacent prose. Final discrepancies fail closed; this slice does not yet repair final
-boundary findings. Review limitations remain visible in the document. Clean reviews
+adjacent prose. Final discrepancies use revision-checked local patches within the
+same bounded allowance, followed by another complete boundary review sweep.
+Unresolved or cyclic candidates fail closed. Review limitations remain visible in the document. Clean reviews
 and passing scripted tests are not proof of semantic completeness.
 
-This path remains experimental pending representative full-video quality acceptance
-and refinement compatibility. It currently rejects legacy section identities during
-refinement and recomposes matching passage sections rather than offering targeted
-refinement. No prompt/checkpoint cache or implicit source-bearing diagnostics are
+Refinement accepts compatible legacy documents, reusing immutable grounding and
+treating prior prose only as labeled context. It produces a new reviewed passage
+revision rather than pretending to preserve legacy chapter identities. No prompt/checkpoint cache or implicit source-bearing diagnostics are
 introduced. The explicitly gated live integration harness requires caller-selected
 configuration/profile and a new private output directory; it is not run by ordinary
 Cargo tests. Source-bearing acceptance artifacts require explicit consent separately

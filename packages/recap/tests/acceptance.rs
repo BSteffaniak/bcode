@@ -302,6 +302,23 @@ impl ModelExecutor for DetailedInspectionProbe {
                     // extraction/registration/admission, not model quality or success.
                     Err(bcode_recap::model::ModelError::Unavailable)
                 }
+                AnalysisStage::PassageComposition => {
+                    assert!(!request.images.is_empty());
+                    assert!(request.images.len() <= 4);
+                    let unit: bcode_recap::passage_contracts::SourceUnit =
+                        serde_json::from_value(request.input["source_unit"].clone()).unwrap();
+                    for image in &request.images {
+                        assert!(image.bytes.starts_with(&[0xff, 0xd8, 0xff]));
+                        assert!(
+                            unit.primary
+                                .assets
+                                .iter()
+                                .any(|asset| asset.id == image.asset_id)
+                        );
+                    }
+                    self.inspected.store(request.images.len(), Ordering::SeqCst);
+                    Err(bcode_recap::model::ModelError::Unavailable)
+                }
                 _ => panic!("inspection probe must stop before editorial stages"),
             }
         })

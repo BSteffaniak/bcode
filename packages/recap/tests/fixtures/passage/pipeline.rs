@@ -562,10 +562,80 @@ async fn clean_local_reviews_do_not_bypass_unresolved_final_boundary_review() {
     let before = source.clone();
     let model = Scripted::new(Scenario::BoundaryFinding, case);
     assert!(matches!(
-        compose(&model, &source, &policy(11_000)).await,
+        compose(
+            &model,
+            &source,
+            &DetailedPolicy {
+                allowances: bcode_recap::analysis_contracts::AnalysisAllowances {
+                    max_repair_rounds: 0,
+                    ..Default::default()
+                },
+                ..policy(11_000)
+            }
+        )
+        .await,
         Err(CompositionError::Invalid(
             "unresolved final source or boundary findings"
         ))
     ));
     assert_eq!(source, before);
+}
+
+#[tokio::test]
+async fn normal_composer_defaults_to_passages_and_refines_legacy_sections() {
+    use bcode_recap::{
+        composition::{Composer, CompositionLimits},
+        model::ImageAsset,
+    };
+    let corpus = passage::corpus();
+    let case = corpus
+        .cases
+        .iter()
+        .find(|c| c.id == "causal_caveats")
+        .unwrap();
+    let source = source(case, true);
+    let model = Scripted::new(Scenario::Repair, case);
+    let images = vec![ImageAsset {
+        asset_id: "source-frame".into(),
+        mime_type: "image/png".into(),
+        bytes: vec![1, 2, 3],
+    }];
+    let composer = Composer {
+        executor: &model,
+        limits: CompositionLimits::default(),
+    };
+    let result = composer
+        .compose(
+            &source,
+            images.clone(),
+            source.intent.clone(),
+            None,
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert!(result.sections[0].id.starts_with("passage-"));
+    let mut legacy = result.clone();
+    legacy.sections[0].id = "legacy-chapter".into();
+    let before = legacy.clone();
+    let refined = composer
+        .compose(
+            &source,
+            images,
+            source.intent.clone(),
+            Some(&legacy),
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy, before);
+    assert_eq!(refined.revision, legacy.revision + 1);
+    assert_eq!(refined.transcript, source.transcript);
+    let requests = model.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .filter(|r| r.stage == AnalysisStage::PassageComposition)
+            .any(|r| !r.input["previous_passage_context_only"].is_null())
+    );
 }

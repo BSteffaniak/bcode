@@ -1243,7 +1243,6 @@ pub fn create_options(options: &Create) -> Result<EngineOptions, Error> {
                 .map_err(|_| Error::Action("Detailed allowance exceeds platform limits".into()))?;
         }
     }
-    configuration.detailed.source_passages = options.experimental_source_passages;
     configuration
         .detailed
         .validate()

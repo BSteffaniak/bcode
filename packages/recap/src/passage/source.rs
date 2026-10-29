@@ -1,4 +1,4 @@
-//! Host-owned source selection and admission for the experimental passage path.
+//! Host-owned source selection and admission for the Detailed passage path.
 use std::collections::BTreeSet;
 
 use crate::{

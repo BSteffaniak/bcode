@@ -88,9 +88,9 @@ impl Default for AnalysisAllowances {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DetailedPolicy {
-    /// Experimental operation-local migration flag for direct-source passages.
-    /// Defaults to false until acceptance; not part of the persisted document format.
-    #[serde(default)]
+    /// Select source-preserving passages (the normal Detailed path).
+    /// False retains the legacy library pipeline for existing integrators.
+    #[serde(default = "default_source_passages")]
     pub source_passages: bool,
     /// Resource budget independently configurable by standalone or hosted callers.
     pub allowances: AnalysisAllowances,
@@ -112,6 +112,10 @@ const fn default_concurrency() -> usize {
     3
 }
 
+const fn default_source_passages() -> bool {
+    true
+}
+
 const fn default_in_flight_bytes() -> usize {
     24 * 1024 * 1024
 }
@@ -119,7 +123,7 @@ const fn default_in_flight_bytes() -> usize {
 impl Default for DetailedPolicy {
     fn default() -> Self {
         Self {
-            source_passages: false,
+            source_passages: true,
             allowances: AnalysisAllowances::default(),
             window_duration_ms: 180_000,
             window_overlap_ms: 10_000,
@@ -748,13 +752,13 @@ mod tests {
     }
 
     #[test]
-    fn source_passages_is_opt_in_and_old_policy_inputs_keep_the_existing_path() {
+    fn source_passages_is_default_for_new_and_old_policy_inputs() {
         let policy = DetailedPolicy::default();
-        assert!(!policy.source_passages);
+        assert!(policy.source_passages);
         let mut value = serde_json::to_value(&policy).unwrap();
         value.as_object_mut().unwrap().remove("source_passages");
         let old_policy: DetailedPolicy = serde_json::from_value(value.clone()).unwrap();
-        assert!(!old_policy.source_passages);
+        assert!(old_policy.source_passages);
         value["source_passages"] = json!(true);
         let experimental: DetailedPolicy = serde_json::from_value(value.clone()).unwrap();
         assert!(experimental.source_passages);

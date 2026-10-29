@@ -30,6 +30,7 @@ struct RecordingExecutor {
     inner: bcode_adapter::BcodeExecutor,
     root: PathBuf,
     calls: AtomicUsize,
+    max_calls: usize,
 }
 impl ModelExecutor for RecordingExecutor {
     fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
@@ -42,7 +43,7 @@ impl ModelExecutor for RecordingExecutor {
     ) -> AnalysisFuture<'a> {
         Box::pin(async move {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
-            if index >= 12 {
+            if index >= self.max_calls {
                 return Err(bcode_recap::model::ModelError::InvalidResponse);
             }
             // Deliberately omit trusted prompts, credentials, provider payloads and image bytes.
@@ -84,6 +85,7 @@ async fn explicit_live_passage_excerpt() {
     let root = PathBuf::from(root);
     assert!(root.starts_with("/tmp/recap-passage-acceptance"));
     std::fs::create_dir(&root).expect("new explicit artifact directory");
+    let full = std::env::var_os("RECAP_PASSAGE_LIVE_FULL").is_some();
     let grounded = grounded_excerpt();
     grounded.validate().unwrap();
     let operation = bcode_recap::diagnostics::Operation::new("live-passage-excerpt".into());
@@ -107,27 +109,33 @@ async fn explicit_live_passage_excerpt() {
         .with_observer(Arc::new(operation.clone())),
         root: root.clone(),
         calls: AtomicUsize::new(0),
+        max_calls: if full { 96 } else { 12 },
     };
     let mut policy = DetailedPolicy::default();
-    policy.allowances.max_model_calls = 12;
+    policy.allowances.max_model_calls = if full { 96 } else { 12 };
     policy.source_passages = true;
     let cancel = Cancellation::default().observed(Arc::new(operation.clone()));
     executor.inner.observe_selection(&cancel);
     let deadline = cancel.clone();
     let timer = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(180)).await;
+        tokio::time::sleep(Duration::from_secs(if full { 900 } else { 180 })).await;
         deadline.cancel();
     });
-    let result = bcode_recap::passage::compose_passages(
-        &executor,
-        &grounded,
-        vec![],
-        grounded.intent.clone(),
-        None,
-        &policy,
-        &cancel,
-    )
-    .await;
+    let result = if full {
+        generate_video(&executor, &root, policy, &cancel).await
+    } else {
+        bcode_recap::passage::compose_passages(
+            &executor,
+            &grounded,
+            vec![],
+            grounded.intent.clone(),
+            None,
+            &policy,
+            &cancel,
+        )
+        .await
+        .map_err(bcode_recap::engine::EngineError::from)
+    };
     timer.abort();
     drop(timer);
     drop(executor);
@@ -140,7 +148,11 @@ async fn explicit_live_passage_excerpt() {
         Ok(document) => {
             let html = bcode_recap::export::export_html(
                 &document,
-                &root,
+                &(if full {
+                    root.join("store").join(format!("{}.assets", document.id))
+                } else {
+                    root.clone()
+                }),
                 bcode_recap::export::ExportBudget::default(),
             )
             .unwrap();
@@ -200,4 +212,59 @@ fn grounded_excerpt() -> RecapDocument {
             }],
         }],
     }
+}
+
+async fn generate_video(
+    executor: &dyn ModelExecutor,
+    root: &std::path::Path,
+    policy: DetailedPolicy,
+    cancel: &Cancellation,
+) -> Result<RecapDocument, bcode_recap::engine::EngineError> {
+    use bcode_recap::{
+        composition::CompositionLimits,
+        engine::{Engine, EngineOptions, GenerateRequest},
+        export::ExportBudget,
+        media::{InspectionBudget, MediaBudget, MediaTools},
+        source::{AcquisitionOptions, SourceInput},
+        storage::DocumentStore,
+    };
+    let downloader = std::env::var_os("RECAP_PASSAGE_YT_DLP").expect("explicit downloader");
+    let engine = Engine {
+        executor,
+        store: DocumentStore::new(root.join("store"), 8 * 1024 * 1024),
+        options: EngineOptions {
+            acquisition: AcquisitionOptions {
+                yt_dlp: PathBuf::from(downloader),
+                workspace: root.into(),
+                max_video_bytes: 512 * 1024 * 1024,
+                max_duration_seconds: 14_400.0,
+                caption_language: "en".into(),
+                timeout: Duration::from_secs(180),
+            },
+            transcription: None,
+            tools: MediaTools::default(),
+            media: MediaBudget::default(),
+            composition: CompositionLimits::default(),
+            detailed: policy,
+            inspection: InspectionBudget::default(),
+            export: ExportBudget::default(),
+        },
+    };
+    engine
+        .generate(
+            &GenerateRequest {
+                id: "full-video".into(),
+                source_id: "bbizG1oVWYc".into(),
+                source_title: "Full video acceptance".into(),
+                input: SourceInput::Youtube("https://www.youtube.com/watch?v=bbizG1oVWYc".into()),
+                transcript: None,
+                intent: GenerationIntent {
+                    depth: Depth::Detailed,
+                    ..GenerationIntent::default()
+                },
+            },
+            cancel,
+            &mut |_| {},
+        )
+        .await
 }

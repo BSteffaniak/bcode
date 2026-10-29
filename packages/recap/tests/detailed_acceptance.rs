@@ -556,6 +556,7 @@ impl ModelExecutor for AnnotatedExecutor<'_> {
 
 fn policy() -> DetailedPolicy {
     DetailedPolicy {
+        source_passages: false,
         window_duration_ms: 600_000,
         window_overlap_ms: 0,
         ..DetailedPolicy::default()

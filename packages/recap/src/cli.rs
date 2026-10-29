@@ -125,9 +125,6 @@ pub struct Create {
     /// Aggregate request/image/response byte reservation allowed in flight.
     #[arg(long, value_parser = positive_u64)]
     pub detailed_max_in_flight_bytes: Option<u64>,
-    /// Exercise direct-source passage adaptation during acceptance.
-    #[arg(long, hide = true)]
-    pub experimental_source_passages: bool,
     /// Existing video path or supported `YouTube` URL.
     #[arg(long)]
     pub source: String,
@@ -240,6 +237,9 @@ struct Inspect {
 
 #[derive(Debug, Clone, Args)]
 struct Doctor {
+    /// Configured authentication account reference.
+    #[arg(long)]
+    auth_profile: Option<String>,
     #[command(flatten)]
     tools: Tools,
     /// Exercise real bounded `YouTube` acquisition (downloads video/captions, never inference).
@@ -552,7 +552,7 @@ async fn doctor(options: &Doctor, cancel: &Cancellation) -> Result<(), CliError>
             model: options.model.clone(),
             provider: options.provider.clone(),
             endpoint: None,
-            auth_profile: None,
+            auth_profile: options.auth_profile.clone(),
             context: options.context.clone(),
             max_output_tokens: 8192,
             model_timeout_seconds: 180,
