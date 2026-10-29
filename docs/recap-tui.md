@@ -25,3 +25,14 @@ HTML remains the full-fidelity portable reader. Terminal presentation adapts doc
 ## Validation
 
 Validate real terminal entry and restoration in a PTY, plus subprocess behavior with closed stdin and redirected stdout/stderr. Capture home/reader/working/error states at multiple sizes and inspect visible output. Layout checks include long source titles/paths, CJK, emoji, combining marks, focus, resize and clipping. Pipeline tests and offline HTML acceptance remain separate from terminal visual acceptance. A semantic grid capture without styled-cell data is not proof of palette quality.
+
+## Per-video duration approval
+
+When a known video duration exceeds the current acquisition allowance, creation pauses
+before download/model generation and offers **Run anyway for this video** and **Cancel**
+(Esc). The prompt shows the actual duration and configured limit, plus time/disk/AI-use
+implications. Approval retains the submitted URL, focus, depth, model selection and output
+options; it raises only that request's duration allowance. It does not change saved
+preferences or declarative configuration. Other limits remain in effect. Unknown duration,
+live sources, invalid metadata and permission failures are not duration approvals. Headless
+commands stay noninteractive and can set `--max-duration-seconds` explicitly.

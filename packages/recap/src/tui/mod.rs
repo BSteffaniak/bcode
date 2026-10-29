@@ -103,6 +103,7 @@ struct App {
     sequence: u64,
     status: String,
     failure_lines: Vec<bmux_tui::text::Line>,
+    duration_approval: Option<application::DurationApproval>,
     export: Option<PathBuf>,
     quitting: bool,
     refine: bool,
@@ -161,6 +162,7 @@ impl App {
             status: "Your next perspective starts here. No model runs until you choose Generate."
                 .into(),
             failure_lines: Vec::new(),
+            duration_approval: None,
             export: None,
             quitting: false,
             refine: false,
@@ -305,7 +307,9 @@ impl App {
                     Depth::Detailed => Depth::Brief,
                 }
             }
-            "generate" | "apply" | "export" | "open" => return self.effect_action(action),
+            "generate" | "apply" | "export" | "open" | "approve-duration" | "decline-duration" => {
+                return self.effect_action(action);
+            }
             "more" => {
                 let cursor = self.cursor.take();
                 return self.admit(Request::List { cursor, limit: 24 });
@@ -333,7 +337,21 @@ impl App {
     }
     fn effect_action(&mut self, action: &str) -> Update<Message> {
         match action {
+            "approve-duration" => {
+                if self.active.is_some() {
+                    return Update::none();
+                }
+                if let Some(approval) = self.duration_approval.take() {
+                    return self.admit(Request::CreateAndExport(approval.approve()));
+                }
+            }
+            "decline-duration" => {
+                self.duration_approval = None;
+                self.status =
+                    "Cancelled · no generation started; duration defaults unchanged".into();
+            }
             "generate" => {
+                self.duration_approval = None;
                 if self.text(0).is_empty() {
                     self.status = "Add a YouTube URL or a local video path first.".into();
                     return Update::redraw();
@@ -403,6 +421,11 @@ impl App {
                     && matches!(key.key, KeyCode::Char('c' | 'C' | 'q' | 'Q')))
         }) {
             return Some(self.action("quit"));
+        }
+        if self.duration_approval.is_some()
+            && event.key().is_some_and(|key| key.key == KeyCode::Escape)
+        {
+            return Some(self.effect_action("decline-duration"));
         }
         if let Event::Resize(size) = event {
             self.size.set((size.width, size.height));
@@ -535,6 +558,17 @@ impl App {
     }
     fn install_outcome(&mut self, result: Result<Outcome, String>) {
         match result {
+            Ok(Outcome::DurationApproval(approval)) => {
+                self.status =
+                    "Duration approval required · choose Run anyway or Cancel · Esc cancels".into();
+                self.duration_approval = Some(approval);
+                self.screen = Screen::Home;
+                self.drawer = false;
+                self.focused = usize::MAX;
+                self.failure_lines.clear();
+                self.layout.replace(None);
+                self.router = InteractionRouter::new();
+            }
             Ok(Outcome::Checked) => {
                 self.status = "Source acquisition checked".into();
             }

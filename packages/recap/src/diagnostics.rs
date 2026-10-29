@@ -49,6 +49,8 @@ pub enum Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    /// Work stopped before generation pending explicit resource approval.
+    ApprovalRequired,
     /// Operation succeeded.
     Succeeded,
     /// Operation failed.

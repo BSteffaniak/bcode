@@ -695,3 +695,97 @@ async fn quit_shortcuts_cancel_active_work_and_wait_for_settlement() {
         assert!(app.active.is_none());
     }
 }
+
+#[test]
+fn duration_approval_is_actionable_and_cancel_does_not_start_work() {
+    let mut app = App::new(TuiOptions::default());
+    let mut request = crate::cli::Create::defaults_for_form();
+    request.source = "https://www.youtube.com/watch?v=lXUZvyajciY".into();
+    app.install_outcome(Ok(Outcome::DurationApproval(
+        application::DurationApproval {
+            request: Box::new(request),
+            actual_seconds: 8768,
+            limit_seconds: 7200,
+        },
+    )));
+    assert!(app.active.is_none());
+    let (buffer, hits) = paint(&app, 100, 30);
+    let text: String = buffer
+        .cells()
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect();
+    assert!(text.contains("2h 26m 8s"));
+    assert!(
+        hits.regions()
+            .iter()
+            .any(|hit| hit.id.as_str() == "approve-duration")
+    );
+    assert!(
+        hits.regions()
+            .iter()
+            .any(|hit| hit.id.as_str() == "decline-duration")
+    );
+    let _ = app.action("decline-duration");
+    assert!(app.duration_approval.is_none());
+    assert!(app.active.is_none());
+}
+
+#[test]
+fn duration_approval_retains_exact_request_and_changes_only_duration() {
+    let options = TuiOptions::default();
+    let request = options.create_request(
+        "https://www.youtube.com/watch?v=lXUZvyajciY".into(),
+        None,
+        Some("mechanism".into()),
+        Depth::Detailed,
+    );
+    let bytes = request.budget.max_video_bytes;
+    let calls = request.detailed_max_model_calls;
+    let approved = application::DurationApproval {
+        request: Box::new(request),
+        actual_seconds: 8768,
+        limit_seconds: 7200,
+    }
+    .approve();
+    assert_eq!(approved.budget.max_duration_seconds, 8768);
+    assert_eq!(approved.budget.max_video_bytes, bytes);
+    assert_eq!(approved.detailed_max_model_calls, calls);
+    assert_eq!(approved.focus.as_deref(), Some("mechanism"));
+    assert_eq!(approved.depth, Depth::Detailed);
+    assert_eq!(
+        options
+            .create_request("another".into(), None, None, Depth::Detailed)
+            .budget
+            .max_duration_seconds,
+        7200
+    );
+}
+
+#[tokio::test]
+async fn keyboard_duration_approval_starts_only_the_explicitly_accepted_request() {
+    let mut app = App::new(TuiOptions::default());
+    let mut request = crate::cli::Create::defaults_for_form();
+    request.source = "https://www.youtube.com/watch?v=lXUZvyajciY".into();
+    request.model.model_config = "/nonexistent/recap-test-config.toml".into();
+    app.install_outcome(Ok(Outcome::DurationApproval(
+        application::DurationApproval {
+            request: Box::new(request),
+            actual_seconds: 8768,
+            limit_seconds: 7200,
+        },
+    )));
+    let (_, hits) = paint(&app, 80, 28);
+    commit_app(&mut app, &hits, &bmux_tui::focus::FocusTrap::new());
+    let _ = app
+        .router
+        .set_focused(&bmux_tui::focus::FocusId::new("approve-duration"));
+    let _ = app.terminal(&Event::Key(bmux_keyboard::KeyStroke::simple(
+        KeyCode::Enter,
+    )));
+    assert!(app.duration_approval.is_none());
+    assert!(app.active.is_some());
+    let active = app.active.take().unwrap();
+    active.cancel.cancel();
+    active.task.await.unwrap();
+}

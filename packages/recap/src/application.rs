@@ -224,8 +224,40 @@ pub enum Request {
         path: PathBuf,
     },
 }
+/// A request-scoped duration approval. No preference or declarative config is changed.
+#[cfg(feature = "tui")]
+#[derive(Debug)]
+pub struct DurationApproval {
+    pub request: Box<Create>,
+    pub actual_seconds: u64,
+    pub limit_seconds: u64,
+}
+#[cfg(feature = "tui")]
+impl DurationApproval {
+    pub fn approve(mut self) -> Box<Create> {
+        self.request.budget.max_duration_seconds = self.actual_seconds;
+        self.request
+    }
+    pub fn message(&self) -> String {
+        let time = |seconds: u64| {
+            format!(
+                "{}h {}m {}s",
+                seconds / 3600,
+                seconds % 3600 / 60,
+                seconds % 60
+            )
+        };
+        format!(
+            "This video is {}. Your current duration limit is {}. Run it anyway? Longer videos can take more time, disk space and AI usage. Only this video's duration allowance will change; other limits stay in place.",
+            time(self.actual_seconds),
+            time(self.limit_seconds)
+        )
+    }
+}
 #[derive(Debug)]
 pub enum Outcome {
+    #[cfg(feature = "tui")]
+    DurationApproval(DurationApproval),
     Checked,
     Ready {
         document: Box<RecapDocument>,
@@ -397,6 +429,10 @@ pub async fn execute(
             .unwrap_or_else(std::sync::PoisonError::into_inner)(counts);
     }
     let (status, code) = match &result {
+        #[cfg(feature = "tui")]
+        Ok(Outcome::DurationApproval(_)) => {
+            (Status::ApprovalRequired, "duration_approval_required")
+        }
         Ok(Outcome::Ready { export: Err(_), .. }) => (Status::ExportFailed, "export_failed"),
         Ok(_) => (Status::Succeeded, "ok"),
         Err(_) if cancel.is_cancelled() => (Status::Cancelled, "cancelled"),
@@ -407,6 +443,7 @@ pub async fn execute(
         code: code.into(),
     });
     let report = operation.report();
+    let report_path = report_path.filter(|_| !approval_pending(&result));
     if let Some(path) = report_path {
         // Explicit destination, atomic no-clobber write: never append unbounded logs or overwrite files.
         let saved = serde_json::to_vec_pretty(&report)
@@ -425,6 +462,18 @@ pub async fn execute(
     })
 }
 
+const fn approval_pending(result: &Result<Outcome, Error>) -> bool {
+    #[cfg(feature = "tui")]
+    {
+        matches!(result, Ok(Outcome::DurationApproval(_)))
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = result;
+        false
+    }
+}
+
 async fn execute_inner(
     options: &TuiOptions,
     request: Request,
@@ -432,6 +481,8 @@ async fn execute_inner(
     progress: &mut (impl FnMut(Stage) + Send),
 ) -> Result<Outcome, Error> {
     check_cancel(cancel)?;
+    #[cfg(feature = "tui")]
+    let interactive = matches!(&request, Request::CreateAndExport(_));
     let (request, automatic_export) = match request {
         #[cfg(feature = "tui")]
         Request::CreateAndExport(mut value) => {
@@ -469,8 +520,26 @@ async fn execute_inner(
         }
         other => (other, None::<OutputOptions>),
     };
+    #[cfg(feature = "tui")]
+    let approval_request = if let Request::Create(value) = &request {
+        Some(value.clone())
+    } else {
+        None
+    };
     let store = DocumentStore::new(&options.store, options.max_document_bytes);
-    let outcome = execute_job(options, &store, request, cancel, progress).await?;
+    let result = execute_job(options, &store, request, cancel, progress).await;
+    #[cfg(feature = "tui")]
+    if let (true, Err(error), Some(request)) = (interactive, &result, approval_request)
+        && let Some((actual_seconds, limit_seconds)) = error.duration_limit()
+        && !cancel.is_cancelled()
+    {
+        return Ok(Outcome::DurationApproval(DurationApproval {
+            request,
+            actual_seconds,
+            limit_seconds,
+        }));
+    }
+    let outcome = result?;
     if let Some(output) = automatic_export
         && let Outcome::Document(document) = outcome
     {
@@ -786,6 +855,25 @@ pub enum Error {
     Export(#[from] bcode_recap::export::ExportError),
 }
 
+impl Error {
+    #[cfg(feature = "tui")]
+    fn duration_limit(&self) -> Option<(u64, u64)> {
+        use bcode_recap::{engine::EngineError, source::SourceError};
+        match self {
+            Self::Source(SourceError::DurationExceeded {
+                actual_seconds,
+                limit_seconds,
+            })
+            | Self::Engine(EngineError::Source(SourceError::DurationExceeded {
+                actual_seconds,
+                limit_seconds,
+            })) => Some((*actual_seconds, *limit_seconds)),
+            Self::Operation { source, .. } => source.duration_limit(),
+            _ => None,
+        }
+    }
+}
+
 fn check_report_destination(path: &Path) -> Result<(), Error> {
     if path.symlink_metadata().is_ok() {
         return Err(Error::Action(
@@ -925,6 +1013,10 @@ fn diagnostic_code(error: &Error) -> &'static str {
         | Error::Engine(EngineError::Source(SourceError::Invalid(
             "reversed or zero-duration caption",
         ))) => "captions_invalid_timing",
+        Error::Source(SourceError::DurationExceeded { .. })
+        | Error::Engine(EngineError::Source(SourceError::DurationExceeded { .. })) => {
+            "source_duration_limit"
+        }
         Error::ModelExecution(failure) => failure.code(),
         Error::Cancelled | Error::Engine(EngineError::Cancelled) => "cancelled",
         Error::Engine(EngineError::Composition(_)) => "composition_failed",

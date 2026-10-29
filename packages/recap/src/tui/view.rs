@@ -265,6 +265,15 @@ impl App {
     }
     fn home(&self, mode: Density) -> Element<'_> {
         let p = self.palette;
+        if let Some(approval) = &self.duration_approval {
+            return Element::new(
+                Column::new()
+                    .child(Self::label("Longer video · your choice", p.title()))
+                    .child(Self::label(approval.message(), p.text()))
+                    .child(self.button("approve-duration", "Run anyway for this video", 68))
+                    .child(self.button("decline-duration", "Cancel · keep defaults", 69)),
+            );
+        }
         if self.drawer {
             return self.library();
         }

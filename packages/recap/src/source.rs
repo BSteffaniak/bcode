@@ -57,6 +57,16 @@ pub enum SourceError {
     /// Invalid source, resource budget or subtitle representation.
     #[error("invalid source: {0}")]
     Invalid(&'static str),
+    /// A known duration exceeds this operation's user-adjustable allowance.
+    #[error(
+        "video is {actual_seconds} seconds long; this run allows {limit_seconds} seconds. Increase the duration allowance to continue"
+    )]
+    DurationExceeded {
+        /// Source duration rounded up to whole seconds.
+        actual_seconds: u64,
+        /// Configured maximum rounded up to whole seconds.
+        limit_seconds: u64,
+    },
     /// Local filesystem failure.
     #[error("source I/O failed")]
     Io(#[from] std::io::Error),
@@ -184,6 +194,33 @@ async fn download_process(
         }
     })
     .await
+}
+
+/// Check a duration against an explicit operation allowance, without performing I/O.
+/// # Errors
+/// Rejects unknown/invalid durations or returns a typed, user-overridable duration limit.
+pub fn check_duration(actual: f64, limit: f64) -> Result<(), SourceError> {
+    let seconds = |value| {
+        Duration::try_from_secs_f64(value)
+            .map(|duration| {
+                duration
+                    .as_secs()
+                    .saturating_add(u64::from(duration.subsec_nanos() > 0))
+            })
+            .map_err(|_| SourceError::Invalid("invalid source duration"))
+    };
+    if !actual.is_finite() || actual <= 0.0 || !limit.is_finite() || limit <= 0.0 {
+        return Err(SourceError::Invalid(
+            "video duration is unavailable or invalid",
+        ));
+    }
+    if actual > limit {
+        return Err(SourceError::DurationExceeded {
+            actual_seconds: seconds(actual)?,
+            limit_seconds: seconds(limit)?,
+        });
+    }
+    Ok(())
 }
 
 /// Validate only known `YouTube` URL forms and discard unrelated query arguments.
@@ -372,6 +409,19 @@ fn downloader_request(options: &AcquisitionOptions, workspace: &Path, url: &str)
         )),
     }
 }
+fn check_metadata_duration(metadata: &serde_json::Value, limit: f64) -> Result<(), SourceError> {
+    if metadata.get("is_live").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(SourceError::Invalid("live video unsupported"));
+    }
+    let duration = metadata
+        .get("duration")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or(SourceError::Invalid(
+            "video duration is unavailable; cannot safely determine its length",
+        ))?;
+    check_duration(duration, limit)
+}
+
 /// Acquire local video or bounded `YouTube` media, including manual/automatic captions.
 /// # Errors
 /// Fails closed on invalid input, unknown duration, exhausted budgets or adapter failure.
@@ -425,15 +475,7 @@ pub async fn acquire(
     {
         return Err(SourceError::Invalid("downloader source identity mismatch"));
     }
-    let duration = metadata
-        .get("duration")
-        .and_then(serde_json::Value::as_f64)
-        .filter(|value| value.is_finite() && *value > 0.0 && *value <= options.max_duration_seconds)
-        .ok_or(SourceError::Invalid("unknown or over-budget duration"))?;
-    if metadata.get("is_live").and_then(serde_json::Value::as_bool) == Some(true) || duration <= 0.0
-    {
-        return Err(SourceError::Invalid("live video unsupported"));
-    }
+    check_metadata_duration(&metadata, options.max_duration_seconds)?;
     let size = options.max_video_bytes.to_string();
     request.args = [
         "--ignore-config",
@@ -801,6 +843,69 @@ mod tests {
             }
         }
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duration_approval_blocks_download_until_explicitly_raised() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("downloader");
+        let marker = directory.path().join("download-started");
+        std::fs::write(&script, format!("#!/bin/sh\ncase \"$*\" in *--dump-single-json*) printf '%s' '{{\"id\":\"lXUZvyajciY\",\"duration\":8768,\"is_live\":false}}';; *) touch '{}'; exit 1;; esac\n",marker.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut options = AcquisitionOptions {
+            yt_dlp: script,
+            workspace: directory.path().into(),
+            max_video_bytes: 1024,
+            max_duration_seconds: 7200.0,
+            caption_language: "en".into(),
+            timeout: Duration::from_secs(10),
+        };
+        let input = SourceInput::Youtube("https://www.youtube.com/watch?v=lXUZvyajciY".into());
+        let result = acquire(&input, &options, &Cancellation::default()).await;
+        assert!(
+            matches!(
+                result,
+                Err(SourceError::DurationExceeded {
+                    actual_seconds: 8768,
+                    limit_seconds: 7200
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(!marker.exists());
+        options.max_duration_seconds = 8768.0;
+        assert!(matches!(
+            acquire(&input, &options, &Cancellation::default()).await,
+            Err(SourceError::Acquisition {
+                stage: AcquisitionStage::Download,
+                ..
+            })
+        ));
+        assert!(marker.exists());
+        assert!(check_metadata_duration(&serde_json::json!({"duration":null}), 8768.0).is_err());
+        assert!(
+            check_metadata_duration(&serde_json::json!({"duration":8768,"is_live":true}), 8768.0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn duration_limit_is_typed_and_can_be_raised_for_one_source() {
+        let error = check_duration(8768.0, 7200.0).unwrap_err();
+        assert!(matches!(
+            error,
+            SourceError::DurationExceeded {
+                actual_seconds: 8768,
+                limit_seconds: 7200
+            }
+        ));
+        assert!(check_duration(8768.0, 8768.0).is_ok());
+        assert!(check_duration(8768.2, 8768.0).is_err());
+        assert!(check_duration(0.0, 7200.0).is_err());
+        assert!(check_duration(f64::NAN, 7200.0).is_err());
+        assert!(check_duration(f64::INFINITY, 7200.0).is_err());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn real_failed_downloader_reports_phase_without_raw_stderr() {

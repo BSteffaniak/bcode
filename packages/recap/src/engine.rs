@@ -141,11 +141,10 @@ impl Engine<'_> {
             phase: crate::diagnostics::Phase::Probe,
         });
         let metadata = media::probe(&acquired.video, &self.options.tools, cancel).await?;
-        let maximum = Duration::try_from_secs_f64(self.options.acquisition.max_duration_seconds)
-            .map_err(|_| EngineError::Invalid("duration limit"))?;
-        if u128::from(metadata.duration_ms) > maximum.as_millis() {
-            return Err(EngineError::Invalid("source duration exceeds budget"));
-        }
+        source::check_duration(
+            Duration::from_millis(metadata.duration_ms).as_secs_f64(),
+            self.options.acquisition.max_duration_seconds,
+        )?;
         let captions = if let Some(supplied) = &request.transcript {
             source::parse_subtitles(supplied)?
         } else if acquired.captions.is_empty() {
