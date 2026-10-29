@@ -11,6 +11,8 @@ pub mod engine;
 pub mod export;
 pub mod media;
 pub mod model;
+pub mod passage;
+pub mod passage_contracts;
 pub mod process;
 pub mod source;
 pub mod source_analysis;

@@ -60,6 +60,36 @@ Explicit diagnostic export uses report version 2 with a versioned count-only mea
 
 Exhausted allowances and unsupported analysis execution fail explicitly rather than silently falling back to Standard. Intermediate analysis is operation-local; no implicit durable prompt/checkpoint cache is introduced. The existing versioned document shape and unknown-version rejection remain authoritative. Prior revisions remain unchanged until a validated successor commits.
 
+## Experimental source-aligned passages
+
+`DetailedPolicy::source_passages` (default false; hidden standalone opt-in
+`--experimental-source-passages`) selects an operation-local alternative. Persisted
+documents and existing Standard/Detailed defaults are unchanged.
+
+The existing bounded source planner supplies immutable primary units and separately
+labeled preceding context. Initial writers receive original source directly and run
+through the shared reservation/cancellation executor. Host-assigned passage/block
+identities and revisions support local two-way reviews and atomic targeted patches.
+The host rejects stale revisions, foreign/gapped provenance, illegal/conflicting
+operations, unchanged or repeated candidates, and unresolved review findings. Patch
+application retains untouched blocks exactly. Provenance validates references, not
+whether a model's allegation is true.
+
+Assembly preserves source order without another summarization pass. Independent final
+reviews receive primary source, exact adjacent source units labeled context-only, and
+adjacent prose. Final discrepancies fail closed; this slice does not yet repair final
+boundary findings. Review limitations remain visible in the document. Clean reviews
+and passing scripted tests are not proof of semantic completeness.
+
+This path remains experimental pending representative full-video quality acceptance
+and refinement compatibility. It currently rejects legacy section identities during
+refinement and recomposes matching passage sections rather than offering targeted
+refinement. No prompt/checkpoint cache or implicit source-bearing diagnostics are
+introduced. The explicitly gated live integration harness requires caller-selected
+configuration/profile and a new private output directory; it is not run by ordinary
+Cargo tests. Source-bearing acceptance artifacts require explicit consent separately
+from routine count-only diagnostics.
+
 ## Acceptance
 
 Deterministic model adapters test pipeline mechanics, not live model quality. Local media tests must exercise actual extraction, composition, storage, and export. Browser acceptance opens `file://` output offline, with JavaScript enabled and disabled, verifies embedded media behavior, and inspects narrow and wide layouts. YouTube acquisition and live model quality require separate real-path evidence; a supplied transcript or precomposed JSON does not establish those capabilities.

@@ -122,6 +122,42 @@ impl Composer<'_> {
         .await
     }
 
+    async fn compose_detailed(
+        &self,
+        grounded: &RecapDocument,
+        images: Vec<ImageAsset>,
+        intent: GenerationIntent,
+        previous: Option<&RecapDocument>,
+        policy: &crate::analysis_contracts::DetailedPolicy,
+        cancellation: &Cancellation,
+    ) -> Result<RecapDocument, CompositionError> {
+        grounded.validate()?;
+        validate_images(grounded, &images, self.limits)?;
+        if policy.source_passages {
+            crate::passage::compose_passages(
+                self.executor,
+                grounded,
+                images,
+                intent,
+                previous,
+                policy,
+                cancellation,
+            )
+            .await
+        } else {
+            crate::detailed::compose_detailed(
+                self.executor,
+                grounded,
+                images,
+                intent,
+                previous,
+                policy,
+                cancellation,
+            )
+            .await
+        }
+    }
+
     /// Compose with explicit comprehensive-analysis allowances.
     ///
     /// # Errors
@@ -138,18 +174,9 @@ impl Composer<'_> {
     ) -> Result<RecapDocument, CompositionError> {
         check_cancelled(cancellation)?;
         if intent.depth == crate::contracts::Depth::Detailed {
-            grounded.validate()?;
-            validate_images(grounded, &images, self.limits)?;
-            return crate::detailed::compose_detailed(
-                self.executor,
-                grounded,
-                images,
-                intent,
-                previous,
-                policy,
-                cancellation,
-            )
-            .await;
+            return self
+                .compose_detailed(grounded, images, intent, previous, policy, cancellation)
+                .await;
         }
         grounded.validate()?;
         validate_images(grounded, &images, self.limits)?;

@@ -107,6 +107,11 @@ impl ModelExecutor for Typed {
                 AnalysisStage::ChapterComposition => self.stage_chapter(&request),
                 AnalysisStage::SourceAudit => self.stage_audit(&request),
                 AnalysisStage::SourceRepair => self.stage_repair(&request),
+                AnalysisStage::PassageComposition
+                | AnalysisStage::PassageReview
+                | AnalysisStage::PassagePatch => {
+                    panic!("passage stage reached the old Detailed pipeline adapter")
+                }
             };
             if self.scenarios.contains(&Scenario::OversizedChapter)
                 && let AnalysisResponse::ChapterComposition(chapter) = &mut response
@@ -140,6 +145,11 @@ impl ModelExecutor for Typed {
                     }
                     AnalysisResponse::SourceRepair(value) => {
                         value.chapters[0].section.id = "fake-chapter".into();
+                    }
+                    AnalysisResponse::PassageComposition(_)
+                    | AnalysisResponse::PassageReview(_)
+                    | AnalysisResponse::PassagePatch(_) => {
+                        unreachable!("old Detailed adapter cannot produce passage responses")
                     }
                 }
             }
@@ -1110,6 +1120,11 @@ async fn every_stage_rejects_fabricated_or_incomplete_identity_sets() {
                 assert!(!calls.contains(&AnalysisStage::SourceRepair));
             }
             AnalysisStage::SourceRepair => {}
+            AnalysisStage::PassageComposition
+            | AnalysisStage::PassageReview
+            | AnalysisStage::PassagePatch => {
+                panic!("passage stage reached the old Detailed corruption test")
+            }
         }
         assert_eq!(model.standard_calls.load(Ordering::SeqCst), 0);
     }

@@ -125,6 +125,9 @@ pub struct Create {
     /// Aggregate request/image/response byte reservation allowed in flight.
     #[arg(long, value_parser = positive_u64)]
     pub detailed_max_in_flight_bytes: Option<u64>,
+    /// Exercise direct-source passage adaptation during acceptance.
+    #[arg(long, hide = true)]
+    pub experimental_source_passages: bool,
     /// Existing video path or supported `YouTube` URL.
     #[arg(long)]
     pub source: String,

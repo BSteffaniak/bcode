@@ -300,6 +300,11 @@ impl<'a> AnnotatedExecutor<'a> {
             }
             AnalysisStage::SourceAudit => self.audit(request),
             AnalysisStage::SourceRepair => self.repair(request),
+            AnalysisStage::PassageComposition
+            | AnalysisStage::PassageReview
+            | AnalysisStage::PassagePatch => {
+                panic!("passage stage reached the old Detailed acceptance adapter")
+            }
         }
     }
 

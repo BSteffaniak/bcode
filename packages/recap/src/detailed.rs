@@ -15,7 +15,7 @@ use crate::{
     process::Cancellation,
 };
 
-mod execution;
+pub(crate) mod execution;
 mod ownership;
 mod pipeline;
 mod stages;
@@ -42,7 +42,7 @@ source and actual block text, not trust covered-item declarations. A missing sou
 the inventory is still an audit failure; report its source-grounded description. Retain stable \
 previous section IDs. Do not summarize composed chapters in a final pass.";
 
-struct Operation<'a> {
+pub(crate) struct Operation<'a> {
     executor: &'a dyn ModelExecutor,
     policy: &'a DetailedPolicy,
     cancel: &'a Cancellation,
@@ -52,8 +52,23 @@ struct Operation<'a> {
     completed: [u64; 4],
 }
 
-impl Operation<'_> {
-    async fn call(
+impl<'a> Operation<'a> {
+    pub(crate) const fn new(
+        executor: &'a dyn ModelExecutor,
+        policy: &'a DetailedPolicy,
+        cancel: &'a Cancellation,
+    ) -> Self {
+        Self {
+            executor,
+            policy,
+            cancel,
+            calls: 0,
+            input_bytes: 0,
+            image_bytes: 0,
+            completed: [0; 4],
+        }
+    }
+    pub(crate) async fn call(
         &mut self,
         stage: AnalysisStage,
         input: Value,

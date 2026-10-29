@@ -388,6 +388,97 @@ pub(crate) fn detailed_window_source(
     })
 }
 
+/// Adapt the existing window planner to immutable, direct-source passage inputs.
+///
+/// Caller admission validates the document. Context retains exact preceding cues,
+/// but grants neither new primary ownership nor evidence/asset authority. Image
+/// records identify source assets; actual bytes must be supplied by the executor.
+///
+/// Primary evidence must intersect the window and either reference at least one
+/// primary cue or have no transcript references (potential visual support).
+/// Context-only transcript evidence is excluded. Mixed primary/context evidence
+/// remains an unchanged source record, not authority to narrate its nonprimary
+/// cues as newly covered material. Context evidence/assets are always empty.
+/// Missing primary evidence is not synthesized or borrowed from context: callers
+/// must reject unsupported output or report the missing support explicitly.
+///
+/// Whole-cue ownership and source references establish selection mechanics, not
+/// preservation of every explanation, example or qualification. Independent
+/// source-based review remains necessary; image presence does not prove inspection.
+pub(crate) fn passage_units(
+    document: &crate::contracts::RecapDocument,
+    policy: &crate::analysis_contracts::DetailedPolicy,
+    cancel: &crate::process::Cancellation,
+) -> Result<Vec<crate::passage_contracts::SourceUnit>, crate::composition::CompositionError> {
+    use crate::{
+        composition::CompositionError,
+        contracts::TimeRange,
+        passage_contracts::{PassageSource, SourceUnit},
+    };
+    let windows = detailed_windows(document, policy, cancel)?;
+    let mut units = Vec::with_capacity(windows.len());
+    for window in windows {
+        if cancel.is_cancelled() {
+            return Err(crate::model::ModelError::Cancelled.into());
+        }
+        // Use the admitted payload's exact ordering and bounded context selection.
+        let payload = detailed_window_source(document, &window);
+        let transcript: Vec<TranscriptSegment> =
+            serde_json::from_value(payload["transcript"].clone())?;
+        let context_transcript: Vec<TranscriptSegment> =
+            serde_json::from_value(payload["preceding_context"]["transcript"].clone())?;
+        let context_range = context_transcript
+            .iter()
+            .fold(None::<TimeRange>, |range, cue| {
+                Some(range.map_or(cue.range, |range| TimeRange {
+                    start_ms: range.start_ms.min(cue.range.start_ms),
+                    end_ms: range.end_ms.max(cue.range.end_ms),
+                }))
+            })
+            .unwrap_or(TimeRange {
+                start_ms: window.range.start_ms,
+                end_ms: window.range.start_ms,
+            });
+        let primary = PassageSource {
+            range: window.range,
+            transcript,
+            // Temporal overlap alone must not promote context-only transcript
+            // evidence to primary support. Mixed evidence remains unchanged;
+            // only the primary transcript, not every referenced cue, is owned.
+            evidence: document
+                .evidence
+                .iter()
+                .filter(|evidence| {
+                    window.evidence_ids.contains(&evidence.id)
+                        && (evidence.transcript_segment_ids.is_empty()
+                            || evidence
+                                .transcript_segment_ids
+                                .iter()
+                                .any(|id| window.transcript_ids.contains(id)))
+                })
+                .cloned()
+                .collect(),
+            assets: serde_json::from_value(payload["assets"].clone())?,
+        };
+        let unit = SourceUnit {
+            id: window.id,
+            primary,
+            context: PassageSource {
+                range: context_range,
+                transcript: context_transcript,
+                evidence: Vec::new(),
+                assets: Vec::new(),
+            },
+        };
+        // Budget the actual typed source envelope as well as planner admission.
+        if serde_json::to_vec(&unit)?.len() > policy.allowances.max_input_bytes / 4 {
+            return Err(CompositionError::Budget);
+        }
+        units.push(unit);
+    }
+    Ok(units)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +857,187 @@ mod tests {
         cancel.cancel();
         assert!(matches!(
             detailed_windows(&document, &policy, &cancel),
+            Err(crate::composition::CompositionError::Model(
+                crate::model::ModelError::Cancelled
+            ))
+        ));
+    }
+
+    #[test]
+    fn passage_primary_and_context_retain_exact_source_without_context_authority() {
+        use crate::{analysis_contracts::DetailedPolicy, process::Cancellation};
+        let mut cues = timed_segments(8);
+        cues[0].text = "Attributed example: 17 units, except when cold.".into();
+        let mut document = detailed_source(cues, 8_000);
+        // Valid broad evidence overlaps later windows but supports only cue zero.
+        document.evidence[0].range.end_ms = 8_000;
+        document.validate().unwrap();
+        let policy = DetailedPolicy {
+            window_duration_ms: 3_000,
+            window_overlap_ms: 500,
+            ..DetailedPolicy::default()
+        };
+        let cancel = Cancellation::default();
+        let windows = detailed_windows(&document, &policy, &cancel).unwrap();
+        let units = passage_units(&document, &policy, &cancel).unwrap();
+        let owned: Vec<_> = units
+            .iter()
+            .flat_map(|unit| unit.primary.transcript.iter())
+            .collect();
+        assert_eq!(owned, document.transcript.iter().collect::<Vec<_>>());
+        for (unit, window) in units.iter().zip(&windows) {
+            let payload = detailed_window_source(&document, window);
+            assert_eq!(unit.id, window.id);
+            assert_eq!(unit.primary.range, window.range);
+            assert_eq!(
+                serde_json::to_value(&unit.primary.transcript).unwrap(),
+                payload["transcript"]
+            );
+            assert_eq!(
+                serde_json::to_value(&unit.context.transcript).unwrap(),
+                payload["preceding_context"]["transcript"]
+            );
+            assert!(unit.context.evidence.is_empty());
+            assert!(unit.context.assets.is_empty());
+            for cue in &unit.context.transcript {
+                assert!(
+                    !unit
+                        .primary
+                        .transcript
+                        .iter()
+                        .any(|primary| primary.id == cue.id)
+                );
+                assert!(unit.context.range.start_ms <= cue.range.start_ms);
+                assert!(cue.range.end_ms <= unit.context.range.end_ms);
+            }
+        }
+        assert!(units[0].primary.evidence.contains(&document.evidence[0]));
+        assert!(
+            units[1]
+                .context
+                .transcript
+                .contains(&document.transcript[0])
+        );
+        assert!(!units[1].primary.evidence.contains(&document.evidence[0]));
+    }
+
+    #[test]
+    fn passage_visual_only_gaps_retain_actual_asset_and_evidence_records() {
+        use crate::{
+            analysis_contracts::DetailedPolicy,
+            contracts::{Asset, AssetPath, Evidence},
+            process::Cancellation,
+        };
+        let mut document = detailed_source(vec![], 8_000);
+        document.evidence.push(Evidence {
+            id: "diagram".into(),
+            range: TimeRange {
+                start_ms: 4_000,
+                end_ms: 4_001,
+            },
+            transcript_segment_ids: vec![],
+        });
+        document.assets.push(Asset {
+            id: "frame".into(),
+            path: AssetPath::new("frame.jpg").unwrap(),
+            mime_type: "image/jpeg".into(),
+            range: document.evidence[0].range,
+        });
+        let policy = DetailedPolicy {
+            window_duration_ms: 3_000,
+            window_overlap_ms: 500,
+            ..DetailedPolicy::default()
+        };
+        let units = passage_units(&document, &policy, &Cancellation::default()).unwrap();
+        assert!(units.iter().all(|unit| unit.primary.transcript.is_empty()));
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.primary.assets == document.assets
+                    && unit.primary.evidence == document.evidence)
+        );
+        assert_eq!(units.first().unwrap().primary.range.start_ms, 0);
+        assert_eq!(units.last().unwrap().primary.range.end_ms, 8_000);
+    }
+
+    #[test]
+    fn passage_crossing_cue_is_owned_whole_once() {
+        use crate::{analysis_contracts::DetailedPolicy, process::Cancellation};
+        let mut cues = timed_segments(8);
+        cues[3].range.end_ms = 5_000;
+        let document = detailed_source(cues, 8_000);
+        let policy = DetailedPolicy {
+            window_duration_ms: 4_000,
+            window_overlap_ms: 500,
+            ..DetailedPolicy::default()
+        };
+        let units = passage_units(&document, &policy, &Cancellation::default()).unwrap();
+        assert_eq!(
+            units
+                .iter()
+                .flat_map(|unit| &unit.primary.transcript)
+                .collect::<Vec<_>>(),
+            document.transcript.iter().collect::<Vec<_>>()
+        );
+        for unit in units {
+            for cue in unit.primary.transcript {
+                assert!(unit.primary.range.start_ms <= cue.range.start_ms);
+                assert!(cue.range.end_ms <= unit.primary.range.end_ms);
+            }
+        }
+    }
+
+    #[test]
+    fn passage_long_crossing_cue_preserves_planner_failure_instead_of_truncating() {
+        use crate::{analysis_contracts::DetailedPolicy, process::Cancellation};
+        let mut cues = timed_segments(1);
+        cues[0].range.end_ms = 5_000;
+        let document = detailed_source(cues, 10_000);
+        let policy = DetailedPolicy {
+            window_duration_ms: 4_000,
+            window_overlap_ms: 500,
+            ..DetailedPolicy::default()
+        };
+        assert!(matches!(
+            passage_units(&document, &policy, &Cancellation::default()),
+            Err(crate::composition::CompositionError::Budget)
+        ));
+    }
+
+    #[test]
+    fn passage_limits_and_cancellation_fail_without_partial_source() {
+        use crate::{analysis_contracts::DetailedPolicy, process::Cancellation};
+        let mut document = detailed_source(timed_segments(8), 8_000);
+        for cue in &mut document.transcript {
+            cue.text = "語🙂\\\"\\n".repeat(15);
+        }
+        let mut policy = DetailedPolicy {
+            window_duration_ms: 3_000,
+            window_overlap_ms: 500,
+            ..DetailedPolicy::default()
+        };
+        policy.allowances.max_input_bytes = 16_000;
+        let cancel = Cancellation::default();
+        let units = passage_units(&document, &policy, &cancel).unwrap();
+        for unit in units {
+            assert!(
+                serde_json::to_vec(&unit).unwrap().len() <= policy.allowances.max_input_bytes / 4
+            );
+        }
+        policy.allowances.max_source_windows = 1;
+        assert!(matches!(
+            passage_units(&document, &policy, &cancel),
+            Err(crate::composition::CompositionError::Budget)
+        ));
+        policy.allowances.max_source_windows = 100;
+        document.transcript[0].text = "x".repeat(policy.allowances.max_input_bytes);
+        assert!(matches!(
+            passage_units(&document, &policy, &cancel),
+            Err(crate::composition::CompositionError::Budget)
+        ));
+        cancel.cancel();
+        assert!(matches!(
+            passage_units(&document, &policy, &cancel),
             Err(crate::composition::CompositionError::Model(
                 crate::model::ModelError::Cancelled
             ))

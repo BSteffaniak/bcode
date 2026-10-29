@@ -222,7 +222,7 @@ fn render_document(mut renderer: Renderer<'_>) -> HtmlExport {
             "<a class=\"back-to-contents\" href=\"#contents\">Back to contents ↑</a></section>",
         );
     }
-    html.push_str("<aside class=\"notice\" aria-label=\"Export limits\"><strong>This offline edition</strong><p>This is a selected recap, not the complete source video. Media is embedded only when it passes format, path, and size checks. Browser playback support can vary.</p><p>");
+    html.push_str("<aside class=\"notice\" aria-label=\"Export limits\"><strong>This offline edition</strong><p>This is a readable recap, not the complete source video. Media is embedded only when it passes format, path, and size checks. Browser playback support can vary.</p><p>");
     escape(
         &mut html,
         &format!(

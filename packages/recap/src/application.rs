@@ -1243,6 +1243,7 @@ pub fn create_options(options: &Create) -> Result<EngineOptions, Error> {
                 .map_err(|_| Error::Action("Detailed allowance exceeds platform limits".into()))?;
         }
     }
+    configuration.detailed.source_passages = options.experimental_source_passages;
     configuration
         .detailed
         .validate()
@@ -1278,9 +1279,9 @@ impl<F: FnMut(Stage) + Send> ModelExecutor for ProgressExecutor<'_, F> {
             AnalysisStage::ExtractionInventory
             | AnalysisStage::Outline
             | AnalysisStage::VisualInspection => Phase::Analysis,
-            AnalysisStage::ChapterComposition => Phase::Writing,
-            AnalysisStage::SourceAudit => Phase::Audit,
-            AnalysisStage::SourceRepair => Phase::Repair,
+            AnalysisStage::ChapterComposition | AnalysisStage::PassageComposition => Phase::Writing,
+            AnalysisStage::SourceAudit | AnalysisStage::PassageReview => Phase::Audit,
+            AnalysisStage::SourceRepair | AnalysisStage::PassagePatch => Phase::Repair,
         };
         if !cancellation.is_cancelled() {
             cancellation.emit(Event::Phase { phase });

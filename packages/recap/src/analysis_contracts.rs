@@ -27,6 +27,12 @@ pub enum AnalysisStage {
     SourceRepair,
     /// Inspect actual source frames for information unavailable in the transcript.
     VisualInspection,
+    /// Compose a readable passage directly from one immutable source unit.
+    PassageComposition,
+    /// Compare one passage and its source in both directions.
+    PassageReview,
+    /// Propose revision-checked targeted edits to one passage.
+    PassagePatch,
 }
 
 /// Provider-neutral stage request. Adapters must put instructions in a trusted
@@ -82,6 +88,10 @@ impl Default for AnalysisAllowances {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DetailedPolicy {
+    /// Experimental operation-local migration flag for direct-source passages.
+    /// Defaults to false until acceptance; not part of the persisted document format.
+    #[serde(default)]
+    pub source_passages: bool,
     /// Resource budget independently configurable by standalone or hosted callers.
     pub allowances: AnalysisAllowances,
     /// Maximum source duration per extraction window, in milliseconds.
@@ -109,6 +119,7 @@ const fn default_in_flight_bytes() -> usize {
 impl Default for DetailedPolicy {
     fn default() -> Self {
         Self {
+            source_passages: false,
             allowances: AnalysisAllowances::default(),
             window_duration_ms: 180_000,
             window_overlap_ms: 10_000,
@@ -433,6 +444,12 @@ pub enum AnalysisResponse {
     SourceRepair(SourceRepair),
     /// Actual-frame inspection.
     VisualInspection(VisualInspection),
+    /// Direct-source readable passage.
+    PassageComposition(crate::passage_contracts::PassageComposition),
+    /// Local two-way source review.
+    PassageReview(crate::passage_contracts::PassageReview),
+    /// Revision-checked targeted edit proposal.
+    PassagePatch(crate::passage_contracts::PassagePatch),
 }
 
 impl AnalysisResponse {
@@ -463,6 +480,11 @@ impl AnalysisResponse {
             AnalysisStage::VisualInspection => {
                 serde_json::from_slice(bytes).map(Self::VisualInspection)
             }
+            AnalysisStage::PassageComposition => {
+                serde_json::from_slice(bytes).map(Self::PassageComposition)
+            }
+            AnalysisStage::PassageReview => serde_json::from_slice(bytes).map(Self::PassageReview),
+            AnalysisStage::PassagePatch => serde_json::from_slice(bytes).map(Self::PassagePatch),
         }
         .map_err(|_| ModelError::InvalidResponse)
     }
@@ -477,6 +499,9 @@ impl AnalysisResponse {
             Self::SourceAudit(_) => AnalysisStage::SourceAudit,
             Self::SourceRepair(_) => AnalysisStage::SourceRepair,
             Self::VisualInspection(_) => AnalysisStage::VisualInspection,
+            Self::PassageComposition(_) => AnalysisStage::PassageComposition,
+            Self::PassageReview(_) => AnalysisStage::PassageReview,
+            Self::PassagePatch(_) => AnalysisStage::PassagePatch,
         }
     }
 }
@@ -505,6 +530,9 @@ pub fn analysis_response_schema(stage: AnalysisStage) -> serde_json::Value {
         "item_ids":strings,"chapter_ids":strings,"description":text
     }));
     match stage {
+        AnalysisStage::PassageComposition => crate::passage_contracts::composition_schema(),
+        AnalysisStage::PassageReview => crate::passage_contracts::review_schema(),
+        AnalysisStage::PassagePatch => crate::passage_contracts::patch_schema(),
         AnalysisStage::ExtractionInventory => {
             object(json!({"window_id":text,"items":array(item),"limitations":strings}))
         }
@@ -592,6 +620,9 @@ mod tests {
             AnalysisStage::SourceAudit,
             AnalysisStage::SourceRepair,
             AnalysisStage::VisualInspection,
+            AnalysisStage::PassageComposition,
+            AnalysisStage::PassageReview,
+            AnalysisStage::PassagePatch,
         ] {
             let schema = analysis_response_schema(stage);
             assert_eq!(schema["type"], "object");
@@ -714,6 +745,22 @@ mod tests {
         assert!(!report.is_complete());
         report.dispositions[1] = report.dispositions[0].clone();
         assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn source_passages_is_opt_in_and_old_policy_inputs_keep_the_existing_path() {
+        let policy = DetailedPolicy::default();
+        assert!(!policy.source_passages);
+        let mut value = serde_json::to_value(&policy).unwrap();
+        value.as_object_mut().unwrap().remove("source_passages");
+        let old_policy: DetailedPolicy = serde_json::from_value(value.clone()).unwrap();
+        assert!(!old_policy.source_passages);
+        value["source_passages"] = json!(true);
+        let experimental: DetailedPolicy = serde_json::from_value(value.clone()).unwrap();
+        assert!(experimental.source_passages);
+        assert!(experimental.validate().is_ok());
+        value["source_passages"] = json!("true");
+        assert!(serde_json::from_value::<DetailedPolicy>(value).is_err());
     }
 
     #[test]

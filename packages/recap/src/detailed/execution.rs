@@ -16,7 +16,7 @@ type SendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type PendingCall<'a> = SendFuture<'a, Result<AnalysisResponse>>;
 type CallIterator<'a> = Box<dyn Iterator<Item = Result<PreparedCall>> + Send + 'a>;
 
-pub(super) struct PreparedCall {
+pub struct PreparedCall {
     request: AnalysisRequest,
     input_bytes: usize,
     image_bytes: usize,
@@ -31,7 +31,18 @@ impl PreparedCall {
         task: &str,
         max_response_bytes: usize,
     ) -> Result<Self> {
-        let instructions = format!("{POLICY}\n{task}");
+        Self::with_policy(stage, input, images, task, max_response_bytes, POLICY)
+    }
+
+    pub(crate) fn with_policy(
+        stage: AnalysisStage,
+        input: Value,
+        images: Vec<ImageAsset>,
+        task: &str,
+        max_response_bytes: usize,
+        policy: &str,
+    ) -> Result<Self> {
+        let instructions = format!("{policy}\n{task}");
         let input_bytes = serde_json::to_vec(&input)?
             .len()
             .checked_add(instructions.len())
@@ -152,7 +163,7 @@ impl Operation<'_> {
         })
     }
 
-    pub(super) fn run<'a>(
+    pub(crate) fn run<'a>(
         &'a mut self,
         mut calls: CallIterator<'a>,
     ) -> SendFuture<'a, Result<Vec<AnalysisResponse>>> {
@@ -197,6 +208,9 @@ impl Operation<'_> {
                         AnalysisResponse::SourceAudit(value) => serde_json::to_vec(value)?,
                         AnalysisResponse::SourceRepair(value) => serde_json::to_vec(value)?,
                         AnalysisResponse::VisualInspection(value) => serde_json::to_vec(value)?,
+                        AnalysisResponse::PassageComposition(value) => serde_json::to_vec(value)?,
+                        AnalysisResponse::PassageReview(value) => serde_json::to_vec(value)?,
+                        AnalysisResponse::PassagePatch(value) => serde_json::to_vec(value)?,
                     }
                     .len();
                     if size > self.policy.allowances.max_response_bytes {
@@ -224,8 +238,10 @@ const fn progress(stage: AnalysisStage) -> (crate::diagnostics::Phase, usize) {
         AnalysisStage::ExtractionInventory
         | AnalysisStage::VisualInspection
         | AnalysisStage::Outline => (Phase::Analysis, 0),
-        AnalysisStage::ChapterComposition => (Phase::Writing, 1),
-        AnalysisStage::SourceAudit => (Phase::Audit, 2),
-        AnalysisStage::SourceRepair => (Phase::Repair, 3),
+        AnalysisStage::ChapterComposition | AnalysisStage::PassageComposition => {
+            (Phase::Writing, 1)
+        }
+        AnalysisStage::SourceAudit | AnalysisStage::PassageReview => (Phase::Audit, 2),
+        AnalysisStage::SourceRepair | AnalysisStage::PassagePatch => (Phase::Repair, 3),
     }
 }

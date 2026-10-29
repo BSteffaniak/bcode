@@ -399,9 +399,11 @@ const fn request_stage(stage: bcode_recap::model::AnalysisStage) -> RequestStage
     match stage {
         AnalysisStage::ExtractionInventory => RequestStage::Inventory,
         AnalysisStage::Outline => RequestStage::Outline,
-        AnalysisStage::ChapterComposition => RequestStage::Chapter,
-        AnalysisStage::SourceAudit => RequestStage::Audit,
-        AnalysisStage::SourceRepair => RequestStage::Repair,
+        AnalysisStage::ChapterComposition | AnalysisStage::PassageComposition => {
+            RequestStage::Chapter
+        }
+        AnalysisStage::SourceAudit | AnalysisStage::PassageReview => RequestStage::Audit,
+        AnalysisStage::SourceRepair | AnalysisStage::PassagePatch => RequestStage::Repair,
         AnalysisStage::VisualInspection => RequestStage::VisualInspection,
     }
 }

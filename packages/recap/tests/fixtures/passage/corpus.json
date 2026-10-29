@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "causal_caveats",
+      "units": [
+        {"id": "cause", "start_ms": 0, "end_ms": 18000, "kind": "transcript", "text": "A deeper queue hides brief stalls because producers can continue while the consumer pauses. At 200 records per second, a 3-second pause requires room for 600 records. This is a sizing example, not a measured throughput gain. If the consumer is permanently slower, a larger queue only delays overload."}
+      ],
+      "obligations": [
+        {"id": "mechanism", "source_ids": ["cause"], "meaning": "Capacity absorbs temporary consumer pauses by allowing producers to continue; it does not fix a sustained rate mismatch.", "phrases": ["producers continue", "only delays overload"]},
+        {"id": "example", "source_ids": ["cause"], "meaning": "Retain the worked example and distinguish capacity arithmetic from a performance measurement.", "phrases": ["200 records per second", "3-second", "600 records", "not a measured throughput gain"]}
+      ],
+      "acceptable": "A deeper queue absorbs brief consumer stalls because producers continue during the pause. At 200 records per second, a 3-second pause needs 600 records of capacity. This is a sizing example, not a measured throughput gain. When the consumer is permanently slower, extra capacity only delays overload.",
+      "forbidden": ["A deeper queue permanently fixes overload", "Throughput increased by 600 records per second"],
+      "controls": [
+        {"id": "ids_without_explanation", "kind": "omission_despite_ids", "source_ids": ["cause"], "text": "Queue sizing is discussed.", "missing": ["mechanism", "example"], "unsupported": []},
+        {"id": "lost_caveat_and_number", "kind": "lost_caveat_number", "source_ids": ["cause"], "text": "A deeper queue helps because producers continue during pauses and only delays overload when the consumer stays slower. The example describes capacity.", "missing": ["example"], "unsupported": []},
+        {"id": "false_rate", "kind": "unsupported_addition", "source_ids": ["cause"], "text": "Throughput increased by 600 records per second", "missing": ["mechanism", "example"], "unsupported": ["Throughput increased by 600 records per second"]},
+        {"id": "reversed_cause", "kind": "contradiction", "source_ids": ["cause"], "text": "A deeper queue permanently fixes overload", "missing": ["mechanism", "example"], "unsupported": ["A deeper queue permanently fixes overload"]}
+      ]
+    },
+    {
+      "id": "ordered_procedure",
+      "units": [
+        {"id": "prepare", "start_ms": 0, "end_ms": 10000, "kind": "transcript", "text": "First stop writes and record the current checksum. Copy the data to staging in batches of 128 records; do not replace the live directory yet."},
+        {"id": "verify", "start_ms": 10000, "end_ms": 22000, "kind": "transcript", "text": "Next verify the staging checksum against the recorded value. Only after it matches, atomically swap staging into place, then resume writes. On mismatch leave the live directory unchanged."}
+      ],
+      "obligations": [
+        {"id": "preparation", "source_ids": ["prepare"], "meaning": "Stop writes before recording the checksum and copying 128-record batches to staging, not live storage.", "phrases": ["stop writes", "record the checksum", "128 records", "staging"]},
+        {"id": "gated_swap", "source_ids": ["prepare", "verify"], "meaning": "Verification precedes atomic replacement; resume follows replacement; a mismatch preserves live data.", "phrases": ["verify before swapping", "resume writes after the swap", "on mismatch leave live data unchanged"]}
+      ],
+      "acceptable": "First stop writes and record the checksum. Copy batches of 128 records to staging. Next verify before swapping: compare the staged checksum with the recorded value, and only on a match atomically replace the live directory. Then resume writes after the swap; on mismatch leave live data unchanged.",
+      "forbidden": ["Swap first and verify afterward"],
+      "controls": [
+        {"id": "wrong_order", "kind": "contradiction", "source_ids": ["prepare", "verify"], "text": "First stop writes and record the checksum. Copy 128 records per batch to staging. Swap first and verify afterward.", "missing": ["gated_swap"], "unsupported": ["Swap first and verify afterward"]}
+      ]
+    },
+    {
+      "id": "visual_only",
+      "units": [
+        {"id": "spoken", "start_ms": 0, "end_ms": 5000, "kind": "transcript", "text": "Watch the latch while I move the lever."},
+        {"id": "motion", "start_ms": 5000, "end_ms": 11000, "kind": "visual_annotation", "text": "Synthetic motion annotation, not transcript or actual decoded media: the hand lifts the red safety tab, then rotates the lever clockwise. The latch retracts only after the tab is raised. The blue button is untouched. A single final frame would not establish this order."}
+      ],
+      "obligations": [
+        {"id": "visual_sequence", "source_ids": ["motion"], "meaning": "The observed action requires lifting the red safety tab before clockwise lever rotation; do not infer motion from a still or attribute this to speech.", "phrases": ["visual annotation", "lift the red safety tab before rotating the lever clockwise", "blue button is untouched", "not established by a single still"]}
+      ],
+      "acceptable": "The synthetic visual annotation shows: lift the red safety tab before rotating the lever clockwise; the latch then retracts. The blue button is untouched. This order is not established by a single still, and the narrator does not describe these steps aloud.",
+      "forbidden": ["Caption: press the blue button to release the latch", "The narrator says to rotate counterclockwise"],
+      "controls": [
+        {"id": "misleading_caption", "kind": "misleading_caption", "source_ids": ["motion"], "text": "Caption: press the blue button to release the latch", "missing": ["visual_sequence"], "unsupported": ["Caption: press the blue button to release the latch"]}
+      ]
+    },
+    {
+      "id": "attributed_disagreement",
+      "units": [
+        {"id": "lin", "start_ms": 0, "end_ms": 12000, "kind": "transcript", "text": "Dr Lin: In our non-randomized trial of 24 machines, the median fell from 80 to 68 degrees Celsius after the fan and firmware both changed. That is 12 degrees, not 12 percent. We cannot attribute it to the fan alone."},
+        {"id": "reyes", "start_ms": 12000, "end_ms": 25000, "kind": "transcript", "text": "Operator Reyes: I disagree that this establishes a general improvement. Two machines overheated in high humidity; dry-room tests missed that condition."}
+      ],
+      "obligations": [
+        {"id": "attributed_result", "source_ids": ["lin"], "meaning": "Lin reports a non-randomized combined intervention, not isolated fan causation; preserve denominator and temperature units.", "phrases": ["Lin", "non-randomized", "24 machines", "80 to 68", "12 degrees, not 12 percent", "fan and firmware", "not attributable to the fan alone"]},
+        {"id": "disagreement", "source_ids": ["reyes"], "meaning": "Reyes disputes generalization because two machines overheated under humidity absent from dry tests; do not collapse speakers into consensus.", "phrases": ["Reyes disagrees", "two machines overheated", "high humidity", "dry-room tests"]}
+      ],
+      "acceptable": "Lin reports a non-randomized trial of 24 machines: median temperature fell from 80 to 68 degrees Celsius, a change of 12 degrees, not 12 percent, after fan and firmware changes. It is not attributable to the fan alone. Reyes disagrees that this establishes general improvement: two machines overheated in high humidity, a condition absent from dry-room tests.",
+      "forbidden": ["Lin and Reyes agree the fan alone caused a general improvement"],
+      "controls": [
+        {"id": "false_consensus", "kind": "contradiction", "source_ids": ["lin", "reyes"], "text": "Lin and Reyes agree the fan alone caused a general improvement", "missing": ["attributed_result", "disagreement"], "unsupported": ["Lin and Reyes agree the fan alone caused a general improvement"]}
+      ]
+    },
+    {
+      "id": "boundary_explanation",
+      "units": [
+        {"id": "boundary_left", "start_ms": 0, "end_ms": 10000, "kind": "transcript", "text": "The client timed out after sending the write. We do not yet know whether the server committed it. Retrying is safe only under the condition I will explain next."},
+        {"id": "boundary_right", "start_ms": 10000, "end_ms": 21000, "kind": "transcript", "text": "That condition is reusing the same idempotency key: the server durably records it with the result. A new key could apply the write twice. Do not label the timed-out write a failure with no effects."}
+      ],
+      "obligations": [
+        {"id": "ambiguous_outcome", "source_ids": ["boundary_left"], "meaning": "Timeout leaves commit status unknown, not an authoritative effect-free failure.", "phrases": ["commit status is unknown", "not a failure with no effects"]},
+        {"id": "cross_boundary_condition", "source_ids": ["boundary_left", "boundary_right"], "meaning": "Resolve the forward reference across the unit boundary: retry uses the same key, durably paired with the result; a new key risks duplicate effects.", "phrases": ["retry only with the same idempotency key", "durably records the key with the result", "a new key can duplicate the write"]}
+      ],
+      "acceptable": "After the client times out, commit status is unknown: it is not a failure with no effects. The next source unit supplies the condition: retry only with the same idempotency key, because the server durably records the key with the result; a new key can duplicate the write.",
+      "forbidden": ["Retry with a new key because timeout proves no write occurred"],
+      "controls": [
+        {"id": "boundary_fact_missing", "kind": "cross_boundary_fact", "source_ids": ["boundary_left", "boundary_right"], "text": "After timeout, commit status is unknown; it is not a failure with no effects. Retry under the condition discussed next.", "missing": ["cross_boundary_condition"], "unsupported": []},
+        {"id": "unsafe_retry", "kind": "contradiction", "source_ids": ["boundary_left", "boundary_right"], "text": "Retry with a new key because timeout proves no write occurred", "missing": ["ambiguous_outcome", "cross_boundary_condition"], "unsupported": ["Retry with a new key because timeout proves no write occurred"]}
+      ]
+    }
+  ],
+  "patch_scenario": {
+    "expected_revision": 7,
+    "current_revision": 8,
+    "target_block": "retry-explanation",
+    "untouched_text": "The client timeout leaves the outcome unresolved.",
+    "untouched_image": {"asset_id": "retry-timeline", "caption": "Timeline, not proof of commit", "evidence_ids": ["boundary_left", "boundary_right"]},
+    "replacement_text": "Retry only with the same idempotency key; a new key can duplicate the write."
+  }
+}
