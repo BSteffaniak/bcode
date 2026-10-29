@@ -45,6 +45,16 @@ pub enum CompositionError {
     /// Explicit resource budget exceeded.
     #[error("recap composition budget exceeded")]
     Budget,
+    /// A specific caller constraint was exceeded; counts are safe for diagnostics.
+    #[error("recap {resource} exceeded: {actual} required, {limit} configured")]
+    Limit {
+        /// Resource being constrained.
+        resource: &'static str,
+        /// Required amount.
+        actual: usize,
+        /// Configured allowance.
+        limit: usize,
+    },
     /// Unsupported grounding or invalid refinement identity.
     #[error("invalid recap composition: {0}")]
     Invalid(&'static str),
@@ -202,7 +212,11 @@ impl Composer<'_> {
             untrusted_previous: previous,
         })?;
         if input_text.len() > self.limits.input_bytes {
-            return Err(CompositionError::Budget);
+            return Err(CompositionError::Limit {
+                resource: "per-request input bytes",
+                actual: input_text.len(),
+                limit: self.limits.input_bytes,
+            });
         }
         cancellation.emit(crate::diagnostics::Event::InferenceStarted);
         let response = self
@@ -221,8 +235,13 @@ impl Composer<'_> {
         cancellation.emit(crate::diagnostics::Event::Phase {
             phase: crate::diagnostics::Phase::ValidationOutput,
         });
-        if serde_json::to_vec(&response)?.len() > self.limits.response_bytes {
-            return Err(CompositionError::Budget);
+        let response_bytes = serde_json::to_vec(&response)?.len();
+        if response_bytes > self.limits.response_bytes {
+            return Err(CompositionError::Limit {
+                resource: "per-request response bytes",
+                actual: response_bytes,
+                limit: self.limits.response_bytes,
+            });
         }
         let mut document = grounded.clone();
         document.intent = intent;

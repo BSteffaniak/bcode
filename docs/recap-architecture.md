@@ -16,7 +16,7 @@ A versioned `RecapDocument` retains source identity, transcript segments, timest
 
 Text remains untrusted plain text, including model output. References and source ranges are validated before publication. Structured model output is not sufficient evidence of factual accuracy: real source comparison remains necessary for product acceptance.
 
-Acquisition and media operations have explicit input, time, output, and duration budgets. External tools receive argument arrays, never interpolated shell scripts. Missing tools and inaccessible sources produce actionable failures, not synthetic successful recaps. Cancellation is propagated to subprocesses and model execution.
+Acquisition size, duration, and subprocess deadlines are opt-in caller constraints; normal creation has no such cutoff. Subprocess log streams are drained with bounded retention, while structured parsing and media sampling remain bounded. External tools receive argument arrays, never interpolated shell scripts. Missing tools and inaccessible sources produce actionable failures, not synthetic successful recaps. Cancellation is propagated to subprocesses and model execution.
 
 ## Export
 
@@ -94,3 +94,19 @@ from routine count-only diagnostics.
 ## Acceptance
 
 Deterministic model adapters test pipeline mechanics, not live model quality. Local media tests must exercise actual extraction, composition, storage, and export. Browser acceptance opens `file://` output offline, with JavaScript enabled and disabled, verifies embedded media behavior, and inspects narrow and wide layouts. YouTube acquisition and live model quality require separate real-path evidence; a supplied transcript or precomposed JSON does not establish those capabilities.
+
+### Detailed operation allowances
+
+Normal Detailed generation has no fixed total model-call or source-window ceiling.
+Writing, local review/repair and final boundary review proceed over the complete source;
+the source determines the amount of work. `AnalysisAllowances.max_model_calls` and
+`max_source_windows` use zero to mean no operation-wide ceiling (the defaults). Explicit
+positive values, including existing serialized positive values, remain enforced. CLI
+`--detailed-max-model-calls` and `--detailed-max-source-windows` expose those opt-in limits.
+
+Per-request input/output/image constraints and bounded concurrent working sets remain
+separate from total operation length. Local repair rounds and cycle detection remain
+bounded to reject unresolved candidates, not to publish unreviewed output. Resource errors
+in model dispatch identify the actual resource, required amount and configured allowance;
+integer-overflow and invalid source-envelope failures remain fail-closed. Disabling an
+operation ceiling does not disable provider context limits or authorize automatic retries.

@@ -1036,7 +1036,7 @@ async fn explicit_call_window_input_output_and_image_allowances_fail_closed() {
                 &Cancellation::default()
             )
             .await,
-            Err(CompositionError::Budget)
+            Err(CompositionError::Budget | CompositionError::Limit { .. })
         ));
     }
 }
@@ -1257,7 +1257,7 @@ async fn indivisible_chapter_is_rejected_before_an_oversized_audit_dispatch() {
             &Cancellation::default()
         )
         .await,
-        Err(CompositionError::Budget)
+        Err(CompositionError::Budget | CompositionError::Limit { .. })
     ));
     assert!(
         model
@@ -1452,7 +1452,10 @@ async fn wave_budget_is_reserved_before_any_executor_invocation() {
             &Cancellation::default()
         )
         .await,
-        Err(CompositionError::Budget)
+        Err(CompositionError::Limit {
+            resource: "explicit model-call allowance",
+            ..
+        })
     ));
     assert!(model.calls.lock().unwrap().is_empty());
 }
@@ -1537,7 +1540,7 @@ async fn in_flight_payload_ceiling_fails_before_dispatch() {
             &Cancellation::default()
         )
         .await,
-        Err(CompositionError::Budget)
+        Err(CompositionError::Limit { .. })
     ));
     assert!(model.calls.lock().unwrap().is_empty());
 }

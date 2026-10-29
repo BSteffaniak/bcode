@@ -51,12 +51,12 @@ pub struct AnalysisRequest {
     pub max_response_bytes: usize,
 }
 
-/// Explicit finite resource allowances, not editorial chapter or information caps.
+/// Per-request constraints and optional operation allowances, not editorial caps.
 /// Exhaustion must fail or report incomplete coverage, never silently truncate it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalysisAllowances {
-    /// Maximum model invocations across all stages and repair attempts.
+    /// Optional maximum model invocations; zero disables the operation-wide ceiling.
     pub max_model_calls: usize,
     /// Maximum serialized input bytes per invocation.
     pub max_input_bytes: usize,
@@ -64,7 +64,7 @@ pub struct AnalysisAllowances {
     pub max_response_bytes: usize,
     /// Maximum encoded image bytes across one invocation.
     pub max_image_bytes: usize,
-    /// Maximum source windows accepted by this operation.
+    /// Optional maximum source windows (zero disables the ceiling) accepted by this operation.
     pub max_source_windows: usize,
     /// Maximum explicit audit/repair iterations.
     pub max_repair_rounds: usize,
@@ -73,11 +73,11 @@ pub struct AnalysisAllowances {
 impl Default for AnalysisAllowances {
     fn default() -> Self {
         Self {
-            max_model_calls: 128,
+            max_model_calls: 0,
             max_input_bytes: 256 * 1024,
             max_response_bytes: 256 * 1024,
             max_image_bytes: 16 * 1024 * 1024,
-            max_source_windows: 128,
+            max_source_windows: 0,
             max_repair_rounds: 2,
         }
     }
@@ -145,10 +145,8 @@ impl DetailedPolicy {
             || self.max_in_flight_bytes == 0
             || self.window_duration_ms == 0
             || self.window_overlap_ms >= self.window_duration_ms
-            || limits.max_model_calls == 0
             || limits.max_input_bytes == 0
             || limits.max_response_bytes == 0
-            || limits.max_source_windows == 0
             || (self.inspect_visuals && limits.max_image_bytes == 0)
         {
             return Err(ModelError::InvalidResponse);
@@ -786,6 +784,19 @@ mod tests {
     }
 
     #[test]
+    fn operation_ceilings_default_to_unlimited_but_persist_explicit_allowances() {
+        let mut policy = DetailedPolicy::default();
+        assert_eq!(policy.allowances.max_model_calls, 0);
+        assert_eq!(policy.allowances.max_source_windows, 0);
+        policy.allowances.max_model_calls = 128;
+        policy.allowances.max_source_windows = 128;
+        let restored: DetailedPolicy =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        assert_eq!(restored, policy);
+        restored.validate().unwrap();
+    }
+
+    #[test]
     fn policy_separates_resources_from_editorial_structure() {
         let mut policy = DetailedPolicy::default();
         assert!(policy.validate().is_ok());
@@ -793,6 +804,6 @@ mod tests {
         assert!(policy.validate().is_err());
         policy.window_overlap_ms = 0;
         policy.allowances.max_model_calls = 0;
-        assert!(policy.validate().is_err());
+        assert!(policy.validate().is_ok());
     }
 }

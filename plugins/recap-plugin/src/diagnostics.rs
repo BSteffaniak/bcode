@@ -15,6 +15,7 @@ pub fn engine(error: EngineError) -> String {
         EngineError::Composition(CompositionError::Model(bcode_recap::model::ModelError::Unavailable)) => "recap_model_unavailable: select an admitted executor supporting the requested mode; Detailed requires typed analysis and never falls back to Standard".into(),
         EngineError::Composition(CompositionError::Model(error)) => format!("recap_model_failed: {error}; check admitted profile and structured/image capabilities"),
         EngineError::Composition(CompositionError::Invalid(reason)) => format!("recap_grounding_invalid: {reason}; model output must reference actual evidence/assets"),
+        EngineError::Composition(CompositionError::Limit { resource, actual, limit }) => format!("recap_composition_limit: {resource}: {actual} required, {limit} configured"),
         EngineError::Composition(CompositionError::Budget) => "recap_context_budget: source evidence exceeds configured composition limits".into(),
         EngineError::Composition(_) => "recap_output_invalid: model editorial content failed document validation".into(),
         EngineError::Contract(_) => "recap_storage_contract: check existing document revision, locks and asset confinement".into(),

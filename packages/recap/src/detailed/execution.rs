@@ -79,10 +79,25 @@ impl Operation<'_> {
         let mut input = self.input_bytes;
         let mut images = self.image_bytes;
         for call in wave {
-            if call.input_bytes > limits.max_input_bytes
-                || call.image_bytes > limits.max_image_bytes
-            {
-                return Err(CompositionError::Budget);
+            for (resource, actual, limit) in [
+                (
+                    "per-request input bytes",
+                    call.input_bytes,
+                    limits.max_input_bytes,
+                ),
+                (
+                    "per-request image bytes",
+                    call.image_bytes,
+                    limits.max_image_bytes,
+                ),
+            ] {
+                if actual > limit {
+                    return Err(CompositionError::Limit {
+                        resource,
+                        actual,
+                        limit,
+                    });
+                }
             }
             calls = calls.checked_add(1).ok_or(CompositionError::Budget)?;
             input = input
@@ -92,16 +107,12 @@ impl Operation<'_> {
                 .checked_add(call.image_bytes)
                 .ok_or(CompositionError::Budget)?;
         }
-        let total_input = limits
-            .max_input_bytes
-            .checked_mul(limits.max_model_calls)
-            .ok_or(CompositionError::Budget)?;
-        let total_images = limits
-            .max_image_bytes
-            .checked_mul(limits.max_model_calls)
-            .ok_or(CompositionError::Budget)?;
-        if calls > limits.max_model_calls || input > total_input || images > total_images {
-            return Err(CompositionError::Budget);
+        if limits.max_model_calls > 0 && calls > limits.max_model_calls {
+            return Err(CompositionError::Limit {
+                resource: "explicit model-call allowance",
+                actual: calls,
+                limit: limits.max_model_calls,
+            });
         }
         self.calls = calls;
         self.input_bytes = input;
@@ -180,7 +191,11 @@ impl Operation<'_> {
                     };
                     let call = call?;
                     if call.in_flight_bytes > self.policy.max_in_flight_bytes {
-                        return Err(CompositionError::Budget);
+                        return Err(CompositionError::Limit {
+                            resource: "single-request working-set bytes",
+                            actual: call.in_flight_bytes,
+                            limit: self.policy.max_in_flight_bytes,
+                        });
                     }
                     let total = bytes
                         .checked_add(call.in_flight_bytes)
@@ -214,7 +229,11 @@ impl Operation<'_> {
                     }
                     .len();
                     if size > self.policy.allowances.max_response_bytes {
-                        return Err(CompositionError::Budget);
+                        return Err(CompositionError::Limit {
+                            resource: "per-request response bytes",
+                            actual: size,
+                            limit: self.policy.allowances.max_response_bytes,
+                        });
                     }
                     let (phase, index) = progress(stage);
                     self.completed[index] = self.completed[index].saturating_add(1);

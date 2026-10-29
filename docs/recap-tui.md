@@ -48,3 +48,8 @@ options; it raises only that request's duration allowance. It does not change sa
 preferences or declarative configuration. Other limits remain in effect. Unknown duration,
 live sources, invalid metadata and permission failures are not duration approvals. Headless
 commands stay noninteractive and can set `--max-duration-seconds` explicitly.
+
+Detailed writing and auditing also have no default total model-call or source-window cap.
+Advanced callers may opt into `--detailed-max-model-calls` or
+`--detailed-max-source-windows` (zero disables either). Per-request model constraints and
+bounded concurrency still apply; an incomplete or unresolved review is never published.

@@ -17,16 +17,20 @@ pub(super) fn admit(
 ) -> Result<()> {
     cancelled(cancel)?;
     policy.validate()?;
-    let total_input = policy
-        .allowances
-        .max_input_bytes
-        .checked_mul(policy.allowances.max_source_windows)
-        .ok_or(CompositionError::Budget)?;
-    let total_images = policy
-        .allowances
-        .max_image_bytes
-        .checked_mul(policy.allowances.max_source_windows)
-        .ok_or(CompositionError::Budget)?;
+    let total_input = policy.allowances.max_input_bytes.saturating_mul(
+        if policy.allowances.max_source_windows == 0 {
+            usize::MAX
+        } else {
+            policy.allowances.max_source_windows
+        },
+    );
+    let total_images = policy.allowances.max_image_bytes.saturating_mul(
+        if policy.allowances.max_source_windows == 0 {
+            usize::MAX
+        } else {
+            policy.allowances.max_source_windows
+        },
+    );
     if serde_json::to_vec(document)?.len() > total_input
         || previous.is_some_and(|prior| {
             serde_json::to_vec(prior).map_or(true, |bytes| bytes.len() > total_input)

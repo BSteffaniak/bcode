@@ -28,16 +28,20 @@ pub(super) fn admit(
     // Operation admission is finite as well as each request. These totals are
     // derived from the caller's explicit request/window allowances, not editorial
     // limits, and are checked before constructing model-visible source windows.
-    let total_input = policy
-        .allowances
-        .max_input_bytes
-        .checked_mul(policy.allowances.max_source_windows)
-        .ok_or(CompositionError::Budget)?;
-    let total_images = policy
-        .allowances
-        .max_image_bytes
-        .checked_mul(policy.allowances.max_source_windows)
-        .ok_or(CompositionError::Budget)?;
+    let total_input = policy.allowances.max_input_bytes.saturating_mul(
+        if policy.allowances.max_source_windows == 0 {
+            usize::MAX
+        } else {
+            policy.allowances.max_source_windows
+        },
+    );
+    let total_images = policy.allowances.max_image_bytes.saturating_mul(
+        if policy.allowances.max_source_windows == 0 {
+            usize::MAX
+        } else {
+            policy.allowances.max_source_windows
+        },
+    );
     if serde_json::to_vec(grounded)?.len() > total_input
         || previous.is_some_and(|prior| {
             serde_json::to_vec(prior).map_or(true, |bytes| bytes.len() > total_input)

@@ -111,10 +111,10 @@ pub struct Create {
     #[arg(long, default_value = "standard", value_parser = parse_depth)]
     pub depth: bcode_recap::contracts::Depth,
     /// Detailed model-call allowance; exhaustion fails rather than downgrading.
-    #[arg(long, value_parser = positive_u64)]
+    #[arg(long)]
     pub detailed_max_model_calls: Option<u64>,
     /// Detailed source-window allowance, not an editorial chapter cap.
-    #[arg(long, value_parser = positive_u64)]
+    #[arg(long)]
     pub detailed_max_source_windows: Option<u64>,
     /// Detailed repair-round allowance; zero audits without attempting repairs.
     #[arg(long)]
@@ -863,12 +863,19 @@ mod tests {
         assert_eq!(engine.detailed.allowances.max_repair_rounds, 0);
         assert_eq!(engine.detailed.max_concurrent_requests, 2);
         assert_eq!(engine.detailed.max_in_flight_bytes, 8 * 1024 * 1024);
+        for flag in [
+            "--detailed-max-model-calls",
+            "--detailed-max-source-windows",
+        ] {
+            assert!(
+                Cli::try_parse_from(["recap", "create", "--source", "video.mp4", flag, "0"])
+                    .is_ok()
+            );
+        }
         for (flag, value) in [
             ("--depth", "unknown"),
-            ("--detailed-max-model-calls", "0"),
             ("--detailed-max-concurrent-requests", "0"),
             ("--detailed-max-in-flight-bytes", "0"),
-            ("--detailed-max-source-windows", "0"),
             ("--detailed-max-repair-rounds", "-1"),
         ] {
             assert!(

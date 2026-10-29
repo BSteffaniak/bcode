@@ -162,9 +162,11 @@ pub(crate) fn detailed_windows(
         return Err(crate::model::ModelError::Cancelled.into());
     }
     let source_limit = policy.allowances.max_input_bytes / 4;
-    let total_limit = source_limit
-        .checked_mul(policy.allowances.max_source_windows)
-        .ok_or(CompositionError::Budget)?;
+    let total_limit = source_limit.saturating_mul(if policy.allowances.max_source_windows == 0 {
+        usize::MAX
+    } else {
+        policy.allowances.max_source_windows
+    });
     // Admission precedes cloning; never truncate a cue or a source tail.
     transcript_windows(
         &document.transcript,
@@ -186,8 +188,14 @@ pub(crate) fn detailed_windows(
         if cancel.is_cancelled() {
             return Err(crate::model::ModelError::Cancelled.into());
         }
-        if windows.len() >= policy.allowances.max_source_windows {
-            return Err(CompositionError::Budget);
+        if policy.allowances.max_source_windows > 0
+            && windows.len() >= policy.allowances.max_source_windows
+        {
+            return Err(CompositionError::Limit {
+                resource: "explicit source-window allowance",
+                actual: windows.len().saturating_add(1),
+                limit: policy.allowances.max_source_windows,
+            });
         }
         let end = start
             .saturating_add(policy.window_duration_ms)
@@ -829,7 +837,8 @@ mod tests {
         policy.allowances.max_input_bytes = 8_000;
         assert!(matches!(
             detailed_windows(&document, &policy, &Cancellation::default()),
-            Err(crate::composition::CompositionError::Budget)
+            Err(crate::composition::CompositionError::Budget
+                | crate::composition::CompositionError::Limit { .. })
         ));
     }
 
@@ -1000,7 +1009,8 @@ mod tests {
         };
         assert!(matches!(
             passage_units(&document, &policy, &Cancellation::default()),
-            Err(crate::composition::CompositionError::Budget)
+            Err(crate::composition::CompositionError::Budget
+                | crate::composition::CompositionError::Limit { .. })
         ));
     }
 
@@ -1027,13 +1037,15 @@ mod tests {
         policy.allowances.max_source_windows = 1;
         assert!(matches!(
             passage_units(&document, &policy, &cancel),
-            Err(crate::composition::CompositionError::Budget)
+            Err(crate::composition::CompositionError::Budget
+                | crate::composition::CompositionError::Limit { .. })
         ));
         policy.allowances.max_source_windows = 100;
         document.transcript[0].text = "x".repeat(policy.allowances.max_input_bytes);
         assert!(matches!(
             passage_units(&document, &policy, &cancel),
-            Err(crate::composition::CompositionError::Budget)
+            Err(crate::composition::CompositionError::Budget
+                | crate::composition::CompositionError::Limit { .. })
         ));
         cancel.cancel();
         assert!(matches!(

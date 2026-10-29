@@ -291,7 +291,7 @@ impl ModelExecutor for Scripted {
                 serde_json::from_value(request.input["source_unit"].clone()).unwrap();
             // The executable path must supply actual source, never an inventory proxy.
             assert_eq!(unit.primary.transcript[0].text, "Hello");
-            let response = match request.stage {
+            let mut response = match request.stage {
                 AnalysisStage::PassageComposition => {
                     AnalysisResponse::PassageComposition(PassageComposition {
                         title: "Source passage".into(),
@@ -334,6 +334,32 @@ impl ModelExecutor for Scripted {
                 }
                 _ => return Err(ModelError::InvalidResponse),
             };
+            let evidence_ids: Vec<_> = unit
+                .primary
+                .evidence
+                .iter()
+                .map(|item| item.id.clone())
+                .collect();
+            match &mut response {
+                AnalysisResponse::PassageComposition(value) => {
+                    for block in &mut value.blocks {
+                        block.evidence_ids.clone_from(&evidence_ids);
+                    }
+                }
+                AnalysisResponse::PassageReview(value) => {
+                    for finding in &mut value.findings {
+                        finding.evidence_ids.clone_from(&evidence_ids);
+                    }
+                }
+                AnalysisResponse::PassagePatch(value) => {
+                    for operation in &mut value.operations {
+                        for block in &mut operation.blocks {
+                            block.evidence_ids.clone_from(&evidence_ids);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
             Ok(response)
         })
     }
@@ -559,4 +585,70 @@ async fn cyclic_prose_is_rejected_without_mutating_source_or_spending_remaining_
     );
     assert_eq!(document, original);
     assert_eq!(executor.stages.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn long_source_completes_all_audits_past_old_call_and_window_ceilings() {
+    let (mut document, _, _) = fixture();
+    let count = 130_u64;
+    document.source.duration_ms = count * 10_000;
+    document.sections.clear();
+    document.transcript.clear();
+    let template = document.evidence[0].clone();
+    document.evidence.clear();
+    for index in 0..count {
+        let id = format!("cue-{index}");
+        let range = TimeRange {
+            start_ms: index * 10_000,
+            end_ms: index * 10_000 + 1000,
+        };
+        document
+            .transcript
+            .push(crate::contracts::TranscriptSegment {
+                id: id.clone(),
+                range,
+                text: "Hello".into(),
+            });
+        let mut evidence = template.clone();
+        evidence.id = format!("evidence-{index}");
+        evidence.range = range;
+        evidence.transcript_segment_ids = vec![id];
+        document.evidence.push(evidence);
+    }
+    let policy = DetailedPolicy {
+        inspect_visuals: false,
+        window_duration_ms: 10_000,
+        window_overlap_ms: 0,
+        ..DetailedPolicy::default()
+    };
+    let units = super::source::units(&document, &policy, &Cancellation::default()).unwrap();
+    assert_eq!(units.len(), 130);
+    let executor = ConcurrentWrites {
+        inner: Scripted {
+            stages: Mutex::new(vec![]),
+            cycle: false,
+        },
+        active: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+        source_units: units,
+        boundary_sources_seen: Mutex::new(vec![]),
+    };
+    let result = compose_passages(
+        &executor,
+        &document,
+        vec![],
+        document.intent.clone(),
+        None,
+        &policy,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.sections.len(), 130);
+    assert_eq!(executor.boundary_sources_seen.lock().unwrap().len(), 130);
+    assert!(executor.inner.stages.lock().unwrap().len() > 128);
+    assert!(
+        executor.peak.load(std::sync::atomic::Ordering::SeqCst) <= policy.max_concurrent_requests
+    );
+    result.validate().unwrap();
 }
