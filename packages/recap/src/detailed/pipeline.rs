@@ -1,5 +1,5 @@
 //! Focused pipeline stages; all inputs and prior revisions remain immutable.
-use super::stages::{append_limitations, audit, repair};
+use super::stages::{audit, repair};
 use super::validation::{check, exact_ids, validate_inventory};
 use super::{
     AnalysisResponse, AnalysisStage, Cancellation, CompositionError, DetailedPolicy,
@@ -351,7 +351,6 @@ pub(super) fn finish(
     previous: Option<&RecapDocument>,
     outline: Outline,
     chapters: Vec<ChapterComposition>,
-    limitations: Vec<String>,
 ) -> Result<RecapDocument> {
     let mut document = grounded.clone();
     document.intent = intent;
@@ -396,7 +395,6 @@ pub(super) fn finish(
             .checked_add(1)
             .ok_or(CompositionError::Invalid("revision exhausted"))
     })?;
-    append_limitations(&mut document, limitations)?;
     document.validate()?;
     Ok(document)
 }

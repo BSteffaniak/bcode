@@ -6,7 +6,7 @@ use serde_json::json;
 use crate::{
     analysis_contracts::{AnalysisResponse, AnalysisStage, DetailedPolicy},
     composition::CompositionError,
-    contracts::{Block, BlockContent, GenerationIntent, RecapDocument, Section},
+    contracts::{GenerationIntent, RecapDocument, Section},
     detailed::{Operation, execution::PreparedCall},
     model::{ImageAsset, ModelError, ModelExecutor},
     passage_contracts::{Passage, PassageReview, SourceUnit},
@@ -89,14 +89,7 @@ pub async fn compose_passages(
     check(!units.is_empty(), "no passage source units")?;
     let mut execution = Operation::new(executor, policy, cancel);
     let mut passages = Vec::new();
-    let mut limitations = BTreeSet::from([String::from(
-        "Source and prose were reviewed, but reviews do not prove semantic completeness. Sampled frames do not establish complete visual or motion coverage.",
-    )]);
-    if !policy.inspect_visuals {
-        limitations.insert(
-            "Visual inspection was disabled; visual-only information may be absent.".into(),
-        );
-    }
+    let mut limitations = BTreeSet::new();
     let writes = units.iter().map(|unit| {
         PreparedCall::with_policy(
             AnalysisStage::PassageComposition,
@@ -138,7 +131,10 @@ pub async fn compose_passages(
     )
     .await?;
     cancelled(cancel)?;
-    let document = assemble(grounded, intent, previous, passages, limitations)?;
+    cancel.emit(crate::diagnostics::Event::ReviewLimitations {
+        count: limitations.len(),
+    });
+    let document = assemble(grounded, intent, previous, passages)?;
     cancelled(cancel)?;
     Ok(document)
 }
@@ -222,7 +218,6 @@ fn assemble(
     intent: GenerationIntent,
     previous: Option<&RecapDocument>,
     passages: Vec<Passage>,
-    limitations: BTreeSet<String>,
 ) -> Result<RecapDocument> {
     let mut document = grounded.clone();
     document.intent = intent;
@@ -240,20 +235,6 @@ fn assemble(
             .checked_add(1)
             .ok_or(CompositionError::Invalid("revision exhausted"))
     })?;
-    let last = document
-        .sections
-        .last_mut()
-        .ok_or(CompositionError::Invalid("no passages"))?;
-    last.blocks.push(Block {
-        id: "passage-inspection-limitations".into(),
-        evidence_ids: vec![],
-        content: BlockContent::Text {
-            text: format!(
-                "Inspection limitations (not a completeness claim):\n{}",
-                limitations.into_iter().collect::<Vec<_>>().join("\n")
-            ),
-        },
-    });
     document.validate()?;
     Ok(document)
 }

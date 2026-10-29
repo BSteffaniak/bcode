@@ -369,6 +369,12 @@ async fn direct_source_write_review_patch_rereview_final_review_assembles_withou
             text: "Hello, with example".into()
         }
     );
+    assert_eq!(result.sections.len(), 1);
+    assert_eq!(
+        result.sections[0].blocks.len(),
+        1,
+        "review limitations must not become recap blocks"
+    );
     assert_ne!(result.sections[0].blocks[0].id, "model-owned");
     assert_eq!(
         *executor.stages.lock().unwrap(),

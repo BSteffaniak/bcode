@@ -308,6 +308,20 @@ pub struct RecapDocument {
 }
 
 impl RecapDocument {
+    /// Remove only the recognizable host-generated process notes from older recaps.
+    /// Source-authored caveats and limitations remain ordinary content.
+    pub fn remove_generation_notes(&mut self) {
+        self.sections.retain(|section| {
+            !(section.title == "Visual observation limits"
+                && section.id.starts_with("host-visual-observations-"))
+        });
+        for section in &mut self.sections {
+            section.blocks.retain(|block| !matches!(&block.content, BlockContent::Text { text }
+                if (block.id == "passage-inspection-limitations" && text.starts_with("Inspection limitations (not a completeness claim):"))
+                || (block.id.starts_with("detailed-coverage-limitations-") && text.starts_with("Coverage limitations (not a claim of complete source coverage):"))));
+        }
+    }
+
     /// Decode a document after checking its compatibility header first.
     /// The caller must bound input bytes before invoking this method.
     ///

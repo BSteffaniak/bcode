@@ -48,7 +48,7 @@ Reports exclude prompts, captions, source URLs, signed URLs, frames, credentials
 
 `Detailed` is a source-information-preserving readable adaptation, while Brief and Standard retain selective recap behavior. The portable library owns a multi-stage pipeline behind an injected typed analysis executor: window inventories, inspected visual observations, item-accounted chapter planning, chapter composition, source-based auditing, and bounded targeted repair. Final assembly does not summarize chapters again. Chapter count follows source content rather than a fixed editorial cap.
 
-Source windows and information items carry host-validated evidence identities. Extraction and model-declared coverage are not proof of semantic completeness: audits compare drafts to source evidence, and the reader must retain unresolved acquisition or inspection limitations. Sampled frames do not establish complete visual coverage. Focus changes emphasis rather than implicitly restricting Detailed's coverage.
+Source windows and information items carry host-validated evidence identities. Extraction and model-declared coverage are not proof of semantic completeness: audits compare drafts to source evidence, and operation diagnostics retain bounded acquisition/inspection facts separately from recap content. Sampled frames do not establish complete visual coverage. Focus changes emphasis rather than implicitly restricting Detailed's coverage.
 
 Resource allowances are distinct from editorial coverage. Independent extraction and chapter calls execute in pre-reserved bounded waves, with deterministic result ordering and no automatic retry. Each standalone request uses its own SDK runtime turn owner; it retains the configured provider, authentication context, model selection and policy rather than sharing a superseding turn scope. In-flight byte reservations cover dispatched request/image payloads and allowed responses, not total process memory.
 
@@ -80,7 +80,7 @@ Assembly preserves source order without another summarization pass. Independent 
 reviews receive primary source, exact adjacent source units labeled context-only, and
 adjacent prose. Final discrepancies use revision-checked local patches within the
 same bounded allowance, followed by another complete boundary review sweep.
-Unresolved or cyclic candidates fail closed. Review limitations remain visible in the document. Clean reviews
+Unresolved or cyclic candidates fail closed. Review limitation counts and visual-sampling facts are emitted through operation diagnostics, never appended as source chapters or prose. Free-form reviewer notes are not copied into public diagnostics because they may contain source text. Clean reviews
 and passing scripted tests are not proof of semantic completeness.
 
 Refinement accepts compatible legacy documents, reusing immutable grounding and

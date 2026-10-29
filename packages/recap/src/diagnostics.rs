@@ -93,6 +93,14 @@ pub enum Event {
         exit_code: Option<i32>,
         http_status: Option<u16>,
     },
+    /// Count-only review limitations; free-form model notes may contain source text.
+    ReviewLimitations { count: usize },
+    /// Bounded visual sampling facts, separate from recap content.
+    VisualSampling {
+        frames: usize,
+        effective_limit: usize,
+        policy_limited: bool,
+    },
     /// Terminal operation event.
     Terminal { status: Status, code: String },
 }

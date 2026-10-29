@@ -698,50 +698,6 @@ fn same_illustration_media(prior: &Block, replacement: &Block) -> bool {
     }
 }
 
-pub(super) fn append_limitations(
-    document: &mut RecapDocument,
-    limitations: Vec<String>,
-) -> Result<()> {
-    if limitations.is_empty() {
-        return Ok(());
-    }
-    let unique: BTreeSet<_> = limitations.into_iter().collect();
-    let text = format!(
-        "Coverage limitations (not a claim of complete source coverage):\n{}",
-        unique.into_iter().collect::<Vec<_>>().join("\n")
-    );
-    let existing: BTreeSet<_> = document
-        .sections
-        .iter()
-        .flat_map(|section| section.blocks.iter().map(|block| block.id.as_str()))
-        .collect();
-    let mut index = 0usize;
-    let block_id = loop {
-        let candidate = format!("detailed-coverage-limitations-{index}");
-        if !existing.contains(candidate.as_str()) {
-            break candidate;
-        }
-        index = index.checked_add(1).ok_or(CompositionError::Budget)?;
-    };
-    let evidence_ids = document
-        .evidence
-        .iter()
-        .map(|item| item.id.clone())
-        .collect();
-    let section = document
-        .sections
-        .last_mut()
-        .ok_or(CompositionError::Invalid(
-            "no chapters for coverage limitations",
-        ))?;
-    section.blocks.push(Block {
-        id: block_id,
-        evidence_ids,
-        content: BlockContent::Text { text },
-    });
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn apply_repair(
     document: &RecapDocument,

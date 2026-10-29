@@ -522,7 +522,10 @@ async fn execute_job(
             check_cancel(cancel)?;
             let result = refine(store.clone(), &value, &executor, cancel, progress)
                 .await
-                .map(|document| Outcome::Document(Box::new(document)))
+                .map(|mut document| {
+                    document.remove_generation_notes();
+                    Outcome::Document(Box::new(document))
+                })
                 .map_err(|error| model_job_error(error, &executor));
             drop(executor);
             result
@@ -530,7 +533,10 @@ async fn execute_job(
         #[cfg(feature = "tui")]
         Request::Load { id } => store
             .load(&id)
-            .map(|document| Outcome::Document(Box::new(document)))
+            .map(|mut document| {
+                document.remove_generation_notes();
+                Outcome::Document(Box::new(document))
+            })
             .map_err(Error::from),
         Request::Export { id, options } => {
             let document = store.load(&id)?;
@@ -611,7 +617,10 @@ async fn create_job(
     check_cancel(cancel)?;
     let result = create(store.clone(), &value, &executor, cancel, progress)
         .await
-        .map(|document| Outcome::Document(Box::new(document)))
+        .map(|mut document| {
+            document.remove_generation_notes();
+            Outcome::Document(Box::new(document))
+        })
         .map_err(|error| model_job_error(error, &executor));
     drop(executor);
     result

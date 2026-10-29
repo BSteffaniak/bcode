@@ -165,7 +165,10 @@ pub async fn compose_detailed(
     )
     .await?;
     op.cancelled()?;
-    pipeline::finish(grounded, intent, previous, outline, chapters, limitations)
+    cancel.emit(crate::diagnostics::Event::ReviewLimitations {
+        count: limitations.len(),
+    });
+    pipeline::finish(grounded, intent, previous, outline, chapters)
 }
 
 fn namespace_items(items: &mut [InformationItem], prefix: &str) {

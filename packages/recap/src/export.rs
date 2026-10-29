@@ -130,6 +130,9 @@ pub fn export_html(
     budget: ExportBudget,
 ) -> Result<HtmlExport, ExportError> {
     document.validate()?;
+    let mut reader_document = document.clone();
+    reader_document.remove_generation_notes();
+    let document = &reader_document;
     let metadata = fs::symlink_metadata(asset_root).map_err(|_| ExportError::InvalidAssetRoot)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(ExportError::InvalidAssetRoot);
@@ -777,6 +780,48 @@ mod tests {
             }],
         };
         (root, document)
+    }
+
+    #[test]
+    fn legacy_process_notes_are_not_reader_content_and_source_caveats_survive() {
+        let (root, mut document) = fixture();
+        let source_caveat = Block {
+            id: "source-caveat".into(),
+            evidence_ids: vec![],
+            content: BlockContent::Text {
+                text: "The trial has limitations: only five samples.".into(),
+            },
+        };
+        document.sections[0].blocks.push(source_caveat);
+        document.sections[0].blocks.push(Block {
+            id: "passage-inspection-limitations".into(),
+            evidence_ids: vec![],
+            content: BlockContent::Text {
+                text: "Inspection limitations (not a completeness claim): INTERNAL_REVIEW_NOTE"
+                    .into(),
+            },
+        });
+        document.sections.push(Section {
+            id: "host-visual-observations-0".into(),
+            title: "Visual observation limits".into(),
+            blocks: vec![Block {
+                id: "host-visual-observations-text-0".into(),
+                evidence_ids: vec![],
+                content: BlockContent::Text {
+                    text: "INTERNAL_SAMPLING_NOTE".into(),
+                },
+            }],
+        });
+        let original = document.clone();
+        let export = export_html(&document, root.path(), ExportBudget::default()).unwrap();
+        assert!(!export.html.contains("INTERNAL_REVIEW_NOTE"));
+        assert!(!export.html.contains("INTERNAL_SAMPLING_NOTE"));
+        assert!(
+            export
+                .html
+                .contains("The trial has limitations: only five samples.")
+        );
+        assert_eq!(document, original);
     }
 
     #[test]

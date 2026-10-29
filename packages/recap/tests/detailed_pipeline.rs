@@ -613,8 +613,8 @@ async fn missing_late_visual_only_window_is_repaired_and_prior_is_immutable() {
     assert_eq!(grounded, before);
     assert!(result.sections.iter().flat_map(|section| &section.blocks).any(|block|
         matches!(&block.content, BlockContent::Text { text } if text.contains("never retry after commit"))));
-    assert!(result.sections.iter().flat_map(|section| &section.blocks).any(|block|
-        matches!(&block.content, BlockContent::Text { text } if text.contains("Coverage limitations") && text.contains("unreadable"))));
+    assert!(!result.sections.iter().flat_map(|section| &section.blocks).any(|block|
+        matches!(&block.content, BlockContent::Text { text } if text.contains("Coverage limitations"))));
     assert!(
         model
             .calls
