@@ -694,6 +694,48 @@ pub(super) async fn typed_provider_fixture_with_target(
 }
 
 #[tokio::test]
+async fn xray_background_context_uses_current_canonical_association_without_task_local() {
+    let (_root, _sessions_root, state, _) = typed_provider_fixture().await;
+    let parent = status(&state, "new")
+        .await
+        .expect("status")
+        .expect("run")
+        .parent_session_id
+        .expect("association");
+    let context = crate::xray_workflow::originating_run_context(&state, "new")
+        .await
+        .expect("canonical context");
+    assert_eq!(context.correlation().session_id, parent);
+    assert_eq!(context.correlation().run_id.as_deref(), Some("new"));
+    let foreign = state.xray.context(bcode_xray_models::XrayCorrelation {
+        session_id: crate::SessionId::new().to_string(),
+        turn_id: Some("foreign-turn".into()),
+        ..Default::default()
+    });
+    foreign
+        .scope(async {
+            let context = crate::xray_workflow::originating_run_context(&state, "new")
+                .await
+                .expect("canonical context");
+            assert_eq!(context.correlation().session_id, parent);
+            assert!(context.correlation().turn_id.is_none());
+        })
+        .await;
+    assert!(
+        crate::xray_workflow::originating_run_context(&state, "missing")
+            .await
+            .is_none()
+    );
+    assert_eq!(detach(&state, "new").await.expect("detach"), Some(true));
+    assert!(
+        crate::xray_workflow::originating_run_context(&state, "new")
+            .await
+            .is_none(),
+        "detached runs must not reuse historical parent provenance"
+    );
+}
+
+#[tokio::test]
 async fn typed_shared_parent_uses_real_prompt_owner_and_retains_canonical_link() {
     let _workflow_runtime_guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     let (_root, _sessions_root, state, _) = typed_provider_fixture_with_target(

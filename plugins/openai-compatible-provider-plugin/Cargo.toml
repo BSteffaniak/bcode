@@ -28,6 +28,8 @@ bcode_provider_auth_models = { workspace = true }
 bcode_session_import = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool = { workspace = true }
+bcode_xray = { workspace = true }
+bcode_xray_models = { workspace = true }
 flate2 = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }

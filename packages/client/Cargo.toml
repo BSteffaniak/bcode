@@ -35,8 +35,13 @@ bcode_workflow             = { workspace = true }
 bcode_workflow_store       = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
 bcode_worktree_models      = { workspace = true }
+bcode_xray                 = { workspace = true }
+bcode_xray_models          = { workspace = true }
+hex                        = { workspace = true }
+reqwest                    = { workspace = true, features = ["json", "stream"] }
 serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json                 = { workspace = true }
+sha2                       = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, features = ["sync", "time"] }
 tracing                    = { workspace = true }

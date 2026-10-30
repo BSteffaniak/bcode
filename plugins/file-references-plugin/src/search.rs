@@ -476,6 +476,7 @@ mod tests {
     fn nested_bound_host_search_and_unavailable_without_fallback() {
         let request = request("@s");
         let context = NativeServiceContext {
+            diagnostics: None,
             plugin_id: "bcode.file-references".into(),
             request: ServiceRequest {
                 interface_id: "bcode.composer/v1".into(),

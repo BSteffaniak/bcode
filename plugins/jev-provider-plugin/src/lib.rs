@@ -5,6 +5,8 @@
 //! `TypeSafe` Jev adapter for Bcode's provider-neutral judgement interface.
 //! Credentials and HTTP payloads are private to this plugin; errors never include upstream bodies.
 
+mod diagnostics;
+
 use bcode_model::ProviderRequestContext;
 use bcode_model::judgement::{
     self, Answer, Model, ModelList, ProviderRequest, Question, QuestionKind, Response, Usage,
@@ -152,7 +154,10 @@ fn invoke(request: &ServiceRequest, cancellation: &ServiceCancellation) -> Servi
             let Ok(envelope) = request.payload_json::<ProviderRequest>() else {
                 return ServiceResponse::error("invalid_request", "invalid judgement request");
             };
-            match runtime.block_on(cancel_on_signal(judge(&envelope), cancellation)) {
+            match runtime.block_on(diagnostics::scope(cancel_on_signal(
+                judge(&envelope),
+                cancellation,
+            ))) {
                 Ok(result) => encode(&result),
                 Err(error) => ServiceResponse::error(error, error),
             }
@@ -541,6 +546,7 @@ async fn judge(envelope: &ProviderRequest) -> Result<Response, &'static str> {
     {
         return Err("provider request exceeds size limit");
     }
+    diagnostics::record("adapted_request", &payload);
     let response = http_client()?
         .post(url)
         .bearer_auth(key)
@@ -550,6 +556,7 @@ async fn judge(envelope: &ProviderRequest) -> Result<Response, &'static str> {
         .map_err(|error| transport_error(&error))?;
     check_status(response.status())?;
     let bytes = read_bounded(response, "judgement provider response exceeds size limit").await?;
+    diagnostics::bytes("received_record", &bytes);
     let wire: JudgeWire =
         serde_json::from_slice(&bytes).map_err(|_| "invalid judgement provider response")?;
     if wire.model.is_empty()

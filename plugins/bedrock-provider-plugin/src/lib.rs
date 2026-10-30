@@ -4,6 +4,9 @@
 
 //! Amazon Bedrock Runtime and Mantle model provider plugin for Bcode.
 
+mod converse_diagnostics;
+mod diagnostics;
+
 #[cfg(feature = "static-bundled")]
 mod cli;
 mod usage;
@@ -152,11 +155,11 @@ impl BedrockTurnExecutor for AwsBedrockTurnExecutor {
             turn: turn.clone(),
             completed: false,
         };
-        if let Err(error) = runtime.try_spawn(async move {
+        if let Err(error) = runtime.try_spawn(diagnostics::scope(async move {
             stream_bedrock_turn(&request, &completion.turn, discovery).await;
             completion.completed = true;
             drop(completion);
-        }) {
+        })) {
             push_runtime_error(&turn, &error.to_string());
         }
     }
@@ -822,8 +825,16 @@ async fn stream_bedrock_converse_turn(
         if let Some(additional_fields) = bedrock_request.additional_model_request_fields {
             builder = builder.additional_model_request_fields(additional_fields);
         }
+        diagnostics::record(
+            "adapted_request",
+            &converse_diagnostics::Wire(builder.as_input()),
+        );
         match builder.send().await {
             Ok(response) => {
+                diagnostics::record(
+                    "received_response",
+                    &converse_diagnostics::ResponseRecord::default(),
+                );
                 return read_bedrock_stream(response.stream, turn, name_map.clone()).await;
             }
             Err(error) => {
@@ -903,6 +914,12 @@ async fn stream_mantle_anthropic_turn(
     bound_anthropic_messages_cache_points(&mut provider_request);
     let mut last_error = None;
     for model_id in &selection.model_ids {
+        let payload = build_mantle_anthropic_request(
+            &provider_request,
+            model_id,
+            settings.region.as_deref(),
+        )?;
+        diagnostics::record("adapted_request", &payload);
         let response = request_builder
             .try_clone()
             .ok_or_else(|| {
@@ -912,11 +929,7 @@ async fn stream_mantle_anthropic_turn(
                     "failed to prepare Bedrock Mantle request",
                 )
             })?
-            .json(&build_mantle_anthropic_request(
-                &provider_request,
-                model_id,
-                settings.region.as_deref(),
-            )?)
+            .json(&payload)
             .send()
             .await
             .map_err(|error| mantle_network_error("request_failed", &error))?;
@@ -1263,6 +1276,8 @@ async fn stream_mantle_openai_turn(
         .header("user-agent", "bcode/0.0.1");
     let mut last_error = None;
     for model_id in &selection.model_ids {
+        let payload = build_mantle_openai_request(request, model_id)?;
+        diagnostics::record("adapted_request", &payload);
         let response = request_builder
             .try_clone()
             .ok_or_else(|| {
@@ -1272,7 +1287,7 @@ async fn stream_mantle_openai_turn(
                     "failed to prepare Bedrock Mantle request",
                 )
             })?
-            .json(&build_mantle_openai_request(request, model_id)?)
+            .json(&payload)
             .send()
             .await
             .map_err(|error| mantle_network_error("request_failed", &error))?;
@@ -1413,6 +1428,7 @@ fn process_mantle_openai_line<'a>(
 ) -> Result<Option<StreamOutcome>, ProviderError> {
     use bcode_openai_responses as responses;
 
+    diagnostics::stream_line(line);
     let recorder = state.usage.get_or_insert_with(|| {
         let mut requested = BTreeMap::new();
         if let Some(tier) = requested_service_tier {
@@ -2061,6 +2077,7 @@ async fn send_bedrock_messages_request(
     synthetic: Option<SyntheticStructuredOutput>,
 ) -> Result<StreamOutcome, ProviderError> {
     let body = build_anthropic_messages_request(request, model_id, region)?;
+    diagnostics::bytes("adapted_request", &body);
     let response = client
         .invoke_model_with_response_stream()
         .model_id(model_id)
@@ -2412,6 +2429,7 @@ impl AnthropicMessagesAccumulator {
         json: &str,
         turn: &TurnState,
     ) -> Result<Option<StreamOutcome>, ProviderError> {
+        diagnostics::bytes("stream_record", json.as_bytes());
         self.usage
             .set_capture_enabled(turn.original_usage_enabled());
         self.usage_sink = Some(turn.clone());
@@ -2820,6 +2838,7 @@ async fn read_bedrock_stream(
                     }
                     return Ok(accumulator.finish_outcome());
                 };
+                diagnostics::record("stream_record", &converse_diagnostics::StreamRecord(&event));
                 if let Some(outcome) = accumulator.process_event(event, turn)? {
                     return Ok(outcome);
                 }
@@ -7435,6 +7454,7 @@ mod tests {
                 turn.push(ProviderTurnEvent::TurnFinished { stop_reason });
             }
             let context = NativeServiceContext {
+                diagnostics: None,
                 plugin_id: PROVIDER_ID.to_string(),
                 request: ServiceRequest {
                     interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),
@@ -10159,6 +10179,7 @@ mod tests {
             R: serde::de::DeserializeOwned,
         {
             let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
+                diagnostics: None,
                 plugin_id: PROVIDER_ID.to_string(),
                 request: ServiceRequest {
                     interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),

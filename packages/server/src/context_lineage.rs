@@ -119,6 +119,7 @@ pub fn final_lineage(
     messages: &[ModelMessage],
     optional: &Incorporated,
 ) -> Option<RequestContextLineage> {
+    super::xray_context::final_messages(messages);
     let mut lineage = RequestContextLineage {
         version: 1,
         request_ordinal: ordinal()?,

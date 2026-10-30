@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Portable live diagnostic observation contracts for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "diagnostics", "models"]
+license     = { workspace = true }
+name        = "bcode_xray_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -47,9 +47,12 @@ bcode_workflow = { workspace = true }
 bcode_workflow_discovery = { workspace = true }
 bcode_workflow_store = { workspace = true }
 bcode_worktree_models = { workspace = true }
+bcode_xray = { workspace = true }
+bcode_xray_models = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events"] }
+libc = { workspace = true }
 open = { workspace = true, optional = true }
 rand = { workspace = true }
 rpassword = { workspace = true }

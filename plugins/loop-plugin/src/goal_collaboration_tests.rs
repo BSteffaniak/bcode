@@ -7,6 +7,7 @@ fn collaboration_cases() -> Vec<serde_json::Value> {
 
 fn prepare_group(value: serde_json::Value) -> bcode_workflow::WorkflowRunGraphEditBatch {
     let response = bcode_workflow_plugin::WorkflowPlugin.invoke_service(NativeServiceContext {
+        diagnostics: None,
         plugin_id: "bcode.workflow".into(),
         request: ServiceRequest {
             interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.into(),

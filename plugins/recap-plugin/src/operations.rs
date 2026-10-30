@@ -353,6 +353,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("video.mp4"), b"not-probed").unwrap();
         let context = NativeServiceContext {
+            diagnostics: None,
             plugin_id: crate::PLUGIN_ID.into(),
             request: ServiceRequest {
                 interface_id: bcode_command::COMMAND_INTERFACE_ID.into(),

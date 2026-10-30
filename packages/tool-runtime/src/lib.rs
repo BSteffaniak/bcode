@@ -15,7 +15,77 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore};
+
+struct ProcessObservation {
+    capture: Option<bcode_xray::CaptureContext>,
+    id: ToolExecutionId,
+    started: Instant,
+    finished: bool,
+}
+
+impl ProcessObservation {
+    fn new(id: ToolExecutionId) -> Self {
+        let observation = Self {
+            capture: bcode_xray::CaptureContext::current(),
+            id,
+            started: Instant::now(),
+            finished: false,
+        };
+        observation.emit("queued", &serde_json::Value::Null);
+        observation
+    }
+
+    fn emit(&self, name: &str, data: &serde_json::Value) {
+        if let Some(capture) = &self.capture {
+            capture.emit("tool_process", name, serde_json::json!({
+                "execution_id": self.id.get(),
+                "elapsed_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "details": data,
+            }), false);
+        }
+    }
+
+    fn finish(&mut self, outcome: &str) {
+        self.finished = true;
+        self.emit("finished", &serde_json::json!({"outcome": outcome}));
+    }
+}
+
+impl Drop for ProcessObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit(
+                "unfinished",
+                &serde_json::json!({"cleanup_confirmed": false}),
+            );
+        }
+    }
+}
+
+struct OutputReaderCleanup {
+    stdout: tokio::task::AbortHandle,
+    stderr: tokio::task::AbortHandle,
+}
+
+impl Drop for OutputReaderCleanup {
+    fn drop(&mut self) {
+        // JoinHandle drop detaches: cancellation/error must not orphan pipe readers.
+        self.stdout.abort();
+        self.stderr.abort();
+    }
+}
+
+async fn process_capture_scope<F: std::future::Future>(
+    capture: Option<bcode_xray::CaptureContext>,
+    future: F,
+) -> F::Output {
+    if let Some(capture) = capture {
+        capture.scope(future).await
+    } else {
+        future.await
+    }
+}
 
 /// Unique managed tool execution identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -110,16 +180,97 @@ struct RuntimeMetrics {
     cancelled: u64,
 }
 
+#[derive(Debug, Default)]
+struct ProcessCancellation {
+    requested: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl ProcessCancellation {
+    fn cancel(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.requested.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RunningExecution {
-    cancel: Arc<Notify>,
+    cancel: Arc<ProcessCancellation>,
+}
+
+/// Synchronous, short accounting critical sections allow caller-abort cleanup in `Drop`.
+struct ExecutionAccounting<'a> {
+    runtime: &'a ToolExecutionRuntime,
+    id: ToolExecutionId,
+    running: bool,
+    finished: bool,
+}
+
+impl ExecutionAccounting<'_> {
+    fn start_running(&mut self) {
+        let mut metrics = self
+            .runtime
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.queued = metrics.queued.saturating_sub(1);
+        metrics.running += 1;
+        drop(metrics);
+        self.running = true;
+    }
+
+    fn finish(&mut self, outcome: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.runtime
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+        let mut metrics = self
+            .runtime
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.running {
+            metrics.running = metrics.running.saturating_sub(1);
+        } else {
+            metrics.queued = metrics.queued.saturating_sub(1);
+        }
+        match outcome {
+            "completed" | "timed_out" => metrics.completed += 1,
+            "cancelled" | "abandoned" => metrics.cancelled += 1,
+            _ => metrics.failed += 1,
+        }
+    }
+}
+
+impl Drop for ExecutionAccounting<'_> {
+    fn drop(&mut self) {
+        // Caller abandonment cancels local work; it does not establish an OS outcome.
+        self.finish("abandoned");
+    }
 }
 
 /// Cancellation handle for a managed tool execution.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionCancelHandle {
     id: ToolExecutionId,
-    notify: Arc<Notify>,
+    notify: Arc<ProcessCancellation>,
 }
 
 impl ToolExecutionCancelHandle {
@@ -131,7 +282,7 @@ impl ToolExecutionCancelHandle {
 
     /// Request cancellation of the managed execution.
     pub fn cancel(&self) {
-        self.notify.notify_waiters();
+        self.notify.cancel();
     }
 }
 
@@ -153,8 +304,8 @@ pub enum ToolRuntimeError {
 pub struct ToolExecutionRuntime {
     next_id: Arc<AtomicU64>,
     semaphore: Arc<Semaphore>,
-    metrics: Arc<Mutex<RuntimeMetrics>>,
-    running: Arc<Mutex<BTreeMap<ToolExecutionId, RunningExecution>>>,
+    metrics: Arc<std::sync::Mutex<RuntimeMetrics>>,
+    running: Arc<std::sync::Mutex<BTreeMap<ToolExecutionId, RunningExecution>>>,
 }
 
 impl ToolExecutionRuntime {
@@ -165,51 +316,63 @@ impl ToolExecutionRuntime {
         Self {
             next_id: Arc::new(AtomicU64::new(1)),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            metrics: Arc::new(Mutex::new(RuntimeMetrics {
+            metrics: Arc::new(std::sync::Mutex::new(RuntimeMetrics {
                 running: 0,
                 queued: 0,
                 completed: 0,
                 failed: 0,
                 cancelled: 0,
             })),
-            running: Arc::new(Mutex::new(BTreeMap::new())),
+            running: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
-    /// Return a runtime status snapshot.
-    pub async fn status(&self) -> ToolRuntimeStatus {
-        let metrics = self.metrics.lock().await;
-        ToolRuntimeStatus {
+    /// Return an immediately ready runtime status snapshot.
+    #[must_use = "await the snapshot to consume its value"]
+    pub fn status(&self) -> impl std::future::Future<Output = ToolRuntimeStatus> {
+        let metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = ToolRuntimeStatus {
             running: metrics.running,
             queued: metrics.queued,
             completed: metrics.completed,
             failed: metrics.failed,
             cancelled: metrics.cancelled,
-        }
+        };
+        drop(metrics);
+        std::future::ready(status)
     }
 
-    /// Create a cancellation handle for the next managed process execution.
+    /// Reserve a unique identifier and cancellation handle for a managed execution.
     #[must_use]
     pub fn cancellation_handle(&self) -> ToolExecutionCancelHandle {
         ToolExecutionCancelHandle {
-            id: ToolExecutionId(self.next_id.load(Ordering::Relaxed)),
-            notify: Arc::new(Notify::new()),
+            id: ToolExecutionId(self.next_id.fetch_add(1, Ordering::Relaxed)),
+            notify: Arc::new(ProcessCancellation::default()),
         }
     }
 
-    /// Cancel a currently running execution by ID.
-    pub async fn cancel(&self, id: ToolExecutionId) -> bool {
+    /// Cancel a queued or currently running execution by ID and return a ready result.
+    ///
+    /// Cancellation is signalled immediately when this method is called.
+    #[must_use = "await the result to determine whether the execution was registered"]
+    pub fn cancel(&self, id: ToolExecutionId) -> impl std::future::Future<Output = bool> {
         let cancel = {
-            let running = self.running.lock().await;
+            let running = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             running
                 .get(&id)
                 .map(|execution| Arc::clone(&execution.cancel))
         };
         if let Some(cancel) = cancel {
-            cancel.notify_waiters();
-            return true;
+            cancel.cancel();
+            return std::future::ready(true);
         }
-        false
+        std::future::ready(false)
     }
 
     /// Run a process to completion under runtime accounting and concurrency limits.
@@ -265,42 +428,67 @@ impl ToolExecutionRuntime {
             ));
         }
         let id = cancel.id;
+        let mut observation = ProcessObservation::new(id);
         self.next_id
             .fetch_max(id.0.saturating_add(1), Ordering::Relaxed);
         let cancel_notify = Arc::clone(&cancel.notify);
         {
-            let mut metrics = self.metrics.lock().await;
+            let mut metrics = self
+                .metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             metrics.queued += 1;
         }
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ToolRuntimeError::Cancelled)?;
-        {
-            let mut metrics = self.metrics.lock().await;
-            metrics.queued = metrics.queued.saturating_sub(1);
-            metrics.running += 1;
-        }
-        self.running.lock().await.insert(
+        let mut accounting = ExecutionAccounting {
+            runtime: self,
             id,
-            RunningExecution {
-                cancel: Arc::clone(&cancel_notify),
+            running: false,
+            finished: false,
+        };
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id,
+                RunningExecution {
+                    cancel: Arc::clone(&cancel_notify),
+                },
+            );
+        let permit = tokio::select! {
+            biased;
+            () = cancel_notify.cancelled() => {
+                observation.emit("cancellation_observed", &serde_json::json!({"phase": "queued"}));
+                accounting.finish("cancelled");
+                observation.emit("retired", &serde_json::json!({"spawned": false}));
+                observation.finish("cancelled_before_spawn");
+                return Err(ToolRuntimeError::Cancelled);
+            }
+            permit = self.semaphore.clone().acquire_owned() => if let Ok(permit) = permit {
+                permit
+            } else {
+                accounting.finish("cancelled");
+                observation.emit("retired", &serde_json::json!({"spawned": false}));
+                observation.finish("admission_closed");
+                return Err(ToolRuntimeError::Cancelled);
             },
-        );
+        };
+        accounting.start_running();
+        observation.emit("started", &serde_json::Value::Null);
         let result = run_process_inner(id, request, cancel_notify, on_output).await;
         drop(permit);
-        self.running.lock().await.remove(&id);
-        {
-            let mut metrics = self.metrics.lock().await;
-            metrics.running = metrics.running.saturating_sub(1);
-            match &result {
-                Ok(result) if result.cancelled => metrics.cancelled += 1,
-                Ok(_) => metrics.completed += 1,
-                Err(_) => metrics.failed += 1,
-            }
-        }
+        let outcome = match &result {
+            Ok(result) if result.cancelled => "cancelled",
+            Ok(result) if result.timed_out => "timed_out",
+            Ok(_) => "completed",
+            Err(ToolRuntimeError::Cancelled) => "cancelled",
+            Err(_) => "failed",
+        };
+        accounting.finish(outcome);
+        observation.emit(
+            "retired",
+            &serde_json::json!({"running_registration_removed": true}),
+        );
+        observation.finish(outcome);
         result
     }
 }
@@ -311,12 +499,7 @@ impl Default for ToolExecutionRuntime {
     }
 }
 
-async fn run_process_inner(
-    id: ToolExecutionId,
-    request: ProcessExecutionRequest,
-    cancel: Arc<Notify>,
-    on_output: impl FnMut(ProcessOutputEvent) + Send + 'static,
-) -> Result<ProcessExecutionResult, ToolRuntimeError> {
+fn process_command(request: &ProcessExecutionRequest) -> Command {
     let mut command = Command::new(&request.program);
     command
         .args(&request.args)
@@ -326,14 +509,27 @@ async fn run_process_inner(
     if !request.inherit_environment {
         command.env_clear();
     }
-    command.envs(request.environment);
-    for name in request.remove_environment {
+    command.envs(&request.environment);
+    for name in &request.remove_environment {
         command.env_remove(name);
     }
-    if let Some(cwd) = request.cwd {
+    if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
     configure_command_for_timeout(&mut command);
+    command
+}
+
+async fn run_process_inner(
+    id: ToolExecutionId,
+    request: ProcessExecutionRequest,
+    cancel: Arc<ProcessCancellation>,
+    on_output: impl FnMut(ProcessOutputEvent) + Send + 'static,
+) -> Result<ProcessExecutionResult, ToolRuntimeError> {
+    if cancel.requested.load(Ordering::Acquire) {
+        return Err(ToolRuntimeError::Cancelled);
+    }
+    let mut command = process_command(&request);
     let started = Instant::now();
     let mut child = command.kill_on_drop(true).spawn()?;
     #[cfg(windows)]
@@ -343,32 +539,65 @@ async fn run_process_inner(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let output_callback = Arc::new(std::sync::Mutex::new(on_output));
-    let stdout_task = tokio::spawn(read_limited(
-        id,
-        ProcessOutputStream::Stdout,
-        stdout,
-        request.max_output_bytes,
-        Arc::clone(&output_callback),
+    let capture = bcode_xray::CaptureContext::current();
+    if let Some(capture) = &capture {
+        capture.emit(
+            "tool_process",
+            "spawned",
+            serde_json::json!({"execution_id": id.get()}),
+            false,
+        );
+    }
+    let stdout_task = tokio::spawn(process_capture_scope(
+        capture.clone(),
+        read_limited(
+            id,
+            ProcessOutputStream::Stdout,
+            stdout,
+            request.max_output_bytes,
+            Arc::clone(&output_callback),
+        ),
     ));
-    let stderr_task = tokio::spawn(read_limited(
-        id,
-        ProcessOutputStream::Stderr,
-        stderr,
-        request.max_output_bytes,
-        output_callback,
+    let stderr_task = tokio::spawn(process_capture_scope(
+        capture.clone(),
+        read_limited(
+            id,
+            ProcessOutputStream::Stderr,
+            stderr,
+            request.max_output_bytes,
+            output_callback,
+        ),
     ));
+    let _reader_cleanup = OutputReaderCleanup {
+        stdout: stdout_task.abort_handle(),
+        stderr: stderr_task.abort_handle(),
+    };
     let (status, timed_out, cancelled) =
-        wait_for_process(&mut child, request.timeout, cancel, &process_guard).await?;
-    let (stdout, stdout_truncated) = if timed_out {
-        (Vec::new(), false)
-    } else {
-        stdout_task.await??
-    };
-    let (stderr, stderr_truncated) = if timed_out {
-        (Vec::new(), false)
-    } else {
-        stderr_task.await??
-    };
+        wait_for_process(id, &mut child, request.timeout, cancel, &process_guard).await?;
+    if let Some(capture) = &capture {
+        capture.emit("tool_process", "reaped", serde_json::json!({
+            "execution_id": id.get(), "timed_out": timed_out, "cancelled": cancelled,
+            "termination": match normalize_process_termination(status) {
+                ProcessTermination::Exited { code } => serde_json::json!({"exited": code}),
+                ProcessTermination::Signaled { signal } => serde_json::json!({"signal": signal}),
+                ProcessTermination::Unknown => serde_json::Value::Null,
+            },
+        }), false);
+    }
+    let (stdout, stdout_truncated) = collect_process_output(stdout_task, timed_out).await?;
+    let (stderr, stderr_truncated) = collect_process_output(stderr_task, timed_out).await?;
+    if let Some(capture) = &capture {
+        capture.emit(
+            "tool_process",
+            "output_collection_finished",
+            serde_json::json!({
+                "execution_id": id.get(), "omitted_after_timeout": timed_out,
+                "stdout_bytes": stdout.len(), "stderr_bytes": stderr.len(),
+                "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
+            }),
+            false,
+        );
+    }
     Ok(ProcessExecutionResult {
         id,
         termination: normalize_process_termination(status),
@@ -386,6 +615,19 @@ async fn run_process_inner(
     })
 }
 
+async fn collect_process_output(
+    task: tokio::task::JoinHandle<Result<(Vec<u8>, bool), std::io::Error>>,
+    timed_out: bool,
+) -> Result<(Vec<u8>, bool), ToolRuntimeError> {
+    if timed_out {
+        task.abort();
+        let _ = task.await;
+        Ok((Vec::new(), false))
+    } else {
+        Ok(task.await??)
+    }
+}
+
 fn normalize_process_termination(status: std::process::ExitStatus) -> ProcessTermination {
     if let Some(code) = status.code() {
         return ProcessTermination::Exited { code };
@@ -401,9 +643,10 @@ fn normalize_process_termination(status: std::process::ExitStatus) -> ProcessTer
 }
 
 async fn wait_for_process(
+    id: ToolExecutionId,
     child: &mut Child,
     timeout: Option<Duration>,
-    cancel: Arc<Notify>,
+    cancel: Arc<ProcessCancellation>,
     process_guard: &ChildProcessGuard,
 ) -> Result<(std::process::ExitStatus, bool, bool), std::io::Error> {
     let started = Instant::now();
@@ -416,10 +659,18 @@ async fn wait_for_process(
                 .await
                 .map(|status| (status, true, false));
         }
-        if tokio::time::timeout(Duration::from_millis(10), cancel.notified())
+        if tokio::time::timeout(Duration::from_millis(10), cancel.cancelled())
             .await
             .is_ok()
         {
+            if let Some(capture) = bcode_xray::CaptureContext::current() {
+                capture.emit(
+                    "tool_process",
+                    "cancellation_observed",
+                    serde_json::json!({"execution_id": id.get(), "phase": "running"}),
+                    false,
+                );
+            }
             return terminate_child_after_timeout(child, process_guard)
                 .await
                 .map(|status| (status, false, true));
@@ -597,6 +848,21 @@ async fn read_limited(
             break;
         }
         sequence = sequence.saturating_add(1);
+        if let Some(capture) = bcode_xray::CaptureContext::current() {
+            // Raw process output can contain credentials, so retain only geometry here.
+            capture.emit(
+                "tool_process",
+                "output_chunk",
+                serde_json::json!({
+                    "execution_id": id.get(), "stream": match stream {
+                        ProcessOutputStream::Stdout => "stdout",
+                        ProcessOutputStream::Stderr => "stderr",
+                    },
+                    "sequence": sequence, "byte_len": read,
+                }),
+                false,
+            );
+        }
         if let Ok(mut on_output) = on_output.lock() {
             on_output(ProcessOutputEvent {
                 id,
@@ -616,6 +882,176 @@ async fn read_limited(
         output.extend_from_slice(&buffer[..read.min(remaining)]);
     }
     Ok((output, truncated))
+}
+
+#[cfg(test)]
+mod xray_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_cancellation_is_latched_and_retires_accounting_without_spawn() {
+        let runtime = ToolExecutionRuntime::new(1);
+        let permit = runtime
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold admission");
+        let cancel = runtime.cancellation_handle();
+        let other = runtime.cancellation_handle();
+        assert_ne!(cancel.id(), other.id());
+        let request = ProcessExecutionRequest {
+            program: "must-not-be-spawned".into(),
+            args: Vec::new(),
+            cwd: None,
+            timeout: None,
+            max_output_bytes: 16,
+            inherit_environment: false,
+            environment: BTreeMap::new(),
+            remove_environment: Vec::new(),
+        };
+        let work = runtime.run_process_streaming_with_cancel(request, &cancel, |_| {});
+        tokio::pin!(work);
+        tokio::select! {
+            biased;
+            result = &mut work => panic!("admission unexpectedly completed: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(runtime.status().await.queued, 1);
+        assert!(runtime.cancel(cancel.id()).await);
+        assert!(matches!(work.await, Err(ToolRuntimeError::Cancelled)));
+        assert_eq!(runtime.status().await.queued, 0);
+        assert_eq!(runtime.status().await.running, 0);
+        assert_eq!(runtime.status().await.cancelled, 1);
+        assert!(!runtime.cancel(cancel.id()).await);
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_queued_future_releases_registration_and_queue_count() {
+        let runtime = ToolExecutionRuntime::new(1);
+        let _permit = runtime
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold admission");
+        let cancel = runtime.cancellation_handle();
+        {
+            let request = ProcessExecutionRequest {
+                program: "must-not-be-spawned".into(),
+                args: Vec::new(),
+                cwd: None,
+                timeout: None,
+                max_output_bytes: 16,
+                inherit_environment: false,
+                environment: BTreeMap::new(),
+                remove_environment: Vec::new(),
+            };
+            let work = runtime.run_process_streaming_with_cancel(request, &cancel, |_| {});
+            tokio::pin!(work);
+            tokio::select! {
+                biased;
+                result = &mut work => panic!("admission unexpectedly completed: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+            assert_eq!(runtime.status().await.queued, 1);
+        }
+        assert_eq!(runtime.status().await.queued, 0);
+        assert_eq!(runtime.status().await.cancelled, 1);
+        assert!(!runtime.cancel(cancel.id()).await);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_waiter_registration_is_not_lost() {
+        let cancellation = ProcessCancellation::default();
+        cancellation.cancel();
+        cancellation.cancelled().await;
+        cancellation.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn pipe_reader_observation_uses_explicit_origin_and_never_emits_output_text() {
+        let hub = bcode_xray::XrayHub::default();
+        let mut observation = hub
+            .observe(bcode_xray::XrayObserveRequest {
+                schema_version: bcode_xray::XRAY_SCHEMA_VERSION,
+                session_id: "session".into(),
+                deep_capture: true,
+            })
+            .expect("observe");
+        let capture = hub.context(bcode_xray::XrayCorrelation {
+            session_id: "session".into(),
+            turn_id: Some("turn".into()),
+            tool_call_id: Some("call".into()),
+            ..Default::default()
+        });
+        let bytes = b"private-tool-output";
+        let (output, truncated) = tokio::spawn(process_capture_scope(Some(capture), async move {
+            read_limited(
+                ToolExecutionId(7),
+                ProcessOutputStream::Stdout,
+                Some(&bytes[..]),
+                4,
+                Arc::new(std::sync::Mutex::new(|_| {})),
+            )
+            .await
+        }))
+        .await
+        .expect("join")
+        .expect("read");
+        assert_eq!(output, b"priv");
+        assert!(truncated);
+        observation.finalize().expect("cutoff");
+        let mut chunks = 0;
+        while let Some(envelope) = observation.recv().await {
+            assert!(
+                !serde_json::to_string(&envelope)
+                    .expect("json")
+                    .contains("private-tool-output")
+            );
+            if envelope.event.name == "output_chunk" {
+                chunks += 1;
+                assert_eq!(
+                    envelope.event.correlation.tool_call_id.as_deref(),
+                    Some("call")
+                );
+                assert_eq!(envelope.event.data["byte_len"], bytes.len());
+                assert!(!envelope.event.sensitive);
+            }
+        }
+        assert_eq!(chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_process_observation_does_not_claim_cleanup() {
+        let hub = bcode_xray::XrayHub::default();
+        let mut observation = hub
+            .observe(bcode_xray::XrayObserveRequest {
+                schema_version: bcode_xray::XRAY_SCHEMA_VERSION,
+                session_id: "session".into(),
+                deep_capture: false,
+            })
+            .expect("observe");
+        hub.context(bcode_xray::XrayCorrelation {
+            session_id: "session".into(),
+            ..Default::default()
+        })
+        .scope(async {
+            drop(ProcessObservation::new(ToolExecutionId(8)));
+        })
+        .await;
+        observation.finalize().expect("cutoff");
+        let mut unfinished = 0;
+        while let Some(envelope) = observation.recv().await {
+            if envelope.event.name == "unfinished" {
+                unfinished += 1;
+                assert_eq!(envelope.event.data["details"]["cleanup_confirmed"], false);
+            }
+            assert_ne!(envelope.event.name, "finished");
+        }
+        assert_eq!(unfinished, 1);
+    }
 }
 
 #[cfg(test)]

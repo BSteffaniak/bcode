@@ -52,8 +52,30 @@ pub async fn dispatch_after_settlement(
     parent: &WorkId,
     commands: &mut RuntimeCommandContext<'_>,
 ) {
+    let context = state.xray.context(bcode_xray_models::XrayCorrelation {
+        session_id: facts.session_id.to_string(),
+        turn_id: Some(facts.turn_id.clone()),
+        ..Default::default()
+    });
+    let context = Some(
+        bcode_xray::CaptureContext::current()
+            .filter(|current| {
+                current.correlation().session_id == facts.session_id.to_string()
+                    && current.correlation().turn_id.as_deref() == Some(facts.turn_id.as_str())
+            })
+            .unwrap_or(context),
+    );
+    crate::xray_workflow::fact(
+        context.as_ref(),
+        "turn.settlement_append",
+        if terminal_persisted {
+            "persisted"
+        } else {
+            "not_persisted"
+        },
+    );
     if terminal_persisted {
-        dispatch(state, facts, parent, commands).await;
+        crate::xray_workflow::scope(context, dispatch(state, facts, parent, commands)).await;
     }
 }
 
@@ -85,6 +107,10 @@ async fn dispatch_one(
     commands: &mut RuntimeCommandContext<'_>,
     provider: &str,
 ) -> bool {
+    let boundary = crate::xray_workflow::Boundary::new(
+        bcode_xray::CaptureContext::current(),
+        "turn.settled_observer",
+    );
     let cancellation = ServiceCancellation::default();
     if facts.cancellation_requested {
         cancellation.cancel();
@@ -98,6 +124,7 @@ async fn dispatch_one(
         )
         .await
     else {
+        boundary.finish("ownership_unavailable");
         return true;
     };
     let mut spec = RuntimeWorkSpec::new(
@@ -110,6 +137,7 @@ async fn dispatch_one(
     spec.ownership = Some(ownership);
     let (_, admitted) = state.runtime_work.start(facts.session_id, spec).await;
     if !admitted {
+        boundary.finish("runtime_admission_deferred");
         return true;
     }
     let persisted = state
@@ -132,9 +160,14 @@ async fn dispatch_one(
         .await;
     let Ok(event) = persisted else {
         state.runtime_work.finish(facts.session_id, &work_id).await;
+        boundary.finish("runtime_registration_not_persisted");
         return true;
     };
     super::publish_session_event(state, &event).await;
+    let callback = crate::xray_workflow::Boundary::new(
+        bcode_xray::CaptureContext::current(),
+        "turn.settled_observer_callback",
+    );
     let operation = observe(state, provider, facts, &cancellation);
     tokio::pin!(operation);
     let result = loop {
@@ -153,6 +186,14 @@ async fn dispatch_one(
             }
         }
     };
+    let callback_outcome = if cancellation.is_cancelled() {
+        "cancellation_observed"
+    } else if result.is_ok() {
+        "ok"
+    } else {
+        "error"
+    };
+    callback.finish(callback_outcome);
     let status = if cancellation.is_cancelled() {
         RuntimeWorkStatus::Cancelled
     } else if result.is_ok() {
@@ -162,6 +203,7 @@ async fn dispatch_one(
     };
     let diagnostic = result.as_ref().err().cloned();
     finish_registered_runtime_work(state, facts.session_id, work_id, status, diagnostic).await;
+    boundary.finish(callback_outcome);
     !cancellation.is_cancelled()
 }
 

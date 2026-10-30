@@ -120,5 +120,15 @@ pub async fn events(
         .ok_or_else(invalid)?;
     let events = Arc::clone(&capture.events);
     drop(captures);
+    if let Some(context) = super::xray_context::current(session_id) {
+        context.emit(
+            "context",
+            "generation_source_incorporated",
+            serde_json::json!({"events": events.len(), "request_only": true}),
+            false,
+        );
+        // Source events are not serialized: they can include provider-private trace content.
+        // The final model-visible normalized messages are captured at request assembly instead.
+    }
     Ok(Some(events))
 }

@@ -1437,6 +1437,18 @@ pub fn execute(
             "pause".into(),
         ]);
     }
+    // Observe the root session before admission. This is not subtree coverage:
+    // children require their own pre-dispatch attachment contract.
+    let _xray = super::xray_capture::Capture::start_workflow(
+        session_id,
+        rep_dir,
+        &config.binary,
+        variant
+            .env
+            .iter()
+            .chain(&case.env)
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
     let start = Instant::now();
     let admitted = invoke(&args, "admission", remaining()).inspect_err(|_| {
         // The single admission request may have committed before its transport deadline.

@@ -42,6 +42,18 @@ impl FanOutScan {
         authority: &bcode_workflow_store::WorkflowExecutionAuthority,
         run_id: &str,
     ) -> Result<(bool, bool), super::super::ServerError> {
+        // Keep the page-local graph/reduction state out of every driver and test
+        // caller's future while preserving the same borrow and cancellation scope.
+        Box::pin(self.advance_inner(path, db, authority, run_id)).await
+    }
+
+    async fn advance_inner(
+        &mut self,
+        path: &std::path::Path,
+        db: &dyn switchy_database::Database,
+        authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+        run_id: &str,
+    ) -> Result<(bool, bool), super::super::ServerError> {
         use super::super::{backpressure, representation};
         let version = backpressure::retry(|| {
             representation::graph::parallel_progress::scan_version(db, run_id)
@@ -89,16 +101,28 @@ impl FanOutScan {
             {
                 continue;
             }
-            let (changed, pending) = super::super::fanout::advance(
-                path,
-                db,
-                authority,
+            let context = crate::xray_workflow::activation_context(
+                bcode_xray::CaptureContext::current(),
                 run_id,
-                version.revision,
-                &node.id,
                 &activation,
+                None,
+            );
+            let boundary = crate::xray_workflow::Boundary::new(context.clone(), "fanout.advance");
+            let result = crate::xray_workflow::scope(
+                context,
+                super::super::fanout::advance(
+                    path,
+                    db,
+                    authority,
+                    run_id,
+                    version.revision,
+                    &node.id,
+                    &activation,
+                ),
             )
-            .await?;
+            .await;
+            boundary.finish_result(&result);
+            let (changed, pending) = result?;
             progressed |= changed;
             self.reduction_pending |= pending;
         }

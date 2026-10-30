@@ -14,6 +14,8 @@
 mod agent_cleanup;
 mod agent_progress;
 mod capture;
+mod xray_capture;
+pub use xray_capture::{EvalXrayCapture, EvalXrayEvidence, with_xray_capture};
 mod semantic_capture;
 
 /// Capture supported public workflow history collections from verified inspection capabilities.
@@ -1710,6 +1712,8 @@ async fn execute_agent_variant_async(
                 }),
             },
         )?;
+        let mut xray = xray_capture::Capture::start(&session.id.to_string(), rep_dir, &client);
+        let mut pre_restart_evidence = None;
         let start = Instant::now();
         progress(format!(
             "agent turn: variant={} case={} rep={} session={} sending prompt",
@@ -1773,6 +1777,11 @@ async fn execute_agent_variant_async(
         if let Some(follow_up) = &variant.follow_up
             && !telemetry.timed_out
         {
+            if follow_up.restart_daemon {
+                pre_restart_evidence = xray
+                    .take()
+                    .and_then(xray_capture::Capture::finish_with_restart_gap);
+            }
             let outcome = run_agent_follow_up(AgentFollowUpInput {
                 client: &client,
                 case,
@@ -1806,6 +1815,40 @@ async fn execute_agent_variant_async(
                 }),
             },
         )?;
+        let xray_evidence =
+            pre_restart_evidence.or_else(|| xray.and_then(xray_capture::Capture::finish));
+        if let Some(evidence) = xray_evidence {
+            measurements.insert(
+                "eval.xray.evidence_complete".into(),
+                f64::from(evidence.evidence_complete),
+            );
+            measurements.insert(
+                "eval.xray.delivery_complete".into(),
+                f64::from(evidence.delivery_complete),
+            );
+            measurements.insert(
+                "eval.xray.payloads_complete".into(),
+                f64::from(evidence.payloads_complete),
+            );
+            artifacts.push(EvalArtifactRef {
+                kind: "xray_evidence".into(),
+                path: "xray-evidence.json".into(),
+            });
+            if evidence.ready_before_submission {
+                artifacts.push(EvalArtifactRef {
+                    kind: "xray_recording".into(),
+                    path: "xray/manifest.json".into(),
+                });
+            }
+            if !evidence.evidence_complete {
+                diagnostics.push(EvalDiagnostic {
+                    severity: EvalDiagnosticSeverity::Warning,
+                    message:
+                        "X-ray evidence incomplete; task result and canonical telemetry unchanged"
+                            .into(),
+                });
+            }
+        }
         let timed_out = telemetry.timed_out || follow_up_timed_out;
         Ok(ExecutionOutput {
             exit_code: Some(if timed_out { 124 } else { 0 }),
@@ -1899,6 +1942,15 @@ async fn run_agent_follow_up(
             },
         )?;
     }
+    let follow_up_xray = if follow_up.restart_daemon {
+        let directory = rep_dir.join("follow-up-xray");
+        // Optional evidence failure must not alter execution or canonical telemetry.
+        fs::create_dir_all(&directory).ok().and_then(|()| {
+            xray_capture::Capture::start(&session_id.to_string(), &directory, client)
+        })
+    } else {
+        None
+    };
     let start_sequence = latest_session_sequence(client, session_id).await?;
     let start = Instant::now();
     progress(format!(
@@ -1953,6 +2005,9 @@ async fn run_agent_follow_up(
             severity: EvalDiagnosticSeverity::Error,
             message: "follow-up turn timed out before ModelTurnFinished".into(),
         });
+    }
+    if let Some(capture) = follow_up_xray {
+        let _ = capture.finish_with_restart_gap();
     }
     Ok(AgentFollowUpOutcome {
         measurements,

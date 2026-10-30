@@ -4,6 +4,10 @@
 
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
+mod diagnostics;
+#[cfg(test)]
+mod xray_tests;
+
 mod artifact_references;
 mod compaction_control;
 mod compaction_fixture;
@@ -698,6 +702,19 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
+        if bcode_xray::CaptureContext::current()
+            .is_some_and(|context| context.deep_capture_active())
+        {
+            diagnostics::record(
+                "adapted_request",
+                &serde_json::json!({
+                    "model_id": request.model_id, "system_prompt": request.system_prompt,
+                    "messages": request.messages, "tools": request.tools,
+                    "parameters": request.parameters, "structured_output": request.structured_output,
+                    "tool_call_policy": request.tool_call_policy, "prompt_cache": request.prompt_cache
+                }),
+            );
+        }
         if let Err(error) = compaction_control::capture_context(&request) {
             return ServiceResponse::error("fake_context_capture_failed", &error);
         }
@@ -882,6 +899,7 @@ impl FakeProviderPlugin {
             .turns
             .get(&request.provider_turn_id)
             .map_or_else(Vec::new, FakeTurn::drain);
+        diagnostics::record("stream_records", &events);
         json_response(&PollTurnEventsResponse { events })
     }
 
@@ -3124,6 +3142,7 @@ fn stream_fake_turn_events(turn: &FakeTurn, context: &NativeServiceContext) -> S
 
 /// Emit one provider turn event as an incremental service event.
 fn emit_provider_turn_event(context: &NativeServiceContext, event: &ProviderTurnEvent) {
+    diagnostics::record("stream_record", event);
     if let Ok(payload) = serde_json::to_vec(event) {
         context.events.emit(&payload);
     }

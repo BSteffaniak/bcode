@@ -3098,6 +3098,7 @@ mod tests {
         bridge: ServiceBridge,
     ) -> NativeServiceContext {
         NativeServiceContext {
+            diagnostics: None,
             plugin_id: "bcode.shell".to_string(),
             request: ServiceRequest {
                 interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),

@@ -17,6 +17,8 @@ crate-type = ["cdylib", "rlib"]
 bcode_model                  = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
+bcode_xray                   = { workspace = true }
+bcode_xray_models            = { workspace = true }
 clap                         = { workspace = true, features = ["derive", "std"] }
 libc                         = { workspace = true }
 reqwest                      = { workspace = true, features = ["json"] }

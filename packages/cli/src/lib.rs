@@ -14,6 +14,7 @@ pub use clierror::CliDiagnosticError;
 mod plugin_cli;
 pub mod retired_catalogs;
 mod session_migration_adapter;
+mod xray;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -6302,6 +6303,8 @@ enum SessionMilestonesCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Observe live session diagnostics over local HTTP; emits JSONL until finalized.
+    Xray(xray::XrayArgs),
     /// Explicitly export sensitive captures and inspect normalized context observations.
     ContextObservationReport {
         session_id: SessionId,
@@ -8441,6 +8444,7 @@ async fn print_derivation_status(operation_id: uuid::Uuid) -> Result<(), CliErro
 
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match command.as_ref() {
+        SessionCommand::Xray(args) => Box::pin(xray::run(args)).await,
         SessionCommand::Milestones { command } => {
             match command {
                 SessionMilestonesCommand::List {
@@ -9008,6 +9012,7 @@ fn dispatch_non_ranking_session_command(
     command: Box<SessionCommand>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CliError>> + Send>> {
     match *command {
+        SessionCommand::Xray(args) => Box::pin(async move { xray::run(&args).await }),
         SessionCommand::RankCategories { .. } => unreachable!("ranking is dispatched above"),
         SessionCommand::Categorization { session_id, json } => Box::pin(async move {
             Box::pin(print_session_categorization(session_id, json)).await?;

@@ -140,8 +140,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 55 adds secret-free queued-submission recovery confirmation and targeted operations.
 /// Version 56 adds separate opt-in durable interaction admission, views and retry receipts.
 /// Version 57 adds bounded canonical durable interaction discovery.
+/// Version 58 adds explicit session-scoped local X-ray endpoint bootstrap and revocation.
 /// Older positional request/response layouts are rejected rather than misinterpreted.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 57;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 58;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -326,6 +327,30 @@ impl Envelope {
             kind,
             payload,
         }
+    }
+}
+
+/// A session-scoped local diagnostic capability. No bearer bytes cross IPC.
+/// The private credential file is delivered only to an authorized matching client.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XrayEndpointInfo {
+    pub endpoint_id: String,
+    pub session_id: SessionId,
+    pub endpoint: String,
+    pub credential_file: PathBuf,
+    pub deep_capture: bool,
+    pub schema_version: u16,
+}
+
+impl std::fmt::Debug for XrayEndpointInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XrayEndpointInfo")
+            .field("endpoint_id", &self.endpoint_id)
+            .field("session_id", &self.session_id)
+            .field("endpoint", &self.endpoint)
+            .field("deep_capture", &self.deep_capture)
+            .field("schema_version", &self.schema_version)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1404,6 +1429,15 @@ pub enum Request {
     ReadWorkflowDiagnosticArtifact {
         request: bcode_workflow::WorkflowDiagnosticArtifactRequest,
     },
+    /// Open a one-session local diagnostic endpoint; deep capture requires explicit opt-in.
+    OpenXrayEndpoint {
+        session_id: SessionId,
+        deep_capture: bool,
+    },
+    /// Revoke a local diagnostic capability without affecting session execution.
+    CloseXrayEndpoint {
+        endpoint_id: String,
+    },
     /// Explicit sensitive diagnostic access to a canonical event's retained trace blob.
     ReadSessionTraceBlob {
         request: bcode_session_models::ReadSessionTraceBlobRequest,
@@ -2303,6 +2337,10 @@ pub use bcode_session_models::RuntimeWorkSnapshot;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsePayload {
+    XrayEndpointOpened {
+        endpoint: XrayEndpointInfo,
+    },
+    XrayEndpointClosed,
     Hello {
         protocol_version: ProtocolVersion,
         client_id: ClientId,
@@ -4522,7 +4560,7 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 57);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 58);
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
     }
 

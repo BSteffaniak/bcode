@@ -179,6 +179,13 @@ pub enum SessionLifecycleRequest {
     /// Read a bounded byte range from a generic session artifact reference.
     PrepareContextGeneration(bcode_session_models::PrepareContextGeneration),
     SessionWorkingDocument(bcode_session_models::SessionWorkingDocumentRequest),
+    OpenXrayEndpoint {
+        session_id: SessionId,
+        deep_capture: bool,
+    },
+    CloseXrayEndpoint {
+        endpoint_id: String,
+    },
     ReadSessionTraceBlob(bcode_session_models::ReadSessionTraceBlobRequest),
     ReadSessionArtifact {
         session_id: SessionId,
@@ -2387,6 +2394,18 @@ impl RoutedRequest {
             Request::SessionWorkingDocument { request } => Self::SessionLifecycle(Box::new(
                 SessionLifecycleRequest::SessionWorkingDocument(request),
             )),
+            Request::OpenXrayEndpoint {
+                session_id,
+                deep_capture,
+            } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::OpenXrayEndpoint {
+                session_id,
+                deep_capture,
+            })),
+            Request::CloseXrayEndpoint { endpoint_id } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CloseXrayEndpoint {
+                    endpoint_id,
+                }))
+            }
             Request::ReadSessionTraceBlob { request } => Self::SessionLifecycle(Box::new(
                 SessionLifecycleRequest::ReadSessionTraceBlob(request),
             )),

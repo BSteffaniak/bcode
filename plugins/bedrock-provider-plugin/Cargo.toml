@@ -28,6 +28,8 @@ bcode_model_schema = { workspace = true }
 bcode_openai_responses = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
+bcode_xray = { workspace = true }
+bcode_xray_models = { workspace = true }
 clap = { workspace = true, features = ["derive", "std"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }

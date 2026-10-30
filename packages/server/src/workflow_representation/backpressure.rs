@@ -85,12 +85,16 @@ where
 pub(super) struct ObservedWriteGuard<'a> {
     guard: Option<tokio::sync::MutexGuard<'a, ()>>,
     held: bcode_metrics::MetricsSpan,
+    capture: Option<crate::xray_workflow::Boundary>,
 }
 
 impl Drop for ObservedWriteGuard<'_> {
     fn drop(&mut self) {
         // Publish release only after relinquishing the real execution guard.
         drop(self.guard.take());
+        if let Some(capture) = self.capture.take() {
+            capture.finish("released");
+        }
         self.held.finish_with_outcome(&"released");
     }
 }
@@ -106,12 +110,19 @@ pub(super) async fn observe_write_lock<'a>(
     let wait = metrics
         .span("workflow.writer_queue.wait")
         .labels(labels.clone());
+    let context = bcode_xray::CaptureContext::current();
+    let capture = crate::xray_workflow::Boundary::new(context.clone(), "writer_queue.wait");
     let guard = lock.await;
+    capture.finish("acquired");
     wait.finish_ok();
     metrics.record_event("workflow.writer_queue.acquired", 1, labels.clone());
     ObservedWriteGuard {
         guard: Some(guard),
         held: metrics.span("workflow.writer_queue.held").labels(labels),
+        capture: Some(crate::xray_workflow::Boundary::new(
+            context,
+            "writer_queue.held",
+        )),
     }
 }
 
@@ -145,6 +156,79 @@ pub(super) fn normalize(error: RepresentationError) -> super::ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn xray_observes_real_wait_and_release_without_taking_queue_ownership() {
+        use std::future::Future as _;
+        let hub = bcode_xray::XrayHub::default();
+        let mut observation = hub
+            .observe(bcode_xray_models::XrayObserveRequest {
+                schema_version: 1,
+                session_id: "queue-session".into(),
+                deep_capture: false,
+            })
+            .expect("observe");
+        let _ready = observation.recv().await.expect("ready");
+        let context = hub.context(bcode_xray_models::XrayCorrelation {
+            session_id: "queue-session".into(),
+            turn_id: Some("origin-turn".into()),
+            run_id: Some("origin-run".into()),
+            ..bcode_xray_models::XrayCorrelation::default()
+        });
+        let queue = tokio::sync::Mutex::new(());
+        let holder = queue.lock().await;
+        let metrics = bcode_metrics::MetricsRegistry::default();
+        let mut waiter = Box::pin(context.scope(observe_write_lock(
+            &metrics,
+            std::collections::BTreeMap::new(),
+            queue.lock(),
+        )));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                waiter.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        drop(waiter);
+        let started = observation.recv().await.expect("wait start");
+        let unfinished = observation.recv().await.expect("wait dropped");
+        assert_eq!(started.event.name, "writer_queue.wait");
+        assert_eq!(unfinished.event.data["outcome"], "unfinished");
+        assert_eq!(
+            unfinished.event.correlation.turn_id.as_deref(),
+            Some("origin-turn")
+        );
+        assert!(
+            queue.try_lock().is_err(),
+            "observer did not release real holder"
+        );
+        drop(holder);
+        let held = context
+            .scope(observe_write_lock(
+                &metrics,
+                std::collections::BTreeMap::new(),
+                queue.lock(),
+            ))
+            .await;
+        drop(held);
+        let mut outcomes = Vec::new();
+        for _ in 0..4 {
+            let event = observation.recv().await.expect("acquisition event").event;
+            outcomes.push((event.name, event.data["outcome"].clone()));
+        }
+        assert_eq!(
+            outcomes[1],
+            ("writer_queue.wait".into(), serde_json::json!("acquired"))
+        );
+        assert_eq!(
+            outcomes[3],
+            ("writer_queue.held".into(), serde_json::json!("released"))
+        );
+        assert!(
+            queue.try_lock().is_ok(),
+            "capture must not retain the real guard"
+        );
+    }
 
     #[tokio::test]
     async fn observed_queue_separates_wait_from_holder_and_cancelled_waiter() {

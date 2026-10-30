@@ -4,6 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod bmux_host_adapter;
+mod diagnostics;
 pub mod interaction_controller;
 mod invocation_callbacks;
 
@@ -195,6 +196,23 @@ extern "C" fn service_event_callback(
     user_data: *mut std::ffi::c_void,
 ) {
     if payload_ptr.is_null() || user_data.is_null() {
+        diagnostics::record_loss(user_data as usize, "invalid_event_callback_arguments");
+        return;
+    }
+    // Diagnostic callbacks outlive the invocation stack only through their own retained lease.
+    // Inspect the fixed discriminator before allocating or acquiring ordinary callback state.
+    let bytes = unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) };
+    if let Some(bytes) = bytes
+        .strip_prefix(bcode_plugin_sdk::diagnostics::DIAGNOSTIC_EVENT_PREFIX)
+        .filter(|_| diagnostics::negotiated(user_data as usize))
+    {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            diagnostics::event(user_data as usize, bytes);
+        }))
+        .is_err()
+        {
+            diagnostics::record_loss(user_data as usize, "event_callback_panicked");
+        }
         return;
     }
     let Some(guard) = CallbackGuard::acquire(user_data) else {
@@ -229,7 +247,40 @@ extern "C" fn service_bridge_callback(
         || user_data.is_null()
         || request_len > SERVICE_BRIDGE_MAX_REQUEST_BYTES
     {
+        diagnostics::record_loss(user_data as usize, "invalid_control_callback_arguments");
         return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+    if let Some(bytes) = bytes
+        .strip_prefix(bcode_plugin_sdk::diagnostics::DIAGNOSTIC_CONTROL_PREFIX)
+        .filter(|_| diagnostics::negotiated(user_data as usize))
+    {
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Check fixed control response capacity before Acquire can retain a lease.
+            // All version-1 status replies fit 256 bytes; SDK always provides this capacity.
+            if output_ptr.is_null() || output_capacity < 256 {
+                diagnostics::record_loss(user_data as usize, "control_response_unavailable");
+                return SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE;
+            }
+            let Some(status) = diagnostics::control(user_data as usize, bytes) else {
+                return SERVICE_BRIDGE_STATUS_CANCELLED;
+            };
+            let Ok(encoded) = serde_json::to_vec(&status) else {
+                return SERVICE_BRIDGE_STATUS_FAILED;
+            };
+            if output_ptr.is_null() || encoded.len() > output_capacity {
+                return SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE;
+            }
+            unsafe {
+                *output_len = encoded.len();
+                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            }
+            SERVICE_BRIDGE_STATUS_OK
+        }))
+        .unwrap_or_else(|_| {
+            diagnostics::record_loss(user_data as usize, "control_callback_panicked");
+            SERVICE_BRIDGE_STATUS_FAILED
+        });
     }
     let Some(guard) = CallbackGuard::acquire(user_data) else {
         return SERVICE_BRIDGE_STATUS_CANCELLED;
@@ -1616,7 +1667,8 @@ impl LoadedPlugin {
                 }
                 other => other,
             })?;
-        let context = NativeServiceContext {
+        let mut context = NativeServiceContext {
+            diagnostics: None,
             plugin_id: self.manifest.id.clone(),
             request: ServiceRequest {
                 interface_id,
@@ -1634,7 +1686,6 @@ impl LoadedPlugin {
             bridge: bcode_plugin_sdk::ServiceBridge::default(),
             transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
         };
-        let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let output_capacity = 1024 * 1024;
         let mut output_len = 0_usize;
         let mut output = vec![0_u8; output_capacity];
@@ -1646,6 +1697,14 @@ impl LoadedPlugin {
         };
         let callback_registration = CallbackRegistration::new(&mut callback_state);
         let event_user_data = callback_registration.user_data();
+        let diagnostic_registration = diagnostics::DiagnosticRegistration::new(
+            event_user_data,
+            bcode_xray::CaptureContext::current(),
+        );
+        context.diagnostics = diagnostic_registration
+            .as_ref()
+            .and_then(diagnostics::DiagnosticRegistration::negotiation);
+        let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let mut cancellation_callback_state = cancellation.clone();
         let cancellation_registration = CallbackRegistration::new(&mut cancellation_callback_state);
         let cancellation_user_data = cancellation_registration.user_data();
@@ -2699,6 +2758,7 @@ impl std::fmt::Debug for PluginInvocationBridge {
 
 #[derive(Debug)]
 struct PluginInvocation {
+    diagnostics: diagnostics::DiagnosticOrigin,
     id: PluginInvocationId,
     class: PluginInvocationClass,
     enqueued_at: Instant,
@@ -2742,7 +2802,7 @@ impl Drop for PluginQueueCount {
 #[derive(Debug)]
 enum PluginExecutorMessage {
     Queued(Box<Self>, PluginQueueCount),
-    Service(PluginInvocation),
+    Service(Box<PluginInvocation>),
     Event(PluginEventInvocation),
     Deactivate(oneshot::Sender<Result<(), PluginLoadError>>),
 }
@@ -3063,6 +3123,7 @@ impl PluginExecutorHandle {
                     "plugin service invocation serialized by host"
                 );
                 let invocation = PluginInvocation {
+                    diagnostics: diagnostics::DiagnosticOrigin::current(),
                     id: invocation_id,
                     class,
                     enqueued_at: Instant::now(),
@@ -3076,8 +3137,12 @@ impl PluginExecutorHandle {
                     event_sender: Some(event_sender),
                     resource_permit: Some(resource_permit.clone()),
                 };
-                self.enqueue_exclusive(sender, class, PluginExecutorMessage::Service(invocation))
-                    .await?;
+                self.enqueue_exclusive(
+                    sender,
+                    class,
+                    PluginExecutorMessage::Service(Box::new(invocation)),
+                )
+                .await?;
             }
             PluginExecutorKind::Concurrent(plugin, semaphore) => {
                 let permit = match semaphore {
@@ -3090,6 +3155,7 @@ impl PluginExecutorHandle {
                 };
                 let (unused_response, _) = oneshot::channel();
                 let invocation = PluginInvocation {
+                    diagnostics: diagnostics::DiagnosticOrigin::current(),
                     id: invocation_id,
                     class,
                     enqueued_at: Instant::now(),
@@ -3146,6 +3212,7 @@ impl PluginExecutorHandle {
         let result = {
             let (response, receiver) = oneshot::channel();
             let invocation = PluginInvocation {
+                diagnostics: diagnostics::DiagnosticOrigin::current(),
                 id: invocation_id,
                 class,
                 enqueued_at: Instant::now(),
@@ -3174,7 +3241,7 @@ impl PluginExecutorHandle {
                     self.enqueue_exclusive(
                         sender,
                         class,
-                        PluginExecutorMessage::Service(invocation),
+                        PluginExecutorMessage::Service(Box::new(invocation)),
                     )
                     .await?;
                     receiver
@@ -5201,37 +5268,44 @@ fn execute_plugin_service_invocation(
     );
     let bridge = invocation.bridge.clone();
     let mut delivered_events = 0_u64;
-    let response = plugin.invoke_service_with_bridge(
-        invocation.interface_id,
-        invocation.operation,
-        invocation.payload,
-        |event| {
-            if let Some(sender) = &invocation.event_sender {
-                let accepted = sender.send(event).is_ok();
-                delivered_events = delivered_events.saturating_add(1);
-                // Schema-neutral, bounded evidence: never log service payloads. The first few
-                // callbacks distinguish queued work from delivery without per-token log growth.
-                if delivered_events <= 3 {
-                    tracing::debug!(
-                        target: "bcode_plugin::runtime",
-                        plugin_id = %plugin.manifest.id,
-                        invocation_id = invocation.id.get(),
-                        scope = ?invocation.scope,
-                        event_index = delivered_events,
-                        accepted,
-                        "plugin streaming event callback"
-                    );
+    let capture = invocation.diagnostics.0.clone();
+    let invoke = || {
+        plugin.invoke_service_with_bridge(
+            invocation.interface_id,
+            invocation.operation,
+            invocation.payload,
+            |event| {
+                if let Some(sender) = &invocation.event_sender {
+                    let accepted = sender.send(event).is_ok();
+                    delivered_events = delivered_events.saturating_add(1);
+                    // Schema-neutral, bounded evidence: never log service payloads. The first few
+                    // callbacks distinguish queued work from delivery without per-token log growth.
+                    if delivered_events <= 3 {
+                        tracing::debug!(
+                            target: "bcode_plugin::runtime",
+                            plugin_id = %plugin.manifest.id,
+                            invocation_id = invocation.id.get(),
+                            scope = ?invocation.scope,
+                            event_index = delivered_events,
+                            accepted,
+                            "plugin streaming event callback"
+                        );
+                    }
                 }
-            }
-        },
-        move |request, cancellation| {
-            bridge.as_ref().map_or_else(
-                || Err("invocation bridge is unavailable".to_string()),
-                |bridge| bridge.request(request, cancellation),
-            )
-        },
-        &invocation.cancellation.cancellation,
-    );
+            },
+            move |request, cancellation| {
+                bridge.as_ref().map_or_else(
+                    || Err("invocation bridge is unavailable".to_string()),
+                    |bridge| bridge.request(request, cancellation),
+                )
+            },
+            &invocation.cancellation.cancellation,
+        )
+    };
+    let response = match capture {
+        Some(capture) => capture.scope_sync(invoke),
+        None => invoke(),
+    };
     running.succeeded = response.is_ok();
     drop(running);
     tracing::debug!(
@@ -5304,7 +5378,8 @@ fn spawn_exclusive_plugin_executor(
                 }
                 match message {
                     PluginExecutorMessage::Queued(_, _) => unreachable!("queue envelopes removed"),
-                    PluginExecutorMessage::Service(mut invocation) => {
+                    PluginExecutorMessage::Service(invocation) => {
+                        let mut invocation = *invocation;
                         let queue_wait_ms = elapsed_ms(invocation.enqueued_at);
                         metrics.registry().record_histogram_with_labels(
                             "plugin.queue_wait.duration_ms",
@@ -5320,15 +5395,14 @@ fn spawn_exclusive_plugin_executor(
                         let (unused_response, _) = oneshot::channel();
                         let response_sender =
                             std::mem::replace(&mut invocation.response, unused_response);
-                        let response = plugin.as_ref().filter(|_| !stopping).map_or_else(
-                            || {
-                                metrics.failed.fetch_add(1, Ordering::Relaxed);
-                                Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
-                            },
-                            |plugin| {
-                                execute_plugin_service_invocation(plugin, invocation, &metrics)
-                            },
-                        );
+                        let response = if let Some(plugin) = plugin.as_ref().filter(|_| !stopping) {
+                            execute_plugin_service_invocation(plugin, invocation, &metrics)
+                        } else {
+                            // Release invocation-owned resources before publishing failure.
+                            drop(invocation);
+                            metrics.failed.fetch_add(1, Ordering::Relaxed);
+                            Err(PluginLoadError::PluginNotLoaded(plugin_id))
+                        };
                         let _ = response_sender.send(response);
                     }
                     PluginExecutorMessage::Event(mut invocation) => {
@@ -12247,7 +12321,7 @@ library = "libexample_plugin.dylib"
         }
     }
 
-    fn test_large_vtable() -> StaticPluginVtable {
+    pub fn test_large_vtable() -> StaticPluginVtable {
         StaticPluginVtable {
             instance: std::ptr::null(),
             manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
@@ -12592,7 +12666,7 @@ library = "libexample_plugin.dylib"
         assert!(plugin_composer_contributions(&[]).is_empty());
     }
 
-    fn test_manifest(id: &str) -> PluginManifest {
+    pub fn test_manifest(id: &str) -> PluginManifest {
         PluginManifest {
             config: None,
             id: id.to_string(),

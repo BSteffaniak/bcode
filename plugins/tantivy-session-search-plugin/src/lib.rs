@@ -1871,6 +1871,7 @@ mod tests {
 
     fn service_context(configured_root: &Path, managed_root: &Path) -> NativeServiceContext {
         NativeServiceContext {
+            diagnostics: None,
             plugin_id: PLUGIN_ID.to_owned(),
             request: ServiceRequest {
                 interface_id: SESSION_SEARCH_INTERFACE_ID.to_owned(),

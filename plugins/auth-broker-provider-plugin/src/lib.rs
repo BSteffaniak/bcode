@@ -3,6 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 //! Scoped normalized text/tool model gateway client. Never handles upstream auth.
 
+mod diagnostics;
+
 #[cfg(feature = "static-bundled")]
 mod cli;
 pub mod setup;
@@ -134,7 +136,11 @@ impl Broker {
         let mut request = client
             .post(self.url.join(path).map_err(|_| "invalid_broker_route")?)
             .bearer_auth(&self.token);
+        if body.is_none() {
+            diagnostics::record("adapted_request", &serde_json::Value::Null);
+        }
         if let Some(body) = body {
+            diagnostics::bytes("adapted_request", &body);
             request = request
                 .header("content-type", "application/json")
                 .body(body);
@@ -163,6 +169,7 @@ impl Broker {
             }
             bytes.extend_from_slice(&chunk);
         }
+        diagnostics::bytes("received_record", &bytes);
         serde_json::from_slice(&bytes).map_err(|_| "invalid_broker_response")
     }
 }
@@ -461,7 +468,9 @@ impl AuthBrokerProviderPlugin {
         self.runtime
             .as_ref()
             .map_err(|_| "broker_runtime_unavailable")?
-            .block_on(async move { broker.post(&path, body).await })
+            .block_on(diagnostics::scope(
+                async move { broker.post(&path, body).await },
+            ))
             .map_err(|_| "broker_runtime_unavailable")?
     }
 

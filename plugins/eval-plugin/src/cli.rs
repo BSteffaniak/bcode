@@ -49,6 +49,46 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             .map_err(|e| e.to_string())
     })
 }
+fn read_xray_token(path: &std::path::Path) -> Result<String, CliError> {
+    use std::io::Read as _;
+    let invalid = || {
+        CliError::EvalCheckFailed(
+            "X-ray credential must be a stable private regular file of at most 4096 bytes".into(),
+        )
+    };
+    let before = std::fs::symlink_metadata(path).map_err(|_| invalid())?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(invalid());
+    }
+    let file = std::fs::File::open(path).map_err(|_| invalid())?;
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.mode() & 0o077 != 0
+            || before.dev() != metadata.dev()
+            || before.ino() != metadata.ino()
+        {
+            return Err(invalid());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        return Err(invalid());
+    }
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() > 4096 {
+        return Err(invalid());
+    }
+    String::from_utf8(bytes).map_err(|_| invalid())
+}
+
 fn surface_outcome(kind: &str, run: Option<PathBuf>) -> StaticCliOutcome {
     let mut options = BTreeMap::new();
     if let Some(run) = run {
@@ -80,6 +120,18 @@ enum EvalCommand {
         /// Optional explicit run id.
         #[arg(long)]
         run_id: Option<String>,
+        /// Record live diagnostics using exact-daemon bootstrap before submission.
+        #[arg(long)]
+        xray: bool,
+        /// Explicit public HTTP origin for the exact subject daemon (no discovery).
+        #[arg(long, requires = "xray_token_file")]
+        xray_endpoint: Option<String>,
+        /// Private bearer credential file; never retained in eval artifacts.
+        #[arg(long, requires = "xray_endpoint")]
+        xray_token_file: Option<PathBuf>,
+        /// Explicitly authorize sensitive live diagnostic capture.
+        #[arg(long)]
+        xray_deep: bool,
         /// Print the full JSON summary.
         #[arg(long)]
         json: bool,
@@ -278,6 +330,10 @@ fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
             suite,
             output_root,
             run_id,
+            xray,
+            xray_endpoint,
+            xray_token_file,
+            xray_deep,
             json,
             fail_under_pass_rate,
         } => {
@@ -286,7 +342,32 @@ fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
                 output_root,
                 run_id,
             };
-            let result = bcode_eval::run_suite(&options)?;
+            let result = if let (Some(endpoint), Some(token_file)) =
+                (xray_endpoint, xray_token_file)
+            {
+                let token = read_xray_token(&token_file)?;
+                let client =
+                    bcode_client::xray::XrayClient::new(&endpoint, token.trim()).map_err(|_| {
+                        CliError::EvalCheckFailed("invalid X-ray connection configuration".into())
+                    })?;
+                bcode_eval::with_xray_capture(
+                    bcode_eval::EvalXrayCapture {
+                        client: Some(client),
+                        deep_capture: xray_deep,
+                    },
+                    || bcode_eval::run_suite(&options),
+                )?
+            } else if xray || xray_deep {
+                bcode_eval::with_xray_capture(
+                    bcode_eval::EvalXrayCapture {
+                        client: None,
+                        deep_capture: xray_deep,
+                    },
+                    || bcode_eval::run_suite(&options),
+                )?
+            } else {
+                bcode_eval::run_suite(&options)?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {

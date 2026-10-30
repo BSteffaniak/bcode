@@ -296,6 +296,7 @@ mod tests {
     fn invoke(payload: Vec<u8>, operation: &str) -> bcode_plugin_sdk::ServiceResponse {
         use bcode_plugin_sdk::RustPlugin as _;
         crate::LoopPlugin.invoke_service(bcode_plugin_sdk::NativeServiceContext {
+            diagnostics: None,
             plugin_id: PLUGIN_ID.into(),
             request: bcode_plugin_sdk::ServiceRequest {
                 interface_id: bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID.into(),

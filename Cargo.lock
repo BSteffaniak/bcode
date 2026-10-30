@@ -1620,6 +1620,8 @@ dependencies = [
  "bcode_model",
  "bcode_session_models",
  "bcode_tool",
+ "bcode_xray",
+ "bcode_xray_models",
  "futures 0.3.34",
  "serde",
  "serde_json",
@@ -1654,6 +1656,8 @@ dependencies = [
  "bcode_model",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
+ "bcode_xray",
+ "bcode_xray_models",
  "clap",
  "libc",
  "reqwest 0.12.28",
@@ -1681,6 +1685,8 @@ dependencies = [
  "bcode_openai_responses",
  "bcode_plugin_sdk",
  "bcode_session_models",
+ "bcode_xray",
+ "bcode_xray_models",
  "clap",
  "reqwest 0.12.28",
  "rustls 0.23.45",
@@ -1811,9 +1817,12 @@ dependencies = [
  "bcode_workflow_discovery",
  "bcode_workflow_store",
  "bcode_worktree_models",
+ "bcode_xray",
+ "bcode_xray_models",
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "open",
  "rand 0.9.5",
  "rpassword",
@@ -1860,8 +1869,13 @@ dependencies = [
  "bcode_workflow_store",
  "bcode_workflow_view_models",
  "bcode_worktree_models",
+ "bcode_xray",
+ "bcode_xray_models",
+ "hex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2072,6 +2086,8 @@ dependencies = [
  "bcode_tool",
  "bcode_workflow",
  "bcode_workflow_view_models",
+ "bcode_xray",
+ "bcode_xray_models",
  "hex",
  "regex",
  "serde",
@@ -2125,6 +2141,8 @@ dependencies = [
  "bcode_provider_auth_models",
  "bcode_session_models",
  "bcode_tool",
+ "bcode_xray",
+ "bcode_xray_models",
  "hex",
  "image",
  "jsonschema",
@@ -2302,6 +2320,8 @@ dependencies = [
  "bcode_model",
  "bcode_plugin_sdk",
  "bcode_provider_auth_models",
+ "bcode_xray",
+ "bcode_xray_models",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2462,6 +2482,8 @@ dependencies = [
  "bcode_model",
  "bcode_plugin_sdk",
  "bcode_session_models",
+ "bcode_xray",
+ "bcode_xray_models",
  "httpdate",
  "image",
  "serde",
@@ -2533,6 +2555,8 @@ dependencies = [
  "bcode_session_import",
  "bcode_session_models",
  "bcode_tool",
+ "bcode_xray",
+ "bcode_xray_models",
  "flate2",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -2594,6 +2618,8 @@ dependencies = [
  "bcode_question_plugin",
  "bcode_tool",
  "bcode_workflow",
+ "bcode_xray",
+ "bcode_xray_models",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "hex",
@@ -2633,6 +2659,8 @@ dependencies = [
  "bcode_usage_models",
  "bcode_workflow",
  "bcode_workflow_view_models",
+ "bcode_xray",
+ "bcode_xray_models",
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",
@@ -2856,6 +2884,7 @@ dependencies = [
 name = "bcode_server"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "bcode_agent_profile",
  "bcode_agent_runtime",
@@ -2923,6 +2952,8 @@ dependencies = [
  "bcode_worktree",
  "bcode_worktree_models",
  "bcode_worktree_plugin",
+ "bcode_xray",
+ "bcode_xray_models",
  "bmux_keyboard",
  "bmux_tui",
  "chrono",
@@ -3285,7 +3316,10 @@ dependencies = [
 name = "bcode_tool_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_xray",
+ "bcode_xray_models",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3676,6 +3710,30 @@ dependencies = [
  "bmux_tui",
  "bmux_tui_components",
  "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_xray"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_xray_models",
+ "hex",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "bcode_xray_models"
+version = "0.0.1-alpha.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

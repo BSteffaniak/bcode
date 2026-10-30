@@ -560,6 +560,7 @@ mod tests {
                 preparation: None,
             };
             let context = NativeServiceContext {
+                diagnostics: None,
                 plugin_id: PLUGIN_ID.into(),
                 request: ServiceRequest {
                     interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
@@ -673,6 +674,7 @@ mod tests {
                 preparation: None,
             };
             let context = NativeServiceContext {
+                diagnostics: None,
                 plugin_id: PLUGIN_ID.into(),
                 request: ServiceRequest {
                     interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
@@ -721,6 +723,7 @@ mod tests {
         let mut state = loop_workflow_initial_value(&input);
         state.condition_met = true;
         let context = NativeServiceContext {
+            diagnostics: None,
             plugin_id: PLUGIN_ID.into(),
             request: ServiceRequest {
                 interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
@@ -802,6 +805,7 @@ mod tests {
         };
         let mut boundaries = Vec::<String>::new();
         let mut context = NativeServiceContext {
+            diagnostics: None,
             plugin_id: PLUGIN_ID.into(),
             request: ServiceRequest {
                 interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
@@ -846,6 +850,7 @@ mod tests {
             preparation: None,
         };
         let context = |invocation: &bcode_workflow::WorkflowBlockInvocation| NativeServiceContext {
+            diagnostics: None,
             plugin_id: PLUGIN_ID.into(),
             request: ServiceRequest {
                 interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),

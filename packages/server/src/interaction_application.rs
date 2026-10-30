@@ -139,13 +139,21 @@ impl<'a> InteractionApplicationHandle<'a> {
         if permission.session_id != session_id {
             return Err(InteractionControllerError::Unauthorized);
         }
-        Ok(interaction_operations::resolve_permission(
+        let mut observation = crate::xray_tools::InteractionObservation::start_tool(
+            self.state,
+            session_id,
+            &permission.tool_call_id,
+            "permission_response",
+        );
+        let resolved = interaction_operations::resolve_permission(
             self.state,
             permission_id,
             approved,
             remember,
         )
-        .await)
+        .await;
+        observation.finish(if resolved { "resolved" } else { "not_pending" });
+        Ok(resolved)
     }
 
     /// Discover bounded committed public views for exactly one authorized session.
@@ -396,14 +404,26 @@ impl<'a> InteractionApplicationHandle<'a> {
             .map(|exchange| exchange.summary.clone())
             .ok_or(InteractionControllerError::NotPending)?;
         self.require_session(pending.session_id).await?;
-        interaction_operations::resolve_tool_exchange(
+        let mut observation = crate::xray_tools::InteractionObservation::start_tool(
+            self.state,
+            pending.session_id,
+            &pending.request.invocation_id,
+            "exchange_response",
+        );
+        let result = interaction_operations::resolve_tool_exchange(
             self.state,
             self.client_id,
             exchange_id,
             resolution,
         )
         .await
-        .map_err(|_| InteractionControllerError::InvalidContract)
+        .map_err(|_| InteractionControllerError::InvalidContract);
+        observation.finish(match &result {
+            Ok(true) => "resolved",
+            Ok(false) => "not_pending",
+            Err(_) => "rejected",
+        });
+        result
     }
 }
 

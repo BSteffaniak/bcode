@@ -950,6 +950,20 @@ async fn execute_compaction_plan(
     checkpoint_key: String,
     mut local_checkpoint: Option<checkpoint::LocalCheckpoint>,
 ) -> Result<CompactionCompletion, CompactionError> {
+    let xray = super::xray_context::current(session_id);
+    if let Some(context) = &xray {
+        context.emit(
+            "context",
+            "compaction_plan_selected",
+            serde_json::json!({
+                "compacted_through_sequence": plan.compacted_through_sequence,
+                "source_events": plan.compactable_prefix.len(),
+                "chunks": chunks.len(),
+                "resuming": local_checkpoint.is_some(),
+            }),
+            false,
+        );
+    }
     let synthesis_policy = synthesis_limits(&summary_budget);
     // A saved local operation must not repeat a provider-native operation on resume.
     let native_snapshot = if local_checkpoint.is_some() {
@@ -1168,6 +1182,31 @@ async fn publish_compaction_plan(
             },
         )
         .await?;
+    if let Some(context) = super::xray_context::current(session_id) {
+        context.emit(
+            "context",
+            "compaction_committed",
+            serde_json::json!({
+                "compacted_through_sequence": transcript.compacted_through_sequence,
+                "marker_sequence": event.sequence,
+            }),
+            false,
+        );
+        // Capture only the portable summary. A native snapshot also contains opaque provider data.
+        match &event.kind {
+            SessionEventKind::ContextCompacted { summary, .. } => {
+                super::xray_context::sensitive(&context, "compaction_summary", summary);
+            }
+            SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
+                super::xray_context::sensitive(
+                    &context,
+                    "compaction_summary",
+                    &snapshot.portable_summary,
+                );
+            }
+            _ => {}
+        }
+    }
     publish_session_event(state, &event).await;
     state.invalidate_session_continuations(session_id).await;
     drop(marker_commit);
@@ -1415,6 +1454,18 @@ pub async fn compact_context_with_selected_backend(
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
+    let xray = super::xray_context::current(session_id);
+    if let Some(context) = &xray {
+        context.emit(
+            "context",
+            "native_compaction_dispatch",
+            serde_json::json!({
+                "source_events": history.len(),
+                "opaque_payload_omitted": true,
+            }),
+            false,
+        );
+    }
     let response = tokio::select! {
         () = cancel_state.cancelled() => return Err(CompactionError::Cancelled),
         response = state.plugins.invoke_service_json::<_, bcode_model::CompactContextResponse>(
@@ -1424,6 +1475,18 @@ pub async fn compact_context_with_selected_backend(
             &request,
         ) => response,
     };
+    if let Some(context) = &xray {
+        context.emit(
+            "context",
+            "native_compaction_response",
+            serde_json::json!({
+                "response_received": response.is_ok(),
+                "cancellation_observed": cancel_state.is_cancelled(),
+                "opaque_payload_omitted": true,
+            }),
+            false,
+        );
+    }
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
@@ -1801,6 +1864,24 @@ pub async fn append_context_compaction_trace(
     compacted: bool,
     message: Option<String>,
 ) {
+    if let Some(context) = super::xray_context::current(session_id) {
+        let event_name = match kind {
+            CompactionTraceKind::Diagnostic => "compaction_diagnostic",
+            CompactionTraceKind::Skipped => "compaction_skipped",
+            CompactionTraceKind::Started => "compaction_started",
+            CompactionTraceKind::Finished => "compaction_finished",
+        };
+        context.emit(
+            "context",
+            event_name,
+            serde_json::json!({
+                "projected_context_chars": projected_context_chars,
+                "compacted": compacted,
+            }),
+            false,
+        );
+        // reason/message can contain provider text. Do not put them in scalar diagnostics.
+    }
     let phase = match kind {
         CompactionTraceKind::Diagnostic => SessionTracePhase::ContextCompactionDiagnostic,
         CompactionTraceKind::Skipped => SessionTracePhase::ContextCompactionSkipped,
@@ -3192,6 +3273,49 @@ async fn dispatch_synthesis_request(
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     // Preserve push preference and compaction-specific transport validation.
+    super::xray_context::assembled_request(&request, "compaction_request_dispatch");
+    let xray = super::xray_context::current(session_id).map(|context| {
+        let mut correlation = context.correlation().clone();
+        correlation.request_id = Some(request.turn_id.clone());
+        context.with_correlation(correlation)
+    });
+    let dispatch = dispatch_synthesis_request_inner(
+        state,
+        session_id,
+        selection,
+        request,
+        attempt,
+        command_context,
+        cancel_state,
+    );
+    let result = if let Some(context) = &xray {
+        context.scope(dispatch).await
+    } else {
+        dispatch.await
+    };
+    if let Some(context) = &xray {
+        context.emit(
+            "context",
+            "compaction_request_completed",
+            serde_json::json!({
+                "response_received": result.is_ok(),
+                "cancellation_observed": matches!(&result, Err(CompactionError::Cancelled)),
+            }),
+            false,
+        );
+    }
+    result
+}
+
+async fn dispatch_synthesis_request_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    request: ModelTurnRequest,
+    attempt: &mut ModelRequestAttempt,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+) -> Result<String, CompactionError> {
     if let Some((push_plugin_id, push_interface_id)) =
         model_provider_push_route(state, selection.provider_plugin_id.as_deref())
     {

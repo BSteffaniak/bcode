@@ -9,6 +9,7 @@
 //! the host to decide whether the item may be replayed. Unknown item fields must survive an exact
 //! deserialize/persist/replay round trip.
 
+mod diagnostics;
 mod discovery;
 /// Provider-owned conversion of external conversation history.
 pub mod history;
@@ -3384,9 +3385,9 @@ fn usage_window_refs(
 
 fn start_chat_completion(runtime: &ProviderRuntime, request: ModelTurnRequest, turn: &TurnState) {
     let worker_turn = turn.clone();
-    if let Err(error) = runtime.try_spawn(async move {
+    if let Err(error) = runtime.try_spawn(diagnostics::scope(async move {
         stream_chat_completion(&request, &worker_turn).await;
-    }) {
+    })) {
         push_runtime_error(turn, &error.to_string());
     }
 }
@@ -5058,6 +5059,7 @@ async fn send_chat_completion_request(
         settings.base_url.trim_end_matches('/')
     );
     let request_body = build_chat_completion_request(settings, request, model_id)?;
+    diagnostics::record("adapted_request", &request_body);
     let bytes = encode_request_body(&request_body)?;
     let mut projection = openai_request_projection(
         settings,
@@ -5129,6 +5131,7 @@ async fn send_responses_request_to(
     let routing = turn.map(|turn| &turn.routing);
     let (request_body, context_representation) =
         build_responses_request_with_representation(settings, request, model_id)?;
+    diagnostics::record("adapted_request", &request_body);
     let mut builder = client
         .post(url)
         .bearer_auth(access_token)
@@ -5574,6 +5577,7 @@ fn process_responses_stream_line(
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
     saw_tool_call: &mut bool,
 ) -> Result<StreamOutcome, ProviderError> {
+    diagnostics::stream_line(line);
     if let Some(data) = line.strip_prefix("data:")
         && data.trim() != "[DONE]"
     {
@@ -5921,6 +5925,7 @@ fn process_stream_line(
     saw_tool_call: &mut bool,
     name_map: &BTreeMap<String, String>,
 ) -> Result<StreamOutcome, ProviderError> {
+    diagnostics::stream_line(line);
     let Some(data) = line.strip_prefix("data: ") else {
         return Ok(StreamOutcome::Cancelled);
     };
@@ -11954,6 +11959,7 @@ mod tests {
             R: serde::de::DeserializeOwned,
         {
             let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
+                diagnostics: None,
                 plugin_id: PROVIDER_ID.to_string(),
                 request: ServiceRequest {
                     interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),

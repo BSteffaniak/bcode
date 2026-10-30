@@ -1241,6 +1241,15 @@ pub async fn register_pending_permission(
     permissions.insert(pending.summary.permission_id.clone(), routed.clone());
     drop(permissions);
     drop(batch_decision);
+    crate::xray_tools::emit_tool(
+        state,
+        pending.summary.session_id,
+        &pending.summary.tool_call_id,
+        "permission_pending",
+        serde_json::json!({
+            "permission_id": pending.summary.permission_id,
+        }),
+    );
     publish_session_event(state, &event).await;
     notify_interaction_destination(state, &routed.summary).await;
     Ok(())
@@ -1718,6 +1727,16 @@ async fn complete_conditional_batch(
     drop(decision);
     for permission in &permissions {
         *permission.decision.lock().await = Some(request.approved);
+        crate::xray_tools::emit_tool(
+            state,
+            permission.summary.session_id,
+            &permission.summary.tool_call_id,
+            "permission_resolved",
+            serde_json::json!({
+                "permission_id": permission.summary.permission_id,
+                "approved": request.approved, "recorded": true, "batch": true,
+            }),
+        );
     }
     for permission in &permissions {
         permission.notify.notify_waiters();
@@ -1918,6 +1937,16 @@ async fn complete_pending_permission_inner(
         );
     }
     *permission.decision.lock().await = Some(approved);
+    crate::xray_tools::emit_tool(
+        state,
+        permission.summary.session_id,
+        &permission.summary.tool_call_id,
+        "permission_resolved",
+        serde_json::json!({
+            "permission_id": permission.summary.permission_id,
+            "approved": approved, "recorded": recorded,
+        }),
+    );
     permission.notify.notify_waiters();
     notify_interaction_destination(state, &permission.summary).await;
     recorded
@@ -2072,6 +2101,16 @@ async fn resolve_permission_batch_owned(
     drop(batch_decision);
     for permission in &permissions {
         *permission.decision.lock().await = Some(approved);
+        crate::xray_tools::emit_tool(
+            state,
+            permission.summary.session_id,
+            &permission.summary.tool_call_id,
+            "permission_resolved",
+            serde_json::json!({
+                "permission_id": permission.summary.permission_id,
+                "approved": approved, "recorded": true, "batch": true,
+            }),
+        );
     }
     for permission in &permissions {
         permission.notify.notify_waiters();
@@ -2261,6 +2300,12 @@ async fn request_tool_exchange_inner(
     cancel_state: &TurnCancelState,
     sequences: Option<(u64, u64)>,
 ) -> Result<ToolExchangeResolution, String> {
+    let mut observation = crate::xray_tools::InteractionObservation::start_tool(
+        state,
+        session_id,
+        &request.invocation_id,
+        "exchange_request",
+    );
     let (resolution, notify, durable) = match Box::pin(register_pending_tool_exchange_inner(
         state, session_id, request, sequences,
     ))
@@ -2268,6 +2313,7 @@ async fn request_tool_exchange_inner(
     {
         Ok(registration) => registration,
         Err(ExchangeRegistrationError::Duplicate) => {
+            observation.finish("rejected_duplicate");
             return Err(format!(
                 "duplicate interactive tool request id: {}",
                 request.exchange_id
@@ -2278,11 +2324,20 @@ async fn request_tool_exchange_inner(
             // failure. Keep original canonical work alive and expose a stable diagnostic.
             tracing::warn!(%session_id, exchange_id = %request.exchange_id, error = error.message(),
                 "durable exchange admission deferred; canonical invocation preserved");
+            crate::xray_tools::emit_tool(
+                state,
+                session_id,
+                &request.invocation_id,
+                "exchange_admission_deferred",
+                serde_json::json!({"exchange_id": request.exchange_id}),
+            );
             cancel_state.cancelled().await;
+            observation.finish("cancelled_after_admission_deferred");
             return Ok(ToolExchangeResolution::Cancelled);
         }
     };
     if !retain_without_consumer(Ok(durable)) && !has_exchange_consumer(state, request).await {
+        observation.finish("consumer_detached");
         return Ok(abort_tool_exchange(
             state,
             &request.exchange_id,
@@ -2290,14 +2345,16 @@ async fn request_tool_exchange_inner(
         )
         .await);
     }
-    Ok(wait_for_tool_exchange_resolution(
+    let resolution = wait_for_tool_exchange_resolution(
         state,
         &request.exchange_id,
         &resolution,
         &notify,
         cancel_state,
     )
-    .await)
+    .await;
+    observation.finish(crate::xray_tools::exchange_outcome(&resolution));
+    Ok(resolution)
 }
 
 /// Absence is conclusive only after a successful canonical check. Storage or
@@ -2509,6 +2566,15 @@ async fn register_exchange_after_checkpoint(
     }
     exchanges.insert(request.exchange_id.clone(), pending);
     drop(exchanges);
+    crate::xray_tools::emit_tool(
+        state,
+        session_id,
+        &request.invocation_id,
+        "exchange_pending",
+        serde_json::json!({
+            "exchange_id": request.exchange_id, "durable": durable,
+        }),
+    );
     notify_route_destination(state, route.as_ref()).await;
     Ok((resolution, notify, durable))
 }
@@ -2623,6 +2689,15 @@ where
     for exchange in detached.into_values() {
         controllers.remove_exchange(&exchange.summary.request.exchange_id);
         *exchange.resolution.lock().await = Some(ToolExchangeResolution::ConsumerDetached);
+        crate::xray_tools::emit_tool(
+            state,
+            exchange.summary.session_id,
+            &exchange.summary.request.invocation_id,
+            "exchange_resolved",
+            serde_json::json!({
+                "exchange_id": exchange.summary.request.exchange_id, "outcome": "consumer_detached",
+            }),
+        );
         exchange.notify.notify_waiters();
     }
     drop(controllers);
@@ -2679,6 +2754,8 @@ pub async fn wait_for_tool_exchange_resolution(
 /// This is not a concurrent session cancellation or a workflow-wide cleanup API.
 /// Registry lock order matches semantic effects: controllers, then pending exchanges.
 pub async fn cancel_session_tool_exchanges(state: &ServerState, session_id: SessionId) {
+    let mut observation =
+        crate::xray_tools::InteractionObservation::start(state, session_id, "exchange_cleanup");
     let removed = {
         let mut controllers = state.interaction_controllers.lock().await;
         let mut exchanges = state.pending_tool_exchanges.lock().await;
@@ -2698,15 +2775,35 @@ pub async fn cancel_session_tool_exchanges(state: &ServerState, session_id: Sess
         drop(controllers);
         removed
     };
+    let removed_count = removed.len();
     for pending in removed {
         let mut resolution = pending.resolution.lock().await;
         if resolution.is_none() {
             *resolution = Some(ToolExchangeResolution::Cancelled);
         }
+        let outcome = resolution
+            .as_ref()
+            .map_or("unknown", crate::xray_tools::exchange_outcome);
+        crate::xray_tools::emit_tool(
+            state,
+            pending.summary.session_id,
+            &pending.summary.request.invocation_id,
+            "exchange_cleanup_resolved",
+            serde_json::json!({
+                "exchange_id": pending.summary.request.exchange_id, "outcome": outcome,
+            }),
+        );
         drop(resolution);
         pending.notify.notify_waiters();
         notify_route_destination(state, pending.summary.interaction_route.as_ref()).await;
     }
+    crate::xray_tools::emit(
+        state,
+        session_id,
+        "exchanges_cleaned",
+        serde_json::json!({"removed": removed_count}),
+    );
+    observation.finish("completed");
 }
 
 /// Remove one pending exchange because its owning workflow cancelled or lost its consumer.
@@ -2723,6 +2820,15 @@ pub async fn abort_tool_exchange(
         .await
         .remove(interaction_id);
     if let Some(pending) = pending {
+        crate::xray_tools::emit_tool(
+            state,
+            pending.summary.session_id,
+            &pending.summary.request.invocation_id,
+            "exchange_aborted",
+            serde_json::json!({
+                "exchange_id": interaction_id, "outcome": crate::xray_tools::exchange_outcome(&resolution),
+            }),
+        );
         *pending.resolution.lock().await = Some(resolution.clone());
         pending.notify.notify_waiters();
         notify_route_destination(state, pending.summary.interaction_route.as_ref()).await;
@@ -2760,6 +2866,15 @@ pub async fn complete_tool_exchange_under_controller_lock(
     let Some(request) = request else {
         return false;
     };
+    crate::xray_tools::emit_tool(
+        state,
+        request.summary.session_id,
+        &request.summary.request.invocation_id,
+        "exchange_resolved",
+        serde_json::json!({
+            "exchange_id": interaction_id, "outcome": crate::xray_tools::exchange_outcome(&resolution),
+        }),
+    );
     *request.resolution.lock().await = Some(resolution);
     request.notify.notify_waiters();
     notify_route_destination(state, request.summary.interaction_route.as_ref()).await;

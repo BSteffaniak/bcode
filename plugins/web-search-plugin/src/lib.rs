@@ -3142,6 +3142,7 @@ mod tests {
         context: &bcode_plugin_sdk::PluginConfigContext,
     ) -> ProviderCredentials {
         let native_context = NativeServiceContext {
+            diagnostics: None,
             plugin_id: WEB_SEARCH_PLUGIN_ID.to_owned(),
             request: ServiceRequest {
                 interface_id: TOOL_SERVICE_INTERFACE_ID.to_owned(),

@@ -308,6 +308,40 @@ pub(super) fn merge_response_with_policy(
     reconcilable: &BTreeSet<u64>,
     policy: SynthesisPolicy,
 ) -> Result<CompactionEvidence, Rejection> {
+    let result = merge_response_inner(
+        summary,
+        prior,
+        user_sequences,
+        new_user_sequences,
+        reconcilable,
+        policy,
+    );
+    if let Some(context) = bcode_xray::CaptureContext::current() {
+        context.emit(
+            "context",
+            "compaction_synthesis_merge",
+            serde_json::json!({
+                "accepted": result.is_ok(),
+                "new_sources": new_user_sequences.len(),
+                "reconcilable_sources": reconcilable.len(),
+            }),
+            false,
+        );
+        if let Ok(evidence) = &result {
+            crate::xray_context::sensitive(&context, "compaction_synthesis_candidate", evidence);
+        }
+    }
+    result
+}
+
+fn merge_response_inner(
+    summary: &str,
+    prior: &CompactionEvidence,
+    user_sequences: &BTreeSet<u64>,
+    new_user_sequences: &BTreeSet<u64>,
+    reconcilable: &BTreeSet<u64>,
+    policy: SynthesisPolicy,
+) -> Result<CompactionEvidence, Rejection> {
     let value = decode(summary, policy)?;
     if value
         .get("format")

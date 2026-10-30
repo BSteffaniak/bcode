@@ -24,6 +24,7 @@ fn context(source: &str) -> NativeServiceContext {
         host_context: Vec::new(),
     };
     NativeServiceContext {
+        diagnostics: None,
         plugin_id: "bcode.shell".to_owned(),
         request: ServiceRequest {
             interface_id: TOOL_SERVICE_INTERFACE_ID.to_owned(),

@@ -1877,6 +1877,7 @@ library = "libtest_wait_second.dylib"
         let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
         cancellation.cancel();
         let context = bcode_plugin_sdk::NativeServiceContext {
+            diagnostics: None,
             plugin_id: "test.composer-wait".into(),
             config: bcode_plugin_sdk::PluginConfigContext::default(),
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),

@@ -4,6 +4,9 @@
 
 //! Shared turn lifecycle support for native model provider plugins.
 
+pub mod diagnostics;
+pub use diagnostics::ProviderDiagnostics;
+
 mod usage_receiver;
 pub use usage_receiver::receive_original_usage;
 
@@ -618,9 +621,22 @@ pub struct TurnState {
     cancelled: Arc<AtomicBool>,
     terminal: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
+    diagnostics: ProviderDiagnostics,
 }
 
 impl TurnState {
+    /// Bind the originating observer context before publishing any turn events.
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    /// Return observation-only hooks for adapted requests and raw protocol frames.
+    #[must_use]
+    pub const fn diagnostics(&self) -> &ProviderDiagnostics {
+        &self.diagnostics
+    }
     /// Queue a provider event for the host to poll.
     ///
     /// Events published after `TurnFinished` are ignored, even after the terminal
@@ -653,6 +669,7 @@ impl TurnState {
         } else {
             event
         };
+        self.diagnostics.event(&event);
         events.push_back(event);
     }
 
@@ -688,6 +705,7 @@ impl TurnState {
 
     /// Mark the turn as cancelled and wake stream workers.
     pub fn cancel(&self) {
+        self.diagnostics.cancellation_requested();
         self.cancelled.store(true, Ordering::SeqCst);
         self.cancel_notify.notify_waiters();
     }
@@ -743,12 +761,36 @@ impl TurnStore {
     ///
     /// Panics before modifying the store if the turn identity space is exhausted.
     pub fn insert_started(&mut self, id_prefix: &str) -> (String, TurnState) {
+        self.insert_started_with_diagnostics(id_prefix, ProviderDiagnostics::current())
+    }
+
+    /// Insert a request with explicit originating capture, including at a plugin boundary.
+    /// Request identity must already be present in the supplied capture correlation. This does
+    /// not derive identity from metadata or enable observation implicitly.
+    ///
+    /// # Panics
+    /// Panics before modifying the store if the turn identity space is exhausted.
+    pub fn insert_started_for_request(
+        &mut self,
+        id_prefix: &str,
+        request: &bcode_model::ModelTurnRequest,
+        diagnostics: ProviderDiagnostics,
+    ) -> (String, TurnState) {
+        diagnostics.request(request);
+        self.insert_started_with_diagnostics(id_prefix, diagnostics)
+    }
+
+    fn insert_started_with_diagnostics(
+        &mut self,
+        id_prefix: &str,
+        diagnostics: ProviderDiagnostics,
+    ) -> (String, TurnState) {
         self.next_turn = self
             .next_turn
             .checked_add(1)
             .expect("provider turn identity exhausted");
         let provider_turn_id = format!("{id_prefix}-{}", self.next_turn);
-        let turn = TurnState::default();
+        let turn = TurnState::default().with_diagnostics(diagnostics);
         turn.push(ProviderTurnEvent::TurnStarted);
         self.turns.insert(provider_turn_id.clone(), turn.clone());
         (provider_turn_id, turn)
@@ -1591,7 +1633,8 @@ impl ProviderRuntime {
         if admission.is_none() {
             return Err(ProviderRuntimeError::ShuttingDown);
         }
-        let task = self.handle.spawn(future);
+        let diagnostics = ProviderDiagnostics::current();
+        let task = self.handle.spawn(diagnostics.scope(future));
         drop(admission);
         Ok(ProviderTask {
             task: Some(task),
@@ -1681,10 +1724,11 @@ impl ProviderRuntime {
             return Err(ProviderRuntimeError::ShuttingDown);
         }
         let (sender, receiver) = mpsc::sync_channel(1);
-        self.handle.spawn(async move {
+        let diagnostics = ProviderDiagnostics::current();
+        self.handle.spawn(diagnostics.scope(async move {
             let output = future.await;
             let _ = sender.send(output);
-        });
+        }));
         drop(admission);
         receiver
             .recv()

@@ -3059,6 +3059,7 @@ mod tests {
     ) {
         let updates = Mutex::new(Vec::<Vec<u8>>::new());
         let mut context = NativeServiceContext {
+            diagnostics: None,
             plugin_id: FILESYSTEM_PLUGIN_ID.to_owned(),
             request: ServiceRequest {
                 interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),

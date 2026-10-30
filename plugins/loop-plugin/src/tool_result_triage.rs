@@ -678,6 +678,7 @@ mod tests {
 
     fn context(request: &TriageRequest, bridge: ServiceBridge) -> NativeServiceContext {
         NativeServiceContext {
+            diagnostics: None,
             plugin_id: "bcode.loop".into(),
             request: ServiceRequest {
                 interface_id: INTERFACE_ID.into(),

@@ -1804,8 +1804,9 @@ impl AgentRuntime {
             capacity,
         });
         let parent_span = tracing::Span::current();
+        let capture = bcode_xray::CaptureContext::current();
         switchy::unsync::task::spawn(
-            async move {
+            in_capture_scope(capture, async move {
                 let catalog = SharedToolCatalog(catalog);
                 let result = runtime
                     .run_provider_tool_loop(
@@ -1828,7 +1829,7 @@ impl AgentRuntime {
                     Err(error) => AgentLoopStreamItem::Error(error),
                 };
                 worker.complete(item);
-            }
+            })
             .instrument(parent_span),
         );
         AgentLoopStream {
@@ -2322,8 +2323,9 @@ impl AgentRuntime {
         };
         let runtime = self.clone();
         let parent_span = tracing::Span::current();
+        let capture = bcode_xray::CaptureContext::current();
         switchy::unsync::task::spawn(
-            async move {
+            in_capture_scope(capture, async move {
                 let stream = StreamOutput {
                     sender: sender.clone(),
                     terminal: Arc::clone(&task_terminal),
@@ -2338,7 +2340,7 @@ impl AgentRuntime {
                     Err(error) => AgentRuntimeStreamItem::Error(error),
                 };
                 worker.complete(item);
-            }
+            })
             .instrument(parent_span),
         );
         AgentRuntimeStream {
@@ -3103,6 +3105,85 @@ fn tool_batch_span(
     )
 }
 
+/// Run a future under the explicitly captured originating observation context.
+async fn in_capture_scope<F: std::future::Future>(
+    capture: Option<bcode_xray::CaptureContext>,
+    future: F,
+) -> F::Output {
+    if let Some(capture) = capture {
+        capture.scope(future).await
+    } else {
+        future.await
+    }
+}
+
+fn tool_capture(scope: &TurnScope, tool_call_id: &str) -> Option<bcode_xray::CaptureContext> {
+    scope.capture_context().map(|capture| {
+        let mut correlation = capture.correlation().clone();
+        correlation.tool_call_id = Some(tool_call_id.to_owned());
+        capture.with_correlation(correlation)
+    })
+}
+
+struct ToolQueueObservation {
+    observation: RuntimeObservation,
+    cancellation: CancellationToken,
+}
+
+impl Drop for ToolQueueObservation {
+    fn drop(&mut self) {
+        if self.cancellation.is_cancelled() {
+            self.observation.finish("cancelled_before_start");
+        }
+    }
+}
+
+struct RuntimeObservation {
+    capture: Option<bcode_xray::CaptureContext>,
+    operation: &'static str,
+    started: Instant,
+    finished: bool,
+}
+
+impl RuntimeObservation {
+    fn start(capture: Option<bcode_xray::CaptureContext>, operation: &'static str) -> Self {
+        if let Some(capture) = &capture {
+            capture.emit(
+                "runtime",
+                "operation_started",
+                serde_json::json!({"operation": operation}),
+                false,
+            );
+        }
+        Self {
+            capture,
+            operation,
+            started: instant_now(),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(capture) = &self.capture {
+            capture.emit("runtime", "operation_finished", serde_json::json!({
+                "operation": self.operation,
+                "outcome": outcome,
+                "duration_ms": duration_millis(instant_now().saturating_duration_since(self.started)),
+            }), false);
+        }
+    }
+}
+
+impl Drop for RuntimeObservation {
+    fn drop(&mut self) {
+        self.finish("unfinished");
+    }
+}
+
 struct RuntimePhaseDuration {
     phase: &'static str,
     provider_round: Option<u32>,
@@ -3169,6 +3250,16 @@ async fn authorize_runtime_tool_batch<A>(
 where
     A: ToolAuthorizationCoordinator + ?Sized,
 {
+    let mut observation = RuntimeObservation::start(scope.capture_context(), "tool_authorization");
+    let mut call_observations = prepared
+        .iter()
+        .map(|call| {
+            RuntimeObservation::start(
+                tool_capture(scope, &call.call.id),
+                "tool_authorization_wait",
+            )
+        })
+        .collect::<Vec<_>>();
     let requests = prepared
         .iter()
         .map(|prepared| ToolAuthorizationRequest {
@@ -3184,13 +3275,30 @@ where
     let decisions = switchy::unsync::select! {
         biased;
         () = cancellation.cancelled() => {
+            observation.finish("cancelled");
+            for observation in &mut call_observations {
+                observation.finish("cancelled");
+            }
             record_scheduler_cancellations(scope, prepared.len(), 0);
             insert_cancelled_calls(terminal, &prepared);
             return Ok(Vec::new());
         }
-        decisions = authorization_future => decisions?,
+        decisions = authorization_future => match decisions {
+            Ok(decisions) => decisions,
+            Err(error) => {
+                observation.finish("failed");
+                for observation in &mut call_observations {
+                    observation.finish("failed");
+                }
+                return Err(error);
+            }
+        },
     };
     if decisions.len() != prepared.len() {
+        observation.finish("invalid_response");
+        for observation in &mut call_observations {
+            observation.finish("invalid_response");
+        }
         return Err(RuntimeError::InvalidBatchResponse {
             component: "authorization",
             expected: prepared.len(),
@@ -3198,8 +3306,48 @@ where
         });
     }
 
+    observation.finish("completed");
+    Ok(apply_tool_authorization_decisions(
+        prepared,
+        decisions,
+        call_observations,
+        scope,
+        terminal,
+    ))
+}
+
+fn apply_tool_authorization_decisions(
+    prepared: Vec<PreparedRuntimeToolCall>,
+    decisions: Vec<ToolAuthorizationDecision>,
+    call_observations: Vec<RuntimeObservation>,
+    scope: &TurnScope,
+    terminal: &mut BTreeMap<usize, Result<ToolExecutionOutput>>,
+) -> Vec<PreparedRuntimeToolCall> {
     let mut approved = Vec::with_capacity(prepared.len());
-    for (prepared, decision) in prepared.into_iter().zip(decisions) {
+    for ((prepared, decision), mut wait) in
+        prepared.into_iter().zip(decisions).zip(call_observations)
+    {
+        wait.finish(match &decision {
+            ToolAuthorizationDecision::Allow => "allow",
+            ToolAuthorizationDecision::Ask(_) => "ask",
+            ToolAuthorizationDecision::Deny(_) => "deny",
+        });
+        if let Some(capture) = scope.capture_context() {
+            let mut correlation = capture.correlation().clone();
+            correlation.tool_call_id = Some(prepared.call.id.clone());
+            capture.with_correlation(correlation).emit(
+                "runtime",
+                "tool_authorization_decided",
+                serde_json::json!({
+                    "decision": match &decision {
+                        ToolAuthorizationDecision::Allow => "allow",
+                        ToolAuthorizationDecision::Ask(_) => "ask",
+                        ToolAuthorizationDecision::Deny(_) => "deny",
+                    },
+                }),
+                false,
+            );
+        }
         match decision {
             ToolAuthorizationDecision::Allow => approved.push(prepared),
             ToolAuthorizationDecision::Ask(reason) => {
@@ -3213,7 +3361,7 @@ where
             }
         }
     }
-    Ok(approved)
+    approved
 }
 
 async fn prepare_runtime_tool_batch<C, I>(
@@ -3246,6 +3394,8 @@ where
             host_context: host_context.to_vec(),
         };
         let preparation_scope = PreparationScope::new(scope.clone(), host_context.to_vec());
+        let mut preparation_observation =
+            RuntimeObservation::start(tool_capture(scope, &call.id), "tool_preparation");
         let preparation = invoker.prepare_tool(&tool, &preparation_request, &preparation_scope);
         let cancellation = scope.control().cancellation();
         let prepared_result = switchy::unsync::select! {
@@ -3258,6 +3408,12 @@ where
                 }),
             ),
         };
+        preparation_observation.finish(match &prepared_result {
+            Ok(_) => "prepared",
+            Err(RuntimeError::Cancelled) => "cancelled",
+            Err(RuntimeError::ToolPreparationTimeout { .. }) => "timed_out",
+            Err(_) => "failed",
+        });
         match prepared_result {
             Ok(preparation) => prepared.push(PreparedRuntimeToolCall {
                 index,
@@ -3797,6 +3953,37 @@ impl RuntimeToolGroupExecution {
 // Bounds cooperative cleanup of active calls; queued calls still fail the scope gate.
 const TOOL_SETTLEMENT_GRACE: Duration = Duration::from_secs(3);
 
+fn queued_tool_observations(
+    group: &[PreparedRuntimeToolCall],
+    scope: &TurnScope,
+) -> Vec<(PreparedRuntimeToolCall, Option<ToolQueueObservation>)> {
+    // Construct every queued observation before polling any invocation, including
+    // work which buffer_unordered may never admit before cancellation.
+    let mut observations = group
+        .iter()
+        .map(|call| {
+            (
+                call.index,
+                ToolQueueObservation {
+                    observation: RuntimeObservation::start(
+                        tool_capture(scope, &call.call.id),
+                        "tool_queue",
+                    ),
+                    cancellation: scope.control().cancellation(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    group
+        .iter()
+        .cloned()
+        .map(|prepared| {
+            let wait = observations.remove(&prepared.index);
+            (prepared, wait)
+        })
+        .collect()
+}
+
 async fn execute_runtime_tool_group<I>(
     invoker: &I,
     group: &[PreparedRuntimeToolCall],
@@ -3811,10 +3998,18 @@ where
     let observation = Arc::new(BatchConcurrencyObservation::default());
     let mut remaining = group.iter().map(|call| call.index).collect::<BTreeSet<_>>();
     let mut completions = Vec::with_capacity(group.len());
+    let queued = queued_tool_observations(group, scope);
     let mut executions = Box::pin(
-        stream::iter(group.iter().cloned().map(|prepared| {
+        stream::iter(queued.into_iter().map(|(prepared, mut wait)| {
             let observation = Arc::clone(&observation);
             async move {
+                if let Some(wait) = &mut wait {
+                    wait.observation.finish(if scope.accepts_work() {
+                        "admitted"
+                    } else {
+                        "cancelled_before_start"
+                    });
+                }
                 let tool_span = tracing::info_span!(
                     target: "bcode::sdk",
                     "bcode.tool_call",
@@ -3846,6 +4041,14 @@ where
         switchy::unsync::select! {
             biased;
             () = cancellation.cancelled() => {
+                for call in group.iter().filter(|call| remaining.contains(&call.index)) {
+                    if let Some(capture) = tool_capture(scope, &call.call.id) {
+                        capture.emit("runtime", "tool_cancellation_observed", serde_json::json!({
+                            "settlement": settlement[call.index].load(Ordering::Acquire),
+                            "outcome": "unknown_until_settled",
+                        }), false);
+                    }
+                }
                 let running = observation.active();
                 let queued = remaining.len().saturating_sub(running);
                 let drain = async {
@@ -3937,12 +4140,19 @@ fn provider_batch_execution_groups(
 }
 
 struct InvocationLifecycleGuard {
+    observation: RuntimeObservation,
     scope: InvocationScope,
     terminal: bool,
 }
 
 impl InvocationLifecycleGuard {
     fn start(scope: InvocationScope) -> Self {
+        let capture = scope.turn().capture_context().map(|capture| {
+            let mut correlation = capture.correlation().clone();
+            correlation.tool_call_id = Some(scope.invocation_id().to_owned());
+            capture.with_correlation(correlation)
+        });
+        let observation = RuntimeObservation::start(capture, "tool_invocation");
         let event = ToolInvocationLifecycleEvent {
             invocation_id: scope.invocation_id().to_string(),
             sequence: 0,
@@ -3954,6 +4164,7 @@ impl InvocationLifecycleGuard {
             .turn()
             .emit(ScopedTurnEvent::InvocationLifecycle(event));
         Self {
+            observation,
             scope,
             terminal: false,
         }
@@ -3965,6 +4176,10 @@ impl InvocationLifecycleGuard {
             bcode_tool::ToolInvocationLifecycleStage::Completed
                 | bcode_tool::ToolInvocationLifecycleStage::Failed
         ));
+        self.observation.finish(match stage {
+            bcode_tool::ToolInvocationLifecycleStage::Completed => "completed",
+            _ => "failed",
+        });
         self.terminal = true;
         self.scope
             .emit_invocation_terminal(ToolInvocationLifecycleEvent {
@@ -3984,6 +4199,7 @@ impl InvocationLifecycleGuard {
     }
 
     fn cancel_with_message(&mut self, message: String) -> bool {
+        self.observation.finish("cancelled_outcome_unknown");
         self.terminal = true;
         self.scope
             .emit_cancellation_lifecycle(ToolInvocationLifecycleEvent {
@@ -4001,6 +4217,8 @@ impl Drop for InvocationLifecycleGuard {
         if self.terminal {
             return;
         }
+        // Dropping a future is not evidence that the invocation failed or was cancelled.
+        self.observation.finish("unfinished");
         if self.scope.accepts_work() {
             let _ = self.finish(bcode_tool::ToolInvocationLifecycleStage::Failed);
         } else {
@@ -4035,13 +4253,15 @@ where
     }
     let mut lifecycle = InvocationLifecycleGuard::start(invocation_scope.clone());
     settlement.store(1, Ordering::Release);
-    let invocation = invoker
-        .invoke_tool(&prepared.tool, &prepared.invocation, &invocation_scope)
-        .await
-        .map_err(|error| RuntimeError::ToolExecution {
-            tool_name: prepared.call.name.clone(),
-            message: error.to_string(),
-        });
+    let invocation = in_capture_scope(
+        lifecycle.observation.capture.clone(),
+        invoker.invoke_tool(&prepared.tool, &prepared.invocation, &invocation_scope),
+    )
+    .await
+    .map_err(|error| RuntimeError::ToolExecution {
+        tool_name: prepared.call.name.clone(),
+        message: error.to_string(),
+    });
     if !invocation_scope.settlement_unresolved() {
         settlement.store(2, Ordering::Release);
     }
@@ -4070,6 +4290,7 @@ where
     };
     let mut output = tool_execution_output(&prepared.call, invocation);
     apply_tool_result_policy(&mut output, result_policy);
+    observe_tool_result(&lifecycle, &invocation_scope, &output);
     if !scope.control().accepts_normal_output() {
         let _ = lifecycle.cancel_with_message(format!(
             "Tool cancelled; final invocation report: {}",
@@ -4107,6 +4328,67 @@ where
     };
     let _ = lifecycle.finish(stage);
     Ok(output)
+}
+
+fn observe_tool_result(
+    lifecycle: &InvocationLifecycleGuard,
+    invocation_scope: &InvocationScope,
+    output: &ToolExecutionOutput,
+) {
+    if let Some(capture) = &lifecycle.observation.capture {
+        capture.emit(
+            "runtime",
+            "tool_result",
+            serde_json::json!({
+                "is_error": output.invocation.is_error,
+                "output_bytes": output.model_result.output.len(),
+                "content_items": output.model_result.content.len(),
+                "settlement_unresolved": invocation_scope.settlement_unresolved(),
+            }),
+            false,
+        );
+        capture_tool_result_text(capture, &output.model_result.output);
+    }
+}
+
+// This is the sole owner of policy-transformed result-text capture. Provider
+// observations capture request construction, not another copy of this tool body.
+fn capture_tool_result_text(capture: &bcode_xray::CaptureContext, text: &str) {
+    if !capture.deep_capture_active() {
+        return;
+    }
+    match capture.capture_payload("text/plain; charset=utf-8", text.as_bytes()) {
+        Ok(Some(payload)) => capture.emit(
+            "runtime",
+            "tool_result_text",
+            serde_json::json!({
+                "payload": payload, "stage": "after_result_policy",
+                "scope": "model_result_text_only",
+            }),
+            true,
+        ),
+        result => {
+            let reason = match result {
+                Ok(None) | Err(bcode_xray::XrayError::CaptureInactive) => "capture_inactive",
+                Err(bcode_xray::XrayError::PayloadTooLarge) => "payload_limit",
+                Err(bcode_xray::XrayError::Busy) => "producer_busy",
+                Err(bcode_xray::XrayError::PayloadCaptureUnsupported) => {
+                    "payload_capture_unsupported"
+                }
+                Err(_) => "capture_unavailable",
+                Ok(Some(_)) => unreachable!(),
+            };
+            capture.emit(
+                "runtime",
+                "payload_omitted",
+                serde_json::json!({
+                    "kind": "tool_result_text", "reason": reason,
+                    "byte_len": text.len(), "stage": "after_result_policy",
+                }),
+                false,
+            );
+        }
+    }
 }
 
 fn apply_tool_result_policy(output: &mut ToolExecutionOutput, policy: &ToolResultPolicy) {
@@ -4508,6 +4790,202 @@ fn normalize_provider_event(
         ProviderTurnEvent::Cancelled => {
             Ok(EventDisposition::Cancelled(AgentRuntimeEvent::Cancelled))
         }
+    }
+}
+
+#[cfg(test)]
+mod xray_observation_tests {
+    use super::*;
+    use bcode_xray::{XRAY_SCHEMA_VERSION, XrayCorrelation, XrayHub, XrayObserveRequest};
+
+    #[tokio::test]
+    async fn queued_tool_cancellation_keeps_call_identity_and_explicit_outcome() {
+        let hub = XrayHub::default();
+        let mut observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "origin".into(),
+                deep_capture: false,
+            })
+            .expect("observe");
+        let context = hub.context(XrayCorrelation {
+            session_id: "origin".into(),
+            ..Default::default()
+        });
+        let scope = context
+            .scope(async { TurnScope::without_events("turn", TurnGeneration::new(1)) })
+            .await;
+        let cancellation = scope.control().cancellation();
+        let queued = ToolQueueObservation {
+            observation: RuntimeObservation::start(
+                tool_capture(&scope, "queued-call"),
+                "tool_queue",
+            ),
+            cancellation: cancellation.clone(),
+        };
+        cancellation.cancel();
+        drop(queued);
+        let _ = observation.recv().await.expect("ready");
+        let _ = observation.recv().await.expect("queued");
+        let terminal = observation.recv().await.expect("cancelled");
+        assert_eq!(
+            terminal.event.correlation.tool_call_id.as_deref(),
+            Some("queued-call")
+        );
+        assert_eq!(terminal.event.correlation.turn_id.as_deref(), Some("turn"));
+        assert_eq!(terminal.event.data["outcome"], "cancelled_before_start");
+    }
+
+    #[tokio::test]
+    async fn large_tool_text_is_referenced_once_and_shallow_observers_get_no_body() {
+        let hub = XrayHub::default();
+        let mut deep = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "origin".into(),
+                deep_capture: true,
+            })
+            .expect("deep");
+        let mut shallow = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "origin".into(),
+                deep_capture: false,
+            })
+            .expect("shallow");
+        let capture = hub.context(XrayCorrelation {
+            session_id: "origin".into(),
+            tool_call_id: Some("call".into()),
+            ..Default::default()
+        });
+        let text = "large-result".repeat(4096);
+        capture_tool_result_text(&capture, &text);
+        let _ = deep.recv().await.expect("ready");
+        let envelope = deep.recv().await.expect("reference");
+        assert_eq!(envelope.event.name, "tool_result_text");
+        assert_eq!(
+            envelope.event.correlation.tool_call_id.as_deref(),
+            Some("call")
+        );
+        assert!(envelope.event.sensitive);
+        assert!(envelope.event.data.get("text").is_none());
+        let payload: bcode_xray::XrayPayloadRef =
+            serde_json::from_value(envelope.event.data["payload"].clone()).expect("payload ref");
+        let bytes = hub
+            .read_payload(&bcode_xray::XrayReadPayloadRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                observation_id: deep.id().to_owned(),
+                session_id: "origin".into(),
+                payload_id: payload.payload_id,
+                offset: 0,
+                length: u32::try_from(text.len()).expect("length"),
+            })
+            .expect("retained bytes");
+        assert_eq!(bytes.bytes, text.as_bytes());
+        shallow.finalize().expect("cutoff");
+        while let Some(event) = shallow.recv().await {
+            assert_ne!(event.event.name, "tool_result_text");
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_limit_reports_omission_without_inline_fallback() {
+        let hub = XrayHub::new(bcode_xray::XrayConfig {
+            max_payload_bytes: 16,
+            ..Default::default()
+        });
+        let mut observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "origin".into(),
+                deep_capture: true,
+            })
+            .expect("observe");
+        let capture = hub.context(XrayCorrelation {
+            session_id: "origin".into(),
+            ..Default::default()
+        });
+        capture_tool_result_text(&capture, "sensitive-result-too-large");
+        let _ = observation.recv().await.expect("ready");
+        let omission = observation.recv().await.expect("omission");
+        assert_eq!(omission.event.name, "payload_omitted");
+        assert!(omission.event.data.get("text").is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_origin_survives_spawn_and_cleanup_without_inheriting_another_turn() {
+        let hub = XrayHub::default();
+        let mut observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "origin".into(),
+                deep_capture: false,
+            })
+            .expect("observe");
+        let capture = hub.context(XrayCorrelation {
+            session_id: "origin".into(),
+            turn_id: Some("turn-a".into()),
+            ..Default::default()
+        });
+        let operation = RuntimeObservation::start(Some(capture.clone()), "test_wait");
+        let foreign = hub.context(XrayCorrelation {
+            session_id: "foreign".into(),
+            ..Default::default()
+        });
+        foreign
+            .scope(async move {
+                tokio::spawn(in_capture_scope(Some(capture), async move {
+                    assert_eq!(
+                        bcode_xray::CaptureContext::current()
+                            .expect("explicit scope")
+                            .correlation()
+                            .turn_id
+                            .as_deref(),
+                        Some("turn-a")
+                    );
+                    drop(operation);
+                }))
+                .await
+                .expect("join");
+            })
+            .await;
+        assert_eq!(observation.recv().await.expect("ready").event.name, "ready");
+        let start = observation.recv().await.expect("start");
+        let finish = observation.recv().await.expect("unfinished");
+        assert_eq!(start.event.correlation, finish.event.correlation);
+        assert_eq!(finish.event.correlation.session_id, "origin");
+        assert_eq!(finish.event.data["outcome"], "unfinished");
+    }
+
+    #[tokio::test]
+    async fn explicit_completion_is_not_overwritten_by_guard_drop() {
+        let hub = XrayHub::default();
+        let mut observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "origin".into(),
+                deep_capture: false,
+            })
+            .expect("observe");
+        let capture = hub.context(XrayCorrelation {
+            session_id: "origin".into(),
+            ..Default::default()
+        });
+        let mut operation = RuntimeObservation::start(Some(capture), "tool_invocation");
+        operation.finish("cancelled_outcome_unknown");
+        operation.finish("completed");
+        drop(operation);
+        observation.finalize().expect("cutoff");
+        let mut outcomes = Vec::new();
+        while let Some(envelope) = observation.recv().await {
+            if envelope.event.name == "operation_finished" {
+                outcomes.push(envelope.event.data["outcome"].clone());
+            }
+        }
+        assert_eq!(
+            outcomes,
+            vec![serde_json::json!("cancelled_outcome_unknown")]
+        );
     }
 }
 

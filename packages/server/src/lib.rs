@@ -58,6 +58,13 @@ mod session_bulk_migration;
 mod session_compression;
 pub use session_application::SessionApplicationHandle;
 mod session_observation;
+pub mod xray_application;
+pub mod xray_bootstrap;
+mod xray_context;
+pub mod xray_http;
+mod xray_projection;
+mod xray_tools;
+mod xray_workflow;
 pub use session_observation::{SessionObservation, SessionObservationDelivery};
 mod session_operations;
 mod session_search_operations;
@@ -532,6 +539,9 @@ pub struct ServerState {
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
     model_checks: Mutex<BTreeMap<String, model_check::ActiveCheck>>,
     session_observations: session_observation::SessionObservationRegistry,
+    /// Transient diagnostics; never canonical session history or execution authority.
+    pub xray: Arc<bcode_xray::XrayHub>,
+    xray_endpoints: xray_bootstrap::XrayEndpointRegistry,
     generation_contexts: Mutex<BTreeMap<String, context_generation::CapturedContext>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_model_selection_origins: Mutex<BTreeMap<SessionId, SessionModelSelectionOrigin>>,
@@ -2690,6 +2700,8 @@ impl ServerState {
             active_ralph_runs: Mutex::default(),
             model_checks: Mutex::default(),
             session_observations: session_observation::SessionObservationRegistry::default(),
+            xray_endpoints: xray_bootstrap::XrayEndpointRegistry::default(),
+            xray: Arc::new(bcode_xray::XrayHub::default()),
             generation_contexts: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_model_selection_origins: Mutex::default(),
@@ -3157,6 +3169,9 @@ impl ServerState {
     }
 
     async fn idle_shutdown_blocker(&self) -> Option<String> {
+        if self.xray.observation_active().unwrap_or(true) || self.xray_endpoints.active().await {
+            return Some("daemon has live X-ray endpoints; refusing idle-only stop".into());
+        }
         if let Some(blocker) = self.active_migration_shutdown_blocker().await {
             return Some(blocker);
         }
@@ -5865,6 +5880,7 @@ async fn shutdown_constructed_server(
     )
     .await;
     trace_shutdown_stage("catalog_refresh", stop_catalog_refresh(&state)).await;
+    trace_shutdown_stage("xray_endpoints", state.xray_endpoints.stop_all()).await;
     tracing::info!(target: "bcode_server::shutdown", "flushing catalog updates");
     trace_shutdown_stage("catalog_updates", state.sessions.shutdown_catalog_updates()).await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
@@ -6698,7 +6714,8 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         Request::SessionCompress { request } => Some(request.session_id),
         Request::PrepareContextGeneration { request } => Some(request.source_session_id),
         Request::SessionWorkingDocument { request } => Some(request.session_id),
-        Request::SessionAdmission { session_id, .. }
+        Request::OpenXrayEndpoint { session_id, .. }
+        | Request::SessionAdmission { session_id, .. }
         | Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
         | Request::ReadSessionTraceBlob {
@@ -6809,6 +6826,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionWorkingDocument { .. } => "session_working_document",
         Request::ListWorkflowDiagnosticArtifacts { .. } => "list_workflow_diagnostic_artifacts",
         Request::ReadWorkflowDiagnosticArtifact { .. } => "read_workflow_diagnostic_artifact",
+        Request::OpenXrayEndpoint { .. } => "open_xray_endpoint",
+        Request::CloseXrayEndpoint { .. } => "close_xray_endpoint",
         Request::ReadSessionTraceBlob { .. } => "read_session_trace_blob",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
         Request::InvocationInput { .. } => "invocation_input",
@@ -7789,6 +7808,27 @@ fn handle_request_inner<'a>(
             let response = result.map_or_else(
                 |error| Response::Err(ErrorResponse::new(error.code, error.message)),
                 |document| Response::Ok(ResponsePayload::SessionWorkingDocument { document }),
+            );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::OpenXrayEndpoint {
+            session_id,
+            deep_capture,
+        } => Box::pin(async move {
+            let result = state
+                .open_xray_endpoint(client_id, session_id, deep_capture)
+                .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code(), error.to_string())),
+                |endpoint| Response::Ok(ResponsePayload::XrayEndpointOpened { endpoint }),
+            );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::CloseXrayEndpoint { endpoint_id } => Box::pin(async move {
+            let result = state.close_xray_endpoint(client_id, &endpoint_id).await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code(), error.to_string())),
+                |()| Response::Ok(ResponsePayload::XrayEndpointClosed),
             );
             send_response(writer, request_id, response).await
         }),
@@ -21962,18 +22002,27 @@ async fn run_model_turn(
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
     recovering: bool,
 ) -> ModelTurnCompletion {
-    context_compaction_request_budget::scope(Box::pin(run_model_turn_lifecycle(
-        state,
-        permit,
-        trigger_event,
-        client_id,
-        runtime_context,
-        command_context,
-        phase,
-        supplied_cancel_state,
-        recovering,
-    )))
-    .await
+    let correlation = bcode_xray_models::XrayCorrelation {
+        session_id: trigger_event.session_id.to_string(),
+        turn_id: Some(execution_turn_id(trigger_event)),
+        ..Default::default()
+    };
+    let capture = state.xray.context(correlation);
+    capture
+        .scope(context_compaction_request_budget::scope(Box::pin(
+            run_model_turn_lifecycle(
+                state,
+                permit,
+                trigger_event,
+                client_id,
+                runtime_context,
+                command_context,
+                phase,
+                supplied_cancel_state,
+                recovering,
+            ),
+        )))
+        .await
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -24655,6 +24704,8 @@ async fn run_model_turn_round(
     } = round;
     let mut dispatch_request = request.clone();
     prepare_dispatch_context_lineage(state, session_id, &mut dispatch_request);
+    // Capture only after final host dispatch adaptation, never the earlier estimate.
+    xray_context::assembled_request(&dispatch_request, "assembled_request");
     let request = &dispatch_request;
     let _capture_lease = context_lineage::CaptureLease {
         captures: &state.context_lineage_captures,
@@ -26369,6 +26420,7 @@ async fn handle_provider_turn_event(
     stream_progress: &mut ModelStreamProgress,
     command_context: &RuntimeCommandContext<'_>,
 ) {
+    xray_projection::provider_event(state, session_id, provider_turn_id, turn_id, &event);
     // Availability is domain evidence, not session content; retain it even when cancellation
     // races delivery, without reopening the terminal session turn.
     if let ProviderTurnEvent::ModelAvailability { observation } = &event {
@@ -44486,6 +44538,7 @@ fn observe_substantive_stage(state: &ServerState, event: &bcode_session_models::
 }
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
+    xray_projection::canonical_event(state, event);
     state.activity_observations.lock().await.observe(event);
     observe_substantive_stage(state, event);
     state

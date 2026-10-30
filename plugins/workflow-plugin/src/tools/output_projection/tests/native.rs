@@ -8,6 +8,7 @@ fn native_context(
     bridge: ServiceBridge,
 ) -> NativeServiceContext {
     NativeServiceContext {
+        diagnostics: None,
         plugin_id: "bcode.workflow".into(),
         request: ServiceRequest {
             interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.into(),

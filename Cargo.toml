@@ -138,6 +138,8 @@ members = [
     "packages/router/telemetry-util",
     "plugins/worktree-plugin",
     "packages/session/models",
+    "packages/xray",
+    "packages/xray/models",
 ]
 resolver = "2"
 
@@ -150,6 +152,8 @@ repository = "https://github.com/BSteffaniak/bcode"
 version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
+bcode_xray = { version = "0.0.1-alpha.0", default-features = false, path = "packages/xray" }
+bcode_xray_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/xray/models" }
 ruff_formatter = { version = "0.0.17", default-features = false }
 ruff_python_formatter = { version = "0.0.17", default-features = false, features = [
     "serde",

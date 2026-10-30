@@ -7584,14 +7584,34 @@ pub async fn start_run_with_package(
     authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
     package: Option<(&str, &str)>,
 ) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
-    Box::pin(start_run_with_stage(
-        state,
-        request,
-        authored_provenance,
-        package,
-        &mut "read_definition",
-    ))
-    .await
+    let session_id = request.parent_session_id.to_string();
+    let origin = bcode_xray::CaptureContext::current()
+        .filter(|context| context.correlation().session_id == session_id)
+        .unwrap_or_else(|| {
+            state.xray.context(bcode_xray_models::XrayCorrelation {
+                session_id: session_id.clone(),
+                ..Default::default()
+            })
+        });
+    let mut correlation = origin.correlation().clone();
+    correlation.run_id = request.run_id.clone();
+    correlation.activation_id = None;
+    correlation.attempt_id = None;
+    let context = Some(origin.with_correlation(correlation));
+    let boundary = crate::xray_workflow::Boundary::new(context.clone(), "run.admission");
+    let result = crate::xray_workflow::scope(
+        context,
+        Box::pin(start_run_with_stage(
+            state,
+            request,
+            authored_provenance,
+            package,
+            &mut "read_definition",
+        )),
+    )
+    .await;
+    boundary.finish_result(&result);
+    result
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7790,8 +7810,13 @@ async fn start_run_with_stage(
         ),
     )
     .await;
+    let context = crate::xray_workflow::run_context(bcode_xray::CaptureContext::current(), &run_id);
+    crate::xray_workflow::fact(context.as_ref(), "run.admitted", "persisted");
     *phase = "initial_execution";
-    if let Err(error) = Box::pin(super::drive_workflow_run(state, &run_id)).await {
+    if let Err(error) =
+        crate::xray_workflow::scope(context, Box::pin(super::drive_workflow_run(state, &run_id)))
+            .await
+    {
         // Admission can commit a receipt before the first driver call fails. Only
         // verified terminal evidence permits releasing its runtime registration.
         if let Err(reconciliation) =

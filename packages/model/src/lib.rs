@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+pub mod diagnostics;
 pub mod history;
 pub mod host_operation;
 pub mod image_upload;

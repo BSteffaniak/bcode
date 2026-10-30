@@ -11,6 +11,27 @@ pub(super) enum ResponseContract {
 
 impl ResponseContract {
     pub(super) fn validate(self, text: &str) -> Result<(), Rejection> {
+        let result = self.validate_inner(text);
+        if let Some(context) = bcode_xray::CaptureContext::current() {
+            context.emit(
+                "context",
+                "compaction_response_validated",
+                serde_json::json!({
+                    "contract": match self {
+                        Self::Update => "update", Self::Replace => "replace",
+                        Self::Consolidation => "consolidation",
+                    },
+                    "accepted": result.is_ok(),
+                    "response_bytes": text.len(),
+                }),
+                false,
+            );
+            crate::xray_context::sensitive(&context, "compaction_response", text);
+        }
+        result
+    }
+
+    fn validate_inner(self, text: &str) -> Result<(), Rejection> {
         use std::sync::OnceLock;
         static REPLACE: OnceLock<jsonschema::Validator> = OnceLock::new();
         static UPDATE: OnceLock<jsonschema::Validator> = OnceLock::new();

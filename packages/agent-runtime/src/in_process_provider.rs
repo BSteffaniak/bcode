@@ -60,6 +60,14 @@ impl InProcessProviderContext {
         &self.events
     }
 
+    /// Return the originating observation context for explicit child-task propagation.
+    /// This does not enable capture or confer execution authority.
+    // Option is already must-use; repository policy forbids redundant must-use attributes.
+    #[allow(clippy::must_use_candidate)]
+    pub fn capture_context(&self) -> Option<bcode_xray::CaptureContext> {
+        self.events.state.capture.clone()
+    }
+
     /// Return cancellation state for the complete provider round.
     #[must_use]
     pub const fn cancellation(&self) -> &CancellationToken {
@@ -342,6 +350,7 @@ where
             let state = Arc::new(InProcessTurnState {
                 capacity: self.event_capacity.get(),
                 byte_limit: self.event_byte_limit.get(),
+                capture: bcode_xray::CaptureContext::current(),
                 ..InProcessTurnState::new()
             });
             state.push(ProviderTurnEvent::TurnStarted);
@@ -362,7 +371,20 @@ where
                 id: provider_turn_id.clone(),
                 state: Arc::clone(&state),
             };
-            switchy::unsync::task::spawn(async move {
+            let capture = state.capture.clone();
+            if let Some(capture) = &capture {
+                capture.emit(
+                    "provider",
+                    "request_started",
+                    serde_json::json!({
+                        "message_count": request.messages.len(),
+                        "tool_count": request.tools.len(),
+                        "surface": "in_process",
+                    }),
+                    false,
+                );
+            }
+            let worker_future = async move {
                 use futures::FutureExt as _;
                 let _worker = worker;
                 let context = InProcessProviderContext {
@@ -385,6 +407,13 @@ where
                         // acknowledgment; no panic payload crosses the provider boundary.
                         Err(_) => {},
                     },
+                }
+            };
+            switchy::unsync::task::spawn(async move {
+                if let Some(capture) = capture {
+                    capture.scope(worker_future).await;
+                } else {
+                    worker_future.await;
                 }
             });
             acquisition.armed = false;
@@ -426,6 +455,14 @@ where
             .get(&request.provider_turn_id)
             .cloned();
         if let Some(state) = state {
+            if let Some(capture) = &state.capture {
+                capture.emit(
+                    "provider",
+                    "cancellation_requested",
+                    serde_json::json!({}),
+                    false,
+                );
+            }
             state.finish_cancelled();
             state.cancellation.cancel();
         }
@@ -484,7 +521,6 @@ where
     }
 }
 
-#[derive(Debug)]
 struct InProcessTurnState {
     capacity: usize,
     byte_limit: usize,
@@ -493,6 +529,121 @@ struct InProcessTurnState {
     released: CancellationToken,
     abandoned: AtomicBool,
     terminal: AtomicBool,
+    capture: Option<bcode_xray::CaptureContext>,
+}
+
+impl std::fmt::Debug for InProcessTurnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InProcessTurnState")
+            .field("capacity", &self.capacity)
+            .field("byte_limit", &self.byte_limit)
+            .field("terminal", &self.terminal.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use bcode_xray::{XRAY_SCHEMA_VERSION, XrayCorrelation, XrayHub, XrayObserveRequest};
+
+    #[test]
+    fn terminal_state_does_not_reopen_or_double_report_usage() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let hub = XrayHub::default();
+                let mut observer = hub
+                    .observe(XrayObserveRequest {
+                        schema_version: XRAY_SCHEMA_VERSION,
+                        session_id: "session".into(),
+                        deep_capture: true,
+                    })
+                    .unwrap();
+                let state = InProcessTurnState {
+                    capture: Some(hub.context(XrayCorrelation {
+                        session_id: "session".into(),
+                        turn_id: Some("turn".into()),
+                        attempt_id: Some("attempt".into()),
+                        ..XrayCorrelation::default()
+                    })),
+                    ..InProcessTurnState::new()
+                };
+                let usage = ProviderTurnEvent::Usage {
+                    usage: bcode_model::TokenUsage {
+                        input_tokens: Some(11),
+                        output_tokens: Some(2),
+                        ..Default::default()
+                    },
+                };
+                state.push_nonterminal(usage.clone()).unwrap();
+                state.finish(StopReason::EndTurn);
+                state.finish(StopReason::Error);
+                assert_eq!(
+                    state.push_nonterminal(usage.clone()),
+                    Err(InProcessProviderEmitError::TurnFinished)
+                );
+                let events = state.drain();
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0], usage);
+                assert_eq!(
+                    events[1],
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::EndTurn
+                    }
+                );
+                observer.finalize().unwrap();
+                assert_eq!(observer.recv().await.unwrap().event.name, "ready");
+                let usage_event = observer.recv().await.unwrap().event;
+                assert_eq!(usage_event.name, "usage");
+                assert_eq!(usage_event.data["input_tokens"], 11);
+                assert_eq!(
+                    usage_event.correlation.attempt_id.as_deref(),
+                    Some("attempt")
+                );
+                assert_eq!(observer.recv().await.unwrap().event.name, "turn_finished");
+                assert_eq!(observer.recv().await.unwrap().event.name, "finalized");
+            });
+    }
+
+    #[test]
+    fn shallow_stream_observation_excludes_text_content() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let hub = XrayHub::default();
+                let mut observer = hub
+                    .observe(XrayObserveRequest {
+                        schema_version: XRAY_SCHEMA_VERSION,
+                        session_id: "session".into(),
+                        deep_capture: false,
+                    })
+                    .unwrap();
+                let state = InProcessTurnState {
+                    capture: Some(hub.context(XrayCorrelation {
+                        session_id: "session".into(),
+                        ..XrayCorrelation::default()
+                    })),
+                    ..InProcessTurnState::new()
+                };
+                state
+                    .push_nonterminal(ProviderTurnEvent::TextDelta {
+                        text: "sensitive body".into(),
+                    })
+                    .unwrap();
+                observer.finalize().unwrap();
+                assert_eq!(observer.recv().await.unwrap().event.name, "ready");
+                let event = observer.recv().await.unwrap().event;
+                assert_eq!(event.name, "stream_event");
+                assert_eq!(event.data, serde_json::json!({}));
+                assert!(!event.sensitive);
+                assert_eq!(observer.recv().await.unwrap().event.name, "finalized");
+            });
+    }
 }
 
 struct EventSizeBudget(usize);
@@ -540,6 +691,9 @@ impl Drop for InProcessWorkerGuard {
         ));
         self.0.cancellation.cancel();
         self.0.released.cancel();
+        if let Some(capture) = &self.0.capture {
+            capture.emit("provider", "worker_released", serde_json::json!({}), false);
+        }
     }
 }
 
@@ -553,10 +707,79 @@ impl InProcessTurnState {
             released: CancellationToken::new(),
             abandoned: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
+            capture: None,
         }
     }
 
+    fn observe(&self, event: &ProviderTurnEvent) {
+        let Some(capture) = &self.capture else { return };
+        if !capture.capture_active() {
+            return;
+        }
+        // Do not serialize arbitrary errors, metadata, or provider-private content here.
+        let (name, data) = match event {
+            ProviderTurnEvent::TurnStarted => ("turn_started", serde_json::json!({})),
+            ProviderTurnEvent::TurnFinished { stop_reason } => (
+                "turn_finished",
+                serde_json::json!({ "stop_reason": stop_reason }),
+            ),
+            ProviderTurnEvent::Cancelled => ("cancelled", serde_json::json!({})),
+            ProviderTurnEvent::Error { error } => {
+                ("error", serde_json::json!({ "category": error.category }))
+            }
+            ProviderTurnEvent::Usage { usage } => (
+                "usage",
+                serde_json::json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "cached_input_tokens": usage.cached_input_tokens,
+                    "cache_write_input_tokens": usage.cache_write_input_tokens,
+                    "reasoning_tokens": usage.reasoning_tokens,
+                    "semantics": "final_cumulative_per_request",
+                }),
+            ),
+            ProviderTurnEvent::RetryScheduled { retry_at_unix, .. } => (
+                "retry_scheduled",
+                serde_json::json!({ "retry_at_unix": retry_at_unix }),
+            ),
+            ProviderTurnEvent::Output { .. }
+            | ProviderTurnEvent::TextDelta { .. }
+            | ProviderTurnEvent::ReasoningDelta { .. }
+            | ProviderTurnEvent::ReasoningActivity { .. }
+            | ProviderTurnEvent::ToolCallStarted { .. }
+            | ProviderTurnEvent::ToolCallDelta { .. }
+            | ProviderTurnEvent::ToolCallFinished { .. } => {
+                capture.emit("provider", "stream_event", serde_json::json!({}), false);
+                if capture.deep_capture_active() {
+                    let encoded = serde_json::to_writer(EventSizeBudget(16 * 1024), event)
+                        .ok()
+                        .and_then(|()| serde_json::to_value(event).ok());
+                    if let Some(data) = encoded {
+                        capture.emit("provider", "normalized_stream_event", data, true);
+                    } else {
+                        capture.emit(
+                            "provider",
+                            "payload_omitted",
+                            serde_json::json!({
+                                "event": "normalized_stream_event",
+                                "reason": "encoding_failed_or_budget_exceeded",
+                                "max_bytes": 16 * 1024,
+                                "complete": false,
+                            }),
+                            false,
+                        );
+                    }
+                }
+                return;
+            }
+            _ => return,
+        };
+        capture.emit("provider", name, data, false);
+    }
+
     fn push(&self, event: ProviderTurnEvent) {
+        self.observe(&event);
         self.events
             .lock()
             .expect("in-process provider event lock should not be poisoned")
@@ -592,6 +815,7 @@ impl InProcessTurnState {
             self.cancellation.cancel();
             return Err(InProcessProviderEmitError::BufferFull);
         }
+        self.observe(&event);
         events.push_back(event);
         drop(events);
         Ok(())
@@ -617,6 +841,9 @@ impl InProcessTurnState {
             .lock()
             .expect("in-process provider event lock should not be poisoned");
         if self.begin_finish() {
+            for event in &terminal_events {
+                self.observe(event);
+            }
             events.extend(terminal_events);
         }
     }

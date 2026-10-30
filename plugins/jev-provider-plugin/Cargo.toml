@@ -17,6 +17,8 @@ crate-type = ["cdylib", "rlib"]
 bcode_model                = { workspace = true }
 bcode_plugin_sdk           = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
+bcode_xray                 = { workspace = true }
+bcode_xray_models          = { workspace = true }
 reqwest                    = { workspace = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json                 = { workspace = true }

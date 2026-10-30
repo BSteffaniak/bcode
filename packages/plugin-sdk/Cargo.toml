@@ -22,6 +22,8 @@ bcode_tool = { workspace = true }
 bcode_usage_models = { workspace = true }
 bcode_workflow = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
+bcode_xray = { workspace = true }
+bcode_xray_models = { workspace = true }
 bmux_keyboard = { workspace = true, optional = true }
 bmux_text_edit = { workspace = true, optional = true }
 bmux_tui = { workspace = true, optional = true }

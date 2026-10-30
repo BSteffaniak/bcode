@@ -22,6 +22,8 @@ bcode_prompt_cache           = { workspace = true, features = ["simulation"] }
 bcode_provider_auth_models   = { workspace = true }
 bcode_session_models         = { workspace = true }
 bcode_tool                   = { workspace = true }
+bcode_xray                   = { workspace = true }
+bcode_xray_models            = { workspace = true }
 hex                          = { workspace = true }
 image                        = { workspace = true }
 jsonschema                   = { workspace = true }

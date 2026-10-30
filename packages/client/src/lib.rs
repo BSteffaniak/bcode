@@ -6,6 +6,8 @@
 
 mod generation;
 mod session_observation;
+/// Public local HTTP/SSE X-ray observation client.
+pub mod xray;
 pub use session_observation::ClientSessionObservation;
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
@@ -4731,6 +4733,25 @@ impl BcodeClient {
             }
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    /// Bootstrap an authenticated local HTTP diagnostic capability for exactly one session.
+    /// The returned lease retains the authenticated connection for client-scoped revocation.
+    /// Call `XrayEndpointLease::close` after draining or on failure. No provider configuration
+    /// is selected and no execution is submitted or cancelled.
+    ///
+    /// # Errors
+    /// Fails on authorization/admission errors or mismatched session, scope or schema replies.
+    pub async fn open_xray_endpoint(
+        &self,
+        session_id: SessionId,
+        deep_capture: bool,
+    ) -> Result<xray::XrayEndpointLease, ClientError> {
+        let mut connection = self.connect("bcode-xray").await?;
+        let info = connection
+            .open_xray_endpoint(session_id, deep_capture)
+            .await?;
+        Ok(xray::XrayEndpointLease { info, connection })
     }
 
     /// Explicitly read sensitive retained trace bytes referenced by a canonical event.
@@ -9641,6 +9662,59 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
+    /// Open a session-scoped local diagnostic capability on this authenticated connection.
+    /// Retain this connection for revocation; a fresh connection has a different client identity.
+    ///
+    /// # Errors
+    /// Rejects authorization/admission failures and inconsistent response scope or version.
+    pub async fn open_xray_endpoint(
+        &mut self,
+        session_id: SessionId,
+        deep_capture: bool,
+    ) -> Result<bcode_ipc::XrayEndpointInfo, ClientError> {
+        match self
+            .send_request(Request::OpenXrayEndpoint {
+                session_id,
+                deep_capture,
+            })
+            .await?
+        {
+            ResponsePayload::XrayEndpointOpened { endpoint } => {
+                if endpoint.schema_version == bcode_xray_models::XRAY_SCHEMA_VERSION
+                    && endpoint.session_id == session_id
+                    && endpoint.deep_capture == deep_capture
+                    && !endpoint.endpoint_id.is_empty()
+                    && endpoint.credential_file.is_absolute()
+                {
+                    Ok(endpoint)
+                } else {
+                    // The same connection may revoke its own rejected capability only.
+                    if !endpoint.endpoint_id.is_empty() {
+                        let _ = self.close_xray_endpoint(&endpoint.endpoint_id).await;
+                    }
+                    Err(ClientError::UnexpectedResponse)
+                }
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Revoke this connection's diagnostic capability. Never deletes caller-provided files.
+    ///
+    /// # Errors
+    /// Reports rejected/ambiguous revocation or unavailable transport.
+    pub async fn close_xray_endpoint(&mut self, endpoint_id: &str) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::CloseXrayEndpoint {
+                endpoint_id: endpoint_id.to_owned(),
+            })
+            .await?
+        {
+            ResponsePayload::XrayEndpointClosed => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Resolve lifecycle records referenced by one bounded history window.
     /// # Errors
     /// Returns lookup errors, or rejects windows exceeding the bounded lookup budget.

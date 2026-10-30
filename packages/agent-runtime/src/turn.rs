@@ -201,6 +201,7 @@ impl TurnScopeOwner {
             return false;
         };
         TurnControl::signal_cancellation_handles(handles);
+        scope.observe_lifecycle("cancellation_signalled");
         true
     }
 
@@ -225,6 +226,7 @@ impl TurnScopeOwner {
         active.take();
         self.active_generation.store(0, Ordering::Release);
         drop(active);
+        scope.observe_lifecycle("completed");
         true
     }
 
@@ -936,6 +938,7 @@ pub struct TurnScope {
     events: Arc<dyn TurnEventSink>,
     capabilities: InvocationCapabilities,
     active_generation: Option<Arc<AtomicU64>>,
+    capture: Option<bcode_xray::CaptureContext>,
 }
 
 impl fmt::Debug for TurnScope {
@@ -947,6 +950,14 @@ impl fmt::Debug for TurnScope {
             .field("lifecycle", &self.control.lifecycle())
             .finish_non_exhaustive()
     }
+}
+
+fn turn_capture(turn_id: &str) -> Option<bcode_xray::CaptureContext> {
+    bcode_xray::CaptureContext::current().map(|capture| {
+        let mut correlation = capture.correlation().clone();
+        correlation.turn_id = Some(turn_id.to_owned());
+        capture.with_correlation(correlation)
+    })
 }
 
 impl TurnScope {
@@ -973,13 +984,16 @@ impl TurnScope {
         events: Arc<dyn TurnEventSink>,
         capabilities: InvocationCapabilities,
     ) -> Self {
+        let turn_id = turn_id.into();
+        let capture = turn_capture(&turn_id);
         Self {
-            turn_id: turn_id.into(),
+            turn_id,
             generation,
             control: Arc::new(TurnControl::new()),
             events,
             capabilities,
             active_generation: None,
+            capture,
         }
     }
 
@@ -991,13 +1005,16 @@ impl TurnScope {
         capabilities: InvocationCapabilities,
         active_generation: Arc<AtomicU64>,
     ) -> Self {
+        let turn_id = turn_id.into();
+        let capture = turn_capture(&turn_id);
         Self {
-            turn_id: turn_id.into(),
+            turn_id,
             generation,
             control,
             events,
             capabilities,
             active_generation: Some(active_generation),
+            capture,
         }
     }
 
@@ -1005,6 +1022,23 @@ impl TurnScope {
     #[must_use]
     pub fn without_events(turn_id: impl Into<Arc<str>>, generation: TurnGeneration) -> Self {
         Self::new(turn_id, generation, Arc::new(DiscardingTurnEventSink))
+    }
+
+    fn observe_lifecycle(&self, name: &str) {
+        if let Some(capture) = &self.capture {
+            capture.emit(
+                "runtime",
+                name,
+                serde_json::json!({
+                    "generation": self.generation.get(),
+                }),
+                false,
+            );
+        }
+    }
+
+    pub(crate) fn capture_context(&self) -> Option<bcode_xray::CaptureContext> {
+        self.capture.clone()
     }
 
     /// Return the host-assigned turn ID.
@@ -1142,6 +1176,13 @@ impl fmt::Debug for InvocationScope {
 }
 
 impl InvocationScope {
+    fn capture_context(&self) -> Option<bcode_xray::CaptureContext> {
+        self.turn.capture_context().map(|capture| {
+            let mut correlation = capture.correlation().clone();
+            correlation.tool_call_id = Some(self.invocation_id().to_owned());
+            capture.with_correlation(correlation)
+        })
+    }
     /// Create an invocation scope under `turn`.
     #[must_use]
     pub fn new(turn: TurnScope, invocation_id: impl Into<Arc<str>>) -> Self {
@@ -1254,19 +1295,24 @@ impl InvocationScope {
     /// returned resolution is terminal for this request.
     pub async fn request_exchange(&self, request: ToolExchangeRequest) -> ToolExchangeResolution {
         let _duration = InvocationOperationDuration::start("exchange");
+        let mut observation =
+            super::RuntimeObservation::start(self.capture_context(), "exchange_wait");
         if request.invocation_id != self.invocation_id.as_ref() {
+            observation.finish("rejected_invocation_mismatch");
             return ToolExchangeResolution::Failed {
                 code: "invocation_id_mismatch".to_string(),
                 message: "exchange request does not belong to this invocation scope".to_string(),
             };
         }
         if request.exchange_id.is_empty() {
+            observation.finish("rejected_empty_identity");
             return ToolExchangeResolution::Failed {
                 code: "invalid_exchange_id".to_string(),
                 message: "exchange request ID must not be empty".to_string(),
             };
         }
         if !self.accepts_work() {
+            observation.finish("cancelled_before_wait");
             return ToolExchangeResolution::Cancelled;
         }
         let inserted = self
@@ -1275,6 +1321,7 @@ impl InvocationScope {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(request.exchange_id.clone());
         if !inserted {
+            observation.finish("rejected_duplicate");
             return ToolExchangeResolution::Failed {
                 code: "duplicate_exchange_id".to_string(),
                 message: "exchange request ID was already submitted by this invocation".to_string(),
@@ -1286,6 +1333,18 @@ impl InvocationScope {
             () = cancellation.cancelled() => ToolExchangeResolution::Cancelled,
             resolution = self.turn.capabilities.exchanges.request(request) => resolution,
         };
+        observation.finish(if self.accepts_work() {
+            match &resolution {
+                ToolExchangeResolution::Responded { .. } => "responded",
+                ToolExchangeResolution::Cancelled => "cancelled",
+                ToolExchangeResolution::TimedOut => "timed_out",
+                ToolExchangeResolution::NoCompatibleConsumer => "no_compatible_consumer",
+                ToolExchangeResolution::ConsumerDetached => "consumer_detached",
+                ToolExchangeResolution::Failed { .. } => "failed",
+            }
+        } else {
+            "cancelled"
+        });
         if self.accepts_work() {
             resolution
         } else {
@@ -1296,7 +1355,10 @@ impl InvocationScope {
     /// Wait for one unsolicited input, bounded by turn cancellation.
     pub async fn receive_input(&self) -> ToolInvocationInputResolution {
         let _duration = InvocationOperationDuration::start("input_wait");
+        let mut observation =
+            super::RuntimeObservation::start(self.capture_context(), "input_wait");
         if !self.accepts_work() {
+            observation.finish("cancelled_before_wait");
             return ToolInvocationInputResolution::Cancelled;
         }
         let cancellation = self.cancellation();
@@ -1317,6 +1379,17 @@ impl InvocationScope {
                 }
             },
         };
+        observation.finish(if self.accepts_work() {
+            match &resolution {
+                ToolInvocationInputResolution::Received { .. } => "received",
+                ToolInvocationInputResolution::Cancelled => "cancelled",
+                ToolInvocationInputResolution::TimedOut => "timed_out",
+                ToolInvocationInputResolution::Closed => "closed",
+                ToolInvocationInputResolution::Failed { .. } => "failed",
+            }
+        } else {
+            "cancelled"
+        });
         if self.accepts_work() {
             resolution
         } else {
@@ -1330,13 +1403,17 @@ impl InvocationScope {
         request: ToolInvocationServiceRequest,
     ) -> ToolInvocationServiceResolution {
         let _duration = InvocationOperationDuration::start("service");
+        let mut observation =
+            super::RuntimeObservation::start(self.capture_context(), "service_wait");
         if request.invocation_id != self.invocation_id.as_ref() {
+            observation.finish("rejected_invocation_mismatch");
             return ToolInvocationServiceResolution::Failed {
                 code: "invocation_id_mismatch".to_string(),
                 message: "service request does not belong to this invocation scope".to_string(),
             };
         }
         if !self.accepts_work() {
+            observation.finish("cancelled_before_dispatch");
             return ToolInvocationServiceResolution::Cancelled;
         }
         let cancellation = self.cancellation();
@@ -1345,6 +1422,16 @@ impl InvocationScope {
             () = cancellation.cancelled() => ToolInvocationServiceResolution::Cancelled,
             resolution = self.turn.capabilities.services.invoke(request) => resolution,
         };
+        observation.finish(if self.accepts_work() {
+            match &resolution {
+                ToolInvocationServiceResolution::Responded { .. } => "responded",
+                ToolInvocationServiceResolution::Cancelled => "cancelled_outcome_unknown",
+                ToolInvocationServiceResolution::Unsupported => "unsupported",
+                ToolInvocationServiceResolution::Failed { .. } => "failed",
+            }
+        } else {
+            "cancelled_outcome_unknown"
+        });
         if self.accepts_work() {
             resolution
         } else {
@@ -1364,13 +1451,17 @@ impl InvocationScope {
         request: ToolArtifactWriteRequest,
     ) -> ToolArtifactWriteResolution {
         let _duration = InvocationOperationDuration::start("artifact");
+        let mut observation =
+            super::RuntimeObservation::start(self.capture_context(), "artifact_wait");
         if request.invocation_id != self.invocation_id.as_ref() {
+            observation.finish("rejected_invocation_mismatch");
             return ToolArtifactWriteResolution::Failed {
                 code: "invocation_id_mismatch".to_string(),
                 message: "artifact request does not belong to this invocation scope".to_string(),
             };
         }
         if !self.accepts_work() {
+            observation.finish("cancelled_before_dispatch");
             return ToolArtifactWriteResolution::Cancelled;
         }
         let cancellation = self.cancellation();
@@ -1380,6 +1471,16 @@ impl InvocationScope {
             () = cancellation.cancelled() => ToolArtifactWriteResolution::Cancelled,
             resolution = self.turn.capabilities.artifacts.write(request, commit) => resolution,
         };
+        observation.finish(if self.accepts_work() {
+            match &resolution {
+                ToolArtifactWriteResolution::Written { .. } => "written",
+                ToolArtifactWriteResolution::Cancelled => "cancelled_commit_unknown",
+                ToolArtifactWriteResolution::TooLarge { .. } => "too_large",
+                ToolArtifactWriteResolution::Failed { .. } => "failed",
+            }
+        } else {
+            "cancelled_commit_unknown"
+        });
         if self.accepts_work() {
             resolution
         } else {
@@ -1391,6 +1492,31 @@ impl InvocationScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn turn_scope_retains_origin_after_ambient_capture_ends() {
+        let hub = bcode_xray::XrayHub::default();
+        let context = hub.context(bcode_xray::XrayCorrelation {
+            session_id: "session".into(),
+            request_id: Some("request".into()),
+            turn_id: Some("previous".into()),
+            ..Default::default()
+        });
+        let scope = context
+            .scope(async { TurnScope::without_events("current", TurnGeneration::new(1)) })
+            .await;
+        assert!(bcode_xray::CaptureContext::current().is_none());
+        let capture = scope.capture_context().expect("retained context");
+        assert_eq!(capture.correlation().session_id, "session");
+        assert_eq!(capture.correlation().request_id.as_deref(), Some("request"));
+        assert_eq!(capture.correlation().turn_id.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn turn_scope_does_not_enable_capture_on_its_own() {
+        let scope = TurnScope::without_events("turn", TurnGeneration::new(1));
+        assert!(scope.capture_context().is_none());
+    }
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},

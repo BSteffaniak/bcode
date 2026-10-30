@@ -39,22 +39,37 @@ fn owner_stage_span(
     metrics.span(name).labels(labels)
 }
 
-async fn observe_owner_stage<T>(
-    state: &ServerState,
+fn observe_owner_stage<'a, T: 'a>(
+    state: &'a ServerState,
     name: &'static str,
-    request: &PreparedActivationDispatch,
-    operation: impl std::future::Future<Output = Result<T, WorkflowStoreError>>,
-) -> Result<T, WorkflowStoreError> {
-    let span = owner_stage_span(
-        &state.metrics,
-        name,
-        &request.activation.run_id,
-        &request.activation.activation_id,
-        &request.dispatch_identity,
-    );
-    let result = operation.await;
-    span.finish_result(&result);
-    result
+    request: &'a PreparedActivationDispatch,
+    operation: impl std::future::Future<Output = Result<T, WorkflowStoreError>> + 'a,
+) -> impl std::future::Future<Output = Result<T, WorkflowStoreError>> + 'a {
+    // Box before capturing the operation across asynchronous origin resolution.
+    // This contains settlement/dispatch growth at the common owner boundary.
+    let operation = Box::pin(operation);
+    async move {
+        let span = owner_stage_span(
+            &state.metrics,
+            name,
+            &request.activation.run_id,
+            &request.activation.activation_id,
+            &request.dispatch_identity,
+        );
+        let origin =
+            crate::xray_workflow::originating_run_context(state, &request.activation.run_id).await;
+        let context = crate::xray_workflow::activation_context(
+            origin,
+            &request.activation.run_id,
+            &request.activation.activation_id,
+            Some(&request.dispatch_identity),
+        );
+        let boundary = crate::xray_workflow::Boundary::new(context.clone(), name);
+        let result = crate::xray_workflow::scope(context, operation).await;
+        boundary.finish_result(&result);
+        span.finish_result(&result);
+        result
+    }
 }
 
 fn store_error(_: impl std::fmt::Display) -> WorkflowStoreError {
@@ -260,7 +275,19 @@ pub async fn persist_receipt(
         &receipt.activation_id,
         &receipt.dispatch_identity,
     );
-    let result = persist_receipt_inner(state, receipt, authority).await;
+    let origin = crate::xray_workflow::originating_run_context(state, &receipt.run_id).await;
+    let context = crate::xray_workflow::activation_context(
+        origin,
+        &receipt.run_id,
+        &receipt.activation_id,
+        Some(&receipt.dispatch_identity),
+    );
+    let boundary =
+        crate::xray_workflow::Boundary::new(context.clone(), "attempt.receipt_publication");
+    let result =
+        crate::xray_workflow::scope(context, persist_receipt_inner(state, receipt, authority))
+            .await;
+    boundary.finish_result(&result);
     span.finish_result(&result);
     #[cfg(test)]
     state.workflow_test_progress.send_replace(());
@@ -511,13 +538,37 @@ pub async fn settle_observation(
     authority: &WorkflowExecutionAuthority,
     observation: bcode_workflow_store::AttemptObservation,
 ) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
-    observe_owner_stage(
+    let outcome = match &observation {
+        bcode_workflow_store::AttemptObservation::Succeeded { .. } => "succeeded",
+        bcode_workflow_store::AttemptObservation::Failed { .. } => "failed",
+        bcode_workflow_store::AttemptObservation::Cancelled => "cancelled",
+        bcode_workflow_store::AttemptObservation::Deferred { .. } => "ownership_deferred",
+        bcode_workflow_store::AttemptObservation::Unknown => "unknown",
+        bcode_workflow_store::AttemptObservation::RetryableFailure { .. } => "retryable_failure",
+        bcode_workflow_store::AttemptObservation::Paused { .. } => "paused",
+        bcode_workflow_store::AttemptObservation::Admitted => "admitted",
+        bcode_workflow_store::AttemptObservation::Running => "running",
+    };
+    let origin =
+        crate::xray_workflow::originating_run_context(state, &request.activation.run_id).await;
+    let context = crate::xray_workflow::activation_context(
+        origin,
+        &request.activation.run_id,
+        &request.activation.activation_id,
+        Some(&request.dispatch_identity),
+    );
+    let result = observe_owner_stage(
         state,
         "workflow.owner.settlement",
         request,
         settle_observation_inner(state, request, authority, observation),
     )
-    .await
+    .await;
+    if result.is_ok() {
+        // A successful call can defer without changing canonical attempt state.
+        crate::xray_workflow::fact(context.as_ref(), "attempt.settlement_returned", outcome);
+    }
+    result
 }
 
 async fn settle_observation_inner(

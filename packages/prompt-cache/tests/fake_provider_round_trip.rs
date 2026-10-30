@@ -48,6 +48,7 @@ impl BlockingModelProviderInvoker for FakePluginInvoker {
             "every scenario turn must pass through host preparation"
         );
         let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
+            diagnostics: None,
             plugin_id: "bcode.fake-provider".to_string(),
             request: ServiceRequest {
                 interface_id: bcode_model::MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),

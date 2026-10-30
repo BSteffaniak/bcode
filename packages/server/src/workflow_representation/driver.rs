@@ -13,6 +13,14 @@ use representation::admission_observation::{Category, Phase};
 
 /// Drive a canonical new run under an already-verified local authority. No admission bypass.
 pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
+    let context = crate::xray_workflow::originating_run_context(state, run_id).await;
+    let boundary = crate::xray_workflow::Boundary::new(context.clone(), "run.drive");
+    let result = crate::xray_workflow::scope(context, drive_inner(state, run_id)).await;
+    boundary.finish_result(&result);
+    result
+}
+
+async fn drive_inner(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
     let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let guard = super::owner::local_authority(state, run_id)
@@ -49,6 +57,11 @@ pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<
         .map_err(super::backpressure::normalize)?
         .is_some()
         {
+            crate::xray_workflow::fact(
+                bcode_xray::CaptureContext::current().as_ref(),
+                "run.terminalized",
+                "persisted",
+            );
             return Ok(());
         }
         // Drain lifecycle pages without revisiting unchanged receipt-backed leaves.
@@ -111,6 +124,8 @@ async fn pass_allowed(
         .shutdown_requested
         .load(std::sync::atomic::Ordering::SeqCst)
     {
+        let context = bcode_xray::CaptureContext::current();
+        crate::xray_workflow::fact(context.as_ref(), "run.drive_deferred", "shutdown_requested");
         return Ok(false);
     }
     super::backpressure::queued(&crate::workflow_store_path(state), || {
@@ -123,6 +138,10 @@ async fn pass_allowed(
     })
     .await
     .map_err(super::backpressure::normalize)?;
+    if paused {
+        let context = bcode_xray::CaptureContext::current();
+        crate::xray_workflow::fact(context.as_ref(), "run.drive_deferred", "user_paused");
+    }
     Ok(!paused)
 }
 
@@ -271,10 +290,41 @@ pub async fn dispatch_and_record(
     dispatch: &PreparedActivationDispatch,
     owner: &impl ActivationDispatchOwner,
 ) -> Result<(), ServerError> {
+    let origin =
+        crate::xray_workflow::originating_run_context(state, &dispatch.activation.run_id).await;
+    let context = crate::xray_workflow::activation_context(
+        origin,
+        &dispatch.activation.run_id,
+        &dispatch.activation.activation_id,
+        Some(&dispatch.dispatch_identity),
+    );
+    let boundary =
+        crate::xray_workflow::Boundary::new(context.clone(), "attempt.dispatch_and_record");
+    let result = crate::xray_workflow::scope(
+        context,
+        dispatch_and_record_inner(state, authority, dispatch, owner),
+    )
+    .await;
+    boundary.finish_result(&result);
+    result
+}
+
+async fn dispatch_and_record_inner(
+    state: &ServerState,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    dispatch: &PreparedActivationDispatch,
+    owner: &impl ActivationDispatchOwner,
+) -> Result<(), ServerError> {
     // Admission time denotes the handoff, not the later receipt persistence time.
     // Synchronous plugin owners may already return a terminal result from dispatch.
     let admitted_at_ms = crate::current_unix_millis();
-    let receipt = match owner.dispatch(dispatch).await {
+    let boundary = crate::xray_workflow::Boundary::new(
+        bcode_xray::CaptureContext::current(),
+        "attempt.owner_dispatch",
+    );
+    let dispatched = owner.dispatch(dispatch).await;
+    boundary.finish_result(&dispatched);
+    let receipt = match dispatched {
         Ok(receipt) => receipt,
         Err(error) => {
             admission::record(
@@ -481,16 +531,39 @@ fn drive_page<'a>(
             if !activation_ready(&path, &activation_db, run_id, &activation).await? {
                 return Ok(true);
             }
-            drive_activation(
-                state,
-                &activation_db,
-                authority,
+            let context = crate::xray_workflow::activation_context(
+                bcode_xray::CaptureContext::current(),
                 run_id,
-                revision,
-                activation,
-                node,
+                &activation.activation_id,
+                None,
+            );
+            if let Some(context) = context.as_ref().filter(|context| context.capture_active()) {
+                context.emit(
+                    "workflow",
+                    "node.admission",
+                    serde_json::json!({
+                        "node_id": &activation.node_id,
+                        "revision": revision,
+                    }),
+                    false,
+                );
+            }
+            let boundary = crate::xray_workflow::Boundary::new(context.clone(), "activation.drive");
+            let result = crate::xray_workflow::scope(
+                context,
+                drive_activation(
+                    state,
+                    &activation_db,
+                    authority,
+                    run_id,
+                    revision,
+                    activation,
+                    node,
+                ),
             )
-            .await
+            .await;
+            boundary.finish_result(&result);
+            result
         }))
         .await
     })
@@ -522,11 +595,15 @@ async fn finish_pass(
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     run_id: &str,
 ) -> Result<(), ServerError> {
-    super::backpressure::queued(path, || {
+    let terminal = super::backpressure::queued(path, || {
         representation::runs::terminalize(db, authority, run_id)
     })
     .await
     .map_err(super::backpressure::normalize)?;
+    if terminal.is_some() {
+        let context = bcode_xray::CaptureContext::current();
+        crate::xray_workflow::fact(context.as_ref(), "run.terminalized", "persisted");
+    }
     Ok(())
 }
 
@@ -568,7 +645,35 @@ async fn observe_existing(
     side_effect: bcode_workflow::DispatchSideEffect,
     receipt: bcode_workflow_store::DispatchReceipt,
 ) -> Result<bool, ServerError> {
-    let observation = crate::WorkflowTurnReceiptObserver { state }
+    let context = crate::xray_workflow::activation_context(
+        bcode_xray::CaptureContext::current(),
+        &dispatch.activation.run_id,
+        &dispatch.activation.activation_id,
+        Some(&dispatch.dispatch_identity),
+    );
+    let boundary =
+        crate::xray_workflow::Boundary::new(context.clone(), "attempt.observe_and_settle");
+    let result = crate::xray_workflow::scope(
+        context,
+        observe_existing_inner(state, authority, dispatch, side_effect, receipt),
+    )
+    .await;
+    boundary.finish_result(&result);
+    result
+}
+
+async fn observe_existing_inner(
+    state: &std::sync::Arc<ServerState>,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    dispatch: &PreparedActivationDispatch,
+    side_effect: bcode_workflow::DispatchSideEffect,
+    receipt: bcode_workflow_store::DispatchReceipt,
+) -> Result<bool, ServerError> {
+    let boundary = crate::xray_workflow::Boundary::new(
+        bcode_xray::CaptureContext::current(),
+        "attempt.owner_observation",
+    );
+    let observed = crate::WorkflowTurnReceiptObserver { state }
         .observe_async(&bcode_workflow_store::AttemptReconciliationRequest {
             run_id: receipt.run_id,
             node_id: receipt.node_id,
@@ -578,7 +683,9 @@ async fn observe_existing(
             side_effect,
             receipt: receipt.receipt,
         })
-        .await?;
+        .await;
+    boundary.finish_result(&observed);
+    let observation = observed?;
     let progressed = matches!(
         observation,
         bcode_workflow_store::AttemptObservation::Succeeded { .. }

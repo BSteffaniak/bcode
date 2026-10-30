@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bounded live diagnostic observation and recording for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "diagnostics", "observability"]
+license     = { workspace = true }
+name        = "bcode_xray"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_xray_models = { workspace = true }
+hex               = { workspace = true }
+rustix            = { workspace = true, features = ["std", "fs"] }
+serde             = { workspace = true, features = ["derive", "std"] }
+serde_json        = { workspace = true, features = ["std"] }
+sha2              = { workspace = true }
+thiserror         = { workspace = true }
+tokio             = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+uuid              = { workspace = true, features = ["std", "v4"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

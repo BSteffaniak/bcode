@@ -1654,9 +1654,18 @@ impl From<&str> for PluginError {
     }
 }
 
+pub mod diagnostics;
+
 /// Host request delivered to a native plugin service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeServiceContext {
+    /// Optional explicitly negotiated diagnostic side channel, independent of service events.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "diagnostics::deserialize_negotiation"
+    )]
+    pub diagnostics: Option<diagnostics::NativeDiagnosticContext>,
     pub plugin_id: String,
     pub request: ServiceRequest,
     #[serde(default)]
@@ -2314,9 +2323,21 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
         bridge_user_data,
         context.cancellation.clone(),
     );
-    let response = match instance.lock() {
-        Ok(mut plugin) => plugin.invoke_service(context),
-        Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
+    let capture = diagnostics::capture_context(
+        context.diagnostics.as_ref(),
+        events,
+        bridge_callback,
+        bridge_user_data,
+    );
+    let invoke = || {
+        instance
+            .lock()
+            .map(|mut plugin| plugin.invoke_service(context))
+            .map_err(|_| SERVICE_STATUS_PLUGIN_UNAVAILABLE)
+    };
+    let response = match diagnostics::scope(capture, invoke) {
+        Ok(response) => response,
+        Err(status) => return status,
     };
     write_service_response(&response, output_ptr, output_capacity, output_len, events)
 }
@@ -2377,7 +2398,14 @@ pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
         bridge_user_data,
         context.cancellation.clone(),
     );
-    let response = instance.invoke_service_concurrent(context);
+    let capture = diagnostics::capture_context(
+        context.diagnostics.as_ref(),
+        events,
+        bridge_callback,
+        bridge_user_data,
+    );
+    let invoke = || instance.invoke_service_concurrent(context);
+    let response = diagnostics::scope(capture, invoke);
     write_service_response(&response, output_ptr, output_capacity, output_len, events)
 }
 
@@ -3306,6 +3334,7 @@ mod tests {
     #[test]
     fn native_service_context_credentials_use_host_bound_plugin_id() {
         let context = super::NativeServiceContext {
+            diagnostics: None,
             plugin_id: "example.plugin".to_owned(),
             request: ServiceRequest {
                 interface_id: "example/v1".to_owned(),
@@ -3354,6 +3383,7 @@ mod tests {
     fn native_service_context_progress_helper_uses_host_identity_and_limits() {
         let events: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
         let context = super::NativeServiceContext {
+            diagnostics: None,
             plugin_id: "example.plugin".to_owned(),
             request: ServiceRequest {
                 interface_id: "example/v1".to_owned(),
